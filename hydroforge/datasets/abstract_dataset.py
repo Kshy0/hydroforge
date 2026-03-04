@@ -22,16 +22,16 @@ from hydroforge.core.distributed import (binread, find_indices_in,
                                           is_rank_zero, read_map)
 
 
-def compute_grid_id(runoff_lon, runoff_lat, hires_lon, hires_lat):
+def compute_grid_id(grid_lon, grid_lat, hires_lon, hires_lat):
     """
-    Calculates runoff grid IDs considering ascending or descending order of coordinates.
+    Calculates source grid IDs considering ascending or descending order of coordinates.
 
     Notes on longitude handling:
-    - runoff_lon is assumed to be strictly monotonic (usually ascending) and may be in
+    - grid_lon is assumed to be strictly monotonic (usually ascending) and may be in
       [-180, 180] or [0, 360].
     - hires_lon values (e.g., generated from high-res maps) are typically in [-180, 180].
     - To avoid wrap-around mismatches, hires_lon is first normalized to the same range
-      as runoff_lon before computing indices.
+      as grid_lon before computing indices.
     """
 
     def _wrap_lon(lon_vals, mode):
@@ -46,44 +46,44 @@ def compute_grid_id(runoff_lon, runoff_lat, hires_lon, hires_lat):
             wrapped = (np.mod(lon_vals + 180.0, 360.0)) - 180.0
             return wrapped
 
-    # Decide target longitude range based on runoff grid
-    rmin, rmax = float(np.min(runoff_lon)), float(np.max(runoff_lon))
+    # Decide target longitude range based on source grid
+    rmin, rmax = float(np.min(grid_lon)), float(np.max(grid_lon))
     # if entirely non-negative and up to 360 -> treat as 0-360; otherwise -180-180
     target_mode = '0-360' if (rmin >= 0.0 and rmax <= 360.0) else '-180-180'
 
-    # Normalize hires_lon to the same wrap as runoff_lon
+    # Normalize hires_lon to the same wrap as grid_lon
     hires_lon = _wrap_lon(hires_lon, target_mode)
 
-    lon_ascending = runoff_lon[1] > runoff_lon[0]
-    lat_ascending = runoff_lat[1] > runoff_lat[0]
+    lon_ascending = grid_lon[1] > grid_lon[0]
+    lat_ascending = grid_lat[1] > grid_lat[0]
 
-    gsize_lon = abs(runoff_lon[1] - runoff_lon[0])
-    gsize_lat = abs(runoff_lat[1] - runoff_lat[0])
+    gsize_lon = abs(grid_lon[1] - grid_lon[0])
+    gsize_lat = abs(grid_lat[1] - grid_lat[0])
 
     if lon_ascending:
-        westin = runoff_lon[0] - 0.5 * gsize_lon
+        westin = grid_lon[0] - 0.5 * gsize_lon
         ixin = np.floor((hires_lon - westin) / gsize_lon).astype(int)
     else:
-        westin = runoff_lon[0] + 0.5 * gsize_lon
+        westin = grid_lon[0] + 0.5 * gsize_lon
         ixin = np.floor((westin - hires_lon) / gsize_lon).astype(int)
 
     if lat_ascending:
-        southin = runoff_lat[0] - 0.5 * gsize_lat
+        southin = grid_lat[0] - 0.5 * gsize_lat
         iyin = np.floor((hires_lat - southin) / gsize_lat).astype(int)
     else:
-        northin = runoff_lat[0] + 0.5 * gsize_lat
+        northin = grid_lat[0] + 0.5 * gsize_lat
         iyin = np.floor((northin - hires_lat) / gsize_lat).astype(int)
 
     
-    nxin = len(runoff_lon)
-    nyin = len(runoff_lat)
+    nxin = len(grid_lon)
+    nyin = len(grid_lat)
     ixin[ixin == nxin] = 0
-    assert np.all((ixin >= 0) & (ixin < nxin)), "Some hires_lon points fall outside the runoff grid (longitude)"
-    assert np.all((iyin >= 0) & (iyin < nyin)), "Some hires_lat points fall outside the runoff grid (latitude)"
+    assert np.all((ixin >= 0) & (ixin < nxin)), "Some hires_lon points fall outside the source grid (longitude)"
+    assert np.all((iyin >= 0) & (iyin < nyin)), "Some hires_lat points fall outside the source grid (latitude)"
 
-    runoff_id = iyin * nxin + ixin
+    grid_id = iyin * nxin + ixin
 
-    return runoff_id
+    return grid_id
 
 class AbstractDataset(torch.utils.data.Dataset, ABC):
     """
@@ -129,7 +129,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self.calendar = calendar
         self.clip_negative = clip_negative
         
-        # Local runoff indices for spatial compression (set by build_local_mapping)
+        # Local grid indices for spatial compression (set by build_local_mapping)
         self._local_indices: Optional[np.ndarray] = None
         
         # Convert dates to the specified calendar immediately
@@ -305,13 +305,13 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         world_size: int,
     ) -> torch.Tensor:
         """
-        Map grid runoff to catchments and handle distributed sync.
+        Map grid data to catchments and handle distributed sync.
 
         Expected input shape: 
           - (B, T, N) for single trial
           - (B, T, K, N) for K trials
         
-        N should match data_size (compressed runoff grids after build_local_mapping).
+        N should match data_size (compressed source grids after build_local_mapping).
         Output shape: (M, C) where M is the product of non-spatial dims, C = number of catchments.
         """
         if batch_data.dim() == 3:
@@ -344,12 +344,12 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                                   device: Optional[torch.device] = None,
                                   precision: Literal["float32", "float64"]="float32") -> torch.Tensor:
         """
-        Build PyTorch sparse matrix for mapping runoff data to specified catchments.
+        Build PyTorch sparse matrix for mapping grid data to specified catchments.
         
         This method:
         1. Loads the sparse mapping matrix from npz file
         2. Extracts submatrix for desired catchments (or all if desired_catchment_ids is None)
-        3. Identifies non-zero columns (active runoff grids)
+        3. Identifies non-zero columns (active source grids)
         4. Sets self._local_indices for use in __getitem__
         5. Returns the compressed mapping matrix
         
@@ -369,7 +369,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         mapping_file = Path(mapping_file)
         torch_precision = torch.float32 if precision == "float32" else torch.float64
         if mapping_file is None or not os.path.exists(mapping_file):
-            raise ValueError("Runoff mapping file not found. Cannot build local matrix.")
+            raise ValueError("Mapping file not found. Cannot build local matrix.")
         
         # Store the mapping file path for later use
         self._mapping_file = mapping_file
@@ -446,16 +446,16 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         non_zero_cols = np.where(col_sums != 0)[0].astype(np.int64)
         
         if len(non_zero_cols) == 0:
-            raise ValueError("No non-zero runoff data found for the desired catchments.")
+            raise ValueError("No non-zero grid data found for the desired catchments.")
         
-        # Store the local runoff indices for use in __getitem__
+        # Store the local grid indices for use in __getitem__
         self._local_indices = non_zero_cols
         
         # Store the desired catchment IDs for use in export_catchment_data
         self._desired_catchment_ids = np.asarray(desired_catchment_ids)
         
         # Extract final submatrix with only non-zero columns and transpose
-        # Shape: (num_runoff_grids, num_catchments)
+        # Shape: (num_source_grids, num_catchments)
         final_submatrix = submatrix[:, non_zero_cols].T.tocoo()
 
         # Convert to PyTorch sparse COO tensor
@@ -472,9 +472,9 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         ).coalesce()
         
         if is_rank_zero():
-            print(f"[AbstractDataset] Built local runoff matrix: {len(non_zero_cols)} active grids "
+            print(f"[AbstractDataset] Built local mapping matrix: {len(non_zero_cols)} active grids "
                   f"out of {full_grid_size} total")
-            print(f"[AbstractDataset] Mapping {len(non_zero_cols)} runoff grids -> {len(desired_catchment_ids)} catchments")
+            print(f"[AbstractDataset] Mapping {len(non_zero_cols)} source grids -> {len(desired_catchment_ids)} catchments")
         
         return local_mapping
 
@@ -490,14 +490,14 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         description: Optional[str] = None,
     ) -> Path:
         """
-        Compute the temporal-mean (climatological average) runoff and export to NetCDF.
+        Compute the temporal-mean (climatological average) and export to NetCDF.
 
         This mirrors the logic of Fortran-based routing models: iterate over
         every timestep in the dataset, accumulate the sum, and divide by the number
-        of steps to obtain the daily-mean runoff climatology mapped to catchments.
+        of steps to obtain the daily-mean climatology mapped to catchments.
 
         Requires ``build_local_mapping()`` to be called first.
-        The compressed runoff is mapped to catchments via sparse matmul and then
+        The compressed grid data is mapped to catchments via sparse matmul and then
         time-averaged.  Output NetCDF has dimension ``(saved_points,)`` with a
         ``catchment_id`` coordinate variable.
 
@@ -578,7 +578,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         desc = description if description else f"Time-averaged {var_name} over {total_steps} steps"
 
         with nc.Dataset(str(out_path), "w", format="NETCDF4") as ds:
-            ds.setncattr("title", f"Runoff climatology ({var_name})")
+            ds.setncattr("title", f"Climatology ({var_name})")
             ds.setncattr("total_timesteps", total_steps)
 
             ds.createDimension("saved_points", n_catch)
@@ -614,7 +614,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         filename: Optional[str] = None,
     ) -> Union[Path, List[Path]]:
         """
-        Export catchment-aggregated runoff to a NetCDF file readable by MultiRankStatsReader.
+        Export catchment-aggregated data to a NetCDF file readable by MultiRankStatsReader.
         
         Requires build_local_mapping() to be called first.
 
@@ -624,7 +624,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         - Variables:
             * time: numeric with units and calendar
             * catchment_id: (saved_points,) catchment IDs
-            * {var_name}: (time, saved_points) aggregated runoff (area-weighted mean)
+            * {var_name}: (time, saved_points) aggregated data (area-weighted mean)
 
         GPU acceleration:
         - Set `device="cuda:0"` (or any CUDA device) to enable GPU-accelerated sparse matmul.
@@ -647,7 +647,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         if not hasattr(self, '_desired_catchment_ids') or self._desired_catchment_ids is None:
             raise ValueError(
                 "build_local_mapping() must be called before export_catchment_data(). "
-                "This sets the catchment IDs and runoff mapping."
+                "This sets the catchment IDs and grid mapping."
             )
         
         catchment_ids = self._desired_catchment_ids
@@ -664,8 +664,8 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             print("CUDA not available; falling back to CPU for export_catchment_data.")
             dev = torch.device("cpu")
 
-        # Use the provided local runoff matrix
-        # Shape: (n_cols, n_catch) - maps compressed runoff grids to catchments
+        # Use the provided local mapping matrix
+        # Shape: (n_cols, n_catch) - maps compressed source grids to catchments
         t_mapping = local_mapping.to(dev).to(torch_dtype)
         
         if normalized:
@@ -697,7 +697,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         
         def _init_nc(path):
             ds = nc.Dataset(path, "w", format="NETCDF4")
-            ds.setncattr("title", f"Aggregated catchment runoff ({var_name})")
+            ds.setncattr("title", f"Aggregated catchment data ({var_name})")
             ds.createDimension("time", None)
             ds.createDimension("saved_points", n_catch)
 
@@ -791,7 +791,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self,
         map_dir: str,
         out_dir: str,
-        npz_file: str = "runoff_mapping.npz",
+        npz_file: str = "grid_mapping.npz",
         mapinfo_txt: str = "location.txt",
         hires_map_tag: str = "1min",
         lowres_idx_precision: str = "<i4",
@@ -800,7 +800,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         parameter_nc: str | Path | None = None,
     ):
         """
-        Generate runoff mapping table and save as npz file.
+        Generate grid mapping table and save as npz file.
                 The mapping is stored as a sparse matrix format with catchment IDs array.
 
                 Optional alignment/subsetting:
@@ -859,12 +859,12 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         valid_areas = HighResGridArea[x_idx, y_idx]
         catchment_id_hires = np.ravel_multi_index((valid_x, valid_y), (nx, ny))
 
-        # Get runoff coordinates from dataset class
+        # Get source grid coordinates from dataset class
         ro_lon, ro_lat = self.get_coordinates()
         valid_lon = hires_lon_2D[x_idx, y_idx]
         valid_lat = hires_lat_2D[x_idx, y_idx]
 
-        # Compute catchment and runoff IDs
+        # Compute catchment and source grid IDs
         catchment_idx = find_indices_in(catchment_id_hires, catchment_id)
         if np.any(catchment_idx == -1):
             print(
@@ -927,8 +927,8 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         missing_count = baseline_rows - unique_row_count
         if missing_count > 0:
             print(
-                f"Warning: {missing_count} catchments were not mapped to runoff grids. "
-                "Their runoff input will always be zero."
+                f"Warning: {missing_count} catchments were not mapped to source grids. "
+                "Their grid input will always be zero."
             )
 
         # Create sparse matrix using scipy and compress it
@@ -958,9 +958,9 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
         np.savez_compressed(output_path, **mapping_data)
 
-        print(f"Saved runoff mapping to {output_path}")
+        print(f"Saved grid mapping to {output_path}")
         print(f"Mapping contains {matrix_shape[0]} catchments "
-            f"and {len(sparse_matrix.data)} non-zero runoff grid mappings")
+            f"and {len(sparse_matrix.data)} non-zero source grid mappings")
         print(f"Matrix shape: {matrix_shape[0]} x {matrix_shape[1]}")
         print(f"Coordinate metadata: lon[{len(ro_lon)}] x lat[{len(ro_lat)}]")
 
@@ -1134,7 +1134,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     @property
     def data_size(self) -> int:
         """
-        Returns the number of runoff grid points to be loaded per timestep.
+        Returns the number of source grid points to be loaded per timestep.
         
         Before build_local_mapping is called: returns full grid size.
         After build_local_mapping is called: returns compressed size (active grids only).
@@ -1420,7 +1420,7 @@ class StaticParameterDataset:
         self,
         map_dir: str,
         out_dir: str,
-        npz_file: str = "runoff_mapping.npz",
+        npz_file: str = "grid_mapping.npz",
         mapinfo_txt: str = "location.txt",
         hires_map_tag: str = "1min",
         lowres_idx_precision: str = "<i4",
@@ -1429,7 +1429,7 @@ class StaticParameterDataset:
         parameter_nc: Union[str, Path, None] = None,
     ):
         """
-        Generate runoff mapping table and save as npz file.
+        Generate grid mapping table and save as npz file.
         Copied and adapted from AbstractDataset.
         """
         map_dir = Path(map_dir)
@@ -1479,12 +1479,12 @@ class StaticParameterDataset:
         valid_areas = HighResGridArea[x_idx, y_idx]
         catchment_id_hires = np.ravel_multi_index((valid_x, valid_y), (nx, ny))
 
-        # Get runoff coordinates
+        # Get source grid coordinates
         ro_lon, ro_lat = self.get_coordinates()
         valid_lon = hires_lon[x_idx]
         valid_lat = hires_lat[y_idx]
 
-        # Compute catchment and runoff IDs
+        # Compute catchment and source grid IDs
         catchment_idx = find_indices_in(catchment_id_hires, catchment_id)
         if np.any(catchment_idx == -1):
             print(
@@ -1564,9 +1564,9 @@ class StaticParameterDataset:
 
         np.savez_compressed(output_path, **mapping_data)
 
-        print(f"Saved runoff mapping to {output_path}")
+        print(f"Saved grid mapping to {output_path}")
         print(f"Mapping contains {matrix_shape[0]} catchments "
-            f"and {len(sparse_matrix.data)} non-zero runoff grid mappings")
+            f"and {len(sparse_matrix.data)} non-zero source grid mappings")
         print(f"Matrix shape: {matrix_shape[0]} x {matrix_shape[1]}")
 
     def export_catchment_data(

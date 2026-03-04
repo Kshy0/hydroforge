@@ -11,8 +11,6 @@ Generic framework for GPU-accelerated hydrological modelling.
 | `hydroforge.aggregator` | `StatisticsAggregator`, streaming NetCDF output, kernel codegen |
 | `hydroforge.compute` | Kernel backend selection (`triton` / `torch`) |
 
-> All sub-package `__init__.py` files re-export public symbols. Use full module paths for imports.
-
 ## Installation
 
 ### 1. Install PyTorch manually
