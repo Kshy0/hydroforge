@@ -373,6 +373,21 @@ class AbstractModule(BaseModel, ABC):
         """
         auto_fix_log = {}
 
+        # Pass 0: Move ALL tensors to the correct device first.
+        for field_name, field_info in self.get_model_fields().items():
+            json_schema_extra = getattr(field_info, 'json_schema_extra', None)
+            if not isinstance(json_schema_extra, dict) or 'tensor_shape' not in json_schema_extra:
+                continue
+            tensor = getattr(self, field_name, None)
+            if tensor is None or not isinstance(tensor, torch.Tensor):
+                continue
+            if tensor.device.type != self.device.type or (
+                tensor.device.index is not None
+                and self.device.index is not None
+                and tensor.device.index != self.device.index
+            ):
+                setattr(self, field_name, tensor.to(self.device))
+
         for field_name, field_info in self.get_model_fields().items():
             # Check if it is a TensorField by looking for tensor_shape in json_schema_extra
             json_schema_extra = getattr(field_info, 'json_schema_extra', None)
