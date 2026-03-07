@@ -18,8 +18,8 @@ import torch.distributed as dist
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
-from hydroforge.core.distributed import (binread, find_indices_in,
-                                          is_rank_zero, read_map)
+from hydroforge.modeling.distributed import (binread, find_indices_in,
+                                             is_rank_zero, read_map)
 
 
 def compute_grid_id(grid_lon, grid_lat, hires_lon, hires_lat):
@@ -1129,7 +1129,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         """
         Closes any open resources or files.
         """
-        pass
 
     @property
     def data_size(self) -> int:

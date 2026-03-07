@@ -10,8 +10,8 @@ from typing import Callable, Optional, Union
 import cftime
 import numpy as np
 
-from hydroforge.datasets.netcdf_dataset import NetCDFDataset
-from hydroforge.datasets.utils import monthly_time_to_key
+from hydroforge.io.datasets.netcdf_dataset import NetCDFDataset
+from hydroforge.io.datasets.utils import monthly_time_to_key
 
 
 class ERA5LandAccumDataset(NetCDFDataset):
@@ -163,4 +163,3 @@ class ERA5LandAccumDataset(NetCDFDataset):
     def read_chunk(self, idx: int) -> np.ndarray:
         arr = super().read_chunk(idx)
         return self._transform_cumulative_to_incremental(arr)
-

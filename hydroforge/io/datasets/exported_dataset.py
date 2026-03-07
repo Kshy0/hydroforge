@@ -14,9 +14,9 @@ import numpy as np
 import torch
 from netCDF4 import Dataset
 
-from hydroforge.datasets.netcdf_dataset import NetCDFDataset
-from hydroforge.datasets.utils import single_file_key
-from hydroforge.core.distributed import find_indices_in, is_rank_zero
+from hydroforge.io.datasets.netcdf_dataset import NetCDFDataset
+from hydroforge.io.datasets.utils import single_file_key
+from hydroforge.modeling.distributed import find_indices_in, is_rank_zero
 
 
 class ExportedDataset(NetCDFDataset):

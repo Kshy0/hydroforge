@@ -17,8 +17,8 @@ import torch
 from numba import njit
 
 if TYPE_CHECKING:
-    from hydroforge.core.model import AbstractModel
-    from hydroforge.core.module import AbstractModule
+    from hydroforge.modeling.model import AbstractModel
+    from hydroforge.modeling.module import AbstractModule
 
 
 @njit
@@ -285,7 +285,7 @@ class ParameterPlanMixin:
         return None
 
     def _resolve_plan_item(self: AbstractModel, item: PlanItem) -> None:
-        from hydroforge.core.distributed import find_indices_in_torch
+        from hydroforge.modeling.distributed import find_indices_in_torch
 
         variable_map = self.variable_map
 
@@ -415,7 +415,7 @@ class ParameterPlanMixin:
         target_ids: Optional[Union[List[int], torch.Tensor]] = None,
     ) -> None:
         """Directly set the value of a variable for specific IDs immediately."""
-        from hydroforge.core.distributed import find_indices_in_torch
+        from hydroforge.modeling.distributed import find_indices_in_torch
 
         if variable_name not in self.variable_map:
             raise ValueError(f"Variable '{variable_name}' not found in model.")

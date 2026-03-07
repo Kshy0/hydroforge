@@ -1,5 +1,5 @@
 """
-hydroforge.core.distributed
+hydroforge.modeling.distributed
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Distributed-training helpers (rank / world-size queries, process-group
 setup) plus low-level numeric utilities shared across modules.

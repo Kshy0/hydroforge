@@ -7,11 +7,11 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Dict, List, Set
 
 import torch
 
-from hydroforge.core.distributed import torch_to_numpy_dtype
+from hydroforge.modeling.distributed import torch_to_numpy_dtype
 
 if TYPE_CHECKING:
     from hydroforge.aggregator.aggregator import StatisticsAggregator
@@ -115,6 +115,17 @@ class StatisticsMixin:
                     required_tensors[dim_name] = tensor
 
         self._kernel_states = required_tensors
+
+        # Scalar parameters as 1-element device tensors for CUDA Graph compatibility.
+        # Kernel code loads these via tl.load (Triton) or reads from states dict,
+        # so CUDA Graphs can replay without recapture when values change.
+        self._kernel_states['__weight'] = torch.zeros(1, device=self.device, dtype=torch.float32)
+        self._kernel_states['__total_weight'] = torch.zeros(1, device=self.device, dtype=torch.float32)
+        self._kernel_states['__num_macro_steps'] = torch.zeros(1, device=self.device, dtype=torch.float32)
+        self._kernel_states['__sub_step'] = torch.zeros(1, device=self.device, dtype=torch.int32)
+        self._kernel_states['__num_sub_steps'] = torch.zeros(1, device=self.device, dtype=torch.int32)
+        self._kernel_states['__flags'] = torch.zeros(1, device=self.device, dtype=torch.int32)
+        self._kernel_states['__macro_step_index'] = torch.zeros(1, device=self.device, dtype=torch.int32)
 
     
 
@@ -388,22 +399,17 @@ class StatisticsMixin:
 
     
 
-    def update_statistics(self: StatisticsAggregator, weight: float, total_weight: float = 0.0, 
-                          is_inner_first: bool = False, is_inner_last: bool = False, 
-                          is_outer_first: bool = False, is_outer_last: bool = False,
-                          BLOCK_SIZE: int = 128, custom_step_index: Optional[int] = None,
-                          # Legacy kwargs support
-                          is_first: bool = False, is_last: bool = False, 
-                          is_middle: bool = False, is_macro_step_end: bool = False) -> None:
+    def update_statistics(self: StatisticsAggregator, sub_step: int, num_sub_steps: int, flags: int,
+                          weight: float, total_weight: float = 0.0, 
+                          BLOCK_SIZE: int = 128) -> None:
         if not self._aggregator_generated:
             raise RuntimeError("Statistics aggregation not initialized. Call initialize_streaming_aggregation() first.")
         
-        # Handle legacy or new parameters
-        _is_inner_first = is_inner_first or is_first
-        _is_inner_last = is_inner_last or is_last
-        
-        if _is_inner_first:
-            self._step_count = 0
+        # Compute boolean flags from sub_step, num_sub_steps, flags
+        # flags bits: 0=stat_is_first, 1=stat_is_last, 2=stat_is_outer_first, 3=stat_is_outer_last
+        is_inner_last = bool(flags & 2) and (sub_step == num_sub_steps - 1)
+        is_outer_first = bool(flags & 4) and is_inner_last
+        is_outer_last = bool(flags & 8) and is_inner_last
         
         # Reset macro_step_index at the start of each outer statistics period
         # This ensures argmax/argmin indices are always relative to the start of the period
@@ -411,7 +417,7 @@ class StatisticsMixin:
             self._macro_step_index = 0
             self._current_macro_step_count = 0.0
             
-        if _is_inner_last:
+        if is_inner_last:
              for out_name, is_outer in self._output_is_outer.items():
                  # We only trigger dirty for non-outer (Standard) ops when inner loop ends
                  if not is_outer:
@@ -423,18 +429,21 @@ class StatisticsMixin:
                  if is_outer:
                      self._dirty_outputs.add(out_name)
 
-        if is_macro_step_end: # Legacy support or counter
+        if is_inner_last:
             self._current_macro_step_count += 1.0
 
-        macro_count_val = self._current_macro_step_count
-            
-        # Ensure kernel states is actually populated correctly for new keys
-            
-        self._aggregator_function(self._kernel_states, weight, total_weight, macro_count_val, 
-                                  _is_inner_first, _is_inner_last, is_middle, 
-                                  is_outer_first, is_outer_last,
-                                  self._macro_step_index, self._step_count, BLOCK_SIZE)
-        
-        self._step_count += 1
+        num_macro_steps = self._current_macro_step_count
+
+        # Fill scalar tensors so kernels read updated values from fixed addresses
+        states = self._kernel_states
+        states['__weight'].fill_(weight)
+        states['__total_weight'].fill_(total_weight)
+        states['__num_macro_steps'].fill_(num_macro_steps)
+        states['__sub_step'].fill_(sub_step)
+        states['__num_sub_steps'].fill_(num_sub_steps)
+        states['__flags'].fill_(flags)
+        states['__macro_step_index'].fill_(self._macro_step_index)
+
+        self._aggregator_function(states, BLOCK_SIZE)
 
     

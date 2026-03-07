@@ -22,12 +22,12 @@ from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
                       field_validator, model_validator)
 
 from hydroforge.aggregator.aggregator import StatisticsAggregator
-from hydroforge.core.model_utils import (ActivePlan, ParameterPlanMixin,
-                                         PlanItem, ProgressMixin,
-                                         ProgressTracker,
-                                         compute_group_to_rank)
-from hydroforge.core.module import AbstractModule
-from hydroforge.core.input_proxy import InputProxy
+from hydroforge.modeling.input_proxy import InputProxy
+from hydroforge.modeling.model_utils import (ActivePlan, ParameterPlanMixin,
+                                             PlanItem, ProgressMixin,
+                                             ProgressTracker,
+                                             compute_group_to_rank)
+from hydroforge.modeling.module import AbstractModule
 
 
 class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
@@ -78,7 +78,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         description="Base precision of the model",
     )
     mixed_precision: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Enable mixed precision for hpfloat (storage) tensors.\n"
             "When True, hpfloat tensors are promoted one level above base precision:\n"
@@ -347,7 +347,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 if not hasattr(module, name):
                     continue
                 value = getattr(module, name)
-                if isinstance(value, torch.Tensor) and value.device == module.device:
+                if isinstance(value, torch.Tensor) and value.device.type == module.device.type:
                     ptr = value.data_ptr()
                     if ptr not in global_seen_ptrs:
                         global_seen_ptrs.add(ptr)
@@ -742,18 +742,19 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             variable_ops=var_to_ops
         )
 
-    def update_statistics(self, weight: float, total_weight: float = 0.0, is_first: bool = False, is_last: bool = False, is_middle: bool = False, is_macro_step_end: bool = False, is_inner_first: bool = False, is_inner_last: bool = False, is_outer_first: bool = False, is_outer_last: bool = False, BLOCK_SIZE: int = 128, custom_step_index: Optional[int] = None) -> None:
+    def update_statistics(self, sub_step: int, num_sub_steps: int, flags: int, weight: float, total_weight: float = 0.0, BLOCK_SIZE: int = 128) -> None:
         """
         Update streaming statistics with a time weight.
         Args:
+            sub_step: Current sub-step index (0-based)
+            num_sub_steps: Total number of sub-steps
+            flags: Packed boolean flags (bit 0=is_first, 1=is_last, 2=is_outer_first, 3=is_outer_last)
             weight: dt in seconds for this sub-step (time-weighted accumulation)
-            is_first: whether this sub-step is the first of a stats window
-            is_last: whether this sub-step is the last of a stats window
-            is_middle: whether this sub-step is the middle of a stats window
-            is_macro_step_end: whether this sub-step is the end of a macro-step
+            total_weight: Total elapsed time for the full inner window
+            BLOCK_SIZE: GPU block size
         """
         if self._statistics_aggregator is not None:
-            self._statistics_aggregator.update_statistics(weight, total_weight, is_inner_first=is_inner_first, is_inner_last=is_inner_last, is_outer_first=is_outer_first, is_outer_last=is_outer_last, BLOCK_SIZE=BLOCK_SIZE, custom_step_index=custom_step_index, is_first=is_first, is_last=is_last, is_middle=is_middle, is_macro_step_end=is_macro_step_end)
+            self._statistics_aggregator.update_statistics(sub_step, num_sub_steps, flags, weight, total_weight, BLOCK_SIZE=BLOCK_SIZE)
 
     def finalize_time_step(self, current_time: Union[datetime, cftime.datetime]) -> None:
         """
@@ -995,7 +996,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         proxy = InputProxy(data, attrs={
             "title": "hydroforge Model State",
             "history": f"Created by hydroforge at {datetime.now().isoformat()}",
-            "source": "hydroforge.core.model.AbstractModel.save_state"
+            "source": "hydroforge.modeling.model.AbstractModel.save_state"
         })
         
         # Write to file

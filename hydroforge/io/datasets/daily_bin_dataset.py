@@ -11,8 +11,8 @@ from typing import Callable, List, Optional, Tuple, Union
 import cftime
 import numpy as np
 
-from hydroforge.datasets.utils import daily_time_to_key, single_file_key
-from hydroforge.datasets.abstract_dataset import AbstractDataset
+from hydroforge.io.datasets.abstract_dataset import AbstractDataset
+from hydroforge.io.datasets.utils import daily_time_to_key, single_file_key
 
 
 class DailyBinDataset(AbstractDataset):

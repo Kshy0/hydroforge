@@ -9,7 +9,7 @@ Generic framework for GPU-accelerated hydrological modelling.
 | `hydroforge.core` | `AbstractModule`, `AbstractModel`, `InputProxy`, distributed utilities, model utilities |
 | `hydroforge.datasets` | `AbstractDataset`, `MixedDataset`, `StaticParameterDataset`, `DailyBinDataset`, `NetCDFDataset`, `ERA5LandAccumDataset`, `ExportedDataset` |
 | `hydroforge.aggregator` | `StatisticsAggregator`, streaming NetCDF output, kernel codegen |
-| `hydroforge.compute` | Kernel backend selection (`triton` / `torch`) |
+| `hydroforge.runtime` | Kernel backend selection (`cuda` / `metal` / `triton` / `torch`) |
 
 ## Installation
 
@@ -71,7 +71,7 @@ from hydroforge.datasets import (
 from hydroforge.aggregator.aggregator import StatisticsAggregator
 
 # Backend selection
-from hydroforge.compute.backend import KERNEL_BACKEND
+from hydroforge.runtime.backend import KERNEL_BACKEND
 ```
 
 ## License

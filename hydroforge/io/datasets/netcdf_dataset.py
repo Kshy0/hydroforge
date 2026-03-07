@@ -13,8 +13,8 @@ import cftime
 import numpy as np
 from netCDF4 import Dataset, num2date
 
-from hydroforge.datasets.utils import single_file_key, yearly_time_to_key
-from hydroforge.datasets.abstract_dataset import AbstractDataset
+from hydroforge.io.datasets.abstract_dataset import AbstractDataset
+from hydroforge.io.datasets.utils import single_file_key, yearly_time_to_key
 
 
 class NetCDFDataset(AbstractDataset):
@@ -454,7 +454,6 @@ class NetCDFDataset(AbstractDataset):
 
     def close(self) -> None:
         """No persistent open handles are kept; provided for interface completeness."""
-        pass
 
     def get_data(self, current_time: Union[datetime, cftime.datetime], chunk_len: int) -> np.ndarray:
         """Read a contiguous block starting at current_time with minimal NetCDF I/O.

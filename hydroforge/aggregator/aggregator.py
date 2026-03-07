@@ -39,7 +39,7 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
     def __init__(self, device: torch.device, output_dir: Optional[Path] = None, rank: int = 0, 
                  num_workers: int = 4, complevel: int = 4, save_kernels: bool = False,
                  output_split_by_year: bool = False, num_trials: int = 1,
-                 max_pending_steps: int = 10, calendar: str = "standard",
+                 max_pending_steps: int = 200, calendar: str = "standard",
                  time_unit: str = "days since 1900-01-01 00:00:00",
                  in_memory_mode: bool = False, result_device: Optional[torch.device] = None,
                  save_precision: Optional[torch.dtype] = None):
@@ -84,7 +84,6 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
         self.result_device = result_device if result_device is not None else torch.device("cpu")
         self.save_precision = save_precision
         
-        self._step_count = 0
         self._macro_step_index = 0  # Current macro step index (outer loop counter)
         
         # Time index tracking for argmax/argmin conversion
