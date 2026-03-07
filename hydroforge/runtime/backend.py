@@ -234,6 +234,20 @@ def make_triton_dispatcher(
 
 _MISSING = object()
 
+# Singleton 1-element int32 tensor on MPS, allocated once.
+_metal_dummy: dict[str, "torch.Tensor"] = {}
+
+
+def _metal_dummy_buf(device):
+    """Return a 1-element int32 MPS tensor to stand in for a None buffer."""
+    key = str(device)
+    buf = _metal_dummy.get(key)
+    if buf is None:
+        import torch
+        buf = torch.zeros(1, dtype=torch.int32, device=device)
+        _metal_dummy[key] = buf
+    return buf
+
 
 def make_metal_dispatcher(
     msl_source,
@@ -253,6 +267,11 @@ def make_metal_dispatcher(
     The returned function accepts ``**kw`` and handles shader compilation
     (with optional template specialization), ``bool``→``int`` conversion,
     and positional argument extraction automatically.
+
+    On the **first call** a specialised caller function is generated via
+    ``exec`` that maps caller kwargs directly to kernel positional args
+    without any per-call loop or type checks.  All subsequent calls go
+    through the cached fast-path.
 
     Args:
         msl_source: MSL source code as a ``str``, **or** a ``pathlib.Path`` /
@@ -301,42 +320,92 @@ def make_metal_dispatcher(
     else:
         source = msl_source
 
-    _cache: dict[Any, Any] = {}
     _defaults = arg_defaults or {}
     _tpl_keys = tuple(template_vars.values()) if template_vars else ()
 
-    def dispatch(**kw):
-        import torch
+    # ---- code-gen: build the arg-extraction body once ----
+    # The body is shared between template and non-template variants;
+    # only the lib acquisition differs.
+    _ns: dict[str, Any] = {}
+    _body_lines: list[str] = []
+    _arg_names: list[str] = []
 
-        # ---- compile (cached) ----
-        if template_vars:
+    for i, k in enumerate(args):
+        a = f"_a{i}"
+        _arg_names.append(a)
+        dv = _defaults.get(k, _MISSING)
+
+        if dv is not _MISSING and isinstance(dv, bool):
+            # Bool arg with default — store pre-converted int default.
+            # Still need a runtime check because callers *may* override
+            # with a Python bool.
+            _ns[f"_d{i}"] = int(dv)
+            _body_lines.append(
+                f"  {a} = _kw.get('{k}', _d{i}); "
+                f"{a} = int({a}) if {a}.__class__ is bool else {a}"
+            )
+        elif dv is not _MISSING:
+            _ns[f"_d{i}"] = dv
+            _body_lines.append(f"  {a} = _kw.get('{k}', _d{i})")
+        else:
+            _body_lines.append(f"  {a} = _kw['{k}']")
+
+        # Nullable tensor → substitute dummy buffer
+        if k.endswith("_ptr"):
+            _body_lines.append(f"  if {a} is None: {a} = _dummy")
+
+    _call_args = ", ".join(_arg_names)
+    _fn_body = "\n".join(_body_lines)
+    _call_line = (
+        f"  _lib.{kernel_name}({_call_args}, "
+        f"threads=_kw['{size_key}'], group_size={group_size})"
+    )
+
+    # _state[0] holds the compiled fast-path callable (None until first call)
+    _state: list = [None]
+
+    if template_vars:
+        # ---- template path: lib varies per template key ----
+        _shader_cache: dict[Any, Any] = {}
+
+        def _init():
+            import torch
+            _ns["_dummy"] = _metal_dummy_buf(torch.device("mps"))
+            code = f"def _fast(_kw, _lib):\n{_fn_body}\n{_call_line}"
+            exec(code, _ns)  # noqa: S102 – generated code is fully controlled
+            return _ns["_fast"], torch
+
+        def dispatch(**kw):
+            s = _state[0]
+            if s is None:
+                s = _init()
+                _state[0] = s
+            fast_fn, torch_mod = s
+
             cache_key = tuple(kw[k] for k in _tpl_keys)
-            lib = _cache.get(cache_key)
+            lib = _shader_cache.get(cache_key)
             if lib is None:
                 src = source
                 for placeholder, kwarg_key in template_vars.items():
                     src = src.replace(placeholder, str(kw[kwarg_key]))
-                lib = torch.mps.compile_shader(src)
-                _cache[cache_key] = lib
-        else:
-            lib = _cache.get(0)
-            if lib is None:
+                lib = torch_mod.mps.compile_shader(src)
+                _shader_cache[cache_key] = lib
+
+            fast_fn(kw, lib)
+
+    else:
+        # ---- non-template path: lib is fixed → bake into closure ----
+        def dispatch(**kw):
+            fn = _state[0]
+            if fn is None:
+                import torch
                 lib = torch.mps.compile_shader(source)
-                _cache[0] = lib
-
-        # ---- extract positional args (bool → int) ----
-        n = kw[size_key]
-        extracted = []
-        for k in args:
-            v = kw.get(k, _defaults.get(k, _MISSING))
-            if v is _MISSING:
-                raise KeyError(
-                    f"Metal kernel '{kernel_name}': missing required arg '{k}'"
-                )
-            if isinstance(v, bool):
-                v = int(v)
-            extracted.append(v)
-
-        getattr(lib, kernel_name)(*extracted, threads=n, group_size=group_size)
+                _ns["_dummy"] = _metal_dummy_buf(torch.device("mps"))
+                _ns["_lib"] = lib
+                code = f"def _fast(_kw):\n{_fn_body}\n{_call_line}"
+                exec(code, _ns)  # noqa: S102 – generated code is fully controlled
+                fn = _ns["_fast"]
+                _state[0] = fn
+            fn(kw)
 
     return dispatch
