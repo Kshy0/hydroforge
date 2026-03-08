@@ -6,8 +6,8 @@ Generic framework for GPU-accelerated hydrological modelling.
 
 | Package | Contents |
 |---|---|
-| `hydroforge.core` | `AbstractModule`, `AbstractModel`, `InputProxy`, distributed utilities, model utilities |
-| `hydroforge.datasets` | `AbstractDataset`, `MixedDataset`, `StaticParameterDataset`, `DailyBinDataset`, `NetCDFDataset`, `ERA5LandAccumDataset`, `ExportedDataset` |
+| `hydroforge.modeling` | `AbstractModule`, `AbstractModel`, `InputProxy`, distributed utilities, model utilities |
+| `hydroforge.io.datasets` | `AbstractDataset`, `MixedDataset`, `StaticParameterDataset`, `DailyBinDataset`, `NetCDFDataset`, `ERA5LandAccumDataset`, `ExportedDataset` |
 | `hydroforge.aggregator` | `StatisticsAggregator`, streaming NetCDF output, kernel codegen |
 | `hydroforge.runtime` | Kernel backend selection (`cuda` / `metal` / `triton` / `torch`) |
 
@@ -52,12 +52,12 @@ export HYDROFORGE_BACKEND=torch    # pure-PyTorch fallback
 
 ```python
 # Core abstractions
-from hydroforge.core.module import AbstractModule, TensorField, computed_tensor_field
-from hydroforge.core.model import AbstractModel
-from hydroforge.core.input_proxy import InputProxy
+from hydroforge.modeling.module import AbstractModule, TensorField, computed_tensor_field
+from hydroforge.modeling.model import AbstractModel
+from hydroforge.modeling.input_proxy import InputProxy
 
 # Dataset utilities
-from hydroforge.datasets import (
+from hydroforge.io.datasets import (
     AbstractDataset,
     DailyBinDataset,
     NetCDFDataset,

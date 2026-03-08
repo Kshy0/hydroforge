@@ -124,7 +124,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         description="Whether to save generated Triton kernels",
     )
     max_pending_steps: int = Field(
-        default=20,
+        default=200,
         description="Maximum number of pending time steps for output buffering",
     )
     output_start_time: Optional[Union[datetime, cftime.datetime]] = Field(
