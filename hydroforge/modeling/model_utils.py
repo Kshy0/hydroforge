@@ -95,6 +95,10 @@ class ProgressTracker:
     def tick(self) -> None:
         """Record one completed step."""
         now = _time.perf_counter()
+        if self.current_step >= self.total_steps > 0:
+            # Overflow: more ticks than total_steps (e.g. Jupyter cell re-run).
+            self.start(self.total_steps)
+            now = _time.perf_counter()
         if self.current_step > 0:
             self._recent_dts.append(now - self._last_tick)
             if len(self._recent_dts) > self._window_size:
@@ -131,9 +135,9 @@ class ProgressTracker:
     def format_progress(self) -> str:
         """Return a short progress string like ``[25.3% 92/364] 2.8 steps/s ETA 1.6min``."""
         spd = self.recent_speed
-        remaining = self.total_steps - self.current_step
+        remaining = max(0, self.total_steps - self.current_step)
         eta = remaining / spd if spd > 0 else float('inf')
-        pct = self.current_step / max(self.total_steps, 1) * 100
+        pct = min(self.current_step / max(self.total_steps, 1) * 100, 100.0)
         return (
             f"[{pct:5.1f}% {self.current_step}/{self.total_steps}] "
             f"{spd:.2f} steps/s ETA {self._fmt_duration(eta)}"
