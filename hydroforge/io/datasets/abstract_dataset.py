@@ -793,7 +793,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         out_dir: str,
         npz_file: str = "grid_mapping.npz",
         mapinfo_txt: str = "location.txt",
-        hires_map_tag: str = "1min",
+        hires_tag: str = "1min",
         lowres_idx_precision: str = "<i4",
         hires_idx_precision: str = "<i2",
         map_precision: str = "<f4",
@@ -810,7 +810,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         """
         
         map_dir = Path(map_dir)
-        hires_map_dir = map_dir / hires_map_tag
         mapdim_path = map_dir / "mapdim.txt"
         
         with open(mapdim_path, "r") as f:
@@ -828,41 +827,62 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         catchment_x, catchment_y = np.where(nextxy_data[:, :, 0] != -9999)
         catchment_id = np.ravel_multi_index((catchment_x, catchment_y), (nx, ny))
 
-        # Load location info
-        with open(hires_map_dir/ mapinfo_txt, "r") as f:
-            lines = f.readlines()
-        data = lines[2].split()
-        Nx, Ny = int(data[6]), int(data[7])
-        West, East = float(data[2]), float(data[3])
-        South, North = float(data[4]), float(data[5])
-        Csize = float(data[8])
-
-        hires_lon = np.linspace(West + 0.5 * Csize, East - 0.5 * Csize, Nx)
-        hires_lat = np.linspace(North - 0.5 * Csize, South + 0.5 * Csize, Ny)
-        lon2D, lat2D = np.meshgrid(hires_lon, hires_lat)
-        hires_lon_2D = lon2D.T
-        hires_lat_2D = lat2D.T
-
-        # Load high-resolution maps
-        HighResGridArea = read_map(
-            hires_map_dir / f"{hires_map_tag}.grdare.bin", (Nx, Ny), precision=map_precision
-        ) * 1E6
-        HighResCatchmentId = read_map(
-            hires_map_dir / f"{hires_map_tag}.catmxy.bin", (Nx, Ny, 2), precision=hires_idx_precision
-        )
-
-        valid_mask = HighResCatchmentId[:, :, 0] > 0
-        x_idx, y_idx = np.where(valid_mask)
-        HighResCatchmentId -= 1  # convert from 1-based to 0-based
-        valid_x = HighResCatchmentId[x_idx, y_idx, 0]
-        valid_y = HighResCatchmentId[x_idx, y_idx, 1]
-        valid_areas = HighResGridArea[x_idx, y_idx]
-        catchment_id_hires = np.ravel_multi_index((valid_x, valid_y), (nx, ny))
-
         # Get source grid coordinates from dataset class
         ro_lon, ro_lat = self.get_coordinates()
-        valid_lon = hires_lon_2D[x_idx, y_idx]
-        valid_lat = hires_lat_2D[x_idx, y_idx]
+
+        if hires_tag is None:
+            # Use CaMa grid itself as uniform "hires" grid
+            # Assume global coverage: -180..180 lon, -90..90 lat
+            Csize = 360.0 / nx
+            West, East = -180.0, 180.0
+            South, North = -90.0, 90.0
+            hires_lon = np.linspace(West + 0.5 * Csize, East - 0.5 * Csize, nx)
+            hires_lat = np.linspace(North - 0.5 * Csize, South + 0.5 * Csize, ny)
+            lon2D, lat2D = np.meshgrid(hires_lon, hires_lat)
+            hires_lon_2D = lon2D.T
+            hires_lat_2D = lat2D.T
+
+            # Each valid CaMa cell maps to itself as catchment
+            valid_mask = nextxy_data[:, :, 0] != -9999
+            x_idx, y_idx = np.where(valid_mask)
+            catchment_id_hires = np.ravel_multi_index((x_idx, y_idx), (nx, ny))
+            valid_areas = np.ones(len(x_idx), dtype=np.float32)
+            valid_lon = hires_lon_2D[x_idx, y_idx]
+            valid_lat = hires_lat_2D[x_idx, y_idx]
+        else:
+            hires_map_dir = map_dir / hires_tag
+            # Load location info
+            with open(hires_map_dir/ mapinfo_txt, "r") as f:
+                lines = f.readlines()
+            data = lines[2].split()
+            Nx, Ny = int(data[6]), int(data[7])
+            West, East = float(data[2]), float(data[3])
+            South, North = float(data[4]), float(data[5])
+            Csize = float(data[8])
+
+            hires_lon = np.linspace(West + 0.5 * Csize, East - 0.5 * Csize, Nx)
+            hires_lat = np.linspace(North - 0.5 * Csize, South + 0.5 * Csize, Ny)
+            lon2D, lat2D = np.meshgrid(hires_lon, hires_lat)
+            hires_lon_2D = lon2D.T
+            hires_lat_2D = lat2D.T
+
+            # Load high-resolution maps
+            HighResGridArea = read_map(
+                hires_map_dir / f"{hires_tag}.grdare.bin", (Nx, Ny), precision=map_precision
+            ) * 1E6
+            HighResCatchmentId = read_map(
+                hires_map_dir / f"{hires_tag}.catmxy.bin", (Nx, Ny, 2), precision=hires_idx_precision
+            )
+
+            valid_mask = HighResCatchmentId[:, :, 0] > 0
+            x_idx, y_idx = np.where(valid_mask)
+            HighResCatchmentId -= 1  # convert from 1-based to 0-based
+            valid_x = HighResCatchmentId[x_idx, y_idx, 0]
+            valid_y = HighResCatchmentId[x_idx, y_idx, 1]
+            valid_areas = HighResGridArea[x_idx, y_idx]
+            catchment_id_hires = np.ravel_multi_index((valid_x, valid_y), (nx, ny))
+            valid_lon = hires_lon_2D[x_idx, y_idx]
+            valid_lat = hires_lat_2D[x_idx, y_idx]
 
         # Compute catchment and source grid IDs
         catchment_idx = find_indices_in(catchment_id_hires, catchment_id)
@@ -1421,7 +1441,7 @@ class StaticParameterDataset:
         out_dir: str,
         npz_file: str = "grid_mapping.npz",
         mapinfo_txt: str = "location.txt",
-        hires_map_tag: str = "1min",
+        hires_tag: str = "1min",
         lowres_idx_precision: str = "<i4",
         hires_idx_precision: str = "<i2",
         map_precision: str = "<f4",
@@ -1432,7 +1452,6 @@ class StaticParameterDataset:
         Copied and adapted from AbstractDataset.
         """
         map_dir = Path(map_dir)
-        hires_map_dir = map_dir / hires_map_tag
         mapdim_path = map_dir / "mapdim.txt"
         
         with open(mapdim_path, "r") as f:
@@ -1450,38 +1469,56 @@ class StaticParameterDataset:
         catchment_x, catchment_y = np.where(nextxy_data[:, :, 0] != -9999)
         catchment_id = np.ravel_multi_index((catchment_x, catchment_y), (nx, ny))
 
-        # Load location info
-        with open(hires_map_dir/ mapinfo_txt, "r") as f:
-            lines = f.readlines()
-        data = lines[2].split()
-        Nx, Ny = int(data[6]), int(data[7])
-        West, East = float(data[2]), float(data[3])
-        South, North = float(data[4]), float(data[5])
-        Csize = float(data[8])
-
-        hires_lon = np.linspace(West + 0.5 * Csize, East - 0.5 * Csize, Nx)
-        hires_lat = np.linspace(North - 0.5 * Csize, South + 0.5 * Csize, Ny)
-
-        # Load high-resolution maps
-        HighResGridArea = read_map(
-            hires_map_dir / f"{hires_map_tag}.grdare.bin", (Nx, Ny), precision=map_precision
-        ) * 1E6
-        HighResCatchmentId = read_map(
-            hires_map_dir / f"{hires_map_tag}.catmxy.bin", (Nx, Ny, 2), precision=hires_idx_precision
-        )
-
-        valid_mask = HighResCatchmentId[:, :, 0] > 0
-        x_idx, y_idx = np.where(valid_mask)
-        HighResCatchmentId -= 1  # convert from 1-based to 0-based
-        valid_x = HighResCatchmentId[x_idx, y_idx, 0]
-        valid_y = HighResCatchmentId[x_idx, y_idx, 1]
-        valid_areas = HighResGridArea[x_idx, y_idx]
-        catchment_id_hires = np.ravel_multi_index((valid_x, valid_y), (nx, ny))
-
         # Get source grid coordinates
         ro_lon, ro_lat = self.get_coordinates()
-        valid_lon = hires_lon[x_idx]
-        valid_lat = hires_lat[y_idx]
+
+        if hires_tag is None:
+            # Use CaMa grid itself as uniform "hires" grid
+            # Assume global coverage: -180..180 lon, -90..90 lat
+            Csize = 360.0 / nx
+            West, East = -180.0, 180.0
+            South, North = -90.0, 90.0
+            hires_lon = np.linspace(West + 0.5 * Csize, East - 0.5 * Csize, nx)
+            hires_lat = np.linspace(North - 0.5 * Csize, South + 0.5 * Csize, ny)
+
+            # Each valid CaMa cell maps to itself as catchment
+            valid_mask = nextxy_data[:, :, 0] != -9999
+            x_idx, y_idx = np.where(valid_mask)
+            catchment_id_hires = np.ravel_multi_index((x_idx, y_idx), (nx, ny))
+            valid_areas = np.ones(len(x_idx), dtype=np.float32)
+            valid_lon = hires_lon[x_idx]
+            valid_lat = hires_lat[y_idx]
+        else:
+            hires_map_dir = map_dir / hires_tag
+            # Load location info
+            with open(hires_map_dir/ mapinfo_txt, "r") as f:
+                lines = f.readlines()
+            data = lines[2].split()
+            Nx, Ny = int(data[6]), int(data[7])
+            West, East = float(data[2]), float(data[3])
+            South, North = float(data[4]), float(data[5])
+            Csize = float(data[8])
+
+            hires_lon = np.linspace(West + 0.5 * Csize, East - 0.5 * Csize, Nx)
+            hires_lat = np.linspace(North - 0.5 * Csize, South + 0.5 * Csize, Ny)
+
+            # Load high-resolution maps
+            HighResGridArea = read_map(
+                hires_map_dir / f"{hires_tag}.grdare.bin", (Nx, Ny), precision=map_precision
+            ) * 1E6
+            HighResCatchmentId = read_map(
+                hires_map_dir / f"{hires_tag}.catmxy.bin", (Nx, Ny, 2), precision=hires_idx_precision
+            )
+
+            valid_mask = HighResCatchmentId[:, :, 0] > 0
+            x_idx, y_idx = np.where(valid_mask)
+            HighResCatchmentId -= 1  # convert from 1-based to 0-based
+            valid_x = HighResCatchmentId[x_idx, y_idx, 0]
+            valid_y = HighResCatchmentId[x_idx, y_idx, 1]
+            valid_areas = HighResGridArea[x_idx, y_idx]
+            catchment_id_hires = np.ravel_multi_index((valid_x, valid_y), (nx, ny))
+            valid_lon = hires_lon[x_idx]
+            valid_lat = hires_lat[y_idx]
 
         # Compute catchment and source grid IDs
         catchment_idx = find_indices_in(catchment_id_hires, catchment_id)

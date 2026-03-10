@@ -106,12 +106,19 @@ def find_indices_in(a, b):
 
 def find_indices_in_torch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Return indices in *b* for each element of *a* (Torch version)."""
+    if len(b) > torch.iinfo(torch.int32).max:
+        raise OverflowError(
+            f"b has {len(b)} elements, exceeding int32 range. "
+            "find_indices_in_torch returns int32 indices."
+        )
     sorted_b, order = torch.sort(b)
     pos = torch.bucketize(a, sorted_b, right=False)
-    valid_mask = pos < len(sorted_b)
-    hit_mask = torch.zeros_like(a, dtype=torch.bool)
-    hit_mask[valid_mask] = (sorted_b[pos[valid_mask]] == a[valid_mask])
-    index = torch.full_like(pos, -1, dtype=torch.int32)
+    # bucketize on MPS/some GPU backends may return len(sorted_b) for values
+    # that equal the last element; clamp to keep indexing safe — the equality
+    # check below still rejects true misses.
+    pos = pos.clamp(max=len(sorted_b) - 1)
+    hit_mask = sorted_b[pos] == a
+    index = torch.full_like(a, -1, dtype=torch.int32)
     index[hit_mask] = order[pos[hit_mask]].to(torch.int32)
     return index
 
