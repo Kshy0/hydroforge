@@ -302,7 +302,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self,
         batch_data: torch.Tensor,
         local_mapping: torch.Tensor,
-        world_size: int,
     ) -> torch.Tensor:
         """
         Map grid data to catchments and handle distributed sync.
@@ -322,9 +321,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             flat = batch_data.reshape(B * T * K, N)
         else:
             raise ValueError(f"batch_data must be 3D or 4D, got shape {tuple(batch_data.shape)}")
-
-        if world_size > 1:
-            dist.broadcast(flat, src=0)
 
         out = (flat @ local_mapping).contiguous()
         
@@ -1199,16 +1195,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             idx += len(self)
         
         compressed = self._local_indices is not None
-        
-        # Non-rank-0: return zeros to keep shapes consistent across ranks
-        if not is_rank_zero():
-            if compressed:
-                return np.empty((self.chunk_len, self.data_size), dtype=self.out_dtype)
-            else:
-                ny, nx = self.grid_shape
-                return np.empty((self.chunk_len, ny, nx), dtype=self.out_dtype)
 
-        # Rank-0: fetch data
         data = self.read_chunk(idx)
         
         if compressed:
