@@ -158,12 +158,6 @@ class StatisticsMixin:
 
         # Validate and setup each variable
         for var_name, ops in self._variable_ops.items():
-            # Note: argmax/argmin cannot be user-specified operations.
-            # They are automatically created as auxiliary storage when max/min is requested.
-            # The argmax/argmin values are stored as integer indices (macro_step_index),
-            # which are converted to NC time values (days since epoch) when written to the
-            # output files. This creates a time-series-like output where each extreme value
-            # record also has its corresponding occurrence time.
             import re
 
             # Sort ops to ensure consistent processing order
@@ -287,6 +281,20 @@ class StatisticsMixin:
                 if arg_match:
                     arg_k_str = arg_match.group(2)
                     arg_k_val = int(arg_k_str) if arg_k_str else 1
+                
+                # Reject standalone topK / argTopK ops — they must be compound
+                # e.g. "max3" alone is invalid; use "max3_last", "max3_max", etc.
+                is_standalone = len(op_parts) == 1
+                if is_standalone and k_val > 1:
+                    raise ValueError(
+                        f"Standalone top-k op '{op}' is not allowed. "
+                        f"Use a compound form like '{op}_last' or '{op}_max' instead."
+                    )
+                if is_standalone and arg_match and arg_k_val > 1:
+                    raise ValueError(
+                        f"Standalone argTopK op '{op}' is not allowed. "
+                        f"Use a compound form like '{op}_mean' or '{op}_last' instead."
+                    )
                 
                 # Allocate storage by op
                 if k_val > 1:

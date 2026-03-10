@@ -478,9 +478,11 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                      raise ValueError(f"Invalid op '{op}'. Component '{p}' not in allowed ops: {sorted(allowed_ops)}, top-k pattern, or arg-top-k pattern.")
 
             # Single operation (no underscore) - this is the inner aggregation
-            # arg operations are NOT allowed as inner operations
+            # topK and arg operations are NOT allowed standalone
             if len(op_parts) == 1:
                 single_op = op_parts[0]
+                if topk_pattern.match(single_op):
+                    raise ValueError(f"Invalid op '{op}': standalone top-k ops are not allowed. Use a compound form like '{op}_last' or '{op}_max' instead.")
                 if argtopk_pattern.match(single_op) or single_op in ('argmax', 'argmin'):
                     raise ValueError(f"Invalid op '{op}': arg operations (argmax, argmin, argmax3, etc.) cannot be used alone. They are only valid as outer operations in compound form like 'argmax_mean'.")
 
