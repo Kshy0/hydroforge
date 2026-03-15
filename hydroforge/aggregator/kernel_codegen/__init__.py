@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 from hydroforge.aggregator.kernel_codegen.common import CommonCodegenMixin
 from hydroforge.aggregator.kernel_codegen.cuda import CudaCodegenMixin
+from hydroforge.aggregator.kernel_codegen.hip import HipCodegenMixin
 from hydroforge.aggregator.kernel_codegen.metal import MetalCodegenMixin
 from hydroforge.aggregator.kernel_codegen.pytorch import PyTorchCodegenMixin
 from hydroforge.aggregator.kernel_codegen.triton import TritonCodegenMixin
@@ -21,6 +22,7 @@ from hydroforge.aggregator.kernel_codegen.triton import TritonCodegenMixin
 
 class KernelCodegenMixin(
     MetalCodegenMixin,
+    HipCodegenMixin,
     CudaCodegenMixin,
     PyTorchCodegenMixin,
     TritonCodegenMixin,
@@ -51,6 +53,10 @@ class KernelCodegenMixin(
 
         if KERNEL_BACKEND == "cuda":
             self._generate_cuda_aggregator_function()
+            return
+
+        if KERNEL_BACKEND == "hip":
+            self._generate_hip_aggregator_function()
             return
 
         if KERNEL_BACKEND == "metal":

@@ -50,6 +50,8 @@ def _resolve_backend() -> str:
     try:
         import torch
         if torch.cuda.is_available():
+            if getattr(torch.version, "hip", None) is not None:
+                return "hip"
             return "cuda"
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return "metal"
