@@ -35,13 +35,13 @@ class KernelCodegenMixin(
         """
         Generate and compile the aggregation kernel function.
         
-        Dispatches to Triton, CUDA, Metal, or PyTorch code generation
+        Dispatches to CUDA C++, Metal, PyTorch, or Triton code generation
         based on HYDROFORGE_BACKEND.
 
-        For the ``cuda`` backend, Triton codegen is preferred when Triton
-        is available because ``load_inline`` nvcc compilation is very slow
-        (~27 s cold start).  Triton JIT is orders of magnitude faster and
-        the resulting kernels are fully CUDA-graph-compatible.
+        For the ``cuda`` backend, CUDA C++ codegen is always used.  The
+        compiled shared library is cached via ``build_directory`` so that
+        subsequent runs (or ``compile_only`` pre-compilation) avoid the
+        ~27 s cold-start nvcc penalty.
         """
         from hydroforge.runtime.backend import KERNEL_BACKEND
 
@@ -50,20 +50,8 @@ class KernelCodegenMixin(
             return
 
         if KERNEL_BACKEND == "cuda":
-            # Prefer Triton codegen for statistics (fast JIT, CUDA-graph
-            # compatible) over CUDA C++ codegen (slow nvcc compilation).
-            try:
-                import triton  # noqa: F401
-                _use_triton = True
-            except ImportError:
-                _use_triton = False
-
-            if _use_triton:
-                # Fall through to the Triton path below
-                pass
-            else:
-                self._generate_cuda_aggregator_function()
-                return
+            self._generate_cuda_aggregator_function()
+            return
 
         if KERNEL_BACKEND == "metal":
             self._generate_metal_aggregator_function()

@@ -683,13 +683,25 @@ class CudaCodegenMixin:
 
         # Compile
         unique = hashlib.md5((cuda_src + cpp_src).encode()).hexdigest()[:8]
-        module_name = f"hydroforge_aggr_cuda_r{self.rank}_{unique}"
+        module_name = f"hydroforge_aggr_cuda_{unique}"
+
+        build_dir = None
+        if self.output_dir is not None:
+            from pathlib import Path
+            build_dir = str(Path(self.output_dir) / "cuda_build")
+            Path(build_dir).mkdir(parents=True, exist_ok=True)
+
+        # Validate precompiled cache before (potentially slow) compilation
+        if build_dir is not None:
+            from hydroforge.runtime.cuda_kernel import check_build_manifest
+            check_build_manifest(build_dir, "aggregator", module_name)
 
         compiled_mod = load_inline(
             name=module_name,
             cpp_sources=[cpp_src],
             cuda_sources=[cuda_src],
             extra_cuda_cflags=['-O3', '--use_fast_math'],
+            build_directory=build_dir,
             verbose=bool(
                 __import__('os').environ.get("HYDROFORGE_CUDA_VERBOSE", "") == "1"
             ),
@@ -747,6 +759,14 @@ class CudaCodegenMixin:
             compiled_mod, group_metas, grouped_by_save_idx, tensor_info, self
         )
         self._aggregator_generated = True
+
+        # Record in manifest for future validation
+        if build_dir is not None:
+            from hydroforge.runtime.cuda_kernel import update_build_manifest
+            update_build_manifest(build_dir, "aggregator", {
+                "module_name": module_name,
+                "source_hash": unique,
+            })
 
         # Save for debugging
         if self.save_kernels:

@@ -44,9 +44,57 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+import json as _json
+
 import torch
 
 _module_cache: Dict[str, Any] = {}
+
+_MANIFEST_FILENAME = "compile_manifest.json"
+
+
+def load_build_manifest(build_dir: Union[str, Path]) -> dict:
+    """Load the compile manifest from a build directory."""
+    p = Path(build_dir) / _MANIFEST_FILENAME
+    if p.exists():
+        with open(p) as f:
+            return _json.load(f)
+    return {}
+
+
+def update_build_manifest(
+    build_dir: Union[str, Path], section: str, data: dict
+) -> None:
+    """Update one section of the compile manifest and write it back."""
+    manifest = load_build_manifest(build_dir)
+    manifest[section] = data
+    p = Path(build_dir) / _MANIFEST_FILENAME
+    with open(p, "w") as f:
+        _json.dump(manifest, f, indent=2)
+
+
+def check_build_manifest(
+    build_dir: Union[str, Path], section: str, expected_name: str
+) -> None:
+    """Warn if a precompiled kernel in *build_dir* doesn't match current config.
+
+    Called before compilation so the user knows the precompiled cache won't
+    be reused and a slow recompilation is about to happen.
+    """
+    manifest = load_build_manifest(build_dir)
+    entry = manifest.get(section)
+    if entry is None:
+        return  # No prior manifest entry → first compilation, nothing to check
+    cached_name = entry.get("module_name", "")
+    if cached_name != expected_name:
+        import warnings
+        warnings.warn(
+            f"Precompiled {section} kernel mismatch in {build_dir}:\n"
+            f"  precompiled: {cached_name}\n"
+            f"  current:     {expected_name}\n"
+            f"Re-run precompile to update the cache.",
+            stacklevel=3,
+        )
 
 
 def load_cu_module(
@@ -55,14 +103,17 @@ def load_cu_module(
     *,
     extra_cuda_cflags: Sequence[str] = ("-O3", "--use_fast_math"),
     verbose: bool = False,
+    build_directory: Optional[Union[str, Path]] = None,
 ) -> Any:
     """Compile ``.cu`` files into a pybind11 extension module (cached).
 
     Args:
         name: Unique module name for caching.
-        cuda_files: Paths to ``.cu`` source files.
+        cuda_files: Paths to ``.cu`` / ``.cpp`` source files.
         extra_cuda_cflags: Extra NVCC flags.
         verbose: Print compilation output.
+        build_directory: If given, compiled artefacts (``.so``, ``.o``) are
+            stored in this directory so they can be reused across runs.
 
     Returns:
         The compiled extension module.
@@ -70,25 +121,23 @@ def load_cu_module(
     if name in _module_cache:
         return _module_cache[name]
 
-    from torch.utils.cpp_extension import load_inline
+    from torch.utils.cpp_extension import load
 
-    cuda_sources = []
-    cpp_sources = []
-    for f in cuda_files:
-        src = Path(f).read_text(encoding="utf-8")
-        fname = Path(f).name
-        if fname.endswith(".cu"):
-            cuda_sources.append(src)
-        else:
-            cpp_sources.append(src)
+    sources = [str(Path(f).resolve()) for f in cuda_files]
+    _verbose = verbose or os.environ.get("HYDROFORGE_CUDA_VERBOSE", "") == "1"
 
-    mod = load_inline(
+    kw: Dict[str, Any] = dict(
         name=name,
-        cpp_sources=cpp_sources if cpp_sources else [''],
-        cuda_sources=cuda_sources,
+        sources=sources,
         extra_cuda_cflags=list(extra_cuda_cflags),
-        verbose=verbose or os.environ.get("HYDROFORGE_CUDA_VERBOSE", "") == "1",
+        verbose=_verbose,
     )
+    if build_directory is not None:
+        bd = Path(build_directory)
+        bd.mkdir(parents=True, exist_ok=True)
+        kw["build_directory"] = str(bd)
+
+    mod = load(**kw)
     _module_cache[name] = mod
     return mod
 
