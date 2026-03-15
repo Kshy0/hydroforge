@@ -9,13 +9,12 @@ Kernel backend selection and adapter for hydroforge.
 
 Set ``HYDROFORGE_BACKEND`` to choose the backend explicitly::
 
-    export HYDROFORGE_BACKEND=cuda     # CUDA C++ kernels (NVIDIA)
     export HYDROFORGE_BACKEND=metal    # Metal shaders (Apple Silicon)
     export HYDROFORGE_BACKEND=triton   # Triton JIT kernels (NVIDIA/AMD)
     export HYDROFORGE_BACKEND=torch    # Pure-PyTorch fallback
 
 When unset, auto-detection picks the best available backend:
-``cuda`` → ``metal`` → ``triton`` → ``torch``.
+``triton`` → ``metal`` → ``torch``.
 
 When 'torch' is selected, :class:`KernelAdapter` wraps each PyTorch kernel
 so it can be called with the unified hydroforge kwargs convention:
@@ -36,8 +35,7 @@ def _resolve_backend() -> str:
     """Resolve kernel backend from HYDROFORGE_BACKEND environment variable.
 
     When the variable is unset, auto-detect in priority order:
-    ``triton`` → ``cuda`` → ``metal`` → ``torch``.
-    The CUDA backend is still experimental.
+    ``triton`` → ``metal`` → ``torch``.
     """
     env = os.environ.get("HYDROFORGE_BACKEND", "").strip().lower()
     if env:
@@ -49,10 +47,6 @@ def _resolve_backend() -> str:
         pass
     try:
         import torch
-        if torch.cuda.is_available():
-            if getattr(torch.version, "hip", None) is not None:
-                return "hip"
-            return "cuda"
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return "metal"
     except ImportError:

@@ -12,7 +12,7 @@ Subpackages
 modeling    Lowest-level abstractions: AbstractModule, AbstractModel, distributed utils.
 io          AbstractDataset + concrete dataset implementations, multi-rank I/O.
 aggregator  Streaming statistics aggregation with NetCDF / in-memory output.
-runtime     GPU kernel backend selection and adapters (Triton / CUDA / Metal / PyTorch).
+runtime     GPU kernel backend selection and adapters (Triton / Metal / PyTorch).
 """
 
 from hydroforge.modeling.distributed import (find_indices_in,

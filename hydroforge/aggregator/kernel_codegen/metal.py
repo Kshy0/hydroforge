@@ -601,7 +601,7 @@ class MetalCodegenMixin:
 
         Generates raw MSL ``kernel`` functions, compiles them via
         ``torch.mps.compile_shader()``, and wraps in a Python function with
-        the same interface as the Triton/PyTorch/CUDA backends.
+        the same interface as the Triton/PyTorch backends.
         """
 
         import torch

@@ -13,8 +13,6 @@ if TYPE_CHECKING:
     from hydroforge.aggregator.aggregator import StatisticsAggregator
 
 from hydroforge.aggregator.kernel_codegen.common import CommonCodegenMixin
-from hydroforge.aggregator.kernel_codegen.cuda import CudaCodegenMixin
-from hydroforge.aggregator.kernel_codegen.hip import HipCodegenMixin
 from hydroforge.aggregator.kernel_codegen.metal import MetalCodegenMixin
 from hydroforge.aggregator.kernel_codegen.pytorch import PyTorchCodegenMixin
 from hydroforge.aggregator.kernel_codegen.triton import TritonCodegenMixin
@@ -22,28 +20,21 @@ from hydroforge.aggregator.kernel_codegen.triton import TritonCodegenMixin
 
 class KernelCodegenMixin(
     MetalCodegenMixin,
-    HipCodegenMixin,
-    CudaCodegenMixin,
     PyTorchCodegenMixin,
     TritonCodegenMixin,
     CommonCodegenMixin,
 ):
     """Mixin providing multi-backend kernel code generation and compilation.
 
-    Backends: Triton, PyTorch (torch.compile), CUDA C++, Metal MSL.
+    Backends: Triton, PyTorch (torch.compile), Metal MSL.
     """
 
     def _generate_aggregator_function(self: StatisticsAggregator) -> None:
         """
         Generate and compile the aggregation kernel function.
         
-        Dispatches to CUDA C++, Metal, PyTorch, or Triton code generation
+        Dispatches to Metal, PyTorch, or Triton code generation
         based on HYDROFORGE_BACKEND.
-
-        For the ``cuda`` backend, CUDA C++ codegen is always used.  The
-        compiled shared library is cached via ``build_directory`` so that
-        subsequent runs (or ``compile_only`` pre-compilation) avoid the
-        ~27 s cold-start nvcc penalty.
         """
         from hydroforge.runtime.backend import KERNEL_BACKEND
 
@@ -51,19 +42,11 @@ class KernelCodegenMixin(
             self._generate_pytorch_aggregator_function()
             return
 
-        if KERNEL_BACKEND == "cuda":
-            self._generate_cuda_aggregator_function()
-            return
-
-        if KERNEL_BACKEND == "hip":
-            self._generate_hip_aggregator_function()
-            return
-
         if KERNEL_BACKEND == "metal":
             self._generate_metal_aggregator_function()
             return
 
-        # ── Triton path (default for 'triton' backend, also used by 'cuda') ──
+        # ── Triton path (default for 'triton' backend) ──
         if not self._variables:
             raise ValueError("No variables initialized for statistics aggregation")
 
