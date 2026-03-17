@@ -848,37 +848,145 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         else:
             hires_map_dir = map_dir / hires_tag
             # Load location info
-            with open(hires_map_dir/ mapinfo_txt, "r") as f:
-                lines = f.readlines()
-            data = lines[2].split()
-            Nx, Ny = int(data[6]), int(data[7])
-            West, East = float(data[2]), float(data[3])
-            South, North = float(data[4]), float(data[5])
-            Csize = float(data[8])
+            with open(hires_map_dir / mapinfo_txt, "r") as f:
+                loc_lines = f.readlines()
+            narea = int(loc_lines[0].split()[0])
 
-            hires_lon = np.linspace(West + 0.5 * Csize, East - 0.5 * Csize, Nx)
-            hires_lat = np.linspace(North - 0.5 * Csize, South + 0.5 * Csize, Ny)
-            lon2D, lat2D = np.meshgrid(hires_lon, hires_lat)
-            hires_lon_2D = lon2D.T
-            hires_lat_2D = lat2D.T
+            if narea == 1:
+                # --- Single-area hires map ---
+                data = loc_lines[2].split()
+                Nx, Ny = int(data[6]), int(data[7])
+                West, East = float(data[2]), float(data[3])
+                South, North = float(data[4]), float(data[5])
+                Csize = float(data[8])
 
-            # Load high-resolution maps
-            HighResGridArea = read_map(
-                hires_map_dir / f"{hires_tag}.grdare.bin", (Nx, Ny), precision=map_precision
-            ) * 1E6
-            HighResCatchmentId = read_map(
-                hires_map_dir / f"{hires_tag}.catmxy.bin", (Nx, Ny, 2), precision=hires_idx_precision
-            )
+                hires_lon = np.linspace(West + 0.5 * Csize, East - 0.5 * Csize, Nx)
+                hires_lat = np.linspace(North - 0.5 * Csize, South + 0.5 * Csize, Ny)
+                lon2D, lat2D = np.meshgrid(hires_lon, hires_lat)
+                hires_lon_2D = lon2D.T
+                hires_lat_2D = lat2D.T
 
-            valid_mask = HighResCatchmentId[:, :, 0] > 0
-            x_idx, y_idx = np.where(valid_mask)
-            HighResCatchmentId -= 1  # convert from 1-based to 0-based
-            valid_x = HighResCatchmentId[x_idx, y_idx, 0]
-            valid_y = HighResCatchmentId[x_idx, y_idx, 1]
-            valid_areas = HighResGridArea[x_idx, y_idx]
-            catchment_id_hires = np.ravel_multi_index((valid_x, valid_y), (nx, ny))
-            valid_lon = hires_lon_2D[x_idx, y_idx]
-            valid_lat = hires_lat_2D[x_idx, y_idx]
+                # Load high-resolution maps
+                tile_name = data[1]
+                HighResGridArea = read_map(
+                    hires_map_dir / f"{tile_name}.grdare.bin", (Nx, Ny), precision=map_precision
+                ) * 1E6
+                HighResCatchmentId = read_map(
+                    hires_map_dir / f"{tile_name}.catmxy.bin", (Nx, Ny, 2), precision=hires_idx_precision
+                )
+
+                valid_mask = HighResCatchmentId[:, :, 0] > 0
+                x_idx, y_idx = np.where(valid_mask)
+                HighResCatchmentId -= 1  # convert from 1-based to 0-based
+                valid_x = HighResCatchmentId[x_idx, y_idx, 0]
+                valid_y = HighResCatchmentId[x_idx, y_idx, 1]
+                valid_areas = HighResGridArea[x_idx, y_idx]
+                catchment_id_hires = np.ravel_multi_index((valid_x, valid_y), (nx, ny))
+                valid_lon = hires_lon_2D[x_idx, y_idx]
+                valid_lat = hires_lat_2D[x_idx, y_idx]
+            else:
+                # --- Multi-tile hires map (catmxy stores global indices) ---
+                # Read regional map parameters for global-to-regional offset
+                params_path = map_dir / "params.txt"
+                with open(params_path, "r") as f:
+                    plines = f.readlines()
+                gsize = float(plines[3].split()[0])
+                reg_west = float(plines[4].split()[0])
+                reg_north = float(plines[7].split()[0])
+
+                # Global offset: regional map is a subset of global grid starting at (-180, 90)
+                dXX = int(round((reg_west - (-180.0)) / gsize))
+                dYY = int(round((90.0 - reg_north) / gsize))
+
+                Csize = float(loc_lines[2].split()[8])  # same for all tiles
+
+                all_catchment_id_hires = []
+                all_valid_areas = []
+                all_valid_lon = []
+                all_valid_lat = []
+
+                for i in range(narea):
+                    data = loc_lines[2 + i].split()
+                    tile_name = data[1]
+                    tw, te = float(data[2]), float(data[3])
+                    ts, tn = float(data[4]), float(data[5])
+                    tnx, tny = int(data[6]), int(data[7])
+
+                    # Read regional extent from params.txt
+                    reg_east = float(plines[5].split()[0])
+                    reg_south = float(plines[6].split()[0])
+
+                    # Skip tiles with no overlap with regional domain
+                    if te <= reg_west or tw >= reg_east or tn <= reg_south or ts >= reg_north:
+                        continue
+
+                    # Compute sub-region pixel range within this tile
+                    ix_start = max(0, int(round((reg_west - tw) / Csize)))
+                    ix_end = min(tnx, int(round((reg_east - tw) / Csize)))
+                    iy_start = max(0, int(round((tn - reg_north) / Csize)))
+                    iy_end = min(tny, int(round((tn - reg_south) / Csize)))
+
+                    if ix_end <= ix_start or iy_end <= iy_start:
+                        continue
+
+                    # Read tile data
+                    tile_grdare = read_map(
+                        hires_map_dir / f"{tile_name}.grdare.bin",
+                        (tnx, tny), precision=map_precision
+                    ) * 1E6
+                    tile_catmxy = read_map(
+                        hires_map_dir / f"{tile_name}.catmxy.bin",
+                        (tnx, tny, 2), precision=hires_idx_precision
+                    )
+
+                    # Extract sub-region
+                    sub_catmxy = tile_catmxy[ix_start:ix_end, iy_start:iy_end, :]
+                    sub_grdare = tile_grdare[ix_start:ix_end, iy_start:iy_end]
+
+                    # Build coordinates for sub-region pixels
+                    sub_lon = np.linspace(
+                        tw + (ix_start + 0.5) * Csize,
+                        tw + (ix_end - 0.5) * Csize,
+                        ix_end - ix_start,
+                    )
+                    sub_lat = np.linspace(
+                        tn - (iy_start + 0.5) * Csize,
+                        tn - (iy_end - 0.5) * Csize,
+                        iy_end - iy_start,
+                    )
+                    lon2d, lat2d = np.meshgrid(sub_lon, sub_lat)
+                    sub_lon_2D = lon2d.T
+                    sub_lat_2D = lat2d.T
+
+                    # Find valid cells and convert global indices to regional
+                    valid_mask = sub_catmxy[:, :, 0] > 0
+                    xi, yi = np.where(valid_mask)
+                    if len(xi) == 0:
+                        continue
+
+                    # 1-based global -> 0-based regional
+                    vx = sub_catmxy[xi, yi, 0].astype(np.int32) - 1 - dXX
+                    vy = sub_catmxy[xi, yi, 1].astype(np.int32) - 1 - dYY
+
+                    # Keep only cells within regional bounds
+                    in_region = (vx >= 0) & (vx < nx) & (vy >= 0) & (vy < ny)
+                    xi_r, yi_r = xi[in_region], yi[in_region]
+                    vx_r, vy_r = vx[in_region], vy[in_region]
+
+                    if len(xi_r) == 0:
+                        continue
+
+                    all_catchment_id_hires.append(
+                        np.ravel_multi_index((vx_r, vy_r), (nx, ny))
+                    )
+                    all_valid_areas.append(sub_grdare[xi_r, yi_r])
+                    all_valid_lon.append(sub_lon_2D[xi_r, yi_r])
+                    all_valid_lat.append(sub_lat_2D[xi_r, yi_r])
+
+                catchment_id_hires = np.concatenate(all_catchment_id_hires)
+                valid_areas = np.concatenate(all_valid_areas)
+                valid_lon = np.concatenate(all_valid_lon)
+                valid_lat = np.concatenate(all_valid_lat)
 
         # Compute catchment and source grid IDs
         catchment_idx = find_indices_in(catchment_id_hires, catchment_id)
