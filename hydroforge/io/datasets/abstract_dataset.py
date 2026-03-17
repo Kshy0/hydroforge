@@ -78,8 +78,27 @@ def compute_grid_id(grid_lon, grid_lat, hires_lon, hires_lat):
     nxin = len(grid_lon)
     nyin = len(grid_lat)
     ixin[ixin == nxin] = 0
-    assert np.all((ixin >= 0) & (ixin < nxin)), "Some hires_lon points fall outside the source grid (longitude)"
-    assert np.all((iyin >= 0) & (iyin < nyin)), "Some hires_lat points fall outside the source grid (latitude)"
+
+    lon_oob = (ixin < 0) | (ixin >= nxin)
+    lat_oob = (iyin < 0) | (iyin >= nyin)
+    if np.any(lon_oob):
+        bad = hires_lon[lon_oob]
+        raise AssertionError(
+            f"Some hires_lon points fall outside the source grid (longitude).\n"
+            f"  Source grid lon range : [{float(grid_lon.min()):.4f}, {float(grid_lon.max()):.4f}] "
+            f"(cell edges [{float(grid_lon.min()) - 0.5*gsize_lon:.4f}, {float(grid_lon.max()) + 0.5*gsize_lon:.4f}])\n"
+            f"  Out-of-bound hires_lon: min={float(bad.min()):.4f}, max={float(bad.max()):.4f} "
+            f"({int(lon_oob.sum())} / {len(hires_lon)} points)"
+        )
+    if np.any(lat_oob):
+        bad = hires_lat[lat_oob]
+        raise AssertionError(
+            f"Some hires_lat points fall outside the source grid (latitude).\n"
+            f"  Source grid lat range : [{float(grid_lat.min()):.4f}, {float(grid_lat.max()):.4f}] "
+            f"(cell edges [{float(grid_lat.min()) - 0.5*gsize_lat:.4f}, {float(grid_lat.max()) + 0.5*gsize_lat:.4f}])\n"
+            f"  Out-of-bound hires_lat: min={float(bad.min()):.4f}, max={float(bad.max()):.4f} "
+            f"({int(lat_oob.sum())} / {len(hires_lat)} points)"
+        )
 
     grid_id = iyin * nxin + ixin
 
