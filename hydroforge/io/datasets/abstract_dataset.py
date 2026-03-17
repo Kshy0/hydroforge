@@ -22,9 +22,13 @@ from hydroforge.modeling.distributed import (binread, find_indices_in,
                                              is_rank_zero, read_map)
 
 
-def compute_grid_id(grid_lon, grid_lat, hires_lon, hires_lat):
+def compute_grid_id(grid_lon, grid_lat, hires_lon, hires_lat, allow_oob_zero: bool = False):
     """
     Calculates source grid IDs considering ascending or descending order of coordinates.
+
+    Args:
+        allow_oob_zero: If True, out-of-bound points return -1 instead of raising
+            an error, so their contribution is treated as zero.
 
     Notes on longitude handling:
     - grid_lon is assumed to be strictly monotonic (usually ascending) and may be in
@@ -81,24 +85,38 @@ def compute_grid_id(grid_lon, grid_lat, hires_lon, hires_lat):
 
     lon_oob = (ixin < 0) | (ixin >= nxin)
     lat_oob = (iyin < 0) | (iyin >= nyin)
-    if np.any(lon_oob):
-        bad = hires_lon[lon_oob]
-        raise AssertionError(
-            f"Some hires_lon points fall outside the source grid (longitude).\n"
-            f"  Source grid lon range : [{float(grid_lon.min()):.4f}, {float(grid_lon.max()):.4f}] "
-            f"(cell edges [{float(grid_lon.min()) - 0.5*gsize_lon:.4f}, {float(grid_lon.max()) + 0.5*gsize_lon:.4f}])\n"
-            f"  Out-of-bound hires_lon: min={float(bad.min()):.4f}, max={float(bad.max()):.4f} "
-            f"({int(lon_oob.sum())} / {len(hires_lon)} points)"
-        )
-    if np.any(lat_oob):
-        bad = hires_lat[lat_oob]
-        raise AssertionError(
-            f"Some hires_lat points fall outside the source grid (latitude).\n"
-            f"  Source grid lat range : [{float(grid_lat.min()):.4f}, {float(grid_lat.max()):.4f}] "
-            f"(cell edges [{float(grid_lat.min()) - 0.5*gsize_lat:.4f}, {float(grid_lat.max()) + 0.5*gsize_lat:.4f}])\n"
-            f"  Out-of-bound hires_lat: min={float(bad.min()):.4f}, max={float(bad.max()):.4f} "
-            f"({int(lat_oob.sum())} / {len(hires_lat)} points)"
-        )
+    oob = lon_oob | lat_oob
+
+    if np.any(oob):
+        if allow_oob_zero:
+            n_oob = int(oob.sum())
+            print(
+                f"Warning: {n_oob}/{len(hires_lon)} hires points fall outside the "
+                f"source grid and will be treated as zero runoff."
+            )
+            grid_id = np.where(oob, -1, iyin * nxin + ixin)
+            return grid_id
+        # Strict mode: raise with details
+        if np.any(lon_oob):
+            bad = hires_lon[lon_oob]
+            raise AssertionError(
+                f"Some hires_lon points fall outside the source grid (longitude).\n"
+                f"  Source grid lon range : [{float(grid_lon.min()):.4f}, {float(grid_lon.max()):.4f}] "
+                f"(cell edges [{float(grid_lon.min()) - 0.5*gsize_lon:.4f}, {float(grid_lon.max()) + 0.5*gsize_lon:.4f}])\n"
+                f"  Out-of-bound hires_lon: min={float(bad.min()):.4f}, max={float(bad.max()):.4f} "
+                f"({int(lon_oob.sum())} / {len(hires_lon)} points)\n"
+                f"  Hint: set allow_oob_zero=True to treat out-of-bound points as zero runoff."
+            )
+        if np.any(lat_oob):
+            bad = hires_lat[lat_oob]
+            raise AssertionError(
+                f"Some hires_lat points fall outside the source grid (latitude).\n"
+                f"  Source grid lat range : [{float(grid_lat.min()):.4f}, {float(grid_lat.max()):.4f}] "
+                f"(cell edges [{float(grid_lat.min()) - 0.5*gsize_lat:.4f}, {float(grid_lat.max()) + 0.5*gsize_lat:.4f}])\n"
+                f"  Out-of-bound hires_lat: min={float(bad.min()):.4f}, max={float(bad.max()):.4f} "
+                f"({int(lat_oob.sum())} / {len(hires_lat)} points)\n"
+                f"  Hint: set allow_oob_zero=True to treat out-of-bound points as zero runoff."
+            )
 
     grid_id = iyin * nxin + ixin
 
@@ -813,6 +831,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         hires_idx_precision: str = "<i2",
         map_precision: str = "<f4",
         parameter_nc: str | Path | None = None,
+        allow_oob_zero: bool = False,
     ):
         """
         Generate grid mapping table and save as npz file.
@@ -841,6 +860,23 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         )
         catchment_x, catchment_y = np.where(nextxy_data[:, :, 0] != -9999)
         catchment_id = np.ravel_multi_index((catchment_x, catchment_y), (nx, ny))
+
+        # Early read of parameter_nc to get desired catchment IDs for region filtering
+        desired_ids = None
+        if parameter_nc is not None:
+            try:
+                path_nc = Path(parameter_nc)
+                with nc.Dataset(path_nc, "r") as ds:
+                    if "catchment_id" in ds.variables:
+                        desired_ids = np.asarray(ds.variables["catchment_id"][...]).astype(np.int64)
+                    else:
+                        raise KeyError("'catchment_id' not found in parameter_nc")
+                print(f"Read {len(desired_ids)} catchment IDs from parameter_nc")
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to read parameter_nc: {parameter_nc}. "
+                    "Ensure it contains 'catchment_id' variable."
+                ) from e
 
         # Get source grid coordinates from dataset class
         ro_lon, ro_lat = self.get_coordinates()
@@ -1007,6 +1043,22 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 valid_lon = np.concatenate(all_valid_lon)
                 valid_lat = np.concatenate(all_valid_lat)
 
+        # If parameter_nc provided, filter hires data to only the desired catchments' region
+        roi_lon_range = roi_lat_range = None
+        if desired_ids is not None:
+            region_mask = np.isin(catchment_id_hires, desired_ids)
+            n_before = len(catchment_id_hires)
+            catchment_id_hires = catchment_id_hires[region_mask]
+            valid_areas = valid_areas[region_mask]
+            valid_lon = valid_lon[region_mask]
+            valid_lat = valid_lat[region_mask]
+            print(f"Region filter: kept {len(catchment_id_hires)}/{n_before} hires pixels "
+                  f"for {len(desired_ids)} desired catchments")
+            # Save ROI extent for unmapped source grid check later
+            if len(valid_lon) > 0:
+                roi_lon_range = (float(valid_lon.min()), float(valid_lon.max()))
+                roi_lat_range = (float(valid_lat.min()), float(valid_lat.max()))
+
         # Compute catchment and source grid IDs
         catchment_idx = find_indices_in(catchment_id_hires, catchment_id)
         if np.any(catchment_idx == -1):
@@ -1014,53 +1066,42 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 f"Warning: Some high-resolution catchments ({np.sum(catchment_idx == -1)}) were not found in the low-resolution map. "
                 "Please check your mapping files or input data."
             )
-        source_idx = compute_grid_id(ro_lon, ro_lat, valid_lon, valid_lat)
+        source_idx = compute_grid_id(ro_lon, ro_lat, valid_lon, valid_lat,
+                                      allow_oob_zero=allow_oob_zero)
 
         # Full grid - no masking needed
         full_grid_size = len(ro_lat) * len(ro_lon)
 
-        # Filter valid mappings (only check catchment validity)
-        valid_mask = catchment_idx != -1
+        # Filter valid mappings (catchment validity and source grid validity)
+        valid_mask = (catchment_idx != -1) & (source_idx != -1)
         row_idx = catchment_idx[valid_mask]
         col_idx = source_idx[valid_mask]
         data_values = valid_areas[valid_mask]
 
         # Optionally align/subset catchments to parameter_nc order/region
         save_catchment_ids = catchment_id.astype(np.int64)
-        if parameter_nc is not None:
-            try:
-                path_nc = Path(parameter_nc)
-                with nc.Dataset(path_nc, "r") as ds:
-                    if "catchment_id" in ds.variables:
-                        desired_ids = np.asarray(ds.variables["catchment_id"][...]).astype(np.int64)
-                    else:
-                        raise KeyError("'catchment_id' not found in parameter_nc")
-                # Map desired ids to current full catchment_id list
-                desired_to_full = find_indices_in(desired_ids, catchment_id)
-                keep_mask_nc = desired_to_full >= 0
-                if not np.all(keep_mask_nc):
-                    n_miss = int((~keep_mask_nc).sum())
-                    print(
-                        f"Warning: {n_miss} IDs from parameter_nc are not present in current map; they will be skipped."
-                    )
-                # Build remap: full-index -> aligned-row
-                base_to_aligned = -np.ones(len(catchment_id), dtype=np.int64)
-                valid_full_idx = desired_to_full[keep_mask_nc]
-                base_to_aligned[valid_full_idx] = np.arange(valid_full_idx.size, dtype=np.int64)
-                # Remap existing row indices to aligned rows and drop negatives
-                aligned_row_idx = base_to_aligned[row_idx]
-                keep_rows = aligned_row_idx >= 0
-                row_idx = aligned_row_idx[keep_rows]
-                col_idx = col_idx[keep_rows]
-                data_values = data_values[keep_rows]
-                # Update outputs
-                save_catchment_ids = desired_ids[keep_mask_nc]
-                matrix_shape = (save_catchment_ids.size, full_grid_size)
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to read or process parameter_nc: {path_nc}. "
-                    "Ensure it contains 'catchment_id' variable."
-                ) from e
+        if desired_ids is not None:
+            # Map desired ids to current full catchment_id list
+            desired_to_full = find_indices_in(desired_ids, catchment_id)
+            keep_mask_nc = desired_to_full >= 0
+            if not np.all(keep_mask_nc):
+                n_miss = int((~keep_mask_nc).sum())
+                print(
+                    f"Warning: {n_miss} IDs from parameter_nc are not present in current map; they will be skipped."
+                )
+            # Build remap: full-index -> aligned-row
+            base_to_aligned = -np.ones(len(catchment_id), dtype=np.int64)
+            valid_full_idx = desired_to_full[keep_mask_nc]
+            base_to_aligned[valid_full_idx] = np.arange(valid_full_idx.size, dtype=np.int64)
+            # Remap existing row indices to aligned rows and drop negatives
+            aligned_row_idx = base_to_aligned[row_idx]
+            keep_rows = aligned_row_idx >= 0
+            row_idx = aligned_row_idx[keep_rows]
+            col_idx = col_idx[keep_rows]
+            data_values = data_values[keep_rows]
+            # Update outputs
+            save_catchment_ids = desired_ids[keep_mask_nc]
+            matrix_shape = (save_catchment_ids.size, full_grid_size)
         else:
             matrix_shape = (len(catchment_id), full_grid_size)
 
@@ -1083,7 +1124,46 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         
         # Eliminate zeros and compress
         sparse_matrix.eliminate_zeros()
-        
+
+        # Check for unmapped source grid cells within the region
+        if desired_ids is not None and roi_lon_range is not None:
+            nxin = len(ro_lon)
+            gsize_lon = abs(float(ro_lon[1] - ro_lon[0])) if len(ro_lon) > 1 else 1.0
+            gsize_lat = abs(float(ro_lat[1] - ro_lat[0])) if len(ro_lat) > 1 else 1.0
+
+            roi_lon_min, roi_lon_max = roi_lon_range
+            roi_lat_min, roi_lat_max = roi_lat_range
+
+            lon_in_roi = np.where(
+                (ro_lon >= roi_lon_min - gsize_lon) &
+                (ro_lon <= roi_lon_max + gsize_lon)
+            )[0]
+            lat_in_roi = np.where(
+                (ro_lat >= roi_lat_min - gsize_lat) &
+                (ro_lat <= roi_lat_max + gsize_lat)
+            )[0]
+
+            # All source grid cells within the ROI bounding box
+            roi_cols = set(np.add.outer(lat_in_roi * nxin, lon_in_roi).ravel().tolist())
+            # Source grid cells actually mapped
+            mapped_cols = set(col_idx.tolist())
+            unmapped_in_roi = roi_cols - mapped_cols
+
+            if len(unmapped_in_roi) > 0:
+                print(
+                    f"Info: {len(unmapped_in_roi)}/{len(roi_cols)} source grid cells "
+                    f"within the region bounding box "
+                    f"([{roi_lon_min:.2f}, {roi_lon_max:.2f}] lon, "
+                    f"[{roi_lat_min:.2f}, {roi_lat_max:.2f}] lat) "
+                    f"are not mapped to any catchment "
+                    f"(may include ocean/boundary cells)."
+                )
+            else:
+                print(
+                    "All source grid cells within the region bounding box "
+                    "are mapped to catchments."
+                )
+
         # Prepare mapping data for saving with compressed sparse matrix
         # Include coordinate metadata for validation during loading
         mapping_data = {
@@ -1560,6 +1640,7 @@ class StaticParameterDataset:
         hires_idx_precision: str = "<i2",
         map_precision: str = "<f4",
         parameter_nc: Union[str, Path, None] = None,
+        allow_oob_zero: bool = False,
     ):
         """
         Generate grid mapping table and save as npz file.
@@ -1640,7 +1721,8 @@ class StaticParameterDataset:
             print(
                 f"Warning: Some high-resolution catchments ({np.sum(catchment_idx == -1)}) were not found in the low-resolution map."
             )
-        source_idx = compute_grid_id(ro_lon, ro_lat, valid_lon, valid_lat)
+        source_idx = compute_grid_id(ro_lon, ro_lat, valid_lon, valid_lat,
+                                      allow_oob_zero=allow_oob_zero)
 
         # Handle mask if available
         col_mask = self.data_mask
@@ -1651,7 +1733,10 @@ class StaticParameterDataset:
 
         col_mapping = -np.ones_like(col_mask, dtype=np.int64)
         col_mapping[np.flatnonzero(col_mask)] = np.arange(col_mask.sum())
-        mapped_source_idx = col_mapping[source_idx]
+        # OOB points (source_idx == -1) must not index into col_mapping
+        safe_source_idx = np.where(source_idx >= 0, source_idx, 0)
+        mapped_source_idx = col_mapping[safe_source_idx]
+        mapped_source_idx[source_idx < 0] = -1
 
         # Filter valid mappings
         valid_mask = (catchment_idx != -1) & (mapped_source_idx != -1)
