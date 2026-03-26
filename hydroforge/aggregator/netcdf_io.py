@@ -283,6 +283,23 @@ class NetCDFIOMixin:
         Args:
             dt: Time step to finalize (datetime or cftime.datetime)
         """
+        # Error if compound ops are configured but outer flags have never been set
+        if (self._has_compound_ops
+                and not self._outer_flags_ever_seen):
+            compound_ops = [
+                f"{meta['original_variable']}.{meta['op']}"
+                for name, meta in self._metadata.items()
+                if self._output_is_outer.get(name, False)
+            ]
+            raise RuntimeError(
+                f"Compound statistics {compound_ops} are configured but "
+                f"stat_is_outer_first / stat_is_outer_last flags have never "
+                f"been set to True. These outputs will never be written. "
+                f"Set stat_is_outer_first=True at the start of each outer "
+                f"window (e.g. Jan 1) and stat_is_outer_last=True at the "
+                f"end (e.g. Dec 31) in step_advance()."
+            )
+
         # Record this time step for argmax/argmin index-to-time conversion
         # This is called at the end of each outer loop iteration
         self._macro_step_times.append(dt)

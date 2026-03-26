@@ -152,6 +152,7 @@ class StatisticsMixin:
         self._aggregator_generated = False
         self._kernel_states = None
         self._current_macro_step_count = 0.0
+        self._outer_flags_ever_seen = False
 
         # Clean up old temporary files
         self._cleanup_temp_files()
@@ -400,6 +401,7 @@ class StatisticsMixin:
                 # Classify as outer if it is a compound op (e.g. max_mean)
                 self._output_is_outer[out_name] = len(op_parts) > 1
 
+        self._has_compound_ops = any(self._output_is_outer.values())
 
         # Generate kernels and prepare states for all requested variables/ops
         self._generate_aggregator_function()
@@ -424,6 +426,7 @@ class StatisticsMixin:
         if is_outer_first:
             self._macro_step_index = 0
             self._current_macro_step_count = 0.0
+            self._outer_flags_ever_seen = True
             
         if is_inner_last:
              for out_name, is_outer in self._output_is_outer.items():
