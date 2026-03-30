@@ -56,11 +56,25 @@ class DailyBinDataset(AbstractDataset):
                 t += self.time_interval
 
     def _validate_files_exist(self):
-        """Validate that all required files exist."""
+        """Validate that all required files exist and match expected size."""
         unique_files = set()
         for key, _ in self._dt_to_loc.values():
             unique_files.add(Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}")
         self.validate_files_exist(list(unique_files))
+
+        # Validate file sizes are consistent with shape
+        ny, nx = self.shape
+        frame_bytes = ny * nx * np.dtype(self.bin_dtype).itemsize
+        for fp in unique_files:
+            file_bytes = Path(fp).stat().st_size
+            if file_bytes % frame_bytes != 0:
+                raise ValueError(
+                    f"File size mismatch: {fp} is {file_bytes} bytes, "
+                    f"but shape={self.shape} dtype={self.bin_dtype} expects "
+                    f"multiples of {frame_bytes} bytes "
+                    f"(got {file_bytes / frame_bytes:.4f} frames). "
+                    f"Check the 'shape' parameter."
+                )
 
     def __init__(self,
                  base_dir: str,
