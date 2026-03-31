@@ -88,6 +88,7 @@ class DailyBinDataset(AbstractDataset):
                  out_dtype: str = "float32",
                  calendar: str = "standard",
                  lat_south_to_north: bool = False,  # If True, latitude goes from south to north
+                 lon_0_to_360: bool = False,  # If True, longitude goes from 0 to 360 (e.g. ERA5-Land binary)
                  time_to_key: Optional[Callable[[Union[datetime, cftime.datetime]], str]] = daily_time_to_key,
                  *args, **kwargs):
 
@@ -98,6 +99,7 @@ class DailyBinDataset(AbstractDataset):
         self.prefix = prefix
         self.suffix = suffix
         self.lat_south_to_north = lat_south_to_north
+        self.lon_0_to_360 = lon_0_to_360
         self.time_to_key = time_to_key if time_to_key is not None else single_file_key
         super().__init__(out_dtype=out_dtype, chunk_len=1, time_interval=timedelta(days=1), start_date=start_date, end_date=end_date, calendar=calendar, *args, **kwargs)
         self._build_file_mapping()
@@ -111,6 +113,9 @@ class DailyBinDataset(AbstractDataset):
         
         If lat_south_to_north is True, latitude goes from -90 to 90 (south to north).
         Otherwise, latitude goes from 90 to -90 (north to south, default).
+        
+        If lon_0_to_360 is True, longitude goes from 0 to 360 (e.g. ERA5-Land binary).
+        Otherwise, longitude goes from -180 to 180 (default).
         """
         ny, nx = self.shape
         # Resolution in degrees
@@ -121,7 +126,10 @@ class DailyBinDataset(AbstractDataset):
             lat = np.linspace(-90 + res_lat / 2, 90 - res_lat / 2, ny)
         else:
             lat = np.linspace(90 - res_lat / 2, -90 + res_lat / 2, ny)
-        lon = np.linspace(-180 + res_lon / 2, 180 - res_lon / 2, nx)
+        if self.lon_0_to_360:
+            lon = np.linspace(res_lon / 2, 360 - res_lon / 2, nx)
+        else:
+            lon = np.linspace(-180 + res_lon / 2, 180 - res_lon / 2, nx)
         return lon, lat
 
     def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
