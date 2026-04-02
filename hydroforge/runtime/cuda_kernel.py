@@ -40,11 +40,10 @@ Example
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
-
-import json as _json
 
 import torch
 
@@ -58,7 +57,7 @@ def load_build_manifest(build_dir: Union[str, Path]) -> dict:
     p = Path(build_dir) / _MANIFEST_FILENAME
     if p.exists():
         with open(p) as f:
-            return _json.load(f)
+            return json.load(f)
     return {}
 
 
@@ -70,7 +69,7 @@ def update_build_manifest(
     manifest[section] = data
     p = Path(build_dir) / _MANIFEST_FILENAME
     with open(p, "w") as f:
-        _json.dump(manifest, f, indent=2)
+        json.dump(manifest, f, indent=2)
 
 
 def check_build_manifest(

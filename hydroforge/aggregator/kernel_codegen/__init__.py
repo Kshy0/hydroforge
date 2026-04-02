@@ -55,6 +55,9 @@ class KernelCodegenMixin(
         # Generate kernel code
         kernel_code_lines = self._generate_kernel_header()
         
+        # Generate scatter pre-step kernels
+        self._generate_scatter_kernels(kernel_code_lines, grouped_by_save_idx)
+
         # Generate kernels for each save_idx group
         for save_idx, var_list in grouped_by_save_idx.items():
             kernel_name = f"kernel_{save_idx}"

@@ -14,6 +14,8 @@ import tempfile
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Set
 
+from hydroforge.aggregator.scatter_expr import parse_scatter_expr
+
 if TYPE_CHECKING:
     from hydroforge.aggregator.aggregator import StatisticsAggregator
 
@@ -90,6 +92,183 @@ class TritonCodegenMixin:
         self._aggregator_generated = True
 
 
+    def _generate_scatter_kernels(
+        self: StatisticsAggregator,
+        kernel_code_lines: List[str],
+        grouped_by_save_idx: Dict[str, List[str]],
+    ) -> None:
+        """Generate Triton kernels for scatter virtual pre-steps.
+
+        For each scatter virtual variable, two kernels are emitted:
+          1. ``scatter_zero_{var}``  – fills the target buffer (and count buffer
+             for scatter_mean) with zeros.
+          2. ``scatter_add_{var}``   – computes the value expression per source
+             element and atomically accumulates into the target buffer.
+        For *scatter_mean* an additional kernel is emitted:
+          3. ``scatter_divide_{var}`` – divides the sum buffer element-wise by the
+             count buffer.
+        """
+        scatter_virtuals: Dict[str, Any] = getattr(self, '_scatter_virtuals', {})
+        if not scatter_virtuals:
+            return
+
+        kernel_code_lines.append(
+            "# ======================================================================"
+        )
+        kernel_code_lines.append(
+            "# Triton scatter pre-step kernels"
+        )
+        kernel_code_lines.append(
+            "# ======================================================================"
+        )
+        kernel_code_lines.append("")
+
+        for var_name, scatter in scatter_virtuals.items():
+            safe_var = self._get_safe_name(var_name)
+            buf_safe = self._get_safe_name(f"__scatter_buf_{var_name}")
+            is_mean = scatter.mode == 'mean'
+
+            # ── 1. Zero kernel ──
+            kernel_code_lines.append("@triton.jit")
+            if is_mean:
+                cnt_safe = self._get_safe_name(f"__scatter_cnt_{var_name}")
+                kernel_code_lines.append(
+                    f"def scatter_zero_{safe_var}("
+                    f"{buf_safe}_ptr, {cnt_safe}_ptr, "
+                    f"N, BLOCK_SIZE: tl.constexpr, num_trials: tl.constexpr):"
+                )
+            else:
+                kernel_code_lines.append(
+                    f"def scatter_zero_{safe_var}("
+                    f"{buf_safe}_ptr, "
+                    f"N, BLOCK_SIZE: tl.constexpr, num_trials: tl.constexpr):"
+                )
+            kernel_code_lines.extend([
+                "    pid = tl.program_id(0)",
+                "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
+                "    mask = offs < N",
+                "    for t in tl.static_range(num_trials):",
+                f"        tl.store({buf_safe}_ptr + t * N + offs, 0.0, mask=mask)",
+            ])
+            if is_mean:
+                kernel_code_lines.append(
+                    f"        tl.store({cnt_safe}_ptr + t * N + offs, 0.0, mask=mask)"
+                )
+            kernel_code_lines.append("")
+
+            # ── 2. Scatter-add kernel ──
+            # Collect value tokens that are real tensors (not sub-virtuals)
+            value_tokens = sorted(scatter.value_tokens)
+            source_ptrs = set()
+            for tok in value_tokens:
+                info = self._field_registry.get(tok)
+                cat = getattr(info, 'json_schema_extra', {}).get('category', 'param') if info else 'param'
+                if cat == 'virtual':
+                    # Recursively resolve to real tensors
+                    expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
+                    sub_toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                    for st in sub_toks:
+                        if st in self._tensor_registry:
+                            source_ptrs.add(st)
+                else:
+                    source_ptrs.add(tok)
+            source_ptrs.add(scatter.index_var)
+            sorted_src = sorted(source_ptrs)
+
+            kernel_code_lines.append("@triton.jit")
+            sig_parts = [f"{buf_safe}_ptr"]
+            if is_mean:
+                sig_parts.append(f"{cnt_safe}_ptr")
+            for tok in sorted_src:
+                sig_parts.append(f"{self._get_safe_name(tok)}_ptr")
+            sig_parts.extend([
+                "M", "N",
+                "BLOCK_SIZE: tl.constexpr",
+                "num_trials: tl.constexpr",
+            ])
+            # Per-token stride constexprs
+            stride_names = {}
+            for tok in sorted_src:
+                sname = f"stride_{self._get_safe_name(tok)}"
+                sig_parts.append(f"{sname}: tl.constexpr")
+                stride_names[tok] = sname
+
+            kernel_code_lines.append(
+                f"def scatter_add_{safe_var}({', '.join(sig_parts)}):"
+            )
+            idx_safe = self._get_safe_name(scatter.index_var)
+            kernel_code_lines.extend([
+                "    pid = tl.program_id(0)",
+                "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
+                "    mask = offs < M",
+                f"    idx = tl.load({idx_safe}_ptr + offs, mask=mask, other=0).to(tl.int64)",
+                "    for t in tl.static_range(num_trials):",
+            ])
+            # Load each value token
+            for tok in value_tokens:
+                safe_tok = self._get_safe_name(tok)
+                info = self._field_registry.get(tok)
+                cat = getattr(info, 'json_schema_extra', {}).get('category', 'param') if info else 'param'
+                if cat == 'virtual':
+                    # Inline expression (non-scatter sub-virtual)
+                    expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
+                    safe_expr = expr
+                    sub_toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                    for st in sub_toks:
+                        if st in self._tensor_registry:
+                            sst = self._get_safe_name(st)
+                            safe_expr = re.sub(
+                                r'\b' + st + r'\b', f"{sst}_val", safe_expr
+                            )
+                            kernel_code_lines.append(
+                                f"        {sst}_val = tl.load({sst}_ptr + t * {stride_names[st]} + offs, mask=mask, other=0.0)"
+                            )
+                    safe_expr = self._transform_pow_expr(safe_expr)
+                    kernel_code_lines.append(f"        {safe_tok}_val = {safe_expr}")
+                else:
+                    sn = stride_names[tok]
+                    kernel_code_lines.append(
+                        f"        {safe_tok}_val = tl.load({safe_tok}_ptr + t * {sn} + offs, mask=mask, other=0.0)"
+                    )
+            # Compute value expression
+            safe_value_expr = scatter.value_expr
+            for tok in sorted(value_tokens, key=len, reverse=True):
+                safe_tok = self._get_safe_name(tok)
+                safe_value_expr = re.sub(
+                    r'\b' + tok + r'\b', f"{safe_tok}_val", safe_value_expr
+                )
+            safe_value_expr = self._transform_pow_expr(safe_value_expr)
+            kernel_code_lines.append(f"        _val = {safe_value_expr}")
+            kernel_code_lines.append(
+                f"        tl.atomic_add({buf_safe}_ptr + t * N + idx, _val, mask=mask)"
+            )
+            if is_mean:
+                kernel_code_lines.append(
+                    f"        tl.atomic_add({cnt_safe}_ptr + t * N + idx, 1.0, mask=mask)"
+                )
+            kernel_code_lines.append("")
+
+            # ── 3. Divide kernel (scatter_mean only) ──
+            if is_mean:
+                kernel_code_lines.append("@triton.jit")
+                kernel_code_lines.append(
+                    f"def scatter_divide_{safe_var}("
+                    f"{buf_safe}_ptr, {cnt_safe}_ptr, "
+                    f"N, BLOCK_SIZE: tl.constexpr, num_trials: tl.constexpr):"
+                )
+                kernel_code_lines.extend([
+                    "    pid = tl.program_id(0)",
+                    "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
+                    "    mask = offs < N",
+                    "    for t in tl.static_range(num_trials):",
+                    f"        _cnt = tl.load({cnt_safe}_ptr + t * N + offs, mask=mask, other=1.0)",
+                    "        _cnt = tl.where(_cnt > 0.0, _cnt, 1.0)",
+                    f"        _val = tl.load({buf_safe}_ptr + t * N + offs, mask=mask, other=0.0)",
+                    f"        tl.store({buf_safe}_ptr + t * N + offs, _val / _cnt, mask=mask)",
+                ])
+                kernel_code_lines.append("")
+        kernel_code_lines.append("")
+
 
     def _emit_variable_load(self: StatisticsAggregator, var_name: str, code_lines: List[str], emitted: Set[str], is_2d: bool = False):
         """Helper to emit load instructions or expression evaluation recursively."""
@@ -105,21 +284,30 @@ class TritonCodegenMixin:
         
         if cat == 'virtual':
              expr = json_extra.get('expr')
-             # Find dependencies
-             tokens = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
-             safe_expr = expr
-             for token in tokens:
-                  # Only recurse if it's a known variable (field or registered tensor)
-                  if token in self._field_registry or token in self._tensor_registry:
-                       self._emit_variable_load(token, code_lines, emitted, is_2d)
-                       # Replace token in expression with safe token
-                       safe_token = self._get_safe_name(token)
-                       safe_expr = re.sub(r'\b' + token + r'\b', safe_token, safe_expr)
-             
-             safe_expr = self._transform_pow_expr(safe_expr)
-             
-             indent = "        " if is_2d else "    "
-             code_lines.append(f"{indent}{safe_var_name} = {safe_expr}")
+             # Check if this is a scatter virtual — load from materialized buffer
+             scatter = parse_scatter_expr(expr) if expr else None
+             if scatter:
+                 # Scatter virtuals are pre-materialized; load like a real tensor
+                 buf_safe = self._get_safe_name(f"__scatter_buf_{var_name}")
+                 indent = "        " if is_2d else "    "
+                 if is_2d:
+                     code_lines.append(f"{indent}{safe_var_name} = tl.load({buf_safe}_ptr + idx * n_levels + level, mask=mask, other=0.0)")
+                 else:
+                     code_lines.append(f"{indent}{safe_var_name} = tl.load({buf_safe}_ptr + idx, mask=mask, other=0.0)")
+             else:
+                 # Plain virtual — inline expression evaluation
+                 tokens = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                 safe_expr = expr
+                 for token in tokens:
+                      if token in self._field_registry or token in self._tensor_registry:
+                           self._emit_variable_load(token, code_lines, emitted, is_2d)
+                           safe_token = self._get_safe_name(token)
+                           safe_expr = re.sub(r'\b' + token + r'\b', safe_token, safe_expr)
+                 
+                 safe_expr = self._transform_pow_expr(safe_expr)
+                 
+                 indent = "        " if is_2d else "    "
+                 code_lines.append(f"{indent}{safe_var_name} = {safe_expr}")
         else:
              # Real tensor load
              indent = "        " if is_2d else "    "
@@ -219,15 +407,23 @@ class TritonCodegenMixin:
             
             if cat == 'virtual':
                 expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
-                safe_expr = expr
-                toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
-                for t in toks:
-                    if t in self._field_registry or t in self._tensor_registry:
-                        emit_val(t, to_lines)
-                        safe_t = self._get_safe_name(t)
-                        safe_expr = re.sub(r'\b' + t + r'\b', f"{safe_t}_val", safe_expr)
-                safe_expr = self._transform_pow_expr(safe_expr)
-                to_lines.append(f"{indent}{safe_v_name}_val = {safe_expr}")
+                scatter = parse_scatter_expr(expr) if expr else None
+                if scatter:
+                    # Scatter virtual — load from pre-materialized buffer
+                    buf_safe = self._get_safe_name(f"__scatter_buf_{v_name}")
+                    in_ptr_loc = f"{buf_safe}_ptr + t * stride_input + idx"
+                    to_lines.append(f"{indent}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
+                else:
+                    # Plain virtual — inline expression
+                    safe_expr = expr
+                    toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                    for t in toks:
+                        if t in self._field_registry or t in self._tensor_registry:
+                            emit_val(t, to_lines)
+                            safe_t = self._get_safe_name(t)
+                            safe_expr = re.sub(r'\b' + t + r'\b', f"{safe_t}_val", safe_expr)
+                    safe_expr = self._transform_pow_expr(safe_expr)
+                    to_lines.append(f"{indent}{safe_v_name}_val = {safe_expr}")
             else:
                 in_ptr_loc = f"{safe_v_name}_ptr + t * stride_input + idx"
                 to_lines.append(f"{indent}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
@@ -619,12 +815,11 @@ class TritonCodegenMixin:
                             # Reuse the val loaded by deferred load (no duplicate load needed)
                             ops_is_inner_last.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                         else:
-                            # Load inline
-                            in_ptr_loc = f"{safe_var}_ptr + t * stride_input + idx"
-                            ops_is_inner_last.extend([
-                                f"{safe_var}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)",
-                                f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
-                            ])
+                            # Load inline — use emit_val for scatter virtual support
+                            _tmp = []
+                            emit_val(var, _tmp)
+                            ops_is_inner_last.extend(line.lstrip() for line in _tmp)
+                            ops_is_inner_last.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                     else:
                         ops_is_inner_last.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                         
@@ -638,21 +833,21 @@ class TritonCodegenMixin:
                             # Val will be loaded elsewhere (from unconditional or conditional load)
                             ops_is_inner_first.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                         else:
-                            in_ptr_loc = f"{safe_var}_ptr + t * stride_input + idx"
-                            ops_is_inner_first.extend([
-                                f"{safe_var}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)",
-                                f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
-                            ])
+                            # Load inline — use emit_val for scatter virtual support
+                            _tmp = []
+                            emit_val(var, _tmp)
+                            ops_is_inner_first.extend(line.lstrip() for line in _tmp)
+                            ops_is_inner_first.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                     else:
                         ops_is_inner_first.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                         
                 elif op == 'mid':
                     if var in vars_conditional_only:
-                        in_ptr_loc = f"{safe_var}_ptr + t * stride_input + idx"
-                        ops_is_middle.extend([
-                            f"{safe_var}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)",
-                            f"tl.store({out_ptr}, {safe_var}_val, mask=mask)",
-                        ])
+                        # Load inline — use emit_val for scatter virtual support
+                        _tmp = []
+                        emit_val(var, _tmp)
+                        ops_is_middle.extend(line.lstrip() for line in _tmp)
+                        ops_is_middle.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                     else:
                         ops_is_middle.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                 
@@ -995,10 +1190,15 @@ class TritonCodegenMixin:
              info = self._field_registry.get(name)
              if getattr(info, 'json_schema_extra', {}).get('category') == 'virtual':
                   expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
-                  toks = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
-                  for t in toks:
-                       if t in self._field_registry or t in self._tensor_registry:
-                            _gather_inputs(t)
+                  scatter = parse_scatter_expr(expr) if expr else None
+                  if scatter:
+                       # Scatter virtual: kernel reads from materialized buffer, not source tensors
+                       input_ptrs.add(f"__scatter_buf_{name}")
+                  else:
+                       toks = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                       for t in toks:
+                            if t in self._field_registry or t in self._tensor_registry:
+                                 _gather_inputs(t)
              else:
                   input_ptrs.add(name)
         
@@ -1138,16 +1338,22 @@ class TritonCodegenMixin:
                     
                     if cat == 'virtual' and info:
                          expr = getattr(info, 'json_schema_extra', {}).get('expr')
-                         import re
-                         safe_expr = expr
-                         toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
-                         for t in toks:
-                              if t in self._field_registry or t in self._tensor_registry:
-                                   emit_val_2d(t)
-                                   safe_t = self._get_safe_name(t)
-                                   safe_expr = re.sub(r'\b' + t + r'\b', f"{safe_t}_val", safe_expr)
-                         safe_expr = self._transform_pow_expr(safe_expr)
-                         kernel_code_lines.append(f"{indent2}{safe_v_name}_val = {safe_expr}")
+                         scatter = parse_scatter_expr(expr) if expr else None
+                         if scatter:
+                             # Scatter virtual — load from pre-materialized buffer
+                             buf_safe = self._get_safe_name(f"__scatter_buf_{v_name}")
+                             in_ptr_loc = f"{buf_safe}_ptr + (t * stride_input + idx) * n_levels + level"
+                             kernel_code_lines.append(f"{indent2}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
+                         else:
+                             safe_expr = expr
+                             toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                             for t in toks:
+                                  if t in self._field_registry or t in self._tensor_registry:
+                                       emit_val_2d(t)
+                                       safe_t = self._get_safe_name(t)
+                                       safe_expr = re.sub(r'\b' + t + r'\b', f"{safe_t}_val", safe_expr)
+                             safe_expr = self._transform_pow_expr(safe_expr)
+                             kernel_code_lines.append(f"{indent2}{safe_v_name}_val = {safe_expr}")
                     else:
                          in_ptr_loc = f"{safe_v_name}_ptr + (t * stride_input + idx) * n_levels + level"
                          kernel_code_lines.append(f"{indent2}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
@@ -1532,6 +1738,101 @@ class TritonCodegenMixin:
                 f"    # Launch kernel for {save_idx}",
                 f"    save_idx_len = len(states['{save_idx}'])",
                 f"    stride_input = {stride_input}",
+            ])
+
+            # Emit scatter pre-step for scatter virtuals in this group
+            scatter_virtuals_in_group = {}
+            for var in var_list:
+                info = self._field_registry.get(var)
+                if getattr(info, 'json_schema_extra', {}).get('category') == 'virtual':
+                    expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
+                    scatter = parse_scatter_expr(expr) if expr else None
+                    if scatter:
+                        scatter_virtuals_in_group[var] = scatter
+            
+            if scatter_virtuals_in_group:
+                kernel_code_lines.append(f"    # Scatter pre-step: Triton kernels")
+                for var, scatter in scatter_virtuals_in_group.items():
+                    safe_var = self._get_safe_name(var)
+                    buf_key = f"__scatter_buf_{var}"
+                    buf_safe = self._get_safe_name(buf_key)
+                    is_mean = scatter.mode == 'mean'
+
+                    # Determine N (target size) and M (source size)
+                    kernel_code_lines.append(f"    _N_{safe_var} = states['{buf_key}'].shape[-1]")
+                    idx_key = scatter.index_var
+                    kernel_code_lines.append(f"    _M_{safe_var} = len(states['{idx_key}'])")
+
+                    # Launch zero kernel
+                    zero_args = [f"states['{buf_key}']"]
+                    if is_mean:
+                        cnt_key = f"__scatter_cnt_{var}"
+                        zero_args.append(f"states['{cnt_key}']")
+                    zero_args.extend([
+                        f"_N_{safe_var}", "BLOCK_SIZE",
+                        "num_trials",
+                    ])
+                    kernel_code_lines.append(
+                        f"    scatter_zero_{safe_var}["
+                        f"(triton.cdiv(_N_{safe_var}, BLOCK_SIZE),)]"
+                        f"({', '.join(zero_args)})"
+                    )
+
+                    # Launch scatter-add kernel
+                    add_args = [f"states['{buf_key}']"]
+                    if is_mean:
+                        add_args.append(f"states['{cnt_key}']")
+
+                    # Collect source tensor pointers
+                    value_tokens = sorted(scatter.value_tokens)
+                    source_ptrs = set()
+                    for tok in value_tokens:
+                        t_info = self._field_registry.get(tok)
+                        cat = getattr(t_info, 'json_schema_extra', {}).get('category', 'param') if t_info else 'param'
+                        if cat == 'virtual':
+                            sub_expr = getattr(t_info, 'json_schema_extra', {}).get('expr', '')
+                            sub_toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', sub_expr))
+                            for st in sub_toks:
+                                if st in self._tensor_registry:
+                                    source_ptrs.add(st)
+                        else:
+                            source_ptrs.add(tok)
+                    source_ptrs.add(scatter.index_var)
+                    sorted_src = sorted(source_ptrs)
+                    for tok in sorted_src:
+                        add_args.append(f"states['{tok}']")
+                    add_args.extend([
+                        f"_M_{safe_var}", f"_N_{safe_var}",
+                        "BLOCK_SIZE", "num_trials",
+                    ])
+                    # Per-token stride values
+                    for tok in sorted_src:
+                        t_tensor = self._tensor_registry.get(tok)
+                        if t_tensor is not None and self.num_trials > 1 and t_tensor.ndim >= 2:
+                            add_args.append(str(t_tensor.shape[1]))
+                        else:
+                            add_args.append("0")
+                    kernel_code_lines.append(
+                        f"    scatter_add_{safe_var}["
+                        f"(triton.cdiv(_M_{safe_var}, BLOCK_SIZE),)]"
+                        f"({', '.join(add_args)})"
+                    )
+
+                    # Launch divide kernel (scatter_mean)
+                    if is_mean:
+                        div_args = [
+                            f"states['{buf_key}']",
+                            f"states['{cnt_key}']",
+                            f"_N_{safe_var}", "BLOCK_SIZE", "num_trials",
+                        ]
+                        kernel_code_lines.append(
+                            f"    scatter_divide_{safe_var}["
+                            f"(triton.cdiv(_N_{safe_var}, BLOCK_SIZE),)]"
+                            f"({', '.join(div_args)})"
+                        )
+                kernel_code_lines.append("")
+            
+            kernel_code_lines.extend([
                 f"    grid_{save_idx} = lambda meta: (triton.cdiv(save_idx_len, meta['BLOCK_SIZE']),)",
                 f"    {kernel_name}[grid_{save_idx}](",
                 f"        {save_idx}_ptr=states['{save_idx}'],",
@@ -1543,11 +1844,15 @@ class TritonCodegenMixin:
                  info = self._field_registry.get(name)
                  if getattr(info, 'json_schema_extra', {}).get('category') == 'virtual':
                       expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
-                      import re
-                      toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
-                      for t in toks:
-                           if t in self._field_registry or t in self._tensor_registry:
-                                _gather_inputs(t)
+                      scatter = parse_scatter_expr(expr) if expr else None
+                      if scatter:
+                           # Scatter virtual: kernel reads from materialized buffer
+                           input_args.add(f"__scatter_buf_{name}")
+                      else:
+                           toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                           for t in toks:
+                                if t in self._field_registry or t in self._tensor_registry:
+                                     _gather_inputs(t)
                  else:
                       input_args.add(name)
             

@@ -459,7 +459,6 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         # Normalize variables_to_save (op -> vars) into var -> set[ops]
         # Note: argmax/argmin can now be specified explicitly for timing information
         allowed_ops = {"mean", "max", "min", "last", "first", "mid", "sum", "argmax", "argmin"}
-        import re
         topk_pattern = re.compile(r'^(max|min)(\d+)$')
         argtopk_pattern = re.compile(r'^arg(max|min)(\d*)$')  # argmax, argmin, argmax3, argmin3
 
@@ -533,9 +532,40 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         # Handle ad-hoc expressions in var_to_ops
         adhoc_virtuals: Dict[str, Any] = {}
         
+        from hydroforge.aggregator.scatter_expr import parse_scatter_expr
+
+        def get_field_meta(name):
+            mod, attr, _ = self.variable_map[name]
+            info = mod.get_model_fields().get(attr) or mod.get_model_computed_fields().get(attr)
+            if info:
+                extra = info.json_schema_extra or {}
+                return (extra.get("save_idx"), extra.get("save_coord"), extra.get("dim_coords"))
+            return (None, None, None)
+
         current_vars = list(var_to_ops.keys())
         for var_name in current_vars:
             if var_name in self.variable_map:
+                # Check if existing field is a virtual with scatter expr
+                mod, attr, _ = self.variable_map[var_name]
+                info = mod.get_model_fields().get(attr) or mod.get_model_computed_fields().get(attr)
+                if info:
+                    extra = getattr(info, 'json_schema_extra', {}) or {}
+                    if extra.get('category') == 'virtual' and extra.get('expr'):
+                        scatter = parse_scatter_expr(extra['expr'])
+                        if scatter:
+                            # Validate: index_var must exist in variable_map
+                            if scatter.index_var not in self.variable_map:
+                                raise ValueError(
+                                    f"Scatter expression in '{var_name}': index variable "
+                                    f"'{scatter.index_var}' not found in any module."
+                                )
+                            # Validate: all value tokens must exist
+                            for tok in scatter.value_tokens:
+                                if tok not in self.variable_map:
+                                    raise ValueError(
+                                        f"Scatter expression in '{var_name}': value token "
+                                        f"'{tok}' not found in any module."
+                                    )
                 continue
             
             # If provided as tuple, usage is explicit. If string, assume string IS the expression.
@@ -543,7 +573,19 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             
             # Check if it looks like an expression (simple heuristic)
             # and if we can resolve its tokens
-            import re
+            
+            # Try to parse as scatter expression first
+            scatter = parse_scatter_expr(expression)
+            
+            if scatter is not None:
+                raise ValueError(
+                    f"Scatter expression '{expression}' for ad-hoc variable '{var_name}' "
+                    f"cannot be used inline. Scatter virtual fields must be defined in "
+                    f"a module using computed_tensor_field(category='virtual', expr=...) "
+                    f"with explicit save_idx/save_coord pointing to the target dimension."
+                )
+            
+            # ── Plain elementwise expression ──
             tokens = set(re.findall(r'\b[a-zA-Z_]\w*\b', expression))
             
             valid_deps = []
@@ -557,14 +599,6 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
             # Consistency Check
             # Ensure all dependencies share the same save_idx/save_coord/dim_coords
-            def get_field_meta(name):
-                 mod, attr, _ = self.variable_map[name]
-                 info = mod.get_model_fields().get(attr) or mod.get_model_computed_fields().get(attr)
-                 if info:
-                      extra = info.json_schema_extra or {}
-                      return (extra.get("save_idx"), extra.get("save_coord"), extra.get("dim_coords"))
-                 return (None, None, None)
-
             ref_meta = get_field_meta(valid_deps[0])
             # Only enforce save_idx and dim_coords roughly.
             # save_coord might act differently but usually matches too.
@@ -632,12 +666,21 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 cat = field_info.json_schema_extra.get("category", "param")
                 if cat == 'virtual':
                     expr = field_info.json_schema_extra.get("expr", "")
-                    # Simple regex for potential tokens
-                    deps = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
-                    for d in deps:
-                        if d not in vars_seen:
-                            vars_seen.add(d)
-                            vars_to_process.append(d)
+                    # For scatter expressions, extract deps from value_tokens + index_var
+                    scatter = parse_scatter_expr(expr)
+                    if scatter:
+                        scatter_deps = scatter.value_tokens | {scatter.index_var}
+                        for d in scatter_deps:
+                            if d not in vars_seen:
+                                vars_seen.add(d)
+                                vars_to_process.append(d)
+                    else:
+                        # Simple regex for potential tokens
+                        deps = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                        for d in deps:
+                            if d not in vars_seen:
+                                vars_seen.add(d)
+                                vars_to_process.append(d)
 
         # 2. Register all variables (original + dependencies)
         registered_vars = set()
@@ -669,7 +712,12 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             # Check category
             category = field_info.json_schema_extra.get("category", "param")
             allowed_cats = ("state", "shared_state", "init_state", "param", "virtual")
-            if category not in allowed_cats:
+            # Topology tensors are allowed as dependencies (e.g. scatter index)
+            # but not as direct outputs
+            is_dependency_only = var_name not in var_to_ops
+            if category == "topology" and is_dependency_only:
+                pass  # allow topology as dependency
+            elif category not in allowed_cats:
                     # Only warn if it's an explicitly requested output
                     if var_name in var_to_ops:
                         print(f"[rank {self.rank}] Warning: Variable '{var_name}' is category '{category}', skipping output (allowed: {allowed_cats}).")

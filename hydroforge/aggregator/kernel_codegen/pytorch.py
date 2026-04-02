@@ -11,6 +11,8 @@ import re
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List
 
+from hydroforge.aggregator.scatter_expr import parse_scatter_expr
+
 if TYPE_CHECKING:
     from hydroforge.aggregator.aggregator import StatisticsAggregator
 
@@ -61,15 +63,25 @@ class PyTorchCodegenMixin:
 
         if cat == 'virtual':
             expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
-            safe_expr = expr
-            toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
-            for t in toks:
-                if t in self._field_registry or t in self._tensor_registry:
-                    dep_val = self._pytorch_emit_val_load(t, lines, emitted, indent, is_2d)
-                    safe_t = self._get_safe_name(t)
-                    safe_expr = re.sub(r'\b' + t + r'\b', dep_val, safe_expr)
-            safe_expr = self._transform_pow_expr(safe_expr)
-            lines.append(f'{indent}{val_name} = {safe_expr}')
+            scatter = parse_scatter_expr(expr) if expr else None
+            if scatter:
+                # Scatter virtual — load from pre-materialized buffer
+                buf_key = f"__scatter_buf_{var_name}"
+                if is_2d:
+                    lines.append(f'{indent}{val_name} = states["{buf_key}"][(t * stride_input + idx) * n_levels + level]')
+                else:
+                    lines.append(f'{indent}{val_name} = states["{buf_key}"][t * stride_input + idx]')
+            else:
+                # Plain virtual — inline expression
+                safe_expr = expr
+                toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                for t in toks:
+                    if t in self._field_registry or t in self._tensor_registry:
+                        dep_val = self._pytorch_emit_val_load(t, lines, emitted, indent, is_2d)
+                        safe_t = self._get_safe_name(t)
+                        safe_expr = re.sub(r'\b' + t + r'\b', dep_val, safe_expr)
+                safe_expr = self._transform_pow_expr(safe_expr)
+                lines.append(f'{indent}{val_name} = {safe_expr}')
         else:
             if is_2d:
                 lines.append(f'{indent}{val_name} = states["{var_name}"][(t * stride_input + idx) * n_levels + level]')
@@ -582,6 +594,47 @@ class PyTorchCodegenMixin:
                 if meta['original_variable'] == first_var:
                     stride_input = meta.get('stride_input', 0)
                     break
+
+            # Emit scatter pre-step for scatter virtuals in this group
+            scatter_virtuals_in_group = {}
+            for var in var_list:
+                info = self._field_registry.get(var)
+                if getattr(info, 'json_schema_extra', {}).get('category') == 'virtual':
+                    expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
+                    scatter = parse_scatter_expr(expr) if expr else None
+                    if scatter:
+                        scatter_virtuals_in_group[var] = scatter
+
+            if scatter_virtuals_in_group:
+                lines.append(f'    # Scatter pre-step: materialize scatter virtuals')
+                for var, scatter in scatter_virtuals_in_group.items():
+                    buf_key = f"__scatter_buf_{var}"
+                    idx_key = scatter.index_var
+                    lines.append(f'    states["{buf_key}"].zero_()')
+                    value_expr = scatter.value_expr
+                    safe_value_expr = value_expr
+                    toks = scatter.value_tokens
+                    for tok in sorted(toks, key=len, reverse=True):
+                        if tok in self._field_registry or tok in self._tensor_registry:
+                            safe_value_expr = re.sub(r'\b' + tok + r'\b', f'states["{tok}"]', safe_value_expr)
+                    lines.append(f'    _scatter_val = {safe_value_expr}')
+                    lines.append(f'    _scatter_idx = states["{idx_key}"].long()')
+                    if num_trials > 1:
+                        lines.append(f'    _scatter_idx_exp = _scatter_idx.unsqueeze(0).expand_as(_scatter_val)')
+                        lines.append(f'    states["{buf_key}"].scatter_add_(1, _scatter_idx_exp, _scatter_val)')
+                    else:
+                        lines.append(f'    states["{buf_key}"].scatter_add_(0, _scatter_idx, _scatter_val)')
+                    if scatter.mode == 'mean':
+                        lines.append(f'    _scatter_cnt = states["{buf_key}"].new_zeros(states["{buf_key}"].shape)')
+                        lines.append(f'    _scatter_ones = _scatter_val.new_ones(_scatter_val.shape)')
+                        if num_trials > 1:
+                            lines.append(f'    _scatter_cnt.scatter_add_(1, _scatter_idx_exp, _scatter_ones)')
+                        else:
+                            lines.append(f'    _scatter_cnt.scatter_add_(0, _scatter_idx, _scatter_ones)')
+                        lines.append(f'    _scatter_cnt = _scatter_cnt.clamp(min=1.0)')
+                        lines.append(f'    states["{buf_key}"].div_(_scatter_cnt)')
+                lines.append('')
+
             lines.extend([
                 f'    _update_{save_idx}(states, weight, total_weight, num_macro_steps,',
                 f'                      sub_step, num_sub_steps, flags,',

@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Dict, List, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Set
 
 import torch
 
@@ -15,6 +15,8 @@ from hydroforge.modeling.distributed import torch_to_numpy_dtype
 
 if TYPE_CHECKING:
     from hydroforge.aggregator.aggregator import StatisticsAggregator
+
+from hydroforge.aggregator.scatter_expr import parse_scatter_expr
 
 
 class StatisticsMixin:
@@ -25,6 +27,26 @@ class StatisticsMixin:
         required_tensors: Dict[str, torch.Tensor] = {}
 
         def get_dependencies(expr: str) -> Set[str]:
+            # Handle scatter expressions
+            scatter = parse_scatter_expr(expr)
+            if scatter:
+                deps = set()
+                # Add index var
+                if scatter.index_var in self._tensor_registry:
+                    deps.add(scatter.index_var)
+                # Recursively resolve value expression tokens
+                for token in scatter.value_tokens:
+                    if token in self._tensor_registry:
+                        deps.add(token)
+                    elif token in self._field_registry:
+                        f_info = self._field_registry[token]
+                        cat = getattr(f_info, 'json_schema_extra', {}).get('category')
+                        if cat == 'virtual':
+                            sub = getattr(f_info, 'json_schema_extra', {}).get('expr')
+                            if sub:
+                                deps.update(get_dependencies(sub))
+                return deps
+
             tokens = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
             deps = set()
             for token in tokens:
@@ -98,6 +120,22 @@ class StatisticsMixin:
                 if isinstance(dim_name, str):
                     required_dims.add(dim_name)
 
+        # Add scatter buffers and their source/index tensors
+        for var_name, scatter in getattr(self, '_scatter_virtuals', {}).items():
+            buf_key = f"__scatter_buf_{var_name}"
+            if buf_key in self._storage:
+                required_tensors[buf_key] = self._storage[buf_key]
+            if scatter.mode == 'mean':
+                cnt_key = f"__scatter_cnt_{var_name}"
+                if cnt_key in self._storage:
+                    required_tensors[cnt_key] = self._storage[cnt_key]
+            # Ensure all scatter source tensors and index are in required_tensors
+            if scatter.index_var in self._tensor_registry:
+                required_tensors[scatter.index_var] = self._tensor_registry[scatter.index_var]
+            for tok in scatter.value_tokens:
+                if tok in self._tensor_registry:
+                    required_tensors[tok] = self._tensor_registry[tok]
+
         # Add save_idx tensors
         for save_idx in required_save_indices:
             if save_idx in self._tensor_registry:
@@ -153,6 +191,9 @@ class StatisticsMixin:
         self._kernel_states = None
         self._current_macro_step_count = 0.0
         self._outer_flags_ever_seen = False
+        
+        # Scatter virtual metadata: var_name -> ScatterExpr
+        self._scatter_virtuals: Dict[str, Any] = {}
 
         # Clean up old temporary files
         self._cleanup_temp_files()
@@ -260,6 +301,38 @@ class StatisticsMixin:
 
             # Track
             self._variables.add(var_name)
+
+            # Detect scatter virtual and allocate materialized buffer
+            if is_virtual:
+                expr = json_schema_extra.get('expr')
+                scatter = parse_scatter_expr(expr) if expr else None
+                if scatter:
+                    self._scatter_virtuals[var_name] = scatter
+                    # Allocate a scatter buffer in the FULL target dimension
+                    # (not num_saved, but the full grid/cell count).
+                    # The kernel will index into it via save_idx just like any real tensor.
+                    # Determine full target size from index tensor (max + 1) or from
+                    # other real tensors sharing the same save_idx.
+                    idx_tensor = self._tensor_registry.get(scatter.index_var)
+                    if idx_tensor is not None:
+                        full_target_size = int(idx_tensor.max().item()) + 1
+                    else:
+                        # Fallback: use save_idx length (approximate)
+                        full_target_size = len(ref_save_idx)
+                    
+                    scatter_buf_key = f"__scatter_buf_{var_name}"
+                    if self.num_trials > 1:
+                        buf_shape = (self.num_trials, full_target_size)
+                    else:
+                        buf_shape = (full_target_size,)
+                    self._storage[scatter_buf_key] = torch.zeros(
+                        buf_shape, dtype=target_dtype, device=self.device
+                    )
+                    if scatter.mode == 'mean':
+                        scatter_cnt_key = f"__scatter_cnt_{var_name}"
+                        self._storage[scatter_cnt_key] = torch.zeros(
+                            buf_shape, dtype=target_dtype, device=self.device
+                        )
 
             for op in ops:
                 out_name = f"{var_name}_{op}"
@@ -381,6 +454,41 @@ class StatisticsMixin:
                 # For arg ops, use arg_k_val; otherwise use k_val
                 effective_k = arg_k_val if is_arg_op else k_val
 
+                # Determine stride_input and scatter metadata
+                scatter_info = None
+                if is_virtual:
+                    expr = json_schema_extra.get('expr')
+                    scatter = parse_scatter_expr(expr) if expr else None
+                    if scatter:
+                        # For scatter virtuals, the kernel reads from the materialized
+                        # scatter buffer which has target (cell) dimension, not source.
+                        # stride_input must match the scatter buffer's dim-1 size.
+                        buf_key = f"__scatter_buf_{var_name}"
+                        scatter_buf = self._storage.get(buf_key)
+                        if scatter_buf is not None and self.num_trials > 1:
+                            stride_input = scatter_buf.shape[-1]
+                        else:
+                            stride_input = 0
+                        scatter_info = {
+                            'mode': scatter.mode,
+                            'value_expr': scatter.value_expr,
+                            'index_var': scatter.index_var,
+                            'source_size': self._tensor_registry[scatter.index_var].shape[0] if scatter.index_var in self._tensor_registry else 0,
+                        }
+                    else:
+                        stride_input = 0
+                        # For plain virtuals, try to get stride from deps
+                        if expr:
+                            toks = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                            for t in toks:
+                                if t in self._tensor_registry:
+                                    dep = self._tensor_registry[t]
+                                    if self.num_trials > 1 and dep.ndim >= 2:
+                                        stride_input = dep.shape[1]
+                                    break
+                else:
+                    stride_input = tensor.shape[1] if tensor is not None and self.num_trials > 1 else 0
+
                 meta = {
                     'original_variable': var_name,
                     'op': op,
@@ -392,9 +500,10 @@ class StatisticsMixin:
                     'save_coord': save_coord,
                     'nc_coord_name': dim_coords.split('.')[-1] if dim_coords else None,
                     'description': f"{description} ({op})",
-                    'stride_input': tensor.shape[1] if tensor is not None and self.num_trials > 1 else 0,
+                    'stride_input': stride_input,
                     'k': effective_k,
                     'is_time_index': is_arg_op,  # argmax/argmin store integer indices
+                    'scatter': scatter_info,  # None for non-scatter, dict for scatter virtuals
                 }
                 self._metadata[out_name] = meta
                 
