@@ -170,7 +170,8 @@ class TritonCodegenMixin:
                     if cat == 'virtual':
                         # Recursively resolve to real tensors
                         expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
-                        from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                        from hydroforge.aggregator.scatter_expr import \
+                            extract_tokens as _et
                         sub_toks = _et(expr)
                         for st in sub_toks:
                             if st in self._tensor_registry:
@@ -232,7 +233,8 @@ class TritonCodegenMixin:
                             )
                         else:
                             safe_expr = expr
-                            from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                            from hydroforge.aggregator.scatter_expr import \
+                                extract_tokens as _et
                             sub_toks = _et(expr)
                             for st in sub_toks:
                                 if st in self._tensor_registry:
@@ -330,7 +332,8 @@ class TritonCodegenMixin:
                      code_lines.append(f"{indent}{safe_var_name} = tl.load({safe_var_name}_ptr + idx, mask=mask, other=0.0)")
              else:
                  # Plain virtual — inline expression evaluation
-                 from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                 from hydroforge.aggregator.scatter_expr import \
+                     extract_tokens as _et
                  tokens = _et(expr)
                  safe_expr = expr
                  for token in tokens:
@@ -459,7 +462,8 @@ class TritonCodegenMixin:
                 else:
                     # Plain virtual — inline expression
                     safe_expr = expr
-                    from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                    from hydroforge.aggregator.scatter_expr import \
+                        extract_tokens as _et
                     toks = _et(expr)
                     for t in toks:
                         if t in self._field_registry or t in self._tensor_registry:
@@ -1245,7 +1249,8 @@ class TritonCodegenMixin:
                        # Virtual source buffer with no expr
                        input_ptrs.add(name)
                   else:
-                       from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                       from hydroforge.aggregator.scatter_expr import \
+                           extract_tokens as _et
                        toks = _et(expr)
                        for t in toks:
                             if t in self._field_registry or t in self._tensor_registry:
@@ -1405,7 +1410,8 @@ class TritonCodegenMixin:
                              kernel_code_lines.append(f"{indent2}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
                          else:
                              safe_expr = expr
-                             from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                             from hydroforge.aggregator.scatter_expr import \
+                                 extract_tokens as _et
                              toks = _et(expr)
                              for t in toks:
                                   if t in self._field_registry or t in self._tensor_registry:
@@ -1854,7 +1860,8 @@ class TritonCodegenMixin:
                             cat = getattr(t_info, 'json_schema_extra', {}).get('category', 'param') if t_info else 'param'
                             if cat == 'virtual':
                                 sub_expr = getattr(t_info, 'json_schema_extra', {}).get('expr', '')
-                                from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                                from hydroforge.aggregator.scatter_expr import \
+                                    extract_tokens as _et
                                 sub_toks = _et(sub_expr)
                                 for st in sub_toks:
                                     if st in self._tensor_registry:
@@ -1919,7 +1926,8 @@ class TritonCodegenMixin:
                            # Virtual source buffer with no expr
                            input_args.add(name)
                       else:
-                           from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                           from hydroforge.aggregator.scatter_expr import \
+                               extract_tokens as _et
                            toks = _et(expr)
                            for t in toks:
                                 if t in self._field_registry or t in self._tensor_registry:

@@ -304,6 +304,11 @@ class AbstractModule(BaseModel, ABC):
         # Get current scalar values from instance
         scalar_values = {}
         for dim_name in shape_spec:
+            # Literal integer → use directly
+            if isinstance(dim_name, int):
+                scalar_values[dim_name] = dim_name
+                continue
+
             # Handle dotted notation (e.g., "base.num_flood_levels")
             if "." in dim_name:
                 parts = dim_name.split(".")

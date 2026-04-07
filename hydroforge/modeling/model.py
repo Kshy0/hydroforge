@@ -690,7 +690,8 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     field_info = adhoc_virtuals[curr_var]
                     # Check for deps in adhoc virtuals
                     expr = field_info.json_schema_extra.get("expr", "")
-                    from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                    from hydroforge.aggregator.scatter_expr import \
+                        extract_tokens as _et
                     deps = _et(expr)
                     for d in deps:
                         if d not in vars_seen:
@@ -720,7 +721,8 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                                 vars_to_process.append(d)
                     else:
                         # Simple regex for potential tokens (supports dotted names)
-                        from hydroforge.aggregator.scatter_expr import extract_tokens as _et2
+                        from hydroforge.aggregator.scatter_expr import \
+                            extract_tokens as _et2
                         deps = _et2(expr)
                         for d in deps:
                             if d not in vars_seen:

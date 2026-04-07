@@ -28,7 +28,10 @@ The adapter:
 """
 
 import os
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    import torch
 
 
 def _resolve_backend() -> str:
@@ -253,6 +256,7 @@ def make_metal_dispatcher(
     size_key: str = "num_catchments",
     template_vars: dict[str, str] | None = None,
     arg_defaults: dict[str, Any] | None = None,
+    packed_args: dict[str, tuple[str, list[str]]] | None = None,
     group_size: int = 256,
 ) -> Callable:
     """Create a unified dispatch function for a Metal shader kernel.
@@ -283,6 +287,11 @@ def make_metal_dispatcher(
         arg_defaults: Default values for optional kwargs (e.g.
             ``{"HAS_RESERVOIR": False}``).  Missing kwargs without a default
             raise ``KeyError``.
+        packed_args: ``{target_kwarg: (struct_fmt, [source_kwargs])}`` for
+            packing multiple scalar kwargs into a single Metal struct buffer.
+            On first call, source kwargs are packed via ``struct.pack()``
+            into an MPS ``uint8`` tensor and cached.  The tensor is injected
+            as *target_kwarg* on every call, replacing the individual scalars.
         group_size: Threads per threadgroup (default 256).
 
     Returns:
@@ -357,6 +366,9 @@ def make_metal_dispatcher(
         f"threads=_kw['{size_key}'], group_size={group_size})"
     )
 
+    _pack_info = packed_args or {}
+    _packed_cache: dict[str, Any] = {}
+
     # _state[0] holds the compiled fast-path callable (None until first call)
     _state: list = [None]
 
@@ -376,7 +388,18 @@ def make_metal_dispatcher(
             if s is None:
                 s = _init()
                 _state[0] = s
+                if _pack_info:
+                    _, torch_mod = s
+                    import struct as _struct_mod
+                    for target, (fmt, src_keys) in _pack_info.items():
+                        vals = [kw.get(k, _defaults.get(k)) for k in src_keys]
+                        vals = [v.item() if hasattr(v, 'item') else v for v in vals]
+                        _packed_cache[target] = torch_mod.frombuffer(
+                            bytearray(_struct_mod.pack(fmt, *vals)),
+                            dtype=torch_mod.uint8,
+                        ).to("mps")
             fast_fn, torch_mod = s
+            kw.update(_packed_cache)
 
             cache_key = tuple(kw[k] for k in _tpl_keys)
             lib = _shader_cache.get(cache_key)
@@ -402,6 +425,16 @@ def make_metal_dispatcher(
                 exec(code, _ns)  # noqa: S102 – generated code is fully controlled
                 fn = _ns["_fast"]
                 _state[0] = fn
+                if _pack_info:
+                    import struct as _struct_mod
+                    for target, (fmt, src_keys) in _pack_info.items():
+                        vals = [kw.get(k, _defaults.get(k)) for k in src_keys]
+                        vals = [v.item() if hasattr(v, 'item') else v for v in vals]
+                        _packed_cache[target] = torch.frombuffer(
+                            bytearray(_struct_mod.pack(fmt, *vals)),
+                            dtype=torch.uint8,
+                        ).to("mps")
+            kw.update(_packed_cache)
             fn(kw)
 
     return dispatch

@@ -86,7 +86,8 @@ class PyTorchCodegenMixin:
             else:
                 # Plain virtual — inline expression
                 safe_expr = expr
-                from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                from hydroforge.aggregator.scatter_expr import \
+                    extract_tokens as _et
                 toks = _et(expr)
                 for t in toks:
                     if t in self._field_registry or t in self._tensor_registry:
