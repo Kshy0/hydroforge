@@ -51,18 +51,26 @@ class MetalCodegenMixin:
         cat = getattr(info, 'json_schema_extra', {}).get('category', 'param')
         ctype = self._metal_dtype_str(var_name)
 
-        if cat == 'virtual':
+        if var_name in self._tensor_registry:
+            # Real data (includes virtual source buffers)
+            lines.append(f'{indent}{ctype} {val_name} = p_{safe_var}[{idx_expr}];')
+        elif cat == 'virtual':
             expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
-            safe_expr = expr
-            toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
-            for t in toks:
-                if t in self._field_registry or t in self._tensor_registry:
-                    dep_val = self._metal_emit_val_load(t, lines, emitted, indent, idx_expr)
-                    safe_expr = re.sub(r'\b' + t + r'\b', dep_val, safe_expr)
-            safe_expr = safe_expr.replace('**', ', ')
-            if 'pow' not in safe_expr and ', ' in safe_expr:
-                safe_expr = f"pow({safe_expr})"
-            lines.append(f'{indent}{ctype} {val_name} = ({ctype})({safe_expr});')
+            if not expr:
+                # Virtual source buffer with no expr
+                lines.append(f'{indent}{ctype} {val_name} = p_{safe_var}[{idx_expr}];')
+            else:
+                safe_expr = expr
+                from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                toks = _et(expr)
+                for t in toks:
+                    if t in self._field_registry or t in self._tensor_registry:
+                        dep_val = self._metal_emit_val_load(t, lines, emitted, indent, idx_expr)
+                        safe_expr = re.sub(r'\b' + re.escape(t) + r'\b', dep_val, safe_expr)
+                safe_expr = safe_expr.replace('**', ', ')
+                if 'pow' not in safe_expr and ', ' in safe_expr:
+                    safe_expr = f"pow({safe_expr})"
+                lines.append(f'{indent}{ctype} {val_name} = ({ctype})({safe_expr});')
         else:
             lines.append(f'{indent}{ctype} {val_name} = p_{safe_var}[{idx_expr}];')
 
@@ -93,13 +101,20 @@ class MetalCodegenMixin:
         # Collect all input tensors needed (resolve virtuals)
         input_vars = set()
         def _gather_inputs(name):
+            if name in self._tensor_registry:
+                input_vars.add(name)
+                return
             info = self._field_registry.get(name)
             if getattr(info, 'json_schema_extra', {}).get('category') == 'virtual':
                 expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
-                toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
-                for t in toks:
-                    if t in self._field_registry or t in self._tensor_registry:
-                        _gather_inputs(t)
+                if not expr:
+                    input_vars.add(name)
+                else:
+                    from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                    toks = _et(expr)
+                    for t in toks:
+                        if t in self._field_registry or t in self._tensor_registry:
+                            _gather_inputs(t)
             else:
                 input_vars.add(name)
         for var in var_list:

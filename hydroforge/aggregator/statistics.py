@@ -47,7 +47,8 @@ class StatisticsMixin:
                                 deps.update(get_dependencies(sub))
                 return deps
 
-            tokens = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+            from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+            tokens = _et(expr)
             deps = set()
             for token in tokens:
                 if token in self._tensor_registry:
@@ -247,7 +248,8 @@ class StatisticsMixin:
                      if len(tensor_shape) > 1:
                            # Try to resolve dimensions from dependencies or registry
                            expr = json_schema_extra.get('expr')
-                           toks = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                           from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                           toks = _et(expr)
                            found_dep = False
                            for t in toks:
                                 if t in self._tensor_registry:
@@ -479,7 +481,8 @@ class StatisticsMixin:
                         stride_input = 0
                         # For plain virtuals, try to get stride from deps
                         if expr:
-                            toks = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                            from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                            toks = _et(expr)
                             for t in toks:
                                 if t in self._tensor_registry:
                                     dep = self._tensor_registry[t]

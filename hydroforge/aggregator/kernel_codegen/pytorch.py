@@ -61,7 +61,13 @@ class PyTorchCodegenMixin:
         info = self._field_registry.get(var_name)
         cat = getattr(info, 'json_schema_extra', {}).get('category', 'param')
 
-        if cat == 'virtual':
+        if var_name in self._tensor_registry:
+            # Real data (includes virtual source buffers)
+            if is_2d:
+                lines.append(f'{indent}{val_name} = states["{var_name}"][(t * stride_input + idx) * n_levels + level]')
+            else:
+                lines.append(f'{indent}{val_name} = states["{var_name}"][t * stride_input + idx]')
+        elif cat == 'virtual':
             expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
             scatter = parse_scatter_expr(expr) if expr else None
             if scatter:
@@ -71,15 +77,22 @@ class PyTorchCodegenMixin:
                     lines.append(f'{indent}{val_name} = states["{buf_key}"][(t * stride_input + idx) * n_levels + level]')
                 else:
                     lines.append(f'{indent}{val_name} = states["{buf_key}"][t * stride_input + idx]')
+            elif not expr:
+                # Virtual source buffer with no expr
+                if is_2d:
+                    lines.append(f'{indent}{val_name} = states["{var_name}"][(t * stride_input + idx) * n_levels + level]')
+                else:
+                    lines.append(f'{indent}{val_name} = states["{var_name}"][t * stride_input + idx]')
             else:
                 # Plain virtual — inline expression
                 safe_expr = expr
-                toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                toks = _et(expr)
                 for t in toks:
                     if t in self._field_registry or t in self._tensor_registry:
                         dep_val = self._pytorch_emit_val_load(t, lines, emitted, indent, is_2d)
                         safe_t = self._get_safe_name(t)
-                        safe_expr = re.sub(r'\b' + t + r'\b', dep_val, safe_expr)
+                        safe_expr = re.sub(r'\b' + re.escape(t) + r'\b', dep_val, safe_expr)
                 safe_expr = self._transform_pow_expr(safe_expr)
                 lines.append(f'{indent}{val_name} = {safe_expr}')
         else:
@@ -616,7 +629,7 @@ class PyTorchCodegenMixin:
                     toks = scatter.value_tokens
                     for tok in sorted(toks, key=len, reverse=True):
                         if tok in self._field_registry or tok in self._tensor_registry:
-                            safe_value_expr = re.sub(r'\b' + tok + r'\b', f'states["{tok}"]', safe_value_expr)
+                            safe_value_expr = re.sub(r'\b' + re.escape(tok) + r'\b', f'states["{tok}"]', safe_value_expr)
                     lines.append(f'    _scatter_val = {safe_value_expr}')
                     lines.append(f'    _scatter_idx = states["{idx_key}"].long()')
                     if num_trials > 1:

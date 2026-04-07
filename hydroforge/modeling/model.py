@@ -237,6 +237,10 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
     def check_namespace_conflicts(self) -> None:
         """
         Check for namespace conflicts across all opened modules.
+
+        Virtual fields with an ``expr`` (scatter / plain aggregation outputs)
+        are allowed to share a name with their source counterpart in another
+        module — this is the standard subcell→cell aggregation pattern.
         """
         field_definitions: Dict[str, Tuple[str, Any]] = {}
 
@@ -244,14 +248,24 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             if field_name in field_definitions:
                 existing_module, existing_info = field_definitions[field_name]
                 
-                # Compare definitions
-                # 1. Compare annotation (type)
-                new_type = getattr(field_info, 'annotation', getattr(field_info, 'return_type', None))
-                old_type = getattr(existing_info, 'annotation', getattr(existing_info, 'return_type', None))
-                
-                # 2. Compare json_schema_extra (shape, dtype, etc.)
                 new_extra = getattr(field_info, 'json_schema_extra', {}) or {}
                 old_extra = getattr(existing_info, 'json_schema_extra', {}) or {}
+
+                # Allow coexistence when one side is a virtual-with-expr
+                # (scatter/plain aggregation output) — the pair is intentional.
+                new_is_expr_virtual = (new_extra.get('category') == 'virtual'
+                                       and new_extra.get('expr'))
+                old_is_expr_virtual = (old_extra.get('category') == 'virtual'
+                                       and old_extra.get('expr'))
+                if new_is_expr_virtual or old_is_expr_virtual:
+                    # Keep the expr-virtual as the primary definition
+                    if new_is_expr_virtual and not old_is_expr_virtual:
+                        field_definitions[field_name] = (module_name, field_info)
+                    continue
+
+                # Compare definitions
+                new_type = getattr(field_info, 'annotation', getattr(field_info, 'return_type', None))
+                old_type = getattr(existing_info, 'annotation', getattr(existing_info, 'return_type', None))
                 
                 if new_type != old_type or new_extra != old_extra:
                     raise ValueError(
@@ -344,6 +358,10 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             all_fields = module.get_model_fields().copy()
             all_fields.update(module.get_model_computed_fields())
             for name, field_info in all_fields.items():
+                # Skip computed fields that haven't been materialized yet
+                # to avoid triggering @cached_property (lazy allocation).
+                if name in module.get_model_computed_fields() and name not in module.__dict__:
+                    continue
                 if not hasattr(module, name):
                     continue
                 value = getattr(module, name)
@@ -394,8 +412,16 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         """
         Map variable names to (module_instance, field_name, id_attr).
         This provides a unified way to lookup variables across all modules.
+
+        When a field name exists in multiple modules, the virtual field
+        with an ``expr`` (scatter / plain aggregation output) takes
+        priority for the unqualified name.  Both qualified forms
+        (``module.field``) are always available.
         """
         mapping = {}
+        # Track which unqualified names have a virtual-with-expr entry
+        _has_expr_virtual: Dict[str, bool] = {}
+
         for module_name, _, field_name, field_info in self._iter_all_fields(include_computed=True):
             module = self.get_module(module_name)
             if module is None:
@@ -403,17 +429,33 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             
             # Determine ID attribute for coordinate lookup
             id_attr = None
-            
-            # Check dim_coords in field metadata
             dim_coords = None
             if hasattr(field_info, "json_schema_extra") and field_info.json_schema_extra:
                 dim_coords = field_info.json_schema_extra.get("dim_coords")
-            
             if dim_coords:
                 id_attr = dim_coords
             
             entry = (module, field_name, id_attr)
-            mapping[field_name] = entry
+            extra = getattr(field_info, 'json_schema_extra', {}) or {}
+            is_expr_virtual = (extra.get('category') == 'virtual'
+                               and extra.get('expr'))
+
+            # Unqualified name: expr-virtual takes priority
+            if field_name not in mapping:
+                mapping[field_name] = entry
+                _has_expr_virtual[field_name] = is_expr_virtual
+            elif is_expr_virtual and not _has_expr_virtual.get(field_name):
+                # New entry is an expr-virtual, existing is a source → overwrite
+                mapping[field_name] = entry
+                _has_expr_virtual[field_name] = True
+            elif not is_expr_virtual and _has_expr_virtual.get(field_name):
+                # Existing is expr-virtual, new is source → keep existing
+                pass
+            else:
+                # Both same kind → last writer wins (original behaviour)
+                mapping[field_name] = entry
+
+            # Qualified name: always set
             mapping[f"{module_name}.{field_name}"] = entry
             
         return mapping
@@ -586,7 +628,8 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 )
             
             # ── Plain elementwise expression ──
-            tokens = set(re.findall(r'\b[a-zA-Z_]\w*\b', expression))
+            from hydroforge.aggregator.scatter_expr import extract_tokens
+            tokens = extract_tokens(expression)
             
             valid_deps = []
             for t in tokens:
@@ -647,7 +690,8 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     field_info = adhoc_virtuals[curr_var]
                     # Check for deps in adhoc virtuals
                     expr = field_info.json_schema_extra.get("expr", "")
-                    deps = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                    from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                    deps = _et(expr)
                     for d in deps:
                         if d not in vars_seen:
                             vars_seen.add(d)
@@ -665,7 +709,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             if field_info:
                 cat = field_info.json_schema_extra.get("category", "param")
                 if cat == 'virtual':
-                    expr = field_info.json_schema_extra.get("expr", "")
+                    expr = field_info.json_schema_extra.get("expr") or ""
                     # For scatter expressions, extract deps from value_tokens + index_var
                     scatter = parse_scatter_expr(expr)
                     if scatter:
@@ -675,8 +719,9 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                                 vars_seen.add(d)
                                 vars_to_process.append(d)
                     else:
-                        # Simple regex for potential tokens
-                        deps = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                        # Simple regex for potential tokens (supports dotted names)
+                        from hydroforge.aggregator.scatter_expr import extract_tokens as _et2
+                        deps = _et2(expr)
                         for d in deps:
                             if d not in vars_seen:
                                 vars_seen.add(d)
@@ -744,7 +789,20 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             # Register the main tensor if not already done
             if var_name not in registered_vars:
                 if category == 'virtual':
-                    self._statistics_aggregator.register_virtual_tensor(var_name, field_info)
+                    expr = field_info.json_schema_extra.get('expr', '')
+                    if expr:
+                        # Virtual with expression → metadata-only (scatter / plain)
+                        self._statistics_aggregator.register_virtual_tensor(var_name, field_info)
+                    elif tensor is not None:
+                        # Virtual with no expr → source buffer; register as real
+                        # tensor so scatter kernels can read the data.
+                        self._statistics_aggregator.register_tensor(var_name, tensor, field_info)
+                        shape_str = str(tuple(tensor.shape))
+                        if shape_str not in registered_vars_by_shape:
+                            registered_vars_by_shape[shape_str] = []
+                        registered_vars_by_shape[shape_str].append(var_name)
+                    else:
+                        self._statistics_aggregator.register_virtual_tensor(var_name, field_info)
                 else:
                     self._statistics_aggregator.register_tensor(var_name, tensor, field_info)
                     shape_str = str(tuple(tensor.shape))

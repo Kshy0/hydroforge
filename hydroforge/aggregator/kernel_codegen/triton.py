@@ -161,17 +161,22 @@ class TritonCodegenMixin:
             value_tokens = sorted(scatter.value_tokens)
             source_ptrs = set()
             for tok in value_tokens:
-                info = self._field_registry.get(tok)
-                cat = getattr(info, 'json_schema_extra', {}).get('category', 'param') if info else 'param'
-                if cat == 'virtual':
-                    # Recursively resolve to real tensors
-                    expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
-                    sub_toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
-                    for st in sub_toks:
-                        if st in self._tensor_registry:
-                            source_ptrs.add(st)
-                else:
+                if tok in self._tensor_registry:
+                    # Has real data — load directly
                     source_ptrs.add(tok)
+                else:
+                    info = self._field_registry.get(tok)
+                    cat = getattr(info, 'json_schema_extra', {}).get('category', 'param') if info else 'param'
+                    if cat == 'virtual':
+                        # Recursively resolve to real tensors
+                        expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
+                        from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                        sub_toks = _et(expr)
+                        for st in sub_toks:
+                            if st in self._tensor_registry:
+                                source_ptrs.add(st)
+                    else:
+                        source_ptrs.add(tok)
             source_ptrs.add(scatter.index_var)
             sorted_src = sorted(source_ptrs)
 
@@ -207,35 +212,50 @@ class TritonCodegenMixin:
             # Load each value token
             for tok in value_tokens:
                 safe_tok = self._get_safe_name(tok)
-                info = self._field_registry.get(tok)
-                cat = getattr(info, 'json_schema_extra', {}).get('category', 'param') if info else 'param'
-                if cat == 'virtual':
-                    # Inline expression (non-scatter sub-virtual)
-                    expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
-                    safe_expr = expr
-                    sub_toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
-                    for st in sub_toks:
-                        if st in self._tensor_registry:
-                            sst = self._get_safe_name(st)
-                            safe_expr = re.sub(
-                                r'\b' + st + r'\b', f"{sst}_val", safe_expr
-                            )
-                            kernel_code_lines.append(
-                                f"        {sst}_val = tl.load({sst}_ptr + t * {stride_names[st]} + offs, mask=mask, other=0.0)"
-                            )
-                    safe_expr = self._transform_pow_expr(safe_expr)
-                    kernel_code_lines.append(f"        {safe_tok}_val = {safe_expr}")
-                else:
+                if tok in self._tensor_registry:
+                    # Real tensor (or virtual source buffer) — load directly
                     sn = stride_names[tok]
                     kernel_code_lines.append(
                         f"        {safe_tok}_val = tl.load({safe_tok}_ptr + t * {sn} + offs, mask=mask, other=0.0)"
                     )
+                else:
+                    info = self._field_registry.get(tok)
+                    cat = getattr(info, 'json_schema_extra', {}).get('category', 'param') if info else 'param'
+                    if cat == 'virtual':
+                        # Inline expression (non-scatter sub-virtual)
+                        expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
+                        if not expr:
+                            # Source buffer with no expr — should have been in _tensor_registry
+                            sn = stride_names.get(tok, '0')
+                            kernel_code_lines.append(
+                                f"        {safe_tok}_val = tl.load({safe_tok}_ptr + t * {sn} + offs, mask=mask, other=0.0)"
+                            )
+                        else:
+                            safe_expr = expr
+                            from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                            sub_toks = _et(expr)
+                            for st in sub_toks:
+                                if st in self._tensor_registry:
+                                    sst = self._get_safe_name(st)
+                                    safe_expr = re.sub(
+                                        r'\b' + re.escape(st) + r'\b', f"{sst}_val", safe_expr
+                                    )
+                                    kernel_code_lines.append(
+                                        f"        {sst}_val = tl.load({sst}_ptr + t * {stride_names[st]} + offs, mask=mask, other=0.0)"
+                                    )
+                            safe_expr = self._transform_pow_expr(safe_expr)
+                            kernel_code_lines.append(f"        {safe_tok}_val = {safe_expr}")
+                    else:
+                        sn = stride_names[tok]
+                        kernel_code_lines.append(
+                            f"        {safe_tok}_val = tl.load({safe_tok}_ptr + t * {sn} + offs, mask=mask, other=0.0)"
+                        )
             # Compute value expression
             safe_value_expr = scatter.value_expr
             for tok in sorted(value_tokens, key=len, reverse=True):
                 safe_tok = self._get_safe_name(tok)
                 safe_value_expr = re.sub(
-                    r'\b' + tok + r'\b', f"{safe_tok}_val", safe_value_expr
+                    r'\b' + re.escape(tok) + r'\b', f"{safe_tok}_val", safe_value_expr
                 )
             safe_value_expr = self._transform_pow_expr(safe_value_expr)
             kernel_code_lines.append(f"        _val = {safe_value_expr}")
@@ -282,7 +302,14 @@ class TritonCodegenMixin:
         json_extra = getattr(info, 'json_schema_extra', {})
         cat = json_extra.get('category', 'param')
         
-        if cat == 'virtual':
+        if var_name in self._tensor_registry:
+             # Real data in tensor registry (includes virtual source buffers)
+             indent = "        " if is_2d else "    "
+             if is_2d:
+                  code_lines.append(f"{indent}{safe_var_name} = tl.load({safe_var_name}_ptr + idx * n_levels + level, mask=mask, other=0.0)")
+             else:
+                  code_lines.append(f"{indent}{safe_var_name} = tl.load({safe_var_name}_ptr + idx, mask=mask, other=0.0)")
+        elif cat == 'virtual':
              expr = json_extra.get('expr')
              # Check if this is a scatter virtual — load from materialized buffer
              scatter = parse_scatter_expr(expr) if expr else None
@@ -294,15 +321,23 @@ class TritonCodegenMixin:
                      code_lines.append(f"{indent}{safe_var_name} = tl.load({buf_safe}_ptr + idx * n_levels + level, mask=mask, other=0.0)")
                  else:
                      code_lines.append(f"{indent}{safe_var_name} = tl.load({buf_safe}_ptr + idx, mask=mask, other=0.0)")
+             elif not expr:
+                 # Virtual source buffer with no expr — load like real tensor
+                 indent = "        " if is_2d else "    "
+                 if is_2d:
+                     code_lines.append(f"{indent}{safe_var_name} = tl.load({safe_var_name}_ptr + idx * n_levels + level, mask=mask, other=0.0)")
+                 else:
+                     code_lines.append(f"{indent}{safe_var_name} = tl.load({safe_var_name}_ptr + idx, mask=mask, other=0.0)")
              else:
                  # Plain virtual — inline expression evaluation
-                 tokens = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                 from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                 tokens = _et(expr)
                  safe_expr = expr
                  for token in tokens:
                       if token in self._field_registry or token in self._tensor_registry:
                            self._emit_variable_load(token, code_lines, emitted, is_2d)
                            safe_token = self._get_safe_name(token)
-                           safe_expr = re.sub(r'\b' + token + r'\b', safe_token, safe_expr)
+                           safe_expr = re.sub(r'\b' + re.escape(token) + r'\b', safe_token, safe_expr)
                  
                  safe_expr = self._transform_pow_expr(safe_expr)
                  
@@ -405,7 +440,11 @@ class TritonCodegenMixin:
             info = self._field_registry.get(v_name)
             cat = getattr(info, 'json_schema_extra', {}).get('category', 'param')
             
-            if cat == 'virtual':
+            if v_name in self._tensor_registry:
+                # Real data (includes virtual source buffers)
+                in_ptr_loc = f"{safe_v_name}_ptr + t * stride_input + idx"
+                to_lines.append(f"{indent}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
+            elif cat == 'virtual':
                 expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
                 scatter = parse_scatter_expr(expr) if expr else None
                 if scatter:
@@ -413,15 +452,20 @@ class TritonCodegenMixin:
                     buf_safe = self._get_safe_name(f"__scatter_buf_{v_name}")
                     in_ptr_loc = f"{buf_safe}_ptr + t * stride_input + idx"
                     to_lines.append(f"{indent}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
+                elif not expr:
+                    # Virtual source buffer with no expr
+                    in_ptr_loc = f"{safe_v_name}_ptr + t * stride_input + idx"
+                    to_lines.append(f"{indent}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
                 else:
                     # Plain virtual — inline expression
                     safe_expr = expr
-                    toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                    from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                    toks = _et(expr)
                     for t in toks:
                         if t in self._field_registry or t in self._tensor_registry:
                             emit_val(t, to_lines)
                             safe_t = self._get_safe_name(t)
-                            safe_expr = re.sub(r'\b' + t + r'\b', f"{safe_t}_val", safe_expr)
+                            safe_expr = re.sub(r'\b' + re.escape(t) + r'\b', f"{safe_t}_val", safe_expr)
                     safe_expr = self._transform_pow_expr(safe_expr)
                     to_lines.append(f"{indent}{safe_v_name}_val = {safe_expr}")
             else:
@@ -1187,6 +1231,9 @@ class TritonCodegenMixin:
         # Gather input pointers (resolving virtuals)
         input_ptrs = set()
         def _gather_inputs(name):
+             if name in self._tensor_registry:
+                  input_ptrs.add(name)
+                  return
              info = self._field_registry.get(name)
              if getattr(info, 'json_schema_extra', {}).get('category') == 'virtual':
                   expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
@@ -1194,8 +1241,12 @@ class TritonCodegenMixin:
                   if scatter:
                        # Scatter virtual: kernel reads from materialized buffer, not source tensors
                        input_ptrs.add(f"__scatter_buf_{name}")
+                  elif not expr:
+                       # Virtual source buffer with no expr
+                       input_ptrs.add(name)
                   else:
-                       toks = re.findall(r'\b[a-zA-Z_]\w*\b', expr)
+                       from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                       toks = _et(expr)
                        for t in toks:
                             if t in self._field_registry or t in self._tensor_registry:
                                  _gather_inputs(t)
@@ -1336,7 +1387,11 @@ class TritonCodegenMixin:
                     info = self._field_registry.get(v_name)
                     cat = getattr(info, 'json_schema_extra', {}).get('category', 'param') if info else 'param'
                     
-                    if cat == 'virtual' and info:
+                    if v_name in self._tensor_registry:
+                         # Real data (includes virtual source buffers)
+                         in_ptr_loc = f"{safe_v_name}_ptr + (t * stride_input + idx) * n_levels + level"
+                         kernel_code_lines.append(f"{indent2}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
+                    elif cat == 'virtual' and info:
                          expr = getattr(info, 'json_schema_extra', {}).get('expr')
                          scatter = parse_scatter_expr(expr) if expr else None
                          if scatter:
@@ -1344,14 +1399,19 @@ class TritonCodegenMixin:
                              buf_safe = self._get_safe_name(f"__scatter_buf_{v_name}")
                              in_ptr_loc = f"{buf_safe}_ptr + (t * stride_input + idx) * n_levels + level"
                              kernel_code_lines.append(f"{indent2}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
+                         elif not expr:
+                             # Virtual source buffer with no expr
+                             in_ptr_loc = f"{safe_v_name}_ptr + (t * stride_input + idx) * n_levels + level"
+                             kernel_code_lines.append(f"{indent2}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
                          else:
                              safe_expr = expr
-                             toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                             from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                             toks = _et(expr)
                              for t in toks:
                                   if t in self._field_registry or t in self._tensor_registry:
                                        emit_val_2d(t)
                                        safe_t = self._get_safe_name(t)
-                                       safe_expr = re.sub(r'\b' + t + r'\b', f"{safe_t}_val", safe_expr)
+                                       safe_expr = re.sub(r'\b' + re.escape(t) + r'\b', f"{safe_t}_val", safe_expr)
                              safe_expr = self._transform_pow_expr(safe_expr)
                              kernel_code_lines.append(f"{indent2}{safe_v_name}_val = {safe_expr}")
                     else:
@@ -1787,16 +1847,20 @@ class TritonCodegenMixin:
                     value_tokens = sorted(scatter.value_tokens)
                     source_ptrs = set()
                     for tok in value_tokens:
-                        t_info = self._field_registry.get(tok)
-                        cat = getattr(t_info, 'json_schema_extra', {}).get('category', 'param') if t_info else 'param'
-                        if cat == 'virtual':
-                            sub_expr = getattr(t_info, 'json_schema_extra', {}).get('expr', '')
-                            sub_toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', sub_expr))
-                            for st in sub_toks:
-                                if st in self._tensor_registry:
-                                    source_ptrs.add(st)
-                        else:
+                        if tok in self._tensor_registry:
                             source_ptrs.add(tok)
+                        else:
+                            t_info = self._field_registry.get(tok)
+                            cat = getattr(t_info, 'json_schema_extra', {}).get('category', 'param') if t_info else 'param'
+                            if cat == 'virtual':
+                                sub_expr = getattr(t_info, 'json_schema_extra', {}).get('expr', '')
+                                from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                                sub_toks = _et(sub_expr)
+                                for st in sub_toks:
+                                    if st in self._tensor_registry:
+                                        source_ptrs.add(st)
+                            else:
+                                source_ptrs.add(tok)
                     source_ptrs.add(scatter.index_var)
                     sorted_src = sorted(source_ptrs)
                     for tok in sorted_src:
@@ -1841,6 +1905,9 @@ class TritonCodegenMixin:
             # Gather input pointers (resolving virtuals)
             input_args = set()
             def _gather_inputs(name):
+                 if name in self._tensor_registry:
+                      input_args.add(name)
+                      return
                  info = self._field_registry.get(name)
                  if getattr(info, 'json_schema_extra', {}).get('category') == 'virtual':
                       expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
@@ -1848,8 +1915,12 @@ class TritonCodegenMixin:
                       if scatter:
                            # Scatter virtual: kernel reads from materialized buffer
                            input_args.add(f"__scatter_buf_{name}")
+                      elif not expr:
+                           # Virtual source buffer with no expr
+                           input_args.add(name)
                       else:
-                           toks = set(re.findall(r'\b[a-zA-Z_]\w*\b', expr))
+                           from hydroforge.aggregator.scatter_expr import extract_tokens as _et
+                           toks = _et(expr)
                            for t in toks:
                                 if t in self._field_registry or t in self._tensor_registry:
                                      _gather_inputs(t)
