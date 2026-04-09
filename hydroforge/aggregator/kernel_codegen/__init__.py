@@ -32,7 +32,7 @@ class KernelCodegenMixin(
     def _generate_aggregator_function(self: StatisticsAggregator) -> None:
         """
         Generate and compile the aggregation kernel function.
-        
+
         Dispatches to Metal, PyTorch, or Triton code generation
         based on HYDROFORGE_BACKEND.
         """
@@ -51,10 +51,10 @@ class KernelCodegenMixin(
             raise ValueError("No variables initialized for statistics aggregation")
 
         tensor_info, grouped_by_save_idx = self._analyze_tensor_info()
-        
+
         # Generate kernel code
         kernel_code_lines = self._generate_kernel_header()
-        
+
         # Generate scatter pre-step kernels
         self._generate_scatter_kernels(kernel_code_lines, grouped_by_save_idx)
 
@@ -62,14 +62,14 @@ class KernelCodegenMixin(
         for save_idx, var_list in grouped_by_save_idx.items():
             kernel_name = f"kernel_{save_idx}"
             self._generate_kernel_for_group(kernel_code_lines, kernel_name, save_idx, var_list, tensor_info)
-        
+
         # Generate main function
         self._generate_main_function(kernel_code_lines, grouped_by_save_idx, tensor_info)
-        
+
         # Write kernel code to temporary file and import
         kernel_code = "\n".join(kernel_code_lines)
         self._write_and_import_kernels(kernel_code)
-        
+
         # Save kernel file for external inspection if enabled
         if self.save_kernels:
             self._save_kernel_file(kernel_code)

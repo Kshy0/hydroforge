@@ -33,7 +33,7 @@ class NetCDFDataset(AbstractDataset):
         file_paths = []
         for key in sorted(keys):
             file_paths.append(Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}")
-        
+
         self.validate_files_exist(file_paths)
 
     def _scan_time_metadata(self, start_dt: Union[datetime, cftime.datetime], end_dt: Union[datetime, cftime.datetime]) -> None:
@@ -89,14 +89,14 @@ class NetCDFDataset(AbstractDataset):
                             else:
                                 # Fallback to the sample date itself
                                 base = sample_dt
-                    
+
                     if base is None:
                         try:
                             year = int(key)
                             base = datetime(year, 1, 1)
                         except ValueError:
                             pass
-                    
+
                     if base is not None:
                         dates = [base + timedelta(days=float(x)) for x in tvar[:]]
                     else:
@@ -158,7 +158,7 @@ class NetCDFDataset(AbstractDataset):
         self._plan will be a list of (start_time, ops).
         """
         self._plan = []
-        
+
         # Helper to build chunks for a time range
         def build_chunks_for_range(start_dt, end_dt):
             chunks = []
@@ -167,11 +167,11 @@ class NetCDFDataset(AbstractDataset):
             while t <= end_dt:
                 times.append(t)
                 t += self.time_interval
-            
+
             total = len(times)
             if total == 0:
                 return []
-            
+
             n_chunks = (total + self.chunk_len - 1) // self.chunk_len
             for ci in range(n_chunks):
                 a = ci * self.chunk_len
@@ -188,7 +188,7 @@ class NetCDFDataset(AbstractDataset):
             if self.spin_up_start_date is None or self.spin_up_end_date is None:
                 raise ValueError("Spin-up dates must be provided if spin_up_cycles > 0")
             self._spin_up_chunks_template = build_chunks_for_range(self.spin_up_start_date, self.spin_up_end_date)
-            
+
             for _ in range(self.spin_up_cycles):
                 self._plan.extend(self._spin_up_chunks_template)
 
@@ -225,7 +225,7 @@ class NetCDFDataset(AbstractDataset):
         # Each chunk plan is a list of (file_key, abs_time_indices) operations.
         # We read exact timesteps per file using fancy indexing once per file.
         self._chunk_plan = []
-        
+
         # Bounding box for optimized spatial reading (computed lazily)
         self._bbox: Optional[Tuple[int, int, int, int]] = None  # (y_min, y_max, x_min, x_max)
         self._bbox_local_indices: Optional[np.ndarray] = None  # indices relative to bbox
@@ -239,7 +239,7 @@ class NetCDFDataset(AbstractDataset):
             *args,
             **kwargs,
         )
-        
+
         # Determine full data range needed
         scan_start = self.start_date
         scan_end = self.end_date
@@ -258,14 +258,14 @@ class NetCDFDataset(AbstractDataset):
         """
         chunk_idx = idx // self.chunk_len
         offset = idx % self.chunk_len
-        
+
         if chunk_idx >= len(self._plan):
              return False
 
         _, ops = self._plan[chunk_idx]
         # Calculate real length of this chunk
         real_len = sum(len(x[1]) for x in ops)
-        
+
         return offset < real_len
 
     # -------------------------
@@ -313,11 +313,11 @@ class NetCDFDataset(AbstractDataset):
 
     def _compute_bbox_from_indices(self) -> None:
         """Compute 2D bounding box from _local_indices for optimized reading.
-        
+
         This method converts the 1D flattened indices to 2D (y, x) coordinates,
         finds the minimal bounding box, and creates a mapping from the original
         indices to indices relative to the bounding box.
-        
+
         After calling this method:
         - self._bbox: (y_min, y_max, x_min, x_max) - inclusive bounds
         - self._bbox_local_indices: indices relative to the bounding box flatten
@@ -326,23 +326,23 @@ class NetCDFDataset(AbstractDataset):
             self._bbox = None
             self._bbox_local_indices = None
             return
-        
+
         ny, nx = self._grid_shape
-        
+
         # Convert 1D indices to 2D coordinates
         # index = y * nx + x (C-order, row-major)
         y_coords = self._local_indices // nx
         x_coords = self._local_indices % nx
-        
+
         # Compute bounding box
         y_min, y_max = int(y_coords.min()), int(y_coords.max())
         x_min, x_max = int(x_coords.min()), int(x_coords.max())
-        
+
         self._bbox = (y_min, y_max, x_min, x_max)
-        
+
         # Compute new width of the bounding box
         bbox_nx = x_max - x_min + 1
-        
+
         # Convert global indices to bbox-local indices
         # new_index = (y - y_min) * bbox_nx + (x - x_min)
         local_y = y_coords - y_min
@@ -354,37 +354,37 @@ class NetCDFDataset(AbstractDataset):
 
         Each op is (file_key, abs_indices). We'll fetch exactly these time steps
         from the file in a single fancy-indexing operation along the time axis.
-        
+
         When _local_indices is set and a bounding box has been computed,
         this method reads only the bounding box region instead of the full grid,
         significantly reducing I/O for spatially concentrated catchments.
-        
+
         Returns:
         - If _local_indices is set: (T, N) compressed array
         - If _local_indices is None: (T, Y, X) full grid array
-        
+
         Spatial convention: (Y, X) = (lat, lon), C-order flatten (lon varies fastest)
         """
         ny, nx = self._grid_shape
         compressed = self._local_indices is not None
-        
+
         # Lazily compute bounding box on first read if compressed mode is active
         if compressed and self._bbox is None:
             self._compute_bbox_from_indices()
-        
+
         # Check if bounding box optimization is available
-        use_bbox = (compressed and 
-                    self._bbox is not None and 
+        use_bbox = (compressed and
+                    self._bbox is not None and
                     self._bbox_local_indices is not None)
-        
+
         if not ops:
             if compressed:
                 return np.empty((0, len(self._local_indices)), dtype=self.out_dtype)
             else:
                 return np.empty((0, ny, nx), dtype=self.out_dtype)
-        
+
         chunks: List[np.ndarray] = []
-        
+
         for key, abs_indices in ops:
             path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
             with Dataset(path, "r") as ds:
@@ -395,37 +395,37 @@ class NetCDFDataset(AbstractDataset):
                 x_idx = self._pick_dim(dims, "lon", "longitude", "long", "x")
                 if t_idx is None or y_idx is None or x_idx is None:
                     raise ValueError(f"Expect at least time/lat/lon dims, got: {dims}")
-                
+
                 if not abs_indices:
                     continue
-                    
+
                 abs_idx = np.asarray(abs_indices, dtype=np.int32)
                 sel = [slice(None)] * var.ndim
                 sel[t_idx] = abs_idx
-                
+
                 if use_bbox:
                     # Read only the bounding box region
                     y_min, y_max, x_min, x_max = self._bbox
                     sel[y_idx] = slice(y_min, y_max + 1)
                     sel[x_idx] = slice(x_min, x_max + 1)
-                
+
                 arr = var[tuple(sel)]
-                
+
                 # Fill masks / NaNs
                 if isinstance(arr, np.ma.MaskedArray):
                     arr = arr.filled(0.0)
                 else:
                     arr = np.nan_to_num(np.asarray(arr), nan=0.0)
                 arr = np.asarray(arr)
-                
+
                 # Normalize to (T, Y, X) - note: Y, X may be bbox dimensions if use_bbox
                 arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
-                
+
                 if compressed:
                     # Flatten and extract active columns: (T, Y, X) -> (T, N)
                     T, Y, X = arr.shape
                     flat = arr.reshape(T, Y * X)
-                    
+
                     if use_bbox:
                         # Use bbox-relative indices
                         out = flat[:, self._bbox_local_indices]
@@ -435,10 +435,10 @@ class NetCDFDataset(AbstractDataset):
                 else:
                     # Keep as (T, Y, X)
                     out = arr
-                
+
                 out = out.astype(self.out_dtype, copy=False)
                 chunks.append(out)
-                
+
         return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
 
     def read_chunk(self, idx: int) -> np.ndarray:
@@ -447,7 +447,7 @@ class NetCDFDataset(AbstractDataset):
         """
         if idx < 0 or idx >= len(self._plan):
             raise IndexError(f"Chunk index {idx} out of range (0-{len(self._plan)-1})")
-        
+
         _, ops = self._plan[idx]
         data = self._read_ops(ops)
         return data / self.unit_factor

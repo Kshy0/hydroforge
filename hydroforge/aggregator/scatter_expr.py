@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal, Optional, Set, Tuple
+from typing import Literal, Optional, Set
 
 # Regex for a single identifier token that may be qualified with a dot
 # e.g.  ``snow.runoff``  or plain  ``subcell_weight``.

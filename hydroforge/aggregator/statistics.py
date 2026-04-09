@@ -68,7 +68,7 @@ class StatisticsMixin:
             field_info = self._field_registry.get(var_name)
             json_extra = getattr(field_info, 'json_schema_extra', {})
             category = json_extra.get('category', 'param')
-            
+
             if category == 'virtual':
                 expr = json_extra.get('expr')
                 if expr:
@@ -82,7 +82,7 @@ class StatisticsMixin:
             for op in ops:
                 out_name = f"{var_name}_{op}"
                 required_tensors[out_name] = self._storage[out_name]
-                
+
                 # For explicit argmax/argmin operations, add their auxiliary storage
                 op_parts = op.split('_')
                 outer_op = op_parts[0]
@@ -93,7 +93,7 @@ class StatisticsMixin:
                     aux_name = f"{var_name}_{arg_type}{arg_k_str or ''}_aux"
                     if aux_name in self._storage:
                         required_tensors[aux_name] = self._storage[aux_name]
-                
+
                 # Add inner states for compound ops
                 if '_' in op:
                     parts = op.split('_')
@@ -167,7 +167,7 @@ class StatisticsMixin:
         self._kernel_states['__flags'] = torch.zeros(1, device=self.device, dtype=torch.int32)
         self._kernel_states['__macro_step_index'] = torch.zeros(1, device=self.device, dtype=torch.int32)
 
-    
+
 
     def initialize_statistics(self: StatisticsAggregator, variable_ops: Dict[str, List[str]]) -> None:
         """Initialize aggregation tensors and metadata for provided variables and ops."""
@@ -187,13 +187,13 @@ class StatisticsMixin:
         self._output_keys = []
         self._metadata.clear()
         self._output_is_outer: Dict[str, bool] = {}
-        
+
         self._aggregator_function = None
         self._aggregator_generated = False
         self._kernel_states = None
         self._current_macro_step_count = 0.0
         self._outer_flags_ever_seen = False
-        
+
         # Scatter virtual metadata: var_name -> ScatterExpr
         self._scatter_virtuals: Dict[str, Any] = {}
 
@@ -206,7 +206,7 @@ class StatisticsMixin:
 
             # Sort ops to ensure consistent processing order
             ops.sort()
-            
+
             tensor = None
             field_info = self._field_registry[var_name]
             json_schema_extra = getattr(field_info, 'json_schema_extra', {})
@@ -219,7 +219,7 @@ class StatisticsMixin:
                 tensor = None
             else:
                 raise ValueError(f"Variable '{var_name}' not registered. Call register_tensor() first.")
-            
+
             target_dtype = tensor.dtype if tensor is not None else torch.float32
 
             tensor_shape = json_schema_extra.get('tensor_shape', ())
@@ -243,7 +243,7 @@ class StatisticsMixin:
                      tensor_ndim = 1 + (1 if self.num_trials > 1 else 0) # Base guess
                      if len(tensor_shape) > 1: # Has extra dims
                           tensor_ndim += (len(tensor_shape) - 1)
-                     
+
                      # Construct hypothetical shape for allocation size
                      tensor_base_shape = (len(ref_save_idx),) # minimum
                      if len(tensor_shape) > 1:
@@ -276,7 +276,7 @@ class StatisticsMixin:
                                                    raise ValueError
                                          else:
                                               raise ValueError
-                                    
+
                                     # Construct a fake base shape that satisfies the slicing logic below
                                     # The logic below uses [2:] (if trials) or [1:] (if no trials)
                                     # to get the EXTRA dims.
@@ -293,7 +293,7 @@ class StatisticsMixin:
                     actual_shape = (len(ref_save_idx),) + tensor_base_shape[1:]
             else:
                 raise ValueError(f"Save index '{save_idx}' not registered in tensor registry")
-            
+
             actual_ndim = tensor_ndim
             max_ndim = 3 if self.num_trials > 1 else 2
             if actual_ndim > max_ndim:
@@ -323,7 +323,7 @@ class StatisticsMixin:
                     else:
                         # Fallback: use save_idx length (approximate)
                         full_target_size = len(ref_save_idx)
-                    
+
                     scatter_buf_key = f"__scatter_buf_{var_name}"
                     if self.num_trials > 1:
                         buf_shape = (self.num_trials, full_target_size)
@@ -340,11 +340,11 @@ class StatisticsMixin:
 
             for op in ops:
                 out_name = f"{var_name}_{op}"
-                
+
                 # Parse op parts
                 op_parts = op.split('_')
                 outer_op = op_parts[0]
-                
+
                 # Check for K in max/min ops (e.g., max3, min3)
                 k_val = 1
                 match_k = re.match(r'(max|min)(\d+)$', outer_op)
@@ -352,14 +352,14 @@ class StatisticsMixin:
                     outer_base = match_k.group(1)
                     k_val = int(match_k.group(2))
                     outer_op = outer_base # normalize for allocation logic below (mostly)
-                
+
                 # Check for explicit argmax/argmin operators (e.g., argmax, argmax3)
                 arg_match = re.match(r'arg(max|min)(\d*)$', outer_op)
                 arg_k_val = 1  # Default for arg ops
                 if arg_match:
                     arg_k_str = arg_match.group(2)
                     arg_k_val = int(arg_k_str) if arg_k_str else 1
-                
+
                 # Reject standalone topK / argTopK ops — they must be compound
                 # e.g. "max3" alone is invalid; use "max3_last", "max3_max", etc.
                 is_standalone = len(op_parts) == 1
@@ -373,7 +373,7 @@ class StatisticsMixin:
                         f"Standalone argTopK op '{op}' is not allowed. "
                         f"Use a compound form like '{op}_mean' or '{op}_last' instead."
                     )
-                
+
                 # Allocate storage by op
                 if k_val > 1:
                     alloc_shape = actual_shape + (k_val,)
@@ -385,12 +385,12 @@ class StatisticsMixin:
                     arg_type = arg_match.group(1)  # 'max' or 'min'
                     arg_k_str = arg_match.group(2)  # '' or '3' etc
                     # arg_k_val already computed above
-                    
+
                     if arg_k_val > 1:
                         arg_alloc_shape = actual_shape + (arg_k_val,)
                     else:
                         arg_alloc_shape = actual_shape
-                    
+
                     # Store integer indices (macro step index within the window)
                     init_tensor = torch.zeros(arg_alloc_shape, dtype=torch.int32, device=self.device)
                     # Also need to track the corresponding extreme values for comparison
@@ -420,7 +420,7 @@ class StatisticsMixin:
                     # 'last' inner op doesn't need cross-step state - it directly uses current value
                     needs_inner_state = inner_op != 'last'
                     inner_state_name = f"{var_name}_{inner_op}_inner_state"
-                    
+
                     if needs_inner_state and inner_state_name not in self._storage:
                          # Initialize inner state
                          if inner_op == 'mean':
@@ -436,7 +436,7 @@ class StatisticsMixin:
                          else:
                              raise ValueError(f"Unsupported inner op '{inner_op}'.")
                          self._storage[inner_state_name] = init_inner
-                         
+
                          # Allocate weight state only for inner ops that need it (mean)
                          if inner_op == 'mean':
                              weight_state_name = f"{var_name}_{inner_op}_weight_state"
@@ -446,13 +446,13 @@ class StatisticsMixin:
                 if save_coord and save_coord not in self._coord_cache:
                     coord_tensor = self._tensor_registry[save_coord]
                     self._coord_cache[save_coord] = coord_tensor.detach().cpu().numpy()
-                
+
                 # Downcast to save_precision if specified (e.g. float64 -> float32)
                 save_dtype = target_dtype
                 if self.save_precision is not None and target_dtype.is_floating_point:
                     save_dtype = self.save_precision
                 out_dtype = torch_to_numpy_dtype(save_dtype)
-                
+
                 # Check if this is an argmax/argmin op and determine the k value
                 is_arg_op = arg_match is not None
                 # For arg ops, use arg_k_val; otherwise use k_val
@@ -512,7 +512,7 @@ class StatisticsMixin:
                     'scatter': scatter_info,  # None for non-scatter, dict for scatter virtuals
                 }
                 self._metadata[out_name] = meta
-                
+
                 # Classify as outer if it is a compound op (e.g. max_mean)
                 self._output_is_outer[out_name] = len(op_parts) > 1
 
@@ -522,33 +522,33 @@ class StatisticsMixin:
         self._generate_aggregator_function()
         self._prepare_kernel_states()
 
-    
+
 
     def update_statistics(self: StatisticsAggregator, sub_step: int, num_sub_steps: int, flags: int,
-                          weight: float, total_weight: float = 0.0, 
+                          weight: float, total_weight: float = 0.0,
                           BLOCK_SIZE: int = 128) -> None:
         if not self._aggregator_generated:
             raise RuntimeError("Statistics aggregation not initialized. Call initialize_streaming_aggregation() first.")
-        
+
         # Compute boolean flags from sub_step, num_sub_steps, flags
         # flags bits: 0=stat_is_first, 1=stat_is_last, 2=stat_is_outer_first, 3=stat_is_outer_last
         is_inner_last = bool(flags & 2) and (sub_step == num_sub_steps - 1)
         is_outer_first = bool(flags & 4) and is_inner_last
         is_outer_last = bool(flags & 8) and is_inner_last
-        
+
         # Reset macro_step_index at the start of each outer statistics period
         # This ensures argmax/argmin indices are always relative to the start of the period
         if is_outer_first:
             self._macro_step_index = 0
             self._current_macro_step_count = 0.0
             self._outer_flags_ever_seen = True
-            
+
         if is_inner_last:
              for out_name, is_outer in self._output_is_outer.items():
                  # We only trigger dirty for non-outer (Standard) ops when inner loop ends
                  if not is_outer:
                      self._dirty_outputs.add(out_name)
-        
+
         if is_outer_last:
              for out_name, is_outer in self._output_is_outer.items():
                  # We trigger dirty for outer ops when outer loop ends
@@ -571,5 +571,3 @@ class StatisticsMixin:
         states['__macro_step_index'].fill_(self._macro_step_index)
 
         self._aggregator_function(states, BLOCK_SIZE)
-
-    

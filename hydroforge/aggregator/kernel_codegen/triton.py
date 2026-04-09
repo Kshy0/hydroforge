@@ -27,10 +27,10 @@ class TritonCodegenMixin:
         """Generate the header for the kernel file with documentation."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         var_list = sorted(list(self._variables))
-        
+
         header = [
             '"""',
-            f'Auto-generated Triton kernels for hydroforge statistics aggregation (mean/max/min/last)',
+            'Auto-generated Triton kernels for hydroforge statistics aggregation (mean/max/min/last)',
             f'Generated at: {timestamp}',
             f'Rank: {self.rank}',
             f'Variables: {", ".join(var_list)}',
@@ -62,13 +62,13 @@ class TritonCodegenMixin:
             "",
         ]
         return header
-    
+
 
 
     def _write_and_import_kernels(self: StatisticsAggregator, kernel_code: str) -> None:
         """
         Write kernel code to a temporary file and import the module.
-        
+
         Args:
             kernel_code: Generated kernel code as string
         """
@@ -77,7 +77,7 @@ class TritonCodegenMixin:
         with tempfile.NamedTemporaryFile(mode='w', suffix=f'_{unique_name}.py', delete=False) as f:
             f.write(kernel_code)
             self._temp_kernel_file = f.name
-        
+
         # Import the module from the temporary file
         module_name = f"aggr_kernels_r{self.rank}_{unique_name}"
         spec = importlib.util.spec_from_file_location(module_name, self._temp_kernel_file)
@@ -85,7 +85,7 @@ class TritonCodegenMixin:
         # Add to sys.modules to ensure proper import
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
-        
+
         # Bind to instance
         self._kernel_module = module
         self._aggregator_function = getattr(module, 'internal_update_statistics')
@@ -296,14 +296,14 @@ class TritonCodegenMixin:
         """Helper to emit load instructions or expression evaluation recursively."""
         if var_name in emitted:
             return
-        
+
         # Get safe name for this variable
         safe_var_name = self._get_safe_name(var_name)
-        
+
         info = self._field_registry.get(var_name)
         json_extra = getattr(info, 'json_schema_extra', {})
         cat = json_extra.get('category', 'param')
-        
+
         if var_name in self._tensor_registry:
              # Real data in tensor registry (includes virtual source buffers)
              indent = "        " if is_2d else "    "
@@ -341,9 +341,9 @@ class TritonCodegenMixin:
                            self._emit_variable_load(token, code_lines, emitted, is_2d)
                            safe_token = self._get_safe_name(token)
                            safe_expr = re.sub(r'\b' + re.escape(token) + r'\b', safe_token, safe_expr)
-                 
+
                  safe_expr = self._transform_pow_expr(safe_expr)
-                 
+
                  indent = "        " if is_2d else "    "
                  code_lines.append(f"{indent}{safe_var_name} = {safe_expr}")
         else:
@@ -353,9 +353,9 @@ class TritonCodegenMixin:
                   code_lines.append(f"{indent}{safe_var_name} = tl.load({safe_var_name}_ptr + idx * n_levels + level, mask=mask, other=0.0)")
              else:
                   code_lines.append(f"{indent}{safe_var_name} = tl.load({safe_var_name}_ptr + idx, mask=mask, other=0.0)")
-        
+
         emitted.add(var_name)
-    
+
 
 
     def _generate_1d_vars_grouped(self: StatisticsAggregator, kernel_code_lines: List[str], dims_1d: List[str],
@@ -364,17 +364,17 @@ class TritonCodegenMixin:
         Generate 1D variable processing code with conditions grouped for efficiency.
         All operations under the same condition are emitted in a single if block.
         Supports all ops including maxK/minK bubble insert.
-        
+
         Optimization: arg operations (argmax, argmin, argmax3, etc.) can only be outer ops.
         When max+argmax or max3+argmax3 coexist, they are merged to share comparisons.
         """
         from collections import defaultdict
-        
+
         if not dims_1d:
             return
-            
+
         kernel_code_lines.append(f"{indent}# 1D variables")
-        
+
         # Phase 0: Analyze max/argmax pairs for merging optimization
         # For each variable, detect which ops coexist to enable merging
         var_op_analysis = {}  # var -> {'max': bool, 'argmax': bool, 'max3': int, 'argmax3': int, ...}
@@ -404,16 +404,16 @@ class TritonCodegenMixin:
                 if match_argmink:
                     analysis['argminK'][int(match_argmink.group(1))] = True
             var_op_analysis[var] = analysis
-        
+
         # Phase 1: Classify variables by when their value is needed
         vars_need_val = set()  # vars that need val loaded unconditionally (every sub-step)
         vars_conditional_only = set()  # vars only used conditionally (first/last/mid or compound with last/first/mid inner)
-        
+
         # Simple ops that are conditional (only need val at specific points)
         simple_conditional_ops = {'first', 'last', 'mid'}
         # Inner op types that only need the value conditionally (at is_inner_last)
         conditional_inner_ops = {'last', 'first', 'mid'}
-        
+
         for var in dims_1d:
             ops = self._variable_ops[var]
             needs_unconditional = False
@@ -432,17 +432,17 @@ class TritonCodegenMixin:
                 vars_need_val.add(var)
             else:
                 vars_conditional_only.add(var)
-        
+
         # Helper to emit variable value load
         emitted_vars = set()
         def emit_val(v_name, to_lines):
             safe_v_name = self._get_safe_name(v_name)
             if safe_v_name in emitted_vars:
                 return f"{safe_v_name}_val"
-            
+
             info = self._field_registry.get(v_name)
             cat = getattr(info, 'json_schema_extra', {}).get('category', 'param')
-            
+
             if v_name in self._tensor_registry:
                 # Real data (includes virtual source buffers)
                 in_ptr_loc = f"{safe_v_name}_ptr + t * stride_input + idx"
@@ -475,17 +475,17 @@ class TritonCodegenMixin:
             else:
                 in_ptr_loc = f"{safe_v_name}_ptr + t * stride_input + idx"
                 to_lines.append(f"{indent}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
-            
+
             emitted_vars.add(safe_v_name)
             return f"{safe_v_name}_val"
-        
+
         # Phase 2: Collect all operations grouped by condition
         ops_unconditional = []
         ops_is_inner_first = []
         ops_not_is_inner_first = []
         ops_is_inner_last = []
         ops_is_inner_last_is_outer_first = []
-        
+
         # Special storage for maxK/minK operations (need for loop)
         self._maxk_ops = []
         self._argmaxk_ops = []
@@ -493,35 +493,35 @@ class TritonCodegenMixin:
         ops_is_inner_last_is_outer_last = []
         ops_is_inner_last_not_is_outer_last = []
         ops_is_middle = []
-        
+
         # Track which inner aggregations are needed
         inner_aggregations_needed = defaultdict(set)  # inner_type -> set of vars
-        
+
         # Track which merged operations we've already processed
         processed_merged_ops = set()  # (var, op_type, k) tuples
-        
+
         for var in dims_1d:
             safe_var = self._get_safe_name(var)
             ops = self._variable_ops[var]
             out_offset = "t * n_saved_points + offs"
             analysis = var_op_analysis[var]
-            
+
             # Check for compound ops that need inner aggregation
             for op in ops:
                 if '_' in op:
                     inner = op.split('_')[1]
                     inner_aggregations_needed[inner].add(var)
-                
+
             # Process each operation
             for op in ops:
                 out_ptr = f"{safe_var}_{op}_ptr + {out_offset}"
                 op_parts = op.split('_')
-                
+
                 # ===== Compound operations (e.g., max_mean, min_mean) =====
                 if len(op_parts) > 1:
                     outer = op_parts[0]
                     inner = op_parts[1]
-                    
+
                     # Parse maxK/minK/argmaxK/argminK pattern
                     k_val = 1
                     match_k = re.match(r'(arg)?(max|min)(\d+)$', outer)
@@ -532,19 +532,19 @@ class TritonCodegenMixin:
                         k_val = int(match_k.group(3))
                     else:
                         outer_base = outer.lstrip('arg')  # Remove 'arg' prefix if present
-                    
+
                     # Use variable-specific inner aggregation result
                     # For 'last' inner type, directly use the variable value (no intermediate state)
                     if inner == 'last':
                         val_var = f"{safe_var}_val"
                     else:
                         val_var = f"val_for_{safe_var}_{inner}"
-                    
+
                     if is_arg_compound:
                         # Compound argmax/argmin (e.g., argmax_mean, argmax3_mean)
                         arg_type = outer_base  # 'max' or 'min'
                         aux_ptr_base = f"{safe_var}_{arg_type}{k_val if k_val > 1 else ''}_aux_ptr"
-                        
+
                         if k_val == 1:
                             aux_ptr = f"{aux_ptr_base} + {out_offset}"
                             if arg_type == 'max':
@@ -591,7 +591,7 @@ class TritonCodegenMixin:
                                 'var': safe_var, 'op': op, 'k': k_val, 'val_var': val_var,
                                 'out_offset': out_offset, 'type': 'max'
                             })
-                            
+
                     elif outer_base == 'min':
                         # Compound min without automatic arg (e.g., min_mean, min3_mean)
                         if k_val == 1:
@@ -607,7 +607,7 @@ class TritonCodegenMixin:
                                 'var': safe_var, 'op': op, 'k': k_val, 'val_var': val_var,
                                 'out_offset': out_offset, 'type': 'min'
                             })
-                            
+
                     elif outer == 'mean':
                         ops_is_inner_last_is_outer_first.append(
                             f"{safe_var}_{op}_accum = {val_var}")
@@ -617,7 +617,7 @@ class TritonCodegenMixin:
                             f"tl.store({out_ptr}, {safe_var}_{op}_accum / num_macro_steps, mask=mask)")
                         ops_is_inner_last_not_is_outer_last.append(
                             f"tl.store({out_ptr}, {safe_var}_{op}_accum, mask=mask)")
-                            
+
                     elif outer == 'sum':
                         ops_is_inner_last_is_outer_first.append(
                             f"tl.store({out_ptr}, {val_var}, mask=mask)")
@@ -634,7 +634,7 @@ class TritonCodegenMixin:
                         ops_is_inner_last_is_outer_first.append(
                             f"tl.store({out_ptr}, {val_var}, mask=mask)")
                     continue
-                
+
                 # ===== Simple operations (non-compound) =====
                 if op == 'mean':
                     inner_ops = set(o.split('_')[1] for o in ops if '_' in o)
@@ -650,13 +650,13 @@ class TritonCodegenMixin:
                             f"{safe_var}_mean_out = tl.where(is_inner_last, {safe_var}_mean_new / total_weight, {safe_var}_mean_new)",
                         ])
                         ops_unconditional.append(f"tl.store({out_ptr}, {safe_var}_mean_out, mask=mask)")
-                        
+
                 elif op == 'sum':
                     ops_unconditional.extend([
                         f"{safe_var}_sum_old = tl.where(is_inner_first, tl.zeros_like({safe_var}_val), tl.load({out_ptr}, mask=mask, other=0.0))",
                         f"tl.store({out_ptr}, {safe_var}_sum_old + {safe_var}_val * weight, mask=mask)",
                     ])
-                
+
                 # ===== max/argmax MERGED handling =====
                 elif op == 'max':
                     has_argmax = analysis['argmax']
@@ -664,7 +664,7 @@ class TritonCodegenMixin:
                     if merge_key in processed_merged_ops:
                         continue  # Already processed as merged
                     processed_merged_ops.add(merge_key)
-                    
+
                     if has_argmax:
                         # MERGED: max + argmax share the same comparison
                         aux_ptr = f"{safe_var}_max_aux_ptr + {out_offset}"
@@ -692,14 +692,14 @@ class TritonCodegenMixin:
                             f"{safe_var}_max_old = tl.load({out_ptr}, mask=mask, other={safe_var}_val)",
                             f"tl.store({out_ptr}, tl.where({safe_var}_val > {safe_var}_max_old, {safe_var}_val, {safe_var}_max_old), mask=mask)",
                         ])
-                
+
                 elif op == 'argmax':
                     has_max = analysis['max']
                     merge_key = (var, 'max', 1)
                     if has_max:
                         # Will be handled by 'max' branch
                         continue
-                    
+
                     # argmax only (no max)
                     aux_ptr = f"{safe_var}_max_aux_ptr + {out_offset}"
                     ops_is_inner_first.extend([
@@ -712,7 +712,7 @@ class TritonCodegenMixin:
                         f"tl.store({aux_ptr}, tl.where({safe_var}_argmax_cond, {safe_var}_val, {safe_var}_argmax_aux_old), mask=mask)",
                         f"tl.store({out_ptr}, macro_step_index, mask=mask & {safe_var}_argmax_cond)",
                     ])
-                    
+
                 # ===== min/argmin MERGED handling =====
                 elif op == 'min':
                     has_argmin = analysis['argmin']
@@ -720,7 +720,7 @@ class TritonCodegenMixin:
                     if merge_key in processed_merged_ops:
                         continue
                     processed_merged_ops.add(merge_key)
-                    
+
                     if has_argmin:
                         # MERGED: min + argmin share the same comparison
                         aux_ptr = f"{safe_var}_min_aux_ptr + {out_offset}"
@@ -748,14 +748,14 @@ class TritonCodegenMixin:
                             f"{safe_var}_min_old = tl.load({out_ptr}, mask=mask, other={safe_var}_val)",
                             f"tl.store({out_ptr}, tl.where({safe_var}_val < {safe_var}_min_old, {safe_var}_val, {safe_var}_min_old), mask=mask)",
                         ])
-                
+
                 elif op == 'argmin':
                     has_min = analysis['min']
                     merge_key = (var, 'min', 1)
                     if has_min:
                         # Will be handled by 'min' branch
                         continue
-                    
+
                     # argmin only (no min)
                     aux_ptr = f"{safe_var}_min_aux_ptr + {out_offset}"
                     ops_is_inner_first.extend([
@@ -768,7 +768,7 @@ class TritonCodegenMixin:
                         f"tl.store({aux_ptr}, tl.where({safe_var}_argmin_cond, {safe_var}_val, {safe_var}_argmin_aux_old), mask=mask)",
                         f"tl.store({out_ptr}, macro_step_index, mask=mask & {safe_var}_argmin_cond)",
                     ])
-                
+
                 # ===== maxK / argmaxK handling =====
                 elif op.startswith('max') and re.match(r'^max(\d+)$', op):
                     match = re.match(r'^max(\d+)$', op)
@@ -778,7 +778,7 @@ class TritonCodegenMixin:
                     if merge_key in processed_merged_ops:
                         continue
                     processed_merged_ops.add(merge_key)
-                    
+
                     if has_argmaxk:
                         # MERGED: maxK + argmaxK - store both val and idx in bubble insert
                         self._argmaxk_ops.append({
@@ -793,7 +793,7 @@ class TritonCodegenMixin:
                             'var': safe_var, 'op': op, 'k': k_val, 'val_var': f'{safe_var}_val',
                             'out_offset': out_offset, 'type': 'max'
                         })
-                
+
                 elif op.startswith('argmax') and re.match(r'^argmax(\d+)$', op):
                     match = re.match(r'^argmax(\d+)$', op)
                     k_val = int(match.group(1))
@@ -802,14 +802,14 @@ class TritonCodegenMixin:
                     if has_maxk:
                         # Will be handled by maxK branch
                         continue
-                    
+
                     # argmaxK only - bubble insert with aux for values
                     self._argmaxk_ops.append({
                         'var': safe_var, 'op': op, 'k': k_val, 'val_var': f'{safe_var}_val',
                         'out_offset': out_offset, 'type': 'argmax',
                         'has_val_output': False
                     })
-                
+
                 # ===== minK / argminK handling =====
                 elif op.startswith('min') and re.match(r'^min(\d+)$', op):
                     match = re.match(r'^min(\d+)$', op)
@@ -819,7 +819,7 @@ class TritonCodegenMixin:
                     if merge_key in processed_merged_ops:
                         continue
                     processed_merged_ops.add(merge_key)
-                    
+
                     if has_argmink:
                         # MERGED: minK + argminK
                         self._argmaxk_ops.append({
@@ -834,7 +834,7 @@ class TritonCodegenMixin:
                             'var': safe_var, 'op': op, 'k': k_val, 'val_var': f'{safe_var}_val',
                             'out_offset': out_offset, 'type': 'min'
                         })
-                
+
                 elif op.startswith('argmin') and re.match(r'^argmin(\d+)$', op):
                     match = re.match(r'^argmin(\d+)$', op)
                     k_val = int(match.group(1))
@@ -843,20 +843,20 @@ class TritonCodegenMixin:
                     if has_mink:
                         # Will be handled by minK branch
                         continue
-                    
+
                     # argminK only
                     self._argmaxk_ops.append({
                         'var': safe_var, 'op': op, 'k': k_val, 'val_var': f'{safe_var}_val',
                         'out_offset': out_offset, 'type': 'argmin',
                         'has_val_output': False
                     })
-                    
+
                 elif op == 'last':
                     if var in vars_conditional_only:
                         # Check if this var also has compound ops with 'last' inner type
                         # If so, the deferred load inside is_inner_last block will already load the val
                         has_compound_last = any(
-                            '_last' in other_op and other_op != 'last' 
+                            '_last' in other_op and other_op != 'last'
                             for other_op in self._variable_ops[var]
                         )
                         if has_compound_last:
@@ -870,7 +870,7 @@ class TritonCodegenMixin:
                             ops_is_inner_last.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                     else:
                         ops_is_inner_last.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
-                        
+
                 elif op == 'first':
                     if var in vars_conditional_only:
                         has_compound_first = any(
@@ -888,7 +888,7 @@ class TritonCodegenMixin:
                             ops_is_inner_first.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                     else:
                         ops_is_inner_first.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
-                        
+
                 elif op == 'mid':
                     if var in vars_conditional_only:
                         # Load inline — use emit_val for scatter virtual support
@@ -898,16 +898,16 @@ class TritonCodegenMixin:
                         ops_is_middle.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                     else:
                         ops_is_middle.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
-                
+
         # Phase 3: Emit loads for vars that need unconditional val
         for var in vars_need_val:
             emit_val(var, kernel_code_lines)
-        
+
         # For conditional-only vars used in compound ops with 'last' inner type,
         # ensure the variable val is emitted (will be loaded inside is_inner_last block later)
         # We need to track them but NOT emit unconditional loads here.
         # The load will be emitted inside the is_inner_last block in Phase 6.
-        
+
         # Phase 4: Emit inner aggregation state updates (per-variable)
         # Each variable gets its own inner aggregation state (val_for_{safe_var}_{inner_type})
         # For 'last' inner type, no state is needed - the value is simply the current variable value
@@ -918,7 +918,7 @@ class TritonCodegenMixin:
                 out_offset = "t * n_saved_points + offs"
                 val_for_var_inner = f"val_for_{safe_var}_{inner_type}"
                 var_val = f"{safe_var}_val"
-                
+
                 if inner_type == 'last':
                     # 'last' is the simplest: val_for_X_last == X_val at is_inner_last.
                     # No state storage, no load/store needed.
@@ -982,17 +982,17 @@ class TritonCodegenMixin:
                         f"{indent}{val_for_var_inner} = tl.where(is_inner_last, tl.load({inner_ptr}, mask=mask, other=0.0), {val_for_var_inner})",
                     ])
                 # Note: removed 'break' - now generate for each variable in inner_vars
-        
+
         # Phase 5: Emit unconditional ops
         for line in ops_unconditional:
             kernel_code_lines.append(f"{indent}{line}")
-        
+
         # Phase 6: Emit grouped conditional blocks
         if ops_is_inner_first:
             kernel_code_lines.append(f"{indent}if is_inner_first:")
             for line in ops_is_inner_first:
                 kernel_code_lines.append(f"{indent2}{line}")
-                
+
         if ops_not_is_inner_first:
             if ops_is_inner_first:
                 kernel_code_lines.append(f"{indent}else:")
@@ -1000,21 +1000,21 @@ class TritonCodegenMixin:
                 kernel_code_lines.append(f"{indent}if not is_inner_first:")
             for line in ops_not_is_inner_first:
                 kernel_code_lines.append(f"{indent2}{line}")
-        
+
         if ops_is_middle:
             kernel_code_lines.append(f"{indent}if is_middle:")
             for line in ops_is_middle:
                 kernel_code_lines.append(f"{indent2}{line}")
-        
+
         # Nested conditions for is_inner_last with outer conditions
         has_argmaxk_ops = hasattr(self, '_argmaxk_ops') and self._argmaxk_ops
-        has_inner_last_ops = (ops_is_inner_last or ops_is_inner_last_is_outer_first or 
+        has_inner_last_ops = (ops_is_inner_last or ops_is_inner_last_is_outer_first or
                              ops_is_inner_last_not_is_outer_first or ops_is_inner_last_is_outer_last or
                              ops_is_inner_last_not_is_outer_last or self._maxk_ops or has_argmaxk_ops)
-        
+
         if has_inner_last_ops:
             kernel_code_lines.append(f"{indent}if is_inner_last:")
-            
+
             # Emit deferred loads for conditional-only vars used in compound ops
             # These vars are only needed inside is_inner_last, so we load them here
             for var in dims_1d:
@@ -1026,7 +1026,7 @@ class TritonCodegenMixin:
                     if kernel_code_lines and kernel_code_lines[-1].startswith(indent) and not kernel_code_lines[-1].startswith(indent2):
                         last_line = kernel_code_lines.pop()
                         kernel_code_lines.append(f"{indent2}{last_line.lstrip()}")
-            
+
             # is_outer_first / not is_outer_first
             if ops_is_inner_last_is_outer_first or ops_is_inner_last_not_is_outer_first:
                 kernel_code_lines.append(f"{indent2}if is_outer_first:")
@@ -1036,7 +1036,7 @@ class TritonCodegenMixin:
                     kernel_code_lines.append(f"{indent2}else:")
                     for line in ops_is_inner_last_not_is_outer_first:
                         kernel_code_lines.append(f"{indent3}{line}")
-            
+
             # is_outer_last / not is_outer_last (for mean finalization)
             if ops_is_inner_last_is_outer_last or ops_is_inner_last_not_is_outer_last:
                 kernel_code_lines.append(f"{indent2}if is_outer_last:")
@@ -1046,44 +1046,44 @@ class TritonCodegenMixin:
                     kernel_code_lines.append(f"{indent2}else:")
                     for line in ops_is_inner_last_not_is_outer_last:
                         kernel_code_lines.append(f"{indent3}{line}")
-            
+
             # Simple is_inner_last ops
             for line in ops_is_inner_last:
                 kernel_code_lines.append(f"{indent2}{line}")
-            
+
             # ================================================================
             # Optimized MaxK/MinK + ArgmaxK/ArgminK bubble insert operations
-            
+
             # Group by (var, k, out_offset) to share base offset across all operations
             from collections import defaultdict
             grouped_by_var_k = defaultdict(lambda: {'max': None, 'min': None, 'argmax': None, 'argmin': None})
-            
+
             for maxk_op in self._maxk_ops:
                 key = (maxk_op['var'], maxk_op['k'], maxk_op['out_offset'])
                 grouped_by_var_k[key][maxk_op['type']] = maxk_op
-            
+
             if hasattr(self, '_argmaxk_ops') and self._argmaxk_ops:
                 for argk_op in self._argmaxk_ops:
                     key = (argk_op['var'], argk_op['k'], argk_op['out_offset'])
                     op_type = 'argmax' if 'max' in argk_op['type'] else 'argmin'
                     grouped_by_var_k[key][op_type] = argk_op
-            
+
             # Process grouped operations with shared offset
             for (safe_var, k_val, out_offset), ops_dict in grouped_by_var_k.items():
                 has_max = ops_dict['max'] is not None
                 has_min = ops_dict['min'] is not None
                 has_argmax = ops_dict['argmax'] is not None
                 has_argmin = ops_dict['argmin'] is not None
-                
+
                 # Get val_var from each operation (may differ: val for max/min, val_for_mean for argmax/argmin)
                 max_val_var = ops_dict['max']['val_var'] if has_max else None
                 min_val_var = ops_dict['min']['val_var'] if has_min else None
                 argmax_val_var = ops_dict['argmax']['val_var'] if has_argmax else None
                 argmin_val_var = ops_dict['argmin']['val_var'] if has_argmin else None
-                
+
                 # Compute shared base offset once
                 out_offset_k = f"({out_offset}) * {k_val}"
-                
+
                 # Generate header comment
                 op_names = []
                 if has_max: op_names.append(f"max{k_val}")
@@ -1091,10 +1091,10 @@ class TritonCodegenMixin:
                 if has_argmax: op_names.append(f"argmax{k_val}")
                 if has_argmin: op_names.append(f"argmin{k_val}")
                 kernel_code_lines.append(f"{indent2}# Merged Bubble Insert [{'+'.join(op_names)}] for {safe_var} (shared offset, precise mask)")
-                
+
                 # Shared base offset computation
                 kernel_code_lines.append(f"{indent2}{safe_var}_k{k_val}_base_offs = {out_offset_k}")
-                
+
                 # Initialize new values for bubble insert (using correct val_var for each op type)
                 if has_max:
                     kernel_code_lines.append(f"{indent2}new_val_max_{safe_var} = {max_val_var}")
@@ -1106,10 +1106,10 @@ class TritonCodegenMixin:
                     kernel_code_lines.append(f"{indent2}new_val_argmin_{safe_var} = {argmin_val_var}")
                 if has_argmax or has_argmin:
                     kernel_code_lines.append(f"{indent2}new_idx_{safe_var} = tl.full([BLOCK_SIZE], macro_step_index, dtype=tl.int32)")
-                
+
                 # is_outer_first branch: initialize all arrays
                 kernel_code_lines.append(f"{indent2}if is_outer_first:")
-                
+
                 # First position stores the initial value
                 if has_max:
                     max_ptr = f"{safe_var}_{ops_dict['max']['op']}_ptr"
@@ -1133,7 +1133,7 @@ class TritonCodegenMixin:
                     kernel_code_lines.append(f"{indent3}tl.store({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs, new_val_argmin_{safe_var}, mask=mask)")
                     if argmin_op.get('has_val_output') and argmin_op.get('val_output_ptr'):
                         kernel_code_lines.append(f"{indent3}tl.store({argmin_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs, new_val_argmin_{safe_var}, mask=mask)")
-                
+
                 # Initialize remaining positions with inf/-inf
                 kernel_code_lines.append(f"{indent3}for k in tl.static_range(1, {k_val}):")
                 if has_max:
@@ -1150,11 +1150,11 @@ class TritonCodegenMixin:
                     kernel_code_lines.append(f"{indent4}tl.store({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, float('inf'), mask=mask)")
                     if argmin_op.get('has_val_output') and argmin_op.get('val_output_ptr'):
                         kernel_code_lines.append(f"{indent4}tl.store({argmin_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs + k, float('inf'), mask=mask)")
-                
+
                 # else branch: bubble insert
                 kernel_code_lines.append(f"{indent2}else:")
                 kernel_code_lines.append(f"{indent3}for k in tl.static_range({k_val}):")
-                
+
                 # Load old values and compute swap masks
                 if has_max:
                     kernel_code_lines.extend([
@@ -1200,12 +1200,12 @@ class TritonCodegenMixin:
                     ])
                     if argmin_op.get('has_val_output') and argmin_op.get('val_output_ptr'):
                         kernel_code_lines.append(f"{indent4}tl.store({argmin_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs + k, argmin_aux_store, mask=mask & swap_argmin)")
-            
+
             # Reset operation lists
             self._maxk_ops = []
             if hasattr(self, '_argmaxk_ops'):
                 self._argmaxk_ops = []
-        
+
         kernel_code_lines.append("")
 
 
@@ -1257,7 +1257,7 @@ class TritonCodegenMixin:
                                  _gather_inputs(t)
              else:
                   input_ptrs.add(name)
-        
+
         for var in var_list:
              _gather_inputs(var)
 
@@ -1275,15 +1275,15 @@ class TritonCodegenMixin:
             safe_var = self._get_safe_name(var)
             # Track which extra state pointers have been added to avoid duplicates
             added_aux_ptrs = set()  # Track aux pointers already added (for explicit argmax/argmin)
-            
+
             for op in self._variable_ops[var]:
                 kernel_code_lines.append(f"    {safe_var}_{op}_ptr,")
-                
+
                 # For EXPLICIT argmax/argmin operators, add aux pointer for tracking values
                 # NO automatic argmax/argmin generation for max/min operations
                 op_parts = op.split('_')
                 outer_op = op_parts[0]
-                
+
                 # Check for explicit argmax/argmin (e.g., argmax, argmax3, argmin, argmin3)
                 arg_match = re.match(r'arg(max|min)(\d*)$', outer_op)
                 if arg_match:
@@ -1294,7 +1294,7 @@ class TritonCodegenMixin:
                     if aux_name not in added_aux_ptrs:
                         kernel_code_lines.append(f"    {safe_var}_{aux_name}_ptr,")
                         added_aux_ptrs.add(aux_name)
-            
+
             # Inner state pointers (only for ops that need cross-step state)
             added_inner = set()
             for op in self._variable_ops[var]:
@@ -1371,7 +1371,7 @@ class TritonCodegenMixin:
 
         # 1D processing - use grouped generation for all vars
         if dims_1d:
-            self._generate_1d_vars_grouped(kernel_code_lines, dims_1d, 
+            self._generate_1d_vars_grouped(kernel_code_lines, dims_1d,
                                            indent, indent2, indent3, indent4, indent5)
 
         # 2D processing
@@ -1388,10 +1388,10 @@ class TritonCodegenMixin:
                 def emit_val_2d(v_name):
                     safe_v_name = self._get_safe_name(v_name)
                     if safe_v_name in emitted_vars_2d: return f"{safe_v_name}_val"
-                    
+
                     info = self._field_registry.get(v_name)
                     cat = getattr(info, 'json_schema_extra', {}).get('category', 'param') if info else 'param'
-                    
+
                     if v_name in self._tensor_registry:
                          # Real data (includes virtual source buffers)
                          in_ptr_loc = f"{safe_v_name}_ptr + (t * stride_input + idx) * n_levels + level"
@@ -1423,14 +1423,14 @@ class TritonCodegenMixin:
                     else:
                          in_ptr_loc = f"{safe_v_name}_ptr + (t * stride_input + idx) * n_levels + level"
                          kernel_code_lines.append(f"{indent2}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
-                    
+
                     emitted_vars_2d.add(safe_v_name)
                     return f"{safe_v_name}_val"
 
                 for var in non_last_only:
                     safe_var = self._get_safe_name(var)
-                    out_offset = f"(t * n_saved_points + offs) * n_levels + level"
-                    
+                    out_offset = "(t * n_saved_points + offs) * n_levels + level"
+
                     val_name = emit_val_2d(var)
                     kernel_code_lines.append(f"{indent2}val = {val_name}")
 
@@ -1473,7 +1473,7 @@ class TritonCodegenMixin:
                              kernel_code_lines.extend([
                                  f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent2}if is_first and macro_step_index==0:", 
+                                 f"{indent2}if is_first and macro_step_index==0:",
                                  f"{indent3}inner_{inner}_new = val",
                                  f"{indent2}else:",
                                  f"{indent3}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
@@ -1558,7 +1558,7 @@ class TritonCodegenMixin:
                         if len(op_parts) > 1:
                             outer = op_parts[0]
                             inner = op_parts[1]
-                            
+
                             # Parse K
                             k_val = 1
                             match_k = re.match(r'(max|min)(\d+)$', outer)
@@ -1568,7 +1568,7 @@ class TritonCodegenMixin:
 
                             val_var = f"val_for_{inner}"
                             kernel_code_lines.append(f"{indent2}if is_macro_step_end:")
-                            
+
                             if outer == 'max':
                                 # argmax pointer (automatically created alongside max)
                                 argmax_ptr = f"{safe_var}_arg{op}_ptr + {out_offset}"
@@ -1594,7 +1594,7 @@ class TritonCodegenMixin:
                                         f"{indent3}k_offset = ({out_offset}) * {k_val}",
                                         f"{indent3}base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         f"{indent3}idx_base_ptr = {safe_var}_{argmax_op}_ptr + k_offset",
-                                        
+
                                         f"{indent3}if is_outer_first and macro_step_index==0:",
                                         f"{indent4}tl.store(base_ptr, new_val, mask=mask)",
                                         f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
@@ -1639,7 +1639,7 @@ class TritonCodegenMixin:
                                         f"{indent3}k_offset = ({out_offset}) * {k_val}",
                                         f"{indent3}base_ptr = {safe_var}_{op}_ptr + k_offset",
                                         f"{indent3}idx_base_ptr = {safe_var}_{argmin_op}_ptr + k_offset",
-                                        
+
                                         f"{indent3}if is_outer_first and macro_step_index==0:",
                                         f"{indent4}tl.store(base_ptr, new_val, mask=mask)",
                                         f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
@@ -1764,8 +1764,8 @@ class TritonCodegenMixin:
                 ])
                 for var in last_only_vars:
                     safe_var = self._get_safe_name(var)
-                    out_offset = f"(t * n_saved_points + offs) * n_levels + level"
-                    
+                    out_offset = "(t * n_saved_points + offs) * n_levels + level"
+
                     val_name = emit_val_2d(var)
                     kernel_code_lines.extend([
                         f"{indent3}val = {val_name}",
@@ -1783,15 +1783,15 @@ class TritonCodegenMixin:
             "# Main update function",
             "def internal_update_statistics(states, BLOCK_SIZE):",
         ])
-        
+
         if self.num_trials > 1:
              kernel_code_lines.append(f"    num_trials = {self.num_trials}")
         else:
-             kernel_code_lines.append(f"    num_trials = 1")
+             kernel_code_lines.append("    num_trials = 1")
 
         for save_idx, var_list in grouped_by_save_idx.items():
             kernel_name = f"kernel_{save_idx}"
-            
+
             # Get stride_input from metadata of first variable
             first_var = var_list[0]
             stride_input = 0
@@ -1799,7 +1799,7 @@ class TritonCodegenMixin:
                 if meta['original_variable'] == first_var:
                     stride_input = meta.get('stride_input', 0)
                     break
-            
+
             kernel_code_lines.extend([
                 f"    # Launch kernel for {save_idx}",
                 f"    save_idx_len = len(states['{save_idx}'])",
@@ -1815,13 +1815,12 @@ class TritonCodegenMixin:
                     scatter = parse_scatter_expr(expr) if expr else None
                     if scatter:
                         scatter_virtuals_in_group[var] = scatter
-            
+
             if scatter_virtuals_in_group:
-                kernel_code_lines.append(f"    # Scatter pre-step: Triton kernels")
+                kernel_code_lines.append("    # Scatter pre-step: Triton kernels")
                 for var, scatter in scatter_virtuals_in_group.items():
                     safe_var = self._get_safe_name(var)
                     buf_key = f"__scatter_buf_{var}"
-                    buf_safe = self._get_safe_name(buf_key)
                     is_mean = scatter.mode == 'mean'
 
                     # Determine N (target size) and M (source size)
@@ -1902,13 +1901,13 @@ class TritonCodegenMixin:
                             f"({', '.join(div_args)})"
                         )
                 kernel_code_lines.append("")
-            
+
             kernel_code_lines.extend([
                 f"    grid_{save_idx} = lambda meta: (triton.cdiv(save_idx_len, meta['BLOCK_SIZE']),)",
                 f"    {kernel_name}[grid_{save_idx}](",
                 f"        {save_idx}_ptr=states['{save_idx}'],",
             ])
-            
+
             # Gather input pointers (resolving virtuals)
             input_args = set()
             def _gather_inputs(name):
@@ -1934,7 +1933,7 @@ class TritonCodegenMixin:
                                      _gather_inputs(t)
                  else:
                       input_args.add(name)
-            
+
             for var in var_list:
                  _gather_inputs(var)
 
@@ -1946,19 +1945,19 @@ class TritonCodegenMixin:
                  if safe_var == save_idx:
                      continue
                  kernel_code_lines.append(f"        {safe_var}_ptr=states['{var}'],")
-            
+
             # Add variable output pointers
             for var in var_list:
                 safe_var = self._get_safe_name(var)
                 added_aux_ptrs = set()  # Track aux pointers for explicit argmax/argmin
                 for op in self._variable_ops[var]:
                     kernel_code_lines.append(f"        {safe_var}_{op}_ptr=states['{var}_{op}'],")
-                    
+
                     # For EXPLICIT argmax/argmin operations, add aux pointer
                     # NO automatic argmax/argmin generation for max/min operations
                     op_parts = op.split('_')
                     outer_op = op_parts[0]
-                    
+
                     # Check for explicit argmax/argmin (e.g., argmax, argmax3, argmin, argmin3)
                     arg_match = re.match(r'arg(max|min)(\d*)$', outer_op)
                     if arg_match:
@@ -1969,7 +1968,7 @@ class TritonCodegenMixin:
                             aux_storage_key = f"{var}_{arg_type}{arg_k_str if arg_k_str else ''}_aux"
                             kernel_code_lines.append(f"        {safe_var}_{aux_name}_ptr=states['{aux_storage_key}'],")
                             added_aux_ptrs.add(aux_name)
-                
+
                 # Inner state pointers (only for ops that need cross-step state)
                 added_inner = set()
                 for op in self._variable_ops[var]:
@@ -1982,7 +1981,7 @@ class TritonCodegenMixin:
                              if inner == 'mean':
                                  kernel_code_lines.append(f"        {safe_var}_{inner}_weight_state_ptr=states['{var}_{inner}_weight_state'],")
                              added_inner.add(inner)
-            
+
             kernel_code_lines.extend([
                 "        weight_ptr=states['__weight'],",
                 "        total_weight_ptr=states['__total_weight'],",
@@ -1993,7 +1992,7 @@ class TritonCodegenMixin:
                 "        macro_step_index_ptr=states['__macro_step_index'],",
                 "        n_saved_points=save_idx_len,",
             ])
-            
+
             # Add second dimension if needed (use actual shape)
             if self.num_trials > 1:
                 dims_2d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 3]
@@ -2005,7 +2004,7 @@ class TritonCodegenMixin:
                 actual_shape = tensor_info[var_2d]['actual_shape']
                 n_levels = actual_shape[-1]
                 kernel_code_lines.append(f"        n_levels={n_levels},")
-            
+
             kernel_code_lines.extend([
                 "        BLOCK_SIZE=BLOCK_SIZE,",
                 "        num_trials=num_trials,",

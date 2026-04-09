@@ -147,7 +147,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
     _modules: Dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
 
     _statistics_aggregator: Optional[StatisticsAggregator] = PrivateAttr(default=None)
-    
+
     # Parameter Change Plan State
     _plans: List[PlanItem] = PrivateAttr(default_factory=list)
     _active_plans: List[ActivePlan] = PrivateAttr(default_factory=list)
@@ -172,7 +172,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 # Create a dummy object to get the class type for this calendar
                 dummy = cftime.num2date([0], units="days since 1900-01-01", calendar=self.calendar)[0]
                 Cls = dummy.__class__
-                
+
                 kwargs = {}
                 if hasattr(dummy, "has_year_zero"):
                     kwargs["has_year_zero"] = dummy.has_year_zero
@@ -204,12 +204,12 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             if module_name not in self.module_list:
                 continue
             module_class = self.module_list[module_name]
-            
+
             # Regular fields
             for name, info in module_class.get_model_fields().items():
                 if name not in module_class.nc_excluded_fields:
                     yield module_name, module_class, name, info
-            
+
             # Computed fields
             if include_computed:
                 for name, info in module_class.get_model_computed_fields().items():
@@ -247,7 +247,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         for module_name, _, field_name, field_info in self._iter_all_fields(include_computed=True):
             if field_name in field_definitions:
                 existing_module, existing_info = field_definitions[field_name]
-                
+
                 new_extra = getattr(field_info, 'json_schema_extra', {}) or {}
                 old_extra = getattr(existing_info, 'json_schema_extra', {}) or {}
 
@@ -266,7 +266,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 # Compare definitions
                 new_type = getattr(field_info, 'annotation', getattr(field_info, 'return_type', None))
                 old_type = getattr(existing_info, 'annotation', getattr(existing_info, 'return_type', None))
-                
+
                 if new_type != old_type or new_extra != old_extra:
                     raise ValueError(
                         f"Namespace conflict detected for field '{field_name}':\n"
@@ -282,14 +282,14 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         Post-initialization hook to validate opened modules and register them.
         """
         print(f"[rank {self.rank}]: Initializing ModelManager with opened modules:", self.opened_modules)
-        
+
         self.check_namespace_conflicts()
-        
+
         print(f"Using primary group variable: {self.group_by}")
 
         # Validate that all opened modules are registered
         module_data = self.shard_param()  # reads from NetCDF
-        
+
         # Sort modules by dependency
         from graphlib import TopologicalSorter
         sorter = TopologicalSorter()
@@ -300,7 +300,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             # Only include dependencies that are in opened_modules
             active_deps = [d for d in deps if d in self.opened_modules]
             sorter.add(module_name, *active_deps)
-            
+
         # Get sorted order
         sorted_modules = list(sorter.static_order())
 
@@ -336,7 +336,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
     def print_memory_summary(self) -> None:
         """
         Print a summary of memory usage by module.
-        
+
         Each variable is attributed to the first module where it appears;
         duplicates (shared tensors) are skipped so total is never over-counted.
         """
@@ -347,12 +347,12 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         print(f"\n[rank {self.rank}] Memory Usage Summary:")
         print(f"{'Module':<30} | {'Memory (MB)':<15}")
         print(f"{'-' * 48}")
-        
+
         for module_name in self.opened_modules:
             if module_name not in self._modules:
                 continue
             module = self._modules[module_name]
-            
+
             # Count only tensors not yet seen globally
             module_bytes = 0
             all_fields = module.get_model_fields().copy()
@@ -370,16 +370,16 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     if ptr not in global_seen_ptrs:
                         global_seen_ptrs.add(ptr)
                         module_bytes += value.element_size() * value.nelement()
-            
+
             total_memory += module_bytes
             print(f"{module_name:<30} | {module_bytes / (1024 * 1024):<15.2f}")
-        
+
         # Add StatisticsAggregator memory usage
         if self._statistics_aggregator is not None:
             aggregator_mem = self._statistics_aggregator.get_memory_usage()
             total_memory += aggregator_mem
             print(f"{'StatisticsAggregator':<30} | {aggregator_mem / (1024 * 1024):<15.2f}")
-            
+
         print(f"{'-' * 48}")
         print(f"{'Total':<30} | {total_memory / (1024 * 1024):<15.2f} MB\n")
 
@@ -426,7 +426,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             module = self.get_module(module_name)
             if module is None:
                 continue
-            
+
             # Determine ID attribute for coordinate lookup
             id_attr = None
             dim_coords = None
@@ -434,7 +434,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 dim_coords = field_info.json_schema_extra.get("dim_coords")
             if dim_coords:
                 id_attr = dim_coords
-            
+
             entry = (module, field_name, id_attr)
             extra = getattr(field_info, 'json_schema_extra', {}) or {}
             is_expr_virtual = (extra.get('category') == 'virtual'
@@ -457,7 +457,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
             # Qualified name: always set
             mapping[f"{module_name}.{field_name}"] = entry
-            
+
         return mapping
 
     @cached_property
@@ -511,7 +511,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         for op, vars_val in self.variables_to_save.items():
             op_l = str(op).lower()
             op_parts = op_l.split('_')
-            
+
             # Validate op parts
             for p in op_parts:
                 # Check against allowed patterns
@@ -547,7 +547,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 items = vars_val
             else:
                 raise ValueError(f"variables_to_save['{op}'] must be a string, tuple (name, expr), or list of them.")
-            
+
             for item in items:
                 if isinstance(item, str):
                     name = item
@@ -573,7 +573,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
         # Handle ad-hoc expressions in var_to_ops
         adhoc_virtuals: Dict[str, Any] = {}
-        
+
         from hydroforge.aggregator.scatter_expr import parse_scatter_expr
 
         def get_field_meta(name):
@@ -609,16 +609,16 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                                         f"'{tok}' not found in any module."
                                     )
                 continue
-            
+
             # If provided as tuple, usage is explicit. If string, assume string IS the expression.
             expression = explicit_expressions.get(var_name, var_name)
-            
+
             # Check if it looks like an expression (simple heuristic)
             # and if we can resolve its tokens
-            
+
             # Try to parse as scatter expression first
             scatter = parse_scatter_expr(expression)
-            
+
             if scatter is not None:
                 raise ValueError(
                     f"Scatter expression '{expression}' for ad-hoc variable '{var_name}' "
@@ -626,16 +626,16 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     f"a module using computed_tensor_field(category='virtual', expr=...) "
                     f"with explicit save_idx/save_coord pointing to the target dimension."
                 )
-            
+
             # ── Plain elementwise expression ──
             from hydroforge.aggregator.scatter_expr import extract_tokens
             tokens = extract_tokens(expression)
-            
+
             valid_deps = []
             for t in tokens:
                  if t in self.variable_map:
                       valid_deps.append(t)
-            
+
             # If no dependencies found, skip (likely invalid or constant)
             if not valid_deps:
                  continue
@@ -645,7 +645,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             ref_meta = get_field_meta(valid_deps[0])
             # Only enforce save_idx and dim_coords roughly.
             # save_coord might act differently but usually matches too.
-            
+
             for dep in valid_deps[1:]:
                  curr_meta = get_field_meta(dep)
                  if curr_meta != ref_meta:
@@ -657,7 +657,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
             # Create FieldInfo
             save_idx, save_coord, dim_coords = ref_meta
-            
+
             new_info = Field(
                 description=f"Ad-hoc expression: {expression}",
                 json_schema_extra={
@@ -668,15 +668,15 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     "dim_coords": dim_coords
                 }
             )
-            
+
             adhoc_virtuals[var_name] = new_info
 
-        # No need to sanitize names or update var_to_ops keys further, 
+        # No need to sanitize names or update var_to_ops keys further,
         # as var_to_ops already uses the keys we intend to register.
 
 
         registered_vars_by_shape: Dict[str, List[str]] = {}
-        
+
         # 1. Expand variables to include dependencies of virtual variables
         vars_to_process = list(var_to_ops.keys())
         vars_seen = set(vars_to_process)
@@ -684,7 +684,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         while idx < len(vars_to_process):
             curr_var = vars_to_process[idx]
             idx += 1
-            
+
             if curr_var not in self.variable_map:
                 if curr_var in adhoc_virtuals:
                     field_info = adhoc_virtuals[curr_var]
@@ -700,13 +700,13 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 continue
 
             module_instance, attr_name, _ = self.variable_map[curr_var]
-            
+
             # Check normal fields
             field_info = module_instance.get_model_fields().get(attr_name)
             if field_info is None:
                 # Check computed fields
                 field_info = module_instance.get_model_computed_fields().get(attr_name)
-            
+
             if field_info:
                 cat = field_info.json_schema_extra.get("category", "param")
                 if cat == 'virtual':
@@ -752,7 +752,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             field_info = module_instance.get_model_fields().get(attr_name)
             if field_info is None:
                 field_info = module_instance.get_model_computed_fields().get(attr_name)
-            
+
             if field_info is None:
                 continue
 
@@ -779,7 +779,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     limit = 1
                     if self.num_trials and self.num_trials > 1:
                         limit = 2
-                    
+
                     is_real_2d = tensor.ndim > limit
 
                     if is_real_2d:
@@ -811,7 +811,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     if shape_str not in registered_vars_by_shape:
                         registered_vars_by_shape[shape_str] = []
                     registered_vars_by_shape[shape_str].append(var_name)
-                
+
                 registered_vars.add(var_name)
 
             # Check for save_idx
@@ -843,7 +843,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     registered_vars_by_shape[shape_str].append(save_coord)
                 else:
                     print(f"Warning: save_coord '{save_coord}' not found in module '{type(module_instance).__name__}' for variable '{var_name}'")
-        
+
         if registered_vars_by_shape:
             for shape_str, vars_list in registered_vars_by_shape.items():
                 print(f"[rank {self.rank}]: Registered tensors for streaming: {', '.join(vars_list)} (shape: {shape_str})")
@@ -876,34 +876,34 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
     def get_output_results(self, as_stacked: bool = True) -> Dict[str, torch.Tensor]:
         """
         Get the in-memory output results (only available when in_memory_output=True).
-        
+
         Args:
             as_stacked: If True (default), stack all time steps into a single tensor.
                        If False, return list of per-time-step tensors.
-                            
+
         Returns:
             Dictionary mapping output names to result tensors.
             Shape (when stacked): (time_steps, *actual_shape)
-            
+
         Raises:
             RuntimeError: If not in in_memory_output mode or aggregator not initialized.
         """
         if self._statistics_aggregator is None:
             raise RuntimeError("Statistics aggregator not initialized")
         return self._statistics_aggregator.get_results(as_stacked=as_stacked)
-    
+
     def get_output_result(self, variable_name: str, op: str = "mean", as_stacked: bool = True) -> torch.Tensor:
         """
         Get a specific output result tensor by variable name and operation.
-        
+
         Args:
             variable_name: Name of the variable
             op: Operation type (mean, max, min, last, etc.)
             as_stacked: If True (default), stack all time steps into a single tensor.
-            
+
         Returns:
             Result tensor for the specified variable and operation.
-            
+
         Raises:
             RuntimeError: If not in in_memory_output mode or aggregator not initialized.
             KeyError: If the specified variable/op combination doesn't exist.
@@ -911,13 +911,13 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         if self._statistics_aggregator is None:
             raise RuntimeError("Statistics aggregator not initialized")
         return self._statistics_aggregator.get_result(variable_name, op, as_stacked=as_stacked)
-    
+
     def get_output_time_index(self) -> int:
         """Get the current output time index (number of finalized time steps)."""
         if self._statistics_aggregator is None:
             return 0
         return self._statistics_aggregator.get_time_index()
-    
+
     def reset_output_time_index(self) -> None:
         """Reset the output time index to 0 for a new simulation run (in-memory mode only)."""
         if self._statistics_aggregator is not None:
@@ -1026,17 +1026,17 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 else:
                     module_data[field_name] = to_torch(self.input_proxy[field_name])
                     full_fields.append(field_name)
-            
+
             # Flush logs
             for group_var, fields in no_local_fields.items():
                 print(f"[rank {self.rank}]: No local data for distributed fields: {', '.join(fields)} (group_by: {group_var})")
-            
+
             for (shape, group_var), fields in distributed_fields.items():
                 print(f"[rank {self.rank}]: Loaded distributed fields: {', '.join(fields)} (shape: {shape}, group_by: {group_var})")
-            
+
             if full_fields:
                 print(f"[rank {self.rank}]: Loaded full fields: {', '.join(full_fields)} (no group_by)")
-            
+
             if missing_fields:
                 print(f"[rank {self.rank}]: Optional fields not in InputProxy, using default: {', '.join(missing_fields)}")
 
@@ -1064,7 +1064,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         # Collect data
         data = {}
         visited_fields = set()
-        
+
         saved_distributed = []
         saved_global = []
         skipped_none = set()
@@ -1074,7 +1074,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             for field_name, field_info in module.get_model_fields().items():
                 if field_name in module.nc_excluded_fields or field_name in visited_fields:
                     continue
-                
+
                 if field_info.exclude:
                     continue
 
@@ -1085,14 +1085,14 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     continue
 
                 val = getattr(module, field_name)
-                
+
                 if isinstance(val, torch.Tensor):
                     val = val.detach().cpu().numpy()
-                
+
                 if val is None:
                     skipped_none.add(field_name)
                     continue
-                    
+
                 data[field_name] = val
                 visited_fields.add(field_name)
                 skipped_none.discard(field_name)
@@ -1108,13 +1108,13 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             "history": f"Created by hydroforge at {datetime.now().isoformat()}",
             "source": "hydroforge.modeling.model.AbstractModel.save_state"
         })
-        
+
         # Write to file
         if nc_path.exists():
              print(f"[rank {self.rank}] Warning: Overwriting existing model state file: {nc_path}")
-             
+
         proxy.to_nc(nc_path, output_complevel=self.output_complevel if self.world_size == 1 else 0)
-        
+
         if saved_distributed:
             print(f"[rank {self.rank}] Saved distributed fields: {', '.join(saved_distributed)}")
         if saved_global:
@@ -1129,18 +1129,18 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         if self.rank == 0 and self.world_size > 1:
             merged_path = self.output_full_dir / f"model_state_{timestamp}.nc"
             rank_paths = [self.output_full_dir / f"model_state_rank{r}_{timestamp}.nc" for r in range(self.world_size)]
-            
+
             InputProxy.merge(merged_path, rank_paths, self.variable_group_mapping, self.output_complevel)
-            
+
             # Remove rank files
             for p in rank_paths:
                 try:
                     p.unlink()
                 except Exception:
                     pass
-            
+
             print(f"[rank 0] Model state merged to: {merged_path}")
-            
+
         return proxy
 
     def load_state(self, proxy: InputProxy) -> None:
@@ -1149,57 +1149,57 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         Supports loading from both global (merged) and local (sharded) proxies.
         """
         print(f"[rank {self.rank}] Loading state from InputProxy...")
-        
+
         loaded_count = 0
-        
+
         # Cache group indices for sharding
         group_indices_cache: Dict[str, np.ndarray] = {}
 
         for module_name in self.opened_modules:
             module = self._modules[module_name]
-            
+
             for field_name, field_info in module.get_model_fields().items():
                 if field_name not in proxy:
                     continue
-                
+
                 # Skip excluded fields if they happen to be in proxy (unlikely but safe)
                 if field_info.exclude:
                     continue
 
                 new_val = proxy[field_name]
                 current_val = getattr(module, field_name)
-                
+
                 # Handle Tensor fields
                 if isinstance(current_val, torch.Tensor):
                     # Convert new_val to numpy if it's a tensor (InputProxy might hold tensors)
                     if isinstance(new_val, torch.Tensor):
                         new_val = new_val.detach().cpu().numpy()
-                    
+
                     new_val = np.asarray(new_val)
-                    
+
                     # Check 1: Direct shape match (Local file or scalar)
                     if new_val.shape == tuple(current_val.shape):
                         current_val.copy_(torch.as_tensor(new_val).to(current_val.device))
                         loaded_count += 1
                         continue
-                        
+
                     # Check 2: Distributed variable needing sharding (Global file)
                     if field_name in self.variable_group_mapping:
                         group_var = self.variable_group_mapping[field_name]
-                        
+
                         # We rely on self.input_proxy (static params) for sharding info
                         if group_var not in self.input_proxy:
                             print(f"[rank {self.rank}] Warning: Cannot shard '{field_name}' because group var '{group_var}' is missing in static inputs.")
                             continue
-                            
+
                         # Get indices (cached)
                         if group_var not in group_indices_cache:
                             grp = self.input_proxy[group_var]
                             idx = np.nonzero(self.group_id_to_rank[grp] == self.rank)[0]
                             group_indices_cache[group_var] = idx
-                        
+
                         idx = group_indices_cache[group_var]
-                        
+
                         # Shard the global data
                         try:
                             local_val = new_val[idx]
@@ -1214,7 +1214,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                             print(f"[rank {self.rank}] Warning: Shape mismatch for '{field_name}' after sharding. Expected {tuple(current_val.shape)}, got {local_val.shape}.")
                     else:
                         print(f"[rank {self.rank}] Warning: Shape mismatch for '{field_name}'. Expected {tuple(current_val.shape)}, got {new_val.shape}.")
-                
+
                 # Handle Scalar/Other fields
                 else:
                     # For scalars, we just set the value
@@ -1222,7 +1222,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     if isinstance(new_val, (np.ndarray, np.generic)):
                         if new_val.ndim == 0:
                             new_val = new_val.item()
-                    
+
                     setattr(module, field_name, new_val)
                     loaded_count += 1
 
@@ -1258,11 +1258,11 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             for op, vs in self.variables_to_save.items():
                 op_l = str(op).lower()
                 op_parts = op_l.split('_')
-                
+
                 for p in op_parts:
                     if p not in allowed_ops and not topk_pattern.match(p) and not argtopk_pattern.match(p):
                         raise ValueError(f"Invalid statistics op '{op}'. Component '{p}' not in allowed ops: {sorted(allowed_ops)}, top-k pattern, or arg-top-k pattern.")
-                
+
                 # Single operation (no underscore) - this is the inner aggregation
                 # arg operations are NOT allowed as inner operations
                 if len(op_parts) == 1:
@@ -1319,7 +1319,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     if extra and extra.get("save_idx") is not None:
                         has_save_idx = True
                     break
-            
+
             # If not found as direct field, check if it is a valid expression
             if not found:
                  # If the variable name contains characters other than alphanumeric and underscore,

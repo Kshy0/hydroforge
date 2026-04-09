@@ -33,7 +33,7 @@ def TensorField(
 ):
     """
     Create a tensor field with shape information directly in AbstractModule.
-    
+
     Args:
         description: Human-readable description of the variable
         shape: Tuple of dimension names (scalar variable names)
@@ -87,7 +87,7 @@ def computed_tensor_field(
 ):
     """
     Create a computed tensor field with shape information for AbstractModule.
-    
+
     Args:
         description: Human-readable description of the variable
         shape: Tuple of dimension names (scalar variable names)
@@ -135,7 +135,7 @@ def computed_tensor_field(
 class AbstractModule(BaseModel, ABC):
     """
     Abstract base class for all hydroforge physics modules.
-    
+
     This class provides the fundamental framework that all modules must follow:
     - Field discovery and validation using Pydantic v2
     - Shape information for tensor fields
@@ -144,17 +144,17 @@ class AbstractModule(BaseModel, ABC):
     - Integration with PyTorch tensors
     - Device and precision management
     - Support for distributed data splitting
-    
+
     All specific modules (base, bifurcation, reservoir, etc.) inherit from this class.
     """
-    
+
     # Pydantic configuration
     model_config = ConfigDict(
         arbitrary_types_allowed=True,  # Allow torch.Tensor types
         validate_assignment=False,      # Validate on assignment
-        extra='ignore'                
+        extra='ignore'
     )
-    
+
     # Module metadata - must be overridden in subclasses
     module_name: ClassVar[str] = "abstract"
     description: ClassVar[str] = "Abstract base module"
@@ -192,7 +192,7 @@ class AbstractModule(BaseModel, ABC):
         default=None,
         description="Number of parallel simulations (ensemble members)",
     )
-    
+
     _expanded_params: set = PrivateAttr(default_factory=set)
 
     @property
@@ -235,12 +235,12 @@ class AbstractModule(BaseModel, ABC):
     @classmethod
     def get_model_fields(cls) -> Dict[str, FieldInfo]:
         return cls.model_fields
-    
+
     @classmethod
     def get_model_computed_fields(cls) -> Dict[str, Any]:
         return cls.model_computed_fields
 
-    
+
     def init_optional_tensors(self) -> None:
         """
         Initialize optional tensor fields:
@@ -284,10 +284,10 @@ class AbstractModule(BaseModel, ABC):
     def get_expected_shape(self, field_name: str) -> Optional[Tuple[int, ...]]:
         """
         Get the expected shape for a tensor field based on current scalar values.
-        
+
         Args:
             field_name: Name of the tensor field
-            
+
         Returns:
             Tuple of integer dimensions, or None if no shape is defined
         """
@@ -300,7 +300,7 @@ class AbstractModule(BaseModel, ABC):
         shape_spec = json_schema_extra.get('tensor_shape', None)
         if shape_spec is None:
             return None
-        
+
         # Get current scalar values from instance
         scalar_values = {}
         for dim_name in shape_spec:
@@ -327,25 +327,25 @@ class AbstractModule(BaseModel, ABC):
                 scalar_values[dim_name] = getattr(self, dim_name)
             else:
                 raise ValueError(f"Dimension {dim_name} not found in module")
-        
+
         shape = tuple(scalar_values[dim] for dim in shape_spec)
-        
+
         category = json_schema_extra.get('category', 'param')
         if self.num_trials is not None:
              if category in ('state', 'init_state') or \
                 (category in ('param', 'derived_param') and field_name in self._expanded_params):
                  return (self.num_trials,) + shape
-        
+
         return shape
-    
+
 
     def get_expected_dtype(self, field_name: str) -> torch.dtype:
         """
         Get the expected data type for a tensor field based on its definition.
-        
+
         Args:
             field_name: Name of the tensor field
-            
+
         Returns:
             Expected torch.dtype for the tensor
         """
@@ -356,7 +356,7 @@ class AbstractModule(BaseModel, ABC):
         if not isinstance(json_schema_extra, dict):
             json_schema_extra = {}
         dtype_str = str(json_schema_extra.get('tensor_dtype', 'float'))
-        
+
         dtype_map = {
             'float': self.precision,
             'hpfloat': self.high_precision,
@@ -364,9 +364,9 @@ class AbstractModule(BaseModel, ABC):
             'idx': torch.int32,
             'bool': torch.bool
         }
-        
+
         return dtype_map.get(dtype_str, torch.float32)
-    
+
     def validate_tensors(self) -> bool:
         """
         Validate and auto-fix tensor consistency issues.
@@ -400,10 +400,10 @@ class AbstractModule(BaseModel, ABC):
                 continue
 
             tensor = getattr(self, field_name, None)
-            
+
             if tensor is None or not isinstance(tensor, torch.Tensor):
                 continue
-                
+
             # 1. Shape validation (fail fast)
             expected_shape = self.get_expected_shape(field_name)
             if expected_shape is None:
@@ -431,11 +431,11 @@ class AbstractModule(BaseModel, ABC):
                         raise ValueError(f"Shape mismatch for {field_name}: expected {expected_shape}, got {tensor.shape}")
                 else:
                     raise ValueError(f"Shape mismatch for {field_name}: expected {expected_shape}, got {tensor.shape}")
-            
+
             # 2. Auto-fix contiguity
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
-                
+
             # 3. Auto-fix device mismatch
             if tensor.device.type != self.device.type or (
                 tensor.device.index is not None
@@ -443,7 +443,7 @@ class AbstractModule(BaseModel, ABC):
                 and tensor.device.index != self.device.index
             ):
                 tensor = tensor.to(self.device)
-                
+
             # 4. Auto-fix precision for floating-point tensors
             expected_dtype = self.get_expected_dtype(field_name)
             tensor_dtype = tensor.dtype
@@ -455,12 +455,12 @@ class AbstractModule(BaseModel, ABC):
                 auto_fix_log[key].append(field_name)
             # Update tensor if it was modified
             setattr(self, field_name, tensor)
-        
+
         if auto_fix_log:
             for key, fields in auto_fix_log.items():
                 print(f"Auto-fixed dtype for fields: {', '.join(fields)} ({key})")
         return True
-    
+
     def validate_computed_tensors(self) -> bool:
         """
         Validate computed tensors to ensure they are correctly defined.
@@ -497,7 +497,7 @@ class AbstractModule(BaseModel, ABC):
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
                 setattr(self, field_name, tensor)
-            
+
             expected_shape = self.get_expected_shape(field_name)
             if expected_shape is None:
                 continue
@@ -511,7 +511,7 @@ class AbstractModule(BaseModel, ABC):
                         f"Computed field {field_name} has shape {tensor.shape}, "
                         f"but expected shape is {expected_shape}"
                     )
-            
+
             expected_dtype = self.get_expected_dtype(field_name)
             if tensor.dtype != expected_dtype:
                 key = f"{tensor.dtype} -> {expected_dtype}"
@@ -520,12 +520,12 @@ class AbstractModule(BaseModel, ABC):
                 auto_fix_log[key].append(field_name)
                 tensor = tensor.to(expected_dtype)
                 setattr(self, field_name, tensor)
-        
+
         if auto_fix_log:
             for key, fields in auto_fix_log.items():
                 print(f"Auto-fixed dtype for computed fields: {', '.join(fields)} ({key})")
         return True
-    
+
     @model_validator(mode="after")
     def validate_opened_modules(self) -> Self:
         v = self.opened_modules
@@ -549,9 +549,9 @@ class AbstractModule(BaseModel, ABC):
                 f"Module '{self.module_name}' conflicts with modules present in opened_modules: {present_conflicts}. "
                 f"These modules cannot be enabled together."
             )
-        
+
         return self
-    
+
 
     def get_memory_usage(self) -> int:
         """
@@ -562,18 +562,18 @@ class AbstractModule(BaseModel, ABC):
         """
         total_bytes = 0
         seen_ptrs: set = set()
-        
+
         # Combine fields and computed fields
         all_fields = self.get_model_fields().copy()
         all_fields.update(self.get_model_computed_fields())
-        
+
         for name, field_info in all_fields.items():
-                
+
             # Get the value
             if not hasattr(self, name):
                 continue
             value = getattr(self, name)
-            
+
             # Check if it's a tensor
             if isinstance(value, torch.Tensor):
                 # Only count if on the main computing device
@@ -582,13 +582,13 @@ class AbstractModule(BaseModel, ABC):
                     if ptr not in seen_ptrs:
                         seen_ptrs.add(ptr)
                         total_bytes += value.element_size() * value.nelement()
-                
+
         return total_bytes
 
     def gather_tensor(self, tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
         """
         Gather values from a tensor using indices, handling potential batch dimensions.
-        
+
         If tensor is (N, ...), returns (L, ...) where L = len(indices).
         If tensor is (T, N, ...), returns (T, L, ...).
         """
@@ -626,10 +626,10 @@ class AbstractModule(BaseModel, ABC):
             category = field_info.json_schema_extra.get("category", "param") if field_info.json_schema_extra else "param"
             if category == "state" or category == "topology":
                 return
-            
+
             if not hasattr(self, name):
                 return
-                
+
             val = getattr(self, name)
             if isinstance(val, torch.Tensor):
                 # Check if batched: (num_trials, ...) and num_trials > 1
@@ -639,10 +639,10 @@ class AbstractModule(BaseModel, ABC):
 
         for name, field in self.get_model_fields().items():
             check_field(name, field)
-            
+
         for name, field in self.get_model_computed_fields().items():
             check_field(name, field)
-                
+
         return res
 
     def handle_tensor_mode(self) -> None:
@@ -658,18 +658,18 @@ class AbstractModule(BaseModel, ABC):
                 continue
 
             mode = json_schema_extra.get('mode', 'device')
-            
+
             if mode == 'device':
                 continue
-                
+
             if not hasattr(self, name):
                 continue
-                
+
             val = getattr(self, name)
             if not isinstance(val, torch.Tensor):
                 # Could be None already
                 continue
-                
+
             if mode == 'cpu':
                 if val.device.type != 'cpu':
                     setattr(self, name, val.cpu())

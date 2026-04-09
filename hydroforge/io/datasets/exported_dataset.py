@@ -136,10 +136,10 @@ class ExportedDataset(NetCDFDataset):
         else:
             sc, _ = self.get_coordinates()
             out_cols = len(sc)
-        
+
         if not ops:
             return np.empty((0, out_cols), dtype=self.out_dtype)
-        
+
         chunks: List[np.ndarray] = []
         for key, abs_indices in ops:
             path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
@@ -163,13 +163,13 @@ class ExportedDataset(NetCDFDataset):
                 else:
                     arr = np.nan_to_num(np.asarray(arr), nan=0.0)
                 arr = self._ensure_tc(arr, t_idx, c_idx)
-                
+
                 # Reorder columns if indices are set
                 if self._local_indices is not None:
                     arr = arr[:, self._local_indices]
-                
+
                 chunks.append(arr.astype(self.out_dtype, copy=False))
-        
+
         return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
 
     # -------------------------
@@ -180,16 +180,16 @@ class ExportedDataset(NetCDFDataset):
         desired_catchment_ids: np.ndarray,
     ) -> None:
         """Set up column reordering to match desired catchment order.
-        
+
         Unlike grid-based datasets, this doesn't build a sparse matrix.
         It simply finds the column indices that map the file's catchment order
         to the desired order, and stores them in _local_indices.
-        
+
         After calling this method:
           - _read_ops will return data with columns in the desired order
           - __getitem__ can be used (it requires _local_indices to be set)
           - shard_forcing simply flattens without matrix multiply
-        
+
         Returns None (no matrix needed for exported data).
         """
         # Load catchment IDs from file
@@ -199,7 +199,7 @@ class ExportedDataset(NetCDFDataset):
             if self.coord_name not in ds.variables:
                 raise ValueError(f"Coordinate variable '{self.coord_name}' not found in {path}")
             arr = ds.variables[self.coord_name][:]
-            file_catchment_ids = (arr.filled(0) if isinstance(arr, np.ma.MaskedArray) 
+            file_catchment_ids = (arr.filled(0) if isinstance(arr, np.ma.MaskedArray)
                                   else np.asarray(arr)).astype(np.int64)
 
         # Find column positions for desired catchments
@@ -212,25 +212,25 @@ class ExportedDataset(NetCDFDataset):
 
         # Store indices for column reordering in _read_ops
         self._local_indices = col_pos.astype(np.int64)
-        
+
         if is_rank_zero():
             print(f"[ExportedDataset] Mapped {len(desired_catchment_ids)} catchments "
                   f"from {len(file_catchment_ids)} in file")
-        
+
         # Auto-load to memory if in_memory mode is enabled
         if self._in_memory:
             self.load_to_memory()
-        
+
         return None  # No matrix needed
 
     def load_to_memory(self) -> None:
         """Load all data into memory for faster repeated access.
-        
+
         This method reads the entire dataset into a numpy array cached in memory,
         covering ALL files that span the [start_date, end_date] range.
         Subsequent __getitem__ calls will return slices from this cache instead
         of reading from disk.
-        
+
         Note: build_local_mapping should be called first to set up
         the column reordering indices.
         """
@@ -238,14 +238,14 @@ class ExportedDataset(NetCDFDataset):
             if is_rank_zero():
                 print("[ExportedDataset] Data already in memory, skipping reload.")
             return
-        
+
         # Read ALL time steps across all files using the multi-file infrastructure.
         ops = self._ops_from_times(self._global_times)
         all_data = self._read_ops(ops)
-        
+
         # Store in cache with correct dtype and C-contiguous layout
         self._memory_cache = np.ascontiguousarray(all_data.astype(self.out_dtype, copy=False))
-        
+
         if is_rank_zero():
             n_files = len(ops)
             mem_mb = self._memory_cache.nbytes / (1024 * 1024)
@@ -414,7 +414,7 @@ class ExportedDataset(NetCDFDataset):
         batch_data: torch.Tensor,
     ) -> torch.Tensor:
         """Flatten (B, T, C) -> (B*T, C).
-        
+
         For ExportedDataset, data is already in the correct column order
         (set by build_local_mapping), so no matrix multiply is needed.
         """
@@ -441,40 +441,40 @@ class ExportedDataset(NetCDFDataset):
     # -------------------------
     def __getitem__(self, idx: int) -> np.ndarray:
         """Fetch chunk - each rank reads independently for exported data.
-        
+
         If build_local_mapping has been called, returns data reordered to
         match desired catchment order. Otherwise, returns data in file order.
-        
+
         If in_memory mode is enabled (and load_to_memory has been called),
         returns a slice from the memory cache instead of reading from disk.
         """
         if idx < 0:
             idx += len(self)
-        
+
         N = self.data_size
-        
+
         # Use memory cache if available
         if self._memory_cache is not None:
             # Calculate time indices for this chunk
             start_time_idx = idx * self.chunk_len
             end_time_idx = min(start_time_idx + self.chunk_len, self._memory_cache.shape[0])
-            
+
             data = self._memory_cache[start_time_idx:end_time_idx]
             T = data.shape[0]
-            
+
             if T < self.chunk_len:
                 pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
                 data = np.vstack([data, pad]) if data.size else pad
-            
+
             # Already C-contiguous from load_to_memory, but slice may not be
             return np.ascontiguousarray(data)
-        
+
         # Fall back to reading from disk
         data = self.read_chunk(idx)
-        
+
         if data.ndim != 2 or data.shape[1] != N:
             raise ValueError(f"Expected shape (T, {N}), got {tuple(data.shape)}")
-        
+
         T = data.shape[0]
         if T < self.chunk_len:
             pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)

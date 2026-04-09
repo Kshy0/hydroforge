@@ -74,7 +74,7 @@ class InputProxy:
             file_path: Path(s) to NetCDF file(s).
             lazy: If True, data is loaded on demand.
             visible_vars: Optional list/set of variable names to include. Others are ignored.
-            align_on: Variable name to use for alignment. 
+            align_on: Variable name to use for alignment.
                       The FIRST file encountered containing this variable serves as the REFERENCE.
                       Subsequent files will be reordered to match the order of this variable in the reference file.
         """
@@ -106,10 +106,10 @@ class InputProxy:
                     if align_on:
                         # Only consider alignment if the key variable is "visible"
                         is_align_key_visible = (visible_vars is None) or (align_on in visible_vars)
-                        
+
                         if is_align_key_visible and align_on in ds.variables:
                             current_keys = cls._read_var_from_ds(ds, align_on)
-                            
+
                             if reference_keys is None:
                                 # First file with the key sets the reference order
                                 reference_keys = current_keys
@@ -123,15 +123,15 @@ class InputProxy:
 
                                 # Match keys strictly
                                 insert_idx = np.searchsorted(sorted_keys, reference_keys)
-                                
+
                                 # Check range and equality
                                 if np.any(insert_idx >= len(current_keys)):
                                      raise ValueError(f"Alignment failed: Key variable '{align_on}' in '{path_str}' mismatches reference keys (indices out of bounds).")
-                                
+
                                 matched = sorted_keys[insert_idx]
                                 if not np.array_equal(matched, reference_keys):
                                      raise ValueError(f"Alignment failed: Key variable '{align_on}' in '{path_str}' does not strictly match reference keys.")
-                                
+
                                 # alignment_idx maps: index in Ref -> index in Current
                                 alignment_idx = sorter[insert_idx]
                                 file_indices[path_str] = alignment_idx
@@ -143,7 +143,7 @@ class InputProxy:
                     # Merge dimensions
                     for dim_name, dim in ds.dimensions.items():
                         dims[dim_name] = dim.size
-                    
+
                     # Merge variables and check for conflicts
                     for var_name in ds.variables:
                         # Visibility check
@@ -155,10 +155,10 @@ class InputProxy:
                              # Skip conflict check for align key (we use the first one encountered)
                              if align_on and var_name == align_on:
                                  continue
-                             
+
                              if prev_file != path_str:
                                  raise ValueError(f"Naming conflict: Variable '{var_name}' exists in both '{prev_file}' and '{path_str}'")
-                        
+
                         found_vars.add(var_name)
                         file_map[var_name] = path_str
 
@@ -183,15 +183,15 @@ class InputProxy:
 
     def _resolve_target_path(self, key: str) -> str:
         target_path = None
-        
+
         # Priority 1: Check internal file map (populated if from_nc with multiple files)
         if self.file_map and key in self.file_map:
             target_path = self.file_map[key]
-        
+
         # Priority 2: If single file path is stored, use it
         elif self.file_path and isinstance(self.file_path, (str, Path)):
              target_path = self.file_path
-             
+
         # Priority 3: If file_path is a list and map failed
         elif self.file_path and isinstance(self.file_path, list):
              raise RuntimeError(f"Variable '{key}' not found in file map, and multiple files provided. Cannot disambiguate source.")
@@ -202,7 +202,7 @@ class InputProxy:
                  target_path = self.file_path[0]
              else:
                 raise RuntimeError(f"Cannot lazy load variable '{key}': file source not mapped and file_path is ambiguous.")
-        
+
         return str(target_path)
 
     def _load_var(self, key: str, indices: Any = None) -> np.ndarray:
@@ -238,10 +238,10 @@ class InputProxy:
         """
         if key in self.data:
             return self.data[key][indices]
-        
+
         if self.lazy and key in self.visible_vars:
             return self._load_var(key, indices=indices)
-            
+
         raise KeyError(f"Variable '{key}' not found in InputProxy.")
 
     def get_var_shape(self, key: str) -> Tuple[int, ...]:
@@ -263,7 +263,7 @@ class InputProxy:
                 if key not in ds.variables:
                      raise KeyError(f"Variable '{key}' not found in {target_path}")
                 return tuple(ds.variables[key].shape)
-        
+
         raise KeyError(f"Variable '{key}' not found in InputProxy.")
 
 
@@ -405,11 +405,11 @@ class InputProxy:
     def set_variable(self, name: str, value: Any, indices: Optional[Any] = None) -> None:
         """
         Set or update a variable.
-        
+
         Args:
             name: Name of the variable.
             value: New value.
-            indices: Optional indices to update specific elements. 
+            indices: Optional indices to update specific elements.
                      If None, replaces the entire variable.
         """
         if indices is not None:
@@ -419,9 +419,9 @@ class InputProxy:
 
             if name not in self.data:
                 raise KeyError(f"Variable '{name}' not found in InputProxy, cannot update indices.")
-            
+
             target = self.data[name]
-            
+
             # Ensure target is mutable (numpy array or torch tensor)
             if not isinstance(target, (np.ndarray, torch.Tensor)):
                  raise TypeError(f"Variable '{name}' is of type {type(target)}, which does not support indexed assignment.")
@@ -442,13 +442,13 @@ class InputProxy:
     def __getitem__(self, key: str) -> Any:
         if key in self.data:
             return self.data[key]
-        
+
         if self.lazy and key in self.visible_vars:
             # Cache the loaded data to avoid repeated I/O
             loaded_data = self._load_var(key)
             self.data[key] = loaded_data
             return loaded_data
-            
+
         raise KeyError(f"Variable '{key}' not found in InputProxy.")
 
     def __setitem__(self, key: str, value: Any) -> None:

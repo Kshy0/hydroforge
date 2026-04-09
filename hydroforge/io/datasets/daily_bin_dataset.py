@@ -107,13 +107,13 @@ class DailyBinDataset(AbstractDataset):
 
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
         """Return (lon, lat) coordinate arrays.
-        
+
         Note: shape is (ny, nx) = (lat, lon), so shape[0] is lat size, shape[1] is lon size.
         Coordinates are cell centers, computed from shape assuming global coverage.
-        
+
         If lat_south_to_north is True, latitude goes from -90 to 90 (south to north).
         Otherwise, latitude goes from 90 to -90 (north to south, default).
-        
+
         If lon_0_to_360 is True, longitude goes from 0 to 360 (e.g. ERA5-Land binary).
         Otherwise, longitude goes from -180 to 180 (default).
         """
@@ -134,11 +134,11 @@ class DailyBinDataset(AbstractDataset):
 
     def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
         """Read one day's data from binary file.
-        
+
         Returns:
         - If _local_indices is set: (1, N) compressed array
         - If _local_indices is None: (1, Y, X) full grid array
-        
+
         Spatial convention: (Y, X) = (lat, lon), C-order flatten (lon varies fastest)
         """
         if chunk_len != 1:
@@ -158,12 +158,12 @@ class DailyBinDataset(AbstractDataset):
         )
         data[~(data >= 0)] = 0.0
         data = data.astype(self.out_dtype) / self.unit_factor
-        
+
         if self._local_indices is not None:
             return data[self._local_indices][None, :]
         else:
             return data.reshape(1, ny, nx)
-    
+
     def close(self):
         pass
 

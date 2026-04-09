@@ -14,7 +14,6 @@ import cftime
 import netCDF4 as nc
 import numpy as np
 import torch
-import torch.distributed as dist
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
@@ -78,7 +77,7 @@ def compute_grid_id(grid_lon, grid_lat, hires_lon, hires_lat, allow_oob_zero: bo
         northin = grid_lat[0] + 0.5 * gsize_lat
         iyin = np.floor((northin - hires_lat) / gsize_lat).astype(int)
 
-    
+
     nxin = len(grid_lon)
     nyin = len(grid_lat)
     ixin[ixin == nxin] = 0
@@ -165,10 +164,10 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self.time_interval = time_interval
         self.calendar = calendar
         self.clip_negative = clip_negative
-        
+
         # Local grid indices for spatial compression (set by build_local_mapping)
         self._local_indices: Optional[np.ndarray] = None
-        
+
         # Convert dates to the specified calendar immediately
         self.start_date = self._convert_to_calendar(start_date)
         self.end_date = self._convert_to_calendar(end_date)
@@ -195,27 +194,20 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             path = Path(file_path)
             if not path.exists():
                 missing_files.append(str(path))
-        
+
         if missing_files:
             raise FileNotFoundError(
-                f"The following required data files are missing:\n" +
+                "The following required data files are missing:\n" +
                 "\n".join(missing_files)
             )
 
         if is_rank_zero() and self.spin_up_cycles > 0:
             print(f"[AbstractDataset] Spin-up enabled: {self.spin_up_cycles} cycles.")
 
-    def is_valid_time_index(self, idx: int) -> bool:
-        """
-        Checks if the given time index corresponds to a valid data step (not padding).
-        Subclasses with chunking/padding should override this.
-        """
-        return True
-
     def time_iter(self) -> Iterator[Tuple[datetime, bool, bool]]:
         """Returns an iterator that yields (time, is_valid, is_spin_up) tuples step-by-step."""
         valid_steps_count = 0
-        
+
         # Calculate spin-up steps
         spin_up_steps = 0
         if self.spin_up_cycles > 0 and self.time_interval is not None:
@@ -235,10 +227,10 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 # Padding steps (out of bounds)
                 dt = datetime.min
                 valid = False
-            
+
             is_spin_up = valid_steps_count < spin_up_steps
             yield dt, valid, is_spin_up
-            
+
             if valid:
                 valid_steps_count += 1
 
@@ -247,14 +239,14 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         if self.spin_up_cycles > 0:
             if self.time_interval is None:
                  raise ValueError("time_interval must be provided for spin-up calculation")
-            
+
             if self.spin_up_start_date is None or self.spin_up_end_date is None:
                 raise ValueError("spin_up_start_date and spin_up_end_date must be provided if spin_up_cycles > 0")
 
             # Calculate duration of one cycle
             # Assuming spin_up_end_date is inclusive, so we add one time_interval
             cycle_duration = self.spin_up_end_date - self.spin_up_start_date + self.time_interval
-            
+
             return cycle_duration * self.spin_up_cycles
         return timedelta(0)
 
@@ -262,14 +254,14 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         """Calculates the virtual start time including spin-up."""
         if not hasattr(self, 'start_date'):
              raise AttributeError("Dataset must have 'start_date' to calculate virtual start time")
-        
+
         duration = self.get_spin_up_duration()
         virtual_start = self.start_date - duration
-        
+
         if verbose and is_rank_zero() and self.spin_up_cycles > 0:
              print(f"[AbstractDataset] Spin-up duration: {duration}")
              print(f"[AbstractDataset] Virtual start time: {virtual_start}")
-             
+
         return virtual_start
 
     def _calc_spin_up_params(self):
@@ -298,13 +290,13 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         """
         if self.time_interval is None:
              raise NotImplementedError("time_interval must be provided for default read_chunk")
-        
+
         if self.spin_up_cycles > 0:
              if not hasattr(self, '_spin_up_num_chunks'):
                  self._calc_spin_up_params()
-             
+
              total_spin_up_chunks = self._spin_up_num_chunks * self.spin_up_cycles
-             
+
              if idx < total_spin_up_chunks:
                  # In spin-up
                  cycle_idx = idx % self._spin_up_num_chunks
@@ -312,28 +304,18 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                  steps_offset = cycle_idx * self.chunk_len
                  current_time = self.spin_up_start_date + self.time_interval * steps_offset
                  return self.get_data(current_time, self.chunk_len)
-             
+
              # Main simulation
              idx -= total_spin_up_chunks
 
         # Main simulation time
         steps_offset = idx * self.chunk_len
-        
+
         if not hasattr(self, 'start_date'):
              raise AttributeError("Dataset must have 'start_date' attribute to use default read_chunk")
 
         current_time = self.start_date + self.time_interval * steps_offset
         return self.get_data(current_time, self.chunk_len)
-
-    @property
-    def num_spin_up_chunks(self) -> int:
-        if self.spin_up_cycles > 0:
-            if not hasattr(self, '_spin_up_num_chunks'):
-                 self._calc_spin_up_params()
-            return self._spin_up_num_chunks * self.spin_up_cycles
-        return 0
-
-
 
     def shard_forcing(
         self,
@@ -343,10 +325,10 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         """
         Map grid data to catchments and handle distributed sync.
 
-        Expected input shape: 
+        Expected input shape:
           - (B, T, N) for single trial
           - (B, T, K, N) for K trials
-        
+
         N should match data_size (compressed source grids after build_local_mapping).
         Output shape: (M, C) where M is the product of non-spatial dims, C = number of catchments.
         """
@@ -360,7 +342,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             raise ValueError(f"batch_data must be 3D or 4D, got shape {tuple(batch_data.shape)}")
 
         out = (flat @ local_mapping).contiguous()
-        
+
         # If input was 4D (B, T, K, N), reshape output to (B*T, K, C)
         # This makes it ready for step-by-step slicing in the main loop
         if batch_data.dim() == 4:
@@ -368,34 +350,34 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             # out is currently (B*T*K, C)
             # Reshape to (B*T, K, C) so that out[step] gives (K, C) for all trials
             out = out.view(B * T, K, -1)
-            
+
         return out
 
-    def build_local_mapping(self, 
-                                  mapping_file: str, 
-                                  desired_catchment_ids: Optional[np.ndarray] = None, 
+    def build_local_mapping(self,
+                                  mapping_file: str,
+                                  desired_catchment_ids: Optional[np.ndarray] = None,
                                   device: Optional[torch.device] = None,
                                   precision: Literal["float32", "float64"]="float32") -> torch.Tensor:
         """
         Build PyTorch sparse matrix for mapping grid data to specified catchments.
-        
+
         This method:
         1. Loads the sparse mapping matrix from npz file
         2. Extracts submatrix for desired catchments (or all if desired_catchment_ids is None)
         3. Identifies non-zero columns (active source grids)
         4. Sets self._local_indices for use in __getitem__
         5. Returns the compressed mapping matrix
-        
+
         After calling this method, data_size will return the compressed size,
         and __getitem__ will automatically extract only the needed columns.
-        
+
         Args:
             mapping_file: Path to the npz file containing the mapping matrix
-            desired_catchment_ids: Array of catchment IDs to include. If None, uses all 
+            desired_catchment_ids: Array of catchment IDs to include. If None, uses all
                                    catchments from the mapping file in their original order.
             device: PyTorch device for the output tensor
             precision: Data precision ("float32" or "float64")
-            
+
         Returns:
             local_mapping: Stensor of shape (n_active_grids, n_catchments)
         """
@@ -403,24 +385,24 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         torch_precision = torch.float32 if precision == "float32" else torch.float64
         if mapping_file is None or not os.path.exists(mapping_file):
             raise ValueError("Mapping file not found. Cannot build local matrix.")
-        
+
         # Store the mapping file path for later use
         self._mapping_file = mapping_file
-        
+
         # Load the scipy compressed sparsparse e matrix data
         mapping_data = np.load(mapping_file)
-        
+
         all_catchment_ids = mapping_data['catchment_ids']
         sparse_data = mapping_data['sparse_data']
-        sparse_indices = mapping_data['sparse_indices'] 
+        sparse_indices = mapping_data['sparse_indices']
         sparse_indptr = mapping_data['sparse_indptr']
         matrix_shape = tuple(mapping_data['matrix_shape'])
-        
+
         full_sparse_matrix = csr_matrix(
             (sparse_data, sparse_indices, sparse_indptr),
             shape=matrix_shape
         )
-        
+
         # If desired_catchment_ids is None, use all catchments from the mapping file
         if desired_catchment_ids is None:
             desired_catchment_ids = all_catchment_ids
@@ -428,16 +410,16 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         else:
             # Use find_indices_in to get row indices for desired catchments
             desired_row_indices = find_indices_in(desired_catchment_ids, all_catchment_ids)
-            
+
             # Check which catchments were found
             valid_idx = desired_row_indices != -1
-            
+
             if np.any(~valid_idx):
                 raise ValueError(
                     f"Some desired catchments ({np.sum(~valid_idx)}) were not found in the mapping file. "
                     "Please check your input data or mapping file."
                 )
-        
+
         # Verify mapping matrix columns match full grid size
         lon, lat = self.get_coordinates()
         full_grid_size = len(lon) * len(lat)
@@ -446,17 +428,17 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 f"Mapping matrix columns ({matrix_shape[1]}) != full grid size ({full_grid_size}). "
                 "Please regenerate the mapping file."
             )
-        
+
         # Validate coordinate metadata if present in npz
         if 'coord_lon' in mapping_data and 'coord_lat' in mapping_data:
             saved_lon = mapping_data['coord_lon']
             saved_lat = mapping_data['coord_lat']
-            
-            lon_match = (len(lon) == len(saved_lon) and 
+
+            lon_match = (len(lon) == len(saved_lon) and
                         np.allclose(lon, saved_lon, rtol=1e-5, atol=1e-8))
-            lat_match = (len(lat) == len(saved_lat) and 
+            lat_match = (len(lat) == len(saved_lat) and
                         np.allclose(lat, saved_lat, rtol=1e-5, atol=1e-8))
-            
+
             if not lon_match or not lat_match:
                 raise ValueError(
                     f"Coordinate mismatch between dataset and mapping file.\n"
@@ -470,23 +452,23 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             if is_rank_zero():
                 print("[AbstractDataset] Warning: Mapping file has no coordinate metadata. "
                       "Consider regenerating for better validation.")
-        
+
         # Extract submatrix for desired catchments only
         submatrix = full_sparse_matrix[desired_row_indices, :]
-        
+
         # Remove columns that are all zeros to optimize memory
         col_sums = np.array(submatrix.sum(axis=0)).flatten()
         non_zero_cols = np.where(col_sums != 0)[0].astype(np.int64)
-        
+
         if len(non_zero_cols) == 0:
             raise ValueError("No non-zero grid data found for the desired catchments.")
-        
+
         # Store the local grid indices for use in __getitem__
         self._local_indices = non_zero_cols
-        
+
         # Store the desired catchment IDs for use in export_catchment_data
         self._desired_catchment_ids = np.asarray(desired_catchment_ids)
-        
+
         # Extract final submatrix with only non-zero columns and transpose
         # Shape: (num_source_grids, num_catchments)
         final_submatrix = submatrix[:, non_zero_cols].T.tocoo()
@@ -498,17 +480,17 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
         indices = torch.stack([row_tensor, col_tensor])
         local_mapping = torch.sparse_coo_tensor(
-            indices, data_tensor, 
+            indices, data_tensor,
             size=(len(non_zero_cols), len(desired_catchment_ids)),
             dtype=torch_precision,
             device=device
         ).coalesce()
-        
+
         if is_rank_zero():
             print(f"[AbstractDataset] Built local mapping matrix: {len(non_zero_cols)} active grids "
                   f"out of {full_grid_size} total")
             print(f"[AbstractDataset] Mapping {len(non_zero_cols)} source grids -> {len(desired_catchment_ids)} catchments")
-        
+
         return local_mapping
 
     def export_climatology(
@@ -648,7 +630,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     ) -> Union[Path, List[Path]]:
         """
         Export catchment-aggregated data to a NetCDF file readable by MultiRankStatsReader.
-        
+
         Requires build_local_mapping() to be called first.
 
         - Output filename: {filename}_rank0.nc or {var_name}_rank0.nc if filename not specified
@@ -662,7 +644,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         GPU acceleration:
         - Set `device="cuda:0"` (or any CUDA device) to enable GPU-accelerated sparse matmul.
         - Falls back to CPU if CUDA is not available.
-        
+
         Args:
             out_dir: Output directory for NetCDF files
             local_mapping: Sparse tensor from build_local_mapping(), shape (n_grids, n_catchments)
@@ -682,11 +664,11 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 "build_local_mapping() must be called before export_catchment_data(). "
                 "This sets the catchment IDs and grid mapping."
             )
-        
+
         catchment_ids = self._desired_catchment_ids
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        
+
         n_catch = len(catchment_ids)
         n_cols = self.data_size  # This is the compressed size after build_local_mapping
 
@@ -700,7 +682,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         # Use the provided local mapping matrix
         # Shape: (n_cols, n_catch) - maps compressed source grids to catchments
         t_mapping = local_mapping.to(dev).to(torch_dtype)
-        
+
         if normalized:
             # Normalize by row sums (each catchment's total area)
             # t_mapping shape: (n_cols, n_catch)
@@ -719,15 +701,15 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             t_mapping = torch.sparse_coo_tensor(
                 indices, new_values, t_mapping.size(), dtype=torch_dtype, device=dev
             ).coalesce()
-        
+
         # Pre-compute transposed mapping matrix for efficient batch multiplication
         # t_mapping shape: (n_cols, n_catch)
         # t_mapping_T shape: (n_catch, n_cols) for sparse.mm(sparse, dense)
         t_mapping_T = t_mapping.t().coalesce()
-        
+
         dtype_nc = "f4" if dtype == "float32" else "f8"
         file_prefix = filename if filename else var_name
-        
+
         def _init_nc(path):
             ds = nc.Dataset(path, "w", format="NETCDF4")
             ds.setncattr("title", f"Aggregated catchment data ({var_name})")
@@ -795,7 +777,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 # Write each timestep in the block
                 for k in range(T):
                     dt_k = self.get_time_by_index(base_idx + k)
-                    
+
                     if split_by_year:
                         year = dt_k.year
                         if year != current_year:
@@ -806,20 +788,20 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                             ds, time_var, out_var = _init_nc(nc_path)
                             created_files.append(nc_path)
                             write_idx = 0
-                    
+
                     out_var[write_idx, :] = agg_block_np[k, :].astype(np.float32 if dtype == "float32" else np.float64, copy=False)
                     time_val = nc.date2num(dt_k, units=time_var.getncattr("units"), calendar=time_var.getncattr("calendar"))
                     time_var[write_idx] = time_val
                     write_idx += 1
                     pbar.update(1)
-            
+
             pbar.close()
         finally:
             if ds:
                 ds.close()
 
         return created_files if split_by_year else created_files[0]
-    
+
     def generate_mapping_table(
         self,
         map_dir: str,
@@ -842,17 +824,17 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                     aligned to the 1D catchment list read from that NetCDF. The saved
                     'catchment_ids' array (in NPZ) will follow the order from parameter_nc.
         """
-        
+
         map_dir = Path(map_dir)
         mapdim_path = map_dir / "mapdim.txt"
-        
+
         with open(mapdim_path, "r") as f:
             lines = f.readlines()
             nx = int(lines[0].split('!!')[0].strip())
             ny = int(lines[1].split('!!')[0].strip())
 
         nextxy_path = map_dir / "nextxy.bin"
-            
+
         nextxy_data = binread(
             nextxy_path,
             (nx, ny, 2),
@@ -1117,11 +1099,11 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
         # Create sparse matrix using scipy and compress it
         sparse_matrix = csr_matrix(
-            (data_values.astype(np.float32), (row_idx, col_idx)), 
+            (data_values.astype(np.float32), (row_idx, col_idx)),
             shape=matrix_shape,
             dtype=np.float32
         )
-        
+
         # Eliminate zeros and compress
         sparse_matrix.eliminate_zeros()
 
@@ -1233,21 +1215,21 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         if self.spin_up_cycles > 0:
             if self.spin_up_start_date is None or self.spin_up_end_date is None:
                  raise ValueError("Spin-up dates must be provided")
-            
+
             # Calculate items (including padding) in one spin-up cycle
             chunks_per_cycle = self.num_spin_up_chunks // self.spin_up_cycles
             items_per_cycle = chunks_per_cycle * self.chunk_len
-            
+
             total_spin_up_items = items_per_cycle * self.spin_up_cycles
-            
+
             if idx < total_spin_up_items:
                 # In spin-up
                 # cycle_idx is which repetition of spin-up we are in
                 # idx_in_cycle is the index within that repetition (including padding)
                 idx_in_cycle = idx % items_per_cycle
-                
+
                 return self.spin_up_start_date + self.time_interval * idx_in_cycle
-            
+
             # Main simulation
             idx -= total_spin_up_items
 
@@ -1260,7 +1242,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         """Returns the index in the main simulation timeline for a given datetime."""
         if self.start_date is None or self.time_interval is None:
              raise ValueError("start_date and time_interval required")
-        
+
         offset = dt - self.start_date
         return int(offset.total_seconds() / self.time_interval.total_seconds())
 
@@ -1294,21 +1276,21 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         if self.spin_up_cycles > 0:
             if not hasattr(self, '_spin_up_num_chunks'):
                  self._calc_spin_up_params()
-            
+
             chunks_per_cycle = self._spin_up_num_chunks
             items_per_cycle = chunks_per_cycle * self.chunk_len
             total_spin_up_items = items_per_cycle * self.spin_up_cycles
-            
+
             if idx < total_spin_up_items:
                 # In spin-up region
                 idx_in_cycle = idx % items_per_cycle
-                
+
                 # Calculate valid steps per cycle
                 cycle_duration = self.spin_up_end_date - self.spin_up_start_date
                 steps_per_cycle = int(cycle_duration.total_seconds() / self.time_interval.total_seconds()) + 1
-                
+
                 return idx_in_cycle < steps_per_cycle
-            
+
             # Move to main simulation region
             idx -= total_spin_up_items
 
@@ -1329,7 +1311,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
              raise ValueError("time_interval must be provided for validation")
 
         file_paths = set()
-        
+
         # Main simulation
         if self.start_date and self.end_date:
             curr = self.start_date
@@ -1344,7 +1326,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 while curr <= self.spin_up_end_date:
                     file_paths.add(file_path_gen(curr))
                     curr += self.time_interval
-        
+
         self.validate_files_exist(list(file_paths))
 
     @abstractmethod
@@ -1357,7 +1339,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     def data_size(self) -> int:
         """
         Returns the number of source grid points to be loaded per timestep.
-        
+
         Before build_local_mapping is called: returns full grid size.
         After build_local_mapping is called: returns compressed size (active grids only).
         """
@@ -1371,7 +1353,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     def grid_shape(self) -> Tuple[int, int]:
         """
         Returns (ny, nx) = (lat_size, lon_size) grid dimensions.
-        
+
         Spatial convention: (Y, X) = (lat, lon)
         """
         lon, lat = self.get_coordinates()
@@ -1380,7 +1362,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     def _combine(self, other, operation, reverse=False):
         is_dataset = isinstance(other, AbstractDataset)
         is_scalar = isinstance(other, (int, float, np.number))
-        
+
         if not (is_dataset or is_scalar):
             return NotImplemented
 
@@ -1390,21 +1372,21 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     def __getitem__(self, idx: int) -> np.ndarray:
         """
         Fetch one chunk (T <= chunk_len) starting at chunk index `idx`.
-        
+
         Returns:
         - If build_local_mapping has been called: (chunk_len, N) compressed data
         - Otherwise: (chunk_len, Y, X) full grid data
-        
+
         Pads with zeros if the actual data is shorter than chunk_len.
         """
         # Compute absolute start index for this chunk
         if idx < 0:
             idx += len(self)
-        
+
         compressed = self._local_indices is not None
 
         data = self.read_chunk(idx)
-        
+
         if compressed:
             # Expect (T, N)
             N = self.data_size
@@ -1427,11 +1409,11 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             if T < self.chunk_len:
                 pad = np.zeros((self.chunk_len - T, ny, nx), dtype=self.out_dtype)
                 data = np.vstack([data, pad]) if data.size else pad
-        
+
         # Clip negative values to zero if enabled
         if self.clip_negative:
             np.maximum(data, 0, out=data)
-            
+
         return np.ascontiguousarray(data)
 
     def __len__(self) -> int:
@@ -1440,25 +1422,25 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
     def __add__(self, other):
         return self._combine(other, "add")
-    
+
     def __radd__(self, other):
         return self._combine(other, "add", reverse=True)
 
     def __sub__(self, other):
         return self._combine(other, "sub")
-    
+
     def __rsub__(self, other):
         return self._combine(other, "sub", reverse=True)
 
     def __mul__(self, other):
         return self._combine(other, "mul")
-    
+
     def __rmul__(self, other):
         return self._combine(other, "mul", reverse=True)
 
     def __truediv__(self, other):
         return self._combine(other, "div")
-    
+
     def __rtruediv__(self, other):
         return self._combine(other, "div", reverse=True)
 
@@ -1470,21 +1452,21 @@ class MixedDataset(AbstractDataset):
     def __init__(self, operands: List[Union[AbstractDataset, float, int]], operation: str = "add"):
         if not operands:
             raise ValueError("operands list cannot be empty")
-        
+
         base = None
         for op in operands:
             if isinstance(op, AbstractDataset):
                 base = op
                 break
-        
+
         if base is None:
             raise ValueError("MixedDataset requires at least one AbstractDataset operand")
-        
+
         self.base_dataset = base
         self.operands = []
-        
+
         can_flatten = operation in ["add", "mul"]
-        
+
         for op in operands:
             if can_flatten and isinstance(op, MixedDataset) and op.operation == operation:
                 self.operands.extend(op.operands)
@@ -1526,7 +1508,7 @@ class MixedDataset(AbstractDataset):
             return op
 
         data = _fetch(self.operands[0])
-        
+
         for op in self.operands[1:]:
             val = _fetch(op)
             if self.operation == "add":
@@ -1539,7 +1521,7 @@ class MixedDataset(AbstractDataset):
                 data = data / val
             else:
                 raise NotImplementedError(f"Operation {self.operation} not implemented")
-        
+
         return data
 
     @property
@@ -1579,13 +1561,13 @@ class StaticParameterDataset:
         with nc.Dataset(self.nc_path, "r") as ds:
             if self.var_name not in ds.variables:
                 raise ValueError(f"Variable {self.var_name} not found in {self.nc_path}")
-            
+
             self.lat = ds.variables[self.lat_name][:]
             self.lon = ds.variables[self.lon_name][:]
             var = ds.variables[self.var_name]
             self.shape = var.shape
             self.ndim = var.ndim
-            
+
             # Determine if it has a time/month dimension
             # Assuming (lat, lon) or (time, lat, lon)
             if self.ndim == 2:
@@ -1621,11 +1603,11 @@ class StaticParameterDataset:
                 data = var[:]
             else:
                 data = var[idx]
-            
+
             # Handle MaskedArray
             if isinstance(data, np.ma.MaskedArray):
                 data = data.filled(np.nan)
-            
+
             # Flatten to (N,) and return as (1, N)
             return data.flatten().reshape(1, -1)
 
@@ -1648,14 +1630,14 @@ class StaticParameterDataset:
         """
         map_dir = Path(map_dir)
         mapdim_path = map_dir / "mapdim.txt"
-        
+
         with open(mapdim_path, "r") as f:
             lines = f.readlines()
             nx = int(lines[0].split('!!')[0].strip())
             ny = int(lines[1].split('!!')[0].strip())
 
         nextxy_path = map_dir / "nextxy.bin"
-            
+
         nextxy_data = binread(
             nextxy_path,
             (nx, ny, 2),
@@ -1754,36 +1736,36 @@ class StaticParameterDataset:
                     param_cx = pnc.variables["catchment_x"][:]
                     param_cy = pnc.variables["catchment_y"][:]
                     param_cids = np.ravel_multi_index((param_cx, param_cy), (nx, ny))
-                
+
                 # First, get the actual catchment IDs for the sparse entries
                 actual_cids = catchment_id[row_idx]
-                
+
                 # Now find where these actual_cids are in param_cids
                 new_row_idx = find_indices_in(actual_cids, param_cids)
-                
+
                 # Filter out those not in param_cids
                 keep = new_row_idx != -1
                 row_idx = new_row_idx[keep]
                 col_idx = col_idx[keep]
                 data_values = data_values[keep]
-                
+
                 save_catchment_ids = param_cids.astype(np.int64)
                 matrix_shape = (len(param_cids), int(col_mask.sum()))
-                
+
             except Exception as e:
                 print(f"Warning: Failed to align with parameter_nc: {e}")
                 print("Proceeding with default catchment list from nextxy.")
 
         # Create sparse matrix using scipy and compress it
         sparse_matrix = csr_matrix(
-            (data_values.astype(np.float32), (row_idx, col_idx)), 
+            (data_values.astype(np.float32), (row_idx, col_idx)),
             shape=matrix_shape,
             dtype=np.float32
         )
-        
+
         # Eliminate zeros and compress
         sparse_matrix.eliminate_zeros()
-        
+
         # Prepare mapping data for saving with compressed sparse matrix
         mapping_data = {
             'catchment_ids': save_catchment_ids.astype(np.int64),
@@ -1822,7 +1804,7 @@ class StaticParameterDataset:
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         mapping_npz = Path(mapping_npz)
-        
+
         if var_name is None:
             var_name = self.var_name
 
@@ -1840,10 +1822,10 @@ class StaticParameterDataset:
 
         n_catch = int(catchment_ids.shape[0])
         n_cols = int(mat_shape[1])
-        
+
         # Check data size
         # Note: self.data_size is total pixels. If mask is used, n_cols should match mask.sum()
-        
+
         # Prepare device and torch types
         torch_dtype = torch.float32 if dtype == "float32" else torch.float64
         dev = torch.device(device) if not isinstance(device, torch.device) else device
@@ -1855,7 +1837,7 @@ class StaticParameterDataset:
         crow = torch.from_numpy(mapping.indptr.astype(np.int64))
         ccol = torch.from_numpy(mapping.indices.astype(np.int64))
         cval = torch.from_numpy(mapping.data.astype(np.float32 if dtype == "float32" else np.float64))
-        
+
         if normalized:
             row_lengths = crow[1:] - crow[:-1]
             row_ids = torch.repeat_interleave(
@@ -1873,11 +1855,11 @@ class StaticParameterDataset:
         t_mapping = torch.sparse_csr_tensor(
             crow, ccol, cval, size=(n_catch, n_cols), dtype=torch_dtype, device=dev
         )
-        
+
         dtype_nc = "f4" if dtype == "float32" else "f8"
-        
+
         nc_path = out_dir / f"{var_name}_rank0.nc"
-        
+
         with nc.Dataset(nc_path, "w", format="NETCDF4") as ds:
             ds.setncattr("title", f"Aggregated catchment parameter ({var_name})")
             if self.has_time:
@@ -1887,7 +1869,7 @@ class StaticParameterDataset:
             if self.has_time:
                 time_var = ds.createVariable("time", "f8", ("time",))
                 time_var.setncattr("units", "months" if self.ndim==3 else "unknown") # Simplified
-            
+
             save_coord = ds.createVariable("catchment_id", "i8", ("saved_points",))
             save_coord[:] = catchment_ids
 
@@ -1906,23 +1888,23 @@ class StaticParameterDataset:
             # Process data
             # If static, just one chunk (idx=0)
             # If monthly, loop over len(self)
-            
+
             for idx in range(len(self)):
                 block = self.read_chunk(idx) # (1, N)
-                
+
                 if block.shape[1] != n_cols:
                      raise ValueError(
                         f"Data block shape {tuple(block.shape)} incompatible with mapping columns {n_cols}."
                     )
-                
+
                 # block is (1, N). mapping is (C, N).
                 # We want (C, 1).
                 # mapping @ block.T -> (C, 1)
-                
+
                 block_t = torch.as_tensor(block, dtype=torch_dtype, device=dev).T
                 agg_block = torch.sparse.mm(t_mapping, block_t) # (C, 1)
                 agg_block_np = agg_block.T.contiguous().to("cpu").numpy() # (1, C)
-                
+
                 if self.has_time:
                     out_var[idx, :] = agg_block_np[0, :]
                     # time_var[idx] = idx + 1 # Dummy time

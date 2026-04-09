@@ -33,7 +33,7 @@ class PyTorchCodegenMixin:
         var_list = sorted(list(self._variables))
         return [
             '"""',
-            f'Auto-generated PyTorch aggregation functions for hydroforge statistics.',
+            'Auto-generated PyTorch aggregation functions for hydroforge statistics.',
             f'Generated at: {timestamp}',
             f'Rank: {self.rank}',
             f'Variables: {", ".join(var_list)}',
@@ -50,7 +50,7 @@ class PyTorchCodegenMixin:
                                 lines: List[str], emitted: set,
                                 indent: str, is_2d: bool = False) -> str:
         """Emit PyTorch code to load a variable value (handling virtuals recursively).
-        
+
         Returns the expression name for the loaded value.
         """
         safe_var = self._get_safe_name(var_name)
@@ -92,7 +92,6 @@ class PyTorchCodegenMixin:
                 for t in toks:
                     if t in self._field_registry or t in self._tensor_registry:
                         dep_val = self._pytorch_emit_val_load(t, lines, emitted, indent, is_2d)
-                        safe_t = self._get_safe_name(t)
                         safe_expr = re.sub(r'\b' + re.escape(t) + r'\b', dep_val, safe_expr)
                 safe_expr = self._transform_pow_expr(safe_expr)
                 lines.append(f'{indent}{val_name} = {safe_expr}')
@@ -121,32 +120,32 @@ class PyTorchCodegenMixin:
         func_name = f"_update_{save_idx}"
         lines.extend([
             f'def {func_name}(states, weight, total_weight, num_macro_steps,',
-            f'               sub_step, num_sub_steps, flags,',
-            f'               macro_step_index, num_trials, stride_input):',
+            '               sub_step, num_sub_steps, flags,',
+            '               macro_step_index, num_trials, stride_input):',
         ])
         needed_bools = self._analyze_needed_booleans()
         if needed_bools:
-            lines.append(f'    # Compute boolean flags from sub_step, num_sub_steps, flags')
+            lines.append('    # Compute boolean flags from sub_step, num_sub_steps, flags')
             if 'is_inner_first' in needed_bools:
-                lines.append(f'    is_inner_first = (flags & 1) != 0 and sub_step == 0')
+                lines.append('    is_inner_first = (flags & 1) != 0 and sub_step == 0')
             if 'is_inner_last' in needed_bools:
-                lines.append(f'    is_inner_last = ((flags >> 1) & 1) != 0 and sub_step == num_sub_steps - 1')
+                lines.append('    is_inner_last = ((flags >> 1) & 1) != 0 and sub_step == num_sub_steps - 1')
             if 'is_middle' in needed_bools:
-                lines.append(f'    is_middle = sub_step == num_sub_steps // 2')
+                lines.append('    is_middle = sub_step == num_sub_steps // 2')
             if 'is_outer_first' in needed_bools:
-                lines.append(f'    is_outer_first = ((flags >> 2) & 1) != 0 and is_inner_last')
+                lines.append('    is_outer_first = ((flags >> 2) & 1) != 0 and is_inner_last')
             if 'is_outer_last' in needed_bools:
-                lines.append(f'    is_outer_last = ((flags >> 3) & 1) != 0 and is_inner_last')
+                lines.append('    is_outer_last = ((flags >> 3) & 1) != 0 and is_inner_last')
         lines.extend([
             f'    idx = states["{save_idx}"]',
-            f'    n = len(idx)',
+            '    n = len(idx)',
             '',
         ])
 
         indent = '        '  # inside for t loop
         indent2 = indent + '    '
 
-        lines.append(f'    for t in range(num_trials):')
+        lines.append('    for t in range(num_trials):')
 
         # ---------- 1D variables ----------
         if dims_1d:
@@ -485,7 +484,6 @@ class PyTorchCodegenMixin:
                         if match_maxk:
                             op_type = match_maxk.group(1)
                             k_val = int(match_maxk.group(2))
-                            cmp_fn = 'torch.maximum' if op_type == 'max' else 'torch.minimum'
                             init_val = 'float("-inf")' if op_type == 'max' else 'float("inf")'
                             cmp_op = '>' if op_type == 'max' else '<'
                             lines.extend([
@@ -620,7 +618,7 @@ class PyTorchCodegenMixin:
                         scatter_virtuals_in_group[var] = scatter
 
             if scatter_virtuals_in_group:
-                lines.append(f'    # Scatter pre-step: materialize scatter virtuals')
+                lines.append('    # Scatter pre-step: materialize scatter virtuals')
                 for var, scatter in scatter_virtuals_in_group.items():
                     buf_key = f"__scatter_buf_{var}"
                     idx_key = scatter.index_var
@@ -634,24 +632,24 @@ class PyTorchCodegenMixin:
                     lines.append(f'    _scatter_val = {safe_value_expr}')
                     lines.append(f'    _scatter_idx = states["{idx_key}"].long()')
                     if num_trials > 1:
-                        lines.append(f'    _scatter_idx_exp = _scatter_idx.unsqueeze(0).expand_as(_scatter_val)')
+                        lines.append('    _scatter_idx_exp = _scatter_idx.unsqueeze(0).expand_as(_scatter_val)')
                         lines.append(f'    states["{buf_key}"].scatter_add_(1, _scatter_idx_exp, _scatter_val)')
                     else:
                         lines.append(f'    states["{buf_key}"].scatter_add_(0, _scatter_idx, _scatter_val)')
                     if scatter.mode == 'mean':
                         lines.append(f'    _scatter_cnt = states["{buf_key}"].new_zeros(states["{buf_key}"].shape)')
-                        lines.append(f'    _scatter_ones = _scatter_val.new_ones(_scatter_val.shape)')
+                        lines.append('    _scatter_ones = _scatter_val.new_ones(_scatter_val.shape)')
                         if num_trials > 1:
-                            lines.append(f'    _scatter_cnt.scatter_add_(1, _scatter_idx_exp, _scatter_ones)')
+                            lines.append('    _scatter_cnt.scatter_add_(1, _scatter_idx_exp, _scatter_ones)')
                         else:
-                            lines.append(f'    _scatter_cnt.scatter_add_(0, _scatter_idx, _scatter_ones)')
-                        lines.append(f'    _scatter_cnt = _scatter_cnt.clamp(min=1.0)')
+                            lines.append('    _scatter_cnt.scatter_add_(0, _scatter_idx, _scatter_ones)')
+                        lines.append('    _scatter_cnt = _scatter_cnt.clamp(min=1.0)')
                         lines.append(f'    states["{buf_key}"].div_(_scatter_cnt)')
                 lines.append('')
 
             lines.extend([
                 f'    _update_{save_idx}(states, weight, total_weight, num_macro_steps,',
-                f'                      sub_step, num_sub_steps, flags,',
+                '                      sub_step, num_sub_steps, flags,',
                 f'                      macro_step_index, num_trials, {stride_input})',
             ])
         lines.append('')

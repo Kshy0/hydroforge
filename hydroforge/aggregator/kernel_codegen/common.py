@@ -22,20 +22,20 @@ class CommonCodegenMixin:
     def _save_kernel_file(self: StatisticsAggregator, kernel_code: str) -> None:
         """
         Save the generated kernel code to a permanent file for inspection.
-        
+
         Args:
             kernel_code: Generated kernel code as string
         """
         # Use unique name generation
         unique_name = self._generate_unique_name()
         filename = f"kern_{unique_name}.py"
-        
+
         self._saved_kernel_file = self.kernels_dir / filename
-        
+
         with open(self._saved_kernel_file, 'w', encoding='utf-8') as f:
             f.write(kernel_code)
 
-    
+
 
 
     def _transform_pow_expr(self: StatisticsAggregator, expr: str) -> str:
@@ -45,9 +45,9 @@ class CommonCodegenMixin:
         """
         if '**' not in expr and '^' not in expr:
             return expr
-            
+
         safe_expr = expr.replace('^', '**')
-        
+
         def _visit_and_transform_pow(node):
             for field, value in ast.iter_fields(node):
                 if isinstance(value, list):
@@ -60,7 +60,7 @@ class CommonCodegenMixin:
                     setattr(node, field, new_list)
                 elif isinstance(value, ast.AST):
                     setattr(node, field, _visit_and_transform_pow(value))
-            
+
             if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
                 return ast.Call(
                     func=ast.Attribute(value=ast.Name(id='libdevice', ctx=ast.Load()), attr='pow', ctx=ast.Load()),
@@ -81,7 +81,7 @@ class CommonCodegenMixin:
 
     def _analyze_needed_booleans(self: StatisticsAggregator) -> Set[str]:
         """Determine which boolean flags are needed by the configured ops.
-        
+
         Returns a set of needed boolean names from:
         {'is_inner_first', 'is_inner_last', 'is_middle', 'is_outer_first', 'is_outer_last'}
         """
@@ -110,17 +110,17 @@ class CommonCodegenMixin:
 
     def _analyze_tensor_info(self: StatisticsAggregator):
         """Analyze tensor information and group variables by save_idx.
-        
+
         Returns:
             (tensor_info, grouped_by_save_idx) tuple.
         """
         tensor_info = {}
         grouped_by_save_idx = {}
-        
+
         for var_name in self._variables:
             field_info = self._field_registry[var_name]
             tensor = self._tensor_registry.get(var_name)
-            
+
             if tensor is None:
                  first_op = self._variable_ops[var_name][0]
                  out_name = f"{var_name}_{first_op}"
@@ -140,13 +140,13 @@ class CommonCodegenMixin:
                     'actual_shape': tensor.shape,
                     'actual_ndim': tensor.ndim
                 }
-                
+
             json_schema_extra = getattr(field_info, 'json_schema_extra', {})
             save_idx = json_schema_extra.get('save_idx')
             if save_idx not in grouped_by_save_idx:
                 grouped_by_save_idx[save_idx] = []
             grouped_by_save_idx[save_idx].append(var_name)
-        
+
         return tensor_info, grouped_by_save_idx
 
 

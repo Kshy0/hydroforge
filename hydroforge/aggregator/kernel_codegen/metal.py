@@ -221,7 +221,7 @@ class MetalCodegenMixin:
             buf_idx += 1
 
         # thread position — last param, no trailing comma
-        msl_lines.append(f'    uint tid [[thread_position_in_grid]]')
+        msl_lines.append('    uint tid [[thread_position_in_grid]]')
         msl_lines.append(') {')
 
         # Bounds check
@@ -282,7 +282,7 @@ class MetalCodegenMixin:
                     var_val = f"{safe_var}_val"
                     ctype = self._metal_dtype_str(var)
                     val_for = f"val_for_{safe_var}_{inner_type}"
-                    out_idx = f"t * n_saved_points + tid"
+                    out_idx = "t * n_saved_points + tid"
 
                     if inner_type == 'last':
                         pass
@@ -365,7 +365,7 @@ class MetalCodegenMixin:
                 var_val = f"{safe_var}_val"
                 ctype = self._metal_dtype_str(var)
                 ops = self._variable_ops[var]
-                out_idx = f"t * n_saved_points + tid"
+                out_idx = "t * n_saved_points + tid"
 
                 for op in ops:
                     op_parts = op.split('_')
@@ -571,8 +571,8 @@ class MetalCodegenMixin:
                 for op in self._variable_ops[var]:
                     out_ptr = f"p_{safe_var}_{op}"
                     msl_lines.append(f'{I2}for (int level = 0; level < n_levels; level++) {{')
-                    idx_2d = f"(t * stride_input + idx) * n_levels + level" if num_trials > 1 else f"idx * n_levels + level"
-                    out_2d = f"(t * n_saved_points + tid) * n_levels + level"
+                    idx_2d = "(t * stride_input + idx) * n_levels + level" if num_trials > 1 else "idx * n_levels + level"
+                    out_2d = "(t * n_saved_points + tid) * n_levels + level"
                     msl_lines.append(f'{I2}    {ctype} val_2d = p_{safe_var}[{idx_2d}];')
                     if op == 'mean':
                         msl_lines.extend([
@@ -649,8 +649,6 @@ class MetalCodegenMixin:
 
         # Build the Python wrapper
         def _make_wrapper(lib, metas, grouped, ti, self_ref):
-            num_trials = self_ref.num_trials if self_ref.num_trials > 1 else 1
-
             # Pre-compute stride_input for each group
             strides = {}
             for meta in metas:

@@ -45,14 +45,14 @@ class MultiRankStatsReader:
                  return t_obj.strftime(fmt)
              except Exception:
                  pass
-        
+
         # Fallback to isoformat
         if hasattr(t_obj, "isoformat"):
              try:
                  return t_obj.isoformat()
              except Exception:
                  pass
-                 
+
         # Fallback to string
         return str(t_obj)
 
@@ -75,7 +75,7 @@ class MultiRankStatsReader:
         pattern = f"{self.var_name}_rank*.nc"
         files = sorted(self.base_dir.glob(pattern))
         rank_map: Dict[int, List[Tuple[int, Path]]] = {}
-        
+
         # Regex to match rank and optional year: var_rank0.nc or var_rank0_2000.nc
         if self.split_by_year:
             rank_re = re.compile(rf"^{re.escape(self.var_name)}_rank(\d+)_(\d{{4}})\.nc$")
@@ -97,29 +97,27 @@ class MultiRankStatsReader:
             rank_map[rank_id].append((year, fp))
 
         rank_infos: List[dict] = []
-        
+
         for rank_id in sorted(rank_map.keys()):
             # Sort files by year (or just by name if year is -1, but here we use the tuple)
             # If year is -1, it means no year suffix.
             files_with_year = sorted(rank_map[rank_id], key=lambda x: x[0])
             paths = [p for y, p in files_with_year]
-            
+
             # Use the first file to get metadata
             first_fp = paths[0]
-            
+
             try:
                 with nc.Dataset(first_fp, "r") as ds:
                     if self.var_name not in ds.variables:
                         continue
-                    var = ds.variables[self.var_name]
-                    dims = var.dimensions
-                    
+
                     has_trials = "trial" in ds.dimensions
                     n_trials = int(ds.dimensions["trial"].size) if has_trials else 0
-                    
+
                     has_levels = "levels" in ds.dimensions
                     n_levels = int(ds.dimensions["levels"].size) if has_levels else 0
-                    
+
                     saved_points = int(ds.dimensions["saved_points"].size)
 
                     coord_name = self._select_coord_name(ds, saved_points)
@@ -165,9 +163,9 @@ class MultiRankStatsReader:
         first_rank = self._rank_files[0]
         all_times = []
         self._file_time_offsets = [] # For the first rank, but assumed same for all
-        
+
         current_offset = 0
-        
+
         # Read time from all files of the first rank
         for fp in first_rank["paths"]:
             with nc.Dataset(fp, "r") as ds:
@@ -175,17 +173,17 @@ class MultiRankStatsReader:
                 if not hasattr(self, "_time_units"):
                     self._time_units = getattr(tvar, "units")
                     self._time_calendar = getattr(tvar, "calendar", "standard")
-                
+
                 t_vals = np.array(tvar[:])
                 all_times.append(t_vals)
-                
+
                 length = len(t_vals)
                 self._file_time_offsets.append((current_offset, current_offset + length))
                 current_offset += length
 
         t0 = np.concatenate(all_times)
         dt0 = nc.num2date(t0, units=self._time_units, calendar=self._time_calendar)
-        
+
         # Keep original time objects (python datetime or cftime.datetime)
         self._time_datetimes = list(dt0)
 
@@ -198,7 +196,7 @@ class MultiRankStatsReader:
             for fp in info["paths"]:
                 with nc.Dataset(fp, "r") as dsi:
                     rank_len += len(dsi.variables["time"])
-            
+
             if rank_len != self._time_len:
                 print(
                     f"Warning: Rank {info.get('rank_id')} has {rank_len} time steps, "
@@ -249,32 +247,31 @@ class MultiRankStatsReader:
         """Preload only the chosen inclusive slice [self._slice_start, self._slice_end]."""
         if self._slice_start is None or self._slice_end is None:
             raise RuntimeError("Slice indices not set.")
-        
+
         # We need to map global slice to file-specific slices
         # self._file_time_offsets contains [(0, 366), (366, 731), ...]
-        
+
         for info in self._rank_files:
             if info["saved_points"] == 0:
                 info["cache"] = None
                 continue
-            
+
             rank_data_parts = []
-            current_global_idx = 0
-            
+
             # Iterate through files and extract relevant parts
             for i, fp in enumerate(info["paths"]):
                 file_start_global, file_end_global = self._file_time_offsets[i]
-                
+
                 # Check intersection with requested slice [self._slice_start, self._slice_end]
                 # Intersection: max(start1, start2) to min(end1, end2)
                 req_start = max(self._slice_start, file_start_global)
                 req_end = min(self._slice_end + 1, file_end_global) # exclusive end
-                
+
                 if req_start < req_end:
                     # Calculate local indices
                     local_start = req_start - file_start_global
                     local_end = req_end - file_start_global
-                    
+
                     try:
                         with nc.Dataset(fp, "r") as ds:
                             var = ds.variables[self.var_name]
@@ -358,16 +355,16 @@ class MultiRankStatsReader:
         if time_range is not None:
             # Strategy: Convert input range to numeric values using the NetCDF unit/calendar.
             start_in, end_in = time_range
-            
+
             try:
                 # date2num handles mixing types gracefully usually (if calendar compatible)
                 t_start_val = nc.date2num(start_in, self._time_units, self._time_calendar)
                 t_end_val = nc.date2num(end_in, self._time_units, self._time_calendar)
-                
+
                 # Check coverage against numeric limits
                 file_min = self._time_values_num[0]
                 file_max = self._time_values_num[-1]
-                
+
                 if t_start_val < file_min or t_end_val > file_max:
                     # Provide informative error
                     # Try to format limits back to dates for message
@@ -376,10 +373,10 @@ class MultiRankStatsReader:
                         d_max = self._safe_time_str(self._time_datetimes[-1])
                         d_req_start = self._safe_time_str(start_in)
                         d_req_end = self._safe_time_str(end_in)
-                    except:
+                    except Exception:
                         d_min, d_max = str(file_min), str(file_max)
                         d_req_start, d_req_end = str(start_in), str(end_in)
-                        
+
                     raise ValueError(
                         f"time_range outside available coverage. "
                         f"Requested [{d_req_start} .. {d_req_end}] but coverage is [{d_min} .. {d_max}]."
@@ -388,26 +385,26 @@ class MultiRankStatsReader:
                 # Locate indices using vectorized numeric comparison
                 # left: first index where time >= start
                 # right: last index where time <= end
-                
+
                 valid_mask = (self._time_values_num >= t_start_val) & (self._time_values_num <= t_end_val)
                 indices = np.where(valid_mask)[0]
-                
+
                 if len(indices) == 0:
                      raise ValueError("No time steps found in the request range.")
-                
+
                 left = indices[0]
                 right = indices[-1]
 
             except Exception as e:
                 print(f"Warning: Numeric time comparison failed ({e}), falling back to direct object comparison.")
-                
+
                 start_dt, end_dt = start_in, end_in
                 if start_dt > end_dt:
                      raise ValueError("time_range start must be <= end (closed interval).")
-                     
+
                 first_dt = self._time_datetimes[0]
                 last_dt = self._time_datetimes[-1]
-                
+
                 if start_dt < first_dt or end_dt > last_dt:
                     raise ValueError(f"time_range outside coverage [{first_dt} .. {last_dt}]")
 
@@ -417,7 +414,7 @@ class MultiRankStatsReader:
                     if dt >= start_dt:
                         left = i
                         break
-                
+
                 right = None
                 for j in range(len(dts) - 1, -1, -1):
                     if dts[j] <= end_dt:
@@ -450,7 +447,7 @@ class MultiRankStatsReader:
     def _get_data_from_files(self, info: dict, t_index: int, level: Optional[int] = None, trial: int = 0) -> np.ndarray:
         """Helper to fetch data for a single time step from the correct file."""
         orig_time = int(self._t_indices[t_index])
-        
+
         # Find which file contains orig_time
         for i, (start, end) in enumerate(self._file_time_offsets):
             if start <= orig_time < end:
@@ -458,24 +455,24 @@ class MultiRankStatsReader:
                 fp = info["paths"][i]
                 with nc.Dataset(fp, "r") as ds:
                     var = ds.variables[self.var_name]
-                    
+
                     # Build index tuple
                     # 1. time
                     indices = [local_time]
-                    
+
                     # 2. trial
                     if info["has_trials"]:
                         indices.append(trial)
-                        
+
                     # 3. saved_points (all)
                     indices.append(slice(None))
-                    
+
                     # 4. levels
                     if info["has_levels"]:
                         indices.append(level if level is not None else 0)
-                        
+
                     return var[tuple(indices)]
-        
+
         # Should not happen if t_index is valid
         raise IndexError(f"Time index {orig_time} not found in any file.")
 
@@ -488,13 +485,13 @@ class MultiRankStatsReader:
     ) -> np.ndarray:
         if t_index < 0 or t_index >= self._time_len:
             raise IndexError(f"t_index out of range [0, {self._time_len - 1}]")
-        
+
         parts: List[np.ndarray] = []
         for info in self._rank_files:
             if info["saved_points"] == 0:
                 parts.append(np.empty((0,), dtype=dtype or np.float32))
                 continue
-            
+
             cache_arr = info.get("cache")
             if cache_arr is not None:
                 # cache_arr shape: (time, [trial], saved_points, [levels])
@@ -504,11 +501,11 @@ class MultiRankStatsReader:
                 indices.append(slice(None))
                 if info["has_levels"]:
                     indices.append(level if level is not None else 0)
-                
+
                 data = cache_arr[tuple(indices)]
             else:
                 data = self._get_data_from_files(info, t_index, level, trial)
-                
+
             arr = np.array(data, copy=False)
             if dtype is not None:
                 arr = arr.astype(dtype, copy=False)
@@ -538,7 +535,7 @@ class MultiRankStatsReader:
             y = info.get("y")
             if x is None or y is None:
                 raise RuntimeError(f"{info['path'].name} missing (x,y); set map_shape or coord converter.")
-            
+
             cache_arr = info.get("cache")
             if cache_arr is not None:
                 # cache_arr shape: (time, [trial], saved_points, [levels])
@@ -550,13 +547,13 @@ class MultiRankStatsReader:
                     if level is None:
                         raise ValueError("This variable has 'levels'; please specify 'level'.")
                     indices.append(level)
-                
+
                 vals = cache_arr[tuple(indices)]
             else:
                 if info["has_levels"] and level is None:
                      raise ValueError("This variable has 'levels'; please specify 'level'.")
                 vals = self._get_data_from_files(info, t_index, level, trial)
-                
+
             grid[x, y] = np.array(vals, copy=False)
         return grid
 
@@ -614,18 +611,18 @@ class MultiRankStatsReader:
                 x, y = info.get("x"), info.get("y")
                 if x is None or y is None:
                     continue
-                
+
                 # Build lookup map for this rank: (x, y) -> local_index
                 if all(hit is not None for hit in col_to_hits):
                     break
 
                 # Create a dictionary for O(1) lookup
                 rank_lookup = { (int(xi), int(yi)): i for i, (xi, yi) in enumerate(zip(x, y)) }
-                
+
                 for c, (qx, qy) in enumerate(queries):
                     if col_to_hits[c] is not None:
                         continue
-                    
+
                     if (qx, qy) in rank_lookup:
                         col_to_hits[c] = (r_idx, rank_lookup[(qx, qy)])
 
@@ -633,7 +630,7 @@ class MultiRankStatsReader:
             for r_idx, info in enumerate(self._rank_files):
                 if info["saved_points"] == 0 or info["coord_raw"] is None:
                     continue
-                
+
                 if all(hit is not None for hit in col_to_hits):
                     break
 
@@ -643,7 +640,7 @@ class MultiRankStatsReader:
                 for c, qid in enumerate(queries):
                     if col_to_hits[c] is not None:
                         continue
-                    
+
                     if qid in rank_lookup:
                         col_to_hits[c] = (r_idx, rank_lookup[qid])
 
@@ -695,74 +692,74 @@ class MultiRankStatsReader:
                     if level is None:
                         raise ValueError("This variable has 'levels'; specify `level`.")
                     indices.append(level)
-                
-                # We need to be careful with indexing. 
+
+                # We need to be careful with indexing.
                 # cache_arr[indices] gives us (time, saved_points) or similar.
 
                 # Construct base indices tuple
                 base_indices = [slice(None)] # time
                 if info["has_trials"]:
                     base_indices.append(trial)
-                
+
                 # saved_points dim is next.
                 # levels dim is last.
-                
+
                 for col, li in pairs:
                     # Construct specific indices for this point
                     pt_indices = list(base_indices)
                     pt_indices.append(li) # saved_points index
                     if info["has_levels"]:
                         pt_indices.append(level)
-                    
+
                     out[:, col] = np.asarray(cache_arr[tuple(pt_indices)], dtype=dtype or np.float32)
                 continue
 
             # No cache: minimize I/O by opening once and slicing contiguous time window
             if self._slice_start is None or self._slice_end is None:
                 raise RuntimeError("Internal error: time slice is not set.")
-            
+
             idx = np.array([li for (_, li) in pairs], dtype=np.int64)
-            
+
             # Iterate over files to fill data
             for i, fp in enumerate(info["paths"]):
                 file_start_global, file_end_global = self._file_time_offsets[i]
-                
+
                 # Intersection with requested slice [self._slice_start, self._slice_end]
                 req_start = max(self._slice_start, file_start_global)
                 req_end = min(self._slice_end + 1, file_end_global)
-                
+
                 if req_start < req_end:
                     print(f"    Reading {fp.name} (indices: {len(idx)})...")
                     local_start = req_start - file_start_global
                     local_end = req_end - file_start_global
-                    
+
                     # out is indexed 0..self._time_len-1 corresponding to self._slice_start..self._slice_end
                     out_start = req_start - self._slice_start
                     out_end = req_end - self._slice_start
-                    
+
                     try:
                         with nc.Dataset(fp, "r") as ds:
                             var = ds.variables[self.var_name]
-                            
+
                             # Build slicing tuple
                             # 1. time
                             slices = [slice(local_start, local_end)]
-                            
+
                             # 2. trial
                             if info["has_trials"]:
                                 slices.append(trial)
-                                
+
                             # 3. saved_points (using advanced indexing with `idx`)
                             slices.append(idx)
-                            
+
                             # 4. levels
                             if info["has_levels"]:
                                 if level is None:
                                     raise ValueError("This variable has 'levels'; specify `level`.")
                                 slices.append(level)
-                                
+
                             chunk = np.asarray(var[tuple(slices)])
-                        
+
                         # Scatter chunk to output columns
                         # chunk shape should be (time_len, num_points)
                         for k, (col, _) in enumerate(pairs):
@@ -779,16 +776,16 @@ class MultiRankStatsReader:
     def discover_k_variants(base_dir: Union[str, Path], base_var_name: str) -> List[str]:
         """
         Discover all k-indexed variants of a variable (e.g., for maxK operations).
-        
+
         For a variable like 'river_depth_max3', this will find:
         - river_depth_max3_0
         - river_depth_max3_1
         - river_depth_max3_2
-        
+
         Args:
             base_dir: Directory containing the NetCDF files
             base_var_name: Base variable name (e.g., 'river_depth_max3')
-            
+
         Returns:
             List of variant names sorted by k index, or [base_var_name] if no k variants found
         """
@@ -796,7 +793,7 @@ class MultiRankStatsReader:
         # Pattern to match k-indexed files: {base_var_name}_{k}_rank*.nc
         pattern = f"{base_var_name}_*_rank*.nc"
         files = list(base_dir.glob(pattern))
-        
+
         # Extract unique k indices
         k_pattern = re.compile(rf"^{re.escape(base_var_name)}_(\d+)_rank\d+.*\.nc$")
         k_indices = set()
@@ -804,7 +801,7 @@ class MultiRankStatsReader:
             m = k_pattern.match(f.name)
             if m:
                 k_indices.add(int(m.group(1)))
-        
+
         if k_indices:
             # Return sorted list of variant names
             return [f"{base_var_name}_{k}" for k in sorted(k_indices)]
@@ -814,23 +811,23 @@ class MultiRankStatsReader:
             if list(base_dir.glob(base_pattern)):
                 return [base_var_name]
             return []
-    
+
     @staticmethod
     def list_available_variables(base_dir: Union[str, Path]) -> List[str]:
         """
         List all unique variable names available in the directory.
-        
+
         This scans for files matching *_rank*.nc and extracts variable names.
-        
+
         Args:
             base_dir: Directory containing the NetCDF files
-            
+
         Returns:
             Sorted list of unique variable names
         """
         base_dir = Path(base_dir)
         files = list(base_dir.glob("*_rank*.nc"))
-        
+
         # Pattern to extract variable name: {var_name}_rank{rank}[_{year}].nc
         var_pattern = re.compile(r"^(.+)_rank\d+(?:_\d{4})?\.nc$")
         var_names = set()
@@ -838,7 +835,7 @@ class MultiRankStatsReader:
             m = var_pattern.match(f.name)
             if m:
                 var_names.add(m.group(1))
-        
+
         return sorted(var_names)
 
     @property
@@ -887,12 +884,14 @@ class MultiRankStatsReader:
             if (nx is None or ny is None) and "map_shape" in ds.variables:
                 arr = np.array(ds.variables["map_shape"][:]).squeeze()
                 if arr.size >= 2:
-                    nx = int(arr[0]); ny = int(arr[1])
+                    nx = int(arr[0])
+                    ny = int(arr[1])
             if (nx is None or ny is None) and "map_shape" in attrs:
                 arr = np.array(attrs["map_shape"]).squeeze()
                 if np.size(arr) >= 2:
                     flat = np.ravel(arr)
-                    nx = int(flat[0]); ny = int(flat[1])
+                    nx = int(flat[0])
+                    ny = int(flat[1])
             if nx is None or ny is None:
                 dim_pairs = [("nx", "ny"), ("x", "y"), ("lon", "lat")]
                 for a, b in dim_pairs:
@@ -930,16 +929,16 @@ class MultiRankStatsReader:
     ) -> None:
         if t_index < 0 or t_index >= self._time_len:
             raise IndexError(f"t_index out of range [0, {self._time_len - 1}]")
-            
+
         t_str = f"t={t_index}"
         if self.times:
              t_str = self._safe_time_str(self.times[t_index])
-        
+
         # Check if we have trials to display in title
         has_trials = False
         if self._rank_files and self._rank_files[0]["has_trials"]:
             has_trials = True
-        
+
         title_str = f"{self.var_name} @ {t_str}"
         if has_trials:
             title_str += f" (Trial {trial})"
@@ -952,7 +951,7 @@ class MultiRankStatsReader:
             ax.set_title(title_str)
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
-            
+
             if auto_crop:
                 valid_mask = np.isfinite(grid)
                 if np.any(valid_mask):
@@ -960,13 +959,13 @@ class MultiRankStatsReader:
                     if len(xs) > 0:
                         xmin, xmax = xs.min(), xs.max()
                         ymin, ymax = ys.min(), ys.max()
-                        
+
                         # Apply padding
                         xmin = max(0, xmin - crop_pad)
                         xmax = min(grid.shape[0] - 1, xmax + crop_pad)
                         ymin = max(0, ymin - crop_pad)
                         ymax = min(grid.shape[1] - 1, ymax + crop_pad)
-                        
+
                         ax.set_xlim(xmin - 0.5, xmax + 0.5)
                         ax.set_ylim(ymax + 0.5, ymin - 0.5)
 
@@ -995,22 +994,22 @@ class MultiRankStatsReader:
                     orig_t = int(self._t_indices[t_index])
                     with nc.Dataset(info["path"], "r") as ds:
                         var = ds.variables[self.var_name]
-                        
+
                         # Build slicing tuple
                         # 1. time
                         indices = [orig_t]
-                        
+
                         # 2. trial
                         if info["has_trials"]:
                             indices.append(trial)
-                            
+
                         # 3. saved_points (all)
                         indices.append(slice(None))
-                        
+
                         # 4. levels
                         if info["has_levels"]:
                             indices.append(level if level is not None else 0)
-                            
+
                         vv = var[tuple(indices)]
                 vals.append(np.array(vv))
             x_all = np.concatenate(xs) if xs else np.array([])
@@ -1021,11 +1020,11 @@ class MultiRankStatsReader:
             ax.set_title(f"{title_str} (scatter)")
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
-            
+
             if auto_crop and len(x_all) > 0:
                 xmin, xmax = x_all.min(), x_all.max()
                 ymin, ymax = y_all.min(), y_all.max()
-                
+
                 ax.set_xlim(xmin - crop_pad, xmax + crop_pad)
                 ax.set_ylim(ymax + crop_pad, ymin - crop_pad)
                 ax.invert_yaxis()
@@ -1058,12 +1057,12 @@ class MultiRankStatsReader:
             raise ValueError("Invalid t_range: ensure t_start < t_end")
 
         nx_, ny_ = self._map_shape
-        
-        xmin = 0 
-        xmax = nx_ - 1 
-        ymin = 0 
+
+        xmin = 0
+        xmax = nx_ - 1
+        ymin = 0
         ymax = ny_ - 1
-        
+
         if auto_crop and (x_range is None and y_range is None):
             # Fetch first frame
             grid_0 = self.get_grid(t_start, level=level, trial=trial)
@@ -1072,12 +1071,12 @@ class MultiRankStatsReader:
                 xs, ys = np.where(valid_mask)
                 xmin_c, xmax_c = xs.min(), xs.max()
                 ymin_c, ymax_c = ys.min(), ys.max()
-                
+
                 xmin = max(0, xmin_c - crop_pad)
                 xmax = min(nx_ - 1, xmax_c + crop_pad)
                 ymin = max(0, ymin_c - crop_pad)
                 ymax = min(ny_ - 1, ymax_c + crop_pad)
-        
+
         # Override with manual ranges if provided
         if x_range is not None:
             xmin = max(0, int(x_range[0]))
@@ -1097,18 +1096,18 @@ class MultiRankStatsReader:
             vmax = np.nanmax(window) if np.isfinite(window).any() else 1.0
         if not (vmax > vmin):
             vmax = vmin + 1.0
-            
+
         extent = (xmin - 0.5, xmax + 0.5, ymax + 0.5, ymin - 0.5)
 
         fig, ax = plt.subplots(figsize=figsize)
         im = ax.imshow(window.T, origin="upper", cmap=cmap, vmin=vmin, vmax=vmax, extent=extent)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        
+
         # Use our robust time logic if available
         t_label = f"t={t_start}"
         if self.times:
              t_label = self._safe_time_str(self.times[t_start])
-             
+
         ttl = ax.set_title(f"{self.var_name} @ {t_label}")
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
@@ -1119,11 +1118,11 @@ class MultiRankStatsReader:
             grid = self.get_grid(ti, level=level, trial=trial)
             win = grid[xmin:xmax + 1, ymin:ymax + 1]
             im.set_data(win.T)
-            
+
             t_lbl = f"t={ti}"
             if self.times:
                 t_lbl = self._safe_time_str(self.times[ti])
-                
+
             ttl.set_text(f"{self.var_name} @ {t_lbl}")
             return [im, ttl]
 
@@ -1159,7 +1158,7 @@ class MultiRankStatsReader:
     ) -> plt.Axes:
         """
         Plot time series for specified points (IDs or XY coordinates).
-        
+
         Args:
             points: One or more points. Can be a list of IDs/catchment_ids, or a list of (x,y) tuples.
             level: Level index if variable has levels.
@@ -1169,7 +1168,7 @@ class MultiRankStatsReader:
             ax: Existing matplotlib axis to plot on.
             labels: Optional list of labels for the points (length must match number of points).
             **kwargs: Additional keyword arguments passed to ax.plot
-        
+
         Returns:
             The matplotlib Axes object.
         """
@@ -1177,12 +1176,12 @@ class MultiRankStatsReader:
             trials = [trial]
         else:
             trials = trial
-            
+
         created_fig = False
         if ax is None:
             fig, ax = plt.subplots(figsize=figsize)
             created_fig = True
-            
+
         # Select Time Axis Strategy
         # Prefer raw numeric values + FuncFormatter for perfect calendar support
         use_numeric_time = False
@@ -1198,17 +1197,17 @@ class MultiRankStatsReader:
             times_to_plot = np.arange(self.time_len)
 
         # Ensure points is in a format suitable for get_series
-        
+
         for t in trials:
             # Fetch data: shape (time_len, num_points)
             data = self.get_series(points, level=level, trial=t)
             num_points = data.shape[1]
-            
+
             for i in range(num_points):
                 # Construct label
                 # If multiple trials, include trial info. If multiple points, include point info.
                 lbl_parts = []
-                
+
                 # Point Label
                 if labels and i < len(labels):
                     lbl_parts.append(str(labels[i]))
@@ -1220,7 +1219,7 @@ class MultiRankStatsReader:
                         try:
                             pt_val = points[i]
                             lbl_parts.append(f"Pt {pt_val}")
-                        except:
+                        except Exception:
                             lbl_parts.append(f"Pt {i}")
                     else:
                         lbl_parts.append(f"Pt {i}")
@@ -1233,7 +1232,7 @@ class MultiRankStatsReader:
                      lbl_parts.append(f"(Trial {t})")
 
                 label_str = " ".join(lbl_parts)
-                
+
                 ax.plot(times_to_plot, data[:, i], label=label_str, **kwargs)
 
         # Setup Axis Formatting
@@ -1246,14 +1245,14 @@ class MultiRankStatsReader:
                     return d.strftime('%Y-%m-%d')
                 except Exception:
                     return f"{x:.1f}"
-            
+
             ax.xaxis.set_major_formatter(FuncFormatter(time_tick_formatter))
             ax.set_xlabel(f"Time ({self._time_calendar})")
         else:
             ax.set_xlabel("Time")
 
         ax.set_ylabel(self.var_name)
-        
+
         if title:
             ax.set_title(title)
         elif not ax.get_title():
@@ -1265,19 +1264,19 @@ class MultiRankStatsReader:
                         start_d = nc.num2date(times_to_plot[0], units=self._time_units, calendar=self._time_calendar)
                         end_d = nc.num2date(times_to_plot[-1], units=self._time_units, calendar=self._time_calendar)
                         t_str = f"{start_d.strftime('%Y-%m-%d')} - {end_d.strftime('%Y-%m-%d')}"
-                     except:
+                     except Exception:
                         pass
                 elif hasattr(times_to_plot[0], 'date'):
                     t_str = f"{times_to_plot[0].date()} - {times_to_plot[-1].date()}"
             ax.set_title(f"{self.var_name} Time Series {t_str}")
-            
+
         ax.legend()
         ax.grid(True, linestyle='--', alpha=0.3)
-        
+
         # If we created the figure, layout tight
         if created_fig:
             plt.tight_layout()
-            
+
         return ax
 
     # ----------------------------------------------------------------------------------
