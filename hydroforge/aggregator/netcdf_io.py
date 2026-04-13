@@ -10,7 +10,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import cftime
 import netCDF4 as nc
@@ -22,36 +22,69 @@ if TYPE_CHECKING:
     from hydroforge.aggregator.aggregator import StatisticsAggregator
 
 
+# ---------------------------------------------------------------------------
+# Default cap on per-submit IPC payload (bytes).  Each subprocess receives
+# a pickled numpy array; keeping the payload bounded avoids excessive memory
+# copies.  256 MB is a safe default for machines with ≥8 GB RAM.
+# ---------------------------------------------------------------------------
+_DEFAULT_MAX_IPC_BYTES: int = 256 * 1024 * 1024
+_DEFAULT_MAX_BATCH: int = 30
+
+
+def compute_write_batch_size(
+    saved_points: int,
+    dtype_bytes: int = 4,
+    max_ipc_bytes: int = _DEFAULT_MAX_IPC_BYTES,
+    max_batch: int = _DEFAULT_MAX_BATCH,
+) -> int:
+    """Return the number of time steps to batch per subprocess write.
+
+    The batch is capped so that ``batch * saved_points * dtype_bytes``
+    does not exceed *max_ipc_bytes*, giving an automatic fallback to
+    single-step writes for very large grids (e.g. glb_01min).
+    """
+    per_step = saved_points * dtype_bytes
+    batch = int(max_ipc_bytes / max(per_step, 1))
+    return max(1, min(batch, max_batch))
+
+
+def _find_data_variable(ncfile, var_name: str):
+    """Locate the target data variable inside an open NetCDF dataset."""
+    safe = sanitize_symbol(var_name)
+    if var_name in ncfile.variables:
+        return var_name
+    if safe in ncfile.variables:
+        return safe
+    _skip = {'time', 'trial', 'saved_points', 'levels'}
+    for v in ncfile.variables:
+        vobj = ncfile.variables[v]
+        if v in _skip:
+            continue
+        if vobj.dimensions == ('saved_points',) and vobj.dtype.kind in ('i', 'u'):
+            continue
+        return v
+    raise KeyError(
+        f"Could not find variable for '{var_name}' (safe: '{safe}') in {ncfile.filepath()}"
+    )
+
+
+def _wsl_drop_cache(output_path) -> None:
+    """WSL optimisation: advise the kernel to drop page-cache for *output_path*."""
+    if is_wsl() and hasattr(os, 'posix_fadvise'):
+        try:
+            with open(output_path, 'rb') as f:
+                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        except Exception:
+            pass
+
+
 def _write_time_step_netcdf_process(args: Tuple[Any, ...]) -> Tuple[str, int]:
     """Write a single time step to a NetCDF file. Each file contains a single variable."""
     (var_name, time_step_data, output_path, time_datetime) = args
 
     with nc.Dataset(output_path, 'a') as ncfile:
-        safe = sanitize_symbol(var_name)
         time_var = ncfile.variables['time']
-
-        # Find the data variable
-        target_var = None
-        if var_name in ncfile.variables:
-            target_var = var_name
-        elif safe in ncfile.variables:
-            target_var = safe
-        else:
-            # Find first variable that is not dimension/coord related.
-            _skip = {'time', 'trial', 'saved_points', 'levels'}
-            for v in ncfile.variables:
-                vobj = ncfile.variables[v]
-                if v in _skip:
-                    continue
-                # Skip coordinate variables (1-D integer arrays on saved_points)
-                if vobj.dimensions == ('saved_points',) and vobj.dtype.kind in ('i', 'u'):
-                    continue
-                target_var = v
-                break
-
-        if target_var is None:
-            raise KeyError(f"Could not find variable for '{var_name}' (safe: '{safe}') in {output_path}")
-
+        target_var = _find_data_variable(ncfile, var_name)
         nc_var = ncfile.variables[target_var]
         current_len = len(nc_var)
 
@@ -69,15 +102,43 @@ def _write_time_step_netcdf_process(args: Tuple[Any, ...]) -> Tuple[str, int]:
         time_val = nc.date2num(time_datetime, units=time_unit, calendar=calendar)
         time_var[current_len] = time_val
 
-    # WSL optimization: Clear page cache for the written file to prevent memory bloat
-    if is_wsl() and hasattr(os, 'posix_fadvise'):
-        try:
-            with open(output_path, 'rb') as f:
-                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-        except Exception:
-            pass
-
+    _wsl_drop_cache(output_path)
     return (var_name, current_len)
+
+
+def _write_batch_netcdf_process(args: Tuple[Any, ...]) -> Tuple[str, int]:
+    """Write multiple time steps in one file open/close cycle.
+
+    Expects *args* = ``(var_name, data_batch, output_path, dt_list)`` where
+    *data_batch* has shape ``(N, ...)``, and *dt_list* is a list of N
+    datetime objects.
+    """
+    (var_name, data_batch, output_path, dt_list) = args
+    n_steps = data_batch.shape[0]
+
+    with nc.Dataset(output_path, 'a') as ncfile:
+        time_var = ncfile.variables['time']
+        target_var = _find_data_variable(ncfile, var_name)
+        nc_var = ncfile.variables[target_var]
+        current_len = len(nc_var)
+
+        time_unit = time_var.getncattr("units")
+        calendar = time_var.getncattr("calendar")
+
+        for i in range(n_steps):
+            row = data_batch[i]
+            t = current_len + i
+            if row.ndim == 1:
+                nc_var[t, :] = row
+            elif row.ndim == 2:
+                nc_var[t, :, :] = row
+            elif row.ndim == 3:
+                nc_var[t, :, :, :] = row
+
+            time_var[t] = nc.date2num(dt_list[i], units=time_unit, calendar=calendar)
+
+    _wsl_drop_cache(output_path)
+    return (var_name, current_len + n_steps - 1)
 
 
 
@@ -93,7 +154,8 @@ def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]
     Returns:
         Path or List[Path] to the created NetCDF file(s)
     """
-    (mean_var_name, metadata, coord_values, output_dir, complevel, rank, year, calendar, time_unit, num_trials) = args
+    (mean_var_name, metadata, coord_values, output_dir, complevel, rank, year, calendar, time_unit, num_trials, *extra) = args
+    chunksizes = extra[0] if extra else None
 
     safe_name = sanitize_symbol(mean_var_name)
 
@@ -163,7 +225,8 @@ def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]
                 dtype,
                 dim_names,
                 zlib=True,
-                complevel=complevel)
+                complevel=complevel,
+                chunksizes=chunksizes)
             desc = metadata.get("description", "") + description_suffix
             nc_var.setncattr('description', desc)
             nc_var.setncattr('actual_shape', str(actual_shape))
@@ -212,7 +275,7 @@ class NetCDFIOMixin:
             for out_name, metadata in items:
                 coord_name = metadata.get('save_coord')
                 coord_values = self._coord_cache.get(coord_name, None)
-                args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank, year, self.calendar, self.time_unit, self.num_trials)
+                args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank, year, self.calendar, self.time_unit, self.num_trials, self.output_chunksizes)
                 future = executor.submit(_create_netcdf_file_process, args)
                 creation_futures[future] = (out_name, metadata.get('k', 1))
 
@@ -239,6 +302,82 @@ class NetCDFIOMixin:
         self._files_created = True
         total_files = sum(len(v) if isinstance(v, list) else 1 for v in self._netcdf_files.values())
         print(f"Created {total_files} NetCDF files for streaming")
+
+        # --- Initialise write-batch buffers ---
+        # Each buffer key mirrors a submit key (out_name or out_name_kN).
+        # Value: dict(data=[], dt=[], path=Path)
+        self._write_buffers: Dict[str, Dict[str, Any]] = {}
+        # Compute the adaptive batch size from the first registered output
+        first_meta = next(iter(self._metadata.values()), {})
+        actual_shape = first_meta.get('actual_shape', (1,))
+        # saved_points is the first spatial dim (or second if trials present)
+        sp = actual_shape[1] if self.num_trials > 1 and len(actual_shape) > 1 else actual_shape[0] if actual_shape else 1
+        dtype_bytes = np.dtype(first_meta.get('dtype', 'f4')).itemsize
+        self._write_batch_size = compute_write_batch_size(sp, dtype_bytes)
+        print(f"  Write batch size: {self._write_batch_size} steps (saved_points={sp:,})")
+
+
+    def _flush_write_buffer(self: StatisticsAggregator, key: str) -> None:
+        """Submit a buffered batch to the executor and clear the buffer.
+
+        Falls back to synchronous write if the executor is already shut down
+        (e.g. during interpreter shutdown).
+        """
+        buf = self._write_buffers.get(key)
+        if not buf or len(buf['data']) == 0:
+            return
+
+        data_batch = np.stack(buf['data'], axis=0)
+        dt_list = list(buf['dt'])
+        output_path = buf['path']
+        var_name = buf['var_name']
+
+        if data_batch.shape[0] == 1:
+            args = (var_name, data_batch[0], output_path, dt_list[0])
+            writer = _write_time_step_netcdf_process
+        else:
+            args = (var_name, data_batch, output_path, dt_list)
+            writer = _write_batch_netcdf_process
+
+        try:
+            idx = abs(hash(key)) % len(self._write_executors)
+            future = self._write_executors[idx].submit(writer, args)
+            self._write_futures.append(future)
+        except RuntimeError:
+            # Executor already shut down — write synchronously
+            writer(args)
+
+        buf['data'].clear()
+        buf['dt'].clear()
+
+
+    def _flush_all_write_buffers(self: StatisticsAggregator) -> None:
+        """Flush every pending write buffer (called on year transition / shutdown)."""
+        for key in list(self._write_buffers):
+            self._flush_write_buffer(key)
+
+
+    def _buffer_and_maybe_flush(
+        self: StatisticsAggregator,
+        buf_key: str,
+        var_name: str,
+        data: np.ndarray,
+        output_path,
+        dt: Union[datetime, cftime.datetime],
+        batch_size: int,
+    ) -> None:
+        """Append one time step to a write buffer; flush when full."""
+        if buf_key not in self._write_buffers:
+            self._write_buffers[buf_key] = dict(data=[], dt=[], path=output_path, var_name=var_name)
+
+        buf = self._write_buffers[buf_key]
+        # Update path in case of year-split (new file for new year)
+        buf['path'] = output_path
+        buf['data'].append(data.copy())
+        buf['dt'].append(dt)
+
+        if len(buf['data']) >= batch_size:
+            self._flush_write_buffer(buf_key)
 
 
     def _finalize_time_step_in_memory(self: StatisticsAggregator, dt: Union[datetime, cftime.datetime]) -> None:
@@ -315,6 +454,8 @@ class NetCDFIOMixin:
                 self._create_netcdf_files(year=dt.year)
                 self._current_year = dt.year
             elif self._current_year != dt.year:
+                # Year transition – flush remaining buffers for the old year first
+                self._flush_all_write_buffers()
                 # Year transition - create new files for new year
                 self._create_netcdf_files(year=dt.year)
                 self._current_year = dt.year
@@ -334,6 +475,8 @@ class NetCDFIOMixin:
 
         # Clear dirty set for next step
         self._dirty_outputs.clear()
+
+        batch_size = getattr(self, '_write_batch_size', 1)
 
         for out_name in keys_to_write:
             tensor = self._storage[out_name]
@@ -362,36 +505,21 @@ class NetCDFIOMixin:
                 for k_idx, output_path in enumerate(output_paths):
                     # Extract k-th slice (last dimension is k)
                     if time_step_data.ndim == 2:
-                        # (saved_points, k) -> (saved_points,)
                         k_data = time_step_data[:, k_idx]
                     elif time_step_data.ndim == 3:
-                        # (trials, saved_points, k) or (saved_points, levels, k)
                         k_data = time_step_data[:, :, k_idx]
                     elif time_step_data.ndim == 4:
-                        # (trials, saved_points, levels, k)
                         k_data = time_step_data[:, :, :, k_idx]
                     else:
                         k_data = time_step_data[..., k_idx]
 
-                    # Use a unique key for executor selection
-                    exec_key = f"{out_name}_{k_idx}"
-                    idx = abs(hash(exec_key)) % len(self._write_executors)
-                    executor = self._write_executors[idx]
-
+                    buf_key = f"{out_name}_{k_idx}"
                     file_var_name = f"{out_name}_{k_idx}"
-                    args = (file_var_name, k_data, output_path, dt)
-                    future = executor.submit(_write_time_step_netcdf_process, args)
-                    self._write_futures.append(future)
+                    self._buffer_and_maybe_flush(buf_key, file_var_name, k_data, output_path, dt, batch_size)
             else:
                 # Single file case (k=1 or legacy)
                 output_path = output_paths if not isinstance(output_paths, list) else output_paths[0]
-
-                idx = abs(hash(out_name)) % len(self._write_executors)
-                executor = self._write_executors[idx]
-
-                args = (out_name, time_step_data, output_path, dt)
-                future = executor.submit(_write_time_step_netcdf_process, args)
-                self._write_futures.append(future)
+                self._buffer_and_maybe_flush(out_name, out_name, time_step_data, output_path, dt, batch_size)
 
         # Note: _current_macro_step_count is reset in update_statistics when is_outer_first=True
 

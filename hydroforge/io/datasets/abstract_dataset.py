@@ -627,6 +627,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         units: str = "m3/s",
         description: Optional[str] = None,
         filename: Optional[str] = None,
+        chunksizes: Optional[tuple] = None,
     ) -> Union[Path, List[Path]]:
         """
         Export catchment-aggregated data to a NetCDF file readable by MultiRankStatsReader.
@@ -657,6 +658,9 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             units: Units string for the output variable
             description: Optional description for the output variable
             filename: Optional custom filename prefix (default: var_name)
+            chunksizes: Optional NetCDF chunk sizes for the data variable, e.g. (365, 1).
+                If None, uses netCDF4 default. Setting (T, 1) optimizes per-station
+                time series reads at the cost of slower writes.
         """
         # Require build_local_mapping() to be called first
         if not hasattr(self, '_desired_catchment_ids') or self._desired_catchment_ids is None:
@@ -729,6 +733,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 ("time", "saved_points"),
                 zlib=True,
                 complevel=int(complevel),
+                chunksizes=chunksizes,
             )
             desc = description if description else f"Catchment-aggregated {var_name} (area-weighted mean)"
             out_var.setncattr("description", desc)

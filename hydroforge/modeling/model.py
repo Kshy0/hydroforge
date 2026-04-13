@@ -143,6 +143,11 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         default=None,
         description="Device for in-memory results (default: CPU)",
     )
+    output_chunksizes: Optional[tuple] = Field(
+        default=None,
+        description="NetCDF chunk sizes for output data variables, e.g. (365, 1). "
+                    "If None, uses netCDF4 default.",
+    )
 
     _modules: Dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
 
@@ -494,6 +499,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             in_memory_mode=self.in_memory_output,
             result_device=self.result_device,
             save_precision=torch.float32,
+            output_chunksizes=self.output_chunksizes,
         )
 
         registered_vars = set()

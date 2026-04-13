@@ -56,6 +56,13 @@ class ExportedDataset(NetCDFDataset):
         self.coord_name = coord_name
         self._in_memory = in_memory
         self._memory_cache: Optional[np.ndarray] = None  # Shape: (total_time_steps, num_catchments)
+
+        # Auto-detect chunk_len from file's NetCDF time chunking if not provided
+        if "chunk_len" not in kwargs:
+            detected = self._detect_chunk_len(base_dir, prefix, suffix, var_name, start_date, time_to_key)
+            if detected is not None:
+                kwargs["chunk_len"] = detected
+
         super().__init__(
             base_dir=base_dir,
             start_date=start_date,
@@ -68,6 +75,29 @@ class ExportedDataset(NetCDFDataset):
             *args,
             **kwargs,
         )
+
+    @staticmethod
+    def _detect_chunk_len(base_dir, prefix, suffix, var_name, start_date, time_to_key):
+        """Detect chunk_len from file's NetCDF time chunking."""
+        key = time_to_key(start_date) if time_to_key else ""
+        path = Path(base_dir) / f"{prefix}{key}{suffix}"
+        if not path.exists():
+            return None
+        try:
+            with Dataset(path, "r") as ds:
+                if var_name not in ds.variables:
+                    return None
+                var = ds.variables[var_name]
+                chunking = var.chunking()
+                if chunking == "contiguous" or not chunking:
+                    return None
+                dims = tuple(d.lower() for d in var.dimensions)
+                t_idx = dims.index("time") if "time" in dims else None
+                if t_idx is not None:
+                    return int(chunking[t_idx])
+        except Exception:
+            return None
+        return None
 
     # -------------------------
     # Coordinates (1D catchment IDs)

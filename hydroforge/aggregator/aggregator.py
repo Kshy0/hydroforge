@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import os
 import random
@@ -42,7 +43,8 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
                  max_pending_steps: int = 200, calendar: str = "standard",
                  time_unit: str = "days since 1900-01-01 00:00:00",
                  in_memory_mode: bool = False, result_device: Optional[torch.device] = None,
-                 save_precision: Optional[torch.dtype] = None):
+                 save_precision: Optional[torch.dtype] = None,
+                 output_chunksizes: Optional[tuple] = None):
         """
         Initialize the statistics aggregator.
 
@@ -73,7 +75,10 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
         self.complevel = complevel
         self.save_kernels = save_kernels
         self.output_split_by_year = output_split_by_year
+        self.output_chunksizes = output_chunksizes
         self.num_trials = num_trials
+        self._closed = False
+        atexit.register(self._shutdown)
         self.max_pending_steps = max(1, max_pending_steps)
         self.calendar = calendar
         self.time_unit = time_unit
@@ -173,6 +178,9 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
     def _cleanup_executor(self) -> None:
         """Clean up the write executor."""
         if self._write_executors:
+            # Flush any remaining buffered time steps
+            if hasattr(self, '_write_buffers'):
+                self._flush_all_write_buffers()
             # Wait for pending writes to complete
             for future in self._write_futures:
                 try:
@@ -188,11 +196,21 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
             self._write_futures = []
 
 
-    def __del__(self) -> None:
-        """Clean up temporary files and executor when the object is destroyed."""
+    def _shutdown(self) -> None:
+        """Flush pending writes and release resources. Called via atexit."""
+        if self._closed:
+            return
+        self._closed = True
         self._cleanup_temp_files()
         self._cleanup_executor()
         self._cleanup_lock_files()
+
+    def __del__(self) -> None:
+        """Best-effort cleanup if atexit didn't run."""
+        try:
+            self._shutdown()
+        except Exception:
+            pass
 
 
     def get_memory_usage(self) -> int:
