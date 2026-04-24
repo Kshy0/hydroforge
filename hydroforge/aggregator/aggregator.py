@@ -67,6 +67,11 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
                           Only used when in_memory_mode=True.
             save_precision: If set, downcast all float outputs to this precision when saving.
                            E.g. torch.float32 will save float64 tensors as float32.
+
+        Per-saved-point static metadata (e.g. basin_id, per-catchment
+        ``shift_days``) is registered after construction via
+        :meth:`register_static`, mirroring the ``register_tensor`` /
+        ``register_virtual_tensor`` pattern used for dynamic outputs.
         """
         self.device = device
         self.output_dir = output_dir
@@ -89,18 +94,29 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
         self.result_device = result_device if result_device is not None else torch.device("cpu")
         self.save_precision = save_precision
 
-        self._macro_step_index = 0  # Current macro step index (outer loop counter)
+        # Generated-kernel state (populated lazily by the codegen mixins).
+        self._static_kernel_module = None
+        self._static_kernel_file: Optional[str] = None
+        self._static_gather_function = None
 
-        # Time index tracking for argmax/argmin conversion
-        # Maps macro step index -> datetime, populated during finalize_time_step
-        self._macro_step_times: List[Union[datetime, cftime.datetime]] = []
-
-        # Create kernels directory if saving is enabled
+        # Create kernels directory if saving is enabled (must precede any
+        # codegen step so the generated .py files have a destination).
         if self.save_kernels:
             if self.output_dir is None:
                 raise ValueError("output_dir is required when save_kernels=True")
             self.kernels_dir = self.output_dir / "generated_kernels"
             self.kernels_dir.mkdir(parents=True, exist_ok=True)
+
+        # Normalize static_vars.  Populated by :meth:`register_static`
+        # on demand; the NetCDF writer consumes this dict at file
+        # creation time.
+        self.static_vars: Dict[str, Dict[str, Any]] = {}
+
+        self._macro_step_index = 0  # Current macro step index (outer loop counter)
+
+        # Time index tracking for argmax/argmin conversion
+        # Maps macro step index -> datetime, populated during finalize_time_step
+        self._macro_step_times: List[Union[datetime, cftime.datetime]] = []
 
         # Internal state
         # Generic stats state (for all ops)
@@ -154,11 +170,12 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
 
     def _cleanup_temp_files(self) -> None:
         """Remove temporary kernel files."""
-        if self._temp_kernel_file and os.path.exists(self._temp_kernel_file):
-            try:
-                os.unlink(self._temp_kernel_file)
-            except Exception:
-                pass
+        for path in (self._temp_kernel_file, self._static_kernel_file):
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
 
 
     def _cleanup_lock_files(self) -> None:
@@ -317,6 +334,35 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
         self._get_safe_name(name)
         # Do NOT add to _tensor_registry since it has no storage
         self._kernel_states = None
+
+
+    def register_static(self, name: str, tensor: torch.Tensor,
+                        save_idx: Optional[torch.Tensor] = None,
+                        dim: str = "saved_points",
+                        dtype: Optional[str] = None,
+                        attrs: Optional[Dict[str, Any]] = None) -> None:
+        """Register a per-saved-point static variable.
+
+        The raw ``tensor`` (optionally gathered by ``save_idx``) is
+        materialised once via the generated gather kernel and stashed
+        for the NetCDF writer, which emits it along ``dim`` at file
+        creation time.  Mirrors :meth:`register_tensor` /
+        :meth:`register_virtual_tensor` so all aggregator inputs flow
+        through the same register_* surface.
+        """
+        if self._static_gather_function is None:
+            self._generate_static_gather_function()
+        values = (
+            self._static_gather_function(tensor, save_idx)
+            .detach().cpu().numpy()
+        )
+        self.static_vars[name] = {
+            "values": values,
+            "dim": dim,
+            "dtype": dtype if dtype is not None
+                     else values.dtype.str.lstrip("<>|"),
+            "attrs": dict(attrs or {}),
+        }
 
 
     def _init_result_storage(self) -> None:

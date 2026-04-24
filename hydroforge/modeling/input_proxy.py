@@ -64,6 +64,7 @@ class InputProxy:
         lazy: bool = False,
         visible_vars: Optional[Union[List[str], Set[str]]] = None,
         align_on: Optional[str] = None,
+        skip_fields: Optional[Union[List[str], Set[str]]] = None,
     ) -> InputProxy:
         """
         Create an InputProxy from one or multiple NetCDF files.
@@ -77,6 +78,13 @@ class InputProxy:
             align_on: Variable name to use for alignment.
                       The FIRST file encountered containing this variable serves as the REFERENCE.
                       Subsequent files will be reordered to match the order of this variable in the reference file.
+            skip_fields: Optional list/set of variable names to actively exclude.
+                      Complements ``visible_vars``: a field is loaded only if it is in
+                      ``visible_vars`` (when set) AND not in ``skip_fields``.  Useful
+                      when the same NC drives multiple models and one wants to bypass
+                      a validator/consumer on a specific field (e.g. CaMaFlood's
+                      uniqueness check on ``inflow_catchment_id`` when the field is
+                      allowed to repeat in HydroNet).
         """
         data = {}
         attrs = {}
@@ -85,9 +93,10 @@ class InputProxy:
         file_map = {}
         file_indices = {}
 
-        # Normalize visible_vars
+        # Normalize visible_vars / skip_fields
         if visible_vars is not None:
             visible_vars = set(visible_vars)
+        skip_fields = set(skip_fields) if skip_fields else set()
 
         # Normalize to list
         if isinstance(file_path, (str, Path)):
@@ -146,8 +155,10 @@ class InputProxy:
 
                     # Merge variables and check for conflicts
                     for var_name in ds.variables:
-                        # Visibility check
+                        # Visibility / skip check
                         if visible_vars is not None and var_name not in visible_vars:
+                            continue
+                        if var_name in skip_fields:
                             continue
 
                         if var_name in found_vars:
@@ -453,6 +464,44 @@ class InputProxy:
 
     def __setitem__(self, key: str, value: Any) -> None:
         self.data[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        """Drop ``key`` completely from the proxy.
+
+        Mirrors :meth:`drop` for a single name via the ``del proxy[key]``
+        syntax.  Unknown keys raise :class:`KeyError` (dict-like).
+        """
+        if key not in self.data and key not in self.visible_vars:
+            raise KeyError(key)
+        self.drop(key)
+
+    def drop(self, *names: str) -> "InputProxy":
+        """Remove one or more variables from every internal registry.
+
+        Clears ``data``, ``visible_vars``, ``file_map`` and
+        ``file_indices`` for each supplied name so downstream consumers
+        (including lazy loaders, validators, and model construction) no
+        longer see the field.  Unknown names are silently ignored so
+        callers can use ``drop`` as an idempotent cleanup step.
+
+        Returns ``self`` to allow chaining with :meth:`from_nc`.
+
+        Example
+        -------
+        Bypass a CaMaFlood uniqueness check on a field that a different
+        model (e.g. HydroNet) allows to repeat::
+
+            proxy = (InputProxy
+                     .from_nc("interval_params.nc", lazy=False)
+                     .drop("inflow_catchment_id"))
+            model = CaMaFlood(input_proxy=proxy, ...)
+        """
+        for name in names:
+            self.data.pop(name, None)
+            self.visible_vars.discard(name)
+            self.file_map.pop(name, None)
+            self.file_indices.pop(name, None)
+        return self
 
     def __contains__(self, key: str) -> bool:
         return key in self.data or (self.lazy and key in self.visible_vars)
