@@ -63,14 +63,19 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         description="List of active modules",
     )
     # Preferred shape: dict[op -> str | list[str]]; op in {mean,max,min,last};
-    # one variable can appear under multiple ops.
+    # one variable can appear under multiple ops.  Use the reserved key
+    # ``"static"`` to register per-saved-point static variables — these
+    # are materialised once at aggregator init and written into every
+    # output NC alongside the dynamic results.
     variables_to_save: Optional[Dict[str, Union[str, List[Union[str, Dict[str, str]]]]]] = Field(
         default=None,
         description=(
             "Statistics to save, in the form {op: [vars...]}. "
             "Supported ops: mean, max, min, last, first, mid, sum. "
             "For max/min, argmax/argmin are automatically computed. "
-            "Variables can be strings or {alias: expr} dicts."
+            "Variables can be strings or {alias: expr} dicts.  The "
+            "reserved key ``\"static\"`` marks per-saved-point static "
+            "metadata (e.g. shift_days) written once per output NC."
         ),
     )
     precision: Literal["float32", "float64"] = Field(
@@ -485,6 +490,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         """
         if not self.variables_to_save:
             return
+
         self._statistics_aggregator = StatisticsAggregator(
             device=self.device,
             output_dir=self.output_full_dir,
@@ -515,6 +521,36 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         explicit_expressions: Dict[str, str] = {}
 
         for op, vars_val in self.variables_to_save.items():
+            # ── Static per-saved-point metadata (op == "static") ──
+            # Short-circuit: no inner/outer op parsing, no aggregation
+            # buffers.  Each listed variable is gathered once by its
+            # field's ``save_idx`` (if any) and handed to the aggregator
+            # via register_static, which will write it into every
+            # output NC at file creation time.
+            if op == "static":
+                items = [vars_val] if isinstance(vars_val, str) else list(vars_val)
+                for name in items:
+                    if not isinstance(name, str):
+                        raise ValueError(
+                            "variables_to_save['static'] entries must be "
+                            f"plain field names, got {name!r}")
+                    if name not in self.variable_map:
+                        raise ValueError(
+                            f"Static variable '{name}' not found in any "
+                            f"opened module")
+                    module, attr, _ = self.variable_map[name]
+                    tensor = getattr(module, attr)
+                    info = (module.get_model_fields().get(attr)
+                            or module.get_model_computed_fields().get(attr))
+                    extra = (getattr(info, "json_schema_extra", {}) or {}
+                             if info is not None else {})
+                    save_idx_attr = extra.get("save_idx")
+                    save_idx = (getattr(module, save_idx_attr)
+                                if save_idx_attr is not None else None)
+                    self._statistics_aggregator.register_static(
+                        name, tensor, save_idx=save_idx)
+                continue
+
             op_l = str(op).lower()
             op_parts = op_l.split('_')
 
@@ -1262,6 +1298,10 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         else:
             pairs = []
             for op, vs in self.variables_to_save.items():
+                # Static (op=="static") entries bypass op-grammar checks;
+                # the runtime registers them via register_static.
+                if op == "static":
+                    continue
                 op_l = str(op).lower()
                 op_parts = op_l.split('_')
 

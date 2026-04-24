@@ -156,6 +156,7 @@ def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]
     """
     (mean_var_name, metadata, coord_values, output_dir, complevel, rank, year, calendar, time_unit, num_trials, *extra) = args
     chunksizes = extra[0] if extra else None
+    static_vars: Dict[str, Dict[str, Any]] = extra[1] if len(extra) > 1 else {}
 
     safe_name = sanitize_symbol(mean_var_name)
 
@@ -214,6 +215,29 @@ def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]
                     ('saved_points',),
                 )
                 coord_var[:] = coord_values
+
+            # Write user-supplied static per-point variables.  Each entry
+            # must align with the requested dimension; silently skip entries
+            # whose dim is absent in this file (e.g. a saved_points-scoped
+            # static var on a levels-only output).
+            for sv_name, sv_spec in (static_vars or {}).items():
+                sv_dim = sv_spec.get("dim", "saved_points")
+                if sv_dim not in ncfile.dimensions:
+                    continue
+                sv_values = np.asarray(sv_spec["values"])
+                expected = ncfile.dimensions[sv_dim].size
+                if sv_values.shape[0] != expected:
+                    raise ValueError(
+                        f"static_vars['{sv_name}'] length {sv_values.shape[0]} "
+                        f"!= dim '{sv_dim}' size {expected} in {output_path.name}"
+                    )
+                sv_var = ncfile.createVariable(
+                    sv_name, sv_spec.get("dtype", sv_values.dtype.str.lstrip("<>|")),
+                    (sv_dim,),
+                )
+                sv_var[:] = sv_values
+                for ak, av in sv_spec.get("attrs", {}).items():
+                    sv_var.setncattr(ak, av)
 
             time_var = ncfile.createVariable('time', 'f8', ('time',))
             time_var.setncattr('units', time_unit)
@@ -275,7 +299,7 @@ class NetCDFIOMixin:
             for out_name, metadata in items:
                 coord_name = metadata.get('save_coord')
                 coord_values = self._coord_cache.get(coord_name, None)
-                args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank, year, self.calendar, self.time_unit, self.num_trials, self.output_chunksizes)
+                args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank, year, self.calendar, self.time_unit, self.num_trials, self.output_chunksizes, self.static_vars)
                 future = executor.submit(_create_netcdf_file_process, args)
                 creation_futures[future] = (out_name, metadata.get('k', 1))
 

@@ -83,6 +83,7 @@ def computed_tensor_field(
     category: Literal["topology", "derived_param", "state", "shared_state", "virtual"] = "derived_param",
     expr: Optional[str] = None,
     depends_on: Optional[str] = None,
+    static_output: bool = False,
     **kwargs
 ):
     """
@@ -110,7 +111,7 @@ def computed_tensor_field(
     if expr is not None and category != "virtual":
         raise ValueError("expr can only be provided when category is 'virtual'")
 
-    if dtype not in ("float", "hpfloat"):
+    if dtype not in ("float", "hpfloat") and not static_output:
         save_idx = None
 
     if save_idx is None:
@@ -127,6 +128,7 @@ def computed_tensor_field(
             "category": category,
             "expr": expr,
             "depends_on": depends_on,
+            "static_output": static_output,
         },
         **kwargs
     )

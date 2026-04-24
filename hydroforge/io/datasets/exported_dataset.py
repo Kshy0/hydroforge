@@ -11,12 +11,27 @@ from pathlib import Path
 from typing import Callable, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
-import torch
 from netCDF4 import Dataset
 
 from hydroforge.io.datasets.netcdf_dataset import NetCDFDataset
 from hydroforge.io.datasets.utils import single_file_key
 from hydroforge.modeling.distributed import find_indices_in, is_rank_zero
+
+import numba as _numba
+
+@_numba.njit(cache=True, parallel=True)
+def _gather_nb_kernel(data, shift, base_t, length, oob_fill):
+    T, C = data.shape
+    out = np.full((length, C), oob_fill, dtype=data.dtype)
+    for c in _numba.prange(C):
+        s = int(shift[c])
+        for t in range(length):
+            src = base_t + t + s
+            if 0 <= src < T:
+                out[t, c] = data[src, c]
+    return out
+
+_NUMBA_C_THRESHOLD = 5000  # Use numba for C above this (≈8x faster for glb_15min)
 
 
 class ExportedDataset(NetCDFDataset):
@@ -56,6 +71,35 @@ class ExportedDataset(NetCDFDataset):
         self.coord_name = coord_name
         self._in_memory = in_memory
         self._memory_cache: Optional[np.ndarray] = None  # Shape: (total_time_steps, num_catchments)
+
+        # Per-catchment integer day shift applied at read time (None = no shift).
+        # Populated by :meth:`build_local_mapping`.
+        self._shift_days: Optional[np.ndarray] = None  # (C,) int64
+
+        # Window-sampling mode (populated by :meth:`enable_windows`).
+        self._window_len: Optional[int] = None
+        self._window_starts: Optional[np.ndarray] = None
+
+        # Inflow overlay (populated by :meth:`attach_inflow_overlay`).
+        # ``_inflow_valid_length_days[c]`` marks the per-column valid span
+        # on the shifted read axis ``[0, valid_length[c])``.
+        self._inflow_data: Optional[np.ndarray] = None   # (T_full, C_in) f32
+        self._inflow_shift_days: Optional[np.ndarray] = None     # (C_in,)
+        self._inflow_valid_length_days: Optional[np.ndarray] = None  # (C_in,)
+
+        # Basin-level coordinated (shift, length), keyed by basin id.
+        # Populated by :meth:`attach_inflow_overlay`.
+        self._basin_shift: dict[int, int] = {}
+        self._basin_length: dict[int, int] = {}
+
+        # Loss overlay (populated by :meth:`attach_loss_overlay`); NaN preserved.
+        self._loss_data: Optional[np.ndarray] = None     # (T_full, C_loss) f32
+        self._loss_shift_days: Optional[np.ndarray] = None       # (C_loss,)
+
+        # Precomputed shift groups for fast _gather dispatch (avoids np.unique per call).
+        self._shift_day_groups: Optional[list] = None
+        self._inflow_shift_groups: Optional[list] = None
+        self._loss_shift_groups: Optional[list] = None
 
         # Auto-detect chunk_len from file's NetCDF time chunking if not provided
         if "chunk_len" not in kwargs:
@@ -98,6 +142,12 @@ class ExportedDataset(NetCDFDataset):
         except Exception:
             return None
         return None
+
+    @staticmethod
+    def _compile_groups(shift: np.ndarray) -> list:
+        """Precompute [(shift_val, col_indices), ...] for fast _gather dispatch."""
+        unique_shifts, inv = np.unique(shift, return_inverse=True)
+        return [(int(s), np.where(inv == i)[0]) for i, s in enumerate(unique_shifts)]
 
     # -------------------------
     # Coordinates (1D catchment IDs)
@@ -208,19 +258,23 @@ class ExportedDataset(NetCDFDataset):
     def build_local_mapping(
         self,
         desired_catchment_ids: np.ndarray,
+        desired_basin_ids: Optional[np.ndarray] = None,
     ) -> None:
-        """Set up column reordering to match desired catchment order.
+        """Set up column reordering and per-catchment shift for runoff.
 
-        Unlike grid-based datasets, this doesn't build a sparse matrix.
-        It simply finds the column indices that map the file's catchment order
-        to the desired order, and stores them in _local_indices.
+        Must be called **after** :meth:`attach_inflow_overlay` so that
+        ``_basin_shift`` is populated.  The per-catchment runoff shift is
+        auto-derived as ``shift[c] = _basin_shift.get(basin[c], 0)``.
 
-        After calling this method:
-          - _read_ops will return data with columns in the desired order
-          - __getitem__ can be used (it requires _local_indices to be set)
-          - shard_forcing simply flattens without matrix multiply
-
-        Returns None (no matrix needed for exported data).
+        Parameters
+        ----------
+        desired_catchment_ids : np.ndarray, shape (C,)
+            Catchment ids in the order consumers want.
+        desired_basin_ids : np.ndarray, shape (C,), optional
+            Basin id of each desired catchment (e.g.
+            ``model.base.catchment_basin_id``).  When *None* (default) no
+            per-catchment shift is derived, which is the correct behaviour
+            when no inflow shift is needed.
         """
         # Load catchment IDs from file
         key = self.time_to_key(self.start_date)
@@ -232,26 +286,46 @@ class ExportedDataset(NetCDFDataset):
             file_catchment_ids = (arr.filled(0) if isinstance(arr, np.ma.MaskedArray)
                                   else np.asarray(arr)).astype(np.int64)
 
-        # Find column positions for desired catchments
         col_pos = find_indices_in(desired_catchment_ids, file_catchment_ids)
         if np.any(col_pos == -1):
             missing = int(np.sum(col_pos == -1))
             raise ValueError(
                 f"{missing} desired catchments not found in exported file {path.name}"
             )
-
-        # Store indices for column reordering in _read_ops
         self._local_indices = col_pos.astype(np.int64)
 
         if is_rank_zero():
             print(f"[ExportedDataset] Mapped {len(desired_catchment_ids)} catchments "
                   f"from {len(file_catchment_ids)} in file")
 
-        # Auto-load to memory if in_memory mode is enabled
-        if self._in_memory:
+        # Derive per-catchment shift from basin_shift (auto after attach_inflow_overlay).
+        if desired_basin_ids is not None and self._basin_shift:
+            bids = np.asarray(desired_basin_ids, dtype=np.int64).ravel()
+            if bids.shape != (len(desired_catchment_ids),):
+                raise ValueError(
+                    f"desired_basin_ids must have shape "
+                    f"({len(desired_catchment_ids)},); got {bids.shape}")
+            sh = np.array(
+                [int(self._basin_shift.get(int(b), 0)) for b in bids],
+                dtype=np.int64,
+            )
+            if np.any(sh != 0):
+                self._shift_days = sh
+                self._shift_day_groups = self._compile_groups(sh)
+                if is_rank_zero():
+                    print(
+                        f"[ExportedDataset] Registered per-catchment shift: "
+                        f"{np.unique(sh).size} unique values, "
+                        f"range [{int(sh.min())}, {int(sh.max())}] days"
+                    )
+
+        # Load to memory when inflow overlay is attached (enables large-window
+        # reads for val/test) or when per-catchment shift is applied (requires
+        # random-access _gather).
+        if self._inflow_data is not None or self._shift_days is not None:
             self.load_to_memory()
 
-        return None  # No matrix needed
+        return None
 
     def load_to_memory(self) -> None:
         """Load all data into memory for faster repeated access.
@@ -377,13 +451,10 @@ class ExportedDataset(NetCDFDataset):
             data_var.long_name = f"{var_name} quantile values"
 
             if fits_in_memory:
-                # ---- fits in memory: use __getitem__ with original chunk_len ----
-                n_chunks = self._real_len()
-                spin_up_offset = self.num_spin_up_chunks
-                pieces: List[np.ndarray] = []
-                for i in range(n_chunks):
-                    pieces.append(self[spin_up_offset + i])
-                all_data = np.concatenate(pieces, axis=0)[:T_total]
+                # ---- fits in memory: load full series once, compute quantiles ----
+                if self._memory_cache is None:
+                    self.load_to_memory()
+                all_data = self._memory_cache[:T_total]
                 q_values = np.quantile(all_data, quantiles_arr, axis=0)  # (Q, C)
                 data_var[:] = q_values.astype(dtype)
             else:
@@ -441,13 +512,20 @@ class ExportedDataset(NetCDFDataset):
 
     def shard_forcing(
         self,
-        batch_data: torch.Tensor,
-    ) -> torch.Tensor:
+        batch_data,
+    ):
         """Flatten (B, T, C) -> (B*T, C).
 
         For ExportedDataset, data is already in the correct column order
         (set by build_local_mapping), so no matrix multiply is needed.
+
+        When overlays are attached (:meth:`attach_inflow_overlay` and/or
+        :meth:`attach_loss_overlay`), ``batch_data`` is a tuple of
+        per-stream tensors; each is flattened independently and returned
+        as a tuple in the same order.
         """
+        if isinstance(batch_data, (tuple, list)):
+            return tuple(self.shard_forcing(b) for b in batch_data)
         if batch_data.dim() == 3:
             B, T, C = batch_data.shape
             return batch_data.reshape(B * T, C).contiguous()
@@ -469,44 +547,413 @@ class ExportedDataset(NetCDFDataset):
     # -------------------------
     # Override __getitem__ - no rank gating for exported data
     # -------------------------
-    def __getitem__(self, idx: int) -> np.ndarray:
-        """Fetch chunk - each rank reads independently for exported data.
+    def __getitem__(self, idx):
+        """Fetch a chunk or window (no rank gating for exported data).
 
-        If build_local_mapping has been called, returns data reordered to
-        match desired catchment order. Otherwise, returns data in file order.
+        Dispatches on the active mode:
 
-        If in_memory mode is enabled (and load_to_memory has been called),
-        returns a slice from the memory cache instead of reading from disk.
+        * Window-sampling (``enable_windows``): ``base_t`` comes from
+          ``_window_starts[idx]`` and length is ``_window_len``.
+        * Chunked (default): ``base_t = idx * chunk_len``.
+
+        Then returns ``_gather(memory_cache, _shift_days, base_t, length)``
+        if data is cached, else a contiguous ``read_chunk(idx)`` slice.
+        When :meth:`attach_inflow_overlay` is active, also gathers the
+        inflow overlay and returns ``(runoff, inflow, inflow_valid)``;
+        if :meth:`attach_loss_overlay` is additionally active, returns
+        ``(runoff, inflow, inflow_valid, loss)``.
         """
         if idx < 0:
             idx += len(self)
+        if self._window_starts is not None:
+            base_t = int(self._window_starts[idx])
+            length = int(self._window_len)
+        else:
+            base_t = idx * self.chunk_len
+            length = int(self.chunk_len)
 
-        N = self.data_size
-
-        # Use memory cache if available
         if self._memory_cache is not None:
-            # Calculate time indices for this chunk
-            start_time_idx = idx * self.chunk_len
-            end_time_idx = min(start_time_idx + self.chunk_len, self._memory_cache.shape[0])
-
-            data = self._memory_cache[start_time_idx:end_time_idx]
+            runoff = self._gather(self._memory_cache, self._shift_days, base_t, length,
+                                  groups=self._shift_day_groups)
+        else:
+            if self._shift_days is not None:
+                raise RuntimeError("per-catchment shift requires in-memory data; "
+                                   "call load_to_memory() first")
+            # Disk path: contiguous chunk read, zero-padded to `length`.
+            data = self.read_chunk(idx)
             T = data.shape[0]
-
-            if T < self.chunk_len:
-                pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
+            if T < length:
+                pad = np.zeros((length - T, self.data_size), dtype=self.out_dtype)
                 data = np.vstack([data, pad]) if data.size else pad
+            runoff = np.ascontiguousarray(data)
 
-            # Already C-contiguous from load_to_memory, but slice may not be
-            return np.ascontiguousarray(data)
+        if self._inflow_data is None:
+            return runoff
+        inflow = self._gather(self._inflow_data, self._inflow_shift_days, base_t, length,
+                              groups=self._inflow_shift_groups)
+        if self._loss_data is None:
+            return runoff, inflow
+        loss = self._gather(self._loss_data, self._loss_shift_days, base_t, length,
+                            oob_fill=np.nan, groups=self._loss_shift_groups)
+        return runoff, inflow, loss
 
-        # Fall back to reading from disk
-        data = self.read_chunk(idx)
+    @staticmethod
+    def _gather(data: np.ndarray, shift: Optional[np.ndarray],
+                base_t: int, length: int,
+                oob_fill: float = 0.0, *, groups: Optional[list] = None) -> np.ndarray:
+        """Gather a ``(length, C)`` window from in-memory ``data``.
 
-        if data.ndim != 2 or data.shape[1] != N:
-            raise ValueError(f"Expected shape (T, {N}), got {tuple(data.shape)}")
+        Without ``shift``/``groups``: plain contiguous slice, zero-padded at
+        boundaries.
 
-        T = data.shape[0]
-        if T < self.chunk_len:
-            pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
-            data = np.vstack([data, pad]) if data.size else pad
-        return np.ascontiguousarray(data)
+        With shift, dispatches based on ``C``:
+        - ``C >= _NUMBA_C_THRESHOLD`` and numba available → parallel per-column
+          kernel (~8x faster for large C, e.g. glb_15min runoff).
+        - Otherwise → precomputed ``groups`` slice-copy (fastest for small C,
+          e.g. inflow/loss overlays).
+        """
+        T, C = data.shape
+        if shift is None and groups is None:
+            lo = max(base_t, 0)
+            hi = min(base_t + length, T)
+            if lo == base_t and hi == base_t + length:
+                return data[lo:hi].copy()
+            out = np.full((length, C), oob_fill, dtype=data.dtype)
+            if lo < hi:
+                out[lo - base_t: hi - base_t] = data[lo:hi]
+            return out
+        if C >= _NUMBA_C_THRESHOLD:
+            return _gather_nb_kernel(data, shift, base_t, length, float(oob_fill))
+        out = np.full((length, C), oob_fill, dtype=data.dtype)
+        if groups is None:
+            unique_shifts, inv = np.unique(shift, return_inverse=True)
+            groups = [(int(s), np.where(inv == i)[0]) for i, s in enumerate(unique_shifts)]
+        for s, cols in groups:
+            src_lo = base_t + s
+            clip_lo = max(src_lo, 0)
+            clip_hi = min(src_lo + length, T)
+            if clip_lo >= clip_hi:
+                continue
+            out[clip_lo - src_lo: clip_hi - src_lo, cols] = data[clip_lo:clip_hi, cols]
+        return out
+
+    def _inflow_valid_mask(self, base_t: int, length: int) -> np.ndarray:
+        """Compute ``(length, C_in)`` bool mask for inflow overlay.
+
+        Kept for downstream code that wants per-window valid masks
+        explicitly; ``__getitem__`` no longer returns this — consumers
+        read ``self._inflow_valid_length_days`` and derive masks as
+        needed.
+        """
+        vl = self._inflow_valid_length_days
+        if vl is None:
+            C = self._inflow_data.shape[1]
+            return np.ones((length, C), dtype=bool)
+        t_local = np.arange(length, dtype=np.int64)[:, None]
+        return (base_t + t_local) < vl[None, :]
+
+    def __len__(self) -> int:
+        """Window mode length, or chunk-based length."""
+        if self._window_starts is not None:
+            return int(self._window_starts.size)
+        return super().__len__()
+
+    def enable_windows(self, window: int, stride: Optional[int] = None) -> None:
+        """Switch ``__getitem__``/``__len__`` to shifted-window sampling.
+
+        ``self[idx]`` returns ``(window, C)`` covering
+        ``[starts[idx], starts[idx] + window)`` on the shifted time axis,
+        where ``starts = np.arange(0, T - window + 1, stride)``.
+        Combined with DataLoader ``shuffle=True`` this gives randomized
+        training windows.  Compatible with per-catchment shift and with
+        the inflow overlay.
+        """
+        window = int(window)
+        stride = int(stride) if stride is not None else window
+        if window <= 0 or stride <= 0:
+            raise ValueError(f"window/stride must be positive; got {window}/{stride}")
+        T = len(self._global_times)
+        if T < window:
+            raise ValueError(f"window={window} exceeds total time steps {T}")
+        self._window_len = window
+        self._window_starts = np.arange(0, T - window + 1, stride, dtype=np.int64)
+        if is_rank_zero():
+            print(f"[ExportedDataset] Enabled window sampling: window={window}, "
+                  f"stride={stride}, {self._window_starts.size} windows over {T} time steps")
+
+    # -------------------------
+    # Overlay helpers
+    # -------------------------
+    def _align_overlay_data(
+        self,
+        data: np.ndarray,
+        data_start_date: datetime,
+    ) -> np.ndarray:
+        """Crop/pad a native-axis overlay to ``self._global_times``.
+
+        ``data[0]`` corresponds to ``data_start_date``; output row 0
+        corresponds to ``self.start_date`` and output has
+        ``num_main_steps`` rows.  Missing rows are zero-filled; rows
+        beyond the dataset window are dropped.  The daily time
+        interval is assumed (the only case used by gauge overlays).
+        """
+        T_ds = int(self.num_main_steps)
+        offset = (self.start_date - data_start_date).days
+        T_src = int(data.shape[0])
+        out = np.zeros((T_ds, data.shape[1]), dtype=np.float32)
+        # Source row j aligns with output row (j - offset).
+        src_lo = max(offset, 0)
+        src_hi = min(offset + T_ds, T_src)
+        if src_lo < src_hi:
+            out[src_lo - offset: src_hi - offset] = data[src_lo:src_hi]
+        return out
+
+    @staticmethod
+    def _longest_valid_run(valid: np.ndarray) -> tuple[int, int]:
+        """Return ``(start, length)`` of the longest contiguous True run."""
+        if not valid.any():
+            return 0, 0
+        padded = np.concatenate(([False], valid, [False]))
+        diff = np.diff(padded.astype(np.int8))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+        lengths = ends - starts
+        k = int(np.argmax(lengths))
+        return int(starts[k]), int(lengths[k])
+
+    # -------------------------
+    # Inflow overlay
+    # -------------------------
+    def attach_inflow_overlay(
+        self,
+        data: np.ndarray,
+        data_start_date: datetime,
+        data_catchment_ids: np.ndarray,
+        desired_catchment_ids: np.ndarray,
+        desired_basin_ids: np.ndarray,
+    ) -> None:
+        """Attach an inflow overlay from raw gauge data.
+
+        The overlay is supplied on its **native observation axis** with
+        an explicit ``data_start_date``; this method handles time
+        cropping to the dataset window, column reordering, per-column
+        longest-valid-run detection (NaN in the raw data ⇒ invalid),
+        per-basin ``(shift, length)`` coordination and NaN→0 filling.
+
+        After this call:
+
+        * ``self._basin_shift[b] / self._basin_length[b]`` expose the
+          basin-coordinated offset/length keyed by basin id.  These are
+          consumed by :meth:`build_local_mapping` (runoff per-catchment
+          shift) and :meth:`attach_loss_overlay` (loss per-POI shift).
+        * ``self._inflow_shift_days[c]`` equals
+          ``self._basin_shift[desired_basin_ids[c]]``.
+        * ``self._inflow_valid_length_days[c]`` equals
+          ``self._basin_length[desired_basin_ids[c]]`` — the number of
+          leading read-axis steps that are observed (the rest are 0).
+          ``__getitem__`` returns ``(runoff, inflow[, loss])`` without
+          a per-window validity mask; consumers read this attribute to
+          mask partial windows.
+
+        Parameters
+        ----------
+        data : np.ndarray
+            Shape ``(T_src, N_source)`` float.  Native-axis rows; NaN
+            marks missing.
+        data_start_date : datetime
+            Calendar date of ``data[0]``.
+        data_catchment_ids : np.ndarray
+            Shape ``(N_source,)`` int64 — catchment IDs per column of
+            ``data``.
+        desired_catchment_ids : np.ndarray
+            Shape ``(N_desired,)`` int64 — the column order the consumer
+            expects (typically ``model.base.inflow_catchment_id``).
+        desired_basin_ids : np.ndarray
+            Shape ``(N_desired,)`` int64 — basin id of each desired
+            column (typically ``model.base.inflow_basin_id``).  Used to
+            coordinate per-basin (shift, length).
+        """
+        data = np.asarray(data, dtype=np.float32)
+        if data.ndim != 2:
+            raise ValueError(
+                f"attach_inflow_overlay: data must be 2-D; got {data.shape}")
+
+        src_cids = np.asarray(data_catchment_ids, dtype=np.int64)
+        if src_cids.shape != (data.shape[1],):
+            raise ValueError(
+                f"attach_inflow_overlay: data_catchment_ids shape "
+                f"{src_cids.shape} does not match data columns {data.shape[1]}")
+        dst_cids = np.asarray(desired_catchment_ids, dtype=np.int64)
+        dst_basin = np.asarray(desired_basin_ids, dtype=np.int64)
+        if dst_basin.shape != dst_cids.shape:
+            raise ValueError(
+                f"attach_inflow_overlay: desired_basin_ids shape "
+                f"{dst_basin.shape} != desired_catchment_ids shape "
+                f"{dst_cids.shape}")
+
+        col_pos = find_indices_in(dst_cids, src_cids)
+        if np.any(col_pos == -1):
+            missing = int((col_pos == -1).sum())
+            raise ValueError(
+                f"attach_inflow_overlay: {missing} desired catchment IDs "
+                f"not found in data_catchment_ids")
+
+        # 1. Reorder columns, 2. align time axis to dataset window.
+        data_reordered = np.ascontiguousarray(data[:, col_pos])
+        aligned_raw = self._align_overlay_data(data_reordered, data_start_date)
+
+        # 3. Per-column longest valid run on the aligned (dataset-window)
+        #    axis.  NaN → invalid.
+        C = dst_cids.size
+        per_col_shift = np.zeros(C, dtype=np.int64)
+        per_col_length = np.zeros(C, dtype=np.int64)
+        for c in range(C):
+            valid = ~np.isnan(aligned_raw[:, c])
+            s, ln = self._longest_valid_run(valid)
+            per_col_shift[c] = s
+            per_col_length[c] = ln
+
+        # 4. Per-basin coordination: shift = max leading offset,
+        #    length = min end minus coord shift (clamped at 0).
+        basin_shift: dict[int, int] = {}
+        basin_end: dict[int, int] = {}
+        for c in range(C):
+            if per_col_length[c] == 0:
+                continue
+            b = int(dst_basin[c])
+            s = int(per_col_shift[c])
+            e = s + int(per_col_length[c])
+            basin_shift[b] = max(basin_shift.get(b, 0), s)
+            basin_end[b] = min(basin_end.get(b, e), e)
+        basin_length: dict[int, int] = {
+            b: max(0, basin_end[b] - basin_shift[b]) for b in basin_shift
+        }
+
+        # 5. Per desired column: (shift, length) = basin-coord.  Columns
+        #    whose basin has no valid gauges retain (0, 0) and the
+        #    overlay yields zero throughout for those columns.
+        out_shift = np.zeros(C, dtype=np.int64)
+        out_length = np.zeros(C, dtype=np.int64)
+        for c in range(C):
+            b = int(dst_basin[c])
+            if b in basin_shift:
+                out_shift[c] = basin_shift[b]
+                out_length[c] = basin_length[b]
+
+        # 6. Fill NaN with 0 on native axis AND zero-out positions
+        #    outside ``[shift[c], shift[c] + length[c])`` so shifted
+        #    reads beyond the valid span deterministically yield 0.
+        inflow_data = np.where(np.isnan(aligned_raw), 0.0, aligned_raw)
+        T_ds = inflow_data.shape[0]
+        for c in range(C):
+            s = int(out_shift[c])
+            ln = int(out_length[c])
+            if s > 0:
+                inflow_data[:s, c] = 0.0
+            if s + ln < T_ds:
+                inflow_data[s + ln:, c] = 0.0
+        self._inflow_data = np.ascontiguousarray(
+            inflow_data.astype(np.float32))
+        self._inflow_shift_days = out_shift
+        self._inflow_shift_groups = self._compile_groups(out_shift)
+        self._inflow_valid_length_days = out_length
+        self._basin_shift = basin_shift
+        self._basin_length = basin_length
+
+        if is_rank_zero():
+            n_with = int((out_length > 0).sum())
+            max_shift = int(out_shift.max()) if C else 0
+            print(
+                f"[ExportedDataset] Attached inflow overlay: {C} gauges, "
+                f"with valid span={n_with}, "
+                f"basins coordinated={len(basin_shift)}, "
+                f"max shift={max_shift} days"
+            )
+
+    @property
+    def inflow_valid_length_days(self) -> Optional[np.ndarray]:
+        """Per-column number of leading valid read-axis steps, or ``None``."""
+        return self._inflow_valid_length_days
+
+    @property
+    def basin_shift(self) -> dict[int, int]:
+        return dict(self._basin_shift)
+
+    @property
+    def basin_length(self) -> dict[int, int]:
+        return dict(self._basin_length)
+
+    # -------------------------
+    # Loss overlay
+    # -------------------------
+    def attach_loss_overlay(
+        self,
+        data: np.ndarray,
+        data_start_date: datetime,
+        data_catchment_ids: np.ndarray,
+        desired_catchment_ids: np.ndarray,
+        desired_basin_ids: np.ndarray,
+    ) -> None:
+        """Attach a loss-target overlay from raw gauge data.
+
+        Symmetric to :meth:`attach_inflow_overlay` but preserves NaN
+        (the loss function uses the NaN mask).  The per-column shift is
+        read from ``self._basin_shift`` (populated by
+        :meth:`attach_inflow_overlay`); columns whose basin has no
+        inflow use shift 0.  No longest-run / length metadata is stored
+        — ``__getitem__`` returns ``loss`` with NaN preserved outside
+        the valid span via the gather's ``oob_fill=np.nan``.
+        """
+        data = np.asarray(data, dtype=np.float32)
+        if data.ndim != 2:
+            raise ValueError(
+                f"attach_loss_overlay: data must be 2-D; got {data.shape}")
+        src_cids = np.asarray(data_catchment_ids, dtype=np.int64)
+        if src_cids.shape != (data.shape[1],):
+            raise ValueError(
+                f"attach_loss_overlay: data_catchment_ids shape "
+                f"{src_cids.shape} does not match data columns {data.shape[1]}")
+        dst_cids = np.asarray(desired_catchment_ids, dtype=np.int64)
+        dst_basin = np.asarray(desired_basin_ids, dtype=np.int64)
+        if dst_basin.shape != dst_cids.shape:
+            raise ValueError(
+                f"attach_loss_overlay: desired_basin_ids shape "
+                f"{dst_basin.shape} != desired_catchment_ids shape "
+                f"{dst_cids.shape}")
+
+        col_pos = find_indices_in(dst_cids, src_cids)
+        if np.any(col_pos == -1):
+            missing = int((col_pos == -1).sum())
+            raise ValueError(
+                f"attach_loss_overlay: {missing} desired catchment IDs "
+                f"not found in data_catchment_ids")
+        data_reordered = np.ascontiguousarray(data[:, col_pos])
+        aligned = self._align_overlay_data(data_reordered, data_start_date)
+        # _align_overlay_data zero-fills out-of-window rows; convert those
+        # zeros back to NaN so the loss mask treats them as missing.
+        # We detect out-of-window rows by re-computing the offset.
+        T_ds = aligned.shape[0]
+        offset = (self.start_date - data_start_date).days
+        T_src = int(data.shape[0])
+        oob = np.ones(T_ds, dtype=bool)
+        lo = max(offset, 0)
+        hi = min(offset + T_ds, T_src)
+        if lo < hi:
+            oob[lo - offset: hi - offset] = False
+        aligned[oob, :] = np.nan
+
+        shift = np.array(
+            [int(self._basin_shift.get(int(b), 0)) for b in dst_basin],
+            dtype=np.int64,
+        )
+
+        self._loss_data = aligned
+        self._loss_shift_days = shift
+        self._loss_shift_groups = self._compile_groups(shift)
+        if is_rank_zero():
+            nz = int((shift != 0).sum())
+            print(
+                f"[ExportedDataset] Attached loss overlay: "
+                f"{dst_cids.size} catchments, shift nonzero={nz}, "
+                f"max={int(shift.max()) if shift.size else 0}"
+            )

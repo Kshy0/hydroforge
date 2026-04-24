@@ -15,12 +15,14 @@ if TYPE_CHECKING:
 from hydroforge.aggregator.kernel_codegen.common import CommonCodegenMixin
 from hydroforge.aggregator.kernel_codegen.metal import MetalCodegenMixin
 from hydroforge.aggregator.kernel_codegen.pytorch import PyTorchCodegenMixin
+from hydroforge.aggregator.kernel_codegen.static import StaticCodegenMixin
 from hydroforge.aggregator.kernel_codegen.triton import TritonCodegenMixin
 
 
 class KernelCodegenMixin(
     MetalCodegenMixin,
     PyTorchCodegenMixin,
+    StaticCodegenMixin,
     TritonCodegenMixin,
     CommonCodegenMixin,
 ):

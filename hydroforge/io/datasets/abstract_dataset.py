@@ -1839,9 +1839,9 @@ class StaticParameterDataset:
             dev = torch.device("cpu")
 
         # Build torch sparse CSR once on the target device
-        crow = torch.from_numpy(mapping.indptr.astype(np.int64))
-        ccol = torch.from_numpy(mapping.indices.astype(np.int64))
-        cval = torch.from_numpy(mapping.data.astype(np.float32 if dtype == "float32" else np.float64))
+        crow = torch.from_numpy(mapping.indptr.astype(np.int64)).to(dev)
+        ccol = torch.from_numpy(mapping.indices.astype(np.int64)).to(dev)
+        cval = torch.from_numpy(mapping.data.astype(np.float32 if dtype == "float32" else np.float64)).to(dev)
 
         if normalized:
             row_lengths = crow[1:] - crow[:-1]
