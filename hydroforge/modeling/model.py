@@ -406,14 +406,69 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         """
         variable_group_mapping = {}
 
-        # Iterate through all opened modules to collect field information
+        # Collect all declared field names + their metadata for static
+        # validation below.
+        declared_fields: Dict[str, Any] = {}
+        # Track dim_coords references: variable_name -> dim_coords_target
+        dim_coords_refs: Dict[str, str] = {}
         for _, _, field_name, field_info in self._iter_all_fields(include_computed=False):
             json_schema_extra = getattr(field_info, 'json_schema_extra', None)
             if json_schema_extra is None:
                 json_schema_extra = {}
+            declared_fields[field_name] = json_schema_extra
             group_var = json_schema_extra.get('group_by', None)
             if group_var:
                 variable_group_mapping[field_name] = group_var
+            dim_coords_var = json_schema_extra.get('dim_coords', None)
+            if dim_coords_var:
+                dim_coords_refs[field_name] = dim_coords_var
+
+        # ── Static group_by validation ──────────────────────────────────
+        # group_by targets must be 1D integer fields (not necessarily
+        # unique — many catchments may share a basin).
+        _int_dtypes = {"int", "idx"}
+        for field_name, group_var in variable_group_mapping.items():
+            if group_var not in declared_fields:
+                raise ValueError(
+                    f"Field '{field_name}' declares group_by='{group_var}', "
+                    f"but no such field is declared in any opened module. "
+                    f"Likely a typo. Declared fields: "
+                    f"{sorted(declared_fields.keys())}"
+                )
+            tgt_extra = declared_fields[group_var]
+            tgt_shape = tgt_extra.get("tensor_shape")
+            if tgt_shape is not None and len(tgt_shape) != 1:
+                raise ValueError(
+                    f"group_by target '{group_var}' (referenced by "
+                    f"'{field_name}') must be 1-D, got tensor_shape={tgt_shape}."
+                )
+            tgt_dtype = tgt_extra.get("tensor_dtype")
+            if tgt_dtype is not None and tgt_dtype not in _int_dtypes:
+                raise ValueError(
+                    f"group_by target '{group_var}' (referenced by "
+                    f"'{field_name}') must be integer-like "
+                    f"(dtype 'int' or 'idx'), got tensor_dtype={tgt_dtype!r}."
+                )
+
+        # ── Static dim_coords validation ────────────────────────────────
+        # dim_coords targets must be declared key fields (is_key=True).
+        # ``module.field`` qualifiers are stripped to the bare name.
+        for field_name, dc_ref in dim_coords_refs.items():
+            bare = dc_ref.split(".")[-1]
+            if bare not in declared_fields:
+                raise ValueError(
+                    f"Field '{field_name}' declares dim_coords='{dc_ref}', "
+                    f"but no such field is declared. Declared fields: "
+                    f"{sorted(declared_fields.keys())}"
+                )
+            if not declared_fields[bare].get("is_key", False):
+                raise ValueError(
+                    f"dim_coords target '{dc_ref}' (referenced by "
+                    f"'{field_name}') must be declared with is_key=True. "
+                    f"Only unique 1D integer key fields can serve as "
+                    f"dim_coords (PlanItem requires this for target_ids "
+                    f"lookup)."
+                )
 
         return variable_group_mapping
 

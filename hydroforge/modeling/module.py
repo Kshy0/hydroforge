@@ -29,10 +29,16 @@ def TensorField(
     dim_coords: Optional[str] = None,
     category: Literal["topology", "param", "init_state", "state"] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
+    is_key: bool = False,
     **kwargs
 ):
     """
     Create a tensor field with shape information directly in AbstractModule.
+
+    ``is_key=True`` marks the field as a unique 1D integer key. Such
+    fields are validated at startup (1D, int dtype, all values unique)
+    and are the only fields that ``PlanItem`` may use for ``target_ids``
+    lookup (either via ``dim_coords`` or ``target_id_field``).
 
     Args:
         description: Human-readable description of the variable
@@ -70,6 +76,7 @@ def TensorField(
             "dim_coords": dim_coords,
             "category": category,
             "mode": mode,
+            "is_key": is_key,
         }
     )
 
@@ -455,6 +462,28 @@ class AbstractModule(BaseModel, ABC):
                 if key not in auto_fix_log:
                     auto_fix_log[key] = []
                 auto_fix_log[key].append(field_name)
+
+            # 5. Key field validation: 1D integer + unique values.
+            if json_schema_extra.get("is_key", False):
+                if tensor.dtype not in (torch.int32, torch.int64):
+                    raise ValueError(
+                        f"Key field '{field_name}' must be int32/int64, got {tensor.dtype}"
+                    )
+                if tensor.ndim != 1:
+                    raise ValueError(
+                        f"Key field '{field_name}' must be 1D, got shape {tuple(tensor.shape)}"
+                    )
+                if tensor.numel() > 0:
+                    vals, counts = torch.unique(tensor, return_counts=True)
+                    dup_mask = counts > 1
+                    if bool(dup_mask.any()):
+                        n_dup = int(dup_mask.sum().item())
+                        sample = vals[dup_mask][:5].tolist()
+                        raise ValueError(
+                            f"Key field '{field_name}' has {n_dup} duplicate value(s); "
+                            f"first few: {sample}"
+                        )
+
             # Update tensor if it was modified
             setattr(self, field_name, tensor)
 
