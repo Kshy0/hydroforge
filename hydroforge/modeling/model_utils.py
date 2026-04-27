@@ -159,11 +159,13 @@ class PlanItem:
     delta: Union[float, torch.Tensor] = 0.0
     target_value: Optional[Union[float, torch.Tensor]] = None
     target_ids: Optional[Union[List[int], torch.Tensor]] = None
+    target_id_field: Optional[str] = None
 
     # Cached execution context (resolved once)
     _module: Optional[Any] = None
     _attr_name: str = ""
     _indices: Optional[torch.Tensor] = None
+    _resolved_id_field: Optional[str] = None
     _is_ready: bool = False
 
     @property
@@ -288,42 +290,94 @@ class ParameterPlanMixin:
 
         return None
 
+    def _assert_field_is_key(self: AbstractModel, ref: str, ctx: str) -> None:
+        """Assert that ``ref`` (bare or ``module.field``) refers to a field
+        declared with ``is_key=True``.  Raises ValueError otherwise."""
+        bare = ref.split(".")[-1]
+        if bare not in self.variable_map:
+            raise ValueError(
+                f"ParameterChangePlan Error: {ctx} '{ref}' does not "
+                f"resolve to any declared field."
+            )
+        mod_inst, field_name, _ = self.variable_map[bare]
+        info = (mod_inst.get_model_fields().get(field_name)
+                or mod_inst.get_model_computed_fields().get(field_name))
+        extra = getattr(info, "json_schema_extra", None) or {}
+        if not extra.get("is_key", False):
+            raise ValueError(
+                f"ParameterChangePlan Error: {ctx} '{ref}' is not a key "
+                f"field. PlanItem can only target fields declared with "
+                f"is_key=True (1D unique integer keys)."
+            )
+
     def _resolve_plan_item(self: AbstractModel, item: PlanItem) -> None:
         from hydroforge.modeling.distributed import find_indices_in_torch
 
         variable_map = self.variable_map
 
-        if item.variable_name in variable_map:
-            module, attr, id_attr = variable_map[item.variable_name]
-            item._module = module
-            item._attr_name = attr
+        if item.variable_name not in variable_map:
+            raise ValueError(
+                f"ParameterChangePlan Error: Variable "
+                f"'{item.variable_name}' not found in model."
+            )
 
-            if item.target_ids is not None:
-                id_tensor = self._resolve_id_tensor(module, id_attr)
-                if id_tensor is not None:
-                    if item.target_ids.device != id_tensor.device:
-                        item.target_ids = item.target_ids.to(id_tensor.device)
-                    indices = find_indices_in_torch(item.target_ids, id_tensor)
-                    if torch.any(indices < 0):
-                        raise ValueError(
-                            f"ParameterChangePlan Error: Some target_ids for "
-                            f"{item.variable_name} were not found in {id_attr}."
-                        )
-                    item._indices = indices
-                else:
-                    print(
-                        f"ParameterChangePlan Warning: Cannot find ID tensor "
-                        f"'{id_attr}' for {item.variable_name}. Applying to ALL."
+        module, attr, id_attr = variable_map[item.variable_name]
+        item._module = module
+        item._attr_name = attr
+
+        if item.target_ids is not None:
+            lookup_attr = item.target_id_field or id_attr
+            if not lookup_attr:
+                raise ValueError(
+                    f"ParameterChangePlan Error: Variable "
+                    f"'{item.variable_name}' has no dim_coords and no "
+                    f"target_id_field was provided; cannot resolve "
+                    f"target_ids."
+                )
+
+            self._assert_field_is_key(
+                lookup_attr,
+                ctx=("target_id_field" if item.target_id_field
+                     else f"dim_coords of '{item.variable_name}'"),
+            )
+
+            id_tensor = self._resolve_id_tensor(module, lookup_attr)
+            if id_tensor is None:
+                raise ValueError(
+                    f"ParameterChangePlan Error: Cannot find ID tensor "
+                    f"'{lookup_attr}' for variable "
+                    f"'{item.variable_name}'."
+                )
+
+            if item.target_id_field is not None:
+                default_tensor = self._resolve_id_tensor(module, id_attr)
+                if (default_tensor is not None
+                        and id_tensor.shape[0] != default_tensor.shape[0]):
+                    raise ValueError(
+                        f"ParameterChangePlan Error: target_id_field "
+                        f"'{item.target_id_field}' (length "
+                        f"{id_tensor.shape[0]}) is not co-indexed with "
+                        f"variable '{item.variable_name}' default "
+                        f"ID '{id_attr}' (length {default_tensor.shape[0]})."
                     )
 
-            if isinstance(item.delta, torch.Tensor):
-                item.delta = item.delta.to(module.device)
-            if isinstance(item.target_value, torch.Tensor):
-                item.target_value = item.target_value.to(module.device)
+            if item.target_ids.device != id_tensor.device:
+                item.target_ids = item.target_ids.to(id_tensor.device)
+            indices = find_indices_in_torch(item.target_ids, id_tensor)
+            if torch.any(indices < 0):
+                raise ValueError(
+                    f"ParameterChangePlan Error: Some target_ids for "
+                    f"{item.variable_name} were not found in {lookup_attr}."
+                )
+            item._indices = indices
+            item._resolved_id_field = lookup_attr
 
-            item._is_ready = True
-        else:
-            print(f"ParameterChangePlan Warning: Variable {item.variable_name} not found in model.")
+        if isinstance(item.delta, torch.Tensor):
+            item.delta = item.delta.to(module.device)
+        if isinstance(item.target_value, torch.Tensor):
+            item.target_value = item.target_value.to(module.device)
+
+        item._is_ready = True
 
     # ------------------------------------------------------------------
     # Public API
@@ -383,8 +437,13 @@ class ParameterPlanMixin:
         delta: Union[float, torch.Tensor] = 0.0,
         target_value: Optional[Union[float, torch.Tensor]] = None,
         target_ids: Optional[Union[List[int], torch.Tensor]] = None,
+        target_id_field: Optional[str] = None,
     ) -> None:
-        """Add a parameter change plan."""
+        """Add a parameter change plan.
+
+        ``target_id_field`` overrides the lookup field for ``target_ids``
+        (must be co-indexed with the variable's default ``dim_coords``).
+        """
         if active_steps < 1:
             raise ValueError("active_steps must be >= 1")
 
@@ -398,6 +457,7 @@ class ParameterPlanMixin:
             delta=delta,
             target_value=target_value,
             target_ids=target_ids,
+            target_id_field=target_id_field,
         )
 
         self._resolve_plan_item(item)
@@ -528,7 +588,11 @@ class ParameterPlanMixin:
             else:
                 count = len(plan.target_ids)
                 id_attr_name = "IDs"
-                if plan.variable_name in self.variable_map:
+                if plan._resolved_id_field:
+                    id_attr_name = plan._resolved_id_field
+                elif plan.target_id_field:
+                    id_attr_name = plan.target_id_field
+                elif plan.variable_name in self.variable_map:
                     _, _, id_attr = self.variable_map[plan.variable_name]
                     if id_attr:
                         id_attr_name = id_attr

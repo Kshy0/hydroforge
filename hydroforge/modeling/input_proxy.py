@@ -464,6 +464,9 @@ class InputProxy:
 
     def __setitem__(self, key: str, value: Any) -> None:
         self.data[key] = value
+        # Also expose newly injected variables to lazy-mode lookups,
+        # ``keys()`` listings, and ``__contains__``.
+        self.visible_vars.add(key)
 
     def __delitem__(self, key: str) -> None:
         """Drop ``key`` completely from the proxy.

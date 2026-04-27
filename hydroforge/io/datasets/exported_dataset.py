@@ -876,6 +876,11 @@ class ExportedDataset(NetCDFDataset):
         return self._inflow_valid_length_days
 
     @property
+    def inflow_shift_days(self) -> Optional[np.ndarray]:
+        """Per-column basin-coordinated read-axis shift (days), or ``None``."""
+        return self._inflow_shift_days
+
+    @property
     def basin_shift(self) -> dict[int, int]:
         return dict(self._basin_shift)
 
