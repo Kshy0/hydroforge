@@ -569,7 +569,7 @@ class ExportedDataset(NetCDFDataset):
             base_t = int(self._window_starts[idx])
             length = int(self._window_len)
         else:
-            base_t = idx * self.chunk_len
+            base_t = self._chunk_base_t(idx)
             length = int(self.chunk_len)
 
         if self._memory_cache is not None:
@@ -596,6 +596,29 @@ class ExportedDataset(NetCDFDataset):
         loss = self._gather(self._loss_data, self._loss_shift_days, base_t, length,
                             oob_fill=np.nan, groups=self._loss_shift_groups)
         return runoff, inflow, loss
+
+    def _chunk_base_t(self, idx: int) -> int:
+        """Return read-axis offset for a chunk, including spin-up cycling."""
+        if self.spin_up_cycles <= 0:
+            return idx * self.chunk_len
+        if self.time_interval is None:
+            raise ValueError("time_interval must be provided for spin-up reads")
+        if self.spin_up_start_date is None or self.spin_up_end_date is None:
+            raise ValueError(
+                "spin_up_start_date and spin_up_end_date are required when "
+                "spin_up_cycles > 0"
+            )
+        if not hasattr(self, "_spin_up_num_chunks"):
+            self._calc_spin_up_params()
+        total_spin_up_chunks = self._spin_up_num_chunks * self.spin_up_cycles
+        if idx < total_spin_up_chunks:
+            cycle_idx = idx % self._spin_up_num_chunks
+            spin_offset = self.spin_up_start_date - self.start_date
+            spin_offset_steps = int(
+                spin_offset.total_seconds() / self.time_interval.total_seconds()
+            )
+            return spin_offset_steps + cycle_idx * self.chunk_len
+        return (idx - total_spin_up_chunks) * self.chunk_len
 
     @staticmethod
     def _gather(data: np.ndarray, shift: Optional[np.ndarray],

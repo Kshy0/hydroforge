@@ -1384,12 +1384,10 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
         Pads with zeros if the actual data is shorter than chunk_len.
         """
-        # Compute absolute start index for this chunk
         if idx < 0:
             idx += len(self)
 
         compressed = self._local_indices is not None
-
         data = self.read_chunk(idx)
 
         if compressed:
@@ -1422,8 +1420,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         return np.ascontiguousarray(data)
 
     def __len__(self) -> int:
-        real_len = self._real_len()
-        return real_len + self.num_spin_up_chunks
+        return self._real_len() + self.num_spin_up_chunks
 
     def __add__(self, other):
         return self._combine(other, "add")
