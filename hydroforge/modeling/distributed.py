@@ -50,8 +50,26 @@ def setup_distributed():
     """Initialise the NCCL process group and return (local_rank, rank, world_size)."""
     torch.multiprocessing.set_start_method("spawn", force=True)
     if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-        dist.init_process_group(backend="nccl", init_method="env://")
-        local_rank = get_local_rank()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        ws_env = int(os.environ["WORLD_SIZE"])
+        if torch.cuda.is_available():
+            n_dev = torch.cuda.device_count()
+            if ws_env > n_dev:
+                raise RuntimeError(
+                    f"WORLD_SIZE={ws_env} but only {n_dev} CUDA device(s) "
+                    f"visible (CUDA_VISIBLE_DEVICES="
+                    f"{os.environ.get('CUDA_VISIBLE_DEVICES')}). "
+                    "Allocate enough GPUs (e.g. `srun --gres=gpu:N` or "
+                    "sbatch `--gres=gpu:N`) so every rank has its own device."
+                )
+            torch.cuda.set_device(local_rank)
+            device_id = torch.device(f"cuda:{local_rank}")
+            dist.init_process_group(
+                backend="nccl", init_method="env://",
+                device_id=device_id,
+            )
+        else:
+            dist.init_process_group(backend="nccl", init_method="env://")
         rank = dist.get_rank()
         world_size = dist.get_world_size()
     else:
