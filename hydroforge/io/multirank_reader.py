@@ -275,10 +275,16 @@ class MultiRankStatsReader:
                     try:
                         with nc.Dataset(fp, "r") as ds:
                             var = ds.variables[self.var_name]
-                            # Slicing logic: always take all spatial/trial dims
-                            # Dimensions are (time, [trial], saved_points, [levels])
-                            data = var[local_start:local_end, ...]
-                            rank_data_parts.append(np.array(data, copy=True))
+                            # Slicing logic: always take all spatial/trial dims.
+                            # Dimensions are (time, [trial], saved_points, [levels]).
+                            if self.row_chunk_size is None:
+                                data = var[local_start:local_end, ...]
+                                rank_data_parts.append(np.array(data, copy=True))
+                            else:
+                                for t0 in range(local_start, local_end, self.row_chunk_size):
+                                    t1 = min(t0 + self.row_chunk_size, local_end)
+                                    data = var[t0:t1, ...]
+                                    rank_data_parts.append(np.array(data, copy=True))
                     except Exception as e:
                         print(f"Warning: failed to cache {fp.name}: {e}")
                         # Append zeros or handle error?
@@ -314,6 +320,7 @@ class MultiRankStatsReader:
         time_range: Optional[Tuple[Union[datetime, cftime.datetime], Union[datetime, cftime.datetime]]] = None,
         cache_enabled: bool = False,
         split_by_year: bool = False,
+        row_chunk_size: Optional[int] = None,
     ):
         """
         time_range: CLOSED interval (start_dt, end_dt), both inclusive.
@@ -328,6 +335,8 @@ class MultiRankStatsReader:
         self._rank_files: List[dict] = []
         self.cache_enabled = cache_enabled
         self.split_by_year = split_by_year
+        self.row_chunk_size = (None if row_chunk_size is None
+                       else max(1, int(row_chunk_size)))
 
         self._slice_start: Optional[int] = None
         self._slice_end: Optional[int] = None
@@ -557,6 +566,70 @@ class MultiRankStatsReader:
             grid[x, y] = np.array(vals, copy=False)
         return grid
 
+    @staticmethod
+    def _sorted_series_indices(pairs: List[Tuple[int, int]]) -> Tuple[np.ndarray, np.ndarray]:
+        out_cols = np.array([col for col, _ in pairs], dtype=np.int64)
+        local_idx = np.array([li for _, li in pairs], dtype=np.int64)
+        order = np.argsort(local_idx, kind="stable")
+        return out_cols[order], local_idx[order]
+
+    def _copy_series_from_cache(
+        self,
+        out: np.ndarray,
+        cache_arr: np.ndarray,
+        pairs: List[Tuple[int, int]],
+        level: Optional[int],
+        trial: int,
+        dtype: Optional[np.dtype],
+        info: dict,
+    ) -> None:
+        out_cols, local_idx = self._sorted_series_indices(pairs)
+        indices = [slice(None)]
+        if info["has_trials"]:
+            indices.append(trial)
+        indices.append(local_idx)
+        if info["has_levels"]:
+            if level is None:
+                raise ValueError("This variable has 'levels'; specify `level`.")
+            indices.append(level)
+        chunk = np.asarray(cache_arr[tuple(indices)])
+        out[:, out_cols] = chunk.astype(dtype or np.float32, copy=False)
+
+    def _copy_series_from_row_chunks(
+        self,
+        out: np.ndarray,
+        fp: Path,
+        info: dict,
+        pairs: List[Tuple[int, int]],
+        local_start: int,
+        local_end: int,
+        out_start: int,
+        level: Optional[int],
+        trial: int,
+        dtype: Optional[np.dtype],
+    ) -> None:
+        out_cols, local_idx = self._sorted_series_indices(pairs)
+        target_dtype = dtype or np.float32
+        with nc.Dataset(fp, "r") as ds:
+            var = ds.variables[self.var_name]
+            step = (local_end - local_start
+                    if self.row_chunk_size is None else self.row_chunk_size)
+            for t0 in range(local_start, local_end, step):
+                t1 = min(t0 + step, local_end)
+                slices = [slice(t0, t1)]
+                if info["has_trials"]:
+                    slices.append(trial)
+                slices.append(slice(None))
+                if info["has_levels"]:
+                    if level is None:
+                        raise ValueError("This variable has 'levels'; specify `level`.")
+                    slices.append(level)
+                block = np.asarray(var[tuple(slices)])
+                selected = block[:, local_idx]
+                o0 = out_start + (t0 - local_start)
+                o1 = o0 + (t1 - t0)
+                out[o0:o1, out_cols] = selected.astype(target_dtype, copy=False)
+
     def get_series(
         self,
         points: Union[np.ndarray, Sequence[np.ndarray]],
@@ -678,47 +751,20 @@ class MultiRankStatsReader:
             r_idx, li = hit  # hit is guaranteed not None
             rank_to_cols.setdefault(r_idx, []).append((col, li))
 
-        # Fast path: if cached in memory
+        # Fast path for an already materialized in-memory cache.
         for r_idx, pairs in rank_to_cols.items():
             info = self._rank_files[r_idx]
             cache_arr = info.get("cache")
             if cache_arr is not None:
-                # cache_arr shape: (time, [trial], saved_points, [levels])
-                indices = [slice(None)] # time: all
-                if info["has_trials"]:
-                    indices.append(trial)
-                indices.append(slice(None)) # saved_points: placeholder, will index later
-                if info["has_levels"]:
-                    if level is None:
-                        raise ValueError("This variable has 'levels'; specify `level`.")
-                    indices.append(level)
-
-                # We need to be careful with indexing.
-                # cache_arr[indices] gives us (time, saved_points) or similar.
-
-                # Construct base indices tuple
-                base_indices = [slice(None)] # time
-                if info["has_trials"]:
-                    base_indices.append(trial)
-
-                # saved_points dim is next.
-                # levels dim is last.
-
-                for col, li in pairs:
-                    # Construct specific indices for this point
-                    pt_indices = list(base_indices)
-                    pt_indices.append(li) # saved_points index
-                    if info["has_levels"]:
-                        pt_indices.append(level)
-
-                    out[:, col] = np.asarray(cache_arr[tuple(pt_indices)], dtype=dtype or np.float32)
+                self._copy_series_from_cache(
+                    out, cache_arr, pairs, level, trial, dtype, info)
                 continue
 
-            # No cache: minimize I/O by opening once and slicing contiguous time window
+            # Without a materialized cache, still avoid NetCDF advanced column
+            # indexing: read row chunks with all saved_points, then select
+            # sorted columns in NumPy.
             if self._slice_start is None or self._slice_end is None:
                 raise RuntimeError("Internal error: time slice is not set.")
-
-            idx = np.array([li for (_, li) in pairs], dtype=np.int64)
 
             # Iterate over files to fill data
             for i, fp in enumerate(info["paths"]):
@@ -729,41 +775,24 @@ class MultiRankStatsReader:
                 req_end = min(self._slice_end + 1, file_end_global)
 
                 if req_start < req_end:
-                    print(f"    Reading {fp.name} (indices: {len(idx)})...")
+                    print(f"    Reading {fp.name} (indices: {len(pairs)})...")
                     local_start = req_start - file_start_global
                     local_end = req_end - file_start_global
 
                     # out is indexed 0..self._time_len-1 corresponding to self._slice_start..self._slice_end
                     out_start = req_start - self._slice_start
-                    out_end = req_end - self._slice_start
 
                     try:
-                        with nc.Dataset(fp, "r") as ds:
-                            var = ds.variables[self.var_name]
-
-                            # Build slicing tuple
-                            # 1. time
-                            slices = [slice(local_start, local_end)]
-
-                            # 2. trial
-                            if info["has_trials"]:
-                                slices.append(trial)
-
-                            # 3. saved_points (using advanced indexing with `idx`)
-                            slices.append(idx)
-
-                            # 4. levels
-                            if info["has_levels"]:
-                                if level is None:
-                                    raise ValueError("This variable has 'levels'; specify `level`.")
-                                slices.append(level)
-
-                            chunk = np.asarray(var[tuple(slices)])
-
-                        # Scatter chunk to output columns
-                        # chunk shape should be (time_len, num_points)
-                        for k, (col, _) in enumerate(pairs):
-                            out[out_start:out_end, col] = chunk[:, k].astype(dtype or np.float32, copy=False)
+                        if self.row_chunk_size is None:
+                            print("      full-row read, sorted column gather")
+                        else:
+                            print(
+                                f"      row-chunk read ({self.row_chunk_size}), "
+                                "sorted column gather"
+                            )
+                        self._copy_series_from_row_chunks(
+                            out, fp, info, pairs, local_start, local_end,
+                            out_start, level, trial, dtype)
                     except Exception as e:
                         print(f"Warning: failed to read {fp.name}: {e}")
 
