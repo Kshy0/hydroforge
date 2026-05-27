@@ -13,6 +13,7 @@ from typing import Callable, List, Literal, Optional, Sequence, Tuple, Union
 import numpy as np
 from netCDF4 import Dataset
 
+from hydroforge.io.datasets.abstract_dataset import AbstractDataset
 from hydroforge.io.datasets.netcdf_dataset import NetCDFDataset
 from hydroforge.io.datasets.utils import single_file_key
 from hydroforge.modeling.distributed import find_indices_in, is_rank_zero
@@ -985,3 +986,199 @@ class ExportedDataset(NetCDFDataset):
                 f"{dst_cids.size} catchments, shift nonzero={nz}, "
                 f"max={int(shift.max()) if shift.size else 0}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Composite multi-variable wrapper
+# ---------------------------------------------------------------------------
+class MultiVarExportedDataset(AbstractDataset):
+    """Chunked multi-variable composite of :class:`ExportedDataset`.
+
+    Wraps one :class:`ExportedDataset` per variable so that a single
+    ``DataLoader`` (with workers / prefetch / pin_memory) reads all
+    variables together and emits a dict of per-variable chunks per
+    ``__getitem__``. Compared to running N independent ``DataLoader``s
+    this drops worker count from ``N x workers`` to ``workers``,
+    eliminates the slowest-leg synchronisation cost of ``zip(*loaders)``
+    and avoids the duplicated pinned-memory buffers.
+
+    Supports the full :class:`ExportedDataset` feature set: per-year
+    ``time_to_key``, ``chunk_len`` auto-detection, ``spin_up_cycles``,
+    ``time_iter`` and ``total_steps``. With ``chunk_len=1`` the dataset
+    behaves as a per-time-step reader, suitable for legacy callers that
+    iterate one step at a time.
+
+    Parameters
+    ----------
+    base_dir:
+        Directory holding the per-variable NetCDF files.
+    var_specs:
+        Mapping ``{var_name: {"prefix": str, "suffix": str, ...}}``.
+        Per-variable kwargs override the shared kwargs.
+    chunk_len:
+        Optional shared chunk length; each child auto-detects from its
+        NetCDF file when omitted.
+
+    Examples
+    --------
+    >>> mvd = MultiVarExportedDataset(
+    ...     base_dir="./inp/per_var_exported",
+    ...     var_specs={
+    ...         "temp":   {"prefix": "temp_",   "suffix": "rank0.nc"},
+    ...         "precip": {"prefix": "precip_", "suffix": "rank0.nc"},
+    ...     },
+    ...     start_date=datetime(2000, 1, 1),
+    ...     end_date=datetime(2000, 12, 31),
+    ... )
+    """
+
+    def __init__(
+        self,
+        base_dir: str,
+        var_specs,
+        *,
+        start_date: datetime,
+        end_date: datetime,
+        time_interval: timedelta = timedelta(days=1),
+        chunk_len: Optional[int] = None,
+        spin_up_cycles: int = 0,
+        spin_up_start_date: Optional[datetime] = None,
+        spin_up_end_date: Optional[datetime] = None,
+        time_to_key: Optional[Callable[[datetime], str]] = None,
+        coord_name: str = "catchment_id",
+        in_memory: bool = False,
+    ) -> None:
+        if not var_specs:
+            raise ValueError("var_specs must contain at least one variable.")
+
+        shared_kwargs = dict(
+            base_dir=base_dir,
+            start_date=start_date,
+            end_date=end_date,
+            time_interval=time_interval,
+            spin_up_cycles=spin_up_cycles,
+            spin_up_start_date=spin_up_start_date,
+            spin_up_end_date=spin_up_end_date,
+            coord_name=coord_name,
+            in_memory=in_memory,
+        )
+        if time_to_key is not None:
+            shared_kwargs["time_to_key"] = time_to_key
+        if chunk_len is not None:
+            shared_kwargs["chunk_len"] = chunk_len
+
+        self._var_names: List[str] = list(var_specs.keys())
+        self._datasets: List[ExportedDataset] = []
+        for var_name, spec in var_specs.items():
+            kw = dict(shared_kwargs)
+            kw.update(spec)
+            kw["var_name"] = var_name
+            kw.setdefault("prefix", f"{var_name}_")
+            self._datasets.append(ExportedDataset(**kw))
+
+        ref_len = len(self._datasets[0])
+        ref_chunk_len = int(self._datasets[0].chunk_len)
+        for ds, name in zip(self._datasets[1:], self._var_names[1:]):
+            if len(ds) != ref_len:
+                raise ValueError(
+                    f"Length mismatch: {self._var_names[0]!r}={ref_len} "
+                    f"vs {name!r}={len(ds)}"
+                )
+            if int(ds.chunk_len) != ref_chunk_len:
+                raise ValueError(
+                    f"chunk_len mismatch: {self._var_names[0]!r}={ref_chunk_len} "
+                    f"vs {name!r}={int(ds.chunk_len)}"
+                )
+
+        super().__init__(
+            start_date=start_date,
+            end_date=end_date,
+            time_interval=time_interval,
+            chunk_len=ref_chunk_len,
+            spin_up_cycles=spin_up_cycles,
+            spin_up_start_date=spin_up_start_date,
+            spin_up_end_date=spin_up_end_date,
+        )
+
+        # Validate that every variable file exposes the same catchment set;
+        # per-file column orderings may still differ and are reconciled later
+        # via ``build_local_mapping`` (each child resolves its own ordering).
+        ref_ids, _ = self._datasets[0].get_coordinates()
+        ref_set = set(int(x) for x in ref_ids)
+        for ds, name in zip(self._datasets[1:], self._var_names[1:]):
+            ids, _ = ds.get_coordinates()
+            if set(int(x) for x in ids) != ref_set:
+                raise ValueError(
+                    f"Catchment id set mismatch: variable {name!r} "
+                    f"(N={len(ids)}) does not match {self._var_names[0]!r} "
+                    f"(N={len(ref_ids)})."
+                )
+        self._coordinates = ref_ids
+
+    # ---------- composite Dataset API ----------
+    @property
+    def variables(self) -> List[str]:
+        return list(self._var_names)
+
+    @property
+    def datasets(self) -> List[ExportedDataset]:
+        return list(self._datasets)
+
+    @property
+    def coordinates(self) -> np.ndarray:
+        return self._coordinates
+
+    def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self._coordinates, np.arange(self._coordinates.size, dtype=np.int64)
+
+    @property
+    def data_size(self) -> int:
+        return self._datasets[0].data_size
+
+    @property
+    def grid_shape(self) -> Tuple[int, int]:
+        raise NotImplementedError(
+            "MultiVarExportedDataset has no grid shape. Data is already catchment-aggregated."
+        )
+
+    def get_data(self, current_time: datetime, chunk_len: int):
+        return {
+            v: ds.get_data(current_time, chunk_len)
+            for v, ds in zip(self._var_names, self._datasets)
+        }
+
+    def close(self) -> None:
+        for ds in self._datasets:
+            ds.close()
+
+    def __len__(self) -> int:
+        return len(self._datasets[0])
+
+    def __getitem__(self, idx: int):
+        return {v: ds[idx] for v, ds in zip(self._var_names, self._datasets)}
+
+    def shard_forcing(self, batch):
+        """Flatten per-variable ``(B, T, C) -> (B*T, C)`` chunks.
+
+        Mirrors :meth:`ExportedDataset.shard_forcing` but operates on the
+        dict produced by :meth:`__getitem__` / DataLoader collation.
+        """
+        return {v: ds.shard_forcing(batch[v]) for v, ds in zip(self._var_names, self._datasets)}
+
+    def build_local_mapping(self, desired_catchment_ids: np.ndarray) -> None:
+        """Reorder columns per variable to match ``desired_catchment_ids``.
+
+        Each child dataset resolves its own file ordering, so variables
+        whose NetCDF files use a different ``catchment_id`` permutation
+        are still aligned to the consumer's order.
+        """
+        for ds in self._datasets:
+            ds.build_local_mapping(desired_catchment_ids=desired_catchment_ids)
+
+    # ---------- thin forwards to the reference dataset ----------
+    @property
+    def total_steps(self) -> int:
+        return self._datasets[0].total_steps
+
+    def time_iter(self):
+        return self._datasets[0].time_iter()
