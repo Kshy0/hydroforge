@@ -14,7 +14,7 @@ import numpy as np
 from netCDF4 import Dataset, num2date
 
 from hydroforge.io.datasets.abstract_dataset import AbstractDataset
-from hydroforge.io.datasets.utils import single_file_key, yearly_time_to_key
+from hydroforge.io.datasets.utils import read_netcdf_var_sliced, single_file_key, yearly_time_to_key
 
 
 class NetCDFDataset(AbstractDataset):
@@ -223,7 +223,7 @@ class NetCDFDataset(AbstractDataset):
         self._global_times = []
         self._dt_to_loc = {}
         # Each chunk plan is a list of (file_key, abs_time_indices) operations.
-        # We read exact timesteps per file using fancy indexing once per file.
+        # Sequence indices are read as NetCDF slices and reordered in memory.
         self._chunk_plan = []
 
         # Bounding box for optimized spatial reading (computed lazily)
@@ -352,8 +352,8 @@ class NetCDFDataset(AbstractDataset):
     def _read_ops(self, ops: List[Tuple[str, List[int]]]) -> np.ndarray:
         """Execute per-file reads using absolute time indices.
 
-        Each op is (file_key, abs_indices). We'll fetch exactly these time steps
-        from the file in a single fancy-indexing operation along the time axis.
+        Each op is (file_key, abs_indices). Sequence indices are converted to
+        contiguous NetCDF slices, then restored to the requested order in memory.
 
         When _local_indices is set and a bounding box has been computed,
         this method reads only the bounding box region instead of the full grid,
@@ -409,7 +409,7 @@ class NetCDFDataset(AbstractDataset):
                     sel[y_idx] = slice(y_min, y_max + 1)
                     sel[x_idx] = slice(x_min, x_max + 1)
 
-                arr = var[tuple(sel)]
+                arr = read_netcdf_var_sliced(var, tuple(sel))
 
                 # Fill masks / NaNs
                 if isinstance(arr, np.ma.MaskedArray):
