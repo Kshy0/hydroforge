@@ -14,6 +14,8 @@ import numpy.ma as ma
 import torch
 from netCDF4 import Dataset
 
+from hydroforge.io.datasets.utils import read_netcdf_var_sliced
+
 
 class InputProxy:
     """
@@ -44,9 +46,9 @@ class InputProxy:
     def _read_var_from_ds(ds: Dataset, var_name: str, indices: Any = None) -> np.ndarray:
         var = ds.variables[var_name]
         if indices is None:
-            v = var[:]
+            v = read_netcdf_var_sliced(var)
         else:
-            v = var[indices]
+            v = read_netcdf_var_sliced(var, indices)
 
         if ma.isMaskedArray(v):
             # Fill masked values conservatively

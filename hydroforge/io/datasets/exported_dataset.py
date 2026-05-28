@@ -15,7 +15,7 @@ from netCDF4 import Dataset
 
 from hydroforge.io.datasets.abstract_dataset import AbstractDataset
 from hydroforge.io.datasets.netcdf_dataset import NetCDFDataset
-from hydroforge.io.datasets.utils import single_file_key
+from hydroforge.io.datasets.utils import read_netcdf_var_sliced, single_file_key
 from hydroforge.modeling.distributed import find_indices_in, is_rank_zero
 
 import numba as _numba
@@ -101,6 +101,9 @@ class ExportedDataset(NetCDFDataset):
         self._shift_day_groups: Optional[list] = None
         self._inflow_shift_groups: Optional[list] = None
         self._loss_shift_groups: Optional[list] = None
+
+        self._column_bbox: Optional[Tuple[int, int]] = None
+        self._column_bbox_local_indices: Optional[np.ndarray] = None
 
         # Auto-detect chunk_len from file's NetCDF time chunking if not provided
         if "chunk_len" not in kwargs:
@@ -209,14 +212,40 @@ class ExportedDataset(NetCDFDataset):
             out = out.reshape(out.shape[0], out.shape[1])
         return out
 
+    def _compute_column_bbox_from_indices(self) -> None:
+        """Compute the minimal saved_points slice for mapped catchments."""
+        if self._local_indices is None:
+            self._column_bbox = None
+            self._column_bbox_local_indices = None
+            return
+        if self._local_indices.size == 0:
+            self._column_bbox = (0, -1)
+            self._column_bbox_local_indices = np.empty((0,), dtype=np.int64)
+            return
+
+        col_min = int(self._local_indices.min())
+        col_max = int(self._local_indices.max())
+        self._column_bbox = (col_min, col_max)
+        self._column_bbox_local_indices = (
+            self._local_indices - col_min
+        ).astype(np.int64, copy=False)
+
     def _read_ops(self, ops: List[Tuple[str, List[int]]]) -> np.ndarray:
         """Read time steps and reorder columns if _local_indices is set."""
         # Determine output size
         if self._local_indices is not None:
+            if self._column_bbox is None:
+                self._compute_column_bbox_from_indices()
             out_cols = len(self._local_indices)
         else:
             sc, _ = self.get_coordinates()
             out_cols = len(sc)
+
+        use_column_bbox = (
+            self._local_indices is not None
+            and self._column_bbox is not None
+            and self._column_bbox_local_indices is not None
+        )
 
         if not ops:
             return np.empty((0, out_cols), dtype=self.out_dtype)
@@ -238,7 +267,10 @@ class ExportedDataset(NetCDFDataset):
                 abs_idx = np.asarray(abs_indices, dtype=np.int32)
                 sel = [slice(None)] * var.ndim
                 sel[t_idx] = abs_idx
-                arr = var[tuple(sel)]
+                if use_column_bbox:
+                    col_min, col_max = self._column_bbox
+                    sel[c_idx] = slice(col_min, col_max + 1)
+                arr = read_netcdf_var_sliced(var, tuple(sel))
                 if isinstance(arr, np.ma.MaskedArray):
                     arr = arr.filled(0.0)
                 else:
@@ -247,7 +279,10 @@ class ExportedDataset(NetCDFDataset):
 
                 # Reorder columns if indices are set
                 if self._local_indices is not None:
-                    arr = arr[:, self._local_indices]
+                    if use_column_bbox:
+                        arr = arr[:, self._column_bbox_local_indices]
+                    else:
+                        arr = arr[:, self._local_indices]
 
                 chunks.append(arr.astype(self.out_dtype, copy=False))
 
@@ -294,6 +329,7 @@ class ExportedDataset(NetCDFDataset):
                 f"{missing} desired catchments not found in exported file {path.name}"
             )
         self._local_indices = col_pos.astype(np.int64)
+        self._compute_column_bbox_from_indices()
 
         if is_rank_zero():
             print(f"[ExportedDataset] Mapped {len(desired_catchment_ids)} catchments "
@@ -472,10 +508,6 @@ class ExportedDataset(NetCDFDataset):
                     else:
                         file_col_indices = np.arange(c_start, c_end, dtype=np.int64)
 
-                    sort_order = np.argsort(file_col_indices)
-                    sorted_cols = file_col_indices[sort_order]
-                    unsort_order = np.argsort(sort_order)
-
                     file_chunks: List[np.ndarray] = []
                     for key, abs_indices in ops:
                         path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
@@ -486,15 +518,14 @@ class ExportedDataset(NetCDFDataset):
                             c_idx = dims_in.index("saved_points")
 
                             sel = [slice(None)] * var_in.ndim
-                            sel[t_idx] = np.asarray(abs_indices, dtype=np.int32)
-                            sel[c_idx] = sorted_cols
-                            arr = var_in[tuple(sel)]
+                            sel[t_idx] = np.asarray(abs_indices, dtype=np.int64)
+                            sel[c_idx] = file_col_indices
+                            arr = read_netcdf_var_sliced(var_in, tuple(sel))
                             if isinstance(arr, np.ma.MaskedArray):
                                 arr = arr.filled(0.0)
                             else:
                                 arr = np.nan_to_num(np.asarray(arr), nan=0.0)
                             batch_data = self._ensure_tc(arr, t_idx, c_idx)
-                            batch_data = batch_data[:, unsort_order]
                             file_chunks.append(batch_data)
 
                     all_batch = np.concatenate(file_chunks, axis=0) if len(file_chunks) > 1 else file_chunks[0]
