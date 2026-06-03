@@ -7,7 +7,7 @@
 """Shared dataset helpers used by all dataset classes."""
 
 from datetime import datetime
-from typing import Any, Iterator, Optional, Tuple, Union
+from typing import Any, Iterator, List, Optional, Tuple, Union
 
 import cftime
 import numpy as np
@@ -51,6 +51,7 @@ def read_netcdf_var_sliced(var: Any, index: Any = None) -> np.ndarray:
 
 
 def _normalize_netcdf_index(index: Any, ndim: int) -> Tuple[Any, ...]:
+    """Expand an index into one selector per dimension, resolving Ellipsis."""
     if ndim == 0:
         if index is None or index is Ellipsis:
             return ()
@@ -89,6 +90,7 @@ def _normalize_netcdf_index(index: Any, ndim: int) -> Tuple[Any, ...]:
 
 
 def _is_scalar_integer(value: Any) -> bool:
+    """Return True if the selector is a single integer (Python or numpy)."""
     if isinstance(value, (int, np.integer)):
         return True
     try:
@@ -99,6 +101,7 @@ def _is_scalar_integer(value: Any) -> bool:
 
 
 def _as_integer_array(selector: Any, axis_length: int) -> Optional[np.ndarray]:
+    """Convert a sequence/boolean selector to a 1-D int64 index, else None."""
     if isinstance(selector, slice) or _is_scalar_integer(selector):
         return None
     try:
@@ -126,7 +129,8 @@ def _as_integer_array(selector: Any, axis_length: int) -> Optional[np.ndarray]:
     return arr
 
 
-def _read_netcdf_var_sliced_recursive(var: Any, selectors: list[Any]) -> np.ndarray:
+def _read_netcdf_var_sliced_recursive(var: Any, selectors: List[Any]) -> np.ndarray:
+    """Read the variable, expanding the first array selector via slices."""
     for axis, selector in enumerate(selectors):
         if isinstance(selector, np.ndarray):
             return _read_sequence_axis(var, selectors, axis, selector)
@@ -137,10 +141,11 @@ def _read_netcdf_var_sliced_recursive(var: Any, selectors: list[Any]) -> np.ndar
 
 def _read_sequence_axis(
     var: Any,
-    selectors: list[Any],
+    selectors: List[Any],
     axis: int,
     index: np.ndarray,
 ) -> np.ndarray:
+    """Read one array-indexed axis as contiguous slices, then reorder."""
     axis_out = _output_axis(selectors, axis)
     if index.size == 0:
         empty_selectors = selectors.copy()
@@ -168,11 +173,13 @@ def _read_sequence_axis(
     return np.take(data, inverse, axis=axis_out)
 
 
-def _output_axis(selectors: list[Any], axis: int) -> int:
+def _output_axis(selectors: List[Any], axis: int) -> int:
+    """Map an input axis to its output axis after scalar dimensions collapse."""
     return sum(0 if _is_scalar_integer(selector) else 1 for selector in selectors[:axis])
 
 
 def _contiguous_runs(index: np.ndarray) -> Iterator[Tuple[int, int]]:
+    """Yield (start, stop) half-open ranges for each run of consecutive ints."""
     run_start = 0
     split_points = np.flatnonzero(np.diff(index) != 1) + 1
     for run_stop in np.concatenate((split_points, np.array([index.size]))):

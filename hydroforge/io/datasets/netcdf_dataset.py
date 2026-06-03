@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 import cftime
 import numpy as np
+import torch
 from netCDF4 import Dataset, num2date
 
 from hydroforge.io.datasets.abstract_dataset import AbstractDataset
@@ -497,3 +498,194 @@ class NetCDFDataset(AbstractDataset):
             if lat is None or lon is None:
                 raise ValueError("Unable to find lat/lon variables in the dataset.")
             return np.array(lon[:]), np.array(lat[:])
+
+
+class MultiVarNetCDFDataset(AbstractDataset):
+    """Gridded multi-variable composite of :class:`NetCDFDataset`.
+
+    Wraps one :class:`NetCDFDataset` per variable (one NetCDF file per
+    variable) when every variable lives on the same grid. The spatial
+    ``build_local_mapping`` is computed once from the first variable and the
+    resulting compressed-grid selection is reused for the rest, so only the
+    first file's mapping is ever read.
+
+    ``__getitem__`` and :meth:`shard_forcing` emit a dict keyed by variable
+    name; ``total_steps`` / ``time_iter`` are forwarded to the reference
+    (first) dataset.
+
+    Parameters
+    ----------
+    base_dir:
+        Directory holding the per-variable NetCDF files.
+    var_specs:
+        Mapping ``{var_name: {"prefix": str, ...}}``. Per-variable kwargs
+        override the shared kwargs; ``prefix`` defaults to ``f"{var_name}_"``.
+    """
+
+    def __init__(
+        self,
+        base_dir: str,
+        var_specs: Dict[str, dict],
+        *,
+        start_date: Union[datetime, cftime.datetime],
+        end_date: Union[datetime, cftime.datetime],
+        time_interval: timedelta = timedelta(days=1),
+        chunk_len: int = 24,
+        unit_factor: float = 1.0,
+        suffix: str = ".nc",
+        clip_negative: bool = False,
+        time_to_key: Optional[Callable[[Union[datetime, cftime.datetime]], str]] = yearly_time_to_key,
+        spin_up_cycles: int = 0,
+        spin_up_start_date: Optional[Union[datetime, cftime.datetime]] = None,
+        spin_up_end_date: Optional[Union[datetime, cftime.datetime]] = None,
+    ) -> None:
+        if not var_specs:
+            raise ValueError("var_specs must contain at least one variable.")
+
+        shared_kwargs = dict(
+            base_dir=base_dir,
+            start_date=start_date,
+            end_date=end_date,
+            time_interval=time_interval,
+            chunk_len=chunk_len,
+            unit_factor=unit_factor,
+            suffix=suffix,
+            clip_negative=clip_negative,
+            time_to_key=time_to_key,
+            spin_up_cycles=spin_up_cycles,
+            spin_up_start_date=spin_up_start_date,
+            spin_up_end_date=spin_up_end_date,
+        )
+
+        self._var_names: List[str] = list(var_specs.keys())
+        self._datasets: List[NetCDFDataset] = []
+        for var_name, spec in var_specs.items():
+            kw = dict(shared_kwargs)
+            kw.update(spec)
+            kw["var_name"] = var_name
+            kw.setdefault("prefix", f"{var_name}_")
+            self._datasets.append(NetCDFDataset(**kw))
+
+        ref = self._datasets[0]
+        for ds, name in zip(self._datasets[1:], self._var_names[1:]):
+            if len(ds) != len(ref):
+                raise ValueError(
+                    f"Length mismatch: {self._var_names[0]!r}={len(ref)} vs {name!r}={len(ds)}"
+                )
+
+        super().__init__(
+            start_date=start_date,
+            end_date=end_date,
+            time_interval=time_interval,
+            chunk_len=int(ref.chunk_len),
+            clip_negative=clip_negative,
+            spin_up_cycles=spin_up_cycles,
+            spin_up_start_date=spin_up_start_date,
+            spin_up_end_date=spin_up_end_date,
+        )
+
+    @property
+    def variables(self) -> List[str]:
+        return list(self._var_names)
+
+    @property
+    def datasets(self) -> List[NetCDFDataset]:
+        return list(self._datasets)
+
+    @property
+    def data_size(self) -> int:
+        return self._datasets[0].data_size
+
+    @property
+    def grid_shape(self) -> Tuple[int, int]:
+        return self._datasets[0].grid_shape
+
+    def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self._datasets[0].get_coordinates()
+
+    def __len__(self) -> int:
+        return len(self._datasets[0])
+
+    def __getitem__(self, idx: int) -> Dict[str, np.ndarray]:
+        return {v: ds[idx] for v, ds in zip(self._var_names, self._datasets)}
+
+    def get_data(self, current_time, chunk_len):
+        return {
+            v: ds.get_data(current_time, chunk_len)
+            for v, ds in zip(self._var_names, self._datasets)
+        }
+
+    def build_local_mapping(
+        self,
+        mapping_file: str,
+        desired_catchment_ids: Optional[np.ndarray] = None,
+        device=None,
+        precision: str = "float32",
+    ):
+        """Build the mapping once from the first variable and share it.
+
+        All variables are assumed to lie on the same grid, so the compressed
+        grid selection (``_local_indices``) resolved for the reference dataset
+        is propagated to the rest. Returns the single shared local mapping; the
+        caller keeps it as a local variable and passes it to
+        :meth:`shard_forcing` (the dataset itself stays free of device tensors
+        so it remains safe to fork across ``DataLoader`` workers).
+        """
+        ref = self._datasets[0]
+        local_mapping = ref.build_local_mapping(
+            mapping_file=mapping_file,
+            desired_catchment_ids=desired_catchment_ids,
+            device=device,
+            precision=precision,
+        )
+        for ds in self._datasets[1:]:
+            ds._local_indices = ref._local_indices
+            ds._desired_catchment_ids = ref._desired_catchment_ids
+        return local_mapping
+
+    def shard_forcing(self, batch: Dict[str, torch.Tensor], local_mapping) -> Dict[str, torch.Tensor]:
+        return {v: super().shard_forcing(batch[v], local_mapping) for v in self._var_names}
+
+    def iter_loaders(
+        self,
+        *,
+        loader_workers: int = 1,
+        prefetch_factor: int = 2,
+        pin_memory: bool = True,
+    ):
+        """Stream every variable through its own prefetching ``DataLoader``.
+
+        Each per-variable NetCDF file gets a dedicated :class:`DataLoader` so
+        the files are read concurrently. Following the CaMa-Flood-GPU idiom,
+        ``batch_size`` equals ``loader_workers`` so each worker prefetches one
+        chunk per batch. The single-variable loaders are advanced in lock-step
+        with :func:`zip`, yielding ``{var: batch}`` where every batch shares the
+        same simulation plan.
+        """
+        from torch.utils.data import DataLoader
+
+        batch_size = max(1, loader_workers)
+        loaders = [
+            DataLoader(
+                ds,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=loader_workers,
+                pin_memory=pin_memory,
+                prefetch_factor=prefetch_factor if loader_workers > 0 else None,
+            )
+            for ds in self._datasets
+        ]
+        for batches in zip(*loaders):
+            yield {v: b for v, b in zip(self._var_names, batches)}
+
+    @property
+    def total_steps(self) -> int:
+        return self._datasets[0].total_steps
+
+    def time_iter(self):
+        return self._datasets[0].time_iter()
+
+    def close(self) -> None:
+        for ds in self._datasets:
+            ds.close()
