@@ -5,21 +5,21 @@
 #
 
 from hydroforge.io.datasets.abstract_dataset import (AbstractDataset,
-                                                     MixedDataset,
-                                                     StaticParameterDataset)
+                                                     MixedDataset)
 from hydroforge.io.datasets.daily_bin_dataset import DailyBinDataset
 from hydroforge.io.datasets.era5_land_dataset import ERA5LandAccumDataset
 from hydroforge.io.datasets.exported_dataset import (ExportedDataset,
                                                      MultiVarExportedDataset)
-from hydroforge.io.datasets.netcdf_dataset import NetCDFDataset
+from hydroforge.io.datasets.netcdf_dataset import (MultiVarNetCDFDataset,
+                                                   NetCDFDataset)
 
 __all__ = [
     "AbstractDataset",
     "MixedDataset",
-    "StaticParameterDataset",
     "DailyBinDataset",
     "ERA5LandAccumDataset",
     "ExportedDataset",
     "MultiVarExportedDataset",
     "NetCDFDataset",
+    "MultiVarNetCDFDataset",
 ]
