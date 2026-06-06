@@ -117,7 +117,12 @@ class CommonCodegenMixin:
         tensor_info = {}
         grouped_by_save_idx = {}
 
-        for var_name in self._variables:
+        # Iterate in sorted order: ``self._variables`` is a ``set``, whose
+        # string iteration order is randomised per process (PYTHONHASHSEED).
+        # The generated CUDA/Triton source — and therefore the content hash that
+        # keys the compiled-kernel cache — must not depend on that order, or the
+        # cache misses on every run and recompiles from scratch.
+        for var_name in sorted(self._variables):
             field_info = self._field_registry[var_name]
             tensor = self._tensor_registry.get(var_name)
 

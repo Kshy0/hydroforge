@@ -158,28 +158,15 @@ class _CExpression:
 
 
 class CudaCodegenMixin:
-    """CUDA C++ extension code generation for statistics aggregation."""
+    """CUDA C++ extension code generation for statistics aggregation.
+
+    The generated ``.cu`` source is compiled with NVCC on NVIDIA GPUs and,
+    when ``HYDROFORGE_BACKEND=cuda`` is selected under a ROCm PyTorch build,
+    hipified and compiled with hipcc by :func:`load_inline_cu_module` — so AMD
+    users who want a compiled aggregator get one without a separate HIP path.
+    """
 
     def _generate_cuda_aggregator_function(self: StatisticsAggregator) -> None:
-        self._generate_cuda_like_aggregator_function(
-            backend="cuda",
-            loader_factory=self._cuda_extension_loader,
-            cflags=("-O3", "--use_fast_math"),
-        )
-
-    def _cuda_extension_loader(self):
-        from hydroforge.runtime.cuda_kernel import load_inline_cu_module
-
-        return load_inline_cu_module
-
-    def _generate_cuda_like_aggregator_function(
-        self: StatisticsAggregator,
-        *,
-        backend: str,
-        loader_factory,
-        cflags: Sequence[str],
-        source_transform=None,
-    ) -> None:
         if not self._variables:
             raise ValueError("No variables initialized for statistics aggregation")
 
@@ -189,26 +176,26 @@ class CudaCodegenMixin:
                 tensor_info=tensor_info,
                 grouped_by_save_idx=grouped_by_save_idx,
             )
-            if source_transform is not None:
-                cpp_sources, cuda_sources = source_transform(cpp_sources, cuda_sources)
         except Exception as exc:
             warnings.warn(
-                f"{backend.upper()} C++ aggregator generator could not handle "
-                f"this statistics configuration ({exc!r}); falling back to Triton/PyTorch.",
+                "CUDA C++ aggregator generator could not handle this statistics "
+                f"configuration ({exc!r}); falling back to Triton/PyTorch.",
                 RuntimeWarning,
                 stacklevel=2,
             )
-            self._generate_cuda_fallback_aggregator_function(backend, repr(exc))
+            self._generate_cuda_fallback_aggregator_function(repr(exc))
             return
 
+        from hydroforge.runtime.cuda_kernel import load_inline_cu_module
+
         digest = hashlib.sha256((cpp_sources + "\n" + cuda_sources).encode()).hexdigest()[:12]
-        module_name = f"hydroforge_{backend}_aggregator_r{self.rank}_{digest}"
-        ext = loader_factory()(
+        module_name = f"hydroforge_cuda_aggregator_r{self.rank}_{digest}"
+        ext = load_inline_cu_module(
             module_name,
             cpp_sources=cpp_sources,
             cuda_sources=cuda_sources,
             functions=["launch_update"],
-            extra_cuda_cflags=tuple(cflags),
+            extra_cuda_cflags=("-O3", "--use_fast_math"),
         )
 
         def internal_update_statistics(states, BLOCK_SIZE):
@@ -219,19 +206,18 @@ class CudaCodegenMixin:
         self._aggregator_generated = True
 
         if self.save_kernels:
-            self._save_cuda_kernel_file(backend, cpp_sources, cuda_sources)
+            self._save_cuda_kernel_file(cpp_sources, cuda_sources)
 
     def _generate_cuda_fallback_aggregator_function(
         self: StatisticsAggregator,
-        backend: str,
         reason: str,
     ) -> None:
         try:
             self._generate_triton_aggregator_function()
         except Exception as exc:
             warnings.warn(
-                f"{backend.upper()} C++ aggregator fallback to Triton failed "
-                f"after unsupported configuration ({reason}): {exc!r}; falling back to PyTorch.",
+                "CUDA C++ aggregator fallback to Triton failed after unsupported "
+                f"configuration ({reason}): {exc!r}; falling back to PyTorch.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -1065,12 +1051,11 @@ class CudaCodegenMixin:
         lines.append("}")
         return lines
 
-    def _save_cuda_kernel_file(self: StatisticsAggregator, backend: str, cpp_sources: str, cuda_sources: str) -> None:
+    def _save_cuda_kernel_file(self: StatisticsAggregator, cpp_sources: str, cuda_sources: str) -> None:
         unique_name = self._generate_unique_name()
-        suffix = "hip" if backend == "hip" else "cu"
-        self._saved_kernel_file = self.kernels_dir / f"kern_{backend}_{unique_name}.{suffix}"
+        self._saved_kernel_file = self.kernels_dir / f"kern_cuda_{unique_name}.cu"
         with open(self._saved_kernel_file, "w", encoding="utf-8") as f:
             f.write("// C++ declarations passed to torch.utils.cpp_extension.load_inline\n")
             f.write(cpp_sources)
-            f.write("\n// CUDA/HIP source\n")
+            f.write("\n// CUDA source\n")
             f.write(cuda_sources)

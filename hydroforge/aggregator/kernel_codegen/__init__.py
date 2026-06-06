@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 
 from hydroforge.aggregator.kernel_codegen.common import CommonCodegenMixin
 from hydroforge.aggregator.kernel_codegen.cuda import CudaCodegenMixin
-from hydroforge.aggregator.kernel_codegen.hip import HipCodegenMixin
 from hydroforge.aggregator.kernel_codegen.metal import MetalCodegenMixin
 from hydroforge.aggregator.kernel_codegen.pytorch import PyTorchCodegenMixin
 from hydroforge.aggregator.kernel_codegen.static import StaticCodegenMixin
@@ -25,22 +24,21 @@ class KernelCodegenMixin(
     MetalCodegenMixin,
     PyTorchCodegenMixin,
     CudaCodegenMixin,
-    HipCodegenMixin,
     StaticCodegenMixin,
     TritonCodegenMixin,
     CommonCodegenMixin,
 ):
     """Mixin providing multi-backend kernel code generation and compilation.
 
-    Backends: CUDA/HIP C++ extensions, Triton, PyTorch (torch.compile), and
-    Metal MSL.
+    Backends: CUDA C++ extensions (which PyTorch hipifies under ROCm), Triton,
+    PyTorch (torch.compile), and Metal MSL.
     """
 
     def _generate_aggregator_function(self: StatisticsAggregator) -> None:
         """
         Generate and compile the aggregation kernel function.
 
-        Dispatches to CUDA/HIP C++, Metal, PyTorch, or Triton code generation
+        Dispatches to CUDA C++, Metal, PyTorch, or Triton code generation
         based on HYDROFORGE_BACKEND.
         """
         from hydroforge.runtime.backend import KERNEL_BACKEND
@@ -55,10 +53,6 @@ class KernelCodegenMixin(
 
         if KERNEL_BACKEND == "cuda":
             self._generate_cuda_aggregator_function()
-            return
-
-        if KERNEL_BACKEND == "hip":
-            self._generate_hip_aggregator_function()
             return
 
         self._generate_triton_aggregator_function()
