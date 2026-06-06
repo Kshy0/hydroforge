@@ -172,11 +172,27 @@ def _normalise_inline_source(src: Union[str, Sequence[str]]) -> str:
     return "\n".join(src)
 
 
-def _visible_device_arches(toolchain: str) -> List[str]:
-    kind = toolchain.strip().lower()
-    if kind == "cuda" and os.environ.get("TORCH_CUDA_ARCH_LIST"):
-        return []
-    if kind == "hip" and os.environ.get("PYTORCH_ROCM_ARCH"):
+def _normalise_hip_cflags(flags: Sequence[str]) -> List[str]:
+    """Rename the one nvcc-only flag hipcc/clang spells differently.
+
+    PyTorch's JIT ``load_inline`` auto-hipifies the *source* (includes,
+    ``cudaStream_t``, ``<<<>>>`` launches, …) but does not translate device
+    *compile flags*, and clang-based hipcc rejects nvcc's ``--use_fast_math``.
+    The C++ symbols need no shim: ``c10::cuda::getCurrentCUDAStream()`` resolves
+    natively on ROCm because PyTorch keeps the ``c10::cuda`` namespace alive in
+    its hipified stream headers (see Note [Masquerading as CUDA]).
+    """
+    return ["-ffast-math" if f == "--use_fast_math" else f for f in flags]
+
+
+def _visible_device_arches() -> List[str]:
+    # An explicit arch list pins the build target, so the live device set is
+    # irrelevant to the cache key.  ROCm honours PYTORCH_ROCM_ARCH; CUDA uses
+    # TORCH_CUDA_ARCH_LIST.
+    if torch.version.hip is not None:
+        if os.environ.get("PYTORCH_ROCM_ARCH"):
+            return []
+    elif os.environ.get("TORCH_CUDA_ARCH_LIST"):
         return []
     try:
         if not torch.cuda.is_available():
@@ -197,7 +213,6 @@ def _visible_device_arches(toolchain: str) -> List[str]:
 def _build_fingerprint(
     *,
     name: str,
-    toolchain: str,
     cpp_sources: Union[str, Sequence[str]],
     cuda_sources: Union[str, Sequence[str]],
     functions: Sequence[str],
@@ -207,7 +222,7 @@ def _build_fingerprint(
 
     return {
         "module_name": name,
-        "toolchain": toolchain,
+        "toolchain": "hip" if torch.version.hip is not None else "cuda",
         "cpp_sha256": hashlib.sha256(_normalise_inline_source(cpp_sources).encode()).hexdigest(),
         "cuda_sha256": hashlib.sha256(_normalise_inline_source(cuda_sources).encode()).hexdigest(),
         "functions": list(functions),
@@ -219,7 +234,7 @@ def _build_fingerprint(
         "rocm_home": str(ROCM_HOME) if ROCM_HOME is not None else None,
         "torch_cuda_arch_list": os.environ.get("TORCH_CUDA_ARCH_LIST"),
         "pytorch_rocm_arch": os.environ.get("PYTORCH_ROCM_ARCH"),
-        "visible_device_arches": _visible_device_arches(toolchain),
+        "visible_device_arches": _visible_device_arches(),
         "cc": os.environ.get("CC"),
         "cxx": os.environ.get("CXX"),
         "cuda_host_cxx": os.environ.get("CUDAHOSTCXX"),
@@ -343,23 +358,27 @@ def load_inline_cu_module(
     env_prefix: str = "HYDROFORGE",
     force_rebuild: Optional[bool] = None,
     system_compiler: Optional[str] = None,
-    toolchain: str = "cuda",
 ) -> Any:
     """Compile or fast-load an inline PyTorch CUDA extension.
 
-    This is the shared hydroforge implementation used by downstream CUDA
-    backends.  It keeps a config/source fingerprint beside the built ``.so`` and
+    This is the shared hydroforge implementation used by every compiled-CUDA
+    backend.  It keeps a config/source fingerprint beside the built ``.so`` and
     directly imports the cached binary when the fingerprint still matches,
     avoiding PyTorch's per-process ninja staleness check.
 
-    Environment knobs for ``toolchain="cuda"``:
+    Under a ROCm/HIP PyTorch build the same ``.cu`` sources double as the AMD
+    compiled path: PyTorch's ``load_inline`` auto-hipifies the source, and only
+    the nvcc-only ``--use_fast_math`` flag is renamed to ``-ffast-math`` so
+    callers never need a separate HIP loader.
+
+    Environment knobs:
       - ``HYDROFORGE_CUDA_REBUILD=1``: force rebuild.
       - ``HYDROFORGE_CUDA_USE_SYSTEM_COMPILER=auto|1|0``: host compiler fallback.
       - ``HYDROFORGE_CUDA_DIGEST_BUILD_DIR=0``: disable digest-scoped build dirs.
     """
     from torch.utils.cpp_extension import _get_build_directory, load_inline
 
-    env_kind = toolchain.strip().upper()
+    env_kind = "CUDA"
     if force_rebuild is None:
         force_rebuild = (
             _env_truthy(f"{env_prefix}_{env_kind}_REBUILD", False)
@@ -371,9 +390,14 @@ def load_inline_cu_module(
             os.environ.get(f"HYDROFORGE_{env_kind}_USE_SYSTEM_COMPILER", "auto"),
         )
 
+    # ROCm/HIP build: PyTorch's load_inline hipifies the source itself; we only
+    # rename the one device compile flag it leaves untouched.  Done before
+    # fingerprinting so the cache key matches what actually gets compiled.
+    if torch.version.hip is not None:
+        extra_cuda_cflags = _normalise_hip_cflags(extra_cuda_cflags)
+
     fingerprint = _build_fingerprint(
         name=name,
-        toolchain=toolchain,
         cpp_sources=cpp_sources,
         cuda_sources=cuda_sources,
         functions=functions,
@@ -459,11 +483,10 @@ def _local_rank() -> int:
     return 0
 
 
-def _precompile_verbose(env_prefix: str, toolchain: str) -> bool:
-    env_kind = toolchain.strip().upper()
+def _precompile_verbose(env_prefix: str) -> bool:
     return (
-        os.environ.get(f"{env_prefix}_{env_kind}_VERBOSE") == "1"
-        or os.environ.get(f"HYDROFORGE_{env_kind}_VERBOSE") == "1"
+        os.environ.get(f"{env_prefix}_CUDA_VERBOSE") == "1"
+        or os.environ.get("HYDROFORGE_CUDA_VERBOSE") == "1"
     )
 
 
@@ -472,7 +495,6 @@ def precompile_extension_builders(
     builders: Sequence[Tuple[str, str]],
     *,
     env_prefix: str = "HYDROFORGE",
-    toolchain: str = "cuda",
     default_jobs: Optional[int] = None,
     local_rank0_only: bool = True,
 ) -> Dict[str, Any]:
@@ -509,7 +531,7 @@ def precompile_extension_builders(
         if old_pythonpath:
             pythonpath.append(old_pythonpath)
 
-        verbose = _precompile_verbose("HYDROFORGE", toolchain)
+        verbose = _precompile_verbose("HYDROFORGE")
         pending = list(builders)
         running: List[Tuple[str, str, subprocess.Popen]] = []
 
@@ -552,7 +574,7 @@ def precompile_extension_builders(
                     if proc.returncode != 0:
                         msg = err or out
                         raise RuntimeError(
-                            f"{module_name}.{builder} {toolchain} precompile failed:\n{msg}"
+                            f"{module_name}.{builder} cuda precompile failed:\n{msg}"
                         )
                 if not completed and running:
                     time.sleep(0.1)
