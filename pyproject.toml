@@ -23,5 +23,8 @@ dependencies = [
 where = ["."]
 include = ["hydroforge*"]
 
+[project.scripts]
+hydroforge-cuda-precompile = "hydroforge.runtime.cuda_kernel:main"
+
 [project.optional-dependencies]
 dev = ["ipykernel", "matplotlib", "ipympl", "pandas"]

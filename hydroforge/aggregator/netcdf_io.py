@@ -363,13 +363,16 @@ class NetCDFIOMixin:
             args = (var_name, data_batch, output_path, dt_list)
             writer = _write_batch_netcdf_process
 
-        try:
-            idx = abs(hash(key)) % len(self._write_executors)
-            future = self._write_executors[idx].submit(writer, args)
-            self._write_futures.append(future)
-        except RuntimeError:
-            # Executor already shut down — write synchronously
+        if not self._write_executors:
             writer(args)
+        else:
+            try:
+                idx = abs(hash(key)) % len(self._write_executors)
+                future = self._write_executors[idx].submit(writer, args)
+                self._write_futures.append(future)
+            except (RuntimeError, ValueError):
+                # Executor already shut down - write synchronously.
+                writer(args)
 
         buf['data'].clear()
         buf['dt'].clear()
