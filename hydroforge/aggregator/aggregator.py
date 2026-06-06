@@ -76,7 +76,7 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
         self.device = device
         self.output_dir = output_dir
         self.rank = rank
-        self.num_workers = num_workers
+        self.num_workers = max(1, int(num_workers))
         self.complevel = complevel
         self.save_kernels = save_kernels
         self.output_split_by_year = output_split_by_year
@@ -194,23 +194,25 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
 
     def _cleanup_executor(self) -> None:
         """Clean up the write executor."""
+        # Flush any remaining buffered time steps before shutting down executors.
+        if hasattr(self, '_write_buffers'):
+            self._flush_all_write_buffers()
+
+        # Wait for pending writes to complete
+        for future in self._write_futures:
+            try:
+                future.result(timeout=30)  # Wait up to 30 seconds
+            except Exception:
+                pass
+
         if self._write_executors:
-            # Flush any remaining buffered time steps
-            if hasattr(self, '_write_buffers'):
-                self._flush_all_write_buffers()
-            # Wait for pending writes to complete
-            for future in self._write_futures:
-                try:
-                    future.result(timeout=30)  # Wait up to 30 seconds
-                except Exception:
-                    pass
             for executor in self._write_executors:
                 try:
                     executor.shutdown(wait=True)
                 except Exception:
                     pass
-            self._write_executors = []
-            self._write_futures = []
+        self._write_executors = []
+        self._write_futures = []
 
 
     def _shutdown(self) -> None:
