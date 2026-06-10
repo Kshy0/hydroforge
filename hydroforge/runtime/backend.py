@@ -150,10 +150,15 @@ class KernelAdapter:
                 return _k(param_a=kw['a_ptr'], param_b=kw['b_ptr'], ...)
         """
         pairs = []
+        mapped_pos = {}
         for k in kwargs_keys:
             mapped = self._resolve_key(k)
             if mapped:
-                pairs.append((k, mapped))
+                if mapped in mapped_pos:
+                    pairs[mapped_pos[mapped]] = (k, mapped)
+                else:
+                    mapped_pos[mapped] = len(pairs)
+                    pairs.append((k, mapped))
 
         args_str = ", ".join(f"{m}=_kw['{k}']" for k, m in pairs)
         code = f"def _fast(_kw, _k=_kernel): return _k({args_str})"
