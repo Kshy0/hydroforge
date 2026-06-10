@@ -4,38 +4,20 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-"""
-Generic CUDA kernel loader and Triton-compatible wrapper for hydroforge.
+"""Shared CUDA-extension loader for hydroforge compiled backends.
 
-Provides:
-  - :func:`load_cu_module` — compile ``.cu`` files via ``load_inline`` into
-    a pybind11 extension, caching the result.
-  - :class:`CudaKernel` — generic wrapper that adapts a CUDA launcher to the
-    Triton ``kernel[grid](**kwargs)`` calling convention, eliminating the need
-    for per-kernel wrapper classes.
+:func:`load_inline_cu_module` compiles inline ``.cu`` sources into a pybind11
+extension and fast-loads the cached ``.so`` on subsequent runs.  The cache is
+keyed by a content+toolchain fingerprint and is host-agnostic, so a binary
+compiled by any host (or rank) is reused.  When a build is needed,
+:func:`_coordinated_build` serialises compilation across processes / nodes with
+an atomic filesystem lock so exactly one process compiles and the rest reuse its
+output.  :func:`precompile_extension_builders` builds a model's independent
+extensions in parallel before the hot loop.
 
-Example
--------
-::
-
-    from hydroforge.runtime.cuda_kernel import CudaKernel, load_cu_module
-
-    mod = load_cu_module("cmfgpu_physics", [physics_cu, launchers_cu])
-
-    compute_outflow_kernel = CudaKernel(
-        mod, "launch_outflow",
-        args=[
-            "downstream_idx_ptr", "river_inflow_ptr", "river_outflow_ptr",
-            ...
-            ("gravity", float), ("time_step", float),
-            ("num_catchments", int),
-            ("HAS_BIFURCATION", bool, True), ("HAS_RESERVOIR", bool, False),
-        ],
-        nullable={"is_dam_upstream_ptr": "torch.bool"},
-    )
-
-    # Now usable with Triton calling convention:
-    compute_outflow_kernel[grid](river_depth_ptr=tensor, gravity=9.81, ...)
+Under a ROCm/HIP PyTorch build the same ``.cu`` sources double as the AMD path:
+``load_inline`` auto-hipifies the source and only ``--use_fast_math`` is renamed
+to ``-ffast-math``.
 """
 
 from __future__ import annotations
@@ -50,6 +32,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -64,10 +47,6 @@ _MANIFEST_FILENAME = "compile_manifest.json"
 def _safe_path_component(value: str) -> str:
     component = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value.strip())
     return component[:80] or "unknown"
-
-
-def _host_build_scope() -> str:
-    return _safe_path_component(socket.gethostname() or "host")
 
 
 def load_build_manifest(build_dir: Union[str, Path]) -> dict:
@@ -88,75 +67,6 @@ def update_build_manifest(
     p = Path(build_dir) / _MANIFEST_FILENAME
     with open(p, "w") as f:
         json.dump(manifest, f, indent=2)
-
-
-def check_build_manifest(
-    build_dir: Union[str, Path], section: str, expected_name: str
-) -> None:
-    """Warn if a precompiled kernel in *build_dir* doesn't match current config.
-
-    Called before compilation so the user knows the precompiled cache won't
-    be reused and a slow recompilation is about to happen.
-    """
-    manifest = load_build_manifest(build_dir)
-    entry = manifest.get(section)
-    if entry is None:
-        return  # No prior manifest entry → first compilation, nothing to check
-    cached_name = entry.get("module_name", "")
-    if cached_name != expected_name:
-        import warnings
-        warnings.warn(
-            f"Precompiled {section} kernel mismatch in {build_dir}:\n"
-            f"  precompiled: {cached_name}\n"
-            f"  current:     {expected_name}\n"
-            f"Re-run precompile to update the cache.",
-            stacklevel=3,
-        )
-
-
-def load_cu_module(
-    name: str,
-    cuda_files: Sequence[Union[str, Path]],
-    *,
-    extra_cuda_cflags: Sequence[str] = ("-O3", "--use_fast_math"),
-    verbose: bool = False,
-    build_directory: Optional[Union[str, Path]] = None,
-) -> Any:
-    """Compile ``.cu`` files into a pybind11 extension module (cached).
-
-    Args:
-        name: Unique module name for caching.
-        cuda_files: Paths to ``.cu`` / ``.cpp`` source files.
-        extra_cuda_cflags: Extra NVCC flags.
-        verbose: Print compilation output.
-        build_directory: If given, compiled artefacts (``.so``, ``.o``) are
-            stored in this directory so they can be reused across runs.
-
-    Returns:
-        The compiled extension module.
-    """
-    if name in _module_cache:
-        return _module_cache[name]
-
-    from torch.utils.cpp_extension import load
-
-    sources = [str(Path(f).resolve()) for f in cuda_files]
-    _verbose = verbose or os.environ.get("HYDROFORGE_CUDA_VERBOSE", "") == "1"
-
-    kw: Dict[str, Any] = dict(
-        name=name,
-        sources=sources,
-        extra_cuda_cflags=list(extra_cuda_cflags),
-        verbose=_verbose,
-    )
-    if build_directory is not None:
-        bd = Path(build_directory)
-        bd.mkdir(parents=True, exist_ok=True)
-        kw["build_directory"] = str(bd)
-
-    mod = load(**kw)
-    _module_cache[name] = mod
-    return mod
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -239,11 +149,6 @@ def _build_fingerprint(
         "cxx": os.environ.get("CXX"),
         "cuda_host_cxx": os.environ.get("CUDAHOSTCXX"),
     }
-
-
-def _fingerprint_digest(fingerprint: dict) -> str:
-    payload = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _maybe_use_system_compiler(mode: str = "auto") -> Dict[str, Optional[str]]:
@@ -346,6 +251,233 @@ def _maybe_clear_stale_torch_lock(
         )
 
 
+def _host_scoped_cache(env_prefix: str) -> bool:
+    """Whether to isolate the build cache per hostname (default: no).
+
+    Host-agnostic caching lets a ``.so`` compiled on one host be reused by any
+    other host whose build *fingerprint* matches — the digest already encodes
+    binary compatibility (arch, toolchain, torch/cuda version, compiler), so the
+    hostname is irrelevant.  Set ``HYDROFORGE_CUDA_HOST_SCOPED_CACHE=1`` to keep
+    the legacy per-host subdirectory (e.g. on a shared filesystem where you do
+    *not* want cross-host reuse).
+    """
+    return (
+        _env_truthy(f"{env_prefix}_CUDA_HOST_SCOPED_CACHE", False)
+        or _env_truthy("HYDROFORGE_CUDA_HOST_SCOPED_CACHE", False)
+    )
+
+
+def _candidate_build_dirs(base_no_host: Path, digest16: str) -> List[Path]:
+    """Directories to search for an already-compiled ``.so`` (host-agnostic).
+
+    Returns the canonical host-agnostic dir first, then any legacy per-host
+    siblings (``base/<host>/<digest>``) so caches built before host-agnostic
+    mode — or by another host writing into its own scope — are still reused.
+    """
+    cands = [base_no_host / digest16]
+    try:
+        for child in sorted(base_no_host.iterdir()):
+            if child.is_dir() and child.name != digest16:
+                sib = child / digest16
+                if sib.is_dir():
+                    cands.append(sib)
+    except OSError:
+        pass
+    return cands
+
+
+def _try_import_cached(
+    compiled_name: str, digest: str, search_dirs: Sequence[Path]
+) -> Optional[Any]:
+    """Import the first valid cached ``.so`` whose srchash matches ``digest``."""
+    for d in search_dirs:
+        so_path = d / f"{compiled_name}.so"
+        hash_path = d / f"{compiled_name}.srchash"
+        if so_path.is_file() and hash_path.is_file():
+            try:
+                if hash_path.read_text().strip() == digest:
+                    return _import_extension_from_so(compiled_name, so_path)
+            except Exception:
+                continue
+    return None
+
+
+def _read_compile_lock_holder(lock_path: Path) -> Tuple[Optional[str], Optional[int]]:
+    try:
+        raw = lock_path.read_text(errors="replace").strip()
+    except OSError:
+        return None, None
+    parts = raw.split(":", 2)
+    if len(parts) < 2:
+        return None, None
+    try:
+        pid = int(parts[1])
+    except ValueError:
+        pid = None
+    return parts[0] or None, pid
+
+
+def _process_is_alive(pid: Optional[int]) -> bool:
+    if pid is None or pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _maybe_remove_abandoned_compile_lock(
+    lock_path: Path,
+    *,
+    stale_after: float,
+    env_prefix: str,
+    verbose: bool,
+) -> bool:
+    if stale_after <= 0.0:
+        return False
+    try:
+        age = time.time() - lock_path.stat().st_mtime
+    except OSError:
+        return False
+    if age < stale_after:
+        return False
+
+    holder_host, holder_pid = _read_compile_lock_holder(lock_path)
+    local_host = socket.gethostname()
+    if holder_host == local_host and not _process_is_alive(holder_pid):
+        reason = f"abandoned by local pid {holder_pid}"
+    elif (
+        _env_truthy(f"{env_prefix}_CUDA_COMPILE_LOCK_STEAL", False)
+        or _env_truthy("HYDROFORGE_CUDA_COMPILE_LOCK_STEAL", False)
+    ):
+        reason = "explicit stale-lock steal enabled"
+    else:
+        return False
+
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        return True
+    if verbose:
+        print(
+            f"[hydroforge] removed compile lock {lock_path} "
+            f"({reason}, age {age:.0f}s)",
+            file=sys.stderr,
+        )
+    return True
+
+
+def _acquire_compile_lock(lock_path: Path, *, env_prefix: str, verbose: bool) -> None:
+    stale_after = _env_float(
+        f"{env_prefix}_CUDA_COMPILE_LOCK_STALE_SECONDS",
+        _env_float("HYDROFORGE_CUDA_COMPILE_LOCK_STALE_SECONDS", 1800.0),
+    )
+    poll = max(0.05, _env_float("HYDROFORGE_CUDA_COMPILE_LOCK_POLL_SECONDS", 0.25))
+    timeout = _env_float(
+        f"{env_prefix}_CUDA_COMPILE_LOCK_TIMEOUT_SECONDS",
+        _env_float("HYDROFORGE_CUDA_COMPILE_LOCK_TIMEOUT_SECONDS", 1800.0),
+    )
+    deadline = time.time() + timeout if timeout > 0.0 else None
+
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            if _maybe_remove_abandoned_compile_lock(
+                lock_path,
+                stale_after=stale_after,
+                env_prefix=env_prefix,
+                verbose=verbose,
+            ):
+                continue
+            if deadline is not None and time.time() > deadline:
+                holder_host, holder_pid = _read_compile_lock_holder(lock_path)
+                holder = (
+                    f"{holder_host or 'unknown'}:{holder_pid}"
+                    if holder_pid is not None
+                    else (holder_host or "unknown")
+                )
+                raise TimeoutError(
+                    f"Timed out waiting for CUDA compile lock {lock_path} "
+                    f"held by {holder}. Remove the lock if the compiler process "
+                    "has exited, or set HYDROFORGE_CUDA_COMPILE_LOCK_STEAL=1 "
+                    "to override a stale lock."
+                )
+            time.sleep(poll)
+            continue
+        else:
+            try:
+                os.write(
+                    fd,
+                    f"{socket.gethostname()}:{os.getpid()}:{time.time():.0f}".encode(),
+                )
+            finally:
+                os.close(fd)
+            return
+
+
+def _release_compile_lock(lock_path: Path) -> None:
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _coordinated_build(
+    *,
+    compiled_name: str,
+    digest: str,
+    base_no_host: Path,
+    host_dir: Path,
+    host_scoped: bool,
+    force_rebuild: bool,
+    compile_fn,
+    env_prefix: str,
+    verbose: bool,
+) -> Any:
+    """Find-or-build a CUDA extension with cross-process / cross-host coordination.
+
+    1. **Fast path** — import an existing matching ``.so`` from any candidate dir
+       (host-agnostic reuse: a binary compiled by *any* host/rank with the same
+       digest is reused).
+    2. **Slow path** — acquire an atomic ``O_CREAT|O_EXCL`` build lock in the
+       canonical digest dir so *exactly one* process compiles; the rest poll,
+       re-checking the cache until the compiler finishes (then fast-load its
+       output).  ``O_CREAT|O_EXCL`` is atomic on NFS, so this serialises across
+       nodes on a shared filesystem without any ``torch.distributed`` handshake.
+       Abandoned local locks are removed only when the recorded PID is gone;
+       remote stale locks require an explicit override.
+
+    ``compile_fn(build_dir)`` runs the actual ``load_inline`` into ``build_dir``
+    and returns the module.
+    """
+    digest16 = digest[:16]
+    canonical = (host_dir if host_scoped else base_no_host) / digest16
+    search = [canonical] if host_scoped else _candidate_build_dirs(base_no_host, digest16)
+
+    if not force_rebuild:
+        mod = _try_import_cached(compiled_name, digest, search)
+        if mod is not None:
+            return mod
+
+    canonical.mkdir(parents=True, exist_ok=True)
+    lock_path = canonical / ".hydroforge_compile.lock"
+    _acquire_compile_lock(lock_path, env_prefix=env_prefix, verbose=verbose)
+    try:
+        # Double-check: a previous holder may have finished between our cache
+        # miss and acquiring the lock.
+        if not force_rebuild:
+            mod = _try_import_cached(compiled_name, digest, search)
+            if mod is not None:
+                return mod
+        return compile_fn(canonical)
+    finally:
+        _release_compile_lock(lock_path)
+
+
 def load_inline_cu_module(
     name: str,
     *,
@@ -403,63 +535,109 @@ def load_inline_cu_module(
         functions=functions,
         extra_cuda_cflags=extra_cuda_cflags,
     )
-    digest = _fingerprint_digest(fingerprint)
+    digest = hashlib.sha256(
+        json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     compiled_name = f"{name}_{digest[:16]}"
     cache_key = f"inline:{compiled_name}"
     if cache_key in _module_cache:
         return _module_cache[cache_key]
 
     if build_directory is not None:
-        base_build_dir = Path(build_directory)
+        base_no_host = Path(build_directory)
+        host_dir = base_no_host
     else:
-        base_build_dir = Path(_get_build_directory(name, verbose=False)) / _host_build_scope()
+        cache_root = Path(_get_build_directory(name, verbose=False))
+        base_no_host = cache_root
+        host_dir = cache_root / _safe_path_component(socket.gethostname() or "host")
+    host_scoped = _host_scoped_cache(env_prefix)
     digest_build_dir = (
         _env_truthy(f"{env_prefix}_{env_kind}_DIGEST_BUILD_DIR", True)
         and _env_truthy(f"HYDROFORGE_{env_kind}_DIGEST_BUILD_DIR", True)
     )
-    build_dir = base_build_dir / digest[:16] if digest_build_dir else base_build_dir
-    build_dir.mkdir(parents=True, exist_ok=True)
-    so_path = build_dir / f"{compiled_name}.so"
-    hash_path = build_dir / f"{compiled_name}.srchash"
-
-    if not force_rebuild and so_path.is_file() and hash_path.is_file():
-        try:
-            if hash_path.read_text().strip() == digest:
-                mod = _import_extension_from_so(compiled_name, so_path)
-                _module_cache[cache_key] = mod
-                return mod
-        except Exception:
-            pass
+    if not digest_build_dir:
+        # Legacy flat layout (no per-digest subdir): keep the original
+        # single-directory layout but still serialize through the hydroforge lock.
+        build_dir = host_dir if host_scoped else base_no_host
+        build_dir.mkdir(parents=True, exist_ok=True)
+        so_path = build_dir / f"{compiled_name}.so"
+        hash_path = build_dir / f"{compiled_name}.srchash"
+        if not force_rebuild and so_path.is_file() and hash_path.is_file():
+            try:
+                if hash_path.read_text().strip() == digest:
+                    mod = _import_extension_from_so(compiled_name, so_path)
+                    _module_cache[cache_key] = mod
+                    return mod
+            except Exception:
+                pass
 
     _verbose = (
         verbose
         or os.environ.get(f"{env_prefix}_{env_kind}_VERBOSE", "") == "1"
         or os.environ.get(f"HYDROFORGE_{env_kind}_VERBOSE", "") == "1"
     )
-    _maybe_clear_stale_torch_lock(build_dir, env_prefix=env_prefix, env_kind=env_kind, verbose=_verbose)
-    old_compiler_env = _maybe_use_system_compiler(system_compiler)
-    try:
-        mod = load_inline(
-            name=compiled_name,
-            cpp_sources=cpp_sources,
-            cuda_sources=cuda_sources,
-            functions=list(functions),
-            extra_cuda_cflags=list(extra_cuda_cflags),
-            build_directory=str(build_dir),
+
+    def _compile_into(build_dir: Path) -> Any:
+        """Run the real ``load_inline`` into ``build_dir`` and stamp the cache."""
+        build_dir.mkdir(parents=True, exist_ok=True)
+        _maybe_clear_stale_torch_lock(
+            build_dir, env_prefix=env_prefix, env_kind=env_kind, verbose=_verbose
+        )
+        old_compiler_env = _maybe_use_system_compiler(system_compiler)
+        try:
+            mod = load_inline(
+                name=compiled_name,
+                cpp_sources=cpp_sources,
+                cuda_sources=cuda_sources,
+                functions=list(functions),
+                extra_cuda_cflags=list(extra_cuda_cflags),
+                build_directory=str(build_dir),
+                verbose=_verbose,
+            )
+        finally:
+            _restore_compiler_env(old_compiler_env)
+        try:
+            (build_dir / f"{compiled_name}.srchash").write_text(digest)
+            update_build_manifest(
+                build_dir,
+                name,
+                fingerprint | {"digest": digest, "compiled_module_name": compiled_name},
+            )
+        except Exception:
+            pass
+        return mod
+
+    if not digest_build_dir:
+        build_dir = host_dir if host_scoped else base_no_host
+        lock_path = build_dir / ".hydroforge_compile.lock"
+        _acquire_compile_lock(lock_path, env_prefix=env_prefix, verbose=_verbose)
+        try:
+            if not force_rebuild:
+                so_path = build_dir / f"{compiled_name}.so"
+                hash_path = build_dir / f"{compiled_name}.srchash"
+                if so_path.is_file() and hash_path.is_file():
+                    try:
+                        if hash_path.read_text().strip() == digest:
+                            mod = _import_extension_from_so(compiled_name, so_path)
+                            _module_cache[cache_key] = mod
+                            return mod
+                    except Exception:
+                        pass
+            mod = _compile_into(build_dir)
+        finally:
+            _release_compile_lock(lock_path)
+    else:
+        mod = _coordinated_build(
+            compiled_name=compiled_name,
+            digest=digest,
+            base_no_host=base_no_host,
+            host_dir=host_dir,
+            host_scoped=host_scoped,
+            force_rebuild=force_rebuild,
+            compile_fn=_compile_into,
+            env_prefix=env_prefix,
             verbose=_verbose,
         )
-    finally:
-        _restore_compiler_env(old_compiler_env)
-
-    try:
-        hash_path.write_text(digest)
-        update_build_manifest(
-            build_dir,
-            name,
-            fingerprint | {"digest": digest, "compiled_module_name": compiled_name},
-        )
-    except Exception:
-        pass
 
     _module_cache[cache_key] = mod
     return mod
@@ -483,13 +661,6 @@ def _local_rank() -> int:
     return 0
 
 
-def _precompile_verbose(env_prefix: str) -> bool:
-    return (
-        os.environ.get(f"{env_prefix}_CUDA_VERBOSE") == "1"
-        or os.environ.get("HYDROFORGE_CUDA_VERBOSE") == "1"
-    )
-
-
 def precompile_extension_builders(
     module_name: str,
     builders: Sequence[Tuple[str, str]],
@@ -505,7 +676,7 @@ def precompile_extension_builders(
     Python subprocesses by default; other local ranks compile/load serially unless an
     explicit ``HYDROFORGE_PRECOMPILE_JOBS`` override is set.  This keeps multi-GPU jobs
     from multiplying compile fan-out by local world size while still relying on
-    PyTorch's per-build-directory lock for cross-rank cache safety.
+    the shared hydroforge compile lock for cross-rank cache safety.
 
     Environment controls:
       - ``HYDROFORGE_PRECOMPILE_JOBS=N``: override extension fan-out.
@@ -531,9 +702,30 @@ def precompile_extension_builders(
         if old_pythonpath:
             pythonpath.append(old_pythonpath)
 
-        verbose = _precompile_verbose("HYDROFORGE")
+        verbose = os.environ.get("HYDROFORGE_CUDA_VERBOSE") == "1"
         pending = list(builders)
-        running: List[Tuple[str, str, subprocess.Popen]] = []
+        running: List[Tuple[str, str, subprocess.Popen, Path]] = []
+
+        def read_log(log_path: Path, *, tail_bytes: Optional[int] = None) -> str:
+            try:
+                if tail_bytes is None:
+                    return log_path.read_text(errors="replace")
+                with open(log_path, "rb") as f:
+                    try:
+                        f.seek(0, os.SEEK_END)
+                        size = f.tell()
+                        f.seek(max(0, size - tail_bytes))
+                    except OSError:
+                        f.seek(0)
+                    return f.read().decode(errors="replace")
+            except OSError:
+                return ""
+
+        def remove_log(log_path: Path) -> None:
+            try:
+                log_path.unlink()
+            except OSError:
+                pass
 
         def start(label: str, builder: str) -> None:
             env = os.environ.copy()
@@ -544,14 +736,24 @@ def precompile_extension_builders(
                 f"m=importlib.import_module({module_name!r});"
                 f"getattr(m, {builder!r})()"
             )
-            proc = subprocess.Popen(
-                [sys.executable, "-c", code],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-            )
-            running.append((label, builder, proc))
+            with tempfile.NamedTemporaryFile(
+                mode="w+b",
+                prefix=f"hydroforge_cuda_{_safe_path_component(label)}_",
+                suffix=".log",
+                delete=False,
+            ) as log:
+                log_path = Path(log.name)
+                try:
+                    proc = subprocess.Popen(
+                        [sys.executable, "-c", code],
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        env=env,
+                    )
+                except Exception:
+                    remove_log(log_path)
+                    raise
+            running.append((label, builder, proc, log_path))
 
         try:
             while pending or running:
@@ -560,33 +762,34 @@ def precompile_extension_builders(
 
                 completed = False
                 for item in list(running):
-                    label, builder, proc = item
+                    label, builder, proc, log_path = item
                     if proc.poll() is None:
                         continue
                     running.remove(item)
-                    out, err = proc.communicate()
                     completed = True
+                    log_text = read_log(log_path, tail_bytes=None if verbose else 256 * 1024)
                     if verbose:
-                        if out:
-                            print(out, end="", file=sys.stderr)
-                        if err:
-                            print(err, end="", file=sys.stderr)
+                        if log_text:
+                            print(log_text, end="", file=sys.stderr)
+                    remove_log(log_path)
                     if proc.returncode != 0:
-                        msg = err or out
+                        msg = log_text or "<no compiler output captured>"
                         raise RuntimeError(
                             f"{module_name}.{builder} cuda precompile failed:\n{msg}"
                         )
                 if not completed and running:
                     time.sleep(0.1)
         except Exception:
-            for _, _, proc in running:
+            for _, _, proc, _ in running:
                 if proc.poll() is None:
                     proc.terminate()
-            for _, _, proc in running:
+            for _, _, proc, log_path in running:
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                    proc.wait()
+                remove_log(log_path)
             raise
 
     mod = importlib.import_module(module_name)
@@ -620,147 +823,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     precompile_cuda_modules(args.modules)
     return 0
-
-
-# Sentinel for missing defaults
-_MISSING = object()
-
-# dtype string -> torch.dtype
-_DTYPE_MAP = {
-    "torch.bool": torch.bool,
-    "torch.float32": torch.float32,
-    "torch.float64": torch.float64,
-    "torch.int32": torch.int32,
-    "torch.int64": torch.int64,
-    "bool": torch.bool,
-    "float32": torch.float32,
-    "float64": torch.float64,
-    "int32": torch.int32,
-    "int64": torch.int64,
-}
-
-
-class CudaKernel:
-    """Generic wrapper adapting a CUDA launcher to Triton calling convention.
-
-    Replaces per-kernel wrapper classes like ``_OutflowKernel``.  The
-    ``args`` list declares how Triton-style ``**kwargs`` map to the
-    positional arguments of the C++ launcher function.
-
-    Each entry in ``args`` can be:
-
-    - ``"name_ptr"`` — a tensor argument; the kwarg key ``name_ptr`` is
-      looked up directly in ``**kwargs``.
-    - ``("name", type)`` — a scalar; ``type`` is ``float``, ``int``, or
-      ``bool``.  The kwarg key ``name`` is looked up.
-    - ``("name", type, default)`` — a scalar with a default value;
-      ``kw.get(name, default)`` is used.
-
-    The ``nullable`` dict maps tensor kwarg names to dtype strings.  If
-    the kwarg is ``None`` or absent, an empty tensor of that dtype is
-    substituted (required for pybind11 which cannot accept ``None``).
-
-    Args:
-        module: Compiled extension module (from :func:`load_cu_module`).
-        func_name: Name of the launcher function (e.g. ``"launch_outflow"``).
-        args: Argument specification list.
-        nullable: ``{kwarg_name: dtype_str}`` for optional tensor args.
-    """
-
-    __slots__ = ("_func", "_args", "_nullable", "_fast_caller")
-
-    def __init__(
-        self,
-        module: Any,
-        func_name: str,
-        args: List[Union[str, Tuple]],
-        nullable: Optional[Dict[str, str]] = None,
-    ):
-        self._func = getattr(module, func_name)
-        self._args = args
-        self._nullable = nullable or {}
-        self._fast_caller: Any = None
-
-    def _build_fast_caller(self) -> Any:
-        """Generate a specialised caller that avoids per-call arg iteration.
-
-        Instead of looping over 20-31 arg specs on every call, we emit a
-        function that directly maps kwargs to positional args by name.
-        """
-        ns: Dict[str, Any] = {"_func": self._func}
-        body_lines: List[str] = []
-        arg_names: List[str] = []
-
-        for i, spec in enumerate(self._args):
-            a = f"_a{i}"
-            arg_names.append(a)
-            if isinstance(spec, str):
-                if spec in self._nullable:
-                    dt = _DTYPE_MAP.get(self._nullable[spec], torch.bool)
-                    ns[f"_empty{i}"] = torch.empty(0, dtype=dt)
-                    body_lines.append(
-                        f"  {a} = _kw.get('{spec}'); "
-                        f"{a} = _empty{i} if {a} is None else {a}"
-                    )
-                else:
-                    body_lines.append(f"  {a} = _kw['{spec}']")
-            elif isinstance(spec, tuple):
-                name = spec[0]
-                if len(spec) >= 3:
-                    ns[f"_def{i}"] = spec[2]
-                    body_lines.append(f"  {a} = _kw.get('{name}', _def{i})")
-                else:
-                    body_lines.append(f"  {a} = _kw['{name}']")
-            else:
-                ns[f"_const{i}"] = spec
-                body_lines.append(f"  {a} = _const{i}")
-
-        call_args = ", ".join(arg_names)
-        fn_body = "\n".join(body_lines)
-        code = f"def _fast(_kw):\n{fn_body}\n  return _func({call_args})"
-        exec(code, ns)  # noqa: S102 – generated code is fully controlled
-        return ns["_fast"]
-
-    def __call__(self, **kw: Any) -> Any:
-        caller = self._fast_caller
-        if caller is None:
-            caller = self._build_fast_caller()
-            self._fast_caller = caller
-        return caller(kw)
-
-    def __getitem__(self, grid):
-        """Accept ``kernel[grid]`` syntax; grid is unused for CUDA."""
-        return self
-
-
-class LazyCudaKernel:
-    """Lazy-initialized CudaKernel that defers compilation until first call.
-
-    Accepts a zero-argument factory that returns a ``CudaKernel``.
-    Supports the Triton ``kernel[grid](**kw)`` calling convention.
-
-    Example::
-
-        def _make():
-            mod = get_cuda_kernels()
-            return CudaKernel(mod, "launch_outflow", args=[...])
-
-        compute_outflow_kernel = LazyCudaKernel(_make)
-    """
-
-    __slots__ = ("_factory", "_kernel")
-
-    def __init__(self, factory):
-        self._factory = factory
-        self._kernel = None
-
-    def __call__(self, **kw):
-        if self._kernel is None:
-            self._kernel = self._factory()
-        return self._kernel(**kw)
-
-    def __getitem__(self, grid):
-        return self
 
 
 if __name__ == "__main__":
