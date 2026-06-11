@@ -29,6 +29,7 @@ class NetCDFDataset(AbstractDataset):
     - Normalize variable dimensions to (T, Y, X) once per read; precompute a spatial mask
       and use a linear index list to quickly collapse (Y, X) -> N.
     """
+    supports_time_aggregation = True
 
     def _validate_files_exist(self, keys: Set[str]) -> None:
         file_paths = []
@@ -41,20 +42,38 @@ class NetCDFDataset(AbstractDataset):
         """Read only time vars to construct a global time index and lookup map."""
         # Build key -> first_dt map to help with date guessing
         key_to_first_dt: Dict[str, Union[datetime, cftime.datetime]] = {}
+        aggregate = self.time_aggregation is not None
+        scan_end = end_dt + self.time_interval if aggregate else end_dt
+        step = self.time_interval
         t = start_dt
-        while t <= end_dt:
+        while (t < scan_end if aggregate else t <= scan_end):
             k = self.time_to_key(t)
             if k not in key_to_first_dt:
                 key_to_first_dt[k] = t
-            t += self.time_interval
-        # Ensure end_date is covered
-        k_end = self.time_to_key(end_dt)
-        if k_end not in key_to_first_dt:
-            key_to_first_dt[k_end] = end_dt
+            t += step
+        if aggregate:
+            k_end = self.time_to_key(scan_end)
+            if k_end not in key_to_first_dt:
+                key_to_first_dt[k_end] = scan_end
+        # Ensure end_date is covered in non-aggregation mode.
+        if not aggregate:
+            k_end = self.time_to_key(end_dt)
+            if k_end not in key_to_first_dt:
+                key_to_first_dt[k_end] = end_dt
 
+        candidate_key_to_first_dt = key_to_first_dt
+        if aggregate:
+            key_to_first_dt = {
+                key: first_dt
+                for key, first_dt in key_to_first_dt.items()
+                if (Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}").exists()
+            }
+            if not key_to_first_dt:
+                self._validate_files_exist(set(candidate_key_to_first_dt.keys()))
         keys = set(key_to_first_dt.keys())
         self._validate_files_exist(keys)
 
+        source_times = []
         for key in sorted(keys):
             path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
             with Dataset(path, "r") as ds:
@@ -106,13 +125,28 @@ class NetCDFDataset(AbstractDataset):
                 self._file_times[key] = []
                 for i, dt in enumerate(dates):
                     self._file_times[key].append(dt)
-                    if start_dt <= dt <= end_dt:
+                    in_range = (
+                        start_dt <= dt < scan_end
+                        if aggregate
+                        else start_dt <= dt <= end_dt
+                    )
+                    if in_range:
                         self._dt_to_loc[dt] = (key, i)
+                        if aggregate:
+                            source_times.append(dt)
         expected_times: List[datetime] = []
         t = start_dt
         while t <= end_dt:
             expected_times.append(t)
             t += self.time_interval
+
+        if aggregate:
+            self.source_time_interval = self._infer_source_time_interval(source_times)
+            self._aggregation_factor = self._get_time_aggregation_factor(self.source_time_interval)
+            self._validate_source_times_for_aggregation(expected_times)
+            self._global_times = expected_times
+            return
+
         missing = [dt for dt in expected_times if dt not in self._dt_to_loc]
         if missing:
             preview = ", ".join(str(m) for m in missing[:10])
@@ -122,6 +156,75 @@ class NetCDFDataset(AbstractDataset):
                 f"Check start_date alignment and dataset temporal resolution."
             )
         self._global_times = expected_times
+
+    def _infer_source_time_interval(
+        self,
+        source_times: List[Union[datetime, cftime.datetime]],
+    ) -> timedelta:
+        source_times = sorted(source_times)
+        duplicates = [
+            source_times[i]
+            for i in range(1, len(source_times))
+            if source_times[i] == source_times[i - 1]
+        ]
+        if duplicates:
+            preview = ", ".join(str(dt) for dt in duplicates[:10])
+            raise ValueError(
+                "Duplicate source timestamps found in NetCDF time axis. "
+                f"First duplicates: {preview} (total {len(duplicates)})."
+            )
+        diffs = [source_times[i + 1] - source_times[i] for i in range(len(source_times) - 1)]
+        if not diffs:
+            raise ValueError("Unable to infer source_time_interval from NetCDF time axis")
+        source_interval = diffs[0]
+        source_seconds = source_interval.total_seconds()
+        if source_seconds <= 0:
+            raise ValueError("source_time_interval inferred from NetCDF time axis must be positive")
+        irregular = [
+            (source_times[i], source_times[i + 1], diff)
+            for i, diff in enumerate(diffs)
+            if not np.isclose(
+                diff.total_seconds(),
+                source_seconds,
+                rtol=0.0,
+                atol=1e-9,
+            )
+        ]
+        if irregular:
+            preview = ", ".join(
+                f"{left}->{right} ({diff})"
+                for left, right, diff in irregular[:5]
+            )
+            raise ValueError(
+                "NetCDF source time axis must be uniformly spaced for time "
+                f"aggregation; inferred first interval {source_interval}, "
+                f"but found irregular intervals: {preview} "
+                f"(total {len(irregular)})."
+            )
+        return source_interval
+
+    def _source_times_for_output_times(
+        self,
+        output_times: List[Union[datetime, cftime.datetime]],
+    ) -> List[Union[datetime, cftime.datetime]]:
+        return [
+            dt + self.source_time_interval * offset
+            for dt in output_times
+            for offset in range(self._aggregation_factor)
+        ]
+
+    def _validate_source_times_for_aggregation(
+        self,
+        output_times: List[Union[datetime, cftime.datetime]],
+    ) -> None:
+        required = self._source_times_for_output_times(output_times)
+        missing = [dt for dt in required if dt not in self._dt_to_loc]
+        if missing:
+            preview = ", ".join(str(m) for m in missing[:10])
+            raise ValueError(
+                f"Missing required source timestamps for time aggregation. "
+                f"First missing: {preview} (total {len(missing)})."
+            )
 
     def _ops_from_times(self, times: List[Union[datetime, cftime.datetime]]) -> List[Tuple[str, List[int]]]:
         """Group requested datetimes into per-file absolute index ops.
@@ -153,6 +256,12 @@ class NetCDFDataset(AbstractDataset):
 
         return ops
 
+    def _build_plan_entry(self, chunk_times: List[Union[datetime, cftime.datetime]]):
+        if self.time_aggregation is None:
+            return (chunk_times[0], self._ops_from_times(chunk_times))
+        source_times = self._source_times_for_output_times(chunk_times)
+        return (chunk_times[0], self._ops_from_times(source_times), len(chunk_times))
+
     def _build_simulation_plan(self) -> None:
         """
         Builds the sequence of chunks for the entire simulation, including spin-up.
@@ -178,9 +287,8 @@ class NetCDFDataset(AbstractDataset):
                 a = ci * self.chunk_len
                 b = min(a + self.chunk_len, total)
                 chunk_times = times[a:b]
-                ops = self._ops_from_times(chunk_times)
                 # Store the start time of the chunk for reference
-                chunks.append((chunk_times[0], ops))
+                chunks.append(self._build_plan_entry(chunk_times))
             return chunks
 
         # 1. Spin-up chunks
@@ -209,6 +317,7 @@ class NetCDFDataset(AbstractDataset):
         unit_factor: float = 1.0,
         suffix: str = ".nc",
         time_to_key: Optional[Callable[[Union[datetime, cftime.datetime]], str]] = yearly_time_to_key,
+        time_aggregation: Optional[Union[str, Dict[str, str]]] = None,
         *args,
         **kwargs,
     ):
@@ -218,6 +327,9 @@ class NetCDFDataset(AbstractDataset):
         self.prefix = prefix
         self.suffix = suffix
         self.time_to_key = time_to_key if time_to_key is not None else single_file_key
+        self.time_aggregation = self._normalize_time_aggregation(time_aggregation)
+        self.source_time_interval = None
+        self._aggregation_factor = None
 
         # Runtime metadata
         self._file_times = {}
@@ -252,6 +364,7 @@ class NetCDFDataset(AbstractDataset):
 
         self._scan_time_metadata(scan_start, scan_end)
         self._build_simulation_plan()
+        self._aggregation_plan_enabled = self.time_aggregation is not None
 
     def is_valid_time_index(self, idx: int) -> bool:
         """
@@ -263,9 +376,13 @@ class NetCDFDataset(AbstractDataset):
         if chunk_idx >= len(self._plan):
              return False
 
-        _, ops = self._plan[chunk_idx]
-        # Calculate real length of this chunk
-        real_len = sum(len(x[1]) for x in ops)
+        entry = self._plan[chunk_idx]
+        if self.time_aggregation is None:
+            _, ops = entry
+            # Calculate real length of this chunk
+            real_len = sum(len(x[1]) for x in ops)
+        else:
+            real_len = entry[2]
 
         return offset < real_len
 
@@ -442,21 +559,39 @@ class NetCDFDataset(AbstractDataset):
 
         return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
 
-    def read_chunk(self, idx: int) -> np.ndarray:
+    def _finish_read(self, data: np.ndarray) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        if self.time_aggregation is None:
+            return data / self.unit_factor
+        if not self._aggregation_plan_enabled:
+            raise ValueError(
+                "NetCDFDataset must be initialized with time_aggregation before "
+                "time-aggregated chunks can be read."
+            )
+        data = self._apply_time_aggregation(
+            data,
+            self.source_time_interval,
+            self.time_aggregation,
+        )
+        if isinstance(data, dict):
+            return {name: block / self.unit_factor for name, block in data.items()}
+        return data / self.unit_factor
+
+    def read_chunk(self, idx: int) -> Union[np.ndarray, Dict[str, np.ndarray]]:
         """
         Reads the chunk at the specified index using the pre-computed plan.
         """
         if idx < 0 or idx >= len(self._plan):
             raise IndexError(f"Chunk index {idx} out of range (0-{len(self._plan)-1})")
 
-        _, ops = self._plan[idx]
+        entry = self._plan[idx]
+        ops = entry[1]
         data = self._read_ops(ops)
-        return data / self.unit_factor
+        return self._finish_read(data)
 
     def close(self) -> None:
         """No persistent open handles are kept; provided for interface completeness."""
 
-    def get_data(self, current_time: Union[datetime, cftime.datetime], chunk_len: int) -> np.ndarray:
+    def get_data(self, current_time: Union[datetime, cftime.datetime], chunk_len: int) -> Union[np.ndarray, Dict[str, np.ndarray]]:
         """Read a contiguous block starting at current_time with minimal NetCDF I/O.
 
         Returns:
@@ -470,9 +605,10 @@ class NetCDFDataset(AbstractDataset):
 
         end_abs = min(start_abs + int(chunk_len), len(self._global_times))
         times = self._global_times[start_abs:end_abs]
-        ops = self._ops_from_times(times)
+        entry = self._build_plan_entry(times)
+        ops = entry[1]
         data = self._read_ops(ops)
-        return data / self.unit_factor
+        return self._finish_read(data)
 
     def _collect_required_keys(self) -> Set[str]:
         """Collect file keys covering [start_date, end_date] stepping by time_interval."""

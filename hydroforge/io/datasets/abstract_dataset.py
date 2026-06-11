@@ -8,7 +8,7 @@ import os
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Iterator, List, Literal, Optional, Tuple, Union
+from typing import Callable, Dict, Iterator, List, Literal, Optional, Tuple, Union
 
 import cftime
 import netCDF4 as nc
@@ -25,6 +25,91 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     Custom abstract class that inherits from PyTorch Dataset.
     Defines a common interface for accessing data with distributed support.
     """
+    supports_time_aggregation = False
+
+    @staticmethod
+    def _validate_time_aggregation(method: Optional[str]) -> Optional[str]:
+        if method is None:
+            return None
+        if method not in ("mean", "max", "min", "sum"):
+            raise ValueError(
+                f"Unsupported time_aggregation={method!r}; "
+                "expected one of: mean, max, min, sum"
+            )
+        return method
+
+    @classmethod
+    def _normalize_time_aggregation(
+        cls,
+        time_aggregation: Optional[Union[str, Dict[str, str]]],
+    ) -> Optional[Union[str, Dict[str, str]]]:
+        if time_aggregation is None:
+            return None
+        if isinstance(time_aggregation, str):
+            return cls._validate_time_aggregation(time_aggregation)
+        if isinstance(time_aggregation, dict):
+            if not time_aggregation:
+                raise ValueError("time_aggregation mapping must not be empty")
+            return {
+                str(name): cls._validate_time_aggregation(method)
+                for name, method in time_aggregation.items()
+            }
+        raise TypeError("time_aggregation must be None, a string, or a dict")
+
+    def _get_time_aggregation_factor(self, source_time_interval: timedelta) -> int:
+        source_seconds = source_time_interval.total_seconds()
+        if source_seconds <= 0:
+            raise ValueError("source_time_interval must be positive")
+        ratio = self.time_interval.total_seconds() / source_seconds
+        factor = int(round(ratio))
+        if factor <= 0 or not np.isclose(ratio, factor, rtol=0.0, atol=1e-9):
+            raise ValueError(
+                "time_interval must be an integer multiple of "
+                f"source_time_interval for time aggregation; got "
+                f"time_interval={self.time_interval}, "
+                f"source_time_interval={source_time_interval}"
+            )
+        return factor
+
+    def _aggregate_time_axis(
+        self,
+        data: np.ndarray,
+        source_time_interval: timedelta,
+        method: str,
+    ) -> np.ndarray:
+        method = self._validate_time_aggregation(method)
+        factor = self._get_time_aggregation_factor(source_time_interval)
+        if data.shape[0] % factor != 0:
+            raise ValueError(
+                f"Cannot aggregate {data.shape[0]} source frames into "
+                f"windows of {factor} frames"
+            )
+        grouped = data.reshape((data.shape[0] // factor, factor) + data.shape[1:])
+        if method == "mean":
+            out = grouped.mean(axis=1)
+        elif method == "max":
+            out = grouped.max(axis=1)
+        elif method == "min":
+            out = grouped.min(axis=1)
+        elif method == "sum":
+            out = grouped.sum(axis=1)
+        else:
+            raise ValueError(f"Unsupported time_aggregation={method!r}")
+        return out.astype(self.out_dtype, copy=False)
+
+    def _apply_time_aggregation(
+        self,
+        data: np.ndarray,
+        source_time_interval: timedelta,
+        time_aggregation: Union[str, Dict[str, str]],
+    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        time_aggregation = self._normalize_time_aggregation(time_aggregation)
+        if isinstance(time_aggregation, str):
+            return self._aggregate_time_axis(data, source_time_interval, time_aggregation)
+        return {
+            name: self._aggregate_time_axis(data, source_time_interval, method)
+            for name, method in time_aggregation.items()
+        }
 
     def _convert_to_calendar(self, dt: Union[datetime, cftime.datetime]) -> Union[datetime, cftime.datetime]:
         if dt is None:
@@ -218,9 +303,9 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
     def shard_forcing(
         self,
-        batch_data: torch.Tensor,
+        batch_data: Union[torch.Tensor, Dict[str, torch.Tensor]],
         local_mapping: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Map grid data to catchments and handle distributed sync.
 
@@ -231,6 +316,12 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         N should match data_size (compressed source grids after build_local_mapping).
         Output shape: (M, C) where M is the product of non-spatial dims, C = number of catchments.
         """
+        if isinstance(batch_data, dict):
+            return {
+                name: self.shard_forcing(block, local_mapping)
+                for name, block in batch_data.items()
+            }
+
         if batch_data.dim() == 3:
             B, T, N = batch_data.shape
             flat = batch_data.reshape(B * T, N)
@@ -523,11 +614,11 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         normalized: bool = False,
         device: str | torch.device = "cpu",
         split_by_year: bool = False,
-        units: str = "m3/s",
-        description: Optional[str] = None,
-        filename: Optional[str] = None,
+        units: Union[str, Dict[str, str]] = "m3/s",
+        description: Optional[Union[str, Dict[str, str]]] = None,
+        filename: Optional[Union[str, Dict[str, str]]] = None,
         chunksizes: Optional[tuple] = None,
-    ) -> Union[Path, List[Path]]:
+    ) -> Union[Path, List[Path], Dict[str, Path], Dict[str, List[Path]]]:
         """
         Export catchment-aggregated data to a NetCDF file readable by MultiRankStatsReader.
 
@@ -561,6 +652,29 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 If None, uses netCDF4 default. Setting (T, 1) optimizes per-station
                 time series reads at the cost of slower writes.
         """
+        if not isinstance(var_name, str):
+            raise TypeError(
+                "var_name must be a string; define time_aggregation when "
+                "constructing the dataset."
+            )
+
+        active_aggregation = getattr(self, "time_aggregation", None)
+
+        if isinstance(active_aggregation, dict):
+            if not self.supports_time_aggregation:
+                raise ValueError(
+                    f"{type(self).__name__} does not support time aggregation."
+                )
+            output_methods = active_aggregation
+            returns_mapping = True
+        else:
+            if active_aggregation is not None and not self.supports_time_aggregation:
+                raise ValueError(
+                    f"{type(self).__name__} does not support time aggregation."
+                )
+            output_methods = {str(var_name): active_aggregation}
+            returns_mapping = False
+
         # Require build_local_mapping() to be called first
         if not hasattr(self, '_desired_catchment_ids') or self._desired_catchment_ids is None:
             raise ValueError(
@@ -577,6 +691,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
         # Prepare device and torch types
         torch_dtype = torch.float32 if dtype == "float32" else torch.float64
+        numpy_dtype = np.float32 if dtype == "float32" else np.float64
         dev = torch.device(device) if not isinstance(device, torch.device) else device
         if dev.type == "cuda" and not torch.cuda.is_available():
             print("CUDA not available; falling back to CPU for export_catchment_data.")
@@ -611,11 +726,28 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         t_mapping_T = t_mapping.t().coalesce()
 
         dtype_nc = "f4" if dtype == "float32" else "f8"
-        file_prefix = filename if filename else var_name
 
-        def _init_nc(path):
+        def _metadata(metadata, name, default):
+            if metadata is None:
+                return default
+            if isinstance(metadata, str):
+                return metadata
+            return metadata.get(name, default)
+
+        def _file_prefix(name):
+            if filename is None:
+                return name
+            if isinstance(filename, str):
+                if len(output_methods) == 1:
+                    return filename
+                return f"{filename}_{name}"
+            return filename.get(name, name)
+
+        def _init_nc(path, name, method):
             ds = nc.Dataset(path, "w", format="NETCDF4")
-            ds.setncattr("title", f"Aggregated catchment data ({var_name})")
+            ds.setncattr("title", f"Aggregated catchment data ({name})")
+            if method is not None:
+                ds.setncattr("time_aggregation", method)
             ds.createDimension("time", None)
             ds.createDimension("saved_points", n_catch)
 
@@ -627,56 +759,91 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             save_coord[:] = catchment_ids
 
             out_var = ds.createVariable(
-                var_name,
+                name,
                 dtype_nc,
                 ("time", "saved_points"),
                 zlib=True,
                 complevel=int(complevel),
                 chunksizes=chunksizes,
             )
-            desc = description if description else f"Catchment-aggregated {var_name} (area-weighted mean)"
+            default_desc = (
+                f"Catchment-aggregated {name} ({method})"
+                if method is not None
+                else f"Catchment-aggregated {name} (area-weighted mean)"
+            )
+            desc = _metadata(description, name, default_desc)
             out_var.setncattr("description", desc)
-            out_var.setncattr("units", units)
+            out_var.setncattr("units", _metadata(units, name, ""))
             return ds, time_var, out_var
 
-        created_files = []
-        ds = None
-        time_var = None
-        out_var = None
+        writers = {}
+        created_files = {name: [] for name in output_methods}
         current_year = None
         write_idx = 0
         total_steps = self.num_main_steps + self.num_spin_up_steps
 
+        def _close_writers():
+            nonlocal writers
+            for ds, _time_var, _out_var in writers.values():
+                ds.close()
+            writers = {}
+
+        def _open_writers(year=None):
+            nonlocal write_idx
+            _close_writers()
+            for name, method in output_methods.items():
+                if year is None:
+                    nc_path = out_dir / f"{_file_prefix(name)}_rank0.nc"
+                else:
+                    nc_path = out_dir / f"{_file_prefix(name)}_rank0_{year}.nc"
+                writers[name] = _init_nc(nc_path, name, method)
+                created_files[name].append(nc_path)
+            write_idx = 0
+
+        pbar = None
         try:
             if not split_by_year:
-                nc_path = out_dir / f"{file_prefix}_rank0.nc"
-                ds, time_var, out_var = _init_nc(nc_path)
-                created_files.append(nc_path)
+                _open_writers()
 
             n_chunks = len(self)
             pbar = tqdm(total=total_steps, desc="Exporting", unit="step")
             for ci in range(n_chunks):
                 base_idx = ci * self.chunk_len
-                block = self.read_chunk(ci)
-                if block.ndim != 2 or block.shape[1] != n_cols:
-                    raise ValueError(
-                        f"Data block shape {tuple(block.shape)} incompatible with mapping columns {n_cols} at chunk {ci}. "
-                        "Please call build_local_mapping() before export_catchment_data()."
-                    )
-                T = int(block.shape[0])
+                read_data = self.read_chunk(ci)
+                if isinstance(read_data, dict):
+                    blocks = read_data
+                    if set(blocks) != set(output_methods):
+                        raise ValueError(
+                            f"read_chunk returned variables {sorted(blocks)}, "
+                            f"but export expected {sorted(output_methods)}"
+                        )
+                else:
+                    if len(output_methods) != 1:
+                        raise ValueError(
+                            "Multiple time aggregations require read_chunk() "
+                            "to return a dict"
+                        )
+                    name = next(iter(output_methods))
+                    blocks = {name: read_data}
 
-                # Move current block to device and compute in batch:
-                # t_mapping_T shape: (n_catch, n_cols) - sparse COO tensor (pre-computed)
-                # block shape: (T, n_cols)
-                # We want: block @ t_mapping -> (T, n_catch)
-                # Since torch.sparse.mm expects (sparse, dense), we compute:
-                # t_mapping_T @ block.T = (n_catch, n_cols) @ (n_cols, T) = (n_catch, T)
-                # Then transpose to get (T, n_catch)
-                block_tensor = torch.as_tensor(
-                    block, dtype=torch_dtype, device=dev
-                )  # shape: (T, n_cols)
-                agg_block = torch.sparse.mm(t_mapping_T, block_tensor.T)  # (n_catch, T)
-                agg_block_np = agg_block.T.contiguous().to("cpu").numpy()  # (T, n_catch)
+                first_block = next(iter(blocks.values()))
+                T = int(first_block.shape[0])
+                mapped_blocks = {}
+                for name, block in blocks.items():
+                    if block.ndim != 2 or block.shape[1] != n_cols:
+                        raise ValueError(
+                            f"Data block shape {tuple(block.shape)} incompatible with "
+                            f"mapping columns {n_cols} at chunk {ci}. "
+                            "Please call build_local_mapping() before "
+                            "export_catchment_data()."
+                        )
+                    if int(block.shape[0]) != T:
+                        raise ValueError("All exported variables must share chunk length")
+
+                    # t_mapping_T @ block.T = (n_catch, n_cols) @ (n_cols, T)
+                    block_tensor = torch.as_tensor(block, dtype=torch_dtype, device=dev)
+                    agg_block = torch.sparse.mm(t_mapping_T, block_tensor.T)
+                    mapped_blocks[name] = agg_block.T.contiguous().to("cpu").numpy()
 
                 # Write each timestep in the block
                 for k in range(T):
@@ -685,26 +852,34 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                     if split_by_year:
                         year = dt_k.year
                         if year != current_year:
-                            if ds:
-                                ds.close()
                             current_year = year
-                            nc_path = out_dir / f"{file_prefix}_rank0_{year}.nc"
-                            ds, time_var, out_var = _init_nc(nc_path)
-                            created_files.append(nc_path)
-                            write_idx = 0
+                            _open_writers(current_year)
 
-                    out_var[write_idx, :] = agg_block_np[k, :].astype(np.float32 if dtype == "float32" else np.float64, copy=False)
-                    time_val = nc.date2num(dt_k, units=time_var.getncattr("units"), calendar=time_var.getncattr("calendar"))
-                    time_var[write_idx] = time_val
+                    for name in output_methods:
+                        _ds, time_var, out_var = writers[name]
+                        out_var[write_idx, :] = mapped_blocks[name][k, :].astype(
+                            numpy_dtype, copy=False
+                        )
+                        time_val = nc.date2num(
+                            dt_k,
+                            units=time_var.getncattr("units"),
+                            calendar=time_var.getncattr("calendar"),
+                        )
+                        time_var[write_idx] = time_val
                     write_idx += 1
                     pbar.update(1)
-
-            pbar.close()
         finally:
-            if ds:
-                ds.close()
+            if pbar is not None:
+                pbar.close()
+            _close_writers()
 
-        return created_files if split_by_year else created_files[0]
+        if returns_mapping:
+            if split_by_year:
+                return created_files
+            return {name: paths[0] for name, paths in created_files.items()}
+
+        only_name = next(iter(output_methods))
+        return created_files[only_name] if split_by_year else created_files[only_name][0]
 
     def generate_mapping_table(
         self,
@@ -951,7 +1126,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         operands = [self, other] if not reverse else [other, self]
         return MixedDataset(operands, operation=operation)
 
-    def __getitem__(self, idx: int) -> np.ndarray:
+    def __getitem__(self, idx: int) -> Union[np.ndarray, Dict[str, np.ndarray]]:
         """
         Fetch one chunk (T <= chunk_len) starting at chunk index `idx`.
 
@@ -966,6 +1141,13 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
         compressed = self._local_indices is not None
         data = self.read_chunk(idx)
+
+        if isinstance(data, dict):
+            return {name: self._pad_chunk_array(block, compressed) for name, block in data.items()}
+
+        return self._pad_chunk_array(data, compressed)
+
+    def _pad_chunk_array(self, data: np.ndarray, compressed: bool) -> np.ndarray:
 
         if compressed:
             # Expect (T, N)
