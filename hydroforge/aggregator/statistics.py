@@ -220,13 +220,48 @@ class StatisticsMixin:
             else:
                 raise ValueError(f"Variable '{var_name}' not registered. Call register_tensor() first.")
 
-            target_dtype = tensor.dtype if tensor is not None else torch.float32
-
             tensor_shape = json_schema_extra.get('tensor_shape', ())
             save_idx = json_schema_extra.get('save_idx')
             description = getattr(field_info, 'description', f"Variable {var_name}")
             save_coord = json_schema_extra.get('save_coord')
             dim_coords = json_schema_extra.get('dim_coords')
+            target_dtype = tensor.dtype if tensor is not None else torch.float32
+
+            def infer_virtual_dtype(expr: str, seen: Set[str] | None = None) -> torch.dtype | None:
+                if seen is None:
+                    seen = set()
+                scatter = parse_scatter_expr(expr)
+                if scatter:
+                    tokens = set(scatter.value_tokens)
+                else:
+                    from hydroforge.aggregator.scatter_expr import \
+                        extract_tokens as _et
+                    tokens = set(_et(expr))
+
+                inferred = None
+                for token in tokens:
+                    if token in self._tensor_registry:
+                        dep_dtype = self._tensor_registry[token].dtype
+                    elif token in self._field_registry and token not in seen:
+                        info = self._field_registry[token]
+                        extra = getattr(info, 'json_schema_extra', {}) or {}
+                        if extra.get('category') != 'virtual' or not extra.get('expr'):
+                            continue
+                        seen.add(token)
+                        dep_dtype = infer_virtual_dtype(extra['expr'], seen)
+                    else:
+                        continue
+
+                    if dep_dtype is None or not dep_dtype.is_floating_point:
+                        continue
+                    inferred = dep_dtype if inferred is None else torch.promote_types(
+                        inferred, dep_dtype)
+                return inferred
+
+            if tensor is None and is_virtual:
+                inferred_dtype = infer_virtual_dtype(json_schema_extra.get('expr', ''))
+                if inferred_dtype is not None:
+                    target_dtype = inferred_dtype
 
             if not save_idx:
                 raise ValueError(f"Variable '{var_name}' must have save_idx in json_schema_extra")
