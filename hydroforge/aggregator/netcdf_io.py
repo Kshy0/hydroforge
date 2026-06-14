@@ -187,7 +187,31 @@ def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]
             # Create spatial/vertical dimensions based on actual shape
             dim_names = ['time']  # Always start with time
 
-            if num_trials > 1:
+            if metadata.get('full_output'):
+                actual_shape_tuple = tuple(int(v) for v in actual_shape)
+                if num_trials > 1 and actual_shape_tuple and actual_shape_tuple[0] == num_trials:
+                    dim_names.append('trial')
+                    ncfile.createDimension('trial', num_trials)
+                    data_shape = actual_shape_tuple[1:]
+                else:
+                    data_shape = actual_shape_tuple
+
+                logical_dims = list(tensor_shape or ())
+                if len(logical_dims) == len(actual_shape_tuple):
+                    logical_dims = logical_dims[-len(data_shape):]
+                elif len(logical_dims) != len(data_shape):
+                    logical_dims = [f"dim_{i}" for i in range(len(data_shape))]
+
+                used_dims = set(dim_names)
+                for i, (dim_name, dim_size) in enumerate(zip(logical_dims, data_shape)):
+                    nc_dim = sanitize_symbol(str(dim_name)) or f"dim_{i}"
+                    if nc_dim in used_dims:
+                        nc_dim = f"{nc_dim}_{i}"
+                    used_dims.add(nc_dim)
+                    dim_names.append(nc_dim)
+                    ncfile.createDimension(nc_dim, int(dim_size))
+
+            elif num_trials > 1:
                 dim_names.append('trial')
                 ncfile.createDimension('trial', num_trials)
 
@@ -244,13 +268,17 @@ def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]
             time_var.setncattr('calendar', calendar)
 
             # Create single data variable
+            var_chunksizes = chunksizes
+            if var_chunksizes is not None and len(var_chunksizes) != len(dim_names):
+                var_chunksizes = None
+
             nc_var = ncfile.createVariable(
                 file_safe_name,
                 dtype,
                 dim_names,
                 zlib=True,
                 complevel=complevel,
-                chunksizes=chunksizes)
+                chunksizes=var_chunksizes)
             desc = metadata.get("description", "") + description_suffix
             nc_var.setncattr('description', desc)
             nc_var.setncattr('actual_shape', str(actual_shape))
@@ -334,11 +362,16 @@ class NetCDFIOMixin:
         # Compute the adaptive batch size from the first registered output
         first_meta = next(iter(self._metadata.values()), {})
         actual_shape = first_meta.get('actual_shape', (1,))
-        # saved_points is the first spatial dim (or second if trials present)
-        sp = actual_shape[1] if self.num_trials > 1 and len(actual_shape) > 1 else actual_shape[0] if actual_shape else 1
+        if first_meta.get('full_output'):
+            sp = int(np.prod(actual_shape)) if actual_shape else 1
+            size_label = "elements"
+        else:
+            # saved_points is the first spatial dim (or second if trials present)
+            sp = actual_shape[1] if self.num_trials > 1 and len(actual_shape) > 1 else actual_shape[0] if actual_shape else 1
+            size_label = "saved_points"
         dtype_bytes = np.dtype(first_meta.get('dtype', 'f4')).itemsize
         self._write_batch_size = compute_write_batch_size(sp, dtype_bytes)
-        print(f"  Write batch size: {self._write_batch_size} steps (saved_points={sp:,})")
+        print(f"  Write batch size: {self._write_batch_size} steps ({size_label}={sp:,})")
 
 
     def _flush_write_buffer(self: StatisticsAggregator, key: str) -> None:
@@ -461,9 +494,11 @@ class NetCDFIOMixin:
                 f"Compound statistics {compound_ops} are configured but "
                 f"stat_is_outer_first / stat_is_outer_last flags have never "
                 f"been set to True. These outputs will never be written. "
-                f"Set stat_is_outer_first=True at the start of each outer "
-                f"window (e.g. Jan 1) and stat_is_outer_last=True at the "
-                f"end (e.g. Dec 31) in step_advance()."
+                f"For compound ops, set stat_is_outer_first=True on the "
+                f"first inner statistics window that belongs to the outer "
+                f"period, and stat_is_outer_last=True on the inner window "
+                f"that closes that period (e.g. first and last save windows "
+                f"of a year)."
             )
 
         # Record this time step for argmax/argmin index-to-time conversion

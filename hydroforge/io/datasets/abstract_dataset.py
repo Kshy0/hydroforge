@@ -134,6 +134,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         spin_up_end_date: Optional[Union[datetime, cftime.datetime]] = None,
         calendar: str = "standard",
         clip_negative: bool = False,
+        skip_nan: bool = True,
         *args,
         **kwargs,
     ):
@@ -148,6 +149,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self.time_interval = time_interval
         self.calendar = calendar
         self.clip_negative = clip_negative
+        self.skip_nan = skip_nan
 
         # Local grid indices for spatial compression (set by build_local_mapping)
         self._local_indices: Optional[np.ndarray] = None
@@ -157,6 +159,39 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self.end_date = self._convert_to_calendar(end_date)
         self.spin_up_start_date = self._convert_to_calendar(spin_up_start_date)
         self.spin_up_end_date = self._convert_to_calendar(spin_up_end_date)
+
+    @staticmethod
+    def _as_nan_array(data: np.ndarray) -> np.ndarray:
+        """Convert NetCDF masked values to NaN while preserving normal values."""
+        if isinstance(data, np.ma.MaskedArray):
+            mask = np.ma.getmaskarray(data)
+            if np.any(mask):
+                if np.issubdtype(data.dtype, np.floating):
+                    return np.asarray(data.filled(np.nan))
+                return np.asarray(data.astype(np.float64).filled(np.nan))
+            return np.asarray(data.data)
+        return np.asarray(data)
+
+    def _apply_value_policy(self, data: np.ndarray) -> np.ndarray:
+        """Convert masked values, optionally zero NaNs, and optionally clip negatives."""
+        arr = self._as_nan_array(data)
+
+        if self.skip_nan and np.issubdtype(arr.dtype, np.floating):
+            nan_mask = np.isnan(arr)
+            if np.any(nan_mask):
+                if not arr.flags.writeable:
+                    arr = arr.copy()
+                arr[nan_mask] = 0.0
+
+        if self.clip_negative:
+            if not arr.flags.writeable:
+                arr = arr.copy()
+            np.maximum(arr, 0, out=arr)
+        return arr
+
+    def _get_first_frame_nan_mask(self) -> Optional[np.ndarray]:
+        """Return a flat full-grid NaN mask for skip_nan mapping, if supported."""
+        return None
 
     def update_calendar(self, calendar: str):
         """
@@ -331,6 +366,11 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         else:
             raise ValueError(f"batch_data must be 3D or 4D, got shape {tuple(batch_data.shape)}")
 
+        if self.skip_nan and flat.is_floating_point():
+            flat = torch.where(torch.isnan(flat), torch.zeros_like(flat), flat)
+        if self.clip_negative:
+            flat = torch.clamp_min(flat, 0)
+
         out = (flat @ local_mapping).contiguous()
 
         # If input was 4D (B, T, K, N), reshape output to (B*T, K, C)
@@ -446,12 +486,66 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         # Extract submatrix for desired catchments only
         submatrix = full_sparse_matrix[desired_row_indices, :]
 
+        initial_col_sums = np.array(submatrix.sum(axis=0)).flatten()
+        initial_non_zero_cols = np.where(initial_col_sums != 0)[0].astype(np.int64)
+
+        if len(initial_non_zero_cols) == 0:
+            raise ValueError("No non-zero grid data found for the desired catchments.")
+
+        if self.skip_nan:
+            nan_mask = self._get_first_frame_nan_mask()
+            if nan_mask is None:
+                raise NotImplementedError(
+                    f"{type(self).__name__} does not support skip_nan mapping."
+                )
+            nan_mask = np.asarray(nan_mask, dtype=bool).reshape(-1)
+            if nan_mask.size != full_grid_size:
+                raise ValueError(
+                    f"skip_nan mask size ({nan_mask.size}) != full grid size "
+                    f"({full_grid_size})"
+                )
+
+            active_nan_cols = initial_non_zero_cols[nan_mask[initial_non_zero_cols]]
+            if active_nan_cols.size:
+                original_row_sums = np.asarray(submatrix.sum(axis=1)).ravel()
+                coo = submatrix.tocoo()
+                keep = ~nan_mask[coo.col]
+                submatrix = csr_matrix(
+                    (coo.data[keep], (coo.row[keep], coo.col[keep])),
+                    shape=submatrix.shape,
+                )
+                valid_row_sums = np.asarray(submatrix.sum(axis=1)).ravel()
+
+                scale = np.ones_like(original_row_sums, dtype=np.float64)
+                can_scale = (original_row_sums > 0) & (valid_row_sums > 0)
+                scale[can_scale] = original_row_sums[can_scale] / valid_row_sums[can_scale]
+                submatrix = submatrix.multiply(scale[:, None]).tocsr()
+
+                empty_rows = np.where((original_row_sums > 0) & (valid_row_sums <= 0))[0]
+                if is_rank_zero():
+                    print(
+                        f"[AbstractDataset] skip_nan removed {active_nan_cols.size} "
+                        "active source grids with NaN in the first frame."
+                    )
+                    if empty_rows.size:
+                        print(
+                            f"[AbstractDataset] Warning: {empty_rows.size} catchments "
+                            "have no valid source grids after skip_nan masking; "
+                            "their mapped values will be zero."
+                        )
+
         # Remove columns that are all zeros to optimize memory
         col_sums = np.array(submatrix.sum(axis=0)).flatten()
         non_zero_cols = np.where(col_sums != 0)[0].astype(np.int64)
 
         if len(non_zero_cols) == 0:
-            raise ValueError("No non-zero grid data found for the desired catchments.")
+            if not self.skip_nan:
+                raise ValueError("No non-zero grid data found for the desired catchments.")
+            if is_rank_zero():
+                print(
+                    "[AbstractDataset] Warning: no valid source grids remain "
+                    "after skip_nan masking; mapped values will be zero."
+                )
 
         # Store the local grid indices for use in __getitem__
         self._local_indices = non_zero_cols
@@ -1172,10 +1266,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 pad = np.zeros((self.chunk_len - T, ny, nx), dtype=self.out_dtype)
                 data = np.vstack([data, pad]) if data.size else pad
 
-        # Clip negative values to zero if enabled
-        if self.clip_negative:
-            np.maximum(data, 0, out=data)
-
+        data = self._apply_value_policy(data)
         return np.ascontiguousarray(data)
 
     def __len__(self) -> int:
@@ -1259,6 +1350,7 @@ class MixedDataset(AbstractDataset):
             spin_up_end_date=base.spin_up_end_date,
             calendar=base.calendar,
             clip_negative=base.clip_negative,
+            skip_nan=base.skip_nan,
         )
         self.operation = operation
 

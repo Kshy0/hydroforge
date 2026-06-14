@@ -26,6 +26,7 @@ _FLOAT_DTYPES = {
     torch.float64: ("double", "at::kDouble"),
 }
 _INT_DTYPES = {
+    torch.bool: ("bool", "at::kBool"),
     torch.int32: ("int32_t", "at::kInt"),
     torch.int64: ("int64_t", "at::kLong"),
 }
@@ -117,6 +118,42 @@ class _CExpression:
                 return f"(-{val})"
             if isinstance(node.op, ast.UAdd):
                 return val
+            if isinstance(node.op, ast.Not):
+                return f"((!({val})) ? 1.0 : 0.0)"
+        if isinstance(node, ast.BoolOp):
+            op = "&&" if isinstance(node.op, ast.And) else "||"
+            vals = [f"({self.visit(v)})" for v in node.values]
+            joined = f" {op} ".join(vals)
+            return f"(({joined}) ? 1.0 : 0.0)"
+        if isinstance(node, ast.Compare):
+            parts = []
+            left = self.visit(node.left)
+            for op, comparator in zip(node.ops, node.comparators):
+                right = self.visit(comparator)
+                if isinstance(op, ast.Lt):
+                    cmp_op = "<"
+                elif isinstance(op, ast.LtE):
+                    cmp_op = "<="
+                elif isinstance(op, ast.Gt):
+                    cmp_op = ">"
+                elif isinstance(op, ast.GtE):
+                    cmp_op = ">="
+                elif isinstance(op, ast.Eq):
+                    cmp_op = "=="
+                elif isinstance(op, ast.NotEq):
+                    cmp_op = "!="
+                else:
+                    raise ValueError(
+                        f"unsupported comparison operator: {op.__class__.__name__}",
+                    )
+                parts.append(f"({left} {cmp_op} {right})")
+                left = right
+            return f"(({' && '.join(parts)}) ? 1.0 : 0.0)"
+        if isinstance(node, ast.IfExp):
+            cond = self.visit(node.test)
+            body = self.visit(node.body)
+            other = self.visit(node.orelse)
+            return f"(({cond}) ? ({body}) : ({other}))"
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
             return repr(float(node.value))
         if isinstance(node, ast.Name):
@@ -132,6 +169,13 @@ class _CExpression:
             raise ValueError(f"unknown expression token '{token}'")
         if isinstance(node, ast.Call):
             func = self._call_name(node.func)
+            if func == "where":
+                if len(node.args) != 3:
+                    raise ValueError("where(cond, x, y) expects exactly three arguments")
+                cond = self.visit(node.args[0])
+                body = self.visit(node.args[1])
+                other = self.visit(node.args[2])
+                return f"(({cond}) ? ({body}) : ({other}))"
             if func not in self._funcs:
                 raise ValueError(f"unsupported expression function '{func}'")
             args = ", ".join(self.visit(arg) for arg in node.args)
@@ -333,15 +377,23 @@ class CudaCodegenMixin:
 
         groups = []
         for save_idx, var_list in grouped_by_save_idx.items():
-            add_tensor_param(save_idx, const=True)
+            full_output = save_idx == "__full__"
+            if not full_output:
+                add_tensor_param(save_idx, const=True)
             group_vars = []
             max_levels = 1
+            full_total = 0
             for var in var_list:
                 field_info = self._field_registry[var]
                 extra = getattr(field_info, "json_schema_extra", {})
-                is_2d = _tensor_ndim_for_aggregation(self.num_trials, tensor_info[var]["actual_ndim"]) == 2
+                is_2d = (
+                    not full_output
+                    and _tensor_ndim_for_aggregation(self.num_trials, tensor_info[var]["actual_ndim"]) == 2
+                )
                 n_levels = int(tensor_info[var]["actual_shape"][-1]) if is_2d else 1
                 max_levels = max(max_levels, n_levels)
+                var_numel = int(self._tensor_registry[var].numel()) if full_output else 0
+                full_total = max(full_total, var_numel)
                 self._add_value_params(var, add_tensor_param)
 
                 ops = []
@@ -396,6 +448,7 @@ class CudaCodegenMixin:
                         "ops": ops,
                         "inner_ops": inner_ops,
                         "inner_states": inner_states,
+                        "numel": var_numel,
                     }
                 )
 
@@ -411,6 +464,7 @@ class CudaCodegenMixin:
                         for v in group_vars
                     ],
                     "num_trials": self.num_trials,
+                    "full_output": full_output,
                 },
                 sort_keys=True,
             )
@@ -421,6 +475,8 @@ class CudaCodegenMixin:
                     "vars": group_vars,
                     "max_levels": max_levels,
                     "num_trials": int(self.num_trials),
+                    "full_output": full_output,
+                    "full_total": full_total,
                 }
             )
 
@@ -681,6 +737,9 @@ class CudaCodegenMixin:
         return list(dict.fromkeys(keys))
 
     def _generate_group_kernel(self: StatisticsAggregator, group: Dict[str, Any]) -> List[str]:
+        if group.get("full_output"):
+            return self._generate_full_group_kernel(group)
+
         params = [f"const {self._state_ctype(group['save_idx'])[0]}* p_{_c_ident(group['save_idx'])}"]
         for var in group["vars"]:
             for key in self._collect_value_param_keys(var["name"]):
@@ -750,6 +809,68 @@ class CudaCodegenMixin:
                 ctype=var["ctype"],
             )
             lines.append(f"        {var['ctype']} val = {val};")
+            lines.extend(self._generate_inner_updates(var))
+            for op in var["ops"]:
+                lines.extend(self._generate_op_update(var, op))
+            lines.append("    }")
+            lines.append("")
+        lines.append("}")
+        return lines
+
+    def _generate_full_group_kernel(self: StatisticsAggregator, group: Dict[str, Any]) -> List[str]:
+        params = []
+        for var in group["vars"]:
+            for key in self._collect_value_param_keys(var["name"]):
+                ctype, _ = self._state_ctype(key)
+                params.append(f"const {ctype}* p_{_c_ident(key)}")
+            for op in var["ops"]:
+                out_ctype, _ = self._state_ctype(op["out_key"])
+                params.append(f"{out_ctype}* p_{_c_ident(op['out_key'])}")
+                if op["aux_key"]:
+                    aux_ctype, _ = self._state_ctype(op["aux_key"])
+                    params.append(f"{aux_ctype}* p_{_c_ident(op['aux_key'])}")
+            for state in var["inner_states"].values():
+                ctype, _ = self._state_ctype(state["state_key"])
+                params.append(f"{ctype}* p_{_c_ident(state['state_key'])}")
+                if "weight_key" in state:
+                    wc, _ = self._state_ctype(state["weight_key"])
+                    params.append(f"{wc}* p_{_c_ident(state['weight_key'])}")
+        for key, (ctype, _) in _SCALAR_TYPES.items():
+            params.append(f"const {ctype}* p_{_c_ident(key)}")
+        params.append("long n_elements")
+        params = list(dict.fromkeys(params))
+
+        lines = [f"__global__ void {group['kernel_name']}("]
+        for i, param in enumerate(params):
+            comma = "," if i < len(params) - 1 else ""
+            lines.append(f"    {param}{comma}")
+        lines.extend(
+            [
+                ") {",
+                "    long linear = blockIdx.x * blockDim.x + threadIdx.x;",
+                "    if (linear >= n_elements) return;",
+                "    float weight = p___weight[0];",
+                "    float total_weight = p___total_weight[0];",
+                "    float num_macro_steps = p___num_macro_steps[0];",
+                "    int32_t sub_step = p___sub_step[0];",
+                "    int32_t num_sub_steps = p___num_sub_steps[0];",
+                "    int32_t flags = p___flags[0];",
+                "    int32_t macro_step_index = p___macro_step_index[0];",
+                "    bool is_inner_first = ((flags & 1) != 0) && (sub_step == 0);",
+                "    bool is_inner_last = (((flags >> 1) & 1) != 0) && (sub_step == num_sub_steps - 1);",
+                "    bool is_middle = sub_step == (num_sub_steps / 2);",
+                "    bool is_outer_first = (((flags >> 2) & 1) != 0) && is_inner_last;",
+                "    bool is_outer_last = (((flags >> 3) & 1) != 0) && is_inner_last;",
+                "",
+            ]
+        )
+
+        for var in group["vars"]:
+            lines.append(f"    if (linear < {var['numel']}) {{")
+            lines.append("        long out_off = linear;")
+            ctype = var["ctype"]
+            name_ident = _c_ident(var["name"])
+            lines.append(f"        {ctype} val = static_cast<{ctype}>(p_{name_ident}[linear]);")
             lines.extend(self._generate_inner_updates(var))
             for op in var["ops"]:
                 lines.extend(self._generate_op_update(var, op))
@@ -1023,7 +1144,7 @@ class CudaCodegenMixin:
                     ]
                 )
         for group in specs["groups"]:
-            args = [f"p_{_c_ident(group['save_idx'])}"]
+            args = [] if group.get("full_output") else [f"p_{_c_ident(group['save_idx'])}"]
             for var in group["vars"]:
                 for key in self._collect_value_param_keys(var["name"]):
                     args.append(f"p_{_c_ident(key)}")
@@ -1038,16 +1159,28 @@ class CudaCodegenMixin:
             for key in _SCALAR_TYPES:
                 args.append(f"p_{_c_ident(key)}")
             args = list(dict.fromkeys(args))
-            args.extend([f"t_{_c_ident(group['save_idx'])}.numel()", str(group["num_trials"])])
-            lines.extend(
-                [
-                    f"    {{",
-                    f"        long total = t_{_c_ident(group['save_idx'])}.numel() * {group['num_trials']} * {group['max_levels']};",
-                    f"        int blocks = static_cast<int>((total + threads - 1) / threads);",
-                    f"        if (blocks > 0) {group['kernel_name']}<<<blocks, threads, 0, stream>>>({', '.join(args)});",
-                    f"    }}",
-                ]
-            )
+            if group.get("full_output"):
+                args.append(str(group["full_total"]))
+                lines.extend(
+                    [
+                        f"    {{",
+                        f"        long total = {group['full_total']};",
+                        f"        int blocks = static_cast<int>((total + threads - 1) / threads);",
+                        f"        if (blocks > 0) {group['kernel_name']}<<<blocks, threads, 0, stream>>>({', '.join(args)});",
+                        f"    }}",
+                    ]
+                )
+            else:
+                args.extend([f"t_{_c_ident(group['save_idx'])}.numel()", str(group["num_trials"])])
+                lines.extend(
+                    [
+                        f"    {{",
+                        f"        long total = t_{_c_ident(group['save_idx'])}.numel() * {group['num_trials']} * {group['max_levels']};",
+                        f"        int blocks = static_cast<int>((total + threads - 1) / threads);",
+                        f"        if (blocks > 0) {group['kernel_name']}<<<blocks, threads, 0, stream>>>({', '.join(args)});",
+                        f"    }}",
+                    ]
+                )
         lines.append("}")
         return lines
 

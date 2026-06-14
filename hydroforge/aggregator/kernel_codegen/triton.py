@@ -1774,6 +1774,218 @@ class TritonCodegenMixin:
         kernel_code_lines.append("")
 
 
+    def _generate_full_kernel_for_group(self: StatisticsAggregator, kernel_code_lines: List[str],
+                                        save_idx: str, var_list: List[str],
+                                        tensor_info: Dict[str, Dict[str, Any]]) -> None:
+        """Generate a flat Triton kernel for variables saved at full tensor shape."""
+        kernel_name = f"kernel_{save_idx}"
+        kernel_code_lines.extend([
+            f"# Full-output kernel: {save_idx}",
+            f"# Variables: {', '.join(var_list)}",
+            "",
+            "@triton.jit",
+            f"def {kernel_name}(",
+        ])
+
+        for var in var_list:
+            safe_var = self._get_safe_name(var)
+            kernel_code_lines.append(f"    {safe_var}_ptr,")
+            for op in self._variable_ops[var]:
+                kernel_code_lines.append(f"    {safe_var}_{op}_ptr,")
+            added_inner = set()
+            for op in self._variable_ops[var]:
+                if "_" not in op:
+                    continue
+                inner = op.split("_")[1]
+                if inner in added_inner or inner == "last":
+                    continue
+                kernel_code_lines.append(f"    {safe_var}_{inner}_inner_state_ptr,")
+                if inner == "mean":
+                    kernel_code_lines.append(f"    {safe_var}_{inner}_weight_state_ptr,")
+                added_inner.add(inner)
+
+        kernel_code_lines.extend([
+            "    weight_ptr,",
+            "    total_weight_ptr,",
+            "    num_macro_steps_ptr,",
+            "    sub_step_ptr,",
+            "    num_sub_steps_ptr,",
+            "    flags_ptr,",
+            "    macro_step_index_ptr,",
+            "    n_elements: tl.constexpr,",
+            "    BLOCK_SIZE: tl.constexpr,",
+            "):",
+            "    pid = tl.program_id(0)",
+            "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
+            "    mask = offs < n_elements",
+            "",
+            "    weight = tl.load(weight_ptr)",
+            "    total_weight = tl.load(total_weight_ptr)",
+            "    num_macro_steps = tl.load(num_macro_steps_ptr)",
+            "    sub_step = tl.load(sub_step_ptr).to(tl.int32)",
+            "    num_sub_steps = tl.load(num_sub_steps_ptr).to(tl.int32)",
+            "    flags = tl.load(flags_ptr).to(tl.int32)",
+            "    macro_step_index = tl.load(macro_step_index_ptr).to(tl.int32)",
+            "    is_inner_first = ((flags & 1) != 0) & (sub_step == 0)",
+            "    is_inner_last = (((flags >> 1) & 1) != 0) & (sub_step == num_sub_steps - 1)",
+            "    is_middle = sub_step == num_sub_steps // 2",
+            "    is_outer_first = (((flags >> 2) & 1) != 0) & is_inner_last",
+            "    is_outer_last = (((flags >> 3) & 1) != 0) & is_inner_last",
+            "",
+        ])
+
+        I = "    "
+        I2 = "        "
+        for var in var_list:
+            safe_var = self._get_safe_name(var)
+            var_numel = int(self._tensor_registry[var].numel())
+            kernel_code_lines.extend([
+                f"{I}# === full tensor variable: {var} ===",
+                f"{I}var_mask = offs < {var_numel}",
+                f"{I}{safe_var}_val = tl.load({safe_var}_ptr + offs, mask=var_mask, other=0.0)",
+            ])
+
+            for op in self._variable_ops[var]:
+                out_ptr = f"{safe_var}_{op}_ptr + offs"
+                op_parts = op.split("_")
+
+                if len(op_parts) > 1:
+                    outer, inner = op_parts[0], op_parts[1]
+                    val_for = f"{safe_var}_{inner}_val"
+                    if inner == "last":
+                        kernel_code_lines.append(f"{I}{val_for} = {safe_var}_val")
+                    elif inner == "mean":
+                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + offs"
+                        weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + offs"
+                        kernel_code_lines.extend([
+                            f"{I}inner_old = tl.load({inner_ptr}, mask=var_mask, other=0.0)",
+                            f"{I}weight_old = tl.load({weight_ptr}, mask=var_mask, other=0.0)",
+                            f"{I}inner_new = inner_old + {safe_var}_val * weight",
+                            f"{I}weight_new = weight_old + weight",
+                            f"{I}{val_for} = inner_new / weight_new",
+                            f"{I}if is_inner_last:",
+                            f"{I2}tl.store({inner_ptr}, 0.0, mask=var_mask)",
+                            f"{I2}tl.store({weight_ptr}, 0.0, mask=var_mask)",
+                            f"{I}else:",
+                            f"{I2}tl.store({inner_ptr}, inner_new, mask=var_mask)",
+                            f"{I2}tl.store({weight_ptr}, weight_new, mask=var_mask)",
+                        ])
+                    elif inner == "sum":
+                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + offs"
+                        kernel_code_lines.extend([
+                            f"{I}inner_old = tl.load({inner_ptr}, mask=var_mask, other=0.0)",
+                            f"{I}inner_new = inner_old + {safe_var}_val * weight",
+                            f"{I}{val_for} = inner_new",
+                            f"{I}if is_inner_last:",
+                            f"{I2}tl.store({inner_ptr}, 0.0, mask=var_mask)",
+                            f"{I}else:",
+                            f"{I2}tl.store({inner_ptr}, inner_new, mask=var_mask)",
+                        ])
+                    elif inner == "max":
+                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + offs"
+                        kernel_code_lines.extend([
+                            f"{I}inner_old = tl.load({inner_ptr}, mask=var_mask, other={safe_var}_val)",
+                            f"{I}inner_new = tl.where(is_inner_first, {safe_var}_val, tl.maximum(inner_old, {safe_var}_val))",
+                            f"{I}{val_for} = inner_new",
+                            f"{I}if is_inner_last:",
+                            f"{I2}tl.store({inner_ptr}, -float('inf'), mask=var_mask)",
+                            f"{I}else:",
+                            f"{I2}tl.store({inner_ptr}, inner_new, mask=var_mask)",
+                        ])
+                    elif inner == "min":
+                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + offs"
+                        kernel_code_lines.extend([
+                            f"{I}inner_old = tl.load({inner_ptr}, mask=var_mask, other={safe_var}_val)",
+                            f"{I}inner_new = tl.where(is_inner_first, {safe_var}_val, tl.minimum(inner_old, {safe_var}_val))",
+                            f"{I}{val_for} = inner_new",
+                            f"{I}if is_inner_last:",
+                            f"{I2}tl.store({inner_ptr}, float('inf'), mask=var_mask)",
+                            f"{I}else:",
+                            f"{I2}tl.store({inner_ptr}, inner_new, mask=var_mask)",
+                        ])
+                    elif inner in ("first", "mid"):
+                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + offs"
+                        cond = "is_inner_first" if inner == "first" else "is_middle"
+                        kernel_code_lines.extend([
+                            f"{I}if {cond}:",
+                            f"{I2}tl.store({inner_ptr}, {safe_var}_val, mask=var_mask)",
+                            f"{I}{val_for} = tl.load({inner_ptr}, mask=var_mask, other=0.0)",
+                        ])
+                    else:
+                        raise ValueError(f"Unsupported full-output inner op '{inner}'.")
+
+                    kernel_code_lines.append(f"{I}if is_inner_last:")
+                    if outer == "max":
+                        kernel_code_lines.extend([
+                            f"{I2}old = tl.load({out_ptr}, mask=var_mask, other={val_for})",
+                            f"{I2}new = tl.where(is_outer_first, {val_for}, tl.maximum(old, {val_for}))",
+                            f"{I2}tl.store({out_ptr}, new, mask=var_mask)",
+                        ])
+                    elif outer == "min":
+                        kernel_code_lines.extend([
+                            f"{I2}old = tl.load({out_ptr}, mask=var_mask, other={val_for})",
+                            f"{I2}new = tl.where(is_outer_first, {val_for}, tl.minimum(old, {val_for}))",
+                            f"{I2}tl.store({out_ptr}, new, mask=var_mask)",
+                        ])
+                    elif outer == "sum":
+                        kernel_code_lines.extend([
+                            f"{I2}old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
+                            f"{I2}new = tl.where(is_outer_first, {val_for}, old + {val_for})",
+                            f"{I2}tl.store({out_ptr}, new, mask=var_mask)",
+                        ])
+                    elif outer == "mean":
+                        kernel_code_lines.extend([
+                            f"{I2}old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
+                            f"{I2}accum = tl.where(is_outer_first, {val_for}, old + {val_for})",
+                            f"{I2}new = tl.where(is_outer_last, accum / num_macro_steps, accum)",
+                            f"{I2}tl.store({out_ptr}, new, mask=var_mask)",
+                        ])
+                    elif outer == "last":
+                        kernel_code_lines.append(f"{I2}tl.store({out_ptr}, {val_for}, mask=var_mask)")
+                    elif outer == "first":
+                        kernel_code_lines.append(f"{I2}tl.store({out_ptr}, {val_for}, mask=var_mask & is_outer_first)")
+                    else:
+                        raise ValueError(f"Unsupported full-output outer op '{outer}'.")
+                    kernel_code_lines.append("")
+                    continue
+
+                if op == "mean":
+                    kernel_code_lines.extend([
+                        f"{I}old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
+                        f"{I}accum = tl.where(is_inner_first, 0.0, old) + {safe_var}_val * weight",
+                        f"{I}new = tl.where(is_inner_last, accum / total_weight, accum)",
+                        f"{I}tl.store({out_ptr}, new, mask=var_mask)",
+                    ])
+                elif op == "sum":
+                    kernel_code_lines.extend([
+                        f"{I}old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
+                        f"{I}new = tl.where(is_inner_first, 0.0, old) + {safe_var}_val * weight",
+                        f"{I}tl.store({out_ptr}, new, mask=var_mask)",
+                    ])
+                elif op == "max":
+                    kernel_code_lines.extend([
+                        f"{I}old = tl.load({out_ptr}, mask=var_mask, other={safe_var}_val)",
+                        f"{I}new = tl.where(is_inner_first, {safe_var}_val, tl.maximum(old, {safe_var}_val))",
+                        f"{I}tl.store({out_ptr}, new, mask=var_mask)",
+                    ])
+                elif op == "min":
+                    kernel_code_lines.extend([
+                        f"{I}old = tl.load({out_ptr}, mask=var_mask, other={safe_var}_val)",
+                        f"{I}new = tl.where(is_inner_first, {safe_var}_val, tl.minimum(old, {safe_var}_val))",
+                        f"{I}tl.store({out_ptr}, new, mask=var_mask)",
+                    ])
+                elif op == "last":
+                    kernel_code_lines.append(f"{I}tl.store({out_ptr}, {safe_var}_val, mask=var_mask & is_inner_last)")
+                elif op == "first":
+                    kernel_code_lines.append(f"{I}tl.store({out_ptr}, {safe_var}_val, mask=var_mask & is_inner_first)")
+                elif op == "mid":
+                    kernel_code_lines.append(f"{I}tl.store({out_ptr}, {safe_var}_val, mask=var_mask & is_middle)")
+                else:
+                    raise ValueError(f"Unsupported full-output op '{op}'.")
+                kernel_code_lines.append("")
+        kernel_code_lines.append("")
+
+
 
     def _generate_main_function(self: StatisticsAggregator, kernel_code_lines: List[str],
                                 grouped_by_save_idx: Dict[str, List[str]],
@@ -1791,6 +2003,45 @@ class TritonCodegenMixin:
 
         for save_idx, var_list in grouped_by_save_idx.items():
             kernel_name = f"kernel_{save_idx}"
+
+            if save_idx == "__full__":
+                full_len = max(int(self._tensor_registry[var].numel()) for var in var_list)
+                kernel_code_lines.extend([
+                    f"    # Launch full-output kernel",
+                    f"    full_len = {full_len}",
+                    f"    grid___full__ = lambda meta: (triton.cdiv(full_len, meta['BLOCK_SIZE']),)",
+                    f"    {kernel_name}[grid___full__](",
+                ])
+                for var in var_list:
+                    safe_var = self._get_safe_name(var)
+                    kernel_code_lines.append(f"        {safe_var}_ptr=states['{var}'],")
+                    for op in self._variable_ops[var]:
+                        kernel_code_lines.append(f"        {safe_var}_{op}_ptr=states['{var}_{op}'],")
+                    added_inner = set()
+                    for op in self._variable_ops[var]:
+                        if "_" not in op:
+                            continue
+                        inner = op.split("_")[1]
+                        if inner in added_inner or inner == "last":
+                            continue
+                        kernel_code_lines.append(f"        {safe_var}_{inner}_inner_state_ptr=states['{var}_{inner}_inner_state'],")
+                        if inner == "mean":
+                            kernel_code_lines.append(f"        {safe_var}_{inner}_weight_state_ptr=states['{var}_{inner}_weight_state'],")
+                        added_inner.add(inner)
+                kernel_code_lines.extend([
+                    "        weight_ptr=states['__weight'],",
+                    "        total_weight_ptr=states['__total_weight'],",
+                    "        num_macro_steps_ptr=states['__num_macro_steps'],",
+                    "        sub_step_ptr=states['__sub_step'],",
+                    "        num_sub_steps_ptr=states['__num_sub_steps'],",
+                    "        flags_ptr=states['__flags'],",
+                    "        macro_step_index_ptr=states['__macro_step_index'],",
+                    "        n_elements=full_len,",
+                    "        BLOCK_SIZE=BLOCK_SIZE,",
+                    "    )",
+                    "",
+                ])
+                continue
 
             # Get stride_input from metadata of first variable
             first_var = var_list[0]

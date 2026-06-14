@@ -32,6 +32,7 @@ class InputProxy:
         file_path: Optional[Union[str, Path, List[Union[str, Path]]]] = None,
         visible_vars: Optional[Set[str]] = None,
         file_indices: Optional[Dict[str, np.ndarray]] = None,
+        injected_vars: Optional[Set[str]] = None,
     ):
         self.data = data
         self.attrs = attrs or {}
@@ -41,6 +42,7 @@ class InputProxy:
         self.visible_vars = visible_vars or set(data.keys())
         self.file_map: Dict[str, str] = {}
         self.file_indices = file_indices or {}
+        self.injected_vars = injected_vars or set()
 
     @staticmethod
     def _read_var_from_ds(ds: Dataset, var_name: str, indices: Any = None) -> np.ndarray:
@@ -441,7 +443,11 @@ class InputProxy:
 
             target[indices] = value
         else:
+            is_existing = name in self.data or name in self.visible_vars
             self.data[name] = value
+            self.visible_vars.add(name)
+            if not is_existing:
+                self.injected_vars.add(name)
 
     def get(self, key: str, default: Any = None) -> Any:
         try:
@@ -465,10 +471,13 @@ class InputProxy:
         raise KeyError(f"Variable '{key}' not found in InputProxy.")
 
     def __setitem__(self, key: str, value: Any) -> None:
+        is_existing = key in self.data or key in self.visible_vars
         self.data[key] = value
         # Also expose newly injected variables to lazy-mode lookups,
         # ``keys()`` listings, and ``__contains__``.
         self.visible_vars.add(key)
+        if not is_existing:
+            self.injected_vars.add(key)
 
     def __delitem__(self, key: str) -> None:
         """Drop ``key`` completely from the proxy.
@@ -506,6 +515,7 @@ class InputProxy:
             self.visible_vars.discard(name)
             self.file_map.pop(name, None)
             self.file_indices.pop(name, None)
+            self.injected_vars.discard(name)
         return self
 
     def __contains__(self, key: str) -> bool:

@@ -318,6 +318,8 @@ class NetCDFDataset(AbstractDataset):
         suffix: str = ".nc",
         time_to_key: Optional[Callable[[Union[datetime, cftime.datetime]], str]] = yearly_time_to_key,
         time_aggregation: Optional[Union[str, Dict[str, str]]] = None,
+        clip_negative: bool = False,
+        skip_nan: bool = True,
         *args,
         **kwargs,
     ):
@@ -349,6 +351,8 @@ class NetCDFDataset(AbstractDataset):
             start_date=start_date,
             end_date=end_date,
             chunk_len=chunk_len,
+            clip_negative=clip_negative,
+            skip_nan=skip_nan,
             *args,
             **kwargs,
         )
@@ -486,6 +490,10 @@ class NetCDFDataset(AbstractDataset):
         ny, nx = self._grid_shape
         compressed = self._local_indices is not None
 
+        if compressed and len(self._local_indices) == 0:
+            total_len = sum(len(abs_indices) for _key, abs_indices in ops)
+            return np.empty((total_len, 0), dtype=self.out_dtype)
+
         # Lazily compute bounding box on first read if compressed mode is active
         if compressed and self._bbox is None:
             self._compute_bbox_from_indices()
@@ -529,12 +537,7 @@ class NetCDFDataset(AbstractDataset):
 
                 arr = read_netcdf_var_sliced(var, tuple(sel))
 
-                # Fill masks / NaNs
-                if isinstance(arr, np.ma.MaskedArray):
-                    arr = arr.filled(0.0)
-                else:
-                    arr = np.nan_to_num(np.asarray(arr), nan=0.0)
-                arr = np.asarray(arr)
+                arr = self._apply_value_policy(arr)
 
                 # Normalize to (T, Y, X) - note: Y, X may be bbox dimensions if use_bbox
                 arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
@@ -558,6 +561,46 @@ class NetCDFDataset(AbstractDataset):
                 chunks.append(out)
 
         return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
+
+    def _get_first_frame_nan_mask(self) -> Optional[np.ndarray]:
+        """Read the first planned source frame and return a flat NaN/mask bitmap."""
+        if not self._plan:
+            return None
+
+        first_op = None
+        for entry in self._plan:
+            for key, abs_indices in entry[1]:
+                if abs_indices:
+                    first_op = (key, int(abs_indices[0]))
+                    break
+            if first_op is not None:
+                break
+
+        if first_op is None:
+            return None
+
+        key, abs_index = first_op
+        path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
+        with Dataset(path, "r") as ds:
+            var = ds.variables[self.var_name]
+            dims = var.dimensions
+            t_idx = self._pick_dim(dims, "time", "valid_time")
+            y_idx = self._pick_dim(dims, "lat", "latitude", "y")
+            x_idx = self._pick_dim(dims, "lon", "longitude", "long", "x")
+            if t_idx is None or y_idx is None or x_idx is None:
+                raise ValueError(f"Expect at least time/lat/lon dims, got: {dims}")
+
+            sel = [slice(None)] * var.ndim
+            sel[t_idx] = np.asarray([abs_index], dtype=np.int32)
+            arr = read_netcdf_var_sliced(var, tuple(sel))
+            arr = self._as_nan_array(arr)
+            arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
+
+        if arr.shape[0] != 1:
+            raise ValueError(f"Expected one frame for skip_nan mask, got shape={arr.shape}")
+        if not np.issubdtype(arr.dtype, np.floating):
+            return np.zeros(arr.shape[1] * arr.shape[2], dtype=bool)
+        return np.isnan(arr[0]).reshape(-1)
 
     def _finish_read(self, data: np.ndarray) -> Union[np.ndarray, Dict[str, np.ndarray]]:
         if self.time_aggregation is None:
@@ -670,6 +713,7 @@ class MultiVarNetCDFDataset(AbstractDataset):
         unit_factor: float = 1.0,
         suffix: str = ".nc",
         clip_negative: bool = False,
+        skip_nan: bool = True,
         time_to_key: Optional[Callable[[Union[datetime, cftime.datetime]], str]] = yearly_time_to_key,
         spin_up_cycles: int = 0,
         spin_up_start_date: Optional[Union[datetime, cftime.datetime]] = None,
@@ -687,6 +731,7 @@ class MultiVarNetCDFDataset(AbstractDataset):
             unit_factor=unit_factor,
             suffix=suffix,
             clip_negative=clip_negative,
+            skip_nan=skip_nan,
             time_to_key=time_to_key,
             spin_up_cycles=spin_up_cycles,
             spin_up_start_date=spin_up_start_date,
@@ -715,6 +760,7 @@ class MultiVarNetCDFDataset(AbstractDataset):
             time_interval=time_interval,
             chunk_len=int(ref.chunk_len),
             clip_negative=clip_negative,
+            skip_nan=skip_nan,
             spin_up_cycles=spin_up_cycles,
             spin_up_start_date=spin_up_start_date,
             spin_up_end_date=spin_up_end_date,
@@ -780,7 +826,10 @@ class MultiVarNetCDFDataset(AbstractDataset):
         return local_mapping
 
     def shard_forcing(self, batch: Dict[str, torch.Tensor], local_mapping) -> Dict[str, torch.Tensor]:
-        return {v: super().shard_forcing(batch[v], local_mapping) for v in self._var_names}
+        return {
+            v: ds.shard_forcing(batch[v], local_mapping)
+            for v, ds in zip(self._var_names, self._datasets)
+        }
 
     def iter_loaders(
         self,

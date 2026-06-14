@@ -271,10 +271,7 @@ class ExportedDataset(NetCDFDataset):
                     col_min, col_max = self._column_bbox
                     sel[c_idx] = slice(col_min, col_max + 1)
                 arr = read_netcdf_var_sliced(var, tuple(sel))
-                if isinstance(arr, np.ma.MaskedArray):
-                    arr = arr.filled(0.0)
-                else:
-                    arr = np.nan_to_num(np.asarray(arr), nan=0.0)
+                arr = self._apply_value_policy(arr)
                 arr = self._ensure_tc(arr, t_idx, c_idx)
 
                 # Reorder columns if indices are set
@@ -521,10 +518,7 @@ class ExportedDataset(NetCDFDataset):
                             sel[t_idx] = np.asarray(abs_indices, dtype=np.int64)
                             sel[c_idx] = file_col_indices
                             arr = read_netcdf_var_sliced(var_in, tuple(sel))
-                            if isinstance(arr, np.ma.MaskedArray):
-                                arr = arr.filled(0.0)
-                            else:
-                                arr = np.nan_to_num(np.asarray(arr), nan=0.0)
+                            arr = self._apply_value_policy(arr)
                             batch_data = self._ensure_tc(arr, t_idx, c_idx)
                             file_chunks.append(batch_data)
 

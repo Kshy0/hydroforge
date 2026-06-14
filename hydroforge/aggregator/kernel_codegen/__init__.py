@@ -70,8 +70,11 @@ class KernelCodegenMixin(
         # Generate scatter pre-step kernels
         self._generate_scatter_kernels(kernel_code_lines, grouped_by_save_idx)
 
-        # Generate kernels for each save_idx group
+        # Generate kernels for each save_idx/full-output group
         for save_idx, var_list in grouped_by_save_idx.items():
+            if save_idx == "__full__":
+                self._generate_full_kernel_for_group(kernel_code_lines, save_idx, var_list, tensor_info)
+                continue
             kernel_name = f"kernel_{save_idx}"
             self._generate_kernel_for_group(kernel_code_lines, kernel_name, save_idx, var_list, tensor_info)
 

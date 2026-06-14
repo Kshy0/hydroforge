@@ -104,6 +104,203 @@ class PyTorchCodegenMixin:
         emitted.add(safe_var)
         return val_name
 
+    def _generate_pytorch_full_function(self: StatisticsAggregator, lines: List[str],
+                                        full_vars: List[str],
+                                        tensor_info: Dict[str, Any]) -> None:
+        """Generate a PyTorch function for variables saved at full tensor shape."""
+        if not full_vars:
+            return
+
+        lines.extend([
+            'def _update___full__(states, weight, total_weight, num_macro_steps,',
+            '                     sub_step, num_sub_steps, flags, macro_step_index):',
+            '    is_inner_first = (flags & 1) != 0 and sub_step == 0',
+            '    is_inner_last = ((flags >> 1) & 1) != 0 and sub_step == num_sub_steps - 1',
+            '    is_middle = sub_step == num_sub_steps // 2',
+            '    is_outer_first = ((flags >> 2) & 1) != 0 and is_inner_last',
+            '    is_outer_last = ((flags >> 3) & 1) != 0 and is_inner_last',
+            '',
+        ])
+
+        for var in full_vars:
+            safe_var = self._get_safe_name(var)
+            lines.extend([
+                f'    # === full tensor variable: {var} ===',
+                f'    {safe_var}_val = states["{var}"]',
+            ])
+
+            for op in self._variable_ops[var]:
+                out_key = f'{var}_{op}'
+                op_parts = op.split('_')
+
+                if len(op_parts) > 1:
+                    outer, inner = op_parts[0], op_parts[1]
+                    inner_val = f'{safe_var}_{inner}_val'
+                    lines.append(f'    {inner_val} = torch.zeros_like({safe_var}_val)')
+
+                    if inner == 'last':
+                        lines.extend([
+                            '    if is_inner_last:',
+                            f'        {inner_val} = {safe_var}_val',
+                        ])
+                    elif inner == 'mean':
+                        inner_key = f'{var}_{inner}_inner_state'
+                        weight_key = f'{var}_{inner}_weight_state'
+                        lines.extend([
+                            f'    _inner_old = states["{inner_key}"].clone()',
+                            f'    _w_old = states["{weight_key}"].clone()',
+                            f'    _inner_new = _inner_old + {safe_var}_val * weight',
+                            '    _w_new = _w_old + weight',
+                            '    if is_inner_last:',
+                            f'        {inner_val} = _inner_new / _w_new',
+                            f'        states["{inner_key}"].zero_()',
+                            f'        states["{weight_key}"].zero_()',
+                            '    else:',
+                            f'        states["{inner_key}"].copy_(_inner_new)',
+                            f'        states["{weight_key}"].copy_(_w_new)',
+                        ])
+                    elif inner == 'sum':
+                        inner_key = f'{var}_{inner}_inner_state'
+                        lines.extend([
+                            f'    _inner_old = states["{inner_key}"].clone()',
+                            f'    _inner_new = _inner_old + {safe_var}_val * weight',
+                            '    if is_inner_last:',
+                            f'        {inner_val} = _inner_new',
+                            f'        states["{inner_key}"].zero_()',
+                            '    else:',
+                            f'        states["{inner_key}"].copy_(_inner_new)',
+                        ])
+                    elif inner == 'max':
+                        inner_key = f'{var}_{inner}_inner_state'
+                        lines.extend([
+                            '    if is_inner_first:',
+                            f'        states["{inner_key}"].copy_({safe_var}_val)',
+                            '    else:',
+                            f'        states["{inner_key}"].copy_(torch.maximum(states["{inner_key}"], {safe_var}_val))',
+                            '    if is_inner_last:',
+                            f'        {inner_val} = states["{inner_key}"].clone()',
+                            f'        states["{inner_key}"].fill_(float("-inf"))',
+                        ])
+                    elif inner == 'min':
+                        inner_key = f'{var}_{inner}_inner_state'
+                        lines.extend([
+                            '    if is_inner_first:',
+                            f'        states["{inner_key}"].copy_({safe_var}_val)',
+                            '    else:',
+                            f'        states["{inner_key}"].copy_(torch.minimum(states["{inner_key}"], {safe_var}_val))',
+                            '    if is_inner_last:',
+                            f'        {inner_val} = states["{inner_key}"].clone()',
+                            f'        states["{inner_key}"].fill_(float("inf"))',
+                        ])
+                    elif inner == 'first':
+                        inner_key = f'{var}_{inner}_inner_state'
+                        lines.extend([
+                            '    if is_inner_first:',
+                            f'        states["{inner_key}"].copy_({safe_var}_val)',
+                            '    if is_inner_last:',
+                            f'        {inner_val} = states["{inner_key}"]',
+                        ])
+                    elif inner == 'mid':
+                        inner_key = f'{var}_{inner}_inner_state'
+                        lines.extend([
+                            '    if is_middle:',
+                            f'        states["{inner_key}"].copy_({safe_var}_val)',
+                            '    if is_inner_last:',
+                            f'        {inner_val} = states["{inner_key}"]',
+                        ])
+                    else:
+                        raise ValueError(f"Unsupported full-output inner op '{inner}'.")
+
+                    lines.append('    if is_inner_last:')
+                    if outer == 'max':
+                        lines.extend([
+                            '        if is_outer_first:',
+                            f'            states["{out_key}"].copy_({inner_val})',
+                            '        else:',
+                            f'            states["{out_key}"].copy_(torch.maximum(states["{out_key}"], {inner_val}))',
+                        ])
+                    elif outer == 'min':
+                        lines.extend([
+                            '        if is_outer_first:',
+                            f'            states["{out_key}"].copy_({inner_val})',
+                            '        else:',
+                            f'            states["{out_key}"].copy_(torch.minimum(states["{out_key}"], {inner_val}))',
+                        ])
+                    elif outer == 'sum':
+                        lines.extend([
+                            '        if is_outer_first:',
+                            f'            states["{out_key}"].copy_({inner_val})',
+                            '        else:',
+                            f'            states["{out_key}"].add_({inner_val})',
+                        ])
+                    elif outer == 'mean':
+                        lines.extend([
+                            '        if is_outer_first:',
+                            f'            states["{out_key}"].copy_({inner_val})',
+                            '        else:',
+                            f'            states["{out_key}"].add_({inner_val})',
+                            '        if is_outer_last:',
+                            f'            states["{out_key}"].div_(num_macro_steps)',
+                        ])
+                    elif outer == 'last':
+                        lines.append(f'        states["{out_key}"].copy_({inner_val})')
+                    elif outer == 'first':
+                        lines.extend([
+                            '        if is_outer_first:',
+                            f'            states["{out_key}"].copy_({inner_val})',
+                        ])
+                    else:
+                        raise ValueError(f"Unsupported full-output outer op '{outer}'.")
+                    lines.append('')
+                    continue
+
+                if op == 'mean':
+                    lines.extend([
+                        '    if is_inner_first:',
+                        f'        states["{out_key}"].zero_()',
+                        f'    states["{out_key}"].add_({safe_var}_val * weight)',
+                        '    if is_inner_last:',
+                        f'        states["{out_key}"].div_(total_weight)',
+                    ])
+                elif op == 'sum':
+                    lines.extend([
+                        '    if is_inner_first:',
+                        f'        states["{out_key}"].zero_()',
+                        f'    states["{out_key}"].add_({safe_var}_val * weight)',
+                    ])
+                elif op == 'max':
+                    lines.extend([
+                        '    if is_inner_first:',
+                        f'        states["{out_key}"].copy_({safe_var}_val)',
+                        '    else:',
+                        f'        states["{out_key}"].copy_(torch.maximum(states["{out_key}"], {safe_var}_val))',
+                    ])
+                elif op == 'min':
+                    lines.extend([
+                        '    if is_inner_first:',
+                        f'        states["{out_key}"].copy_({safe_var}_val)',
+                        '    else:',
+                        f'        states["{out_key}"].copy_(torch.minimum(states["{out_key}"], {safe_var}_val))',
+                    ])
+                elif op == 'last':
+                    lines.extend([
+                        '    if is_inner_last:',
+                        f'        states["{out_key}"].copy_({safe_var}_val)',
+                    ])
+                elif op == 'first':
+                    lines.extend([
+                        '    if is_inner_first:',
+                        f'        states["{out_key}"].copy_({safe_var}_val)',
+                    ])
+                elif op == 'mid':
+                    lines.extend([
+                        '    if is_middle:',
+                        f'        states["{out_key}"].copy_({safe_var}_val)',
+                    ])
+                else:
+                    raise ValueError(f"Unsupported full-output op '{op}'.")
+                lines.append('')
+
     def _generate_pytorch_group_function(self: StatisticsAggregator, lines: List[str],
                                           save_idx: str, var_list: List[str],
                                           tensor_info: Dict[str, Any]) -> None:
@@ -585,9 +782,11 @@ class PyTorchCodegenMixin:
                                          tensor_info: Dict[str, Any]) -> None:
         """Generate the main entry-point function that calls per-group functions."""
         num_trials = self.num_trials if self.num_trials > 1 else 1
+        full_vars = grouped_by_save_idx.get("__full__", [])
+        if not full_vars:
+            lines.append('@torch.compile')
         lines.extend([
             '# Main update function',
-            '@torch.compile',
             'def internal_update_statistics(states, BLOCK_SIZE):',
             '    weight = states["__weight"]',
             '    total_weight = states["__total_weight"]',
@@ -599,7 +798,15 @@ class PyTorchCodegenMixin:
             f'    num_trials = {num_trials}',
         ])
 
+        if full_vars:
+            lines.extend([
+                '    _update___full__(states, weight, total_weight, num_macro_steps,',
+                '                     sub_step, num_sub_steps, flags, macro_step_index)',
+            ])
+
         for save_idx, var_list in grouped_by_save_idx.items():
+            if save_idx == "__full__":
+                continue
             first_var = var_list[0]
             stride_input = 0
             for out_name, meta in self._metadata.items():
@@ -663,7 +870,12 @@ class PyTorchCodegenMixin:
 
         lines = self._generate_pytorch_header()
 
+        full_vars = grouped_by_save_idx.get("__full__", [])
+        self._generate_pytorch_full_function(lines, full_vars, tensor_info)
+
         for save_idx, var_list in grouped_by_save_idx.items():
+            if save_idx == "__full__":
+                continue
             self._generate_pytorch_group_function(lines, save_idx, var_list, tensor_info)
 
         self._generate_pytorch_main_function(lines, grouped_by_save_idx, tensor_info)
