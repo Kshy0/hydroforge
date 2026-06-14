@@ -226,6 +226,7 @@ class StatisticsMixin:
             save_coord = json_schema_extra.get('save_coord')
             dim_coords = json_schema_extra.get('dim_coords')
             target_dtype = tensor.dtype if tensor is not None else torch.float32
+            full_output = save_idx is None
 
             def infer_virtual_dtype(expr: str, seen: Set[str] | None = None) -> torch.dtype | None:
                 if seen is None:
@@ -263,10 +264,30 @@ class StatisticsMixin:
                 if inferred_dtype is not None:
                     target_dtype = inferred_dtype
 
-            if not save_idx:
-                raise ValueError(f"Variable '{var_name}' must have save_idx in json_schema_extra")
+            if full_output:
+                if is_virtual:
+                    expr = json_schema_extra.get('expr')
+                    scatter = parse_scatter_expr(expr) if expr else None
+                    if scatter:
+                        raise ValueError(
+                            f"Full-output scatter virtual variable '{var_name}' is not supported"
+                        )
 
-            if save_idx in self._tensor_registry:
+                if tensor is not None:
+                    tensor_ndim = tensor.ndim
+                    tensor_base_shape = tuple(tensor.shape)
+                    actual_shape = tuple(tensor.shape)
+                elif is_virtual:
+                    raise ValueError(
+                        f"Full-output virtual variable '{var_name}' is not supported yet"
+                    )
+                else:
+                    raise ValueError(
+                        f"Variable '{var_name}' is configured for full output but "
+                        "has no registered tensor"
+                    )
+
+            elif save_idx in self._tensor_registry:
                 ref_save_idx = self._tensor_registry[save_idx]
                 if tensor is not None:
                      # Real tensor shape/dim logic
@@ -335,8 +356,20 @@ class StatisticsMixin:
                 raise ValueError(f"Variable '{var_name}' has {actual_ndim} actual dimensions. Only up to {max_ndim}D variables are supported.")
 
             is_2d = (self.num_trials > 1 and actual_ndim == 3) or (self.num_trials == 1 and actual_ndim == 2)
-            if is_2d and any(op.split('_')[0] in ['max', 'min'] or re.match(r'(max|min)\d+$', op.split('_')[0]) for op in ops):
+            if (
+                not full_output
+                and is_2d
+                and any(op.split('_')[0] in ['max', 'min'] or re.match(r'(max|min)\d+$', op.split('_')[0]) for op in ops)
+            ):
                 raise ValueError(f"max/min operations are not supported for 2D variable '{var_name}' (with levels).")
+            if full_output:
+                for op in ops:
+                    outer_op = op.split('_')[0]
+                    if re.match(r'(max|min)\d+$', outer_op) or re.match(r'arg(max|min)(\d*)$', outer_op):
+                        raise ValueError(
+                            f"Full-output variable '{var_name}' does not support "
+                            f"top-k or arg operation '{op}' yet"
+                        )
 
             # Track
             self._variables.add(var_name)
@@ -534,6 +567,7 @@ class StatisticsMixin:
                     'original_variable': var_name,
                     'op': op,
                     'save_idx': save_idx,
+                    'full_output': full_output,
                     'tensor_shape': tensor_shape,
                     'dtype': 'i4' if is_arg_op else out_dtype,  # int32 for arg ops
                     'actual_shape': actual_shape,

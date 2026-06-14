@@ -78,6 +78,289 @@ class MetalCodegenMixin:
         emitted.add(safe_var)
         return val_name
 
+    def _generate_metal_full_kernel_for_group(self: StatisticsAggregator,
+                                              msl_lines: list,
+                                              save_idx: str, var_list: list,
+                                              tensor_info: dict) -> dict:
+        """Generate a Metal kernel for variables saved at full tensor shape."""
+        kernel_name = f"aggr_kernel_{self._get_safe_name(save_idx)}"
+
+        sorted_inputs = []
+        for var in var_list:
+            if var not in self._tensor_registry:
+                raise ValueError(
+                    f"Full-output Metal aggregation requires '{var}' to be a registered tensor"
+                )
+            sorted_inputs.append(var)
+        sorted_inputs = sorted(dict.fromkeys(sorted_inputs))
+
+        out_tensors = []
+        seen_out = set()
+        for var in var_list:
+            safe_var = self._get_safe_name(var)
+            ctype = self._metal_dtype_str(var)
+            for op in self._variable_ops[var]:
+                outer = op.split('_')[0]
+                if re.match(r'arg(max|min)(\d*)$', outer) or re.match(r'(max|min)(\d+)$', outer):
+                    raise ValueError(f"Full-output Metal aggregation does not support op '{op}'")
+
+                out_key = f'{var}_{op}'
+                if out_key not in seen_out:
+                    out_tensors.append((out_key, ctype, f"p_{safe_var}_{op}"))
+                    seen_out.add(out_key)
+
+                if '_' not in op:
+                    continue
+                inner = op.split('_')[1]
+                if inner == 'last':
+                    continue
+                inner_key = f'{var}_{inner}_inner_state'
+                if inner_key not in seen_out:
+                    out_tensors.append((inner_key, ctype, f"p_{safe_var}_{inner}_inner_state"))
+                    seen_out.add(inner_key)
+                if inner == 'mean':
+                    weight_key = f'{var}_{inner}_weight_state'
+                    if weight_key not in seen_out:
+                        out_tensors.append((weight_key, ctype, f"p_{safe_var}_{inner}_weight_state"))
+                        seen_out.add(weight_key)
+
+        full_total = max(int(self._tensor_registry[var].numel()) for var in var_list)
+
+        buf_idx = 0
+        arg_order = []
+        I = "    "
+
+        msl_lines.append(f'kernel void {kernel_name}(')
+        for inp in sorted_inputs:
+            safe_inp = self._get_safe_name(inp)
+            ctype = self._metal_dtype_str(inp)
+            msl_lines.append(f'    device const {ctype}* p_{safe_inp} [[buffer({buf_idx})]],')
+            arg_order.append(('tensor', inp))
+            buf_idx += 1
+
+        for state_key, ctype, pname in out_tensors:
+            msl_lines.append(f'    device {ctype}* {pname} [[buffer({buf_idx})]],')
+            arg_order.append(('tensor', state_key))
+            buf_idx += 1
+
+        varying_scalar_params = [
+            ('weight', 'float', '__weight'), ('total_weight', 'float', '__total_weight'),
+            ('num_macro_steps', 'float', '__num_macro_steps'),
+            ('sub_step', 'int', '__sub_step'), ('num_sub_steps', 'int', '__num_sub_steps'),
+            ('flags', 'int', '__flags'),
+            ('macro_step_index', 'int', '__macro_step_index'),
+        ]
+        for sname, stype, state_key in varying_scalar_params:
+            msl_lines.append(f'    device const {stype}* p_{sname}_ptr [[buffer({buf_idx})]],')
+            arg_order.append(('tensor', state_key))
+            buf_idx += 1
+
+        msl_lines.append(f'    constant int& n_elements [[buffer({buf_idx})]],')
+        arg_order.append(('scalar', 'n_elements', 'int'))
+        buf_idx += 1
+
+        msl_lines.append('    uint tid [[thread_position_in_grid]]')
+        msl_lines.append(') {')
+        msl_lines.append(f'{I}if ((int)tid >= n_elements) return;')
+        msl_lines.append(f'{I}int out_idx = (int)tid;')
+        msl_lines.append('')
+        msl_lines.append(f'{I}float weight = *p_weight_ptr;')
+        msl_lines.append(f'{I}float total_weight = *p_total_weight_ptr;')
+        msl_lines.append(f'{I}float num_macro_steps = *p_num_macro_steps_ptr;')
+        msl_lines.append(f'{I}int sub_step = *p_sub_step_ptr;')
+        msl_lines.append(f'{I}int num_sub_steps = *p_num_sub_steps_ptr;')
+        msl_lines.append(f'{I}int flags = *p_flags_ptr;')
+        msl_lines.append(f'{I}int macro_step_index = *p_macro_step_index_ptr;')
+        msl_lines.append('')
+
+        needed_bools = self._analyze_needed_booleans()
+        if needed_bools:
+            if 'is_inner_first' in needed_bools:
+                msl_lines.append(f'{I}bool is_inner_first = ((flags & 1) != 0) && (sub_step == 0);')
+            if 'is_inner_last' in needed_bools:
+                msl_lines.append(f'{I}bool is_inner_last = (((flags >> 1) & 1) != 0) && (sub_step == num_sub_steps - 1);')
+            if 'is_middle' in needed_bools:
+                msl_lines.append(f'{I}bool is_middle = (sub_step == num_sub_steps / 2);')
+            if 'is_outer_first' in needed_bools:
+                msl_lines.append(f'{I}bool is_outer_first = (((flags >> 2) & 1) != 0) && is_inner_last;')
+            if 'is_outer_last' in needed_bools:
+                msl_lines.append(f'{I}bool is_outer_last = (((flags >> 3) & 1) != 0) && is_inner_last;')
+            msl_lines.append('')
+
+        for var in var_list:
+            safe_var = self._get_safe_name(var)
+            ctype = self._metal_dtype_str(var)
+            var_numel = int(self._tensor_registry[var].numel())
+            var_val = f"{safe_var}_val"
+            I2 = I + "    "
+            msl_lines.append(f'{I}if ((int)tid < {var_numel}) {{')
+            msl_lines.append(f'{I2}{ctype} {var_val} = p_{safe_var}[out_idx];')
+
+            inner_ops = sorted({op.split('_')[1] for op in self._variable_ops[var] if '_' in op})
+            for inner_type in inner_ops:
+                if inner_type == 'last':
+                    continue
+                val_for = f"val_for_{safe_var}_{inner_type}"
+                msl_lines.append(f'{I2}{ctype} {val_for} = ({ctype})0;')
+                if inner_type == 'mean':
+                    msl_lines.extend([
+                        f'{I2}{{',
+                        f'{I2}    {ctype} inner_old = p_{safe_var}_mean_inner_state[out_idx];',
+                        f'{I2}    {ctype} w_old = p_{safe_var}_mean_weight_state[out_idx];',
+                        f'{I2}    {ctype} inner_new = inner_old + {var_val} * ({ctype})weight;',
+                        f'{I2}    {ctype} w_new = w_old + ({ctype})weight;',
+                        f'{I2}    if (is_inner_last) {{',
+                        f'{I2}        p_{safe_var}_mean_inner_state[out_idx] = ({ctype})0;',
+                        f'{I2}        p_{safe_var}_mean_weight_state[out_idx] = ({ctype})0;',
+                        f'{I2}        {val_for} = inner_new / w_new;',
+                        f'{I2}    }} else {{',
+                        f'{I2}        p_{safe_var}_mean_inner_state[out_idx] = inner_new;',
+                        f'{I2}        p_{safe_var}_mean_weight_state[out_idx] = w_new;',
+                        f'{I2}    }}',
+                        f'{I2}}}',
+                    ])
+                elif inner_type == 'sum':
+                    msl_lines.extend([
+                        f'{I2}{{',
+                        f'{I2}    {ctype} inner_new = p_{safe_var}_sum_inner_state[out_idx] + {var_val} * ({ctype})weight;',
+                        f'{I2}    if (is_inner_last) {{',
+                        f'{I2}        p_{safe_var}_sum_inner_state[out_idx] = ({ctype})0;',
+                        f'{I2}        {val_for} = inner_new;',
+                        f'{I2}    }} else {{',
+                        f'{I2}        p_{safe_var}_sum_inner_state[out_idx] = inner_new;',
+                        f'{I2}    }}',
+                        f'{I2}}}',
+                    ])
+                elif inner_type == 'max':
+                    msl_lines.extend([
+                        f'{I2}{{',
+                        f'{I2}    {ctype} old_v = p_{safe_var}_max_inner_state[out_idx];',
+                        f'{I2}    {ctype} inner_new = is_inner_first ? {var_val} : fmax(old_v, {var_val});',
+                        f'{I2}    if (is_inner_last) {{',
+                        f'{I2}        p_{safe_var}_max_inner_state[out_idx] = ({ctype})(-1e38);',
+                        f'{I2}        {val_for} = inner_new;',
+                        f'{I2}    }} else {{',
+                        f'{I2}        p_{safe_var}_max_inner_state[out_idx] = inner_new;',
+                        f'{I2}    }}',
+                        f'{I2}}}',
+                    ])
+                elif inner_type == 'min':
+                    msl_lines.extend([
+                        f'{I2}{{',
+                        f'{I2}    {ctype} old_v = p_{safe_var}_min_inner_state[out_idx];',
+                        f'{I2}    {ctype} inner_new = is_inner_first ? {var_val} : fmin(old_v, {var_val});',
+                        f'{I2}    if (is_inner_last) {{',
+                        f'{I2}        p_{safe_var}_min_inner_state[out_idx] = ({ctype})1e38;',
+                        f'{I2}        {val_for} = inner_new;',
+                        f'{I2}    }} else {{',
+                        f'{I2}        p_{safe_var}_min_inner_state[out_idx] = inner_new;',
+                        f'{I2}    }}',
+                        f'{I2}}}',
+                    ])
+                elif inner_type == 'first':
+                    msl_lines.extend([
+                        f'{I2}if (is_inner_first) p_{safe_var}_first_inner_state[out_idx] = {var_val};',
+                        f'{I2}if (is_inner_last) {val_for} = p_{safe_var}_first_inner_state[out_idx];',
+                    ])
+                elif inner_type == 'mid':
+                    msl_lines.extend([
+                        f'{I2}if (is_middle) p_{safe_var}_mid_inner_state[out_idx] = {var_val};',
+                        f'{I2}if (is_inner_last) {val_for} = p_{safe_var}_mid_inner_state[out_idx];',
+                    ])
+                else:
+                    raise ValueError(f"Unsupported full-output inner op '{inner_type}'")
+
+            for op in self._variable_ops[var]:
+                op_parts = op.split('_')
+                out_ptr = f"p_{safe_var}_{op}"
+                if len(op_parts) > 1:
+                    outer, inner = op_parts[0], op_parts[1]
+                    val_var = var_val if inner == 'last' else f"val_for_{safe_var}_{inner}"
+                    if outer == 'max':
+                        msl_lines.extend([
+                            f'{I2}if (is_inner_last) {{',
+                            f'{I2}    if (is_outer_first) {{ {out_ptr}[out_idx] = {val_var}; }}',
+                            f'{I2}    else {{ {out_ptr}[out_idx] = fmax({out_ptr}[out_idx], {val_var}); }}',
+                            f'{I2}}}',
+                        ])
+                    elif outer == 'min':
+                        msl_lines.extend([
+                            f'{I2}if (is_inner_last) {{',
+                            f'{I2}    if (is_outer_first) {{ {out_ptr}[out_idx] = {val_var}; }}',
+                            f'{I2}    else {{ {out_ptr}[out_idx] = fmin({out_ptr}[out_idx], {val_var}); }}',
+                            f'{I2}}}',
+                        ])
+                    elif outer == 'sum':
+                        msl_lines.extend([
+                            f'{I2}if (is_inner_last) {{',
+                            f'{I2}    if (is_outer_first) {{ {out_ptr}[out_idx] = {val_var}; }}',
+                            f'{I2}    else {{ {out_ptr}[out_idx] += {val_var}; }}',
+                            f'{I2}}}',
+                        ])
+                    elif outer == 'mean':
+                        msl_lines.extend([
+                            f'{I2}if (is_inner_last) {{',
+                            f'{I2}    if (is_outer_first) {{ {out_ptr}[out_idx] = {val_var}; }}',
+                            f'{I2}    else {{ {out_ptr}[out_idx] += {val_var}; }}',
+                            f'{I2}    if (is_outer_last) {{ {out_ptr}[out_idx] /= ({ctype})num_macro_steps; }}',
+                            f'{I2}}}',
+                        ])
+                    elif outer == 'last':
+                        msl_lines.append(f'{I2}if (is_inner_last) {{ {out_ptr}[out_idx] = {val_var}; }}')
+                    elif outer == 'first':
+                        msl_lines.append(f'{I2}if (is_inner_last && is_outer_first) {{ {out_ptr}[out_idx] = {val_var}; }}')
+                    else:
+                        raise ValueError(f"Unsupported full-output outer op '{outer}'")
+                    continue
+
+                if op == 'mean':
+                    msl_lines.extend([
+                        f'{I2}{{',
+                        f'{I2}    {ctype} old_val = is_inner_first ? ({ctype})0 : {out_ptr}[out_idx];',
+                        f'{I2}    {ctype} new_val = old_val + {var_val} * ({ctype})weight;',
+                        f'{I2}    {out_ptr}[out_idx] = is_inner_last ? new_val / ({ctype})total_weight : new_val;',
+                        f'{I2}}}',
+                    ])
+                elif op == 'sum':
+                    msl_lines.extend([
+                        f'{I2}{{',
+                        f'{I2}    {ctype} old_val = is_inner_first ? ({ctype})0 : {out_ptr}[out_idx];',
+                        f'{I2}    {out_ptr}[out_idx] = old_val + {var_val} * ({ctype})weight;',
+                        f'{I2}}}',
+                    ])
+                elif op == 'max':
+                    msl_lines.extend([
+                        f'{I2}if (is_inner_first) {{ {out_ptr}[out_idx] = {var_val}; }}',
+                        f'{I2}else {{ {out_ptr}[out_idx] = fmax({out_ptr}[out_idx], {var_val}); }}',
+                    ])
+                elif op == 'min':
+                    msl_lines.extend([
+                        f'{I2}if (is_inner_first) {{ {out_ptr}[out_idx] = {var_val}; }}',
+                        f'{I2}else {{ {out_ptr}[out_idx] = fmin({out_ptr}[out_idx], {var_val}); }}',
+                    ])
+                elif op == 'last':
+                    msl_lines.append(f'{I2}if (is_inner_last) {{ {out_ptr}[out_idx] = {var_val}; }}')
+                elif op == 'first':
+                    msl_lines.append(f'{I2}if (is_inner_first) {{ {out_ptr}[out_idx] = {var_val}; }}')
+                elif op == 'mid':
+                    msl_lines.append(f'{I2}if (is_middle) {{ {out_ptr}[out_idx] = {var_val}; }}')
+                else:
+                    raise ValueError(f"Unsupported full-output op '{op}'")
+
+            msl_lines.append(f'{I}}}')
+            msl_lines.append('')
+
+        msl_lines.append('}')
+        msl_lines.append('')
+
+        return {
+            'kernel_name': kernel_name,
+            'save_idx': save_idx,
+            'full_output': True,
+            'n_elements_val': full_total,
+            'arg_order': arg_order,
+        }
+
     def _generate_metal_kernel_for_group(self: StatisticsAggregator,
                                           msl_lines: list,
                                           save_idx: str, var_list: list,
@@ -87,6 +370,11 @@ class MetalCodegenMixin:
         Returns metadata dict used by the Python wrapper.
         """
         from collections import defaultdict
+
+        if save_idx == "__full__":
+            return self._generate_metal_full_kernel_for_group(
+                msl_lines, save_idx, var_list, tensor_info
+            )
 
         num_trials = self.num_trials if self.num_trials > 1 else 1
         safe_save = self._get_safe_name(save_idx)
@@ -653,6 +941,9 @@ class MetalCodegenMixin:
             strides = {}
             for meta in metas:
                 si = meta['save_idx']
+                if meta.get('full_output'):
+                    strides[si] = 0
+                    continue
                 var_list = grouped[si]
                 first_var = var_list[0]
                 stride = 0
@@ -666,8 +957,14 @@ class MetalCodegenMixin:
                 for meta in metas:
                     kernel_fn = getattr(lib, meta['kernel_name'])
                     si = meta['save_idx']
-                    n_saved = len(states[si])
-                    stride = strides[si]
+                    if meta.get('full_output'):
+                        n_threads = meta['n_elements_val']
+                        n_saved = n_threads
+                        stride = 0
+                    else:
+                        n_saved = len(states[si])
+                        n_threads = n_saved
+                        stride = strides[si]
 
                     args = []
 
@@ -683,8 +980,10 @@ class MetalCodegenMixin:
                                 args.append(stride)
                             elif sname == 'n_levels':
                                 args.append(meta['n_levels_val'])
+                            elif sname == 'n_elements':
+                                args.append(meta['n_elements_val'])
 
-                    kernel_fn(*args, threads=n_saved, group_size=256)
+                    kernel_fn(*args, threads=n_threads, group_size=256)
 
             return internal_update_statistics
 

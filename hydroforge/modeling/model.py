@@ -74,6 +74,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             "Supported ops: mean, max, min, last, first, mid, sum. "
             "For max/min, argmax/argmin are automatically computed. "
             "Variables can be strings or {alias: expr} dicts.  The "
+            "variables without save_idx are saved at full tensor shape. "
             "reserved key ``\"static\"`` marks per-saved-point static "
             "metadata (e.g. shift_days) written once per output NC."
         ),
@@ -307,9 +308,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             if module_name not in self.module_list:
                 raise ValueError(f"Module {module_name} not found in module_list")
             deps = self.module_list[module_name].dependencies
-            # Only include dependencies that are in opened_modules
-            active_deps = [d for d in deps if d in self.opened_modules]
-            sorter.add(module_name, *active_deps)
+            sorter.add(module_name, *deps)
 
         # Get sorted order
         sorted_modules = list(sorter.static_order())
@@ -329,7 +328,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 mixed_precision=self.mixed_precision,
                 num_trials=self.num_trials,
                 **self._modules,
-                **module_data
+                **module_data,
             )
             self._modules[module_name] = module_instance
 
@@ -871,6 +870,17 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             if var_name in var_to_ops:
                 ops = var_to_ops[var_name]
                 if category != 'virtual':
+                    save_idx = field_info.json_schema_extra.get("save_idx")
+                    is_full_output = save_idx is None
+                    if is_full_output:
+                        for op in ops:
+                            op_base = op.split('_')[0]
+                            if topk_pattern.match(op_base) or argtopk_pattern.match(op_base):
+                                raise ValueError(
+                                    f"Operation '{op}' is not supported for full-output "
+                                    f"variable '{var_name}' yet."
+                                )
+
                     # 1D is usually (N,), 2D is (N, Level).
                     # With trials: 1D is (T, N), 2D is (T, N, Level)
                     limit = 1
@@ -879,7 +889,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
                     is_real_2d = tensor.ndim > limit
 
-                    if is_real_2d:
+                    if is_real_2d and not is_full_output:
                         for op in ops:
                             op_base = op.split('_')[0]
                             if topk_pattern.match(op_base) or op_base in ('max', 'min'):
@@ -970,6 +980,11 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         if self._statistics_aggregator is not None:
             self._statistics_aggregator.finalize_time_step(current_time)
 
+    def close_statistics_aggregator(self) -> None:
+        """Flush and close the statistics aggregator if it was initialized."""
+        if self._statistics_aggregator is not None:
+            self._statistics_aggregator._shutdown()
+
     def get_output_results(self, as_stacked: bool = True) -> Dict[str, torch.Tensor]:
         """
         Get the in-memory output results (only available when in_memory_output=True).
@@ -1024,7 +1039,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         """
         Load fields by reading from InputProxy and slicing in-memory per rank.
         """
-        module_data: Dict[str, torch.Tensor] = {}
+        module_data: Dict[str, Any] = {}
 
         # Collect unique fields to load across all opened modules
         fields_to_load: Dict[str, Any] = {}
@@ -1033,6 +1048,17 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 fields_to_load[field_name] = field_info
 
         try:
+            injected_vars = getattr(self.input_proxy, "injected_vars", set())
+            unknown_injected = sorted(
+                name for name in injected_vars
+                if name not in fields_to_load
+            )
+            if unknown_injected:
+                raise KeyError(
+                    f"Injected InputProxy variables are not fields of opened modules: {unknown_injected}. "
+                    f"Available module fields: {sorted(fields_to_load)}"
+                )
+
             # Validate required fields exist
             missing_required = [
                 name for name, info in fields_to_load.items()
@@ -1069,6 +1095,24 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 if not t.is_contiguous():
                     t = t.contiguous()
                 return t
+
+            def is_tensor_field(info: Any) -> bool:
+                json_schema_extra = getattr(info, 'json_schema_extra', None)
+                return isinstance(json_schema_extra, dict) and 'tensor_shape' in json_schema_extra
+
+            def prepare_proxy_value(value: Any, info: Any) -> Any:
+                if is_tensor_field(info):
+                    return to_torch(value)
+                if isinstance(value, torch.Tensor):
+                    if value.numel() == 1:
+                        return value.detach().cpu().item()
+                    return value.detach().cpu().numpy()
+                if isinstance(value, np.ndarray):
+                    if value.ndim == 0 or value.size == 1:
+                        return value.item()
+                if isinstance(value, np.generic):
+                    return value.item()
+                return value
 
             # Buckets for logging
             missing_fields = []
@@ -1108,7 +1152,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
                     # Read only the subset
                     local_np = self.input_proxy.get_subset(field_name, slicer)
-                    module_data[field_name] = to_torch(local_np)
+                    module_data[field_name] = prepare_proxy_value(local_np, field_info)
 
                     if idx.size == 0:
                         if group_var not in no_local_fields:
@@ -1121,7 +1165,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                             distributed_fields[key] = []
                         distributed_fields[key].append(field_name)
                 else:
-                    module_data[field_name] = to_torch(self.input_proxy[field_name])
+                    module_data[field_name] = prepare_proxy_value(self.input_proxy[field_name], field_info)
                     full_fields.append(field_name)
 
             # Flush logs
@@ -1334,6 +1378,24 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         for module in v:
             if module not in cls.module_list:
                 raise ValueError(f"Invalid module name: {module}. Available modules: {list(cls.module_list.keys())}")
+        for module in v:
+            module_class = cls.module_list[module]
+            missing_deps = [dep for dep in module_class.dependencies if dep not in v]
+            if missing_deps:
+                raise ValueError(
+                    f"Module '{module}' has missing dependencies in opened_modules: {missing_deps}. "
+                    f"Required dependencies: {module_class.dependencies}. "
+                    f"Available modules: {v}"
+                )
+            present_conflicts = [
+                conflict for conflict in module_class.conflicts
+                if conflict in v and conflict != module
+            ]
+            if present_conflicts:
+                raise ValueError(
+                    f"Module '{module}' conflicts with modules present in opened_modules: "
+                    f"{present_conflicts}. These modules cannot be enabled together."
+                )
         return v
 
     @model_validator(mode="after")
@@ -1403,22 +1465,18 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     else:
                         pairs.append((var, op_l, False))
 
-        # Validate each variable exists and has save_idx
+        # Validate each variable exists.  Variables without ``save_idx`` are
+        # saved as full tensors by the aggregator.
         for var, _, is_explicit in pairs:
             if is_explicit:
                 continue
 
             found = False
-            has_save_idx = False
             for module in self.opened_modules:
                 module_class = self.module_list[module]
                 fields = module_class.model_fields | module_class.model_computed_fields
                 if var in fields:
                     found = True
-                    field_info = fields[var]
-                    extra = getattr(field_info, "json_schema_extra", {})
-                    if extra and extra.get("save_idx") is not None:
-                        has_save_idx = True
                     break
 
             # If not found as direct field, check if it is a valid expression
@@ -1427,12 +1485,9 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                  # we assume it is a mathematical expression.
                  if re.search(r'[^a-zA-Z0-9_]', var):
                      found = True
-                     has_save_idx = True  # We assume expressions are valid for now and let Aggregator handle/validate them.
 
             if not found:
                 raise ValueError(f"Variable '{var}' not found in any opened module.")
-            if not has_save_idx:
-                raise ValueError(f"Variable '{var}' does not have `save_idx` defined, and cannot be saved.")
         return self
 
     @model_validator(mode="after")

@@ -148,9 +148,10 @@ class CommonCodegenMixin:
 
             json_schema_extra = getattr(field_info, 'json_schema_extra', {})
             save_idx = json_schema_extra.get('save_idx')
-            if save_idx not in grouped_by_save_idx:
-                grouped_by_save_idx[save_idx] = []
-            grouped_by_save_idx[save_idx].append(var_name)
+            group_key = "__full__" if save_idx is None else save_idx
+            if group_key not in grouped_by_save_idx:
+                grouped_by_save_idx[group_key] = []
+            grouped_by_save_idx[group_key].append(var_name)
 
         return tensor_info, grouped_by_save_idx
 

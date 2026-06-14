@@ -156,13 +156,35 @@ class DailyBinDataset(AbstractDataset):
             file_path, dtype=self.bin_dtype,
             count=frame_size, offset=frame_idx * frame_size * element_size,
         )
-        data[~(data >= 0)] = 0.0
         data = data.astype(self.out_dtype) / self.unit_factor
+        data = self._apply_value_policy(data)
 
         if self._local_indices is not None:
             return data[self._local_indices][None, :]
         else:
             return data.reshape(1, ny, nx)
+
+    def _get_first_frame_nan_mask(self) -> Optional[np.ndarray]:
+        key, frame_idx = self._dt_to_loc[self.start_date]
+        file_path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
+
+        ny, nx = self.shape
+        frame_size = ny * nx
+        element_size = np.dtype(self.bin_dtype).itemsize
+        data = np.fromfile(
+            file_path,
+            dtype=self.bin_dtype,
+            count=frame_size,
+            offset=frame_idx * frame_size * element_size,
+        )
+        if data.size != frame_size:
+            raise ValueError(
+                f"Could not read first frame from {file_path}; expected "
+                f"{frame_size} values, got {data.size}"
+            )
+        if not np.issubdtype(data.dtype, np.floating):
+            return np.zeros(frame_size, dtype=bool)
+        return np.isnan(data).reshape(-1)
 
     def close(self):
         pass
