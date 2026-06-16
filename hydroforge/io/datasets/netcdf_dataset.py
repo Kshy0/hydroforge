@@ -319,7 +319,6 @@ class NetCDFDataset(AbstractDataset):
         time_to_key: Optional[Callable[[Union[datetime, cftime.datetime]], str]] = yearly_time_to_key,
         time_aggregation: Optional[Union[str, Dict[str, str]]] = None,
         clip_negative: bool = False,
-        skip_nan: bool = True,
         *args,
         **kwargs,
     ):
@@ -352,7 +351,6 @@ class NetCDFDataset(AbstractDataset):
             end_date=end_date,
             chunk_len=chunk_len,
             clip_negative=clip_negative,
-            skip_nan=skip_nan,
             *args,
             **kwargs,
         )
@@ -597,7 +595,7 @@ class NetCDFDataset(AbstractDataset):
             arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
 
         if arr.shape[0] != 1:
-            raise ValueError(f"Expected one frame for skip_nan mask, got shape={arr.shape}")
+            raise ValueError(f"Expected one frame for source NaN mask, got shape={arr.shape}")
         if not np.issubdtype(arr.dtype, np.floating):
             return np.zeros(arr.shape[1] * arr.shape[2], dtype=bool)
         return np.isnan(arr[0]).reshape(-1)
@@ -713,7 +711,6 @@ class MultiVarNetCDFDataset(AbstractDataset):
         unit_factor: float = 1.0,
         suffix: str = ".nc",
         clip_negative: bool = False,
-        skip_nan: bool = True,
         time_to_key: Optional[Callable[[Union[datetime, cftime.datetime]], str]] = yearly_time_to_key,
         spin_up_cycles: int = 0,
         spin_up_start_date: Optional[Union[datetime, cftime.datetime]] = None,
@@ -731,7 +728,6 @@ class MultiVarNetCDFDataset(AbstractDataset):
             unit_factor=unit_factor,
             suffix=suffix,
             clip_negative=clip_negative,
-            skip_nan=skip_nan,
             time_to_key=time_to_key,
             spin_up_cycles=spin_up_cycles,
             spin_up_start_date=spin_up_start_date,
@@ -760,7 +756,6 @@ class MultiVarNetCDFDataset(AbstractDataset):
             time_interval=time_interval,
             chunk_len=int(ref.chunk_len),
             clip_negative=clip_negative,
-            skip_nan=skip_nan,
             spin_up_cycles=spin_up_cycles,
             spin_up_start_date=spin_up_start_date,
             spin_up_end_date=spin_up_end_date,
