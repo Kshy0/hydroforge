@@ -28,6 +28,7 @@ from hydroforge.modeling.model_utils import (ActivePlan, ParameterPlanMixin,
                                              ProgressTracker,
                                              compute_group_to_rank)
 from hydroforge.modeling.module import AbstractModule
+from hydroforge.runtime.backend import KERNEL_BACKEND
 
 
 class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
@@ -88,7 +89,9 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         description=(
             "Enable mixed precision for hpfloat (storage) tensors.\n"
             "When True, hpfloat tensors are promoted one level above base precision:\n"
-            "  float32 → float64, float64 → float64 (no promotion)."
+            "  float32 → float64, float64 → float64 (no promotion).\n"
+            "If omitted, defaults to enabled for cuda/triton backends and "
+            "disabled for metal/other backends."
         ),
     )
     world_size: int = Field(
@@ -167,6 +170,16 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
     # Progress Tracking
     _progress: Optional[ProgressTracker] = PrivateAttr(default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_backend_mixed_precision_default(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or "mixed_precision" in data:
+            return data
+
+        data = dict(data)
+        data["mixed_precision"] = KERNEL_BACKEND in ("cuda", "triton")
+        return data
 
     @model_validator(mode='after')
     def align_output_start_time(self) -> Self:
