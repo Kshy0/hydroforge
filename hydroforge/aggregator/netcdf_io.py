@@ -55,14 +55,6 @@ def _find_data_variable(ncfile, var_name: str):
         return var_name
     if safe in ncfile.variables:
         return safe
-    _skip = {'time', 'trial', 'saved_points', 'levels'}
-    for v in ncfile.variables:
-        vobj = ncfile.variables[v]
-        if v in _skip:
-            continue
-        if vobj.dimensions == ('saved_points',) and vobj.dtype.kind in ('i', 'u'):
-            continue
-        return v
     raise KeyError(
         f"Could not find variable for '{var_name}' (safe: '{safe}') in {ncfile.filepath()}"
     )
@@ -176,6 +168,14 @@ def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]
         output_path = output_dir / filename
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        reserved = {coord_name} if coord_name else set()
+        reserved.update((static_vars or {}).keys())
+        if file_safe_name in reserved:
+            raise ValueError(
+                f"Output variable '{file_safe_name}' conflicts with coordinate "
+                "or static metadata of the same name."
+            )
+
         with nc.Dataset(output_path, 'w', format='NETCDF4') as ncfile:
             # Write global attributes
             ncfile.setncattr('title', f'Time series for rank {rank}: {file_var_name}')
@@ -202,8 +202,14 @@ def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]
                 elif len(logical_dims) != len(data_shape):
                     logical_dims = [f"dim_{i}" for i in range(len(data_shape))]
 
+                # Full coordinate output uses the same axis as selected output.
+                if coord_name and data_shape:
+                    logical_dims[0] = 'saved_points'
+
                 used_dims = set(dim_names)
-                for i, (dim_name, dim_size) in enumerate(zip(logical_dims, data_shape)):
+                for i, (dim_name, dim_size) in enumerate(
+                    zip(logical_dims, data_shape, strict=True)
+                ):
                     nc_dim = sanitize_symbol(str(dim_name)) or f"dim_{i}"
                     if nc_dim in used_dims:
                         nc_dim = f"{nc_dim}_{i}"
@@ -233,6 +239,16 @@ def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]
                     ncfile.createDimension('levels', actual_shape[1])
 
             if coord_name and coord_values is not None:
+                if 'saved_points' not in ncfile.dimensions:
+                    raise ValueError(
+                        f"Output coordinate '{coord_name}' requires saved_points."
+                    )
+                expected_coord_size = ncfile.dimensions['saved_points'].size
+                if len(coord_values) != expected_coord_size:
+                    raise ValueError(
+                        f"Output coordinate '{coord_name}' length "
+                        f"{len(coord_values)} != saved_points {expected_coord_size}."
+                    )
                 coord_var = ncfile.createVariable(
                     coord_name,
                     coord_values.dtype,
@@ -246,6 +262,10 @@ def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]
             # static var on a levels-only output).
             for sv_name, sv_spec in (static_vars or {}).items():
                 sv_dim = sv_spec.get("dim", "saved_points")
+                sv_coord = sv_spec.get("coordinate")
+                output_coord = metadata.get("output_coord")
+                if sv_coord is not None and sv_coord != output_coord:
+                    continue
                 if sv_dim not in ncfile.dimensions:
                     continue
                 sv_values = np.asarray(sv_spec["values"])
@@ -325,7 +345,7 @@ class NetCDFIOMixin:
         with ProcessPoolExecutor(max_workers=actual_workers) as executor:
             items = list(self._metadata.items())
             for out_name, metadata in items:
-                coord_name = metadata.get('save_coord')
+                coord_name = metadata.get('output_coord')
                 coord_values = self._coord_cache.get(coord_name, None)
                 args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank, year, self.calendar, self.time_unit, self.num_trials, self.output_chunksizes, self.static_vars)
                 future = executor.submit(_create_netcdf_file_process, args)
@@ -596,16 +616,16 @@ class NetCDFIOMixin:
                 future.result()
             except Exception as exc:
                 print(f"  Failed to write time step (backlog): {exc}")
-                raise exc
+                raise
 
         # If we are strictly synchronous (max_pending_steps=1), we can clear the list
         # to keep it perfectly clean, although the loop above handles it too.
         if self.max_pending_steps == 1 and len(self._write_futures) >= batch_n:
-             # Wait for the current batch completely (old behavior)
-             for future in self._write_futures:
-                 try:
-                     future.result()
-                 except Exception as exc:
-                     print(f"  Failed to write time step {dt}: {exc}")
-                     raise exc
-             self._write_futures.clear()
+            # Wait for the current batch completely (old behavior)
+            for future in self._write_futures:
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"  Failed to write time step {dt}: {exc}")
+                    raise
+            self._write_futures.clear()

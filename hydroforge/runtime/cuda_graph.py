@@ -294,8 +294,9 @@ class CUDAGraphMixin:
             warmup_iters: Number of warmup iterations before capture (default 3).
                           Warmup compiles Triton kernels and populates CUDA caches.
         """
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA Graph requires a CUDA device")
+        device = torch.device(self.device)  # type: ignore[attr-defined]
+        if not torch.cuda.is_available() or device.type != "cuda":
+            raise RuntimeError("CUDA Graph requires the model on a CUDA device")
         self.__dict__["_cg_enabled"] = True
         self.__dict__["_cg_cache"] = {}          # cache_key -> (graph, input_buffers)
         self.__dict__["_cg_pool"] = torch.cuda.graph_pool_handle()
@@ -377,6 +378,12 @@ class CUDAGraphMixin:
         capture_kwargs = {}
         for name, val in kwargs.items():
             if isinstance(val, torch.Tensor):
+                from hydroforge.runtime.backend import devices_match
+                if not devices_match(val.device, self.device):  # type: ignore[attr-defined]
+                    raise ValueError(
+                        f"CUDA Graph input '{name}' is on {val.device}, "
+                        f"expected {self.device}."  # type: ignore[attr-defined]
+                    )
                 tensor_keys.append(name)
                 buf = input_buffers.get(name)
                 if buf is None or buf.shape != val.shape or buf.dtype != val.dtype:
@@ -454,8 +461,11 @@ class CUDAGraphMixin:
     def enable_conditional_graph(self, *, warmup_iters: int = 3) -> None:
         """Enable device-side conditional-``WHILE`` capture (independent of the
         host-loop CUDA graph cache; can be enabled alongside it)."""
-        if not torch.cuda.is_available():
-            raise RuntimeError("Conditional graph requires a CUDA device")
+        device = torch.device(self.device)  # type: ignore[attr-defined]
+        if not torch.cuda.is_available() or device.type != "cuda":
+            raise RuntimeError(
+                "Conditional graph requires the model on a CUDA device"
+            )
         self.__dict__["_condg_warmup_iters"] = warmup_iters
 
     def build_conditional_graph(
@@ -478,9 +488,22 @@ class CUDAGraphMixin:
         statistics accumulators).  Returns the instantiated graph.
         """
         device = self.device  # type: ignore[attr-defined]
+        extra = list(extra_snapshot or ())
+        from hydroforge.runtime.backend import devices_match
+        if not devices_match(continue_flag.device, device):
+            raise ValueError(
+                f"continue_flag is on {continue_flag.device}, expected {device}."
+            )
+        mismatched = [
+            str(t.device) for t in extra
+            if not devices_match(t.device, device)
+        ]
+        if mismatched:
+            raise ValueError(
+                f"Conditional graph snapshots must be on {device}, got {mismatched}."
+            )
         warmup = self.__dict__.get("_condg_warmup_iters", 3)
         graph = ConditionalWhileGraph()
-        extra = list(extra_snapshot or ())
 
         cur = torch.cuda.current_stream(device)
         side = torch.cuda.Stream(device)
@@ -494,7 +517,7 @@ class CUDAGraphMixin:
                 body_fn(graph, False, sp)
                 graph.set_conditional(continue_flag, False, sp)
             self._cg_restore_state(saved)
-            for live, base in zip(extra, saved_extra):
+            for live, base in zip(extra, saved_extra, strict=True):
                 live.copy_(base)
 
             reset_fn()
@@ -510,7 +533,7 @@ class CUDAGraphMixin:
             graph.instantiate()
         cur.wait_stream(side)
         self._cg_restore_state(saved)
-        for live, base in zip(extra, saved_extra):
+        for live, base in zip(extra, saved_extra, strict=True):
             live.copy_(base)
         return graph
 

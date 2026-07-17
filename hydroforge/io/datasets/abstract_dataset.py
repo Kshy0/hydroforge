@@ -801,8 +801,8 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             time_var.setncattr("units", "seconds since 1900-01-01 00:00:00")
             time_var.setncattr("calendar", "standard")
 
-            save_coord = ds.createVariable("catchment_id", "i8", ("saved_points",))
-            save_coord[:] = catchment_ids
+            output_coord = ds.createVariable("catchment_id", "i8", ("saved_points",))
+            output_coord[:] = catchment_ids
 
             out_var = ds.createVariable(
                 name,

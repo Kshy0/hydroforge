@@ -744,7 +744,9 @@ class MultiVarNetCDFDataset(AbstractDataset):
             self._datasets.append(NetCDFDataset(**kw))
 
         ref = self._datasets[0]
-        for ds, name in zip(self._datasets[1:], self._var_names[1:]):
+        for ds, name in zip(
+            self._datasets[1:], self._var_names[1:], strict=True,
+        ):
             if len(ds) != len(ref):
                 raise ValueError(
                     f"Length mismatch: {self._var_names[0]!r}={len(ref)} vs {name!r}={len(ds)}"
@@ -784,12 +786,15 @@ class MultiVarNetCDFDataset(AbstractDataset):
         return len(self._datasets[0])
 
     def __getitem__(self, idx: int) -> Dict[str, np.ndarray]:
-        return {v: ds[idx] for v, ds in zip(self._var_names, self._datasets)}
+        return {
+            v: ds[idx]
+            for v, ds in zip(self._var_names, self._datasets, strict=True)
+        }
 
     def get_data(self, current_time, chunk_len):
         return {
             v: ds.get_data(current_time, chunk_len)
-            for v, ds in zip(self._var_names, self._datasets)
+            for v, ds in zip(self._var_names, self._datasets, strict=True)
         }
 
     def build_local_mapping(
@@ -823,7 +828,7 @@ class MultiVarNetCDFDataset(AbstractDataset):
     def shard_forcing(self, batch: Dict[str, torch.Tensor], local_mapping) -> Dict[str, torch.Tensor]:
         return {
             v: ds.shard_forcing(batch[v], local_mapping)
-            for v, ds in zip(self._var_names, self._datasets)
+            for v, ds in zip(self._var_names, self._datasets, strict=True)
         }
 
     def iter_loaders(
@@ -856,8 +861,11 @@ class MultiVarNetCDFDataset(AbstractDataset):
             )
             for ds in self._datasets
         ]
-        for batches in zip(*loaders):
-            yield {v: b for v, b in zip(self._var_names, batches)}
+        for batches in zip(*loaders, strict=True):
+            yield {
+                v: b
+                for v, b in zip(self._var_names, batches, strict=True)
+            }
 
     @property
     def total_steps(self) -> int:

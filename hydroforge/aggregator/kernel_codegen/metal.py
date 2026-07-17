@@ -14,6 +14,26 @@ if TYPE_CHECKING:
     from hydroforge.aggregator.aggregator import StatisticsAggregator
 
 
+def _emit_argument_kernel_start(
+    lines: list[str], kernel_name: str, fields: list[tuple[str, str, bool]],
+) -> None:
+    """Emit an argument-buffer struct and kernel entry point directly."""
+    lines.append(f"struct {kernel_name}_args {{")
+    for index, (type_decl, name, scalar) in enumerate(fields):
+        field_type = f"constant {type_decl}*" if scalar else type_decl
+        lines.append(f"    {field_type} {name} [[id({index})]];")
+    lines.extend([
+        "};", "", f"kernel void {kernel_name}(",
+        f"    constant {kernel_name}_args& args [[buffer(0)]],",
+        "    uint tid [[thread_position_in_grid]]", ") {",
+    ])
+    for type_decl, name, scalar in fields:
+        if scalar:
+            lines.append(f"    const {type_decl} {name} = *args.{name};")
+        else:
+            lines.append(f"    {type_decl} {name} = args.{name};")
+
+
 class MetalCodegenMixin:
     """Metal MSL kernel code generation for statistics aggregation."""
 
@@ -80,10 +100,10 @@ class MetalCodegenMixin:
 
     def _generate_metal_full_kernel_for_group(self: StatisticsAggregator,
                                               msl_lines: list,
-                                              save_idx: str, var_list: list,
+                                              output_index: str, var_list: list,
                                               tensor_info: dict) -> dict:
         """Generate a Metal kernel for variables saved at full tensor shape."""
-        kernel_name = f"aggr_kernel_{self._get_safe_name(save_idx)}"
+        kernel_name = f"aggr_kernel_{self._get_safe_name(output_index)}"
 
         sorted_inputs = []
         for var in var_list:
@@ -126,22 +146,19 @@ class MetalCodegenMixin:
 
         full_total = max(int(self._tensor_registry[var].numel()) for var in var_list)
 
-        buf_idx = 0
         arg_order = []
+        abi_fields = []
         I = "    "
 
-        msl_lines.append(f'kernel void {kernel_name}(')
         for inp in sorted_inputs:
             safe_inp = self._get_safe_name(inp)
             ctype = self._metal_dtype_str(inp)
-            msl_lines.append(f'    device const {ctype}* p_{safe_inp} [[buffer({buf_idx})]],')
-            arg_order.append(('tensor', inp))
-            buf_idx += 1
+            abi_fields.append((f'device const {ctype}*', f'p_{safe_inp}', False))
+            arg_order.append(('tensor', inp, 'read'))
 
         for state_key, ctype, pname in out_tensors:
-            msl_lines.append(f'    device {ctype}* {pname} [[buffer({buf_idx})]],')
-            arg_order.append(('tensor', state_key))
-            buf_idx += 1
+            abi_fields.append((f'device {ctype}*', pname, False))
+            arg_order.append(('tensor', state_key, 'read_write'))
 
         varying_scalar_params = [
             ('weight', 'float', '__weight'), ('total_weight', 'float', '__total_weight'),
@@ -151,16 +168,12 @@ class MetalCodegenMixin:
             ('macro_step_index', 'int', '__macro_step_index'),
         ]
         for sname, stype, state_key in varying_scalar_params:
-            msl_lines.append(f'    device const {stype}* p_{sname}_ptr [[buffer({buf_idx})]],')
-            arg_order.append(('tensor', state_key))
-            buf_idx += 1
+            abi_fields.append((f'device const {stype}*', f'p_{sname}_ptr', False))
+            arg_order.append(('tensor', state_key, 'read'))
 
-        msl_lines.append(f'    constant int& n_elements [[buffer({buf_idx})]],')
+        abi_fields.append(('int', 'n_elements', True))
         arg_order.append(('scalar', 'n_elements', 'int'))
-        buf_idx += 1
-
-        msl_lines.append('    uint tid [[thread_position_in_grid]]')
-        msl_lines.append(') {')
+        _emit_argument_kernel_start(msl_lines, kernel_name, abi_fields)
         msl_lines.append(f'{I}if ((int)tid >= n_elements) return;')
         msl_lines.append(f'{I}int out_idx = (int)tid;')
         msl_lines.append('')
@@ -355,7 +368,7 @@ class MetalCodegenMixin:
 
         return {
             'kernel_name': kernel_name,
-            'save_idx': save_idx,
+            'output_index': output_index,
             'full_output': True,
             'n_elements_val': full_total,
             'arg_order': arg_order,
@@ -363,21 +376,21 @@ class MetalCodegenMixin:
 
     def _generate_metal_kernel_for_group(self: StatisticsAggregator,
                                           msl_lines: list,
-                                          save_idx: str, var_list: list,
+                                          output_index: str, var_list: list,
                                           tensor_info: dict) -> dict:
-        """Generate a Metal kernel function for one save_idx group.
+        """Generate a Metal kernel function for one output_index group.
 
         Returns metadata dict used by the Python wrapper.
         """
         from collections import defaultdict
 
-        if save_idx == "__full__":
+        if output_index == "__full__":
             return self._generate_metal_full_kernel_for_group(
-                msl_lines, save_idx, var_list, tensor_info
+                msl_lines, output_index, var_list, tensor_info
             )
 
         num_trials = self.num_trials if self.num_trials > 1 else 1
-        safe_save = self._get_safe_name(save_idx)
+        safe_save = self._get_safe_name(output_index)
         kernel_name = f"aggr_kernel_{safe_save}"
 
         if num_trials > 1:
@@ -456,16 +469,14 @@ class MetalCodegenMixin:
             n_levels_val = actual_shape[-1]
 
         # ---- Build MSL kernel signature with [[buffer(N)]] bindings ----
-        buf_idx = 0
         arg_order = []  # track Python-side arg order: ('tensor', key) or ('scalar', name, msl_type)
+        abi_fields = []
 
         I = "    "
-        msl_lines.append(f'kernel void {kernel_name}(')
 
-        # save_idx buffer
-        msl_lines.append(f'    device const int* p_{safe_save} [[buffer({buf_idx})]],')
-        arg_order.append(('tensor', save_idx))
-        buf_idx += 1
+        # output_index buffer
+        abi_fields.append(('device const int*', f'p_{safe_save}', False))
+        arg_order.append(('tensor', output_index, 'read'))
 
         # input var buffers
         for inp in sorted_inputs:
@@ -473,15 +484,13 @@ class MetalCodegenMixin:
             if safe_inp == safe_save:
                 continue
             ctype = self._metal_dtype_str(inp)
-            msl_lines.append(f'    device const {ctype}* p_{safe_inp} [[buffer({buf_idx})]],')
-            arg_order.append(('tensor', inp))
-            buf_idx += 1
+            abi_fields.append((f'device const {ctype}*', f'p_{safe_inp}', False))
+            arg_order.append(('tensor', inp, 'read'))
 
         # output/state buffers (read-write)
         for state_key, ctype, pname in out_tensors:
-            msl_lines.append(f'    device {ctype}* {pname} [[buffer({buf_idx})]],')
-            arg_order.append(('tensor', state_key))
-            buf_idx += 1
+            abi_fields.append((f'device {ctype}*', pname, False))
+            arg_order.append(('tensor', state_key, 'read_write'))
 
         # varying scalar params → device buffer pointers (avoids host-device sync)
         varying_scalar_params = [
@@ -492,9 +501,8 @@ class MetalCodegenMixin:
             ('macro_step_index', 'int', '__macro_step_index'),
         ]
         for sname, stype, state_key in varying_scalar_params:
-            msl_lines.append(f'    device const {stype}* p_{sname}_ptr [[buffer({buf_idx})]],')
-            arg_order.append(('tensor', state_key))
-            buf_idx += 1
+            abi_fields.append((f'device const {stype}*', f'p_{sname}_ptr', False))
+            arg_order.append(('tensor', state_key, 'read'))
 
         # fixed scalar params (truly constant per-capture)
         fixed_scalar_params = [
@@ -504,13 +512,10 @@ class MetalCodegenMixin:
             fixed_scalar_params.append(('n_levels', 'int'))
 
         for sname, stype in fixed_scalar_params:
-            msl_lines.append(f'    constant {stype}& {sname} [[buffer({buf_idx})]],')
+            abi_fields.append((stype, sname, True))
             arg_order.append(('scalar', sname, stype))
-            buf_idx += 1
 
-        # thread position — last param, no trailing comma
-        msl_lines.append('    uint tid [[thread_position_in_grid]]')
-        msl_lines.append(') {')
+        _emit_argument_kernel_start(msl_lines, kernel_name, abi_fields)
 
         # Bounds check
         msl_lines.append(f'{I}if ((int)tid >= n_saved_points) return;')
@@ -893,7 +898,7 @@ class MetalCodegenMixin:
 
         return {
             'kernel_name': kernel_name,
-            'save_idx': save_idx,
+            'output_index': output_index,
             'sorted_inputs': sorted_inputs,
             'out_tensors': out_tensors,
             'has_2d': has_2d,
@@ -904,17 +909,14 @@ class MetalCodegenMixin:
     def _generate_metal_aggregator_function(self: StatisticsAggregator) -> None:
         """Generate and compile a Metal MSL aggregation kernel.
 
-        Generates raw MSL ``kernel`` functions, compiles them via
-        ``torch.mps.compile_shader()``, and wraps in a Python function with
-        the same interface as the Triton/PyTorch backends.
+        Generates raw MSL kernels and compiles them through HydroForge's
+        native Metal pipeline bridge.
         """
-
-        import torch
 
         if not self._variables:
             raise ValueError("No variables initialized for statistics aggregation")
 
-        tensor_info, grouped_by_save_idx = self._analyze_tensor_info()
+        tensor_info, grouped_by_output_index = self._analyze_tensor_info()
 
         msl_lines = [
             '// Auto-generated Metal aggregation kernels for hydroforge statistics',
@@ -924,30 +926,49 @@ class MetalCodegenMixin:
         ]
 
         group_metas = []
-        for save_idx, var_list in grouped_by_save_idx.items():
+        for output_index, var_list in grouped_by_output_index.items():
             meta = self._generate_metal_kernel_for_group(
-                msl_lines, save_idx, var_list, tensor_info
+                msl_lines, output_index, var_list, tensor_info
             )
             group_metas.append(meta)
 
         msl_src = '\n'.join(msl_lines)
 
-        # Compile
-        compiled_lib = torch.mps.compile_shader(msl_src)
+        from hydroforge.runtime.backend import make_metal_dispatcher
+        dispatchers = {}
+        for meta in group_metas:
+            arg_names = tuple(
+                f"arg_{index}" for index in range(len(meta['arg_order']))
+            )
+            buffer_access = {
+                arg_names[index]: rest[1]
+                for index, (kind, *rest) in enumerate(meta['arg_order'])
+                if kind == 'tensor'
+            }
+            dispatchers[meta['kernel_name']] = make_metal_dispatcher(
+                msl_src,
+                meta['kernel_name'],
+                args=arg_names,
+                size_key='_grid_size',
+                buffer_access=buffer_access,
+                scalar_types={
+                    name: 'int32' for name in arg_names if name not in buffer_access
+                },
+            )
 
         # Build the Python wrapper
-        def _make_wrapper(lib, metas, grouped, ti, self_ref):
+        def _make_wrapper(metal_runtime, compiled, metas, grouped, ti, self_ref):
             # Pre-compute stride_input for each group
             strides = {}
             for meta in metas:
-                si = meta['save_idx']
+                si = meta['output_index']
                 if meta.get('full_output'):
                     strides[si] = 0
                     continue
                 var_list = grouped[si]
                 first_var = var_list[0]
                 stride = 0
-                for out_name, m in self_ref._metadata.items():
+                for m in self_ref._metadata.values():
                     if m['original_variable'] == first_var:
                         stride = m.get('stride_input', 0)
                         break
@@ -955,8 +976,8 @@ class MetalCodegenMixin:
 
             def internal_update_statistics(states, BLOCK_SIZE):
                 for meta in metas:
-                    kernel_fn = getattr(lib, meta['kernel_name'])
-                    si = meta['save_idx']
+                    dispatcher = compiled[meta['kernel_name']]
+                    si = meta['output_index']
                     if meta.get('full_output'):
                         n_threads = meta['n_elements_val']
                         n_saved = n_threads
@@ -983,12 +1004,15 @@ class MetalCodegenMixin:
                             elif sname == 'n_elements':
                                 args.append(meta['n_elements_val'])
 
-                    kernel_fn(*args, threads=n_threads, group_size=256)
+                    dispatcher(**{
+                        **{f'arg_{i}': value for i, value in enumerate(args)},
+                        '_grid_size': n_threads,
+                    })
 
             return internal_update_statistics
 
         self._aggregator_function = _make_wrapper(
-            compiled_lib, group_metas, grouped_by_save_idx, tensor_info, self
+            None, dispatchers, group_metas, grouped_by_output_index, tensor_info, self
         )
         self._aggregator_generated = True
 

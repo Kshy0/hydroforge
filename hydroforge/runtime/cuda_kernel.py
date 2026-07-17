@@ -127,6 +127,8 @@ def _build_fingerprint(
     cuda_sources: Union[str, Sequence[str]],
     functions: Sequence[str],
     extra_cuda_cflags: Sequence[str],
+    extra_ldflags: Sequence[str] = (),
+    extra_include_paths: Sequence[str] = (),
 ) -> dict:
     from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
@@ -137,6 +139,8 @@ def _build_fingerprint(
         "cuda_sha256": hashlib.sha256(_normalise_inline_source(cuda_sources).encode()).hexdigest(),
         "functions": list(functions),
         "extra_cuda_cflags": list(extra_cuda_cflags),
+        "extra_ldflags": list(extra_ldflags),
+        "extra_include_paths": list(extra_include_paths),
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "torch_hip": torch.version.hip,
@@ -485,6 +489,8 @@ def load_inline_cu_module(
     cuda_sources: Union[str, Sequence[str]],
     functions: Sequence[str],
     extra_cuda_cflags: Sequence[str] = ("-O3", "--use_fast_math"),
+    extra_ldflags: Sequence[str] = (),
+    extra_include_paths: Sequence[str] = (),
     verbose: bool = False,
     build_directory: Optional[Union[str, Path]] = None,
     env_prefix: str = "HYDROFORGE",
@@ -534,6 +540,8 @@ def load_inline_cu_module(
         cuda_sources=cuda_sources,
         functions=functions,
         extra_cuda_cflags=extra_cuda_cflags,
+        extra_ldflags=extra_ldflags,
+        extra_include_paths=extra_include_paths,
     )
     digest = hashlib.sha256(
         json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()
@@ -591,6 +599,8 @@ def load_inline_cu_module(
                 cuda_sources=cuda_sources,
                 functions=list(functions),
                 extra_cuda_cflags=list(extra_cuda_cflags),
+                extra_ldflags=list(extra_ldflags),
+                extra_include_paths=list(extra_include_paths),
                 build_directory=str(build_dir),
                 verbose=_verbose,
             )

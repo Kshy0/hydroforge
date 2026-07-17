@@ -21,7 +21,7 @@ class StaticCodegenMixin:
     """Codegen for the one-shot static-variable gather kernel.
 
     ``static_vars`` entries carry a raw tensor plus an optional
-    ``save_idx`` index tensor.  This mixin emits a tiny ``torch.compile``
+    ``output_index`` index tensor.  This mixin emits a tiny ``torch.compile``
     wrapper to a generated .py file and imports it — matching the
     write-file-and-import convention used by the other backend mixins —
     so the gather stays consistent with the rest of hydroforge's
@@ -32,7 +32,7 @@ class StaticCodegenMixin:
         """Generate, write, and import the static-var gather kernel.
 
         Binds the compiled callable to ``self._static_gather_function``.
-        The kernel is invoked once per ``(tensor, save_idx)`` pair at
+        The kernel is invoked once per ``(tensor, output_index)`` pair at
         aggregator init; callers are responsible for detaching and
         moving the result to CPU / numpy.
         """
@@ -45,7 +45,7 @@ class StaticCodegenMixin:
             f'Device: {self.device}',
             '',
             'One-shot gather used at aggregator init to materialise',
-            'static_vars (raw tensor + optional save_idx index tensor)',
+            'static_vars (raw tensor + optional output_index index tensor)',
             'into saved-point order for the NetCDF writer.',
             '"""',
             '',
@@ -56,11 +56,11 @@ class StaticCodegenMixin:
             '',
             '@torch.compile(dynamic=True)',
             'def gather_static_var(tensor: torch.Tensor,',
-            '                      save_idx: Optional[torch.Tensor]'
+            '                      output_index: Optional[torch.Tensor]'
             ') -> torch.Tensor:',
-            '    if save_idx is None:',
+            '    if output_index is None:',
             '        return tensor',
-            '    return tensor[save_idx]',
+            '    return tensor[output_index]',
             '',
         ])
 

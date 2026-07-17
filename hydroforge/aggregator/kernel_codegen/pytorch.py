@@ -20,10 +20,6 @@ if TYPE_CHECKING:
 class PyTorchCodegenMixin:
     """PyTorch (torch.compile) code generation for statistics aggregation."""
 
-    # ========================================================================
-    # PyTorch code generation (no Triton dependency)
-    # ========================================================================
-
     # PyTorch code generation (no Triton dependency)
     # ========================================================================
 
@@ -302,9 +298,9 @@ class PyTorchCodegenMixin:
                 lines.append('')
 
     def _generate_pytorch_group_function(self: StatisticsAggregator, lines: List[str],
-                                          save_idx: str, var_list: List[str],
+                                          output_index: str, var_list: List[str],
                                           tensor_info: Dict[str, Any]) -> None:
-        """Generate a PyTorch function for one save_idx group."""
+        """Generate a PyTorch function for one output_index group."""
         num_trials = self.num_trials if self.num_trials > 1 else 1
 
         if num_trials > 1:
@@ -314,11 +310,12 @@ class PyTorchCodegenMixin:
             dims_1d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 1]
             dims_2d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 2]
 
-        func_name = f"_update_{save_idx}"
+        func_name = f"_update_{output_index}"
         lines.extend([
             f'def {func_name}(states, weight, total_weight, num_macro_steps,',
             '               sub_step, num_sub_steps, flags,',
             '               macro_step_index, num_trials, stride_input):',
+            '    states = {key: value.reshape(-1) for key, value in states.items()}',
         ])
         needed_bools = self._analyze_needed_booleans()
         if needed_bools:
@@ -334,7 +331,7 @@ class PyTorchCodegenMixin:
             if 'is_outer_last' in needed_bools:
                 lines.append('    is_outer_last = ((flags >> 3) & 1) != 0 and is_inner_last')
         lines.extend([
-            f'    idx = states["{save_idx}"]',
+            f'    idx = states["{output_index}"]',
             '    n = len(idx)',
             '',
         ])
@@ -712,22 +709,15 @@ class PyTorchCodegenMixin:
                 n_levels = actual_shape[-1]
                 lines.append(f'{indent}n_levels = {n_levels}')
 
-                info = self._field_registry.get(var)
-                cat = getattr(info, 'json_schema_extra', {}).get('category', 'param')
-
                 for op in self._variable_ops[var]:
                     out_key = f'{var}_{op}'
                     lines.append(f'{indent}# 2D {op} for {safe_var}')
                     lines.append(f'{indent}for level in range(n_levels):')
-
-                    if cat == 'virtual':
-                        # Virtual with 2D - load dependencies
-                        expr = getattr(info, 'json_schema_extra', {}).get('expr', '')
-                        lines.append(f'{indent2}# virtual: {expr}')
-                        lines.append(f'{indent2}pass  # TODO: 2D virtual expression')
-                    else:
-                        lines.append(f'{indent2}_in_idx = (t * stride_input + idx) * n_levels + level')
-                        lines.append(f'{indent2}_val = states["{var}"][_in_idx]')
+                    emitted: set[str] = set()
+                    var_val = self._pytorch_emit_val_load(
+                        var, lines, emitted, indent2, is_2d=True,
+                    )
+                    lines.append(f'{indent2}_val = {var_val}')
 
                     lines.append(f'{indent2}_out_idx = (t * n + torch.arange(n, device=idx.device)) * n_levels + level')
 
@@ -778,11 +768,11 @@ class PyTorchCodegenMixin:
         lines.append('')
 
     def _generate_pytorch_main_function(self: StatisticsAggregator, lines: List[str],
-                                         grouped_by_save_idx: Dict[str, List[str]],
+                                         grouped_by_output_index: Dict[str, List[str]],
                                          tensor_info: Dict[str, Any]) -> None:
         """Generate the main entry-point function that calls per-group functions."""
         num_trials = self.num_trials if self.num_trials > 1 else 1
-        full_vars = grouped_by_save_idx.get("__full__", [])
+        full_vars = grouped_by_output_index.get("__full__", [])
         if not full_vars:
             lines.append('@torch.compile')
         lines.extend([
@@ -804,12 +794,12 @@ class PyTorchCodegenMixin:
                 '                     sub_step, num_sub_steps, flags, macro_step_index)',
             ])
 
-        for save_idx, var_list in grouped_by_save_idx.items():
-            if save_idx == "__full__":
+        for output_index, var_list in grouped_by_output_index.items():
+            if output_index == "__full__":
                 continue
             first_var = var_list[0]
             stride_input = 0
-            for out_name, meta in self._metadata.items():
+            for meta in self._metadata.values():
                 if meta['original_variable'] == first_var:
                     stride_input = meta.get('stride_input', 0)
                     break
@@ -855,7 +845,7 @@ class PyTorchCodegenMixin:
                 lines.append('')
 
             lines.extend([
-                f'    _update_{save_idx}(states, weight, total_weight, num_macro_steps,',
+                f'    _update_{output_index}(states, weight, total_weight, num_macro_steps,',
                 '                      sub_step, num_sub_steps, flags,',
                 f'                      macro_step_index, num_trials, {stride_input})',
             ])
@@ -866,19 +856,19 @@ class PyTorchCodegenMixin:
         if not self._variables:
             raise ValueError("No variables initialized for statistics aggregation")
 
-        tensor_info, grouped_by_save_idx = self._analyze_tensor_info()
+        tensor_info, grouped_by_output_index = self._analyze_tensor_info()
 
         lines = self._generate_pytorch_header()
 
-        full_vars = grouped_by_save_idx.get("__full__", [])
+        full_vars = grouped_by_output_index.get("__full__", [])
         self._generate_pytorch_full_function(lines, full_vars, tensor_info)
 
-        for save_idx, var_list in grouped_by_save_idx.items():
-            if save_idx == "__full__":
+        for output_index, var_list in grouped_by_output_index.items():
+            if output_index == "__full__":
                 continue
-            self._generate_pytorch_group_function(lines, save_idx, var_list, tensor_info)
+            self._generate_pytorch_group_function(lines, output_index, var_list, tensor_info)
 
-        self._generate_pytorch_main_function(lines, grouped_by_save_idx, tensor_info)
+        self._generate_pytorch_main_function(lines, grouped_by_output_index, tensor_info)
 
         kernel_code = "\n".join(lines)
         self._write_and_import_kernels(kernel_code)

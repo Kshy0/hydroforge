@@ -159,8 +159,8 @@ class ExportedDataset(NetCDFDataset):
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
         """Return catchment coordinate arrays.
 
-        Returns (save_coord, index) where:
-          - save_coord: linear catchment id array of shape (C,)
+        Returns (output_coord, index) where:
+          - output_coord: linear catchment id array of shape (C,)
           - index: simple 0..C-1 integer array of shape (C,)
         """
         key = self.time_to_key(self.start_date)
@@ -816,10 +816,11 @@ class ExportedDataset(NetCDFDataset):
             ``data``.
         desired_catchment_ids : np.ndarray
             Shape ``(N_desired,)`` int64 — the column order the consumer
-            expects (typically ``model.base.inflow_catchment_id``).
+            expects (typically ``model.inflow.inflow_catchment_id``).
         desired_basin_ids : np.ndarray
             Shape ``(N_desired,)`` int64 — basin id of each desired
-            column (typically ``model.base.inflow_basin_id``).  Used to
+            column (typically ``model.base.catchment_basin_id["
+            "model.inflow.inflow_catchment_idx]``). Used to
             coordinate per-basin (shift, length).
         """
         data = np.asarray(data, dtype=np.float32)
@@ -833,6 +834,11 @@ class ExportedDataset(NetCDFDataset):
                 f"attach_inflow_overlay: data_catchment_ids shape "
                 f"{src_cids.shape} does not match data columns {data.shape[1]}")
         dst_cids = np.asarray(desired_catchment_ids, dtype=np.int64)
+        if np.unique(dst_cids).size != dst_cids.size:
+            raise ValueError(
+                "attach_inflow_overlay: desired_catchment_ids must be unique; "
+                "aggregate duplicate gauges on the dataset side"
+            )
         dst_basin = np.asarray(desired_basin_ids, dtype=np.int64)
         if dst_basin.shape != dst_cids.shape:
             raise ValueError(
@@ -840,15 +846,25 @@ class ExportedDataset(NetCDFDataset):
                 f"{dst_basin.shape} != desired_catchment_ids shape "
                 f"{dst_cids.shape}")
 
-        col_pos = find_indices_in(dst_cids, src_cids)
-        if np.any(col_pos == -1):
-            missing = int((col_pos == -1).sum())
+        source_groups = [np.flatnonzero(src_cids == cid) for cid in dst_cids]
+        missing = sum(group.size == 0 for group in source_groups)
+        if missing:
             raise ValueError(
                 f"attach_inflow_overlay: {missing} desired catchment IDs "
                 f"not found in data_catchment_ids")
 
-        # 1. Reorder columns, 2. align time axis to dataset window.
-        data_reordered = np.ascontiguousarray(data[:, col_pos])
+        # Aggregate all source gauges mapped to the same injection catchment.
+        # Preserve NaN when every contributing gauge is missing at a time step.
+        data_reordered = np.empty((data.shape[0], dst_cids.size), dtype=np.float32)
+        for c, cols in enumerate(source_groups):
+            values = data[:, cols]
+            all_missing = np.isnan(values).all(axis=1)
+            total = np.nansum(values, axis=1, dtype=np.float32)
+            total[all_missing] = np.nan
+            data_reordered[:, c] = total
+        data_reordered = np.ascontiguousarray(data_reordered)
+
+        # Align time axis to the dataset window.
         aligned_raw = self._align_overlay_data(data_reordered, data_start_date)
 
         # 3. Per-column longest valid run on the aligned (dataset-window)
@@ -1103,7 +1119,9 @@ class MultiVarExportedDataset(AbstractDataset):
 
         ref_len = len(self._datasets[0])
         ref_chunk_len = int(self._datasets[0].chunk_len)
-        for ds, name in zip(self._datasets[1:], self._var_names[1:]):
+        for ds, name in zip(
+            self._datasets[1:], self._var_names[1:], strict=True,
+        ):
             if len(ds) != ref_len:
                 raise ValueError(
                     f"Length mismatch: {self._var_names[0]!r}={ref_len} "
@@ -1130,7 +1148,9 @@ class MultiVarExportedDataset(AbstractDataset):
         # via ``build_local_mapping`` (each child resolves its own ordering).
         ref_ids, _ = self._datasets[0].get_coordinates()
         ref_set = set(int(x) for x in ref_ids)
-        for ds, name in zip(self._datasets[1:], self._var_names[1:]):
+        for ds, name in zip(
+            self._datasets[1:], self._var_names[1:], strict=True,
+        ):
             ids, _ = ds.get_coordinates()
             if set(int(x) for x in ids) != ref_set:
                 raise ValueError(
@@ -1169,7 +1189,7 @@ class MultiVarExportedDataset(AbstractDataset):
     def get_data(self, current_time: datetime, chunk_len: int):
         return {
             v: ds.get_data(current_time, chunk_len)
-            for v, ds in zip(self._var_names, self._datasets)
+            for v, ds in zip(self._var_names, self._datasets, strict=True)
         }
 
     def close(self) -> None:
@@ -1180,7 +1200,10 @@ class MultiVarExportedDataset(AbstractDataset):
         return len(self._datasets[0])
 
     def __getitem__(self, idx: int):
-        return {v: ds[idx] for v, ds in zip(self._var_names, self._datasets)}
+        return {
+            v: ds[idx]
+            for v, ds in zip(self._var_names, self._datasets, strict=True)
+        }
 
     def shard_forcing(self, batch):
         """Flatten per-variable ``(B, T, C) -> (B*T, C)`` chunks.
@@ -1188,7 +1211,10 @@ class MultiVarExportedDataset(AbstractDataset):
         Mirrors :meth:`ExportedDataset.shard_forcing` but operates on the
         dict produced by :meth:`__getitem__` / DataLoader collation.
         """
-        return {v: ds.shard_forcing(batch[v]) for v, ds in zip(self._var_names, self._datasets)}
+        return {
+            v: ds.shard_forcing(batch[v])
+            for v, ds in zip(self._var_names, self._datasets, strict=True)
+        }
 
     def build_local_mapping(self, desired_catchment_ids: np.ndarray) -> None:
         """Reorder columns per variable to match ``desired_catchment_ids``.

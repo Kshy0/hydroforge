@@ -25,6 +25,8 @@ from hydroforge.modeling.input_proxy import InputProxy
 from hydroforge.modeling.model import AbstractModel
 from hydroforge.modeling.module import (AbstractModule, TensorField,
                                         computed_tensor_field)
+from hydroforge.modeling.schema import (ModuleFieldSchema, ModuleSchema,
+                                        parse_module_schema)
 from hydroforge.runtime.cuda_graph import CUDAGraphMixin
 
 __all__ = [
@@ -32,6 +34,8 @@ __all__ = [
     "AbstractModule",
     "CUDAGraphMixin",
     "InputProxy",
+    "ModuleFieldSchema",
+    "ModuleSchema",
     "TensorField",
     "computed_tensor_field",
     "find_indices_in",
@@ -40,6 +44,7 @@ __all__ = [
     "get_local_rank",
     "get_world_size",
     "is_rank_zero",
+    "parse_module_schema",
     "setup_distributed",
     "torch_to_numpy_dtype",
 ]

@@ -109,13 +109,13 @@ class CommonCodegenMixin:
         return needed
 
     def _analyze_tensor_info(self: StatisticsAggregator):
-        """Analyze tensor information and group variables by save_idx.
+        """Analyze tensor information and group variables by output_index.
 
         Returns:
-            (tensor_info, grouped_by_save_idx) tuple.
+            (tensor_info, grouped_by_output_index) tuple.
         """
         tensor_info = {}
-        grouped_by_save_idx = {}
+        grouped_by_output_index = {}
 
         # Iterate in sorted order: ``self._variables`` is a ``set``, whose
         # string iteration order is randomised per process (PYTHONHASHSEED).
@@ -147,13 +147,13 @@ class CommonCodegenMixin:
                 }
 
             json_schema_extra = getattr(field_info, 'json_schema_extra', {})
-            save_idx = json_schema_extra.get('save_idx')
-            group_key = "__full__" if save_idx is None else save_idx
-            if group_key not in grouped_by_save_idx:
-                grouped_by_save_idx[group_key] = []
-            grouped_by_save_idx[group_key].append(var_name)
+            output_index = json_schema_extra.get('output_index')
+            group_key = "__full__" if output_index is None else output_index
+            if group_key not in grouped_by_output_index:
+                grouped_by_output_index[group_key] = []
+            grouped_by_output_index[group_key].append(var_name)
 
-        return tensor_info, grouped_by_save_idx
+        return tensor_info, grouped_by_output_index
 
 
     # ========================================================================

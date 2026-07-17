@@ -11,6 +11,7 @@ This is the highest level abstraction that all modules inherit from.
 from __future__ import annotations
 
 from abc import ABC
+from numbers import Integral
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Self, Tuple
 
 import torch
@@ -18,18 +19,24 @@ from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
                       computed_field, field_validator, model_validator)
 from pydantic.fields import FieldInfo
 
+from hydroforge.modeling.distributed import find_indices_in_torch
+
 
 def TensorField(
     description: str,
     shape: Tuple[str, ...],
     dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
-    group_by: Optional[str] = None,
-    save_idx: Optional[str] = None,
-    save_coord: Optional[str] = None,
     dim_coords: Optional[str] = None,
     category: Literal["topology", "param", "init_state", "state"] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
     is_key: bool = False,
+    is_coordinate: bool = False,
+    partition_by: Optional[str] = None,
+    references: Optional[str] = None,
+    selects: Optional[str] = None,
+    replicated: bool = False,
+    allow_empty: bool = False,
+    output: Literal["auto", "full", "disabled"] = "auto",
     **kwargs
 ):
     """
@@ -44,10 +51,16 @@ def TensorField(
         description: Human-readable description of the variable
         shape: Tuple of dimension names (scalar variable names)
         dtype: Data type ('float', 'int', 'idx', 'bool', 'hpfloat')
-        group_by: Name of the variable that indicates basin membership for this tensor.
-                       If None, the full data will be loaded without distribution.
         dim_coords: Variable name that provides coordinates (IDs) for the 0th dimension.
                     Useful for selecting elements by ID (e.g. for parameter changes).
+        replicated: Coordinate ownership exception.  ``True`` means every rank
+                    receives the complete coordinate and its aligned fields.
+                    Valid only for CoordinateField declarations.
+        allow_empty: Whether a tensor may contain a zero-length declared axis.
+                     Ordinary model dimensions are non-empty by default.
+        output: Output policy. ``auto`` inherits the default SelectionField for
+                ``dim_coords``; ``full`` writes the full local axis; ``disabled``
+                rejects explicit output requests.
         category: Category of the variable:
                   - 'topology': Static structure (NEVER batched)
                   - 'param': Input parameter (can be batched)
@@ -58,39 +71,177 @@ def TensorField(
                   - 'discard': Set to None after initialization to maximize memory saving
         **kwargs: Additional Field parameters
     """
-    if dtype not in ("float", "hpfloat"):
-        save_idx = None
-
-    if save_idx is None:
-        save_coord = None
-
+    legacy = {"group_by", "save_idx", "save_coord", "partition", "locality"}
+    unsupported = sorted(legacy.intersection(kwargs))
+    if unsupported:
+        names = ", ".join(unsupported)
+        raise TypeError(
+            f"TensorField no longer accepts {names}; declare coordinate relations "
+            "with dim_coords/CoordinateField/ReferenceField/SelectionField instead"
+        )
     return Field(
         description=description,
         **kwargs,
         json_schema_extra={
             "tensor_shape": list(shape),
             "tensor_dtype": dtype,
-            "group_by": group_by,
-            "save_idx": save_idx,
-            "save_coord": save_coord,
             "dim_coords": dim_coords,
             "category": category,
             "mode": mode,
             "is_key": is_key,
+            "is_coordinate": is_coordinate,
+            "partition_by": partition_by,
+            "references": references,
+            "selects": selects,
+            "replicated": replicated,
+            "allow_empty": allow_empty,
+            "output": output,
         }
     )
+
+
+def CoordinateField(
+    description: str,
+    shape: Tuple[str, ...],
+    dtype: Literal["int", "idx"] = "int",
+    partition_by: Optional[str] = None,
+    references: Optional[str] = None,
+    replicated: bool = False,
+    **kwargs,
+):
+    """Declare an axis coordinate; ownership is inferred from its relations."""
+    return TensorField(
+        description=description,
+        shape=shape,
+        dtype=dtype,
+        dim_coords=None,
+        category="topology",
+        mode="cpu",
+        is_key=True,
+        is_coordinate=True,
+        partition_by=partition_by,
+        references=references,
+        replicated=replicated,
+        **kwargs,
+    )
+
+
+def SelectionField(
+    description: str,
+    shape: Tuple[str, ...],
+    selects: str,
+    dtype: Literal["int", "idx"] = "int",
+    allow_empty: bool = True,
+    **kwargs,
+):
+    """Declare a unique coordinate subset used as the default output view."""
+    return TensorField(
+        description=description,
+        shape=shape,
+        dtype=dtype,
+        dim_coords=None,
+        category="topology",
+        mode="cpu",
+        is_key=True,
+        is_coordinate=True,
+        references=selects,
+        selects=selects,
+        allow_empty=allow_empty,
+        output="disabled",
+        **kwargs,
+    )
+
+
+def ReferenceField(
+    description: str,
+    shape: Tuple[str, ...],
+    references: str,
+    dim_coords: str,
+    dtype: Literal["int", "idx"] = "int",
+    **kwargs,
+):
+    """Declare a globally valid foreign key to another coordinate."""
+    return TensorField(
+        description=description,
+        shape=shape,
+        dtype=dtype,
+        dim_coords=dim_coords,
+        category="topology",
+        mode="cpu",
+        references=references,
+        **kwargs,
+    )
+
+
+class _ReferenceIndexDescriptor:
+    """Address-stable, lazily derived local index for a reference field."""
+
+    def __init__(self, reference: str, *, inverse: bool, device: bool) -> None:
+        self.reference = reference
+        self.inverse = inverse
+        self.device = device
+        self.name = ""
+
+    def __set_name__(self, owner, name: str) -> None:
+        self.name = name
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        cache_name = f"__derived_reference_index_{self.name}"
+        cached = instance.__dict__.get(cache_name)
+        if cached is None:
+            if self.inverse:
+                cached = instance.inverse_reference_index(self.reference)
+            else:
+                cached = instance.reference_index(self.reference)
+            if self.device:
+                cached = cached.to(instance.device)
+            instance.__dict__[cache_name] = cached
+        return cached
+
+    def field_info(self, owner: type["AbstractModule"]) -> FieldInfo:
+        """Build tensor metadata from the referenced relation field."""
+        reference_info = owner.get_model_fields().get(self.reference)
+        if reference_info is None:
+            raise TypeError(
+                f"ReferenceIndexField '{self.name}' refers to unknown field "
+                f"'{self.reference}'"
+            )
+        reference_extra = reference_info.json_schema_extra or {}
+        return Field(
+            description=f"Local index derived from {self.reference}",
+            json_schema_extra={
+                "tensor_shape": reference_extra.get("tensor_shape", []),
+                "tensor_dtype": "idx",
+                "dim_coords": reference_extra.get("dim_coords"),
+                "category": "topology",
+                "output": "disabled",
+            },
+        )
+
+
+def ReferenceIndexField(
+    reference: str, *, inverse: bool = False, device: bool = True,
+):
+    """Declare an automatically derived local index for a reference field.
+
+    ``inverse=False`` maps every relation row to its referenced local row;
+    ``inverse=True`` maps every target row back to its unique relation row,
+    using ``-1`` when it is not referenced.
+    """
+    return _ReferenceIndexDescriptor(reference, inverse=inverse, device=device)
 
 def computed_tensor_field(
     description: str,
     shape: Tuple[str, ...],
     dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
-    save_idx: Optional[str] = None,
-    save_coord: Optional[str] = None,
     dim_coords: Optional[str] = None,
     category: Literal["topology", "derived_param", "state", "shared_state", "virtual"] = "derived_param",
     expr: Optional[str] = None,
     depends_on: Optional[str] = None,
-    static_output: bool = False,
+    output: Literal["auto", "full", "disabled"] = "auto",
+    allow_empty: bool = False,
     **kwargs
 ):
     """
@@ -100,9 +251,8 @@ def computed_tensor_field(
         description: Human-readable description of the variable
         shape: Tuple of dimension names (scalar variable names)
         dtype: Data type ('float', 'int', 'idx', 'bool', 'hpfloat')
-        group_by: Name of the variable that indicates basin membership for this tensor.
-                       If None, the full data will be loaded without distribution.
         dim_coords: Variable name that provides coordinates (IDs) for the 0th dimension.
+        output: Output policy (``auto``, ``full``, or ``disabled``).
         category: Category of the variable:
                   - 'topology': Static structure (NEVER batched)
                   - 'derived_param': Computed parameter (can be batched)
@@ -110,32 +260,36 @@ def computed_tensor_field(
                   - 'shared_state': Computed state variable (NEVER batched)
                   - 'virtual': Computed on-demand during analysis/output (not stored in memory)
         expr: Expression string for virtual variables
-        depends_on: Module name that must be in ``opened_modules`` for this field
-                    to be created. When the dependency is absent, the cached_property
-                    should return ``None`` and the framework will skip validation.
+        depends_on: Optional module that must be active before this computed
+            tensor is evaluated or validated.
+        allow_empty: Whether a symbolic tensor dimension may resolve to zero.
         **kwargs: Additional computed_field parameters
     """
+    legacy = {
+        "group_by", "save_idx", "save_coord", "partition", "locality",
+        "static_output",
+    }
+    unsupported = sorted(legacy.intersection(kwargs))
+    if unsupported:
+        names = ", ".join(unsupported)
+        raise TypeError(
+            f"computed_tensor_field no longer accepts {names}; output selection "
+            "is inferred from dim_coords and SelectionField"
+        )
     if expr is not None and category != "virtual":
         raise ValueError("expr can only be provided when category is 'virtual'")
-
-    if dtype not in ("float", "hpfloat") and not static_output:
-        save_idx = None
-
-    if save_idx is None:
-        save_coord = None
 
     return computed_field(
         description=description,
         json_schema_extra={
             "tensor_shape": list(shape),
             "tensor_dtype": dtype,
-            "save_idx": save_idx,
-            "save_coord": save_coord,
             "dim_coords": dim_coords,
             "category": category,
             "expr": expr,
             "depends_on": depends_on,
-            "static_output": static_output,
+            "allow_empty": allow_empty,
+            "output": output,
         },
         **kwargs
     )
@@ -161,7 +315,8 @@ class AbstractModule(BaseModel, ABC):
     model_config = ConfigDict(
         arbitrary_types_allowed=True,  # Allow torch.Tensor types
         validate_assignment=False,      # Validate on assignment
-        extra='ignore'
+        extra='ignore',
+        ignored_types=(_ReferenceIndexDescriptor,),
     )
 
     # Module metadata - must be overridden in subclasses
@@ -169,9 +324,9 @@ class AbstractModule(BaseModel, ABC):
     description: ClassVar[str] = "Abstract base module"
     dependencies: ClassVar[List[str]] = []  # List of modules this module depends on
     conflicts: ClassVar[List[str]] = []  # List of modules that cannot co-exist with this module
-    group_by: ClassVar[Optional[str]] = None  # Variable indicating basin membership
     nc_excluded_fields: ClassVar[List[str]] = [
-        "opened_modules", "device", "precision", "mixed_precision", "rank"
+        "opened_modules", "device", "precision", "mixed_precision", "rank",
+        "num_trials",
     ]  # Fields to exclude from HDF5
 
     opened_modules: List[str] = Field(
@@ -240,6 +395,11 @@ class AbstractModule(BaseModel, ABC):
         self.validate_tensors()
         self.init_optional_tensors()
         self.validate_computed_tensors()
+        # Derived reference indices are declared as descriptors rather than
+        # Pydantic computed fields, but retain eager topology validation and
+        # device placement during module initialization.
+        for name in self.get_reference_index_fields():
+            getattr(self, name)
 
     @classmethod
     def get_model_fields(cls) -> Dict[str, FieldInfo]:
@@ -249,6 +409,120 @@ class AbstractModule(BaseModel, ABC):
     def get_model_computed_fields(cls) -> Dict[str, Any]:
         return cls.model_computed_fields
 
+    @classmethod
+    def get_reference_index_fields(cls) -> Dict[str, _ReferenceIndexDescriptor]:
+        fields: Dict[str, _ReferenceIndexDescriptor] = {}
+        for owner in reversed(cls.mro()):
+            for name, value in vars(owner).items():
+                if isinstance(value, _ReferenceIndexDescriptor):
+                    fields[name] = value
+        return fields
+
+    @classmethod
+    def get_reference_index_field_info(cls, name: str) -> Optional[FieldInfo]:
+        descriptor = cls.get_reference_index_fields().get(name)
+        return descriptor.field_info(cls) if descriptor is not None else None
+
+    @classmethod
+    def get_tensor_field_info(cls, name: str) -> Optional[FieldInfo]:
+        """Resolve regular, computed, and derived-index tensor metadata."""
+        return (
+            cls.get_model_fields().get(name)
+            or cls.get_model_computed_fields().get(name)
+            or cls.get_reference_index_field_info(name)
+        )
+
+    def _reference_target(self, field_name: str) -> Tuple[str, torch.Tensor]:
+        """Resolve the uniquely visible tensor referenced by ``field_name``."""
+        field_info = self.get_model_fields().get(field_name)
+        extra = getattr(field_info, "json_schema_extra", {}) or {}
+        target_name = extra.get("references")
+        if not target_name:
+            raise ValueError(f"Field '{field_name}' does not declare references.")
+
+        parts = target_name.split(".")
+        attr_name = parts[-1]
+        candidates: List[torch.Tensor] = []
+        if len(parts) > 1:
+            owner_name = parts[-2]
+            owner = self if owner_name == self.module_name else getattr(
+                self, owner_name, None
+            )
+            value = getattr(owner, attr_name, None) if owner is not None else None
+            if isinstance(value, torch.Tensor):
+                candidates.append(value)
+        else:
+            value = getattr(self, attr_name, None)
+            if isinstance(value, torch.Tensor):
+                candidates.append(value)
+            for dependency in self.dependencies:
+                owner = getattr(self, dependency, None)
+                value = getattr(owner, attr_name, None) if owner is not None else None
+                if isinstance(value, torch.Tensor):
+                    candidates.append(value)
+        if len(candidates) != 1:
+            raise ValueError(
+                f"Reference target '{target_name}' for '{field_name}' resolved "
+                f"to {len(candidates)} local tensors; use a qualified reference."
+            )
+        return target_name, candidates[0]
+
+    def reference_index(
+        self,
+        field_name: str,
+        target: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Resolve a ReferenceField to rank-local indices.
+
+        ``ReferenceField`` itself guarantees only foreign-key semantics.  This
+        method is the explicit request for a local array representation and
+        therefore fails if any referenced ID is not colocated on this rank.
+        """
+        values = getattr(self, field_name)
+        if not isinstance(values, torch.Tensor):
+            raise TypeError(f"Reference field '{field_name}' is not a tensor.")
+
+        if target is None:
+            target_name, target = self._reference_target(field_name)
+        else:
+            field_info = self.get_model_fields().get(field_name)
+            extra = getattr(field_info, "json_schema_extra", {}) or {}
+            target_name = extra.get("references")
+
+        indices = find_indices_in_torch(values, target)
+        missing = indices < 0
+        if torch.any(missing):
+            examples = values[missing][:5].detach().cpu().tolist()
+            raise ValueError(
+                f"Reference field '{field_name}' is not local on rank {self.rank}; "
+                f"IDs absent from '{target_name}' include {examples}."
+            )
+        return indices
+
+    def inverse_reference_index(
+        self,
+        field_name: str,
+        target: Optional[torch.Tensor] = None,
+        *,
+        fill_value: int = -1,
+    ) -> torch.Tensor:
+        """Return referencing-row indices aligned to the target coordinate."""
+        if target is None:
+            _, target = self._reference_target(field_name)
+        indices = self.reference_index(field_name, target)
+        if indices.numel() and torch.unique(indices).numel() != indices.numel():
+            raise ValueError(
+                f"Reference field '{field_name}' contains duplicate target "
+                "references and therefore has no unique inverse."
+            )
+        inverse = torch.full(
+            (target.shape[0],), fill_value,
+            dtype=torch.int32, device=indices.device,
+        )
+        inverse[indices.to(torch.int64)] = torch.arange(
+            indices.numel(), dtype=torch.int32, device=indices.device,
+        )
+        return inverse
 
     def init_optional_tensors(self) -> None:
         """
@@ -338,12 +612,28 @@ class AbstractModule(BaseModel, ABC):
                 raise ValueError(f"Dimension {dim_name} not found in module")
 
         shape = tuple(scalar_values[dim] for dim in shape_spec)
+        allow_empty = bool(json_schema_extra.get("allow_empty", False))
+        for dim_name, size in zip(shape_spec, shape, strict=True):
+            if isinstance(size, bool) or not isinstance(size, Integral):
+                raise TypeError(
+                    f"Dimension '{dim_name}' used by field '{field_name}' must "
+                    f"be an integer, got {type(size).__name__}"
+                )
+            if size < 0 or (size == 0 and not allow_empty):
+                requirement = "non-negative" if allow_empty else "positive"
+                raise ValueError(
+                    f"Dimension '{dim_name}' used by field '{field_name}' must "
+                    f"be {requirement}, got {size}"
+                )
 
         category = json_schema_extra.get('category', 'param')
         if self.num_trials is not None:
-             if category in ('state', 'init_state') or \
-                (category in ('param', 'derived_param') and field_name in self._expanded_params):
-                 return (self.num_trials,) + shape
+            is_batched = category in ('state', 'init_state') or (
+                category in ('param', 'derived_param')
+                and field_name in self._expanded_params
+            )
+            if is_batched:
+                return (self.num_trials,) + shape
 
         return shape
 
@@ -598,7 +888,7 @@ class AbstractModule(BaseModel, ABC):
         all_fields = self.get_model_fields().copy()
         all_fields.update(self.get_model_computed_fields())
 
-        for name, field_info in all_fields.items():
+        for name in all_fields:
 
             # Get the value
             if not hasattr(self, name):
@@ -636,13 +926,33 @@ class AbstractModule(BaseModel, ABC):
             return tensor[indices]
 
 
-    def _is_batched(self, tensor: torch.Tensor) -> bool:
-        """
-        Check if a tensor is batched (has num_trials as first dimension).
+    def is_batched(self, field: str | torch.Tensor) -> bool:
+        """Return whether a tensor has HydroForge's leading trial axis.
+
+        Declared fields are decided from their schema rank, so a shared tensor
+        whose first dimension happens to equal ``num_trials`` is never
+        misclassified. Passing a raw tensor retains the shape-only behavior for
+        callers that do not have field metadata.
         """
         if self.num_trials is None:
             return False
+        if isinstance(field, str):
+            tensor = getattr(self, field)
+            info = (
+                self.get_model_fields().get(field)
+                or self.get_model_computed_fields().get(field)
+            )
+            if info is None:
+                raise KeyError(f"Unknown tensor field: {field}")
+            extra = getattr(info, "json_schema_extra", {}) or {}
+            if extra.get("category") == "topology":
+                return False
+            declared_rank = len(extra.get("tensor_shape", ()))
+            return tensor.ndim == declared_rank + 1
+        tensor = field
         return tensor.ndim > 0 and tensor.shape[0] == self.num_trials
+
+    _is_batched = is_batched
 
     @property
     def batched_params(self) -> Dict[str, bool]:
@@ -663,10 +973,7 @@ class AbstractModule(BaseModel, ABC):
 
             val = getattr(self, name)
             if isinstance(val, torch.Tensor):
-                # Check if batched: (num_trials, ...) and num_trials > 1
-                # Note: We assume that if shape[0] == num_trials and num_trials > 1, it is batched.
-                is_batched = (self.num_trials is not None and val.ndim > 0 and val.shape[0] == self.num_trials)
-                res[name] = is_batched
+                res[name] = self.is_batched(name)
 
         for name, field in self.get_model_fields().items():
             check_field(name, field)

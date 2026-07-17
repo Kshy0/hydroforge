@@ -108,16 +108,16 @@ class StatisticsMixin:
                             if w_name in self._storage:
                                 required_tensors[w_name] = self._storage[w_name]
 
-        # Collect required dimensions and save indices
+        # Collect required dimensions and output indices.
         required_dims: Set[str] = set()
-        required_save_indices: Set[str] = set()
+        required_output_indices: Set[str] = set()
         for var_name in self._variables:
             field_info = self._field_registry[var_name]
             json_schema_extra = getattr(field_info, 'json_schema_extra', {})
             tensor_shape = json_schema_extra.get('tensor_shape', ())
-            save_idx = json_schema_extra.get('save_idx')
-            if save_idx:
-                required_save_indices.add(save_idx)
+            output_index = json_schema_extra.get('output_index')
+            if output_index:
+                required_output_indices.add(output_index)
             for dim_name in tensor_shape:
                 if isinstance(dim_name, str):
                     required_dims.add(dim_name)
@@ -138,12 +138,12 @@ class StatisticsMixin:
                 if tok in self._tensor_registry:
                     required_tensors[tok] = self._tensor_registry[tok]
 
-        # Add save_idx tensors
-        for save_idx in required_save_indices:
-            if save_idx in self._tensor_registry:
-                required_tensors[save_idx] = self._tensor_registry[save_idx]
+        # Add output_index tensors
+        for output_index in required_output_indices:
+            if output_index in self._tensor_registry:
+                required_tensors[output_index] = self._tensor_registry[output_index]
             else:
-                raise RuntimeError(f"Save index tensor '{save_idx}' not registered")
+                raise RuntimeError(f"Output index tensor '{output_index}' not registered")
 
         # Add dimension tensors/scalars
         for dim_name in required_dims:
@@ -153,6 +153,17 @@ class StatisticsMixin:
                     required_tensors[dim_name] = torch.tensor(tensor, device=self.device)
                 else:
                     required_tensors[dim_name] = tensor
+
+        from hydroforge.runtime.backend import devices_match
+        mismatched = {
+            name: str(tensor.device)
+            for name, tensor in required_tensors.items()
+            if not devices_match(tensor.device, self.device)
+        }
+        if mismatched:
+            raise ValueError(
+                f"Statistics kernel tensors must be on {self.device}: {mismatched}"
+            )
 
         self._kernel_states = required_tensors
 
@@ -221,12 +232,12 @@ class StatisticsMixin:
                 raise ValueError(f"Variable '{var_name}' not registered. Call register_tensor() first.")
 
             tensor_shape = json_schema_extra.get('tensor_shape', ())
-            save_idx = json_schema_extra.get('save_idx')
+            output_index = json_schema_extra.get('output_index')
             description = getattr(field_info, 'description', f"Variable {var_name}")
-            save_coord = json_schema_extra.get('save_coord')
+            output_coord = json_schema_extra.get('output_coord')
             dim_coords = json_schema_extra.get('dim_coords')
             target_dtype = tensor.dtype if tensor is not None else torch.float32
-            full_output = save_idx is None
+            full_output = output_index is None
 
             def infer_virtual_dtype(expr: str, seen: Set[str] | None = None) -> torch.dtype | None:
                 if seen is None:
@@ -287,8 +298,8 @@ class StatisticsMixin:
                         "has no registered tensor"
                     )
 
-            elif save_idx in self._tensor_registry:
-                ref_save_idx = self._tensor_registry[save_idx]
+            elif output_index in self._tensor_registry:
+                ref_output_index = self._tensor_registry[output_index]
                 if tensor is not None:
                      # Real tensor shape/dim logic
                      tensor_ndim = tensor.ndim
@@ -301,7 +312,7 @@ class StatisticsMixin:
                           tensor_ndim += (len(tensor_shape) - 1)
 
                      # Construct hypothetical shape for allocation size
-                     tensor_base_shape = (len(ref_save_idx),) # minimum
+                     tensor_base_shape = (len(ref_output_index),) # minimum
                      if len(tensor_shape) > 1:
                            # Try to resolve dimensions from dependencies or registry
                            expr = json_schema_extra.get('expr')
@@ -344,11 +355,11 @@ class StatisticsMixin:
                                      raise ValueError(f"Virtual variable '{var_name}' has multi-dimensional shape {tensor_shape}. Dependencies not found in registry, and dimensions could not be resolved directly.")
 
                 if self.num_trials > 1:
-                    actual_shape = (self.num_trials, len(ref_save_idx)) + tensor_base_shape[2:] if tensor_ndim > 1 else (self.num_trials, len(ref_save_idx))
+                    actual_shape = (self.num_trials, len(ref_output_index)) + tensor_base_shape[2:] if tensor_ndim > 1 else (self.num_trials, len(ref_output_index))
                 else:
-                    actual_shape = (len(ref_save_idx),) + tensor_base_shape[1:]
+                    actual_shape = (len(ref_output_index),) + tensor_base_shape[1:]
             else:
-                raise ValueError(f"Save index '{save_idx}' not registered in tensor registry")
+                raise ValueError(f"Output index '{output_index}' not registered in tensor registry")
 
             actual_ndim = tensor_ndim
             max_ndim = 3 if self.num_trials > 1 else 2
@@ -382,15 +393,15 @@ class StatisticsMixin:
                     self._scatter_virtuals[var_name] = scatter
                     # Allocate a scatter buffer in the FULL target dimension
                     # (not num_saved, but the full grid/cell count).
-                    # The kernel will index into it via save_idx just like any real tensor.
+                    # The kernel will index into it via output_index just like any real tensor.
                     # Determine full target size from index tensor (max + 1) or from
-                    # other real tensors sharing the same save_idx.
+                    # other real tensors sharing the same output_index.
                     idx_tensor = self._tensor_registry.get(scatter.index_var)
-                    if idx_tensor is not None:
-                        full_target_size = int(idx_tensor.max().item()) + 1
-                    else:
-                        # Fallback: use save_idx length (approximate)
-                        full_target_size = len(ref_save_idx)
+                    if idx_tensor is None:
+                        raise ValueError(
+                            f"Scatter index tensor '{scatter.index_var}' is not registered"
+                        )
+                    full_target_size = int(idx_tensor.max().item()) + 1
 
                     scatter_buf_key = f"__scatter_buf_{var_name}"
                     if self.num_trials > 1:
@@ -511,9 +522,9 @@ class StatisticsMixin:
                              if weight_state_name not in self._storage:
                                  self._storage[weight_state_name] = torch.zeros(actual_shape, dtype=target_dtype, device=self.device)
 
-                if save_coord and save_coord not in self._coord_cache:
-                    coord_tensor = self._tensor_registry[save_coord]
-                    self._coord_cache[save_coord] = coord_tensor.detach().cpu().numpy()
+                if output_coord and output_coord not in self._coord_cache:
+                    coord_tensor = self._tensor_registry[output_coord]
+                    self._coord_cache[output_coord] = coord_tensor.detach().cpu().numpy()
 
                 # Downcast to save_precision if specified (e.g. float64 -> float32)
                 save_dtype = target_dtype
@@ -566,13 +577,13 @@ class StatisticsMixin:
                 meta = {
                     'original_variable': var_name,
                     'op': op,
-                    'save_idx': save_idx,
+                    'output_index': output_index,
                     'full_output': full_output,
                     'tensor_shape': tensor_shape,
                     'dtype': 'i4' if is_arg_op else out_dtype,  # int32 for arg ops
                     'actual_shape': actual_shape,
                     'actual_ndim': actual_ndim,
-                    'save_coord': save_coord,
+                    'output_coord': output_coord,
                     'nc_coord_name': dim_coords.split('.')[-1] if dim_coords else None,
                     'description': f"{description} ({op})",
                     'stride_input': stride_input,
@@ -586,6 +597,22 @@ class StatisticsMixin:
                 self._output_is_outer[out_name] = len(op_parts) > 1
 
         self._has_compound_ops = any(self._output_is_outer.values())
+
+        from hydroforge.aggregator.utils import sanitize_symbol
+        safe_outputs: Dict[str, str] = {}
+        for out_name in self._output_keys:
+            safe_name = sanitize_symbol(out_name)
+            if not safe_name:
+                raise ValueError(
+                    f"Output name '{out_name}' has no valid NetCDF characters."
+                )
+            previous = safe_outputs.get(safe_name)
+            if previous is not None and previous != out_name:
+                raise ValueError(
+                    f"Output names '{previous}' and '{out_name}' both map to "
+                    f"NetCDF variable '{safe_name}'."
+                )
+            safe_outputs[safe_name] = out_name
 
         # Generate kernels and prepare states for all requested variables/ops
         self._generate_aggregator_function()
