@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 import warnings
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Sequence, Tuple
 
 import torch
 
@@ -75,7 +75,7 @@ def _tensor_ndim_for_aggregation(num_trials: int, actual_ndim: int) -> int:
 class _CExpression:
     """Small arithmetic expression renderer for virtual/scatter expressions."""
 
-    _funcs = {
+    _funcs: ClassVar[dict[str, str]] = {
         "abs": "fabs",
         "fabs": "fabs",
         "sqrt": "sqrt",
@@ -128,7 +128,7 @@ class _CExpression:
         if isinstance(node, ast.Compare):
             parts = []
             left = self.visit(node.left)
-            for op, comparator in zip(node.ops, node.comparators):
+            for op, comparator in zip(node.ops, node.comparators, strict=True):
                 right = self.visit(comparator)
                 if isinstance(op, ast.Lt):
                     cmp_op = "<"
@@ -215,10 +215,10 @@ class CudaCodegenMixin:
             raise ValueError("No variables initialized for statistics aggregation")
 
         try:
-            tensor_info, grouped_by_save_idx = self._analyze_tensor_info()
+            tensor_info, grouped_by_output_index = self._analyze_tensor_info()
             cpp_sources, cuda_sources = self._generate_cuda_extension_sources(
                 tensor_info=tensor_info,
-                grouped_by_save_idx=grouped_by_save_idx,
+                grouped_by_output_index=grouped_by_output_index,
             )
         except Exception as exc:
             warnings.warn(
@@ -271,7 +271,7 @@ class CudaCodegenMixin:
         self: StatisticsAggregator,
         *,
         tensor_info: Dict[str, Dict[str, Any]],
-        grouped_by_save_idx: Dict[str, List[str]],
+        grouped_by_output_index: Dict[str, List[str]],
     ) -> Tuple[str, str]:
         params: Dict[str, Dict[str, str]] = {}
 
@@ -295,7 +295,7 @@ class CudaCodegenMixin:
         for key, (ctype, scalar_type) in _SCALAR_TYPES.items():
             add_param(key, ctype, scalar_type, const=True)
 
-        specs = self._build_cuda_specs(tensor_info, grouped_by_save_idx, add_param)
+        specs = self._build_cuda_specs(tensor_info, grouped_by_output_index, add_param)
 
         cpp_sources = "\n".join(
             [
@@ -341,7 +341,7 @@ class CudaCodegenMixin:
     def _build_cuda_specs(
         self: StatisticsAggregator,
         tensor_info: Dict[str, Dict[str, Any]],
-        grouped_by_save_idx: Dict[str, List[str]],
+        grouped_by_output_index: Dict[str, List[str]],
         add_param,
     ) -> Dict[str, Any]:
         def add_tensor_param(key: str, *, const: bool) -> None:
@@ -376,10 +376,10 @@ class CudaCodegenMixin:
             )
 
         groups = []
-        for save_idx, var_list in grouped_by_save_idx.items():
-            full_output = save_idx == "__full__"
+        for output_index, var_list in grouped_by_output_index.items():
+            full_output = output_index == "__full__"
             if not full_output:
-                add_tensor_param(save_idx, const=True)
+                add_tensor_param(output_index, const=True)
             group_vars = []
             max_levels = 1
             full_total = 0
@@ -454,7 +454,7 @@ class CudaCodegenMixin:
 
             payload = json.dumps(
                 {
-                    "save_idx": save_idx,
+                    "output_index": output_index,
                     "vars": [
                         {
                             "name": v["name"],
@@ -470,8 +470,8 @@ class CudaCodegenMixin:
             )
             groups.append(
                 {
-                    "save_idx": save_idx,
-                    "kernel_name": f"hf_aggr_{_c_ident(save_idx)}_{hashlib.sha1(payload.encode()).hexdigest()[:10]}",
+                    "output_index": output_index,
+                    "kernel_name": f"hf_aggr_{_c_ident(output_index)}_{hashlib.sha1(payload.encode()).hexdigest()[:10]}",
                     "vars": group_vars,
                     "max_levels": max_levels,
                     "num_trials": int(self.num_trials),
@@ -740,7 +740,7 @@ class CudaCodegenMixin:
         if group.get("full_output"):
             return self._generate_full_group_kernel(group)
 
-        params = [f"const {self._state_ctype(group['save_idx'])[0]}* p_{_c_ident(group['save_idx'])}"]
+        params = [f"const {self._state_ctype(group['output_index'])[0]}* p_{_c_ident(group['output_index'])}"]
         for var in group["vars"]:
             for key in self._collect_value_param_keys(var["name"]):
                 ctype, _ = self._state_ctype(key)
@@ -777,7 +777,7 @@ class CudaCodegenMixin:
                 "    long point_linear = linear / max_levels;",
                 "    long t = point_linear / n_saved_points;",
                 "    long offs = point_linear - t * n_saved_points;",
-                f"    long idx = static_cast<long>(p_{_c_ident(group['save_idx'])}[offs]);",
+                f"    long idx = static_cast<long>(p_{_c_ident(group['output_index'])}[offs]);",
                 "    float weight = p___weight[0];",
                 "    float total_weight = p___total_weight[0];",
                 "    float num_macro_steps = p___num_macro_steps[0];",
@@ -898,24 +898,24 @@ class CudaCodegenMixin:
                 wptr = f"p_{_c_ident(state['weight_key'])}"
                 lines.extend(
                     [
-                        f"        {{",
+                        "        {",
                         f"            {ctype} old_v = {ptr}[out_off];",
                         f"            {ctype} old_w = {wptr}[out_off];",
                         f"            {ctype} new_v = old_v + val * static_cast<{ctype}>(weight);",
                         f"            {ctype} new_w = old_w + static_cast<{ctype}>(weight);",
                         f"            if (is_inner_last) {{ val_for_{inner} = new_v / new_w; {ptr}[out_off] = static_cast<{ctype}>(0); {wptr}[out_off] = static_cast<{ctype}>(0); }}",
                         f"            else {{ {ptr}[out_off] = new_v; {wptr}[out_off] = new_w; }}",
-                        f"        }}",
+                        "        }",
                     ]
                 )
             elif inner == "sum":
                 lines.extend(
                     [
-                        f"        {{",
+                        "        {",
                         f"            {ctype} new_v = {ptr}[out_off] + val * static_cast<{ctype}>(weight);",
                         f"            if (is_inner_last) {{ val_for_{inner} = new_v; {ptr}[out_off] = static_cast<{ctype}>(0); }}",
                         f"            else {{ {ptr}[out_off] = new_v; }}",
-                        f"        }}",
+                        "        }",
                     ]
                 )
             elif inner in {"max", "min"}:
@@ -923,12 +923,12 @@ class CudaCodegenMixin:
                 reset = f"hf_neg_inf<{ctype}>()" if inner == "max" else f"hf_pos_inf<{ctype}>()"
                 lines.extend(
                     [
-                        f"        {{",
+                        "        {",
                         f"            {ctype} old_v = {ptr}[out_off];",
                         f"            {ctype} new_v = is_inner_first ? val : {fn}(old_v, val);",
                         f"            if (is_inner_last) {{ val_for_{inner} = new_v; {ptr}[out_off] = {reset}; }}",
                         f"            else {{ {ptr}[out_off] = new_v; }}",
-                        f"        }}",
+                        "        }",
                     ]
                 )
             elif inner == "first":
@@ -1100,11 +1100,11 @@ class CudaCodegenMixin:
             zero_args.append(str(scatter["target_size"] * scatter["num_trials"]))
             lines.extend(
                 [
-                    f"    {{",
+                    "    {",
                     f"        long total = {scatter['target_size'] * scatter['num_trials']};",
-                    f"        int blocks = static_cast<int>((total + threads - 1) / threads);",
+                    "        int blocks = static_cast<int>((total + threads - 1) / threads);",
                     f"        if (blocks > 0) hf_scatter_zero_{scatter['safe']}<<<blocks, threads, 0, stream>>>({', '.join(zero_args)});",
-                    f"    }}",
+                    "    }",
                 ]
             )
 
@@ -1121,11 +1121,11 @@ class CudaCodegenMixin:
             add_args.extend([str(scatter["source_size"]), str(scatter["target_size"]), str(scatter["num_trials"])])
             lines.extend(
                 [
-                    f"    {{",
+                    "    {",
                     f"        long total = {scatter['source_size'] * scatter['num_trials']};",
-                    f"        int blocks = static_cast<int>((total + threads - 1) / threads);",
+                    "        int blocks = static_cast<int>((total + threads - 1) / threads);",
                     f"        if (blocks > 0) hf_scatter_add_{scatter['safe']}<<<blocks, threads, 0, stream>>>({', '.join(add_args)});",
-                    f"    }}",
+                    "    }",
                 ]
             )
             if scatter["cnt_key"]:
@@ -1136,15 +1136,15 @@ class CudaCodegenMixin:
                 ]
                 lines.extend(
                     [
-                        f"    {{",
+                        "    {",
                         f"        long total = {scatter['target_size'] * scatter['num_trials']};",
-                        f"        int blocks = static_cast<int>((total + threads - 1) / threads);",
+                        "        int blocks = static_cast<int>((total + threads - 1) / threads);",
                         f"        if (blocks > 0) hf_scatter_divide_{scatter['safe']}<<<blocks, threads, 0, stream>>>({', '.join(divide_args)});",
-                        f"    }}",
+                        "    }",
                     ]
                 )
         for group in specs["groups"]:
-            args = [] if group.get("full_output") else [f"p_{_c_ident(group['save_idx'])}"]
+            args = [] if group.get("full_output") else [f"p_{_c_ident(group['output_index'])}"]
             for var in group["vars"]:
                 for key in self._collect_value_param_keys(var["name"]):
                     args.append(f"p_{_c_ident(key)}")
@@ -1163,22 +1163,22 @@ class CudaCodegenMixin:
                 args.append(str(group["full_total"]))
                 lines.extend(
                     [
-                        f"    {{",
+                        "    {",
                         f"        long total = {group['full_total']};",
-                        f"        int blocks = static_cast<int>((total + threads - 1) / threads);",
+                        "        int blocks = static_cast<int>((total + threads - 1) / threads);",
                         f"        if (blocks > 0) {group['kernel_name']}<<<blocks, threads, 0, stream>>>({', '.join(args)});",
-                        f"    }}",
+                        "    }",
                     ]
                 )
             else:
-                args.extend([f"t_{_c_ident(group['save_idx'])}.numel()", str(group["num_trials"])])
+                args.extend([f"t_{_c_ident(group['output_index'])}.numel()", str(group["num_trials"])])
                 lines.extend(
                     [
-                        f"    {{",
-                        f"        long total = t_{_c_ident(group['save_idx'])}.numel() * {group['num_trials']} * {group['max_levels']};",
-                        f"        int blocks = static_cast<int>((total + threads - 1) / threads);",
+                        "    {",
+                        f"        long total = t_{_c_ident(group['output_index'])}.numel() * {group['num_trials']} * {group['max_levels']};",
+                        "        int blocks = static_cast<int>((total + threads - 1) / threads);",
                         f"        if (blocks > 0) {group['kernel_name']}<<<blocks, threads, 0, stream>>>({', '.join(args)});",
-                        f"    }}",
+                        "    }",
                     ]
                 )
         lines.append("}")

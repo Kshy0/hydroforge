@@ -21,30 +21,46 @@ if TYPE_CHECKING:
     from hydroforge.modeling.module import AbstractModule
 
 
+@dataclass(frozen=True)
+class GroupRankLookup:
+    """Sparse group-ID to rank mapping with NumPy-style lookup."""
+
+    group_ids: np.ndarray
+    ranks: np.ndarray
+
+    def __getitem__(self, values):
+        arr = np.asarray(values)
+        flat = arr.reshape(-1)
+        pos = np.searchsorted(self.group_ids, flat)
+        valid = pos < len(self.group_ids)
+        matched = np.zeros(flat.shape, dtype=np.bool_)
+        matched[valid] = self.group_ids[pos[valid]] == flat[valid]
+        if not np.all(matched):
+            missing = flat[~matched][:5].tolist()
+            raise KeyError(f"Unknown group ID(s): {missing}")
+        result = self.ranks[pos].reshape(arr.shape)
+        return result.item() if arr.ndim == 0 else result
+
+    def __len__(self) -> int:
+        return len(self.group_ids)
+
+
 @njit
 def compute_group_to_rank(world_size: int, group_assignments: np.ndarray):
     """
     Compute a mapping from each original group ID to a rank, using a greedy load balance.
 
-    Returns:
-      full_map: array of length (max_original_id+1), where
-                full_map[original_group_id] = assigned_rank (or -1 if absent)
+    Returns sorted unique group IDs and their assigned ranks.
     """
     # Handle edge cases early
     if world_size <= 0 or group_assignments.size == 0:
-        max_gid = int(group_assignments.max()) if group_assignments.size > 0 else -1
-        return np.full(max_gid + 1, -1, np.int64)
+        return np.empty(0, np.int64), np.empty(0, np.int64)
 
     # 1) Compress original IDs → 0..n_groups-1
     # unique_ids: sorted unique original IDs
     # inv: for each entry in group_assignments, its compressed ID
-    unique_ids, inv = np.unique(group_assignments), None
-    # compute inv via a dense id_map:
-    max_gid = int(unique_ids[-1]) if unique_ids.size > 0 else -1
-    id_map = np.full(max_gid + 1, -1, np.int64)
-    id_map[unique_ids] = np.arange(unique_ids.size, dtype=np.int64)
-
-    inv = id_map[group_assignments]
+    unique_ids = np.unique(group_assignments).astype(np.int64)
+    inv = np.searchsorted(unique_ids, group_assignments)
     n_groups = unique_ids.size
 
     # 2) Count sizes of each compressed group
@@ -61,12 +77,7 @@ def compute_group_to_rank(world_size: int, group_assignments: np.ndarray):
         comp_to_rank[g] = r
         rank_loads[r] += group_sizes[g]
 
-    # 4) Expand back to the full original ID space (fill -1 for IDs not present)
-    full_map = np.full(max_gid + 1, -1, np.int64)
-    # unique_ids are the only valid original IDs; assign directly
-    full_map[unique_ids] = comp_to_rank
-
-    return full_map
+    return unique_ids, comp_to_rank
 
 
 # ---------------------------------------------------------------------------

@@ -57,7 +57,7 @@ class MultiRankStatsReader:
         return str(t_obj)
 
     def _select_coord_name(self, ds: nc.Dataset, saved_points: int) -> Optional[str]:
-        """Pick a ('saved_points',) variable to serve as save_coord."""
+        """Pick a ('saved_points',) variable to serve as output_coord."""
         if self.coord_name and self.coord_name in ds.variables:
             v = ds.variables[self.coord_name]
             if v.dimensions == ("saved_points",) and len(v) == saved_points:
@@ -238,7 +238,7 @@ class MultiRankStatsReader:
                 else:
                     info["x"], info["y"] = None, None
                     print(
-                        f"Note: {info['path'].name} save_coord is not a valid linear index; cannot auto-convert."
+                        f"Note: {info['path'].name} output_coord is not a valid linear index; cannot auto-convert."
                     )
             else:
                 info["x"], info["y"] = None, None
@@ -690,7 +690,10 @@ class MultiRankStatsReader:
                     break
 
                 # Create a dictionary for O(1) lookup
-                rank_lookup = { (int(xi), int(yi)): i for i, (xi, yi) in enumerate(zip(x, y)) }
+                rank_lookup = {
+                    (int(xi), int(yi)): i
+                    for i, (xi, yi) in enumerate(zip(x, y, strict=True))
+                }
 
                 for c, (qx, qy) in enumerate(queries):
                     if col_to_hits[c] is not None:

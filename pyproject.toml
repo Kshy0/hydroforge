@@ -23,6 +23,9 @@ dependencies = [
 where = ["."]
 include = ["hydroforge*"]
 
+[tool.setuptools.package-data]
+"hydroforge.runtime" = ["*.mm"]
+
 [project.scripts]
 hydroforge-cuda-precompile = "hydroforge.runtime.cuda_kernel:main"
 

@@ -221,8 +221,8 @@ def aggregate_field_to_nc(
             time_var = ds.createVariable("time", "f8", ("time",))
             time_var.setncattr("units", "months" if ntime == 12 else "unknown")
 
-        save_coord = ds.createVariable("catchment_id", "i8", ("saved_points",))
-        save_coord[:] = mapping.target_ids
+        output_coord = ds.createVariable("catchment_id", "i8", ("saved_points",))
+        output_coord[:] = mapping.target_ids
 
         dims = ("time", "saved_points") if has_time else ("saved_points",)
         out_var = ds.createVariable(

@@ -30,7 +30,7 @@ def get_global_rank() -> int:
 
 def get_local_rank() -> int:
     if dist.is_available() and dist.is_initialized():
-        return int(os.environ.get("LOCAL_RANK", 0))
+        return int(os.environ.get("LOCAL_RANK", "0"))
     return 0
 
 
@@ -49,8 +49,8 @@ def get_world_size() -> int:
 def setup_distributed():
     """Initialise the NCCL process group and return (local_rank, rank, world_size)."""
     torch.multiprocessing.set_start_method("spawn", force=True)
-    if int(os.environ.get("WORLD_SIZE", 1)) > 1:
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         ws_env = int(os.environ["WORLD_SIZE"])
         if torch.cuda.is_available():
             n_dev = torch.cuda.device_count()
@@ -69,7 +69,7 @@ def setup_distributed():
                 device_id=device_id,
             )
         else:
-            dist.init_process_group(backend="nccl", init_method="env://")
+            dist.init_process_group(backend="gloo", init_method="env://")
         rank = dist.get_rank()
         world_size = dist.get_world_size()
     else:
@@ -124,6 +124,8 @@ def find_indices_in(a, b):
 
 def find_indices_in_torch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Return indices in *b* for each element of *a* (Torch version)."""
+    if b.numel() == 0:
+        return torch.full_like(a, -1, dtype=torch.int32)
     if len(b) > torch.iinfo(torch.int32).max:
         raise OverflowError(
             f"b has {len(b)} elements, exceeding int32 range. "

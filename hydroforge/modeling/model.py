@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import re
+from copy import copy
 from abc import ABC
 from datetime import datetime
 from functools import cached_property
@@ -22,9 +23,10 @@ from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
                       field_validator, model_validator)
 
 from hydroforge.aggregator.aggregator import StatisticsAggregator
+from hydroforge.modeling.distributed import find_indices_in, find_indices_in_torch
 from hydroforge.modeling.input_proxy import InputProxy
 from hydroforge.modeling.model_utils import (ActivePlan, ParameterPlanMixin,
-                                             PlanItem, ProgressMixin,
+                                             GroupRankLookup, PlanItem, ProgressMixin,
                                              ProgressTracker,
                                              compute_group_to_rank)
 from hydroforge.modeling.module import AbstractModule
@@ -44,7 +46,8 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
     # Class variables
     module_list: ClassVar[Dict[str, Type[AbstractModule]]] = {}
-    group_by: ClassVar[str] = "group_id"  # Default group variable, override in subclasses
+    partition_key: ClassVar[Optional[str]] = None
+    partition_group: ClassVar[str] = "group_id"
 
     # Instance fields
     experiment_name: str = Field(
@@ -75,7 +78,8 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             "Supported ops: mean, max, min, last, first, mid, sum. "
             "For max/min, argmax/argmin are automatically computed. "
             "Variables can be strings or {alias: expr} dicts.  The "
-            "variables without save_idx are saved at full tensor shape. "
+            "Output slicing is inferred from each variable's dim_coords and "
+            "the coordinate's default SelectionField. "
             "reserved key ``\"static\"`` marks per-saved-point static "
             "metadata (e.g. shift_days) written once per output NC."
         ),
@@ -178,7 +182,11 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             return data
 
         data = dict(data)
-        data["mixed_precision"] = KERNEL_BACKEND in ("cuda", "triton")
+        device = torch.device(data.get("device", "cpu"))
+        data["mixed_precision"] = (
+            device.type == "cuda"
+            and KERNEL_BACKEND in ("cuda", "triton")
+        )
         return data
 
     @model_validator(mode='after')
@@ -206,9 +214,11 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     self.output_start_time.hour, self.output_start_time.minute, self.output_start_time.second,
                     self.output_start_time.microsecond, **kwargs
                 )
-            except Exception:
-                # If conversion fails, we leave it as is and hope for the best or fail later
-                pass
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"output_start_time {self.output_start_time!r} cannot be "
+                    f"represented by calendar '{self.calendar}'"
+                ) from exc
         return self
 
 
@@ -309,7 +319,10 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
         self.check_namespace_conflicts()
 
-        print(f"Using primary group variable: {self.group_by}")
+        print(
+            f"Using partition root: key={self.partition_key}, "
+            f"group={self.partition_group}"
+        )
 
         # Validate that all opened modules are registered
         module_data = self.shard_param()  # reads from NetCDF
@@ -379,7 +392,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             module_bytes = 0
             all_fields = module.get_model_fields().copy()
             all_fields.update(module.get_model_computed_fields())
-            for name, field_info in all_fields.items():
+            for name in all_fields:
                 # Skip computed fields that haven't been materialized yet
                 # to avoid triggering @cached_property (lazy allocation).
                 if name in module.get_model_computed_fields() and name not in module.__dict__:
@@ -409,80 +422,383 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         return self._modules[module_name] if module_name in self.opened_modules else None
 
     @cached_property
+    def partition_metadata(self) -> Dict[str, Dict[str, Any]]:
+        """Collect and validate the coordinate/foreign-key partition graph."""
+        fields: Dict[str, Dict[str, Any]] = {}
+        for _, _, name, info in self._iter_all_fields(include_computed=False):
+            fields[name] = (getattr(info, "json_schema_extra", None) or {})
+
+        coordinates = {
+            name for name, extra in fields.items()
+            if extra.get("is_coordinate", False)
+        }
+        selections: Dict[str, str] = {}
+        if self.partition_key is None:
+            raise ValueError("Model partition_key must be configured.")
+        if self.partition_key not in coordinates:
+            raise ValueError(
+                f"partition_key '{self.partition_key}' must be a CoordinateField."
+            )
+        if self.partition_group not in fields:
+            raise ValueError(
+                f"partition_group '{self.partition_group}' is not declared."
+            )
+
+        for name, extra in fields.items():
+            coord = extra.get("dim_coords")
+            if coord:
+                coord = coord.split(".")[-1]
+                if coord not in coordinates:
+                    raise ValueError(
+                        f"Field '{name}' uses dim_coords='{coord}', but it is "
+                        "not a CoordinateField."
+                    )
+            references = extra.get("references")
+            if references:
+                references = references.split(".")[-1]
+            if references and references not in coordinates:
+                raise ValueError(
+                    f"Field '{name}' references unknown coordinate "
+                    f"'{references}'."
+                )
+            selects = extra.get("selects")
+            if selects:
+                selects = selects.split(".")[-1]
+            if selects:
+                if name not in coordinates:
+                    raise ValueError(
+                        f"Selection '{name}' must be a CoordinateField."
+                    )
+                if references != selects:
+                    raise ValueError(
+                        f"Selection '{name}' must reference the coordinate it "
+                        f"selects ('{selects}')."
+                    )
+                if selects in selections:
+                    raise ValueError(
+                        f"Coordinate '{selects}' has multiple default selections: "
+                        f"'{selections[selects]}' and '{name}'."
+                    )
+                selections[selects] = name
+            partition_by = extra.get("partition_by")
+            if partition_by:
+                partition_by = partition_by.split(".")[-1]
+            replicated = extra.get("replicated", False)
+            if replicated and name not in coordinates:
+                raise ValueError(
+                    f"replicated=True is only valid on CoordinateField, got '{name}'."
+                )
+            if replicated and (
+                    name == self.partition_key or partition_by or references):
+                raise ValueError(
+                    f"Replicated coordinate '{name}' cannot define partition lineage."
+                )
+            if (
+                name in coordinates
+                and name != self.partition_key
+                and not partition_by
+                and not references
+                and not replicated
+            ):
+                raise ValueError(
+                    f"Coordinate '{name}' has no ownership lineage. Declare "
+                    "partition_by/references or set replicated=True."
+                )
+            if partition_by:
+                if name not in coordinates:
+                    raise ValueError(
+                        f"partition_by is only valid on CoordinateField, got '{name}'."
+                    )
+                if partition_by not in fields:
+                    raise ValueError(
+                        f"Coordinate '{name}' partitions by undeclared field "
+                        f"'{partition_by}'."
+                    )
+                via_extra = fields[partition_by]
+                via_coord = (via_extra.get("dim_coords") or "").split(".")[-1]
+                if via_coord != name:
+                    raise ValueError(
+                        f"Partition field '{partition_by}' must be aligned to "
+                        f"coordinate '{name}', got dim_coords={via_coord!r}."
+                    )
+                if not via_extra.get("references"):
+                    raise ValueError(
+                        f"Partition field '{partition_by}' must declare references."
+                    )
+
+        return {
+            "fields": fields,
+            "coordinates": coordinates,
+            "selections": selections,
+        }
+
+    def _coordinate_is_partitioned(self, coordinate: str) -> bool:
+        fields = self.partition_metadata["fields"]
+        extra = fields[coordinate]
+        if extra.get("replicated", False):
+            return False
+        return bool(
+            coordinate == self.partition_key
+            or extra.get("partition_by")
+            or extra.get("references")
+        )
+
+    def _resolve_output_binding(
+        self, field_info: Any,
+    ) -> Tuple[Optional[str], Optional[torch.Tensor], Optional[str], Optional[torch.Tensor]]:
+        """Resolve output indices and coordinates from a field's logical axis."""
+        extra = getattr(field_info, "json_schema_extra", {}) or {}
+        policy = extra.get("output", "auto")
+        if policy == "disabled":
+            return None, None, None, None
+
+        dim_coords = extra.get("dim_coords")
+        if not dim_coords:
+            return None, None, None, None
+        coordinate = dim_coords.split(".")[-1]
+        if coordinate not in self.variable_map:
+            raise ValueError(
+                f"Output coordinate '{coordinate}' is not available in opened modules."
+            )
+        coord_module, coord_attr, _ = self.variable_map[coordinate]
+        coord_tensor = getattr(coord_module, coord_attr)
+
+        selection = None
+        if policy == "auto":
+            selection = self.partition_metadata["selections"].get(coordinate)
+        if selection is None:
+            return None, None, coordinate, coord_tensor
+
+        selection_module, selection_attr, _ = self.variable_map[selection]
+        selection_tensor = getattr(selection_module, selection_attr)
+        if selection_tensor is None:
+            return None, None, coordinate, coord_tensor
+
+        if selection_tensor.numel() == 0:
+            indices = torch.empty(
+                0, dtype=torch.int32, device=self.device,
+            )
+        else:
+            indices = find_indices_in_torch(selection_tensor, coord_tensor)
+        if torch.any(indices < 0):
+            missing = selection_tensor[indices < 0][:5].detach().cpu().tolist()
+            raise ValueError(
+                f"Selection '{selection}' contains values absent from coordinate "
+                f"'{coordinate}'; examples: {missing}."
+            )
+        indices = indices.to(self.device)
+        index_name = f"__selection_idx__{selection}"
+        return index_name, indices, selection, selection_tensor
+
+    def _bind_output_metadata(self, field_info: Any) -> Tuple[Any, Dict[str, torch.Tensor]]:
+        """Return per-model field metadata with runtime output bindings attached."""
+        bound = copy(field_info)
+        extra = dict(getattr(field_info, "json_schema_extra", {}) or {})
+        index_name, indices, coord_name, coord_tensor = self._resolve_output_binding(field_info)
+        extra["output_index"] = index_name
+        extra["output_coord"] = coord_name
+        bound.json_schema_extra = extra
+        tensors: Dict[str, torch.Tensor] = {}
+        if index_name is not None and indices is not None:
+            tensors[index_name] = indices
+        if coord_name is not None and coord_tensor is not None:
+            tensors[coord_name] = coord_tensor
+        return bound, tensors
+
+    @cached_property
     def variable_group_mapping(self) -> Dict[str, str]:
-        """
-        Build a mapping from each variable to its group variable.
+        """Map each distributed input field to its coordinate axis."""
+        fields = self.partition_metadata["fields"]
+        coordinates = self.partition_metadata["coordinates"]
+        mapping: Dict[str, str] = {}
+        for name, extra in fields.items():
+            if name in coordinates:
+                if self._coordinate_is_partitioned(name):
+                    mapping[name] = name
+                continue
+            coord = extra.get("dim_coords")
+            if coord:
+                coord = coord.split(".")[-1]
+                if self._coordinate_is_partitioned(coord):
+                    mapping[name] = coord
+        return mapping
 
-        Returns:
-            Dictionary mapping variable_name -> group_by_name
-        """
-        variable_group_mapping = {}
+    def _field_coordinate(self, field_info: Any) -> Optional[str]:
+        extra = getattr(field_info, "json_schema_extra", {}) or {}
+        coordinate = extra.get("dim_coords")
+        if not coordinate:
+            return None
+        coordinate = coordinate.split(".")[-1]
+        return coordinate if self._coordinate_is_partitioned(coordinate) else None
 
-        # Collect all declared field names + their metadata for static
-        # validation below.
-        declared_fields: Dict[str, Any] = {}
-        # Track dim_coords references: variable_name -> dim_coords_target
-        dim_coords_refs: Dict[str, str] = {}
-        for _, _, field_name, field_info in self._iter_all_fields(include_computed=False):
-            json_schema_extra = getattr(field_info, 'json_schema_extra', None)
-            if json_schema_extra is None:
-                json_schema_extra = {}
-            declared_fields[field_name] = json_schema_extra
-            group_var = json_schema_extra.get('group_by', None)
-            if group_var:
-                variable_group_mapping[field_name] = group_var
-            dim_coords_var = json_schema_extra.get('dim_coords', None)
-            if dim_coords_var:
-                dim_coords_refs[field_name] = dim_coords_var
+    def _coordinate_group_values(
+        self, coordinate: str, resolving: Optional[set[str]] = None,
+    ) -> np.ndarray:
+        cache = self.__dict__.setdefault("_coordinate_group_cache", {})
+        if coordinate in cache:
+            return cache[coordinate]
+        resolving = set() if resolving is None else resolving
+        if coordinate in resolving:
+            raise ValueError(f"Partition coordinate cycle detected at '{coordinate}'.")
+        resolving.add(coordinate)
 
-        # ── Static group_by validation ──────────────────────────────────
-        # group_by targets must be 1D integer fields (not necessarily
-        # unique — many catchments may share a basin).
-        _int_dtypes = {"int", "idx"}
-        for field_name, group_var in variable_group_mapping.items():
-            if group_var not in declared_fields:
+        fields = self.partition_metadata["fields"]
+        extra = fields[coordinate]
+        keys = np.asarray(self.input_proxy[coordinate])
+        if keys.ndim != 1:
+            raise ValueError(f"Coordinate '{coordinate}' must be 1-D.")
+        if len(np.unique(keys)) != len(keys):
+            raise ValueError(f"Coordinate '{coordinate}' must contain unique values.")
+
+        if coordinate == self.partition_key:
+            groups = np.asarray(self.input_proxy[self.partition_group])
+            if groups.ndim != 1 or len(groups) != len(keys):
                 raise ValueError(
-                    f"Field '{field_name}' declares group_by='{group_var}', "
-                    f"but no such field is declared in any opened module. "
-                    f"Likely a typo. Declared fields: "
-                    f"{sorted(declared_fields.keys())}"
+                    f"partition_group '{self.partition_group}' must align with "
+                    f"partition_key '{coordinate}'."
                 )
-            tgt_extra = declared_fields[group_var]
-            tgt_shape = tgt_extra.get("tensor_shape")
-            if tgt_shape is not None and len(tgt_shape) != 1:
+        else:
+            via = extra.get("partition_by")
+            references = extra.get("references")
+            if via:
+                via = via.split(".")[-1]
+                target = fields[via]["references"]
+                target = target.split(".")[-1]
+                idx = self._reference_index(via)
+            elif references:
+                target = references.split(".")[-1]
+                idx = self._reference_index(coordinate)
+            else:
                 raise ValueError(
-                    f"group_by target '{group_var}' (referenced by "
-                    f"'{field_name}') must be 1-D, got tensor_shape={tgt_shape}."
+                    f"Coordinate '{coordinate}' has no partition lineage."
                 )
-            tgt_dtype = tgt_extra.get("tensor_dtype")
-            if tgt_dtype is not None and tgt_dtype not in _int_dtypes:
+            target_groups = self._coordinate_group_values(target, resolving)
+            groups = target_groups[idx]
+
+        resolving.remove(coordinate)
+        cache[coordinate] = groups
+        return groups
+
+    def _reference_index(self, name: str) -> np.ndarray:
+        """Validate one loaded reference and cache its global target indices."""
+        cache = self.__dict__.setdefault("_reference_index_cache", {})
+        if name in cache:
+            return cache[name]
+        fields = self.partition_metadata["fields"]
+        extra = fields[name]
+        target = (extra.get("references") or "").split(".")[-1]
+        if not target:
+            raise ValueError(f"Field '{name}' is not a reference field.")
+        if name not in self.input_proxy or target not in self.input_proxy:
+            raise ValueError(
+                f"Reference field '{name}' requires loaded coordinate '{target}'."
+            )
+        values = np.asarray(self.input_proxy[name])
+        target_values = np.asarray(self.input_proxy[target])
+        if values.ndim != 1 or target_values.ndim != 1:
+            raise ValueError(
+                f"Reference field '{name}' and coordinate '{target}' must be 1-D."
+            )
+        idx = find_indices_in(values, target_values)
+        missing = idx < 0
+        if np.any(missing):
+            examples = values[missing][:5].tolist()
+            raise ValueError(
+                f"Reference field '{name}' has {int(missing.sum())} value(s) "
+                f"absent from coordinate '{target}'; examples: {examples}."
+            )
+        cache[name] = idx
+        return idx
+
+    def _group_indices_for_rank(self, coordinate: str) -> np.ndarray:
+        groups = self._coordinate_group_values(coordinate)
+        if not np.issubdtype(groups.dtype, np.integer):
+            raise ValueError(
+                f"Resolved groups for coordinate '{coordinate}' must be integer."
+            )
+        if np.any(groups < 0):
+            raise ValueError(f"Resolved groups for coordinate '{coordinate}' are negative.")
+        try:
+            ranks = self.group_id_to_rank[groups]
+        except KeyError as exc:
+            raise ValueError(
+                f"Resolved groups for coordinate '{coordinate}' are unknown."
+            ) from exc
+        return np.nonzero(ranks == self.rank)[0]
+
+    def _logical_axis(self, field_name: str, field_info: Any, shape: Tuple[int, ...]) -> int:
+        """Return the physical axis corresponding to tensor_shape[0]."""
+        extra = getattr(field_info, "json_schema_extra", {}) or {}
+        logical_ndim = len(extra.get("tensor_shape", ()))
+        if len(shape) == logical_ndim:
+            return 0
+        if self.num_trials is not None and len(shape) == logical_ndim + 1:
+            if shape[0] != self.num_trials:
                 raise ValueError(
-                    f"group_by target '{group_var}' (referenced by "
-                    f"'{field_name}') must be integer-like "
-                    f"(dtype 'int' or 'idx'), got tensor_dtype={tgt_dtype!r}."
+                    f"Batched field '{field_name}' has leading size {shape[0]}, "
+                    f"expected num_trials={self.num_trials}."
+                )
+            return 1
+        raise ValueError(
+            f"Field '{field_name}' has rank {len(shape)}, but tensor_shape declares "
+            f"{logical_ndim} logical dimension(s)."
+        )
+
+    def _validate_input_axes(self, fields_to_load: Dict[str, Any]) -> None:
+        """Validate every loaded tensor's logical first axis against dim_coords."""
+        for name, info in fields_to_load.items():
+            if name not in self.input_proxy:
+                continue
+            extra = getattr(info, "json_schema_extra", {}) or {}
+            coord = extra.get("dim_coords")
+            if not coord:
+                continue
+            coord = coord.split(".")[-1]
+            if coord not in self.input_proxy:
+                raise ValueError(
+                    f"Field '{name}' requires missing dim_coords '{coord}'."
+                )
+            shape = self.input_proxy.get_var_shape(name)
+            coord_shape = self.input_proxy.get_var_shape(coord)
+            if len(coord_shape) != 1:
+                raise ValueError(f"Coordinate '{coord}' must be 1-D, got {coord_shape}.")
+            axis = self._logical_axis(name, info, shape)
+            if shape[axis] != coord_shape[0]:
+                raise ValueError(
+                    f"Field '{name}' logical axis length {shape[axis]} does not match "
+                    f"dim_coords '{coord}' length {coord_shape[0]}."
                 )
 
-        # ── Static dim_coords validation ────────────────────────────────
-        # dim_coords targets must be declared key fields (is_key=True).
-        # ``module.field`` qualifiers are stripped to the bare name.
-        for field_name, dc_ref in dim_coords_refs.items():
-            bare = dc_ref.split(".")[-1]
-            if bare not in declared_fields:
-                raise ValueError(
-                    f"Field '{field_name}' declares dim_coords='{dc_ref}', "
-                    f"but no such field is declared. Declared fields: "
-                    f"{sorted(declared_fields.keys())}"
-                )
-            if not declared_fields[bare].get("is_key", False):
-                raise ValueError(
-                    f"dim_coords target '{dc_ref}' (referenced by "
-                    f"'{field_name}') must be declared with is_key=True. "
-                    f"Only unique 1D integer key fields can serve as "
-                    f"dim_coords (PlanItem requires this for target_ids "
-                    f"lookup)."
-                )
+    def _validate_reference_integrity(self, module_data: Dict[str, Any]) -> None:
+        """Validate loaded reference values against their global coordinates."""
+        def as_numpy(value: Any) -> np.ndarray:
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().numpy()
+            return np.asarray(value)
 
-        return variable_group_mapping
+        for name, extra in self.partition_metadata["fields"].items():
+            target = extra.get("references")
+            if not target:
+                continue
+            target = target.split(".")[-1]
+            if name not in module_data or target not in self.input_proxy:
+                continue
+            values = as_numpy(module_data[name])
+            targets = as_numpy(self.input_proxy[target])
+            if values.ndim != 1 or targets.ndim != 1:
+                raise ValueError(
+                    f"Reference field '{name}' and coordinate '{target}' "
+                    "must both be 1-D."
+                )
+            idx = find_indices_in(values, targets)
+            missing = idx < 0
+            if np.any(missing):
+                examples = values[missing][:5].tolist()
+                raise ValueError(
+                    f"Reference field '{name}' has {int(missing.sum())} value(s) "
+                    f"absent from global coordinate '{target}'; "
+                    f"examples: {examples}."
+                )
 
     @cached_property
     def variable_map(self) -> Dict[str, Tuple[AbstractModule, str, Optional[str]]]:
@@ -535,24 +851,37 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             # Qualified name: always set
             mapping[f"{module_name}.{field_name}"] = entry
 
+        for module_name in self.opened_modules:
+            module = self.get_module(module_name)
+            if module is None:
+                continue
+            for field_name in module.get_reference_index_fields():
+                info = module.get_reference_index_field_info(field_name)
+                extra = info.json_schema_extra or {}
+                entry = (module, field_name, extra.get("dim_coords"))
+                mapping.setdefault(field_name, entry)
+                mapping[f"{module_name}.{field_name}"] = entry
+
         return mapping
 
     @cached_property
-    def group_id_to_rank(self) -> np.ndarray:
+    def group_id_to_rank(self) -> GroupRankLookup:
         """
         Load primary group variable from InputProxy and compute
-        a full ID->rank map using compute_group_to_rank.
+        a sparse ID->rank lookup using compute_group_to_rank.
         """
-        if self.group_by not in self.input_proxy:
-            raise ValueError(f"Missing primary group variable '{self.group_by}' in InputProxy.")
-        grp = self.input_proxy[self.group_by]
-        group_id_to_rank = compute_group_to_rank(self.world_size, grp)
-        return group_id_to_rank
+        if self.partition_group not in self.input_proxy:
+            raise ValueError(
+                f"Missing partition_group '{self.partition_group}' in InputProxy."
+            )
+        grp = self.input_proxy[self.partition_group]
+        group_ids, ranks = compute_group_to_rank(self.world_size, np.asarray(grp))
+        return GroupRankLookup(group_ids=group_ids, ranks=ranks)
 
     def initialize_statistics_aggregator(self) -> None:
         """
         Initialize the statistics aggregator for streaming NetCDF output.
-        Registers all variables to save, including their save_idx and save_coord if present.
+        Registers variables together with output bindings inferred from coordinates.
         Avoids duplicate registration.
         """
         if not self.variables_to_save:
@@ -591,7 +920,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             # ── Static per-saved-point metadata (op == "static") ──
             # Short-circuit: no inner/outer op parsing, no aggregation
             # buffers.  Each listed variable is gathered once by its
-            # field's ``save_idx`` (if any) and handed to the aggregator
+            # field's resolved coordinate selection and handed to the aggregator
             # via register_static, which will write it into every
             # output NC at file creation time.
             if op == "static":
@@ -607,15 +936,37 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                             f"opened module")
                     module, attr, _ = self.variable_map[name]
                     tensor = getattr(module, attr)
-                    info = (module.get_model_fields().get(attr)
-                            or module.get_model_computed_fields().get(attr))
-                    extra = (getattr(info, "json_schema_extra", {}) or {}
-                             if info is not None else {})
-                    save_idx_attr = extra.get("save_idx")
-                    save_idx = (getattr(module, save_idx_attr)
-                                if save_idx_attr is not None else None)
+                    if not isinstance(tensor, torch.Tensor) or tensor.ndim != 1:
+                        raise ValueError(
+                            f"Static variable '{name}' must be a one-dimensional tensor"
+                        )
+                    info = module.get_tensor_field_info(attr)
+                    if info is None:
+                        raise ValueError(f"Static variable '{name}' has no field metadata")
+                    if (getattr(info, "json_schema_extra", {}) or {}).get(
+                            "output", "auto") == "disabled":
+                        raise ValueError(f"Variable '{name}' is disabled for output")
+                    bound_info, binding_tensors = self._bind_output_metadata(info)
+                    static_coordinate = (
+                        bound_info.json_schema_extra or {}
+                    ).get("output_coord")
+                    if static_coordinate is None:
+                        raise ValueError(
+                            f"Static variable '{name}' must declare dim_coords so "
+                            "it can be scoped to compatible outputs."
+                        )
+                    if name == static_coordinate:
+                        continue
+                    output_index_name = (
+                        bound_info.json_schema_extra or {}
+                    ).get("output_index")
+                    output_index = binding_tensors.get(output_index_name)
                     self._statistics_aggregator.register_static(
-                        name, tensor, save_idx=save_idx)
+                        name,
+                        tensor,
+                        output_index=output_index,
+                        coordinate=static_coordinate,
+                    )
                 continue
 
             op_l = str(op).lower()
@@ -687,18 +1038,21 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
         def get_field_meta(name):
             mod, attr, _ = self.variable_map[name]
-            info = mod.get_model_fields().get(attr) or mod.get_model_computed_fields().get(attr)
+            info = mod.get_tensor_field_info(attr)
             if info:
                 extra = info.json_schema_extra or {}
-                return (extra.get("save_idx"), extra.get("save_coord"), extra.get("dim_coords"))
-            return (None, None, None)
+                dim_coords = extra.get("dim_coords")
+                if dim_coords:
+                    dim_coords = dim_coords.split(".")[-1]
+                return (extra.get("output", "auto"), dim_coords)
+            return (None, None)
 
         current_vars = list(var_to_ops.keys())
         for var_name in current_vars:
             if var_name in self.variable_map:
                 # Check if existing field is a virtual with scatter expr
                 mod, attr, _ = self.variable_map[var_name]
-                info = mod.get_model_fields().get(attr) or mod.get_model_computed_fields().get(attr)
+                info = mod.get_tensor_field_info(attr)
                 if info:
                     extra = getattr(info, 'json_schema_extra', {}) or {}
                     if extra.get('category') == 'virtual' and extra.get('expr'):
@@ -717,6 +1071,31 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                                         f"Scatter expression in '{var_name}': value token "
                                         f"'{tok}' not found in any module."
                                     )
+                        else:
+                            from hydroforge.aggregator.scatter_expr import extract_tokens
+                            deps = [
+                                token for token in extract_tokens(extra['expr'])
+                                if token in self.variable_map
+                            ]
+                            target_coord = extra.get("dim_coords")
+                            if target_coord:
+                                target_coord = target_coord.split(".")[-1]
+                            dep_coords = {
+                                get_field_meta(dep)[1]
+                                for dep in deps
+                                if get_field_meta(dep)[1] is not None
+                            }
+                            if len(dep_coords) > 1:
+                                raise ValueError(
+                                    f"Virtual field '{var_name}' mixes coordinate axes "
+                                    f"{sorted(dep_coords)}."
+                                )
+                            if dep_coords and target_coord not in dep_coords:
+                                raise ValueError(
+                                    f"Virtual field '{var_name}' declares dim_coords="
+                                    f"'{target_coord}', but its expression uses "
+                                    f"coordinate '{next(iter(dep_coords))}'."
+                                )
                 continue
 
             # If provided as tuple, usage is explicit. If string, assume string IS the expression.
@@ -733,7 +1112,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     f"Scatter expression '{expression}' for ad-hoc variable '{var_name}' "
                     f"cannot be used inline. Scatter virtual fields must be defined in "
                     f"a module using computed_tensor_field(category='virtual', expr=...) "
-                    f"with explicit save_idx/save_coord pointing to the target dimension."
+                    f"with dim_coords pointing to the target dimension."
                 )
 
             # ── Plain elementwise expression ──
@@ -750,31 +1129,27 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                  continue
 
             # Consistency Check
-            # Ensure all dependencies share the same save_idx/save_coord/dim_coords
+            # Ensure all dependencies share the same output policy and logical axis.
             ref_meta = get_field_meta(valid_deps[0])
-            # Only enforce save_idx and dim_coords roughly.
-            # save_coord might act differently but usually matches too.
-
             for dep in valid_deps[1:]:
                  curr_meta = get_field_meta(dep)
                  if curr_meta != ref_meta:
                       raise ValueError(
                           f"Inconsistent metadata in virtual variable '{var_name}' (expression: '{expression}'). "
                           f"Dependency '{valid_deps[0]}' has {ref_meta}, but '{dep}' has {curr_meta}. "
-                          "All dependencies in an expression must share the same 'save_idx', 'save_coord', and 'dim_coords' to ensure correct parallel iteration."
+                          "All dependencies in an expression must share the same output policy and dim_coords to ensure correct parallel iteration."
                       )
 
             # Create FieldInfo
-            save_idx, save_coord, dim_coords = ref_meta
+            output, dim_coords = ref_meta
 
             new_info = Field(
                 description=f"Ad-hoc expression: {expression}",
                 json_schema_extra={
                     "category": "virtual",
                     "expr": expression,
-                    "save_idx": save_idx,
-                    "save_coord": save_coord,
-                    "dim_coords": dim_coords
+                    "dim_coords": dim_coords,
+                    "output": output,
                 }
             )
 
@@ -782,6 +1157,12 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
         # No need to sanitize names or update var_to_ops keys further,
         # as var_to_ops already uses the keys we intend to register.
+
+        if not var_to_ops:
+            raise ValueError(
+                "variables_to_save cannot contain only 'static' entries; "
+                "at least one dynamic output is required to define the output file."
+            )
 
 
         registered_vars_by_shape: Dict[str, List[str]] = {}
@@ -811,10 +1192,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             module_instance, attr_name, _ = self.variable_map[curr_var]
 
             # Check normal fields
-            field_info = module_instance.get_model_fields().get(attr_name)
-            if field_info is None:
-                # Check computed fields
-                field_info = module_instance.get_model_computed_fields().get(attr_name)
+            field_info = module_instance.get_tensor_field_info(attr_name)
 
             if field_info:
                 cat = field_info.json_schema_extra.get("category", "param")
@@ -858,12 +1236,16 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                 continue
 
             tensor = getattr(module_instance, attr_name)
-            field_info = module_instance.get_model_fields().get(attr_name)
-            if field_info is None:
-                field_info = module_instance.get_model_computed_fields().get(attr_name)
+            field_info = module_instance.get_tensor_field_info(attr_name)
 
             if field_info is None:
                 continue
+
+            raw_extra = field_info.json_schema_extra or {}
+            if var_name in var_to_ops and raw_extra.get("output", "auto") == "disabled":
+                raise ValueError(f"Variable '{var_name}' is disabled for output")
+
+            field_info, binding_tensors = self._bind_output_metadata(field_info)
 
             # Check category
             category = field_info.json_schema_extra.get("category", "param")
@@ -883,8 +1265,8 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             if var_name in var_to_ops:
                 ops = var_to_ops[var_name]
                 if category != 'virtual':
-                    save_idx = field_info.json_schema_extra.get("save_idx")
-                    is_full_output = save_idx is None
+                    output_index = field_info.json_schema_extra.get("output_index")
+                    is_full_output = output_index is None
                     if is_full_output:
                         for op in ops:
                             op_base = op.split('_')[0]
@@ -934,35 +1316,36 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
                 registered_vars.add(var_name)
 
-            # Check for save_idx
-            save_idx = field_info.json_schema_extra.get("save_idx")
-            if save_idx and save_idx not in registered_vars:
-                if hasattr(module_instance, save_idx):
-                    save_tensor = getattr(module_instance, save_idx)
-                    self._statistics_aggregator.register_tensor(save_idx, save_tensor, {})
-                    registered_vars.add(save_idx)
+            # Register the runtime-generated output index and coordinate tensors.
+            output_index = field_info.json_schema_extra.get("output_index")
+            if output_index and output_index not in registered_vars:
+                if output_index in binding_tensors:
+                    save_tensor = binding_tensors[output_index]
+                    self._statistics_aggregator.register_tensor(output_index, save_tensor, {})
+                    registered_vars.add(output_index)
                     shape_str = str(tuple(save_tensor.shape))
                     if shape_str not in registered_vars_by_shape:
                         registered_vars_by_shape[shape_str] = []
-                    registered_vars_by_shape[shape_str].append(save_idx)
+                    registered_vars_by_shape[shape_str].append(output_index)
                 else:
                     raise ValueError(
-                        f"save_idx '{save_idx}' not found in module '{type(module_instance).__name__}' for variable '{var_name}'"
+                        f"Runtime output index '{output_index}' was not resolved for '{var_name}'"
                     )
 
-            # Check for save_coord
-            save_coord = field_info.json_schema_extra.get("save_coord")
-            if save_coord and save_coord not in registered_vars:
-                if hasattr(module_instance, save_coord):
-                    coord_tensor = getattr(module_instance, save_coord)
-                    self._statistics_aggregator.register_tensor(save_coord, coord_tensor, {})
-                    registered_vars.add(save_coord)
+            output_coord = field_info.json_schema_extra.get("output_coord")
+            if output_coord and output_coord not in registered_vars:
+                if output_coord in binding_tensors:
+                    coord_tensor = binding_tensors[output_coord]
+                    self._statistics_aggregator.register_tensor(output_coord, coord_tensor, {})
+                    registered_vars.add(output_coord)
                     shape_str = str(tuple(coord_tensor.shape))
                     if shape_str not in registered_vars_by_shape:
                         registered_vars_by_shape[shape_str] = []
-                    registered_vars_by_shape[shape_str].append(save_coord)
+                    registered_vars_by_shape[shape_str].append(output_coord)
                 else:
-                    print(f"Warning: save_coord '{save_coord}' not found in module '{type(module_instance).__name__}' for variable '{var_name}'")
+                    raise ValueError(
+                        f"Runtime output coordinate '{output_coord}' was not resolved for '{var_name}'"
+                    )
 
         if registered_vars_by_shape:
             for shape_str, vars_list in registered_vars_by_shape.items():
@@ -1057,6 +1440,10 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         # Collect unique fields to load across all opened modules
         fields_to_load: Dict[str, Any] = {}
         for _, _, field_name, field_info in self._iter_all_fields(include_computed=False):
+            # Dependency references are injected from already constructed
+            # modules according to the module DAG; they are not dataset fields.
+            if getattr(field_info, "exclude", False):
+                continue
             if field_name not in fields_to_load:
                 fields_to_load[field_name] = field_info
 
@@ -1083,6 +1470,8 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     f"Available fields: {list(self.input_proxy.data.keys())}"
                 )
 
+            self._validate_input_axes(fields_to_load)
+
             # Pre-compute indices per group var for current rank
             group_vars_needed = set()
             for name in fields_to_load.keys():
@@ -1092,11 +1481,10 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                         group_vars_needed.add(self.variable_group_mapping[name])
             group_indices_cache: Dict[str, np.ndarray] = {}
             for group_var in group_vars_needed:
-                if group_var not in self.input_proxy:
-                    raise ValueError(f"Group variable '{group_var}' not found in InputProxy.")
-                grp = self.input_proxy[group_var]
-                idx = np.nonzero(self.group_id_to_rank[grp] == self.rank)[0]
-                group_indices_cache[group_var] = idx
+                group_indices_cache[group_var] = self._group_indices_for_rank(group_var)
+            # Full-domain foreign-key indices are needed only while resolving
+            # partition lineage; do not retain them for the model lifetime.
+            self.__dict__.pop("_reference_index_cache", None)
 
             print(f"[rank {self.rank}]: Loading data for modules {self.opened_modules}")
 
@@ -1155,13 +1543,11 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     # Use get_var_shape to check dimensions without loading full data
                     full_shape = self.input_proxy.get_var_shape(field_name)
 
-                    # Handle batched parameters (num_trials, num_catchments, ...)
-                    if len(full_shape) > 1 and self.num_trials is not None and full_shape[0] == self.num_trials:
-                         # Batched parameter: (T, N, ...) -> slice dim 1
-                         slicer = (slice(None), idx)
-                    else:
-                         # Standard parameter: (N, ...) -> slice dim 0
-                         slicer = idx
+                    logical_axis = self._logical_axis(
+                        field_name, field_info, full_shape,
+                    )
+                    slicer = ((slice(None), idx)
+                              if logical_axis == 1 else idx)
 
                     # Read only the subset
                     local_np = self.input_proxy.get_subset(field_name, slicer)
@@ -1183,16 +1569,18 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
             # Flush logs
             for group_var, fields in no_local_fields.items():
-                print(f"[rank {self.rank}]: No local data for distributed fields: {', '.join(fields)} (group_by: {group_var})")
+                print(f"[rank {self.rank}]: No local data for distributed fields: {', '.join(fields)} (coordinate: {group_var})")
 
             for (shape, group_var), fields in distributed_fields.items():
-                print(f"[rank {self.rank}]: Loaded distributed fields: {', '.join(fields)} (shape: {shape}, group_by: {group_var})")
+                print(f"[rank {self.rank}]: Loaded distributed fields: {', '.join(fields)} (shape: {shape}, coordinate: {group_var})")
 
             if full_fields:
-                print(f"[rank {self.rank}]: Loaded full fields: {', '.join(full_fields)} (no group_by)")
+                print(f"[rank {self.rank}]: Loaded full fields: {', '.join(full_fields)} (no coordinate axis)")
 
             if missing_fields:
                 print(f"[rank {self.rank}]: Optional fields not in InputProxy, using default: {', '.join(missing_fields)}")
+
+            self._validate_reference_integrity(module_data)
 
         except Exception as e:
             raise RuntimeError(f"Error loading data from InputProxy: {e}")
@@ -1223,16 +1611,32 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         saved_global = []
         skipped_none = set()
 
+        state_group_mapping: Dict[str, str] = {}
         for module_name in self.opened_modules:
             module = self._modules[module_name]
-            for field_name, field_info in module.get_model_fields().items():
+            field_items = [
+                (name, info)
+                for name, info in module.get_model_fields().items()
+                if (getattr(info, "json_schema_extra", {}) or {}).get("category")
+                in {"init_state", "state", "shared_state"}
+            ]
+            field_items.extend(
+                (name, info)
+                for name, info in module.get_model_computed_fields().items()
+                if (getattr(info, "json_schema_extra", {}) or {}).get("category")
+                in {"state", "shared_state"}
+            )
+            for field_name, field_info in field_items:
                 if field_name in module.nc_excluded_fields or field_name in visited_fields:
                     continue
 
-                if field_info.exclude:
+                if getattr(field_info, "exclude", False):
                     continue
 
-                is_distributed = field_name in self.variable_group_mapping
+                coordinate = self._field_coordinate(field_info)
+                is_distributed = coordinate is not None
+                if coordinate is not None:
+                    state_group_mapping[field_name] = coordinate
 
                 # Only rank 0 saves non-distributed variables
                 if not is_distributed and self.rank != 0:
@@ -1255,6 +1659,19 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     saved_distributed.append(field_name)
                 else:
                     saved_global.append(field_name)
+
+        # Coordinates are checkpoint metadata used to restore distributed
+        # state by key after rank-wise merge. They are not loaded as state.
+        for coordinate in sorted(set(state_group_mapping.values())):
+            if coordinate in data:
+                continue
+            coord_module, coord_attr, _ = self.variable_map[coordinate]
+            coord_value = getattr(coord_module, coord_attr)
+            if isinstance(coord_value, torch.Tensor):
+                coord_value = coord_value.detach().cpu().numpy()
+            data[coordinate] = coord_value
+            state_group_mapping[coordinate] = coordinate
+            saved_distributed.append(coordinate)
 
         # Create InputProxy
         proxy = InputProxy(data, attrs={
@@ -1284,7 +1701,12 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             merged_path = self.output_full_dir / f"model_state_{timestamp}.nc"
             rank_paths = [self.output_full_dir / f"model_state_rank{r}_{timestamp}.nc" for r in range(self.world_size)]
 
-            InputProxy.merge(merged_path, rank_paths, self.variable_group_mapping, self.output_complevel)
+            InputProxy.merge(
+                merged_path,
+                rank_paths,
+                state_group_mapping,
+                self.output_complevel,
+            )
 
             # Remove rank files
             for p in rank_paths:
@@ -1306,18 +1728,30 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
         loaded_count = 0
 
-        # Cache group indices for sharding
-        group_indices_cache: Dict[str, np.ndarray] = {}
+        # Cache checkpoint-coordinate indices for restoring distributed fields.
+        coordinate_indices_cache: Dict[str, np.ndarray] = {}
 
         for module_name in self.opened_modules:
             module = self._modules[module_name]
+            field_items = [
+                (name, info)
+                for name, info in module.get_model_fields().items()
+                if (getattr(info, "json_schema_extra", {}) or {}).get("category")
+                in {"init_state", "state", "shared_state"}
+            ]
+            field_items.extend(
+                (name, info)
+                for name, info in module.get_model_computed_fields().items()
+                if (getattr(info, "json_schema_extra", {}) or {}).get("category")
+                in {"state", "shared_state"}
+            )
 
-            for field_name, field_info in module.get_model_fields().items():
+            for field_name, field_info in field_items:
                 if field_name not in proxy:
                     continue
 
                 # Skip excluded fields if they happen to be in proxy (unlikely but safe)
-                if field_info.exclude:
+                if getattr(field_info, "exclude", False):
                     continue
 
                 new_val = proxy[field_name]
@@ -1331,6 +1765,53 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
 
                     new_val = np.asarray(new_val)
 
+                    group_var = self._field_coordinate(field_info)
+
+                    # Distributed checkpoints are merged rank-by-rank and are
+                    # therefore not guaranteed to preserve the original global
+                    # ordering. Reindex by coordinate values, never by position.
+                    if group_var is not None and group_var in proxy:
+                        if group_var not in coordinate_indices_cache:
+                            coord_module, coord_attr, _ = self.variable_map[group_var]
+                            local_coord = getattr(coord_module, coord_attr)
+                            if isinstance(local_coord, torch.Tensor):
+                                local_coord = local_coord.detach().cpu().numpy()
+                            checkpoint_coord = proxy[group_var]
+                            if isinstance(checkpoint_coord, torch.Tensor):
+                                checkpoint_coord = (
+                                    checkpoint_coord.detach().cpu().numpy()
+                                )
+                            idx = find_indices_in(
+                                np.asarray(local_coord),
+                                np.asarray(checkpoint_coord),
+                            )
+                            if np.any(idx < 0):
+                                missing = np.asarray(local_coord)[idx < 0][:5].tolist()
+                                raise ValueError(
+                                    f"Checkpoint coordinate '{group_var}' is missing "
+                                    f"local IDs; examples: {missing}."
+                                )
+                            coordinate_indices_cache[group_var] = idx
+
+                        idx = coordinate_indices_cache[group_var]
+                        logical_axis = self._logical_axis(
+                            field_name, field_info, tuple(new_val.shape),
+                        )
+                        slicer = [slice(None)] * new_val.ndim
+                        slicer[logical_axis] = idx
+                        local_val = new_val[tuple(slicer)]
+                        if local_val.shape != tuple(current_val.shape):
+                            raise ValueError(
+                                f"Shape mismatch for '{field_name}' after coordinate "
+                                f"restore: expected {tuple(current_val.shape)}, got "
+                                f"{local_val.shape}."
+                            )
+                        current_val.copy_(
+                            torch.as_tensor(local_val).to(current_val.device)
+                        )
+                        loaded_count += 1
+                        continue
+
                     # Check 1: Direct shape match (Local file or scalar)
                     if new_val.shape == tuple(current_val.shape):
                         current_val.copy_(torch.as_tensor(new_val).to(current_val.device))
@@ -1338,36 +1819,37 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                         continue
 
                     # Check 2: Distributed variable needing sharding (Global file)
-                    if field_name in self.variable_group_mapping:
-                        group_var = self.variable_group_mapping[field_name]
-
-                        # We rely on self.input_proxy (static params) for sharding info
-                        if group_var not in self.input_proxy:
-                            print(f"[rank {self.rank}] Warning: Cannot shard '{field_name}' because group var '{group_var}' is missing in static inputs.")
-                            continue
-
-                        # Get indices (cached)
-                        if group_var not in group_indices_cache:
-                            grp = self.input_proxy[group_var]
-                            idx = np.nonzero(self.group_id_to_rank[grp] == self.rank)[0]
-                            group_indices_cache[group_var] = idx
-
-                        idx = group_indices_cache[group_var]
+                    group_var = self._field_coordinate(field_info)
+                    if group_var is not None:
+                        idx = self._group_indices_for_rank(group_var)
 
                         # Shard the global data
+                        logical_axis = self._logical_axis(
+                            field_name, field_info, tuple(new_val.shape),
+                        )
+                        slicer = [slice(None)] * new_val.ndim
+                        slicer[logical_axis] = idx
                         try:
-                            local_val = new_val[idx]
-                        except IndexError:
-                             print(f"[rank {self.rank}] Warning: Indexing error sharding '{field_name}'. Shape: {new_val.shape}, Indices max: {idx.max() if len(idx)>0 else 'N/A'}")
-                             continue
+                            local_val = new_val[tuple(slicer)]
+                        except IndexError as exc:
+                            raise ValueError(
+                                f"Cannot shard state field '{field_name}' with shape "
+                                f"{new_val.shape} on logical axis {logical_axis}."
+                            ) from exc
 
                         if local_val.shape == tuple(current_val.shape):
                             current_val.copy_(torch.as_tensor(local_val).to(current_val.device))
                             loaded_count += 1
                         else:
-                            print(f"[rank {self.rank}] Warning: Shape mismatch for '{field_name}' after sharding. Expected {tuple(current_val.shape)}, got {local_val.shape}.")
+                            raise ValueError(
+                                f"Shape mismatch for '{field_name}' after sharding: "
+                                f"expected {tuple(current_val.shape)}, got {local_val.shape}."
+                            )
                     else:
-                        print(f"[rank {self.rank}] Warning: Shape mismatch for '{field_name}'. Expected {tuple(current_val.shape)}, got {new_val.shape}.")
+                        raise ValueError(
+                            f"Shape mismatch for global state field '{field_name}': "
+                            f"expected {tuple(current_val.shape)}, got {new_val.shape}."
+                        )
 
                 # Handle Scalar/Other fields
                 else:
@@ -1478,8 +1960,8 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
                     else:
                         pairs.append((var, op_l, False))
 
-        # Validate each variable exists.  Variables without ``save_idx`` are
-        # saved as full tensors by the aggregator.
+        # Validate each variable exists. Output views are resolved later from
+        # dim_coords and the coordinate's SelectionField.
         for var, _, is_explicit in pairs:
             if is_explicit:
                 continue

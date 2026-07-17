@@ -41,45 +41,59 @@ class KernelCodegenMixin(
         Dispatches to CUDA C++, Metal, PyTorch, or Triton code generation
         based on HYDROFORGE_BACKEND.
         """
+        from hydroforge.runtime.backend import BackendRegistry
+
+        registry = BackendRegistry(
+            {
+                "torch": lambda: self._generate_pytorch_aggregator_function,
+                "metal": lambda: self._generate_metal_aggregator_function,
+                "cuda": lambda: self._generate_cuda_aggregator_function,
+                "triton": lambda: self._generate_triton_aggregator_function,
+            },
+            name="statistics code generator",
+        )
         from hydroforge.runtime.backend import KERNEL_BACKEND
 
-        if KERNEL_BACKEND == "torch":
-            self._generate_pytorch_aggregator_function()
-            return
+        device_type = self.device.type
+        if device_type == "cpu":
+            backend = "torch"
+        elif device_type == "mps":
+            backend = "metal"
+        elif device_type == "cuda":
+            if KERNEL_BACKEND not in {"cuda", "triton", "torch"}:
+                raise ValueError(
+                    f"Backend {KERNEL_BACKEND!r} cannot run CUDA tensors."
+                )
+            backend = KERNEL_BACKEND
+        else:
+            backend = "torch"
 
-        if KERNEL_BACKEND == "metal":
-            self._generate_metal_aggregator_function()
-            return
-
-        if KERNEL_BACKEND == "cuda":
-            self._generate_cuda_aggregator_function()
-            return
-
-        self._generate_triton_aggregator_function()
+        generator = registry.resolve(backend)
+        generator()
 
     def _generate_triton_aggregator_function(self: StatisticsAggregator) -> None:
         """Generate and compile the Triton aggregation kernel function."""
         if not self._variables:
             raise ValueError("No variables initialized for statistics aggregation")
 
-        tensor_info, grouped_by_save_idx = self._analyze_tensor_info()
+        tensor_info, grouped_by_output_index = self._analyze_tensor_info()
 
         # Generate kernel code
         kernel_code_lines = self._generate_kernel_header()
 
         # Generate scatter pre-step kernels
-        self._generate_scatter_kernels(kernel_code_lines, grouped_by_save_idx)
+        self._generate_scatter_kernels(kernel_code_lines, grouped_by_output_index)
 
-        # Generate kernels for each save_idx/full-output group
-        for save_idx, var_list in grouped_by_save_idx.items():
-            if save_idx == "__full__":
-                self._generate_full_kernel_for_group(kernel_code_lines, save_idx, var_list, tensor_info)
+        # Generate kernels for each output_index/full-output group
+        for output_index, var_list in grouped_by_output_index.items():
+            if output_index == "__full__":
+                self._generate_full_kernel_for_group(kernel_code_lines, output_index, var_list, tensor_info)
                 continue
-            kernel_name = f"kernel_{save_idx}"
-            self._generate_kernel_for_group(kernel_code_lines, kernel_name, save_idx, var_list, tensor_info)
+            kernel_name = f"kernel_{output_index}"
+            self._generate_kernel_for_group(kernel_code_lines, kernel_name, output_index, var_list, tensor_info)
 
         # Generate main function
-        self._generate_main_function(kernel_code_lines, grouped_by_save_idx, tensor_info)
+        self._generate_main_function(kernel_code_lines, grouped_by_output_index, tensor_info)
 
         # Write kernel code to temporary file and import
         kernel_code = "\n".join(kernel_code_lines)

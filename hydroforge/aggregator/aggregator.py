@@ -253,7 +253,7 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
         seen_ptrs: set = set()
 
         # Storage tensors (accumulation buffers) – these are owned by the aggregator
-        for name, tensor in self._storage.items():
+        for tensor in self._storage.values():
             if isinstance(tensor, torch.Tensor):
                 ptr = tensor.data_ptr()
                 if ptr not in seen_ptrs:
@@ -278,7 +278,7 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
             return 0
 
         total_bytes = 0
-        for name, tensor_list in self._result_tensors.items():
+        for tensor_list in self._result_tensors.values():
             for tensor in tensor_list:
                 if isinstance(tensor, torch.Tensor):
                     total_bytes += tensor.element_size() * tensor.numel()
@@ -339,13 +339,14 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
 
 
     def register_static(self, name: str, tensor: torch.Tensor,
-                        save_idx: Optional[torch.Tensor] = None,
+                        output_index: Optional[torch.Tensor] = None,
                         dim: str = "saved_points",
+                        coordinate: Optional[str] = None,
                         dtype: Optional[str] = None,
                         attrs: Optional[Dict[str, Any]] = None) -> None:
         """Register a per-saved-point static variable.
 
-        The raw ``tensor`` (optionally gathered by ``save_idx``) is
+        The raw ``tensor`` (optionally gathered by ``output_index``) is
         materialised once via the generated gather kernel and stashed
         for the NetCDF writer, which emits it along ``dim`` at file
         creation time.  Mirrors :meth:`register_tensor` /
@@ -354,13 +355,16 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
         """
         if self._static_gather_function is None:
             self._generate_static_gather_function()
+        if output_index is not None and output_index.device != tensor.device:
+            output_index = output_index.to(tensor.device)
         values = (
-            self._static_gather_function(tensor, save_idx)
+            self._static_gather_function(tensor, output_index)
             .detach().cpu().numpy()
         )
         self.static_vars[name] = {
             "values": values,
             "dim": dim,
+            "coordinate": coordinate,
             "dtype": dtype if dtype is not None
                      else values.dtype.str.lstrip("<>|"),
             "attrs": dict(attrs or {}),

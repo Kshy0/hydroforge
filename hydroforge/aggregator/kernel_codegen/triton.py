@@ -37,7 +37,7 @@ class TritonCodegenMixin:
             f'Device: {self.device}',
             '',
             'Kernel Logic:',
-            '- Load save_idx values to get original grid indices',
+            '- Load output_index values to get original grid indices',
             '- Use idx to access original data: data[idx]',
             '- Store outputs using sequential indexing: out[offs]',
             '- max/min ops automatically update corresponding argmax/argmin (step index)',
@@ -95,7 +95,7 @@ class TritonCodegenMixin:
     def _generate_scatter_kernels(
         self: StatisticsAggregator,
         kernel_code_lines: List[str],
-        grouped_by_save_idx: Dict[str, List[str]],
+        grouped_by_output_index: Dict[str, List[str]],
     ) -> None:
         """Generate Triton kernels for scatter virtual pre-steps.
 
@@ -1210,9 +1210,9 @@ class TritonCodegenMixin:
 
 
     def _generate_kernel_for_group(self: StatisticsAggregator, kernel_code_lines: List[str], kernel_name: str,
-                                   save_idx: str, var_list: List[str],
+                                   output_index: str, var_list: List[str],
                                    tensor_info: Dict[str, Dict[str, Any]]) -> None:
-        """Generate kernel code for a specific save_idx group supporting ops."""
+        """Generate kernel code for a specific output_index group supporting ops."""
         if self.num_trials > 1:
             dims_1d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 2]
             dims_2d = [v for v in var_list if tensor_info[v]['actual_ndim'] == 3]
@@ -1222,14 +1222,14 @@ class TritonCodegenMixin:
 
         # Header
         kernel_code_lines.extend([
-            f"# Kernel for save_idx: {save_idx}",
+            f"# Kernel for output_index: {output_index}",
             f"# Variables: {', '.join(var_list)}",
             f"# 1D: {', '.join(dims_1d) if dims_1d else 'None'}",
             f"# 2D: {', '.join(dims_2d) if dims_2d else 'None'}",
             "",
             "@triton.jit",
             f"def {kernel_name}(",
-            f"    {save_idx}_ptr,",
+            f"    {output_index}_ptr,",
         ])
 
         # Gather input pointers (resolving virtuals)
@@ -1266,8 +1266,8 @@ class TritonCodegenMixin:
         sorted_inputs = sorted(list(input_ptrs))
         for var in sorted_inputs:
             safe_var = self._get_safe_name(var)
-            # Avoid duplicate argument if save_idx matches input var
-            if safe_var == save_idx:
+            # Avoid duplicate argument if output_index matches input var
+            if safe_var == output_index:
                 continue
             kernel_code_lines.append(f"    {safe_var}_ptr,")
 
@@ -1357,7 +1357,7 @@ class TritonCodegenMixin:
             kernel_code_lines.append("")
 
         kernel_code_lines.extend([
-            f"    idx = tl.load({save_idx}_ptr + offs, mask=mask)",
+            f"    idx = tl.load({output_index}_ptr + offs, mask=mask)",
             "",
         ])
 
@@ -1775,12 +1775,12 @@ class TritonCodegenMixin:
 
 
     def _generate_full_kernel_for_group(self: StatisticsAggregator, kernel_code_lines: List[str],
-                                        save_idx: str, var_list: List[str],
+                                        output_index: str, var_list: List[str],
                                         tensor_info: Dict[str, Dict[str, Any]]) -> None:
         """Generate a flat Triton kernel for variables saved at full tensor shape."""
-        kernel_name = f"kernel_{save_idx}"
+        kernel_name = f"kernel_{output_index}"
         kernel_code_lines.extend([
-            f"# Full-output kernel: {save_idx}",
+            f"# Full-output kernel: {output_index}",
             f"# Variables: {', '.join(var_list)}",
             "",
             "@triton.jit",
@@ -1988,7 +1988,7 @@ class TritonCodegenMixin:
 
 
     def _generate_main_function(self: StatisticsAggregator, kernel_code_lines: List[str],
-                                grouped_by_save_idx: Dict[str, List[str]],
+                                grouped_by_output_index: Dict[str, List[str]],
                                 tensor_info: Dict[str, Dict[str, Any]]) -> None:
         """Generate the main python function that calls kernels."""
         kernel_code_lines.extend([
@@ -2001,15 +2001,15 @@ class TritonCodegenMixin:
         else:
              kernel_code_lines.append("    num_trials = 1")
 
-        for save_idx, var_list in grouped_by_save_idx.items():
-            kernel_name = f"kernel_{save_idx}"
+        for output_index, var_list in grouped_by_output_index.items():
+            kernel_name = f"kernel_{output_index}"
 
-            if save_idx == "__full__":
+            if output_index == "__full__":
                 full_len = max(int(self._tensor_registry[var].numel()) for var in var_list)
                 kernel_code_lines.extend([
-                    f"    # Launch full-output kernel",
+                    "    # Launch full-output kernel",
                     f"    full_len = {full_len}",
-                    f"    grid___full__ = lambda meta: (triton.cdiv(full_len, meta['BLOCK_SIZE']),)",
+                    "    grid___full__ = lambda meta: (triton.cdiv(full_len, meta['BLOCK_SIZE']),)",
                     f"    {kernel_name}[grid___full__](",
                 ])
                 for var in var_list:
@@ -2046,14 +2046,14 @@ class TritonCodegenMixin:
             # Get stride_input from metadata of first variable
             first_var = var_list[0]
             stride_input = 0
-            for out_name, meta in self._metadata.items():
+            for meta in self._metadata.values():
                 if meta['original_variable'] == first_var:
                     stride_input = meta.get('stride_input', 0)
                     break
 
             kernel_code_lines.extend([
-                f"    # Launch kernel for {save_idx}",
-                f"    save_idx_len = len(states['{save_idx}'])",
+                f"    # Launch kernel for {output_index}",
+                f"    output_index_len = len(states['{output_index}'])",
                 f"    stride_input = {stride_input}",
             ])
 
@@ -2154,9 +2154,9 @@ class TritonCodegenMixin:
                 kernel_code_lines.append("")
 
             kernel_code_lines.extend([
-                f"    grid_{save_idx} = lambda meta: (triton.cdiv(save_idx_len, meta['BLOCK_SIZE']),)",
-                f"    {kernel_name}[grid_{save_idx}](",
-                f"        {save_idx}_ptr=states['{save_idx}'],",
+                f"    grid_{output_index} = lambda meta: (triton.cdiv(output_index_len, meta['BLOCK_SIZE']),)",
+                f"    {kernel_name}[grid_{output_index}](",
+                f"        {output_index}_ptr=states['{output_index}'],",
             ])
 
             # Gather input pointers (resolving virtuals)
@@ -2192,8 +2192,8 @@ class TritonCodegenMixin:
             sorted_inputs = sorted(list(input_args))
             for var in sorted_inputs:
                  safe_var = self._get_safe_name(var)
-                 # Avoid duplicate argument if save_idx matches input var
-                 if safe_var == save_idx:
+                 # Avoid duplicate argument if output_index matches input var
+                 if safe_var == output_index:
                      continue
                  kernel_code_lines.append(f"        {safe_var}_ptr=states['{var}'],")
 
@@ -2241,7 +2241,7 @@ class TritonCodegenMixin:
                 "        num_sub_steps_ptr=states['__num_sub_steps'],",
                 "        flags_ptr=states['__flags'],",
                 "        macro_step_index_ptr=states['__macro_step_index'],",
-                "        n_saved_points=save_idx_len,",
+                "        n_saved_points=output_index_len,",
             ])
 
             # Add second dimension if needed (use actual shape)
