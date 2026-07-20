@@ -149,12 +149,12 @@ def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]
 
     Args:
         args: Tuple containing (mean_var_name, metadata, coord_values,
-              output_dir, complevel, rank, year, calendar, time_unit, num_trials)
+              output_dir, compression, complevel, rank, year, calendar, time_unit, num_trials)
 
     Returns:
         Path or List[Path] to the created NetCDF file(s)
     """
-    (mean_var_name, metadata, coord_values, output_dir, complevel, rank, year, calendar, time_unit, num_trials, *extra) = args
+    (mean_var_name, metadata, coord_values, output_dir, compression, complevel, rank, year, calendar, time_unit, num_trials, *extra) = args
     chunksizes = extra[0] if extra else None
     static_vars: Dict[str, Dict[str, Any]] = extra[1] if len(extra) > 1 else {}
 
@@ -276,7 +276,7 @@ def _create_netcdf_file_process(args: Tuple[Any, ...]) -> Union[Path, List[Path]
                 file_safe_name,
                 dtype,
                 dim_names,
-                zlib=True,
+                compression=compression,
                 complevel=complevel,
                 chunksizes=var_chunksizes)
             desc = metadata.get("description", "") + description_suffix
@@ -327,7 +327,7 @@ class NetCDFIOMixin:
             for out_name, metadata in items:
                 coord_name = metadata.get('save_coord')
                 coord_values = self._coord_cache.get(coord_name, None)
-                args = (out_name, metadata, coord_values, self.output_dir, self.complevel, self.rank, year, self.calendar, self.time_unit, self.num_trials, self.output_chunksizes, self.static_vars)
+                args = (out_name, metadata, coord_values, self.output_dir, self.compression, self.complevel, self.rank, year, self.calendar, self.time_unit, self.num_trials, self.output_chunksizes, self.static_vars)
                 future = executor.submit(_create_netcdf_file_process, args)
                 creation_futures[future] = (out_name, metadata.get('k', 1))
 
