@@ -118,6 +118,10 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
         default=2,
         description="Number of workers for writing output files",
     )
+    output_compression: str = Field(
+        default="zlib",
+        description="Compression algorithm for output NetCDF files",
+    )
     output_complevel: int = Field(
         default=4,
         description="Compression level for output NetCDF files",
@@ -892,6 +896,7 @@ class AbstractModel(ParameterPlanMixin, ProgressMixin, BaseModel, ABC):
             output_dir=self.output_full_dir,
             rank=self.rank,
             num_workers=self.output_workers,
+            compression=self.output_compression,
             complevel=self.output_complevel,
             output_split_by_year=self.output_split_by_year,
             num_trials=self.num_trials or 1,

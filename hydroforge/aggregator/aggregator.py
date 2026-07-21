@@ -38,7 +38,7 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
     """
 
     def __init__(self, device: torch.device, output_dir: Optional[Path] = None, rank: int = 0,
-                 num_workers: int = 4, complevel: int = 4, save_kernels: bool = False,
+                 num_workers: int = 4, compression: str = "zlib", complevel: int = 4, save_kernels: bool = False,
                  output_split_by_year: bool = False, num_trials: int = 1,
                  max_pending_steps: int = 200, calendar: str = "standard",
                  time_unit: str = "days since 1900-01-01 00:00:00",
@@ -53,6 +53,7 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
             output_dir: Output directory for NetCDF files (required for streaming mode, optional for in-memory mode)
             rank: Process rank identifier (int)
             num_workers: Number of worker processes for parallel NetCDF writing
+            compression: Compression algorithm
             complevel: Compression level (1-9)
             save_kernels: Whether to save generated kernel files for inspection
             output_split_by_year: Whether to split output files by year
@@ -77,6 +78,7 @@ class StatisticsAggregator(NetCDFIOMixin, KernelCodegenMixin, StatisticsMixin):
         self.output_dir = output_dir
         self.rank = rank
         self.num_workers = max(1, int(num_workers))
+        self.compression = compression
         self.complevel = complevel
         self.save_kernels = save_kernels
         self.output_split_by_year = output_split_by_year
