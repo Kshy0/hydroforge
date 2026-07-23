@@ -1,0 +1,71 @@
+"""Immutable public contracts compiled before model execution."""
+
+from hydroforge.contracts.fields import (
+    ModuleFieldSchema,
+    ModuleSchema,
+    PartitionSchema,
+    RuntimeTensorMetadata,
+    TensorMetadata,
+    cast_declared_tensor,
+    concrete_tensor_dtype,
+    parse_module_schema,
+)
+from hydroforge.contracts.kernels import (
+    BufferElementLowering,
+    BufferDTypeABI,
+    BUFFER_ACCESS_MODES,
+    AccessMode,
+    BufferAccessSemantics,
+    BackendLoweringSpec,
+    KernelMetadata,
+    KernelSpec,
+    RuntimeScalarKind,
+    buffer_access_semantics,
+)
+from hydroforge.contracts.errors import ResourceCleanupError
+from hydroforge.contracts.runtime import BackendRequirement, ModuleRequirement
+from hydroforge.contracts.temporal import (
+    CalendarWindow,
+    DatasetTemporalContract,
+    EveryStep,
+    ExplicitWindow,
+    ExplicitWindows,
+    SimulationSchedule,
+    SimulationStep,
+    StatisticsFlags,
+    StatisticsPlan,
+    timedelta_microseconds,
+    timedelta_quotient,
+)
+
+__all__ = [
+    "AccessMode",
+    "BUFFER_ACCESS_MODES",
+    "BackendLoweringSpec", "BufferDTypeABI", "BufferElementLowering",
+    "BufferAccessSemantics", "buffer_access_semantics",
+    "KernelMetadata",
+    "KernelSpec",
+    "RuntimeScalarKind",
+    "ResourceCleanupError",
+    "BackendRequirement",
+    "ModuleRequirement",
+    "ModuleFieldSchema",
+    "ModuleSchema",
+    "PartitionSchema",
+    "RuntimeTensorMetadata",
+    "TensorMetadata",
+    "cast_declared_tensor",
+    "concrete_tensor_dtype",
+    "CalendarWindow",
+    "DatasetTemporalContract",
+    "EveryStep",
+    "ExplicitWindow",
+    "ExplicitWindows",
+    "SimulationSchedule",
+    "SimulationStep",
+    "StatisticsFlags",
+    "StatisticsPlan",
+    "timedelta_microseconds",
+    "timedelta_quotient",
+    "parse_module_schema",
+]

@@ -6,11 +6,13 @@ build-backend = "setuptools.build_meta"
 name = "hydroforge"
 version = "0.1.0"
 description = "Generic framework for GPU-accelerated hydrological modelling"
+requires-python = ">=3.11"
 authors = [
     {name = "Shengyu Kang", email = "kshy0204@whu.edu.cn"}
 ]
 dependencies = [
     "pydantic>=2",
+    "torch",
     "netCDF4",
     "numpy",
     "numba",
@@ -22,12 +24,17 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["hydroforge*"]
+exclude = ["hydroforge.validation*"]
+namespaces = false
 
 [tool.setuptools.package-data]
-"hydroforge.runtime" = ["*.mm"]
+"hydroforge.kernels.backends.metal" = ["*.mm"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["__pycache__/*", "*.py[cod]"]
 
 [project.scripts]
-hydroforge-cuda-precompile = "hydroforge.runtime.cuda_kernel:main"
+hydroforge-cuda-precompile = "hydroforge.kernels.backends.cuda.precompile:main"
 
 [project.optional-dependencies]
 dev = ["ipykernel", "matplotlib", "ipympl", "pandas"]

@@ -9,35 +9,78 @@ hydroforge: Generic framework for GPU-accelerated hydrological modelling.
 
 Subpackages
 -----------
-modeling    Lowest-level abstractions: AbstractModule, AbstractModel, distributed utils.
-io          AbstractDataset + concrete dataset implementations, multi-rank I/O.
-aggregator  Streaming statistics aggregation with NetCDF / in-memory output.
-runtime     GPU kernel backend selection and adapters (Triton / Metal / PyTorch).
+contracts   Immutable field, input, and kernel contracts.
+model       Declarative AbstractModule/AbstractModel API.
+compiler    Cold-path model specialization and immutable plans.
+data        Datasets, distributed loading, and spatial mappings.
+serialization Shared file-format contracts and atomic serialization primitives.
+output      Checkpoint, NetCDF, and multi-rank output facilities.
+statistics  Statistics IR, emitters, and runtime.
+kernels     Kernel registration and Torch/Triton/CUDA/Metal backends.
+execution   Compiled step orchestration, input staging, and backend capture.
 """
 
-from hydroforge.modeling.distributed import (find_indices_in,
-                                             find_indices_in_torch,
-                                             get_global_rank, get_local_rank,
-                                             get_world_size, is_rank_zero,
-                                             setup_distributed,
-                                             torch_to_numpy_dtype)
-from hydroforge.modeling.input_proxy import InputProxy
-from hydroforge.modeling.model import AbstractModel
-from hydroforge.modeling.module import (AbstractModule, TensorField,
-                                        computed_tensor_field)
-from hydroforge.modeling.schema import (ModuleFieldSchema, ModuleSchema,
-                                        parse_module_schema)
-from hydroforge.runtime.cuda_graph import CUDAGraphMixin
+from hydroforge.data.distributed import (
+    find_indices_in,
+    find_indices_in_torch,
+    get_global_rank,
+    get_local_rank,
+    get_world_size,
+    is_rank_zero,
+    setup_distributed,
+    torch_to_numpy_dtype,
+)
+from hydroforge.data.input import InputProxy
+from hydroforge.model.model import AbstractModel
+from hydroforge.contracts.kernel_field import KernelField, kernel_field
+from hydroforge.model.module import (
+    AbstractModule,
+    TensorField,
+    computed_tensor_field,
+)
+from hydroforge.contracts.fields import (
+    ModuleFieldSchema,
+    ModuleSchema,
+    parse_module_schema,
+)
+from hydroforge.contracts.temporal import (
+    CalendarWindow,
+    DatasetTemporalContract,
+    EveryStep,
+    ExplicitWindow,
+    ExplicitWindows,
+    SimulationSchedule,
+    SimulationStep,
+    StatisticsFlags,
+    StatisticsPlan,
+)
+from hydroforge.data.forcing import (
+    ForcingBundle, ForcingPlan, ForcingSource, ForcingStream,
+)
 
 __all__ = [
     "AbstractModel",
     "AbstractModule",
-    "CUDAGraphMixin",
     "InputProxy",
+    "KernelField",
     "ModuleFieldSchema",
     "ModuleSchema",
     "TensorField",
+    "CalendarWindow",
+    "DatasetTemporalContract",
+    "EveryStep",
+    "ExplicitWindow",
+    "ExplicitWindows",
+    "ForcingBundle",
+    "ForcingPlan",
+    "ForcingSource",
+    "ForcingStream",
+    "SimulationSchedule",
+    "SimulationStep",
+    "StatisticsFlags",
+    "StatisticsPlan",
     "computed_tensor_field",
+    "kernel_field",
     "find_indices_in",
     "find_indices_in_torch",
     "get_global_rank",
