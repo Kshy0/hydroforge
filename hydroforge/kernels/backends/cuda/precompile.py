@@ -302,7 +302,9 @@ def precompile_extension_specs(
         raise
 
 
-def precompile_cuda_modules(module_names: Iterable[str]) -> Dict[str, Any]:
+def precompile_cuda_modules(
+    module_names: Iterable[str], *, opened_modules: Iterable[str] | None = None,
+) -> Dict[str, Any]:
     """Precompile every CUDA catalog nominally owned by each module.
 
     A downstream CUDA adapter already declares all extensions through
@@ -337,7 +339,11 @@ def precompile_cuda_modules(module_names: Iterable[str]) -> Dict[str, Any]:
                 f"{module_name} has duplicate CUDA binary prefixes: {prefixes}"
             )
         results[module_name] = {
-            group.binary_prefix: group.ensure_precompiled()
+            group.binary_prefix: (
+                group.ensure_precompiled()
+                if opened_modules is None
+                else group.ensure_precompiled_for_modules(opened_modules)
+            )
             for group in groups
         }
     return results

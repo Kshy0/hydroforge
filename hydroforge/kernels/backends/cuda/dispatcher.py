@@ -69,6 +69,7 @@ class CudaExtensionGroup:
     def __init__(
         self, owner_module: str, specs: Mapping[str, CudaExtensionSpec],
         *, binary_prefix: str | None = None, env_prefix: str = "HYDROFORGE",
+        module_extensions: Mapping[str, Any] | None = None,
     ) -> None:
         if (
             type(owner_module) is not str or not owner_module
@@ -105,6 +106,30 @@ class CudaExtensionGroup:
         self.owner_module = owner_module
         self.binary_prefix = resolved_prefix
         self.specs = MappingProxyType(dict(specs))
+        demands = {} if module_extensions is None else {
+            module: frozenset(extensions)
+            for module, extensions in module_extensions.items()
+        }
+        invalid_modules = [
+            module for module in demands
+            if type(module) is not str or not module.isidentifier()
+        ]
+        if invalid_modules:
+            raise ValueError(
+                "CUDA module demand names must be identifiers: "
+                f"{invalid_modules}"
+            )
+        unknown_demands = {
+            module: sorted(extensions.difference(self.specs))
+            for module, extensions in demands.items()
+            if extensions.difference(self.specs)
+        }
+        if unknown_demands:
+            raise ValueError(
+                "CUDA module demands reference unknown extensions: "
+                f"{unknown_demands}"
+            )
+        self.module_extensions = MappingProxyType(demands)
         self._exports = {
             name: list(spec.functions) for name, spec in self.specs.items()
         }
@@ -113,7 +138,7 @@ class CudaExtensionGroup:
         self.env_prefix = env_prefix
         self._loaded: Dict[str, Any] = {}
         self._materialized_sources: Dict[str, str] = {}
-        self._precompiled = False
+        self._precompiled: set[str] = set()
 
     def route(
         self,
@@ -213,23 +238,60 @@ class CudaExtensionGroup:
         self._loaded[name] = module
         return module
 
-    def ensure_precompiled(self) -> Dict[str, Any]:
-        if self._precompiled:
-            return dict(self._loaded)
+    def ensure_precompiled(
+        self, extensions: Any = None,
+    ) -> Dict[str, Any]:
+        """Build and load the requested subset of this extension catalog.
+
+        Repeated calls are cumulative.  Omitting ``extensions`` preserves the
+        public whole-catalog precompile behavior used by the CLI.
+        """
+        requested = (
+            set(self.specs) if extensions is None else set(extensions)
+        )
+        unknown = requested.difference(self.specs)
+        if unknown:
+            raise KeyError(f"unknown CUDA extensions: {sorted(unknown)}")
+        pending = requested.difference(self._precompiled)
+        if not pending:
+            return {name: self._loaded[name] for name in requested}
         self._routes_sealed = True
         from hydroforge.kernels.backends.cuda.precompile import precompile_extension_specs
 
-        effective = self._effective_specs()
+        effective = {
+            name: spec for name, spec in self._effective_specs().items()
+            if name in pending
+        }
         precompile_extension_specs(
             self.binary_prefix, effective, env_prefix=self.env_prefix,
             materialized_sources={
                 name: self._materialized_source(name) for name in effective
             },
         )
-        for name in self.specs:
+        for name in pending:
             self.load(name)
-        self._precompiled = True
-        return dict(self._loaded)
+        self._precompiled.update(pending)
+        return {name: self._loaded[name] for name in requested}
+
+    def ensure_precompiled_for_modules(
+        self, opened_modules: Any,
+    ) -> Dict[str, Any]:
+        """Precompile the exact catalog subset required by model modules."""
+        if not self.module_extensions:
+            raise RuntimeError(
+                f"{self.owner_module} does not declare module_extensions"
+            )
+        opened = set(opened_modules)
+        unknown = opened.difference(self.module_extensions)
+        if unknown:
+            raise KeyError(
+                "opened modules have no CUDA extension demand declaration: "
+                f"{sorted(unknown)}"
+            )
+        required = set().union(*(
+            self.module_extensions[module] for module in opened
+        ))
+        return self.ensure_precompiled(required)
 
     def _dispatcher(
         self, extension: str, launch: str, *,
@@ -469,7 +531,6 @@ class CudaDispatcher:
 
     @cached_property
     def _launcher(self):
-        self.group.ensure_precompiled()
         return getattr(self.group.load(self.extension), self.launch)
 
     def __call__(self, **kwargs: Any):

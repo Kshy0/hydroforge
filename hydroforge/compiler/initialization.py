@@ -40,6 +40,7 @@ class ModelInitializer:
             self._construct_modules(module_data)
             self._bind_module_attributes()
             self._specialize_capabilities()
+            self._precompile_backend()
             self._apply_tensor_modes()
             hook_result = model.initialize_model_state()
             if hook_result is not None:
@@ -227,6 +228,19 @@ class ModelInitializer:
         model = self.model
         for name in model.opened_modules:
             model._modules[name]._tensors.apply_modes()
+
+    def _precompile_backend(self) -> None:
+        """Materialize only backend extensions reachable by opened modules."""
+        model = self.model
+        execution = self._execution
+        if execution is None or getattr(execution, "backend", None) != "cuda":
+            return
+        catalogs = tuple(getattr(model, "cuda_extension_modules", ()))
+        if not catalogs:
+            return
+        execution.precompile_cuda_catalogs(
+            catalogs, model.opened_modules,
+        )
 
     def _compile_model_plan(self) -> None:
         plan = ModelCompiler(self.model).compile()
