@@ -66,6 +66,22 @@ class ModelExecution:
                 "and rebuild or restore a fresh instance from checkpoint"
             )
 
+    def precompile_cuda_catalogs(
+        self, catalogs: Any, opened_modules: Any,
+    ) -> dict[str, Any]:
+        """Materialize CUDA extensions required by the opened model modules."""
+        if self.backend != "cuda":
+            raise RuntimeError(
+                "CUDA catalog precompilation requires the CUDA backend"
+            )
+        from hydroforge.kernels.backends.cuda.precompile import (
+            precompile_cuda_modules,
+        )
+
+        return precompile_cuda_modules(
+            catalogs, opened_modules=opened_modules,
+        )
+
     def poison(self, error: BaseException, *, phase: str) -> None:
         """Permanently reject further stepping after unprovable mutation."""
 
