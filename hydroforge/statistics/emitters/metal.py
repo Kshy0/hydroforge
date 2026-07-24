@@ -265,7 +265,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                         f'{indent2}    {ctype} old_v = p_{safe_var}_max_inner_state[out_idx];',
                         f'{indent2}    {ctype} inner_new = is_inner_first ? {var_val} : fmax(old_v, {var_val});',
                         f'{indent2}    if (is_inner_last) {{',
-                        f'{indent2}        p_{safe_var}_max_inner_state[out_idx] = ({ctype})(-1e38);',
+                        f'{indent2}        p_{safe_var}_max_inner_state[out_idx] = ({ctype})(-INFINITY);',
                         f'{indent2}        {val_for} = inner_new;',
                         f'{indent2}    }} else {{',
                         f'{indent2}        p_{safe_var}_max_inner_state[out_idx] = inner_new;',
@@ -278,7 +278,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                         f'{indent2}    {ctype} old_v = p_{safe_var}_min_inner_state[out_idx];',
                         f'{indent2}    {ctype} inner_new = is_inner_first ? {var_val} : fmin(old_v, {var_val});',
                         f'{indent2}    if (is_inner_last) {{',
-                        f'{indent2}        p_{safe_var}_min_inner_state[out_idx] = ({ctype})1e38;',
+                        f'{indent2}        p_{safe_var}_min_inner_state[out_idx] = ({ctype})(INFINITY);',
                         f'{indent2}        {val_for} = inner_new;',
                         f'{indent2}    }} else {{',
                         f'{indent2}        p_{safe_var}_min_inner_state[out_idx] = inner_new;',
@@ -606,7 +606,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}    {ctype} inner_old = p_{safe_var}_max_inner_state[{out_idx}];',
                             f'{indent2}    {ctype} inner_new = (is_inner_first && macro_step_index == 0) ? {var_val} : fmax(inner_old, {var_val});',
                             f'{indent2}    if (is_inner_last) {{',
-                            f'{indent2}        p_{safe_var}_max_inner_state[{out_idx}] = ({ctype})(-1e38);',
+                            f'{indent2}        p_{safe_var}_max_inner_state[{out_idx}] = ({ctype})(-INFINITY);',
                             f'{indent2}        {val_for} = inner_new;',
                             f'{indent2}    }} else {{',
                             f'{indent2}        p_{safe_var}_max_inner_state[{out_idx}] = inner_new;',
@@ -620,7 +620,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}    {ctype} inner_old = p_{safe_var}_min_inner_state[{out_idx}];',
                             f'{indent2}    {ctype} inner_new = (is_inner_first && macro_step_index == 0) ? {var_val} : fmin(inner_old, {var_val});',
                             f'{indent2}    if (is_inner_last) {{',
-                            f'{indent2}        p_{safe_var}_min_inner_state[{out_idx}] = ({ctype})1e38;',
+                            f'{indent2}        p_{safe_var}_min_inner_state[{out_idx}] = ({ctype})(INFINITY);',
                             f'{indent2}        {val_for} = inner_new;',
                             f'{indent2}    }} else {{',
                             f'{indent2}        p_{safe_var}_min_inner_state[{out_idx}] = inner_new;',
@@ -670,32 +670,93 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             arg_k_str = "" if operation.k == 1 else str(operation.k)
                             aux_ptr = f"p_{safe_var}_{arg_type}{arg_k_str}_aux"
                             out_ptr = f"p_{safe_var}_{op}"
-                            msl_lines.extend([
-                                f'{indent2}if (is_inner_last) {{',
-                                f'{indent2}    if (is_outer_first) {{',
-                                f'{indent2}        {out_ptr}[{out_idx}] = macro_step_index;',
-                                f'{indent2}        {aux_ptr}[{out_idx}] = {val_var};',
-                                f'{indent2}    }} else {{',
-                                f'{indent2}        {ctype} old_aux = {aux_ptr}[{out_idx}];',
-                                f'{indent2}        if ({val_var} {cmp_op} old_aux) {{',
-                                f'{indent2}            {aux_ptr}[{out_idx}] = {val_var};',
-                                f'{indent2}            {out_ptr}[{out_idx}] = macro_step_index;',
-                                f'{indent2}        }}',
-                                f'{indent2}    }}',
-                                f'{indent2}}}',
-                            ])
+                            if operation.k == 1:
+                                msl_lines.extend([
+                                    f'{indent2}if (is_inner_last) {{',
+                                    f'{indent2}    if (is_outer_first) {{',
+                                    f'{indent2}        {out_ptr}[{out_idx}] = macro_step_index;',
+                                    f'{indent2}        {aux_ptr}[{out_idx}] = {val_var};',
+                                    f'{indent2}    }} else {{',
+                                    f'{indent2}        {ctype} old_aux = {aux_ptr}[{out_idx}];',
+                                    f'{indent2}        if ({val_var} {cmp_op} old_aux) {{',
+                                    f'{indent2}            {aux_ptr}[{out_idx}] = {val_var};',
+                                    f'{indent2}            {out_ptr}[{out_idx}] = macro_step_index;',
+                                    f'{indent2}        }}',
+                                    f'{indent2}    }}',
+                                    f'{indent2}}}',
+                                ])
+                            else:
+                                sentinel = (
+                                    f'({ctype})(-INFINITY)'
+                                    if arg_type == 'max'
+                                    else f'({ctype})(INFINITY)'
+                                )
+                                msl_lines.extend([
+                                    f'{indent2}if (is_inner_last) {{',
+                                    f'{indent2}    long k_base = ({out_idx}) * {operation.k};',
+                                    f'{indent2}    {ctype} new_value = {val_var};',
+                                    f'{indent2}    int new_index = macro_step_index;',
+                                    f'{indent2}    if (is_outer_first) {{',
+                                    f'{indent2}        {aux_ptr}[k_base] = new_value;',
+                                    f'{indent2}        {out_ptr}[k_base] = new_index;',
+                                    f'{indent2}        for (int rank = 1; rank < {operation.k}; ++rank) {{',
+                                    f'{indent2}            {aux_ptr}[k_base + rank] = {sentinel};',
+                                    f'{indent2}            {out_ptr}[k_base + rank] = 0;',
+                                    f'{indent2}        }}',
+                                    f'{indent2}    }} else {{',
+                                    f'{indent2}        for (int rank = 0; rank < {operation.k}; ++rank) {{',
+                                    f'{indent2}            {ctype} old_value = {aux_ptr}[k_base + rank];',
+                                    f'{indent2}            int old_index = {out_ptr}[k_base + rank];',
+                                    f'{indent2}            if (new_value {cmp_op} old_value) {{',
+                                    f'{indent2}                {aux_ptr}[k_base + rank] = new_value;',
+                                    f'{indent2}                {out_ptr}[k_base + rank] = new_index;',
+                                    f'{indent2}                new_value = old_value;',
+                                    f'{indent2}                new_index = old_index;',
+                                    f'{indent2}            }}',
+                                    f'{indent2}        }}',
+                                    f'{indent2}    }}',
+                                    f'{indent2}}}',
+                                ])
                         elif outer_base in ('max', 'min'):
                             cmp_fn = "fmax" if outer_base == "max" else "fmin"
                             out_ptr = f"p_{safe_var}_{op}"
-                            msl_lines.extend([
-                                f'{indent2}if (is_inner_last) {{',
-                                f'{indent2}    if (is_outer_first) {{',
-                                f'{indent2}        {out_ptr}[{out_idx}] = {val_var};',
-                                f'{indent2}    }} else {{',
-                                f'{indent2}        {out_ptr}[{out_idx}] = {cmp_fn}({out_ptr}[{out_idx}], {val_var});',
-                                f'{indent2}    }}',
-                                f'{indent2}}}',
-                            ])
+                            if operation.k == 1:
+                                msl_lines.extend([
+                                    f'{indent2}if (is_inner_last) {{',
+                                    f'{indent2}    if (is_outer_first) {{',
+                                    f'{indent2}        {out_ptr}[{out_idx}] = {val_var};',
+                                    f'{indent2}    }} else {{',
+                                    f'{indent2}        {out_ptr}[{out_idx}] = {cmp_fn}({out_ptr}[{out_idx}], {val_var});',
+                                    f'{indent2}    }}',
+                                    f'{indent2}}}',
+                                ])
+                            else:
+                                cmp_op = '>' if outer_base == 'max' else '<'
+                                sentinel = (
+                                    f'({ctype})(-INFINITY)'
+                                    if outer_base == 'max'
+                                    else f'({ctype})(INFINITY)'
+                                )
+                                msl_lines.extend([
+                                    f'{indent2}if (is_inner_last) {{',
+                                    f'{indent2}    long k_base = ({out_idx}) * {operation.k};',
+                                    f'{indent2}    {ctype} new_value = {val_var};',
+                                    f'{indent2}    if (is_outer_first) {{',
+                                    f'{indent2}        {out_ptr}[k_base] = new_value;',
+                                    f'{indent2}        for (int rank = 1; rank < {operation.k}; ++rank) {{',
+                                    f'{indent2}            {out_ptr}[k_base + rank] = {sentinel};',
+                                    f'{indent2}        }}',
+                                    f'{indent2}    }} else {{',
+                                    f'{indent2}        for (int rank = 0; rank < {operation.k}; ++rank) {{',
+                                    f'{indent2}            {ctype} old_value = {out_ptr}[k_base + rank];',
+                                    f'{indent2}            if (new_value {cmp_op} old_value) {{',
+                                    f'{indent2}                {out_ptr}[k_base + rank] = new_value;',
+                                    f'{indent2}                new_value = old_value;',
+                                    f'{indent2}            }}',
+                                    f'{indent2}        }}',
+                                    f'{indent2}    }}',
+                                    f'{indent2}}}',
+                                ])
                         elif outer == 'mean':
                             out_ptr = f"p_{safe_var}_{op}"
                             msl_lines.extend([

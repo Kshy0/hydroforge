@@ -102,13 +102,13 @@ def all_reduce_(tensor: torch.Tensor, *, reduction: Reduction) -> None:
 
     if reduction not in {"min", "max", "sum"}:
         raise ValueError("reduction must be 'min', 'max', or 'sum'")
+    signature = _collective_signature(tensor, operation="all_reduce_")
     recorder = active_operator_recorder()
     if recorder is not None:
         recorder.record_collective(tensor, reduction)
         return
     from hydroforge.execution.step import synchronize_collective
 
-    signature = _collective_signature(tensor, operation="all_reduce_")
     synchronize_collective(
         _event_kind("all_reduce", reduction), signature,
     )
@@ -129,6 +129,7 @@ def reduce_(
         destination >= dist.get_world_size()
     ):
         raise ValueError("reduce_ destination is outside the process group")
+    signature = _collective_signature(tensor, operation="reduce_")
     recorder = active_operator_recorder()
     if recorder is not None:
         recorder.record_collective(
@@ -137,7 +138,6 @@ def reduce_(
         return
     from hydroforge.execution.step import synchronize_collective
 
-    signature = _collective_signature(tensor, operation="reduce_")
     synchronize_collective(
         _event_kind("reduce", reduction, destination), signature,
     )

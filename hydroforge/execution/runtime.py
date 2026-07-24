@@ -217,7 +217,7 @@ class ModelExecution:
 
     def validate_checkpoint_step_state(
         self, state: Any,
-    ) -> tuple[int, tuple[tuple[Any, int], ...]]:
+    ) -> tuple[int, int | None, tuple[tuple[Any, int], ...]]:
         """Validate persisted counters without mutating live execution state."""
 
         if not isinstance(state, dict) or set(state) != {

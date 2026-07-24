@@ -28,6 +28,8 @@ class _OuterProgram:
                 )
             self.graph.replay()
             return
+        if self.capture_mode == "metal_icb":
+            self.operators.reset_metal_errors()
         self.operators.launch()
         self.operators.check_metal_errors()
 
