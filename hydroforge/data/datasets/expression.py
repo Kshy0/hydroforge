@@ -105,8 +105,8 @@ class DatasetExpression(torch.utils.data.Dataset):
     def total_steps(self) -> int:
         return self.reference.total_steps
 
-    def time_iter(self):
-        return self.reference.time_iter()
+    def step_iter(self):
+        return self.reference.step_iter()
 
     def temporal_contract(self):
         return self.reference.temporal_contract()

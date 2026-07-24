@@ -40,6 +40,7 @@ def TensorField(
     allow_empty: bool = False,
     output: Literal["auto", "full", "disabled"] = "auto",
     depends_on: str | Tuple[str, ...] | None = None,
+    required_by: str | Tuple[str, ...] | None = None,
     **kwargs
 ):
     """
@@ -66,16 +67,24 @@ def TensorField(
                 rejects explicit output requests.
         depends_on: Module name, or names, that must all be open for this field
                     to be loaded, allocated, and exposed to runtime compilers.
+        required_by: Consumer module names. The field is active when at least
+                     one listed consumer module is open.
         category: Category of the variable:
                   - 'topology': Static structure (NEVER batched)
                   - 'param': Input parameter (can be batched)
-                  - 'init_state': Initializable state variable (ALWAYS batched if num_trials > 1)
+                  - 'init_state': Initializable restart state (persisted in model
+                    checkpoints; ALWAYS batched if num_trials > 1)
         mode: Handling of variables after initialization:
                   - 'device': Keep on current device (default)
                   - 'cpu': Move to CPU memory to save GPU memory
                   - 'discard': Set to None after initialization to maximize memory saving
         **kwargs: Additional Field parameters
     """
+    if "checkpoint" in kwargs:
+        raise TypeError(
+            "TensorField no longer accepts checkpoint; only category="
+            "'init_state' fields are persisted"
+        )
     legacy = {"group_by", "save_idx", "save_coord", "partition", "locality"}
     unsupported = sorted(legacy.intersection(kwargs))
     if unsupported:
@@ -102,6 +111,7 @@ def TensorField(
             "allow_empty": allow_empty,
             "output": output,
             "depends_on": depends_on,
+            "required_by": required_by,
         }
     )
 
@@ -225,6 +235,7 @@ def computed_tensor_field(
     category: Literal["topology", "derived_param", "state", "shared_state", "virtual"] = "derived_param",
     expr: Optional[str] = None,
     depends_on: str | Tuple[str, ...] | None = None,
+    required_by: str | Tuple[str, ...] | None = None,
     output: Literal["auto", "full", "disabled"] = "auto",
     allow_empty: bool = False,
     **kwargs
@@ -241,15 +252,24 @@ def computed_tensor_field(
         category: Category of the variable:
                   - 'topology': Static structure (NEVER batched)
                   - 'derived_param': Computed parameter (can be batched)
-                  - 'state': Computed state variable (ALWAYS batched if num_trials > 1)
-                  - 'shared_state': Computed state variable (NEVER batched)
+                  - 'state': Reconstructed runtime state (ALWAYS batched if
+                    num_trials > 1; never checkpointed)
+                  - 'shared_state': Reconstructed runtime state (NEVER batched
+                    or checkpointed)
                   - 'virtual': Computed on-demand during analysis/output (not stored in memory)
         expr: Expression string for virtual variables
         depends_on: Module name, or names, that must all be active before this
             computed tensor is evaluated or validated.
+        required_by: Consumer module names. At least one must be active before
+            this computed tensor is evaluated or validated.
         allow_empty: Whether a symbolic tensor dimension may resolve to zero.
         **kwargs: Additional computed_field parameters
     """
+    if "checkpoint" in kwargs:
+        raise TypeError(
+            "computed_tensor_field no longer accepts checkpoint; computed "
+            "fields are reconstructed after restart"
+        )
     legacy = {
         "group_by", "save_idx", "save_coord", "partition", "locality",
         "static_output",
@@ -273,6 +293,7 @@ def computed_tensor_field(
             "category": category,
             "expr": expr,
             "depends_on": depends_on,
+            "required_by": required_by,
             "allow_empty": allow_empty,
             "output": output,
         },

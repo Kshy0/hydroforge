@@ -14,8 +14,6 @@ import cftime
 
 DateLike: TypeAlias = datetime | cftime.datetime
 CalendarPeriod = Literal["day", "month", "year"]
-ForcingSemantics = Literal["mean_rate", "accumulated", "instantaneous"]
-ResamplingMethod = Literal["hold", "conservative", "linear"]
 
 
 _CALENDAR_ALIASES = {

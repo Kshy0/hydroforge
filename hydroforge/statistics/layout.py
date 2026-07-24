@@ -301,16 +301,6 @@ class _StatisticsLayoutCompiler:
         )
 
 
-def compile_statistics_layouts(
-    aggregator: Any,
-    program: StatisticsProgram,
-    variables: Mapping[str, list[str] | tuple[str, ...]],
-) -> Mapping[str, StatisticsVariableLayout]:
-    """Compile all shape, dtype and source-stride decisions exactly once."""
-
-    return _StatisticsLayoutCompiler(aggregator, program).compile(variables)
-
-
 def compile_statistics(
     aggregator: Any,
     variable_ops: Mapping[str, list[str] | tuple[str, ...]],
@@ -346,13 +336,13 @@ def compile_statistics(
         normalized[variable] = canonical
     immutable_ops = MappingProxyType(normalized)
     program = compile_statistics_program(aggregator, immutable_ops)
-    layouts = compile_statistics_layouts(
-        aggregator, program, immutable_ops,
-    )
+    layouts = _StatisticsLayoutCompiler(
+        aggregator, program,
+    ).compile(immutable_ops)
     return StatisticsCompilation(immutable_ops, program, layouts)
 
 
 __all__ = [
     "StatisticsCompilation", "StatisticsVariableLayout",
-    "compile_statistics", "compile_statistics_layouts",
+    "compile_statistics",
 ]

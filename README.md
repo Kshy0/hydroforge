@@ -63,6 +63,10 @@ Use a tuple when storage requires multiple modules, for example
 `depends_on=("log", "water_temperature")`. Supplying an inactive conditional
 field explicitly is an error.
 
+Use `required_by=("bifurcation", "reservoir")` when storage is required if
+at least one listed consumer module is open. Only `init_state` tensors are
+checkpointed; runtime workspaces are reconstructed after restoration.
+
 A model defines its physical execution order directly:
 
 ```python
@@ -107,16 +111,14 @@ from hydroforge.data.datasets import (
 Gridded datasets provide mapping and export helpers such as
 `select()`, `export_climatology()`, and `export_catchment_data()`.
 
-## Model and forcing clocks
+## Model and statistics clocks
 
-Schedules, forcing resampling, and statistics windows are explicit:
+Model schedules and statistics windows are explicit:
 
 ```python
 from datetime import timedelta
 from hydroforge import (
     CalendarWindow,
-    ForcingPlan,
-    ForcingSource,
     SimulationSchedule,
     StatisticsPlan,
 )
@@ -126,24 +128,12 @@ schedule = SimulationSchedule.from_contract(
     step=timedelta(hours=1),
 )
 
-forcing_plan = ForcingPlan.bind(
-    schedule=schedule,
-    runoff=ForcingSource(
-        runoff_dataset.temporal_contract(),
-        semantics="mean_rate",
-        resampling="hold",
-    ),
-)
-
 statistics_plan = StatisticsPlan(
     schedule=schedule,
     inner=CalendarWindow("day"),
     outer=CalendarWindow("year"),
 )
 ```
-
-Use `ForcingPlan.bundle(...)` to stream synchronized inputs into successive
-`step_advance` calls.
 
 ## Statistics and NetCDF output
 

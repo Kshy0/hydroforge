@@ -23,13 +23,29 @@ from torch import distributed as dist
 # ---------------------------------------------------------------------------
 
 LOCAL_PROCESS_RANK_ENV = (
-    "LOCAL_RANK", "SLURM_LOCALID", "OMPI_COMM_WORLD_LOCAL_RANK",
+    "SLURM_LOCALID", "OMPI_COMM_WORLD_LOCAL_RANK",
     "MPI_LOCALRANKID", "MV2_COMM_WORLD_LOCAL_RANK",
 )
 
 
 def get_local_process_rank() -> int:
     """Resolve one strict local rank directly from launcher environment."""
+
+    torchrun_rank = os.environ.get("LOCAL_RANK")
+    if torchrun_rank is not None:
+        try:
+            value = int(torchrun_rank)
+        except ValueError as error:
+            raise ValueError(
+                f"LOCAL_RANK must be a non-negative integer, "
+                f"got {torchrun_rank!r}"
+            ) from error
+        if value < 0:
+            raise ValueError(
+                f"LOCAL_RANK must be a non-negative integer, "
+                f"got {torchrun_rank!r}"
+            )
+        return value
 
     observed: dict[str, int] = {}
     for name in LOCAL_PROCESS_RANK_ENV:
@@ -51,17 +67,6 @@ def get_local_process_rank() -> int:
     if len(ranks) > 1:
         raise ValueError(f"conflicting local-rank environment: {observed}")
     return next(iter(ranks), 0)
-
-def get_global_rank() -> int:
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_rank()
-    return 0
-
-
-def get_local_rank() -> int:
-    if dist.is_available() and dist.is_initialized():
-        return get_local_process_rank()
-    return 0
 
 
 def is_rank_zero() -> bool:

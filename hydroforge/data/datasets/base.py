@@ -6,9 +6,10 @@
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Dict, Iterator, Optional, Tuple, Union
+from typing import Callable, Dict, Iterator, Literal, Optional, Union
 
 import cftime
 import numpy as np
@@ -23,6 +24,27 @@ from hydroforge.contracts.temporal import (
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetStep:
+    """One forcing item positioned on source and model timelines.
+
+    ``model_time`` is continuous across valid items. During spin-up,
+    ``source_time`` may repeat as forcing is replayed while ``model_time``
+    occupies the virtual interval immediately before the main schedule.
+    """
+
+    model_time: Union[datetime, cftime.datetime]
+    source_time: Union[datetime, cftime.datetime]
+    valid: bool
+    phase: Literal["spinup", "main"]
+    spinup_cycle: int | None = None
+
+    @property
+    def is_spin_up(self) -> bool:
+        """Return whether this item belongs to a forcing spin-up cycle."""
+        return self.phase == "spinup"
 
 
 def _close_dataset_tree(root: object, *, scope: str) -> None:
@@ -358,20 +380,18 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         if is_rank_zero() and self.spin_up_cycles > 0:
             logger.info("Spin-up enabled: %d cycles", self.spin_up_cycles)
 
-    def time_iter(self) -> Iterator[Tuple[datetime, bool, bool]]:
-        """Returns an iterator that yields (time, is_valid, is_spin_up) tuples step-by-step."""
-        valid_steps_count = 0
+    def step_iter(self) -> Iterator[DatasetStep]:
+        """Yield source samples on one continuous model timeline.
 
-        # Calculate spin-up steps
-        spin_up_steps = 0
-        if self.spin_up_cycles > 0 and self.time_interval is not None:
-             duration = self.get_spin_up_duration()
-             spin_up_steps = timedelta_quotient(
-                 duration,
-                 self.time_interval,
-                 duration_label="spin-up duration",
-                 interval_label="time_interval",
-             )
+        Data lookup keeps using the physical ``source_time`` returned by
+        :meth:`get_time_by_index`. Replayed spin-up samples are assigned
+        consecutive virtual ``model_time`` values ending exactly where the
+        main simulation starts. Padding items do not consume model time.
+        """
+        valid_steps_count = 0
+        items_per_cycle = self._spin_up_num_chunks * self.chunk_len
+        spin_up_items = items_per_cycle * self.spin_up_cycles
+        virtual_start = self.get_virtual_start_time()
 
         # Iterate exactly as many times as the DataLoader will produce data points
         # This ensures we handle padding steps at the end of the last chunk correctly
@@ -380,15 +400,25 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
         for idx in range(total_items):
             try:
-                dt = self.get_time_by_index(idx)
+                source_time = self.get_time_by_index(idx)
                 valid = self.is_valid_time_index(idx)
             except IndexError:
                 # Padding steps (out of bounds)
-                dt = datetime.min
+                source_time = datetime.min
                 valid = False
 
-            is_spin_up = valid_steps_count < spin_up_steps
-            yield dt, valid, is_spin_up
+            is_spin_up = idx < spin_up_items
+            model_time = virtual_start + self.time_interval * valid_steps_count
+            yield DatasetStep(
+                model_time=model_time,
+                source_time=source_time,
+                valid=valid,
+                phase="spinup" if is_spin_up else "main",
+                spinup_cycle=(
+                    idx // items_per_cycle
+                    if is_spin_up and items_per_cycle else None
+                ),
+            )
 
             if valid:
                 valid_steps_count += 1
@@ -409,13 +439,16 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             return cycle_duration * self.spin_up_cycles
         return timedelta(0)
 
-    def get_virtual_start_time(self, verbose: bool = False) -> datetime:
+    def get_virtual_start_time(
+        self, verbose: bool = False,
+    ) -> Union[datetime, cftime.datetime]:
         """Calculates the virtual start time including spin-up."""
-        if self.start_date is None:
+        start = self.main_start_time
+        if start is None:
             raise ValueError("start_date is required to calculate virtual start time")
 
         duration = self.get_spin_up_duration()
-        virtual_start = self.start_date - duration
+        virtual_start = start - duration
 
         if verbose and is_rank_zero() and self.spin_up_cycles > 0:
              logger.info("Spin-up duration: %s", duration)

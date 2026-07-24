@@ -31,7 +31,14 @@ class ModuleTensors:
             if field.computed or module.is_tensor_field_active(field):
                 continue
             if field.name in module.model_fields_set:
-                dependencies = ", ".join(field.tensor.depends_on)
+                required = ", ".join(field.tensor.depends_on)
+                consumers = ", ".join(field.tensor.required_by)
+                dependencies = required
+                if consumers:
+                    dependencies = (
+                        f"{dependencies}; required by any of: {consumers}"
+                        if dependencies else f"required by any of: {consumers}"
+                    )
                 raise ValueError(
                     f"Inactive field {module.module_name}.{field.name} was "
                     f"supplied explicitly; open its dependencies: {dependencies}"

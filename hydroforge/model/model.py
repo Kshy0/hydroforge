@@ -499,7 +499,10 @@ class AbstractModel(BaseModel, ABC):
             for field in schema.fields(module_name):
                 if field.tensor is not None:
                     unknown_dependencies = sorted(
-                        set(field.tensor.depends_on).difference(self.module_list)
+                        set(
+                            (*field.tensor.depends_on,
+                             *field.tensor.required_by),
+                        ).difference(self.module_list)
                     )
                     if unknown_dependencies:
                         raise ValueError(
@@ -551,6 +554,15 @@ class AbstractModel(BaseModel, ABC):
 
     def initialize_model_state(self) -> None:
         """Initialize cross-module state inside HydroForge's transaction."""
+
+    def rebuild_runtime_state(self) -> None:
+        """Rebuild non-checkpoint runtime state after checkpoint restoration.
+
+        Implementations must preserve tensor identities used by compiled
+        kernels and may only derive transient state from already restored
+        model fields. HydroForge invokes this hook inside the checkpoint load
+        transaction and invokes it again after rollback if the commit fails.
+        """
 
     def print_memory_summary(self) -> None:
         """
@@ -806,12 +818,12 @@ class AbstractModel(BaseModel, ABC):
     def save_state(
         self, current_time: Optional[Union[datetime, cftime.datetime]],
     ) -> InputProxy:
-        """Persist model state through the internal checkpoint service."""
+        """Persist physical model state without runtime cursors."""
         return self._checkpoint.save(current_time)
 
     @between_steps
     def load_state(self, proxy: InputProxy) -> None:
-        """Restore model state through the internal checkpoint service."""
+        """Restore physical model state without changing runtime cursors."""
         self._checkpoint.load(proxy)
 
     @field_validator("opened_modules")

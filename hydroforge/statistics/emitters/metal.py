@@ -1064,7 +1064,6 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 strides[si] = stride
 
             def internal_update_statistics(states, BLOCK_SIZE):
-                del BLOCK_SIZE
                 for meta in scatters:
                     dispatcher = compiled[meta['kernel_name']]
                     args = [
@@ -1073,6 +1072,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     ]
                     dispatcher(**{
                         **{f'arg_{i}': value for i, value in enumerate(args)},
+                        'BLOCK_SIZE': BLOCK_SIZE,
                         '_grid_size': meta['grid_size'],
                     })
                 for meta in metas:
@@ -1106,6 +1106,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
 
                     dispatcher(**{
                         **{f'arg_{i}': value for i, value in enumerate(args)},
+                        'BLOCK_SIZE': BLOCK_SIZE,
                         '_grid_size': n_threads,
                     })
 

@@ -116,7 +116,7 @@ class MappingTable:
             np.asarray(selected.sum(axis=0)).ravel() != 0,
         ).astype(np.int64)
         if active.size == 0:
-            raise ValueError("selected mapping has no active source cells")
+            raise ValueError("selected mapping has no source support")
         source_to_target = selected[:, active].T.tocsr().astype(np.float32)
         return LocalMapping(selected_ids, active, source_to_target)
 
