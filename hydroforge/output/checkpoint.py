@@ -15,6 +15,7 @@ import torch.distributed as dist
 
 from hydroforge.data.distributed import find_indices_in
 from hydroforge.contracts.events import emit
+from hydroforge.contracts.fields import tensor_is_active
 from hydroforge.contracts import ResourceCleanupError
 from hydroforge.contracts.temporal import timedelta_microseconds
 from hydroforge.data.input import InputProxy
@@ -189,9 +190,8 @@ class CheckpointRuntime:
     @staticmethod
     def _state_fields(module: Any) -> Iterator[tuple[str, Any]]:
         for field in module.tensor_schema():
-            if any(
-                dependency not in module.opened_modules
-                for dependency in field.tensor.depends_on
+            if not tensor_is_active(
+                field.tensor, getattr(module, "opened_modules", ()),
             ):
                 continue
             category = field.tensor.category

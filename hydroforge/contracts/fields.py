@@ -15,6 +15,15 @@ ModuleType: TypeAlias = type[Any]
 DimensionToken: TypeAlias = str | int
 
 
+def tensor_is_active(metadata: Any, opened_modules: Iterable[str]) -> bool:
+    """Return whether every declared module dependency is open."""
+    opened = set(opened_modules)
+    return all(
+        dependency in opened
+        for dependency in getattr(metadata, "depends_on", ())
+    )
+
+
 def concrete_tensor_dtype(
     kind: str, base_dtype: torch.dtype, mixed_precision: bool,
 ) -> torch.dtype:
@@ -121,11 +130,22 @@ class TensorMetadata:
     depends_on: tuple[str, ...]
     expression: str
 
+    def is_active(self, opened_modules: Iterable[str]) -> bool:
+        """Return whether every module required by this field is open."""
+        return tensor_is_active(self, opened_modules)
+
     @classmethod
     def compile(cls, raw: Mapping[str, Any]) -> TensorMetadata:
         depends_on = raw.get("depends_on") or ()
         if isinstance(depends_on, str):
             depends_on = (depends_on,)
+        if any(
+            not isinstance(dependency, str) or not dependency
+            for dependency in depends_on
+        ):
+            raise TypeError("depends_on must contain non-empty module names")
+        if len(depends_on) != len(set(depends_on)):
+            raise ValueError("depends_on contains duplicate module names")
         return cls(
             shape=tuple(raw["tensor_shape"]),
             dtype=str(raw.get("tensor_dtype", "float")),

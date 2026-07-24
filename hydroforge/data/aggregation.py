@@ -110,8 +110,9 @@ def build_cama_mapping(
 
     empty_rows = int(np.sum(np.diff(mapping.matrix.indptr) == 0))
     if empty_rows > 0:
-        raise ValueError(
-            f"{empty_rows} catchment(s) have no source-grid mapping"
+        print(
+            f"Warning: {empty_rows} catchments were not mapped to source grids. "
+            "Their grid input will always be zero."
         )
     return mapping
 

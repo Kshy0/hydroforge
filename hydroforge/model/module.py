@@ -20,6 +20,7 @@ from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
 
 from hydroforge.data.distributed import find_indices_in_torch
 from hydroforge.contracts.events import EventSink, ModelEvent, NullEventSink
+from hydroforge.contracts.fields import tensor_is_active
 from hydroforge.model.tensors import ModuleTensors
 
 
@@ -38,6 +39,7 @@ def TensorField(
     replicated: bool = False,
     allow_empty: bool = False,
     output: Literal["auto", "full", "disabled"] = "auto",
+    depends_on: str | Tuple[str, ...] | None = None,
     **kwargs
 ):
     """
@@ -62,6 +64,8 @@ def TensorField(
         output: Output policy. ``auto`` inherits the default SelectionField for
                 ``dim_coords``; ``full`` writes the full local axis; ``disabled``
                 rejects explicit output requests.
+        depends_on: Module name, or names, that must all be open for this field
+                    to be loaded, allocated, and exposed to runtime compilers.
         category: Category of the variable:
                   - 'topology': Static structure (NEVER batched)
                   - 'param': Input parameter (can be batched)
@@ -97,6 +101,7 @@ def TensorField(
             "replicated": replicated,
             "allow_empty": allow_empty,
             "output": output,
+            "depends_on": depends_on,
         }
     )
 
@@ -219,7 +224,7 @@ def computed_tensor_field(
     dim_coords: Optional[str] = None,
     category: Literal["topology", "derived_param", "state", "shared_state", "virtual"] = "derived_param",
     expr: Optional[str] = None,
-    depends_on: Optional[str] = None,
+    depends_on: str | Tuple[str, ...] | None = None,
     output: Literal["auto", "full", "disabled"] = "auto",
     allow_empty: bool = False,
     **kwargs
@@ -240,8 +245,8 @@ def computed_tensor_field(
                   - 'shared_state': Computed state variable (NEVER batched)
                   - 'virtual': Computed on-demand during analysis/output (not stored in memory)
         expr: Expression string for virtual variables
-        depends_on: Optional module that must be active before this computed
-            tensor is evaluated or validated.
+        depends_on: Module name, or names, that must all be active before this
+            computed tensor is evaluated or validated.
         allow_empty: Whether a symbolic tensor dimension may resolve to zero.
         **kwargs: Additional computed_field parameters
     """
@@ -468,6 +473,16 @@ class AbstractModule(BaseModel, ABC):
     def tensor_schema_map(cls):
         """Index the compiled schema without reparsing ``json_schema_extra``."""
         return {field.name: field for field in cls.tensor_schema()}
+
+    def is_tensor_field_active(self, field: str | Any) -> bool:
+        """Return whether a tensor field belongs to this module specialization."""
+        schema = (
+            self.tensor_schema_map().get(field)
+            if isinstance(field, str) else field
+        )
+        if schema is None or schema.tensor is None:
+            raise KeyError(f"Unknown tensor field: {field}")
+        return tensor_is_active(schema.tensor, self.opened_modules)
 
     def _emit(self, level: str, name: str, message: str, **fields: Any) -> None:
         self._event_sink.emit(ModelEvent(level, name, message, fields))

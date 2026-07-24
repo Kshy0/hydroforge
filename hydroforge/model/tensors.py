@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from hydroforge.contracts.fields import (
-    cast_declared_tensor, concrete_tensor_dtype,
+    cast_declared_tensor, concrete_tensor_dtype, tensor_is_active,
 )
 
 
@@ -20,15 +20,31 @@ class ModuleTensors:
         self.expanded_parameters: set[str] = set()
 
     def initialize(self) -> None:
+        self._deactivate_declared()
         self._normalize_declared()
         self._initialize_optional()
         self._validate_computed()
+
+    def _deactivate_declared(self) -> None:
+        module = self.module
+        for field in module.tensor_schema():
+            if field.computed or module.is_tensor_field_active(field):
+                continue
+            if field.name in module.model_fields_set:
+                dependencies = ", ".join(field.tensor.depends_on)
+                raise ValueError(
+                    f"Inactive field {module.module_name}.{field.name} was "
+                    f"supplied explicitly; open its dependencies: {dependencies}"
+                )
+            setattr(module, field.name, None)
 
     def expected_shape(self, field_name: str) -> tuple[int, ...] | None:
         module = self.module
         schema = module.tensor_schema_map().get(field_name)
         if schema is None:
             raise ValueError(f"Field {field_name} is not a tensor field")
+        if not tensor_is_active(schema.tensor, module.opened_modules):
+            return None
         values: dict[Any, Any] = {}
         for dimension in schema.tensor.shape:
             if isinstance(dimension, int):
@@ -87,7 +103,11 @@ class ModuleTensors:
     def _initialize_optional(self) -> None:
         module = self.module
         for schema in module.tensor_schema():
-            if schema.computed or schema.name in module.model_fields_set:
+            if (
+                schema.computed
+                or schema.name in module.model_fields_set
+                or not module.is_tensor_field_active(schema)
+            ):
                 continue
             shape = self.expected_shape(schema.name)
             if shape is None:
@@ -110,7 +130,8 @@ class ModuleTensors:
         module = self.module
         conversions: dict[str, list[str]] = {}
         fields = tuple(
-            field for field in module.tensor_schema() if not field.computed
+            field for field in module.tensor_schema()
+            if not field.computed and module.is_tensor_field_active(field)
         )
         # Shape expressions can depend on topology tensors, so place every
         # supplied tensor before evaluating any expected shape.
@@ -194,10 +215,7 @@ class ModuleTensors:
         for field in module.tensor_schema():
             if not field.computed or field.tensor.category == "virtual":
                 continue
-            if any(
-                dependency not in module.opened_modules
-                for dependency in field.tensor.depends_on
-            ):
+            if not module.is_tensor_field_active(field):
                 continue
             tensor = getattr(module, field.name)
             if not isinstance(tensor, torch.Tensor):
@@ -256,7 +274,11 @@ class ModuleTensors:
     def apply_modes(self) -> None:
         module = self.module
         for field in module.tensor_schema():
-            if field.computed or field.tensor.mode == "device":
+            if (
+                field.computed
+                or not module.is_tensor_field_active(field)
+                or field.tensor.mode == "device"
+            ):
                 continue
             value = getattr(module, field.name)
             if not isinstance(value, torch.Tensor):

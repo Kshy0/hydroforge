@@ -24,6 +24,7 @@ from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
 from hydroforge.statistics.ir import parse_operation
 from hydroforge.data.input import InputProxy
 from hydroforge.contracts.kernel_field import KernelField
+from hydroforge.contracts.fields import tensor_is_active
 from hydroforge.contracts.temporal import (
     SimulationSchedule,
     StatisticsPlan,
@@ -496,7 +497,24 @@ class AbstractModel(BaseModel, ABC):
         for module_name in self.opened_modules:
             excluded = set(self.module_list[module_name].nc_excluded_fields)
             for field in schema.fields(module_name):
+                if field.tensor is not None:
+                    unknown_dependencies = sorted(
+                        set(field.tensor.depends_on).difference(self.module_list)
+                    )
+                    if unknown_dependencies:
+                        raise ValueError(
+                            f"Tensor field {module_name}.{field.name} depends "
+                            "on unknown modules: "
+                            f"{unknown_dependencies}"
+                        )
                 if field.excluded or field.name in excluded:
+                    continue
+                if (
+                    field.tensor is not None
+                    and not tensor_is_active(
+                        field.tensor, self.opened_modules,
+                    )
+                ):
                     continue
                 previous = field_definitions.get(field.name)
                 if previous is None:
