@@ -11,7 +11,9 @@ import torch
 from numba import njit
 
 from hydroforge.data.distributed import find_indices_in, find_indices_in_torch
-from hydroforge.contracts.fields import PartitionSchema, RuntimeTensorMetadata
+from hydroforge.contracts.fields import (
+    PartitionSchema, RuntimeTensorMetadata, tensor_is_active,
+)
 
 
 @dataclass(frozen=True)
@@ -79,7 +81,11 @@ class PartitionCompiler:
             field.name: field.tensor
             for module_name in model.opened_modules
             for field in model.compiled_schema().fields(module_name)
-            if not field.computed and field.tensor is not None
+            if (
+                not field.computed
+                and field.tensor is not None
+                and tensor_is_active(field.tensor, model.opened_modules)
+            )
         }
         coordinates = {
             name for name, metadata in fields.items() if metadata.is_coordinate

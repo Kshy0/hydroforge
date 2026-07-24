@@ -17,6 +17,7 @@ from hydroforge.compiler.plan import (
     StatisticsPlan,
 )
 from hydroforge.contracts.kernel_field import KernelField
+from hydroforge.contracts.fields import tensor_is_active
 
 
 class ModelCompiler:
@@ -69,7 +70,15 @@ class ModelCompiler:
             fields = {
                 name
                 for name, schema in module.field_schema_map().items()
-                if schema.tensor is None or not schema.tensor.expression
+                if (
+                    schema.tensor is None
+                    or (
+                        not schema.tensor.expression
+                        and tensor_is_active(
+                            schema.tensor, getattr(model, "opened_modules", ()),
+                        )
+                    )
+                )
             } | set(module.get_reference_index_fields()) | {
                 name
                 for name in type(module).model_fields

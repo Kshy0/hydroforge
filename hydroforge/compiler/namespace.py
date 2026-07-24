@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from hydroforge.contracts.fields import tensor_is_active
+
 
 class NamespaceCompiler:
     """Build qualified mappings and reject ambiguous unqualified fields."""
@@ -26,6 +28,8 @@ class NamespaceCompiler:
                     "model namespace"
                 )
             for field in module.tensor_schema():
+                if not tensor_is_active(field.tensor, self.model.opened_modules):
+                    continue
                 field_name = field.name
                 entry = (module, field_name, field.tensor.dim_coords)
                 is_virtual = (

@@ -9,7 +9,7 @@ import torch
 
 from hydroforge.contracts.events import emit
 from hydroforge.contracts.fields import (
-    cast_declared_tensor, concrete_tensor_dtype,
+    cast_declared_tensor, concrete_tensor_dtype, tensor_is_active,
 )
 
 
@@ -24,7 +24,11 @@ class ModelDataCompiler:
         schema = model.compiled_schema()
         for module_name in model.opened_modules:
             for field in schema.fields(module_name):
-                if not field.computed and not field.excluded:
+                if (
+                    not field.computed
+                    and not field.excluded
+                    and tensor_is_active(field.tensor, model.opened_modules)
+                ):
                     fields.setdefault(field.name, field)
 
         injected = getattr(model.input_proxy, "injected_vars", set())

@@ -43,6 +43,26 @@ from hydroforge.model import (
 - `managed_step`: manages one public model step.
 - `copy_input`: copies caller data into stable model storage.
 
+Tensor storage can depend on optional modules. A conditional field remains
+`None` and is excluded from input loading, partitioning, runtime namespaces,
+kernel ownership, and checkpoints unless every named module is open:
+
+```python
+import torch
+
+diagnostic: torch.Tensor | None = TensorField(
+    "Per-cell diagnostic",
+    shape=("base.num_cells",),
+    category="state",
+    default=0,
+    depends_on="log",
+)
+```
+
+Use a tuple when storage requires multiple modules, for example
+`depends_on=("log", "water_temperature")`. Supplying an inactive conditional
+field explicitly is an error.
+
 A model defines its physical execution order directly:
 
 ```python
