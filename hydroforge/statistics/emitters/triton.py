@@ -1049,6 +1049,18 @@ class TritonStatisticsEmitter(StatisticsEmitter):
 
         # 2D processing
         if dims_2d:
+            unsupported = [
+                operation.spelling
+                for variable in dims_2d
+                for operation in self._statistics_lowering.operations(variable)
+                if operation.compound or operation.k > 1 or operation.stores_index
+            ]
+            if unsupported:
+                raise RuntimeError(
+                    "statistics lowering admitted unsupported indexed-level "
+                    f"operations into Triton code generation: {unsupported}"
+                )
+
             def is_last_only(name: str) -> bool:
                 operations = self._statistics_lowering.operations(name)
                 return (
@@ -1122,7 +1134,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                  f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}inner_{inner}_new = inner_{inner}_old + val * weight",
                                  f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent2}if is_macro_step_end:",
+                                 f"{indent2}if is_inner_last:",
                                  f"{indent3}tl.store({inner_ptr}, 0.0, mask=mask)",
                                  f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
                                  f"{indent3}val_for_{inner} = inner_{inner}_new / (weight_{inner}_new)",
@@ -1134,7 +1146,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                              kernel_code_lines.extend([
                                  f"{indent2}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}inner_{inner}_new = inner_{inner}_old + val * weight",
-                                 f"{indent2}if is_macro_step_end:",
+                                 f"{indent2}if is_inner_last:",
                                  f"{indent3}tl.store({inner_ptr}, 0.0, mask=mask)",
                                  f"{indent3}val_for_{inner} = inner_{inner}_new",
                                  f"{indent2}else:",
@@ -1145,12 +1157,12 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                              kernel_code_lines.extend([
                                  f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent2}if is_first and macro_step_index==0:",
+                                 f"{indent2}if is_inner_first and macro_step_index==0:",
                                  f"{indent3}inner_{inner}_new = val",
                                  f"{indent2}else:",
                                  f"{indent3}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
                                  f"{indent3}inner_{inner}_new = tl.maximum(inner_{inner}_old, val)",
-                                 f"{indent2}if is_macro_step_end:",
+                                 f"{indent2}if is_inner_last:",
                                  f"{indent3}tl.store({inner_ptr}, -float('inf'), mask=mask)",
                                  f"{indent3}val_for_{inner} = inner_{inner}_new",
                                  f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
@@ -1164,12 +1176,12 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                              kernel_code_lines.extend([
                                  f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent2}if is_first and macro_step_index==0:",
+                                 f"{indent2}if is_inner_first and macro_step_index==0:",
                                  f"{indent3}inner_{inner}_new = val",
                                  f"{indent2}else:",
                                  f"{indent3}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
                                  f"{indent3}inner_{inner}_new = tl.minimum(inner_{inner}_old, val)",
-                                 f"{indent2}if is_macro_step_end:",
+                                 f"{indent2}if is_inner_last:",
                                  f"{indent3}tl.store({inner_ptr}, float('inf'), mask=mask)",
                                  f"{indent3}val_for_{inner} = inner_{inner}_new",
                                  f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
@@ -1188,7 +1200,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                  f"{indent3}inner_{inner}_new = val",
                                  f"{indent2}else:",
                                  f"{indent3}inner_{inner}_new = val_stored",
-                                 f"{indent2}if is_macro_step_end:",
+                                 f"{indent2}if is_inner_last:",
                                  f"{indent3}val_for_{inner} = inner_{inner}_new",
                                  f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
                                  f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
@@ -1202,7 +1214,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                              kernel_code_lines.extend([
                                  f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
                                  f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent2}if is_macro_step_end:",
+                                 f"{indent2}if is_inner_last:",
                                  f"{indent3}val_for_{inner} = val",
                                  f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
                                  f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
@@ -1233,7 +1245,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                             k_val = operation.k
 
                             val_var = f"val_for_{inner}"
-                            kernel_code_lines.append(f"{indent2}if is_macro_step_end:")
+                            kernel_code_lines.append(f"{indent2}if is_inner_last:")
 
                             if outer == 'max':
                                 # argmax pointer (automatically created alongside max)

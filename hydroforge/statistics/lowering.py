@@ -264,6 +264,10 @@ def lower_statistics(
                 flags.update({
                     "is_inner_last", "is_outer_first", "is_outer_last",
                 })
+                if operation.value_reduction in {
+                    Reduction.FIRST, Reduction.MAX, Reduction.MIN,
+                }:
+                    flags.add("is_inner_first")
                 continue
             match operation.output:
                 case Reduction.FIRST | Reduction.MAX | Reduction.MIN | Reduction.SUM:

@@ -480,29 +480,82 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                             # argmax_*/argmin_* compound
                             arg_type = outer_base
                             aux_key = f'{var}_{arg_type}{k_val if k_val > 1 else ""}_aux'
-                            lines.extend([
-                                f'{indent}if is_inner_last:',
-                                f'{indent2}if is_outer_first:',
-                                f'{indent2}    states["{out_key}"][_csl] = macro_step_index',
-                                f'{indent2}    states["{aux_key}"][_csl] = {val_var}',
-                                f'{indent2}else:',
-                                f'{indent2}    _old_aux = states["{aux_key}"][_csl].clone()',
-                                f'{indent2}    _cond = {val_var} {">" if arg_type == "max" else "<"} _old_aux',
-                                f'{indent2}    states["{aux_key}"][_csl] = torch.where(_cond, {val_var}, _old_aux)',
-                                f'{indent2}    _old_idx = states["{out_key}"][_csl].clone()',
-                                f'{indent2}    _mi = torch.full_like(_old_idx, macro_step_index)',
-                                f'{indent2}    states["{out_key}"][_csl] = torch.where(_cond, _mi, _old_idx)',
-                            ])
-                        elif outer_base in ('max', 'min') and k_val == 1:
+                            if k_val == 1:
+                                lines.extend([
+                                    f'{indent}if is_inner_last:',
+                                    f'{indent2}if is_outer_first:',
+                                    f'{indent2}    states["{out_key}"][_csl] = macro_step_index',
+                                    f'{indent2}    states["{aux_key}"][_csl] = {val_var}',
+                                    f'{indent2}else:',
+                                    f'{indent2}    _old_aux = states["{aux_key}"][_csl].clone()',
+                                    f'{indent2}    _cond = {val_var} {">" if arg_type == "max" else "<"} _old_aux',
+                                    f'{indent2}    states["{aux_key}"][_csl] = torch.where(_cond, {val_var}, _old_aux)',
+                                    f'{indent2}    _old_idx = states["{out_key}"][_csl].clone()',
+                                    f'{indent2}    _mi = macro_step_index.to(dtype=_old_idx.dtype).expand_as(_old_idx)',
+                                    f'{indent2}    states["{out_key}"][_csl] = torch.where(_cond, _mi, _old_idx)',
+                                ])
+                            else:
+                                sentinel = (
+                                    '-float("inf")'
+                                    if arg_type == 'max'
+                                    else 'float("inf")'
+                                )
+                                comparison = '>' if arg_type == 'max' else '<'
+                                lines.extend([
+                                    f'{indent}if is_inner_last:',
+                                    f'{indent2}_k_slice = slice(t * n * {k_val}, (t + 1) * n * {k_val})',
+                                    f'{indent2}_top_values = states["{aux_key}"][_k_slice].view(n, {k_val})',
+                                    f'{indent2}_top_indices = states["{out_key}"][_k_slice].view(n, {k_val})',
+                                    f'{indent2}if is_outer_first:',
+                                    f'{indent2}    _top_values[:, 0] = {val_var}',
+                                    f'{indent2}    _top_values[:, 1:] = {sentinel}',
+                                    f'{indent2}    _top_indices[:, 0] = macro_step_index',
+                                    f'{indent2}    _top_indices[:, 1:] = 0',
+                                    f'{indent2}else:',
+                                    f'{indent2}    _new_value = {val_var}.clone()',
+                                    f'{indent2}    _new_index = macro_step_index.to(dtype=_top_indices.dtype).expand_as(_new_value).clone()',
+                                    f'{indent2}    for _rank in range({k_val}):',
+                                    f'{indent2}        _old_value = _top_values[:, _rank].clone()',
+                                    f'{indent2}        _old_index = _top_indices[:, _rank].clone()',
+                                    f'{indent2}        _swap = _new_value {comparison} _old_value',
+                                    f'{indent2}        _top_values[:, _rank] = torch.where(_swap, _new_value, _old_value)',
+                                    f'{indent2}        _top_indices[:, _rank] = torch.where(_swap, _new_index, _old_index)',
+                                    f'{indent2}        _new_value = torch.where(_swap, _old_value, _new_value)',
+                                    f'{indent2}        _new_index = torch.where(_swap, _old_index, _new_index)',
+                                ])
+                        elif outer_base in ('max', 'min'):
                             cmp = 'torch.maximum' if outer_base == 'max' else 'torch.minimum'
-                            lines.extend([
-                                f'{indent}if is_inner_last:',
-                                f'{indent2}if is_outer_first:',
-                                f'{indent2}    states["{out_key}"][_csl] = {val_var}',
-                                f'{indent2}else:',
-                                f'{indent2}    _old = states["{out_key}"][_csl].clone()',
-                                f'{indent2}    states["{out_key}"][_csl] = {cmp}(_old, {val_var})',
-                            ])
+                            if k_val == 1:
+                                lines.extend([
+                                    f'{indent}if is_inner_last:',
+                                    f'{indent2}if is_outer_first:',
+                                    f'{indent2}    states["{out_key}"][_csl] = {val_var}',
+                                    f'{indent2}else:',
+                                    f'{indent2}    _old = states["{out_key}"][_csl].clone()',
+                                    f'{indent2}    states["{out_key}"][_csl] = {cmp}(_old, {val_var})',
+                                ])
+                            else:
+                                sentinel = (
+                                    '-float("inf")'
+                                    if outer_base == 'max'
+                                    else 'float("inf")'
+                                )
+                                comparison = '>' if outer_base == 'max' else '<'
+                                lines.extend([
+                                    f'{indent}if is_inner_last:',
+                                    f'{indent2}_k_slice = slice(t * n * {k_val}, (t + 1) * n * {k_val})',
+                                    f'{indent2}_top_values = states["{out_key}"][_k_slice].view(n, {k_val})',
+                                    f'{indent2}if is_outer_first:',
+                                    f'{indent2}    _top_values[:, 0] = {val_var}',
+                                    f'{indent2}    _top_values[:, 1:] = {sentinel}',
+                                    f'{indent2}else:',
+                                    f'{indent2}    _new_value = {val_var}.clone()',
+                                    f'{indent2}    for _rank in range({k_val}):',
+                                    f'{indent2}        _old_value = _top_values[:, _rank].clone()',
+                                    f'{indent2}        _swap = _new_value {comparison} _old_value',
+                                    f'{indent2}        _top_values[:, _rank] = torch.where(_swap, _new_value, _old_value)',
+                                    f'{indent2}        _new_value = torch.where(_swap, _old_value, _new_value)',
+                                ])
                         elif outer == 'mean':
                             lines.extend([
                                 f'{indent}if is_inner_last:',
