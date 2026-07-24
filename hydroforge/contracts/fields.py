@@ -16,12 +16,14 @@ DimensionToken: TypeAlias = str | int
 
 
 def tensor_is_active(metadata: Any, opened_modules: Iterable[str]) -> bool:
-    """Return whether every declared module dependency is open."""
+    """Return whether field dependencies and consumer requirements hold."""
     opened = set(opened_modules)
+    required = getattr(metadata, "depends_on", ())
+    consumers = getattr(metadata, "required_by", ())
     return all(
         dependency in opened
-        for dependency in getattr(metadata, "depends_on", ())
-    )
+        for dependency in required
+    ) and (not consumers or any(item in opened for item in consumers))
 
 
 def concrete_tensor_dtype(
@@ -128,24 +130,30 @@ class TensorMetadata:
     allow_empty: bool
     output: str
     depends_on: tuple[str, ...]
+    required_by: tuple[str, ...]
     expression: str
 
     def is_active(self, opened_modules: Iterable[str]) -> bool:
-        """Return whether every module required by this field is open."""
+        """Return whether this field is active for the opened module set."""
         return tensor_is_active(self, opened_modules)
 
     @classmethod
     def compile(cls, raw: Mapping[str, Any]) -> TensorMetadata:
-        depends_on = raw.get("depends_on") or ()
-        if isinstance(depends_on, str):
-            depends_on = (depends_on,)
-        if any(
-            not isinstance(dependency, str) or not dependency
-            for dependency in depends_on
-        ):
-            raise TypeError("depends_on must contain non-empty module names")
-        if len(depends_on) != len(set(depends_on)):
-            raise ValueError("depends_on contains duplicate module names")
+        def dependencies(key: str) -> tuple[str, ...]:
+            values = raw.get(key) or ()
+            if isinstance(values, str):
+                values = (values,)
+            if any(
+                not isinstance(dependency, str) or not dependency
+                for dependency in values
+            ):
+                raise TypeError(f"{key} must contain non-empty module names")
+            if len(values) != len(set(values)):
+                raise ValueError(f"{key} contains duplicate module names")
+            return tuple(values)
+
+        depends_on = dependencies("depends_on")
+        required_by = dependencies("required_by")
         return cls(
             shape=tuple(raw["tensor_shape"]),
             dtype=str(raw.get("tensor_dtype", "float")),
@@ -160,7 +168,8 @@ class TensorMetadata:
             replicated=bool(raw.get("replicated", False)),
             allow_empty=bool(raw.get("allow_empty", False)),
             output=str(raw.get("output", "auto")),
-            depends_on=tuple(depends_on),
+            depends_on=depends_on,
+            required_by=required_by,
             expression=str(raw.get("expr") or ""),
         )
 

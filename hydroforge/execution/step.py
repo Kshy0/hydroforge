@@ -403,7 +403,6 @@ class _StepRuntime:
         program_owner: _ManagedStepDescriptor,
         override: StatisticsFlags | None = None,
     ) -> _StepRuntime:
-        model = self.model
         state = self.state
         if not isinstance(program_owner, _ManagedStepDescriptor):
             raise TypeError(

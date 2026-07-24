@@ -48,7 +48,7 @@ from hydroforge.kernels.backends.metal.template import make_spec_metal_dispatche
 from hydroforge.kernels.backends.cuda.template import make_spec_cuda_dispatcher
 
 __all__ = [
-    "BackendRegistry", "KERNEL_BACKEND", "KernelEntry", "StrictImplementation",
+    "BackendRegistry", "KERNEL_BACKEND", "KernelEntry",
     "TorchDispatcher", "VariantDispatcher",
     "devices_match", "make_metal_dispatcher", "make_torch_dispatcher",
     "registry_factory", "require_active_kernel_spec",

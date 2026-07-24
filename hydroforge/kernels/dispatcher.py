@@ -313,6 +313,38 @@ def _cdiv(n: int, d: int) -> int:
     return (n + d - 1) // d
 
 
+class _FixedTritonKernel:
+    """Project fixed constexprs out of a Triton kernel's public ABI."""
+
+    def __init__(self, kernel, fixed: dict[str, Any]) -> None:
+        unknown = set(fixed).difference(kernel.arg_names)
+        if unknown:
+            raise TypeError(f"fixed Triton constants are unknown: {sorted(unknown)}")
+        self.kernel = kernel
+        self.fixed = dict(fixed)
+        self.arg_names = tuple(
+            name for name in kernel.arg_names if name not in self.fixed
+        )
+        self.__name__ = kernel.__name__
+
+    def __getitem__(self, grid):
+        launch = self.kernel[grid]
+        fixed = self.fixed
+
+        def launch_fixed(**kwargs: Any) -> None:
+            launch(**fixed, **kwargs)
+
+        return launch_fixed
+
+
+def make_fixed_triton_dispatcher(kernel, *, fixed: dict[str, Any]) -> Callable:
+    """Bind compile-time constants while keeping a strict projected ABI."""
+
+    if not fixed:
+        raise ValueError("fixed Triton dispatcher requires at least one constant")
+    return make_triton_dispatcher(_FixedTritonKernel(kernel, fixed))
+
+
 def make_triton_dispatcher(
     kernel,
     *,

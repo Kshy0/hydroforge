@@ -17,13 +17,11 @@ from hydroforge.data.distributed import find_indices_in
 from hydroforge.contracts.events import emit
 from hydroforge.contracts.fields import tensor_is_active
 from hydroforge.contracts import ResourceCleanupError
-from hydroforge.contracts.temporal import timedelta_microseconds
 from hydroforge.data.input import InputProxy
 
 
-_STATE_CATEGORIES = frozenset({"init_state", "state", "shared_state"})
 _CHECKPOINT_FORMAT = "hydroforge.model-state"
-_CHECKPOINT_VERSION = 4
+_CHECKPOINT_VERSION = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +49,6 @@ class _CheckpointSaveStage:
     global_fields: tuple[str, ...]
     groups: dict[str, str]
     attrs: dict[str, Any]
-    temporal_state: Any
 
 
 class CheckpointRuntime:
@@ -194,11 +191,7 @@ class CheckpointRuntime:
                 field.tensor, getattr(module, "opened_modules", ()),
             ):
                 continue
-            category = field.tensor.category
-            if (
-                not field.computed and category in _STATE_CATEGORIES
-                or field.computed and category in {"state", "shared_state"}
-            ):
+            if not field.computed and field.tensor.category == "init_state":
                 yield field.name, field
 
     def _fields(self) -> tuple[_StateField, ...]:
@@ -234,28 +227,6 @@ class CheckpointRuntime:
 
     def _manifest(self, fields: tuple[_StateField, ...]) -> dict[str, Any]:
         model = self.model
-        controller = model._execution.step.controller
-        statistics = (
-            {"mode": "plan", "fingerprint": controller.fingerprint}
-            if controller is not None else {
-                "mode": "implicit",
-                "calendar": model.calendar,
-                "inner_microseconds": (
-                    None if model.statistics_interval is None
-                    else timedelta_microseconds(
-                        model.statistics_interval,
-                        label="statistics_interval",
-                    )
-                ),
-                "outer_microseconds": (
-                    None if model.statistics_outer_interval is None
-                    else timedelta_microseconds(
-                        model.statistics_outer_interval,
-                        label="statistics_outer_interval",
-                    )
-                ),
-            }
-        )
         entries = []
         for field in fields:
             metadata = field.info.tensor
@@ -272,11 +243,6 @@ class CheckpointRuntime:
         return {
             "model": f"{type(model).__module__}.{type(model).__qualname__}",
             "modules": list(model.opened_modules),
-            "simulation_schedule": (
-                None if getattr(model, "simulation_schedule", None) is None
-                else model.simulation_schedule.fingerprint
-            ),
-            "statistics": statistics,
             "fields": entries,
         }
 
@@ -504,30 +470,6 @@ class CheckpointRuntime:
             "source": "hydroforge.output.checkpoint.CheckpointRuntime.save",
             **self._schema_attrs(fields),
         }
-        execution = model._execution
-        step = execution.step
-        attrs["hydroforge_managed_step_state"] = self._canonical_json(
-            execution.checkpoint_step_state()
-        )
-        attrs["hydroforge_parameter_plan_state"] = self._canonical_json(
-            model._parameters.checkpoint_state()
-        )
-        attrs["hydroforge_statistics_control"] = step.statistics_control
-        attrs["hydroforge_statistics_boundary"] = "closed"
-        temporal_state = step.persisted_statistics_state()
-        aggregator = execution.statistics.aggregator
-        has_outer = bool(
-            aggregator is not None
-            and any(aggregator._output_is_outer.values())
-        )
-        inner_open, outer_open = step.open_statistics_windows(
-            has_outer=has_outer,
-        )
-        if aggregator is not None and (inner_open or outer_open):
-            raise RuntimeError(
-                "checkpointing inside an unfinished statistics window is "
-                "not supported; save at an inner/outer window boundary"
-            )
         return _CheckpointSaveStage(
             timestamp=timestamp,
             path=path,
@@ -536,7 +478,6 @@ class CheckpointRuntime:
             global_fields=tuple(global_fields),
             groups=groups,
             attrs=attrs,
-            temporal_state=temporal_state,
         )
 
     def save(self, current_time: Any) -> InputProxy:
@@ -568,38 +509,7 @@ class CheckpointRuntime:
         groups = stage.groups
         attrs = stage.attrs
         attrs["hydroforge_checkpoint_id"] = checkpoint_id
-        temporal_state = stage.temporal_state
         execution = model._execution
-        durability_error: BaseException | None = None
-        try:
-            execution.statistics.ensure_output_durable(current_time)
-        except BaseException as error:
-            durability_error = error
-        durability_failures = self._gather_failures(durability_error)
-        if any(failure is not None for failure in durability_failures):
-            if durability_error is not None:
-                execution.poison(
-                    durability_error,
-                    phase="statistics output durability",
-                )
-                raise durability_error
-            try:
-                self._raise_remote_failure(
-                    "statistics durability", durability_failures,
-                )
-            except RuntimeError as error:
-                execution.poison(
-                    error, phase="statistics output durability",
-                )
-                raise
-        if temporal_state is not None:
-            attrs.update({
-                "hydroforge_statistics_plan": temporal_state["fingerprint"],
-                "hydroforge_statistics_last_step": temporal_state["last_step_index"],
-                "hydroforge_statistics_output_active": temporal_state["output_active"],
-                "hydroforge_statistics_inner_open": temporal_state["inner_open"],
-                "hydroforge_statistics_outer_open": temporal_state["outer_open"],
-            })
         proxy = InputProxy(data, attrs=attrs)
         write_error: BaseException | None = None
         try:
@@ -723,7 +633,7 @@ class CheckpointRuntime:
 
     def _stage_load(
         self, proxy: InputProxy,
-    ) -> tuple[list[_TensorRestore], Any, Any, Any, str]:
+    ) -> tuple[list[_TensorRestore], str]:
         """Validate a checkpoint completely without mutating live state."""
 
         model = self.model
@@ -738,102 +648,6 @@ class CheckpointRuntime:
             model, "info", "checkpoint.loading", "Loading model state",
             rank=model.rank,
         )
-        execution = model._execution
-        step = execution.step
-        encoded_step_state = proxy.attrs.get("hydroforge_managed_step_state")
-        if not isinstance(encoded_step_state, str):
-            raise ValueError("checkpoint is missing managed-step runtime state")
-        try:
-            checkpoint_step_state = json.loads(encoded_step_state)
-        except json.JSONDecodeError as error:
-            raise ValueError(
-                "checkpoint managed-step runtime state is not valid JSON"
-            ) from error
-        staged_step_state = execution.validate_checkpoint_step_state(
-            checkpoint_step_state,
-        )
-        encoded_parameter_state = proxy.attrs.get(
-            "hydroforge_parameter_plan_state"
-        )
-        if not isinstance(encoded_parameter_state, str):
-            raise ValueError("checkpoint is missing parameter-plan runtime state")
-        try:
-            checkpoint_parameter_state = json.loads(encoded_parameter_state)
-        except json.JSONDecodeError as error:
-            raise ValueError(
-                "checkpoint parameter-plan runtime state is not valid JSON"
-            ) from error
-        staged_parameter_state = model._parameters.validate_checkpoint_state(
-            checkpoint_parameter_state,
-        )
-        temporal_state = None
-        expected_control = step.statistics_control
-        if proxy.attrs.get("hydroforge_statistics_control") != expected_control:
-            raise ValueError(
-                "checkpoint statistics control does not match the initialized "
-                f"model: expected {expected_control!r}"
-            )
-        if proxy.attrs.get("hydroforge_statistics_boundary") != "closed":
-            raise ValueError(
-                "checkpoint does not declare a closed statistics boundary"
-            )
-        if expected_control == "plan":
-            required = {
-                "hydroforge_statistics_plan",
-                "hydroforge_statistics_last_step",
-                "hydroforge_statistics_output_active",
-                "hydroforge_statistics_inner_open",
-                "hydroforge_statistics_outer_open",
-            }
-            missing = required.difference(proxy.attrs)
-            if missing:
-                raise ValueError(
-                    "checkpoint is missing statistics plan state: "
-                    f"{sorted(missing)}"
-                )
-            temporal_state = {
-                "fingerprint": proxy.attrs["hydroforge_statistics_plan"],
-                "last_step_index": self._integer_attr(
-                    proxy.attrs, "hydroforge_statistics_last_step",
-                ),
-                "output_active": self._integer_attr(
-                    proxy.attrs, "hydroforge_statistics_output_active",
-                ),
-                "inner_open": self._integer_attr(
-                    proxy.attrs, "hydroforge_statistics_inner_open",
-                ),
-                "outer_open": self._integer_attr(
-                    proxy.attrs, "hydroforge_statistics_outer_open",
-                ),
-            }
-            step.validate_persisted_statistics_state(temporal_state)
-            aggregator = execution.statistics.aggregator
-            has_outer = bool(
-                aggregator is not None
-                and any(aggregator._output_is_outer.values())
-            )
-            if aggregator is not None and (
-                temporal_state["inner_open"] == 1
-                or temporal_state["outer_open"] == 1 and has_outer
-            ):
-                raise RuntimeError(
-                    "checkpoint contains an unfinished statistics window, "
-                    "whose accumulators are not checkpoint state"
-                )
-        else:
-            unexpected = {
-                name for name in proxy.attrs
-                if name.startswith("hydroforge_statistics_")
-                and name not in {
-                    "hydroforge_statistics_control",
-                    "hydroforge_statistics_boundary",
-                }
-            }
-            if unexpected:
-                raise ValueError(
-                    "implicit statistics checkpoint contains plan cursor "
-                    f"attributes: {sorted(unexpected)}"
-                )
         restores: list[_TensorRestore] = []
         coordinate_indices: dict[str, np.ndarray] = {}
         for field in fields:
@@ -898,17 +712,13 @@ class CheckpointRuntime:
             array = self._validate_array_dtype(field_name, array, current)
             restores.append(_TensorRestore(field, array))
 
-        return (
-            restores, temporal_state, staged_step_state,
-            staged_parameter_state, checkpoint_id,
-        )
+        return restores, checkpoint_id
 
     def load(self, proxy: InputProxy) -> None:
         """Restore one checkpoint as a rank-synchronous transaction."""
 
         model = self.model
         execution = model._execution
-        step = execution.step
         staged = None
         checkpoint_id = None
         validation_error: BaseException | None = None
@@ -928,29 +738,19 @@ class CheckpointRuntime:
             )
         if staged is None:
             raise RuntimeError("checkpoint load validation produced no plan")
-        (
-            restores, temporal_state, staged_step_state,
-            staged_parameter_state, _checkpoint_id,
-        ) = staged
+        restores, _checkpoint_id = staged
 
         # Commit only after every rank validated every field, coordinate and
-        # temporal cursor. Copies preserve tensor identities, so existing
-        # compiled bindings remain valid. Retain all old state until every
-        # rank reports a successful commit.
-        old_temporal_state = step.persisted_statistics_state()
-        old_step_state = execution.validate_checkpoint_step_state(
-            execution.checkpoint_step_state(),
-        )
-        old_parameter_state = model._parameters.validate_checkpoint_state(
-            model._parameters.checkpoint_state(),
-        )
+        # tensor. Copies preserve tensor identities, so existing compiled
+        # bindings remain valid. Retain old state until every rank reports a
+        # successful commit.
         original_tensors: list[_TensorRestore] | None = None
         commit_error: BaseException | None = None
         try:
             original_tensors = self._commit_restores(restores)
-            step.restore_persisted_statistics_state(temporal_state)
-            execution.restore_checkpoint_step_state(staged_step_state)
-            model._parameters.restore_checkpoint_state(staged_parameter_state)
+            rebuild = getattr(model, "rebuild_runtime_state", None)
+            if rebuild is not None:
+                rebuild()
         except BaseException as error:
             commit_error = error
 
@@ -958,16 +758,14 @@ class CheckpointRuntime:
         if any(failure is not None for failure in commit_failures):
             rollback_errors: list[BaseException] = []
             rollbacks = (
-                lambda: model._parameters.restore_checkpoint_state(
-                    old_parameter_state,
-                ),
-                lambda: execution.restore_checkpoint_step_state(old_step_state),
-                lambda: step.restore_persisted_statistics_state(
-                    old_temporal_state,
-                ),
                 lambda: (
                     None if original_tensors is None
                     else self._commit_restores(original_tensors)
+                ),
+                lambda: (
+                    None
+                    if getattr(model, "rebuild_runtime_state", None) is None
+                    else model.rebuild_runtime_state()
                 ),
             )
             for rollback in rollbacks:
