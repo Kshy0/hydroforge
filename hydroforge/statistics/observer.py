@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from hydroforge.contracts.naming import RESERVED_CONTROL_STATE
 from hydroforge.kernels.backends.metal.protocol import MetalCommandNode
 
 
@@ -120,7 +121,8 @@ class StatisticsObserver:
         return [
             value
             for name, value in self.aggregator._kernel_states.items()
-            if isinstance(value, torch.Tensor) and not name.startswith("__")
+            if isinstance(value, torch.Tensor)
+            and name not in RESERVED_CONTROL_STATE
         ]
 
     def captured_body(

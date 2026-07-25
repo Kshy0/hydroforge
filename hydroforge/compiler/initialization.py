@@ -114,17 +114,6 @@ class ModelInitializer:
         plan = model.statistics_plan
         schedule = model.simulation_schedule
         if plan is not None:
-            conflicting = {
-                name for name in (
-                    "statistics_interval", "statistics_outer_interval",
-                )
-                if name in model.model_fields_set and getattr(model, name) is not None
-            }
-            if conflicting:
-                raise ValueError(
-                    "statistics_plan cannot be combined with legacy interval "
-                    f"fields: {sorted(conflicting)}"
-                )
             if schedule is not None and schedule != plan.schedule:
                 raise ValueError(
                     "statistics_plan and simulation_schedule use different schedules"

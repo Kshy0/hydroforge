@@ -122,22 +122,40 @@ class RankOutputCatalog:
                     f"committed={committed}, time={time_length}, "
                     f"data={data_length}"
                 )
-            has_trials = "trial" in ds.dimensions
-            has_levels = "levels" in ds.dimensions
-            dimensions = (
-                ("time", "trial", "saved_points", "levels")
-                if has_trials and has_levels else
-                ("time", "trial", "saved_points")
-                if has_trials else
-                ("time", "saved_points", "levels")
-                if has_levels else
-                ("time", "saved_points")
-            )
-            if variable.dimensions != dimensions:
+            # The optional trailing value axis keeps its model-defined name.
+            dimensions = tuple(variable.dimensions)
+            cursor = 0
+            if not dimensions or dimensions[cursor] != "time":
                 raise ValueError(
                     f"variable {self.owner.var_name!r} has dimensions "
-                    f"{variable.dimensions}, expected {dimensions}"
+                    f"{dimensions}; the first dimension must be 'time'"
                 )
+            cursor += 1
+            has_trials = (
+                cursor < len(dimensions) and dimensions[cursor] == "trial"
+            )
+            if has_trials:
+                cursor += 1
+            if cursor >= len(dimensions) or dimensions[cursor] != "saved_points":
+                expected_layout = (
+                    "('time', ['trial'], 'saved_points', [value_axis])"
+                )
+                raise ValueError(
+                    f"variable {self.owner.var_name!r} has dimensions "
+                    f"{dimensions}, expected {expected_layout}"
+                )
+            cursor += 1
+            trailing_dimensions = dimensions[cursor:]
+            if len(trailing_dimensions) > 1:
+                raise ValueError(
+                    f"variable {self.owner.var_name!r} has multiple trailing "
+                    f"value dimensions {trailing_dimensions}; the reader's "
+                    "level API supports at most one"
+                )
+            level_dimension = (
+                trailing_dimensions[0] if trailing_dimensions else None
+            )
+            has_levels = level_dimension is not None
             saved_points = int(ds.dimensions["saved_points"].size)
             metadata = {
                 "saved_points": saved_points,
@@ -147,9 +165,11 @@ class RankOutputCatalog:
                 ),
                 "has_levels": has_levels,
                 "n_levels": (
-                    int(ds.dimensions["levels"].size) if has_levels else 0
+                    int(ds.dimensions[level_dimension].size)
+                    if level_dimension is not None else 0
                 ),
-                "dimensions": variable.dimensions,
+                "level_dimension": level_dimension,
+                "dimensions": dimensions,
                 "dtype": np.dtype(variable.dtype),
                 "contract_rank": int(rank),
                 "world_size": int(world_size),
@@ -281,8 +301,7 @@ class RankOutputCatalog:
                     {
                         "rank_id": rank_id,
                         "years": years,
-                        "paths": paths, # List of paths
-                        "path": first_fp, # Keep for backward compat / metadata
+                        "paths": paths,
                         **metadata,
                         "coord_name": coord_name,
                         "coord_raw": coord_raw,
@@ -300,8 +319,8 @@ class RankOutputCatalog:
             for info in rank_infos[1:]:
                 for name in (
                     "years", "has_trials", "n_trials", "has_levels",
-                    "n_levels", "dimensions", "dtype", "coord_name",
-                    "world_size",
+                    "n_levels", "level_dimension", "dimensions", "dtype",
+                    "coord_name", "world_size",
                 ):
                     if info[name] != reference[name]:
                         raise ValueError(
@@ -472,7 +491,7 @@ class RankOutputCatalog:
                 expected = (info["saved_points"],)
                 if x.shape != expected or y.shape != expected:
                     raise ValueError(
-                        f"coordinate converter for {info['path'].name} returned "
+                        f"coordinate converter for rank {info['rank_id']} returned "
                         f"shapes {x.shape}/{y.shape}, expected {expected}"
                     )
                 if x.dtype.kind not in "iu" or y.dtype.kind not in "iu":
@@ -497,7 +516,7 @@ class RankOutputCatalog:
                     info["x"], info["y"] = None, None
                     logger.info(
                         "%s output_coord is not a valid linear index; cannot "
-                        "auto-convert", info["path"].name,
+                        "auto-convert rank %d", info["rank_id"],
                     )
             else:
                 info["x"], info["y"] = None, None

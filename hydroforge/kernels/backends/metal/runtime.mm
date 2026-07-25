@@ -60,8 +60,7 @@ std::vector<int64_t> free_graph_ids;
 std::shared_ptr<Pipeline> get_pipeline(int64_t pipeline_id);
 
 MTLLanguageVersion latest_stable_msl_version() {
-  // Keep the binary buildable with older SDKs while selecting the newest
-  // stable language revision supported by both the build SDK and host OS.
+  // Select the newest language revision exposed by the build SDK and host OS.
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
   if (@available(macOS 26.0, *)) return MTLLanguageVersion4_0;
 #endif

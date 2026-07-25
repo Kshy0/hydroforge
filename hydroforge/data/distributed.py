@@ -214,6 +214,8 @@ def torch_to_numpy_dtype(torch_dtype: torch.dtype) -> type:
         torch.float32: np.float32,
         torch.float64: np.float64,
         torch.float16: np.float16,
+        torch.int64: np.int64,
+        torch.int32: np.int32,
     }
     if torch_dtype not in dtype_mapping:
         raise ValueError(f"Unsupported torch dtype: {torch_dtype}")

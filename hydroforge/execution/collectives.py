@@ -20,7 +20,8 @@ _DTYPE_CODES = {
         torch.float16, torch.float32, torch.float64, torch.bfloat16,
     ), start=1)
 }
-_DEVICE_CODES = {"cpu": 1, "cuda": 2}
+_DEVICE_CODES = {"cpu": 1, "cuda": 2, "mps": 3}
+_COLLECTIVE_DEVICES = frozenset({"cpu", "cuda"})
 
 
 def _reduce_op(reduction: Reduction):
@@ -44,9 +45,10 @@ def _require_distributed(operation: str) -> None:
 def _collective_signature(
     tensor: torch.Tensor, *, operation: str,
 ) -> tuple[int, int, int]:
+    """Validate and encode the process-group-independent tensor ABI."""
+
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{operation} tensor must be a torch.Tensor")
-    _require_distributed(operation)
     if tensor.layout != torch.strided or not tensor.is_contiguous():
         raise ValueError(f"{operation} tensor must be contiguous and strided")
     if tensor.numel() < 1:
@@ -63,21 +65,37 @@ def _collective_signature(
         raise ValueError(
             f"{operation} does not support device {tensor.device.type!r}"
         ) from error
-    backend = str(dist.get_backend()).lower()
-    if "nccl" in backend and tensor.device.type != "cuda":
-        raise ValueError(f"{operation} with NCCL requires a CUDA tensor")
     return dtype_code, tensor.numel(), device_code
 
 
+def _validate_collective_runtime(
+    tensor: torch.Tensor, *, operation: str, destination: int | None = None,
+) -> None:
+    """Validate process-group state only when communication will execute."""
+
+    _require_distributed(operation)
+    if tensor.device.type not in _COLLECTIVE_DEVICES:
+        raise ValueError(
+            f"{operation} does not support device {tensor.device.type!r}"
+        )
+    if destination is not None and destination >= dist.get_world_size():
+        raise ValueError("reduce_ destination is outside the process group")
+    backend = str(dist.get_backend()).lower()
+    if "nccl" in backend and tensor.device.type != "cuda":
+        raise ValueError(f"{operation} with NCCL requires a CUDA tensor")
+
+
 def _launch_all_reduce(tensor: torch.Tensor, reduction: Reduction) -> None:
-    _require_distributed("all_reduce_")
+    _validate_collective_runtime(tensor, operation="all_reduce_")
     dist.all_reduce(tensor, op=_reduce_op(reduction))
 
 
 def _launch_reduce(
     tensor: torch.Tensor, reduction: Reduction, *, destination: int,
 ) -> None:
-    _require_distributed("reduce_")
+    _validate_collective_runtime(
+        tensor, operation="reduce_", destination=destination,
+    )
     dist.reduce(tensor, dst=destination, op=_reduce_op(reduction))
 
 
@@ -105,10 +123,11 @@ def all_reduce_(tensor: torch.Tensor, *, reduction: Reduction) -> None:
     signature = _collective_signature(tensor, operation="all_reduce_")
     recorder = active_operator_recorder()
     if recorder is not None:
-        recorder.record_collective(tensor, reduction)
+        recorder.record_collective(tensor, reduction, signature=signature)
         return
     from hydroforge.execution.step import synchronize_collective
 
+    _validate_collective_runtime(tensor, operation="all_reduce_")
     synchronize_collective(
         _event_kind("all_reduce", reduction), signature,
     )
@@ -125,19 +144,25 @@ def reduce_(
         raise ValueError("reduce_ destination must be a non-negative exact int")
     if reduction not in {"min", "max", "sum"}:
         raise ValueError("reduction must be 'min', 'max', or 'sum'")
-    if dist.is_available() and dist.is_initialized() and (
-        destination >= dist.get_world_size()
-    ):
-        raise ValueError("reduce_ destination is outside the process group")
     signature = _collective_signature(tensor, operation="reduce_")
     recorder = active_operator_recorder()
     if recorder is not None:
+        # Recording does not require an initialized process group.
+        if (
+            dist.is_available() and dist.is_initialized()
+            and destination >= dist.get_world_size()
+        ):
+            raise ValueError("reduce_ destination is outside the process group")
         recorder.record_collective(
             tensor, reduction, operation="reduce", destination=destination,
+            signature=signature,
         )
         return
     from hydroforge.execution.step import synchronize_collective
 
+    _validate_collective_runtime(
+        tensor, operation="reduce_", destination=destination,
+    )
     synchronize_collective(
         _event_kind("reduce", reduction, destination), signature,
     )

@@ -46,10 +46,6 @@ class ModelExecution:
         self._model_tensor_ids: frozenset[int] = frozenset()
         self._field_namespace: Any = None
         self._tensor_index_valid = False
-        # Execution semantics are independent from the optional progress UI.
-        # Drivers may configure this after model initialization through
-        # ``set_total_steps``; managed-step policies read only this value.
-        self.total_steps = 0
         self.step: Any = None
         self.active_step: Any = None
         self._failure: tuple[str, str, str] | None = None
@@ -186,111 +182,6 @@ class ModelExecution:
             statistics._aggregator_function(
                 statistics._kernel_states, block_size,
             )
-
-    def _step_policy_index(self) -> dict[str, Any]:
-        policies: dict[str, Any] = {}
-        for policy in self.step_policies.values():
-            function = policy.descriptor.function
-            name = f"{function.__module__}.{function.__qualname__}"
-            if name in policies:
-                raise RuntimeError(
-                    f"managed-step checkpoint key {name!r} is not unique"
-                )
-            policies[name] = policy
-        return policies
-
-    def checkpoint_step_state(self) -> dict[str, Any]:
-        """Return JSON-safe managed-step counters for exact continuation."""
-
-        step_runtime = self.step
-        return {
-            "total_steps": self.total_steps,
-            "schedule_step": (
-                None if step_runtime is None
-                else step_runtime.state.schedule_step
-            ),
-            "completed": {
-                name: policy.completed_steps
-                for name, policy in sorted(self._step_policy_index().items())
-            },
-        }
-
-    def validate_checkpoint_step_state(
-        self, state: Any,
-    ) -> tuple[int, int | None, tuple[tuple[Any, int], ...]]:
-        """Validate persisted counters without mutating live execution state."""
-
-        if not isinstance(state, dict) or set(state) != {
-            "total_steps", "schedule_step", "completed",
-        }:
-            raise ValueError(
-                "checkpoint managed-step state must contain exactly "
-                "'total_steps', 'schedule_step', and 'completed'"
-            )
-        total = state["total_steps"]
-        if type(total) is not int or total < 0:
-            raise ValueError("checkpoint total_steps must be a non-negative int")
-        completed = state["completed"]
-        if not isinstance(completed, dict):
-            raise TypeError("checkpoint completed-step state must be a mapping")
-        schedule_step = state["schedule_step"]
-        if schedule_step is not None and (
-            type(schedule_step) is not int or schedule_step < 0
-        ):
-            raise ValueError(
-                "checkpoint schedule_step must be None or a non-negative int"
-            )
-        schedule = None if self.step is None else self.step.schedule
-        if (
-            schedule_step is not None
-            and schedule is not None
-            and schedule_step >= len(schedule)
-        ):
-            raise ValueError("checkpoint schedule_step is outside the model schedule")
-        policies = self._step_policy_index()
-        if set(completed) != set(policies):
-            raise ValueError(
-                "checkpoint managed-step methods do not match the model: "
-                f"missing={sorted(set(policies).difference(completed))}, "
-                f"extra={sorted(set(completed).difference(policies))}"
-            )
-        staged = []
-        for name, policy in sorted(policies.items()):
-            count = completed[name]
-            if type(count) is not int or count < 0:
-                raise ValueError(
-                    f"checkpoint completed count for {name!r} must be a "
-                    "non-negative int"
-                )
-            if total > 0 and count > total:
-                raise ValueError(
-                    f"checkpoint completed count for {name!r} exceeds "
-                    f"total_steps={total}"
-                )
-            staged.append((policy, count))
-        if self.total_steps not in {0, total}:
-            raise ValueError(
-                f"checkpoint total_steps={total} conflicts with configured "
-                f"total_steps={self.total_steps}"
-            )
-        return total, schedule_step, tuple(staged)
-
-    def restore_checkpoint_step_state(
-        self, state: tuple[int, int | None, tuple[tuple[Any, int], ...]],
-    ) -> None:
-        """Commit a state returned by :meth:`validate_checkpoint_step_state`."""
-
-        total, schedule_step, staged = state
-        self.total_steps = total
-        step_runtime = self.step
-        if step_runtime is None and schedule_step is not None:
-            raise RuntimeError(
-                "cannot restore a model schedule cursor before step compilation"
-            )
-        if step_runtime is not None:
-            step_runtime.state.schedule_step = schedule_step
-        for policy, count in staged:
-            policy.completed_steps = count
 
     def invalidate(self) -> None:
         if self.closed:

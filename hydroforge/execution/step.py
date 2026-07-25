@@ -7,11 +7,9 @@ import math
 from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from functools import wraps
 from typing import Any, Callable
 
-import cftime
 import torch
 import torch.distributed as dist
 
@@ -19,7 +17,6 @@ from hydroforge.contracts.events import emit
 from hydroforge.contracts.temporal import (
     StatisticsFlags,
     require_calendar,
-    timedelta_microseconds,
 )
 from hydroforge.execution.parameters import (
     ParameterChangeEffect, ParameterPlanRuntime,
@@ -46,147 +43,9 @@ def synchronize_collective(
 class _StepState:
     elapsed: float = 0.0
     start_time: Any = None
-    next_time: Any = None
     pending_outer_first: bool = False
-    inner_bucket: int | None = None
-    outer_bucket: int | None = None
     schedule_step: int | None = None
     output_active: bool = False
-
-
-class _WindowPolicy:
-    """Calendar-aligned statistics positions derived without caller flags."""
-
-    def __init__(self, model: Any, state: _StepState) -> None:
-        self.state = state
-        self.calendar = model.calendar
-        if (
-            model.statistics_interval is None
-            and model.statistics_outer_interval is not None
-        ):
-            raise ValueError(
-                "statistics_outer_interval requires statistics_interval"
-            )
-        self.inner = (
-            None if model.statistics_interval is None
-            else timedelta_microseconds(
-                model.statistics_interval, label="statistics_interval",
-            )
-        )
-        self.outer = (
-            self.inner if model.statistics_outer_interval is None
-            else timedelta_microseconds(
-                model.statistics_outer_interval,
-                label="statistics_outer_interval",
-            )
-        )
-
-    def _instant_microseconds(self, current_time: Any) -> int:
-        require_calendar(
-            current_time, self.calendar, label="model current_time",
-        )
-        if isinstance(current_time, cftime.datetime):
-            epoch = cftime.datetime(1970, 1, 1, calendar=self.calendar)
-        elif isinstance(current_time, datetime):
-            epoch = datetime(1970, 1, 1)
-        else:
-            raise TypeError("model current_time must be a datetime value")
-        return timedelta_microseconds(
-            current_time - epoch, label="model calendar offset",
-        )
-
-    def _bucket(self, current_time: Any, interval: int | None) -> int:
-        if interval is None:
-            return 0
-        if current_time is None:
-            raise ValueError(
-                "current_time is required when statistics_interval is configured"
-            )
-        return self._instant_microseconds(current_time) // interval
-
-    def position(
-        self, *, current_time: Any, time_step: float,
-        output_enabled: bool, final_step: bool,
-    ) -> tuple[bool, bool, bool, bool]:
-        state = self.state
-        was_active = state.output_active
-        tracks_time = self.inner is not None or self.outer is not None
-        if (
-            tracks_time
-            and output_enabled
-            and was_active
-            and current_time != state.next_time
-        ):
-            raise ValueError(
-                f"implicit statistics expected the next model step at "
-                f"{state.next_time!r}, got {current_time!r}"
-            )
-        if self.inner is None:
-            inner_first = inner_last = True
-            inner_bucket = 0
-        else:
-            inner_bucket = self._bucket(current_time, self.inner)
-            inner_first = state.inner_bucket != inner_bucket
-            end_bucket = self._validated_bucket_offset(
-                current_time, float(time_step), self.inner,
-                label="statistics_interval",
-            )
-            inner_last = end_bucket != inner_bucket or final_step
-
-        output_starts = bool(output_enabled and not state.output_active)
-        if not output_enabled:
-            state.output_active = False
-            state.next_time = None
-        elif output_starts:
-            inner_first = True
-            state.output_active = True
-
-        if self.outer is None:
-            outer_bucket = inner_bucket
-            outer_first = inner_first
-            outer_last = inner_last
-        else:
-            outer_bucket = self._bucket(current_time, self.outer)
-            outer_first = state.outer_bucket != outer_bucket
-            outer_last = (
-                self._validated_bucket_offset(
-                    current_time, float(time_step), self.outer,
-                    label="statistics_outer_interval",
-                ) != outer_bucket
-                or final_step
-            )
-        if output_starts:
-            outer_first = True
-
-        state.inner_bucket = inner_bucket
-        state.outer_bucket = outer_bucket
-        if output_enabled and tracks_time:
-            state.next_time = current_time + timedelta(seconds=float(time_step))
-        return inner_first, inner_last, outer_first, outer_last
-
-    def _validated_bucket_offset(
-        self, current_time: Any, offset: float, interval: int, *, label: str,
-    ) -> int:
-        try:
-            offset_delta = timedelta(seconds=offset)
-        except OverflowError as exc:
-            raise ValueError("time_step is outside timedelta range") from exc
-        offset_microseconds = timedelta_microseconds(
-            offset_delta, label="time_step",
-        )
-        start = self._instant_microseconds(current_time)
-        end = start + offset_microseconds
-        start_bucket = start // interval
-        end_bucket = end // interval
-        if end_bucket != start_bucket and (
-            end_bucket != start_bucket + 1 or end % interval != 0
-        ):
-            raise ValueError(
-                f"model step starting at {current_time!r} crosses a {label} "
-                "boundary without ending exactly at the next boundary; use "
-                "an aligned step or an explicit StatisticsPlan"
-            )
-        return end_bucket
 
 
 class _StepRuntime:
@@ -203,7 +62,6 @@ class _StepRuntime:
             raise ValueError("model world_size must be an exact positive int")
         self.statistics = execution.statistics
         self.state = _StepState()
-        self.window = _WindowPolicy(model, self.state)
         plan = getattr(model, "statistics_plan", None)
         self.controller = (
             None if plan is None else StatisticsWindowController(plan)
@@ -312,94 +170,38 @@ class _StepRuntime:
 
         self.synchronize_distributed(0, failed=True)
 
-    def checkpoint_state(self) -> tuple[tuple[Any, ...], dict[str, Any] | None]:
+    def snapshot_state(self) -> tuple[tuple[Any, ...], dict[str, Any] | None]:
         state = self.state
         local = (
             state.elapsed,
             state.start_time,
-            state.next_time,
             state.pending_outer_first,
-            state.inner_bucket,
-            state.outer_bucket,
             state.schedule_step,
             state.output_active,
         )
         controller = (
             None if self.controller is None
-            else self.controller.checkpoint_state()
+            else self.controller.snapshot_state()
         )
         return local, controller
 
-    def restore_checkpoint_state(
+    def restore_snapshot_state(
         self, snapshot: tuple[tuple[Any, ...], dict[str, Any] | None],
     ) -> None:
         local, controller = snapshot
         (
             self.state.elapsed,
             self.state.start_time,
-            self.state.next_time,
             self.state.pending_outer_first,
-            self.state.inner_bucket,
-            self.state.outer_bucket,
             self.state.schedule_step,
             self.state.output_active,
         ) = local
         if self.controller is not None and controller is not None:
-            self.controller.restore_checkpoint_state(controller)
-
-    @property
-    def statistics_control(self) -> str:
-        """Return the one persisted temporal-control dialect for this model."""
-
-        return "plan" if self.controller is not None else "implicit"
-
-    def persisted_statistics_state(self) -> dict[str, Any] | None:
-        """Return the explicit-plan cursor; implicit mode resumes at a boundary."""
-
-        return (
-            None if self.controller is None
-            else self.controller.checkpoint_state()
-        )
-
-    def validate_persisted_statistics_state(
-        self, state: dict[str, Any] | None,
-    ) -> None:
-        if self.controller is None:
-            if state is not None:
-                raise ValueError(
-                    "implicit statistics control cannot restore a plan cursor"
-                )
-            return
-        if state is None:
-            raise ValueError("statistics-plan checkpoint is missing its cursor")
-        self.controller.validate_checkpoint_state(state)
-
-    def open_statistics_windows(self, *, has_outer: bool) -> tuple[bool, bool]:
-        """Report accumulator windows that cannot be restored without payloads."""
-
-        if self.controller is not None:
-            return self.controller.open_windows
-        if not self.state.output_active:
-            return False, False
-        return (
-            not self.stat_is_last,
-            bool(has_outer and not self.stat_is_outer_last),
-        )
-
-    def restore_persisted_statistics_state(
-        self, state: dict[str, Any] | None,
-    ) -> None:
-        """Restore a validated closed-window cursor without stale local state."""
-
-        self.validate_persisted_statistics_state(state)
-        self.state = _StepState()
-        self.window = _WindowPolicy(self.model, self.state)
-        if self.controller is not None:
-            self.controller.restore_checkpoint_state(state)
+            self.controller.restore_snapshot_state(controller)
 
     def begin(
         self, *, current_time: Any, time_step: float,
-        output_enabled: bool, final_step: bool,
+        output_enabled: bool,
         program_owner: _ManagedStepDescriptor,
         override: StatisticsFlags | None = None,
     ) -> _StepRuntime:
@@ -442,6 +244,8 @@ class _StepRuntime:
                 output_enabled=output_enabled,
                 override=override,
             )
+            if current_time >= self.schedule.start:
+                state.schedule_step = self.schedule.index_at(current_time)
             output_enabled = decision.output_enabled
             flags = decision.flags
             self.stat_is_first = flags.first
@@ -455,15 +259,9 @@ class _StepRuntime:
             outer_first = override.outer_first
             outer_last = override.outer_last
         else:
-            (
-                self.stat_is_first,
-                self.stat_is_last,
-                outer_first,
-                outer_last,
-            ) = self.window.position(
-                current_time=current_time, time_step=self.time_step,
-                output_enabled=output_enabled, final_step=final_step,
-            )
+            self.stat_is_first = self.stat_is_last = True
+            outer_first = outer_last = True
+        state.output_active = bool(output_enabled)
         if override is None:
             if outer_first and not self.stat_is_last:
                 state.pending_outer_first = True
@@ -686,7 +484,6 @@ class _CompiledStepPolicy:
         self.execution = model._execution
         self.descriptor = descriptor
         self.layout = descriptor.layout
-        self.completed_steps = 0
         parameters = getattr(model, "_parameters", None)
         if parameters is not None and not isinstance(
             parameters, ParameterPlanRuntime,
@@ -700,21 +497,13 @@ class _CompiledStepPolicy:
         self._execute_parameter_change_plan = model.execute_parameter_change_plan
         self._rank = model.rank
         if self._rank == 0:
+            self._progress_start = getattr(model, "progress_start", None)
             self._progress_tick = getattr(model, "progress_tick", None)
             self._format_progress = getattr(model, "format_progress", None)
         else:
+            self._progress_start = None
             self._progress_tick = None
             self._format_progress = None
-
-    def _proposed_completion(self) -> tuple[bool, int]:
-        """Return final-step status and counter without mutating live state."""
-
-        total_steps = self.execution.total_steps
-        if total_steps <= 0:
-            return False, self.completed_steps + 1
-        base = 0 if self.completed_steps >= total_steps else self.completed_steps
-        proposed = base + 1
-        return proposed >= total_steps, proposed
 
     def _coordinate_failure(
         self, context: _StepRuntime, snapshot: Any,
@@ -735,7 +524,7 @@ class _CompiledStepPolicy:
         if poison:
             self.execution.poison(error, phase="managed-step execution")
         try:
-            context.restore_checkpoint_state(snapshot)
+            context.restore_snapshot_state(snapshot)
         except BaseException as rollback_error:
             from hydroforge.contracts import ResourceCleanupError
 
@@ -766,7 +555,7 @@ class _CompiledStepPolicy:
                 )
                 raise combined from error
             raise
-        snapshot = context.checkpoint_state()
+        snapshot = context.snapshot_state()
         layout = self.layout
         try:
             kwargs = dict(kwargs)
@@ -796,17 +585,21 @@ class _CompiledStepPolicy:
                 raise
             raise resolved from error
         entered_user_step = False
-        final_step, proposed_completed_steps = self._proposed_completion()
         try:
             self.execution.statistics.check_background_failures(current_time)
             context.begin(
                 current_time=current_time,
                 time_step=layout.get(args, kwargs, "time_step"),
                 output_enabled=layout.get(args, kwargs, "output_enabled", True),
-                final_step=final_step,
                 program_owner=self.descriptor,
                 override=override,
             )
+            if self._rank == 0:
+                if self._progress_start is None:
+                    raise RuntimeError(
+                        "rank-zero managed models must define progress_start()"
+                    )
+                self._progress_start()
             with self._parameter_transaction():
                 parameter_effect = self._execute_parameter_change_plan(current_time)
                 if not isinstance(parameter_effect, ParameterChangeEffect):
@@ -854,7 +647,6 @@ class _CompiledStepPolicy:
             context.finish()
             self.execution.statistics.check_background_failures(current_time)
             context.synchronize_distributed(3)
-            self.completed_steps = proposed_completed_steps
             return result
         except BaseException as error:
             resolved = self._coordinate_failure(

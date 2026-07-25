@@ -48,22 +48,19 @@ class MultiRankStatsReader:
     # Internal helpers
     # ----------------------------------------------------------------------------------
     def _safe_time_str(self, t_obj, fmt="%Y-%m-%d %H:%M:%S") -> str:
-        """Helper to safely format time objects (datetime, cftime, or others)."""
-        # Try strftime first (works for datetime and modern cftime)
+        """Format datetime-like objects without assuming one implementation."""
         if hasattr(t_obj, "strftime"):
              try:
                  return t_obj.strftime(fmt)
              except (TypeError, ValueError, OverflowError):
                  pass
 
-        # Fallback to isoformat
         if hasattr(t_obj, "isoformat"):
              try:
                  return t_obj.isoformat()
              except (TypeError, ValueError, OverflowError):
                  pass
 
-        # Fallback to string
         return str(t_obj)
 
     def _preload_cache(self) -> None:
@@ -101,7 +98,8 @@ class MultiRankStatsReader:
                         with nc.Dataset(fp, "r") as ds:
                             var = ds.variables[self.var_name]
                             # Slicing logic: always take all spatial/trial dims.
-                            # Dimensions are (time, [trial], saved_points, [levels]).
+                            # Dimensions are
+                            # (time, [trial], saved_points, [value_axis]).
                             if self.row_chunk_size is None:
                                 data = var[local_start:local_end, ...]
                                 rank_data_parts.append(
@@ -388,8 +386,8 @@ class MultiRankStatsReader:
         base_dir = Path(base_dir)
         files = list(base_dir.glob("*_rank*.nc"))
 
-        # Pattern to extract variable name: {var_name}_rank{rank}[_{year}].nc
-        var_pattern = re.compile(r"^(.+)_rank\d+(?:_\d{4})?\.nc$")
+        # Match the same optional signed year accepted by the catalog.
+        var_pattern = re.compile(r"^(.+)_rank\d+(?:_-?\d+)?\.nc$")
         var_names = set()
         for f in files:
             m = var_pattern.match(f.name)
@@ -485,7 +483,10 @@ class MultiRankStatsReader:
         if self._map_shape is None:
             raise RuntimeError("map_shape is required to export .bin files.")
         if any(info["has_levels"] for info in self._rank_files):
-            raise ValueError("Variables with 'levels' not supported for export.")
+            raise ValueError(
+                "Variables with a trailing value dimension are not supported "
+                "for CaMa binary export."
+            )
         if not self.times or self._time_len == 0:
             raise RuntimeError("No time axis available for export.")
 
@@ -559,10 +560,16 @@ class MultiRankStatsReader:
             f"Coord converter  : {'yes' if self._coord_converter is not None else 'no'}",
         ]
         for i, info in enumerate(self._rank_files):
+            files = ", ".join(path.name for path in info["paths"])
+            value_axis = (
+                f"{info['level_dimension']} ({info['n_levels']})"
+                if info["has_levels"] else "N/A"
+            )
             lines.append(
-                f"  - rank[{i}]: file={info['path'].name}, saved_points={info['saved_points']}, "
-                f"trials={'yes (' + str(info['n_trials']) + ')' if info['has_trials'] else 'no'}, "
-                f"levels={'yes (' + str(info['n_levels']) + ')' if info['has_levels'] else 'no'}, "
+                f"  - rank[{i}]: files={files}, "
+                f"saved_points={info['saved_points']}, "
+                f"trials={info['n_trials'] if info['has_trials'] else 'no'}, "
+                f"value_axis={value_axis}, "
                 f"coord={info['coord_name'] or 'N/A'}"
             )
         return "\n".join(lines)

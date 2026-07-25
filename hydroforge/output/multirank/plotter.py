@@ -148,7 +148,6 @@ class MultiRankPlotter:
                 ys.append(info["y"])
                 cache_arr = info.get("cache")
                 if cache_arr is not None:
-                    # cache_arr shape: (time, [trial], saved_points, [levels])
                     indices = [t_index]
                     if info["has_trials"]:
                         indices.append(trial)
@@ -157,26 +156,9 @@ class MultiRankPlotter:
                         indices.append(level if level is not None else 0)
                     vv = cache_arr[tuple(indices)]
                 else:
-                    orig_t = int(self._t_indices[t_index])
-                    with nc.Dataset(info["path"], "r") as ds:
-                        var = ds.variables[self.var_name]
-
-                        # Build slicing tuple
-                        # 1. time
-                        indices = [orig_t]
-
-                        # 2. trial
-                        if info["has_trials"]:
-                            indices.append(trial)
-
-                        # 3. saved_points (all)
-                        indices.append(slice(None))
-
-                        # 4. levels
-                        if info["has_levels"]:
-                            indices.append(level if level is not None else 0)
-
-                        vv = var[tuple(indices)]
+                    vv = self.owner._data_access._get_data_from_files(
+                        info, t_index, level, trial,
+                    )
                 vals.append(np.array(vv))
             x_all = np.concatenate(xs) if xs else np.array([])
             y_all = np.concatenate(ys) if ys else np.array([])
@@ -196,7 +178,9 @@ class MultiRankPlotter:
                 ax.invert_yaxis()
 
         else:
-            raise RuntimeError("Cannot plot without map_shape and scatter fallback disabled.")
+            raise RuntimeError(
+                "Cannot plot without map_shape when scatter plotting is disabled"
+            )
         fig.tight_layout()
 
     def animate(
@@ -352,8 +336,6 @@ class MultiRankPlotter:
             fig, ax = plt.subplots(figsize=figsize)
             created_fig = True
 
-        # Select Time Axis Strategy
-        # Prefer raw numeric values + FuncFormatter for perfect calendar support
         use_numeric_time = False
         if (
             self._time_values_num is not None
@@ -363,10 +345,8 @@ class MultiRankPlotter:
             times_to_plot = self._time_values_num
             use_numeric_time = True
         elif self.times:
-            # Fallback to datetime list (cached property)
             times_to_plot = self.times
         else:
-            # Fallback to simple indices
             times_to_plot = np.arange(self.time_len)
 
         # Ensure points is in a format suitable for get_series

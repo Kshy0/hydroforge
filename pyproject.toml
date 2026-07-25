@@ -19,6 +19,7 @@ dependencies = [
     "tqdm",
     "cftime",
     "scipy",
+    "ninja",
 ]
 
 [tool.setuptools.packages.find]

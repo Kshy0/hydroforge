@@ -65,7 +65,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
 
     def _pytorch_emit_val_load(self: StatisticsRuntime, var_name: str,
                                 lines: List[str], emitted: set,
-                                indent: str, is_2d: bool = False) -> str:
+                                indent: str, idx_expr: str) -> str:
         """Emit PyTorch code to load a variable value (handling virtuals recursively).
 
         Returns the expression name for the loaded value.
@@ -77,21 +77,18 @@ class TorchStatisticsEmitter(StatisticsEmitter):
 
         source = self._statistics_ir.sources.get(var_name, TensorSource(var_name))
         if isinstance(source, TensorSource):
-            # Real data (includes virtual source buffers)
-            if is_2d:
-                lines.append(f'{indent}{val_name} = states["{var_name}"][(t * stride_input + idx) * n_levels + level]')
-            else:
-                lines.append(f'{indent}{val_name} = states["{var_name}"][t * stride_input + idx]')
+            lines.append(
+                f'{indent}{val_name} = states["{var_name}"][{idx_expr}]'
+            )
         elif isinstance(source, ScatterSource):
             buf_key = f"__scatter_buf_{var_name}"
-            if is_2d:
-                lines.append(f'{indent}{val_name} = states["{buf_key}"][(t * stride_input + idx) * n_levels + level]')
-            else:
-                lines.append(f'{indent}{val_name} = states["{buf_key}"][t * stride_input + idx]')
+            lines.append(
+                f'{indent}{val_name} = states["{buf_key}"][{idx_expr}]'
+            )
         elif isinstance(source, ExpressionSource):
             names = {
                 dependency: self._pytorch_emit_val_load(
-                    dependency, lines, emitted, indent, is_2d,
+                    dependency, lines, emitted, indent, idx_expr,
                 )
                 for dependency in source.expression.dependencies
             }
@@ -123,10 +120,77 @@ class TorchStatisticsEmitter(StatisticsEmitter):
 
         for var in full_vars:
             safe_var = self._get_safe_name(var)
+            value_expression = self._pytorch_state_expression(var)
             lines.extend([
                 f'    # === full tensor variable: {var} ===',
-                f'    {safe_var}_val = states["{var}"]',
+                f'    {safe_var}_val = {value_expression}',
             ])
+
+            for reduction in self._statistics_lowering.inner_reductions(var):
+                inner = reduction.value
+                if inner == 'last':
+                    continue
+                inner_val = f'{safe_var}_{inner}_val'
+                lines.append(
+                    f'    {inner_val} = torch.zeros_like({safe_var}_val)'
+                )
+                inner_key = f'{var}_{inner}_inner_state'
+                if inner == 'mean':
+                    weight_key = f'{var}_{inner}_weight_state'
+                    lines.extend([
+                        f'    _inner_old = states["{inner_key}"].clone()',
+                        f'    _w_old = states["{weight_key}"].clone()',
+                        f'    _inner_new = _inner_old + {safe_var}_val * weight',
+                        '    _w_new = _w_old + weight',
+                        '    if is_inner_last:',
+                        f'        {inner_val} = _inner_new / _w_new',
+                        f'        states["{inner_key}"].zero_()',
+                        f'        states["{weight_key}"].zero_()',
+                        '    else:',
+                        f'        states["{inner_key}"].copy_(_inner_new)',
+                        f'        states["{weight_key}"].copy_(_w_new)',
+                    ])
+                elif inner == 'sum':
+                    lines.extend([
+                        f'    _inner_old = states["{inner_key}"].clone()',
+                        f'    _inner_new = _inner_old + {safe_var}_val * weight',
+                        '    if is_inner_last:',
+                        f'        {inner_val} = _inner_new',
+                        f'        states["{inner_key}"].zero_()',
+                        '    else:',
+                        f'        states["{inner_key}"].copy_(_inner_new)',
+                    ])
+                elif inner == 'max':
+                    lines.extend([
+                        '    if is_inner_first:',
+                        f'        states["{inner_key}"].copy_({safe_var}_val)',
+                        '    else:',
+                        f'        states["{inner_key}"].copy_(torch.fmax(states["{inner_key}"], {safe_var}_val))',
+                        '    if is_inner_last:',
+                        f'        {inner_val} = states["{inner_key}"].clone()',
+                        f'        states["{inner_key}"].fill_(float("-inf"))',
+                    ])
+                elif inner == 'min':
+                    lines.extend([
+                        '    if is_inner_first:',
+                        f'        states["{inner_key}"].copy_({safe_var}_val)',
+                        '    else:',
+                        f'        states["{inner_key}"].copy_(torch.fmin(states["{inner_key}"], {safe_var}_val))',
+                        '    if is_inner_last:',
+                        f'        {inner_val} = states["{inner_key}"].clone()',
+                        f'        states["{inner_key}"].fill_(float("inf"))',
+                    ])
+                elif inner == 'first':
+                    lines.extend([
+                        '    if is_inner_first:',
+                        f'        states["{inner_key}"].copy_({safe_var}_val)',
+                        '    if is_inner_last:',
+                        f'        {inner_val} = states["{inner_key}"]',
+                    ])
+                else:
+                    raise ValueError(
+                        f"Unsupported full-output inner op '{inner}'."
+                    )
 
             for operation in self._statistics_lowering.operations(var):
                 op = operation.spelling
@@ -135,81 +199,10 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                 if operation.compound:
                     outer = operation.outer.value
                     inner = operation.inner.value
-                    inner_val = f'{safe_var}_{inner}_val'
-                    lines.append(f'    {inner_val} = torch.zeros_like({safe_var}_val)')
-
-                    if inner == 'last':
-                        lines.extend([
-                            '    if is_inner_last:',
-                            f'        {inner_val} = {safe_var}_val',
-                        ])
-                    elif inner == 'mean':
-                        inner_key = f'{var}_{inner}_inner_state'
-                        weight_key = f'{var}_{inner}_weight_state'
-                        lines.extend([
-                            f'    _inner_old = states["{inner_key}"].clone()',
-                            f'    _w_old = states["{weight_key}"].clone()',
-                            f'    _inner_new = _inner_old + {safe_var}_val * weight',
-                            '    _w_new = _w_old + weight',
-                            '    if is_inner_last:',
-                            f'        {inner_val} = _inner_new / _w_new',
-                            f'        states["{inner_key}"].zero_()',
-                            f'        states["{weight_key}"].zero_()',
-                            '    else:',
-                            f'        states["{inner_key}"].copy_(_inner_new)',
-                            f'        states["{weight_key}"].copy_(_w_new)',
-                        ])
-                    elif inner == 'sum':
-                        inner_key = f'{var}_{inner}_inner_state'
-                        lines.extend([
-                            f'    _inner_old = states["{inner_key}"].clone()',
-                            f'    _inner_new = _inner_old + {safe_var}_val * weight',
-                            '    if is_inner_last:',
-                            f'        {inner_val} = _inner_new',
-                            f'        states["{inner_key}"].zero_()',
-                            '    else:',
-                            f'        states["{inner_key}"].copy_(_inner_new)',
-                        ])
-                    elif inner == 'max':
-                        inner_key = f'{var}_{inner}_inner_state'
-                        lines.extend([
-                            '    if is_inner_first:',
-                            f'        states["{inner_key}"].copy_({safe_var}_val)',
-                            '    else:',
-                            f'        states["{inner_key}"].copy_(torch.maximum(states["{inner_key}"], {safe_var}_val))',
-                            '    if is_inner_last:',
-                            f'        {inner_val} = states["{inner_key}"].clone()',
-                            f'        states["{inner_key}"].fill_(float("-inf"))',
-                        ])
-                    elif inner == 'min':
-                        inner_key = f'{var}_{inner}_inner_state'
-                        lines.extend([
-                            '    if is_inner_first:',
-                            f'        states["{inner_key}"].copy_({safe_var}_val)',
-                            '    else:',
-                            f'        states["{inner_key}"].copy_(torch.minimum(states["{inner_key}"], {safe_var}_val))',
-                            '    if is_inner_last:',
-                            f'        {inner_val} = states["{inner_key}"].clone()',
-                            f'        states["{inner_key}"].fill_(float("inf"))',
-                        ])
-                    elif inner == 'first':
-                        inner_key = f'{var}_{inner}_inner_state'
-                        lines.extend([
-                            '    if is_inner_first:',
-                            f'        states["{inner_key}"].copy_({safe_var}_val)',
-                            '    if is_inner_last:',
-                            f'        {inner_val} = states["{inner_key}"]',
-                        ])
-                    elif inner == 'mid':
-                        inner_key = f'{var}_{inner}_inner_state'
-                        lines.extend([
-                            '    if is_middle:',
-                            f'        states["{inner_key}"].copy_({safe_var}_val)',
-                            '    if is_inner_last:',
-                            f'        {inner_val} = states["{inner_key}"]',
-                        ])
-                    else:
-                        raise ValueError(f"Unsupported full-output inner op '{inner}'.")
+                    inner_val = (
+                        f'{safe_var}_val' if inner == 'last'
+                        else f'{safe_var}_{inner}_val'
+                    )
 
                     lines.append('    if is_inner_last:')
                     if outer == 'max':
@@ -217,14 +210,14 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                             '        if is_outer_first:',
                             f'            states["{out_key}"].copy_({inner_val})',
                             '        else:',
-                            f'            states["{out_key}"].copy_(torch.maximum(states["{out_key}"], {inner_val}))',
+                            f'            states["{out_key}"].copy_(torch.fmax(states["{out_key}"], {inner_val}))',
                         ])
                     elif outer == 'min':
                         lines.extend([
                             '        if is_outer_first:',
                             f'            states["{out_key}"].copy_({inner_val})',
                             '        else:',
-                            f'            states["{out_key}"].copy_(torch.minimum(states["{out_key}"], {inner_val}))',
+                            f'            states["{out_key}"].copy_(torch.fmin(states["{out_key}"], {inner_val}))',
                         ])
                     elif outer == 'sum':
                         lines.extend([
@@ -273,14 +266,14 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                         '    if is_inner_first:',
                         f'        states["{out_key}"].copy_({safe_var}_val)',
                         '    else:',
-                        f'        states["{out_key}"].copy_(torch.maximum(states["{out_key}"], {safe_var}_val))',
+                        f'        states["{out_key}"].copy_(torch.fmax(states["{out_key}"], {safe_var}_val))',
                     ])
                 elif op == 'min':
                     lines.extend([
                         '    if is_inner_first:',
                         f'        states["{out_key}"].copy_({safe_var}_val)',
                         '    else:',
-                        f'        states["{out_key}"].copy_(torch.minimum(states["{out_key}"], {safe_var}_val))',
+                        f'        states["{out_key}"].copy_(torch.fmin(states["{out_key}"], {safe_var}_val))',
                     ])
                 elif op == 'last':
                     lines.extend([
@@ -308,11 +301,11 @@ class TorchStatisticsEmitter(StatisticsEmitter):
         """Generate a PyTorch function for one output_index group."""
         dims_1d, dims_2d = self._statistics_lowering.split_indexed(var_list)
 
-        func_name = f"_update_{output_index}"
+        func_name = f"_update_{self._get_safe_name(output_index)}"
         lines.extend([
             f'def {func_name}(states, weight, total_weight, num_macro_steps,',
             '               sub_step, num_sub_steps, flags,',
-            '               macro_step_index, num_trials, stride_input):',
+            '               macro_step_index, num_trials):',
             '    states = {key: value.reshape(-1) for key, value in states.items()}',
         ])
         needed_bools = self._statistics_lowering.required_flags
@@ -346,7 +339,11 @@ class TorchStatisticsEmitter(StatisticsEmitter):
 
             # Pre-load all needed values
             for var in dims_1d:
-                self._pytorch_emit_val_load(var, lines, emitted, indent, is_2d=False)
+                stride = self._stride_input(var)
+                idx_expr = f"t * {stride} + idx" if self.num_trials > 1 else "idx"
+                self._pytorch_emit_val_load(
+                    var, lines, emitted, indent, idx_expr,
+                )
 
             # Inner aggregation states (for compound ops)
             # Emit inner aggregation state updates
@@ -402,7 +399,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                             f'{indent}if is_inner_first and macro_step_index == 0:',
                             f'{indent2}_inner_new = {var_val}',
                             f'{indent}else:',
-                            f'{indent2}_inner_new = torch.maximum(_inner_old, {var_val})',
+                            f'{indent2}_inner_new = torch.fmax(_inner_old, {var_val})',
                             f'{indent}if is_inner_last:',
                             f'{indent2}states["{inner_key}"][_isl] = float("-inf")',
                             f'{indent2}{val_for} = _inner_new',
@@ -418,7 +415,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                             f'{indent}if is_inner_first and macro_step_index == 0:',
                             f'{indent2}_inner_new = {var_val}',
                             f'{indent}else:',
-                            f'{indent2}_inner_new = torch.minimum(_inner_old, {var_val})',
+                            f'{indent2}_inner_new = torch.fmin(_inner_old, {var_val})',
                             f'{indent}if is_inner_last:',
                             f'{indent2}states["{inner_key}"][_isl] = float("inf")',
                             f'{indent2}{val_for} = _inner_new',
@@ -479,17 +476,33 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                         if is_arg:
                             # argmax_*/argmin_* compound
                             arg_type = outer_base
-                            aux_key = f'{var}_{arg_type}{k_val if k_val > 1 else ""}_aux'
+                            aux_key = f'{var}_{op}_aux'
                             if k_val == 1:
+                                sentinel = (
+                                    '-float("inf")'
+                                    if arg_type == 'max'
+                                    else 'float("inf")'
+                                )
+                                candidate = f'_candidate_{safe_var}_{op}'
+                                candidate_expression = (
+                                    f'torch.where({val_var} == {val_var}, '
+                                    f'{val_var}, torch.full_like('
+                                    f'{val_var}, {sentinel}))'
+                                    if self._statistics_layouts[
+                                        var
+                                    ].dtype.is_floating_point
+                                    else val_var
+                                )
                                 lines.extend([
                                     f'{indent}if is_inner_last:',
+                                    f'{indent2}{candidate} = {candidate_expression}',
                                     f'{indent2}if is_outer_first:',
                                     f'{indent2}    states["{out_key}"][_csl] = macro_step_index',
-                                    f'{indent2}    states["{aux_key}"][_csl] = {val_var}',
+                                    f'{indent2}    states["{aux_key}"][_csl] = {candidate}',
                                     f'{indent2}else:',
                                     f'{indent2}    _old_aux = states["{aux_key}"][_csl].clone()',
-                                    f'{indent2}    _cond = {val_var} {">" if arg_type == "max" else "<"} _old_aux',
-                                    f'{indent2}    states["{aux_key}"][_csl] = torch.where(_cond, {val_var}, _old_aux)',
+                                    f'{indent2}    _cond = {candidate} {">" if arg_type == "max" else "<"} _old_aux',
+                                    f'{indent2}    states["{aux_key}"][_csl] = torch.where(_cond, {candidate}, _old_aux)',
                                     f'{indent2}    _old_idx = states["{out_key}"][_csl].clone()',
                                     f'{indent2}    _mi = macro_step_index.to(dtype=_old_idx.dtype).expand_as(_old_idx)',
                                     f'{indent2}    states["{out_key}"][_csl] = torch.where(_cond, _mi, _old_idx)',
@@ -506,13 +519,14 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                                     f'{indent2}_k_slice = slice(t * n * {k_val}, (t + 1) * n * {k_val})',
                                     f'{indent2}_top_values = states["{aux_key}"][_k_slice].view(n, {k_val})',
                                     f'{indent2}_top_indices = states["{out_key}"][_k_slice].view(n, {k_val})',
+                                    f'{indent2}_candidate = torch.where({val_var} == {val_var}, {val_var}, torch.full_like({val_var}, {sentinel}))',
                                     f'{indent2}if is_outer_first:',
-                                    f'{indent2}    _top_values[:, 0] = {val_var}',
+                                    f'{indent2}    _top_values[:, 0] = _candidate',
                                     f'{indent2}    _top_values[:, 1:] = {sentinel}',
                                     f'{indent2}    _top_indices[:, 0] = macro_step_index',
                                     f'{indent2}    _top_indices[:, 1:] = 0',
                                     f'{indent2}else:',
-                                    f'{indent2}    _new_value = {val_var}.clone()',
+                                    f'{indent2}    _new_value = _candidate.clone()',
                                     f'{indent2}    _new_index = macro_step_index.to(dtype=_top_indices.dtype).expand_as(_new_value).clone()',
                                     f'{indent2}    for _rank in range({k_val}):',
                                     f'{indent2}        _old_value = _top_values[:, _rank].clone()',
@@ -524,7 +538,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                                     f'{indent2}        _new_index = torch.where(_swap, _old_index, _new_index)',
                                 ])
                         elif outer_base in ('max', 'min'):
-                            cmp = 'torch.maximum' if outer_base == 'max' else 'torch.minimum'
+                            cmp = 'torch.fmax' if outer_base == 'max' else 'torch.fmin'
                             if k_val == 1:
                                 lines.extend([
                                     f'{indent}if is_inner_last:',
@@ -545,11 +559,12 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                                     f'{indent}if is_inner_last:',
                                     f'{indent2}_k_slice = slice(t * n * {k_val}, (t + 1) * n * {k_val})',
                                     f'{indent2}_top_values = states["{out_key}"][_k_slice].view(n, {k_val})',
+                                    f'{indent2}_candidate = torch.where({val_var} == {val_var}, {val_var}, torch.full_like({val_var}, {sentinel}))',
                                     f'{indent2}if is_outer_first:',
-                                    f'{indent2}    _top_values[:, 0] = {val_var}',
+                                    f'{indent2}    _top_values[:, 0] = _candidate',
                                     f'{indent2}    _top_values[:, 1:] = {sentinel}',
                                     f'{indent2}else:',
-                                    f'{indent2}    _new_value = {val_var}.clone()',
+                                    f'{indent2}    _new_value = _candidate.clone()',
                                     f'{indent2}    for _rank in range({k_val}):',
                                     f'{indent2}        _old_value = _top_values[:, _rank].clone()',
                                     f'{indent2}        _swap = _new_value {comparison} _old_value',
@@ -615,7 +630,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}states["{out_key}"][_sl] = {var_val}',
                             f'{indent}else:',
                             f'{indent2}_old = states["{out_key}"][_sl].clone()',
-                            f'{indent2}states["{out_key}"][_sl] = torch.maximum(_old, {var_val})',
+                            f'{indent2}states["{out_key}"][_sl] = torch.fmax(_old, {var_val})',
                         ])
                     elif op == 'min':
                         lines.extend([
@@ -623,7 +638,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}states["{out_key}"][_sl] = {var_val}',
                             f'{indent}else:',
                             f'{indent2}_old = states["{out_key}"][_sl].clone()',
-                            f'{indent2}states["{out_key}"][_sl] = torch.minimum(_old, {var_val})',
+                            f'{indent2}states["{out_key}"][_sl] = torch.fmin(_old, {var_val})',
                         ])
                     elif op == 'last':
                         lines.extend([
@@ -659,8 +674,14 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                     lines.append(f'{indent}# 2D {op} for {safe_var}')
                     lines.append(f'{indent}for level in range(n_levels):')
                     emitted: set[str] = set()
+                    stride = self._stride_input(var)
+                    idx_expr = (
+                        f"(t * {stride} + idx) * n_levels + level"
+                        if self.num_trials > 1
+                        else "idx * n_levels + level"
+                    )
                     var_val = self._pytorch_emit_val_load(
-                        var, lines, emitted, indent2, is_2d=True,
+                        var, lines, emitted, indent2, idx_expr,
                     )
                     lines.append(f'{indent2}_val = {var_val}')
 
@@ -691,7 +712,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}    states["{out_key}"][_out_idx] = _val',
                             f'{indent2}else:',
                             f'{indent2}    _old = states["{out_key}"][_out_idx]',
-                            f'{indent2}    states["{out_key}"][_out_idx] = torch.maximum(_old, _val)',
+                            f'{indent2}    states["{out_key}"][_out_idx] = torch.fmax(_old, _val)',
                         ])
                     elif op == 'min':
                         lines.extend([
@@ -699,7 +720,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}    states["{out_key}"][_out_idx] = _val',
                             f'{indent2}else:',
                             f'{indent2}    _old = states["{out_key}"][_out_idx]',
-                            f'{indent2}    states["{out_key}"][_out_idx] = torch.minimum(_old, _val)',
+                            f'{indent2}    states["{out_key}"][_out_idx] = torch.fmin(_old, _val)',
                         ])
                     elif op == 'last':
                         lines.extend([
@@ -805,17 +826,11 @@ class TorchStatisticsEmitter(StatisticsEmitter):
         for output_index, var_list in grouped_by_output_index.items():
             if output_index == "__full__":
                 continue
-            first_var = var_list[0]
-            stride_input = 0
-            for meta in self._metadata.values():
-                if meta['original_variable'] == first_var:
-                    stride_input = meta.get('stride_input', 0)
-                    break
-
+            safe_output_index = self._get_safe_name(output_index)
             lines.extend([
-                f'    _update_{output_index}(states, weight, total_weight, num_macro_steps,',
+                f'    _update_{safe_output_index}(states, weight, total_weight, num_macro_steps,',
                 '                      sub_step, num_sub_steps, flags,',
-                f'                      macro_step_index, num_trials, {stride_input})',
+                '                      macro_step_index, num_trials)',
             ])
         lines.append('')
 

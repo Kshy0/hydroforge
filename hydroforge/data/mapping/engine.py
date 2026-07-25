@@ -105,13 +105,27 @@ def aggregate_hires_coo(
     Returns ``(rows, cols, data)`` COO triplets where ``rows`` index into
     ``target_ids`` (the catchment that each pixel drains to) and ``cols`` index
     flattened source grid cells.  Pixels whose catchment is absent from
-    ``target_ids`` or whose coordinates fall outside the source grid are dropped.
+    ``target_ids`` are dropped.  Coordinates outside the source grid raise by
+    default; when ``allow_oob_zero`` is true, those pixels are dropped so their
+    contribution is zero.
     """
     from hydroforge.data.distributed import find_indices_in
 
     target_ids = np.asarray(target_ids, dtype=np.int64)
     catchment_idx = find_indices_in(np.asarray(pixel_catchment_id, dtype=np.int64), target_ids)
-    source_idx = source.index_of_points(pixel_lon, pixel_lat, allow_oob=not allow_oob_zero)
+    try:
+        source_idx = source.index_of_points(
+            pixel_lon,
+            pixel_lat,
+            allow_oob=allow_oob_zero,
+        )
+    except ValueError as exc:
+        if not allow_oob_zero and "points fall outside the source grid" in str(exc):
+            raise ValueError(
+                f"{exc}; set allow_oob_zero=True to ignore out-of-bounds "
+                "hires pixels as zero contribution"
+            ) from exc
+        raise
     source_idx = np.asarray(source_idx, dtype=np.int64).ravel()
 
     valid = (catchment_idx != -1) & (source_idx != -1)

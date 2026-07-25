@@ -71,6 +71,20 @@ class _StatisticsLayoutCompiler:
             name: self._selected_layout(name)
             for name in variables
         }
+        for name, source in self.program.sources.items():
+            if name in layouts or not isinstance(source, ScatterSource):
+                continue
+            materialized = self._source_layout(name)
+            layouts[name] = StatisticsVariableLayout(
+                actual_shape=materialized.shape,
+                dtype=materialized.dtype,
+                stride_input=(
+                    materialized.logical_extent
+                    if materialized.batched else 0
+                ),
+                scatter_extent=materialized.scatter_extent,
+                scatter_source_size=materialized.scatter_source_size,
+            )
         return MappingProxyType(layouts)
 
     def _field_info(self, name: str):

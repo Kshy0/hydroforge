@@ -778,8 +778,8 @@ class NetCDFWriter:
             raise RuntimeError(
                 f"Compound statistics {compound_ops} are configured but "
                 "the managed step policy has not observed an outer statistics "
-                "window. Configure statistics_interval/statistics_outer_interval "
-                "on the model and advance through @managed_step."
+                "window. Configure statistics_plan on the model and advance "
+                "through @managed_step."
             )
 
         # Record this time step for argmax/argmin index-to-time conversion
@@ -858,7 +858,7 @@ class NetCDFWriter:
                     file_var_name = f"{out_name}_{k_idx}"
                     self.owner._buffer_and_maybe_flush(buf_key, file_var_name, k_data, output_path, dt, batch_size)
             else:
-                # Single file case (k=1 or legacy)
+                # Single output file.
                 output_path = output_paths if not isinstance(output_paths, list) else output_paths[0]
                 self.owner._buffer_and_maybe_flush(out_name, out_name, time_step_data, output_path, dt, batch_size)
 

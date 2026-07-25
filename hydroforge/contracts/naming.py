@@ -3,6 +3,14 @@
 import re
 
 
+# Read-only launch controls excluded from accumulator snapshots.
+RESERVED_CONTROL_STATE = frozenset({
+    "__weight", "__total_weight", "__num_macro_steps",
+    "__sub_step", "__num_sub_steps", "__flags",
+    "__macro_step_index",
+})
+
+
 def sanitize_symbol(name: str) -> str:
     """Return a stable Python/C/filename-safe spelling."""
 
