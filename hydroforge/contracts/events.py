@@ -43,7 +43,7 @@ class ConsoleEventSink:
             substeps = event.fields.get("adaptive_time_step")
             message = f"Processed step at {current_time}"
             if substeps is not None:
-                message += f", adaptive_time_step={substeps}"
+                message += f", substeps={substeps}"
             progress = event.fields.get("progress")
             if progress:
                 message += f" | {progress}"

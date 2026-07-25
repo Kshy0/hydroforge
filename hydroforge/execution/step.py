@@ -203,6 +203,7 @@ class _StepRuntime:
         self, *, current_time: Any, time_step: float,
         output_enabled: bool,
         program_owner: _ManagedStepDescriptor,
+        spinup: bool = False,
         override: StatisticsFlags | None = None,
     ) -> _StepRuntime:
         state = self.state
@@ -220,10 +221,23 @@ class _StepRuntime:
         self.time_step = float(time_step)
         if not math.isfinite(self.time_step) or self.time_step <= 0:
             raise ValueError("time_step must be finite and positive")
-        if self.controller is None:
+        if type(spinup) is not bool:
+            raise TypeError("spinup must be an exact bool")
+        if spinup and output_enabled:
+            raise ValueError("spin-up requires output_enabled=False")
+        if spinup and state.schedule_step is not None:
+            raise ValueError(
+                "spin-up cannot resume after the main schedule starts"
+            )
+        if spinup and override is not None:
+            raise ValueError("spin-up does not accept manual statistics flags")
+        if spinup and self.schedule is not None:
+            require_calendar(
+                current_time, self.schedule.calendar, label="model current_time",
+            )
+        if not spinup and self.controller is None:
             self._validate_model_schedule(
                 current_time=current_time,
-                output_enabled=output_enabled,
             )
         if (
             self.output_start_time is not None and current_time is not None
@@ -237,7 +251,11 @@ class _StepRuntime:
             raise ValueError(
                 "manual statistics flags must be false when output is disabled"
             )
-        if self.controller is not None:
+        if spinup:
+            self.stat_is_first = self.stat_is_last = False
+            outer_first = outer_last = False
+            output_enabled = False
+        elif self.controller is not None:
             decision = self.controller.resolve(
                 current_time=current_time,
                 time_step=self.time_step,
@@ -289,9 +307,7 @@ class _StepRuntime:
         )
         return self
 
-    def _validate_model_schedule(
-        self, *, current_time: Any, output_enabled: bool,
-    ) -> None:
+    def _validate_model_schedule(self, *, current_time: Any) -> None:
         """Advance a schedule cursor when statistics does not already own it."""
 
         schedule = self.schedule
@@ -303,14 +319,6 @@ class _StepRuntime:
         try:
             index = schedule.index_at(current_time)
         except KeyError as error:
-            # Before the first main-schedule step, disabled-output calls are
-            # explicit spin-up and intentionally do not advance the cursor.
-            if (
-                not output_enabled
-                and self.state.schedule_step is None
-                and current_time < schedule.start
-            ):
-                return
             raise ValueError(
                 f"current_time {current_time!r} is not a model schedule boundary"
             ) from error
@@ -576,6 +584,9 @@ class _CompiledStepPolicy:
                 if any(type(value) is not bool for value in values):
                     raise TypeError("manual statistics flags must be bool values")
                 override = StatisticsFlags(*values)
+            spinup = kwargs.pop("spinup", False)
+            if type(spinup) is not bool:
+                raise TypeError("spinup must be an exact bool")
             current_time = layout.get(args, kwargs, "current_time", None)
         except BaseException as error:
             resolved = self._coordinate_failure(
@@ -591,8 +602,15 @@ class _CompiledStepPolicy:
                 current_time=current_time,
                 time_step=layout.get(args, kwargs, "time_step"),
                 output_enabled=layout.get(args, kwargs, "output_enabled", True),
+                spinup=spinup,
                 program_owner=self.descriptor,
                 override=override,
+            )
+            context.synchronize_distributed(
+                4,
+                signature=(
+                    int(spinup), int(context.output_enabled), context.flags,
+                ),
             )
             if self._rank == 0:
                 if self._progress_start is None:
@@ -601,12 +619,15 @@ class _CompiledStepPolicy:
                     )
                 self._progress_start()
             with self._parameter_transaction():
-                parameter_effect = self._execute_parameter_change_plan(current_time)
-                if not isinstance(parameter_effect, ParameterChangeEffect):
-                    raise TypeError(
-                        "execute_parameter_change_plan() must return "
-                        "ParameterChangeEffect"
+                if not spinup:
+                    parameter_effect = self._execute_parameter_change_plan(
+                        current_time,
                     )
+                    if not isinstance(parameter_effect, ParameterChangeEffect):
+                        raise TypeError(
+                            "execute_parameter_change_plan() must return "
+                            "ParameterChangeEffect"
+                        )
                 self.execution.active_step = context
                 call_args, call_kwargs = layout.replace(
                     args, kwargs, "output_enabled", context.output_enabled,

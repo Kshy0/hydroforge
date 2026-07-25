@@ -25,9 +25,8 @@ class ERA5LandAccumDataset(NetCDFDataset):
         end_date   = datetime(2000, 12, 31, 23, 0)   # last  interval: [23:00, 00:00 next day)
 
     get_time_by_index() and DatasetStep.source_time always return these physical
-    (unshifted) times. DatasetStep.model_time uses the continuous virtual model
-    timeline during spin-up, then matches physical time throughout the main
-    simulation.
+    (unshifted) times. DatasetStep.model_time follows the same physical time,
+    including replayed spin-up cycles.
 
     Why we shift internally by +time_interval:
     ERA5-Land accumulated variables (e.g., hourly runoff `ro`) are time-stamped
