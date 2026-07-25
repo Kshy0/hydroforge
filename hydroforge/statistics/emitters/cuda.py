@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from math import prod
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Sequence, Tuple
 
@@ -161,8 +162,15 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             "",
             "template <typename T> __device__ inline T hf_max(T a, T b) { return a > b ? a : b; }",
             "template <typename T> __device__ inline T hf_min(T a, T b) { return a < b ? a : b; }",
+            "template <> __device__ inline float hf_max<float>(float a, float b) { return fmaxf(a, b); }",
+            "template <> __device__ inline float hf_min<float>(float a, float b) { return fminf(a, b); }",
+            "template <> __device__ inline double hf_max<double>(double a, double b) { return fmax(a, b); }",
+            "template <> __device__ inline double hf_min<double>(double a, double b) { return fmin(a, b); }",
             "template <typename T> __device__ inline T hf_neg_inf() { return static_cast<T>(-INFINITY); }",
             "template <typename T> __device__ inline T hf_pos_inf() { return static_cast<T>(INFINITY); }",
+            "template <typename T> __device__ inline T hf_ignore_nan(T value, T replacement) { return value; }",
+            "template <> __device__ inline float hf_ignore_nan<float>(float value, float replacement) { return isnan(value) ? replacement : value; }",
+            "template <> __device__ inline double hf_ignore_nan<double>(double value, double replacement) { return isnan(value) ? replacement : value; }",
             "",
         ]
 
@@ -231,7 +239,10 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                     int(variable.variable.actual_shape[-1]) if is_2d else 1
                 )
                 max_levels = max(max_levels, n_levels)
-                var_numel = int(self._tensor_registry[var].numel()) if full_output else 0
+                var_numel = (
+                    prod(self._statistics_layouts[var].actual_shape)
+                    if full_output else 0
+                )
                 full_total = max(full_total, var_numel)
                 self._add_value_params(var, add_tensor_param)
 
@@ -248,7 +259,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                     }
                     aux_key = None
                     if info["is_arg"]:
-                        aux_key = f"{var}_{info['base']}{info['k'] if info['k'] > 1 else ''}_aux"
+                        aux_key = f"{var}_{operation.spelling}_aux"
                         add_tensor_param(aux_key, const=False)
                     ops.append(
                         {
@@ -339,8 +350,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         variable = self._statistics_lowering.by_name.get(name)
         for operation in variable.operations if variable is not None else ():
             if operation.stores_index:
-                suffix = str(operation.k) if operation.k > 1 else ""
-                aux_key = f"{name}_{operation.outer.value}{suffix}_aux"
+                aux_key = f"{name}_{operation.spelling}_aux"
                 if aux_key in self._storage:
                     return self._state_ctype(aux_key)[0]
             out_key = f"{name}_{operation.spelling}"
@@ -382,6 +392,8 @@ class CudaStatisticsEmitter(StatisticsEmitter):
 
         if context == "scatter":
             offset = "src_off"
+        elif context == "full":
+            offset = "linear"
         elif is_2d:
             offset = f"(t * {self._stride_expr(name)} + idx) * {n_levels} + level"
         else:
@@ -656,8 +668,12 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             lines.append(f"    if (linear < {var['numel']}) {{")
             lines.append("        long out_off = linear;")
             ctype = var["ctype"]
-            name_ident = _c_ident(var["name"])
-            lines.append(f"        {ctype} val = static_cast<{ctype}>(p_{name_ident}[linear]);")
+            emitted: Dict[str, str] = {}
+            val = self._value_expr(
+                var["name"], lines, emitted, context="full", is_2d=False,
+                n_levels=1, ctype=ctype,
+            )
+            lines.append(f"        {ctype} val = {val};")
             lines.extend(self._generate_inner_updates(var))
             for op in var["ops"]:
                 lines.extend(self._generate_op_update(var, op))
@@ -759,13 +775,25 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         if outer["is_arg"]:
             aux = f"p_{_c_ident(op['aux_key'])}"
             cmp = ">" if outer["base"] == "max" else "<"
+            sentinel = (
+                f"hf_neg_inf<{ctype}>()"
+                if outer["base"] == "max"
+                else f"hf_pos_inf<{ctype}>()"
+            )
+            candidate = (
+                f"hf_ignore_nan<{ctype}>({value}, {sentinel})"
+                if self._statistics_layouts[
+                    var["name"]
+                ].dtype.is_floating_point
+                else value
+            )
             body = [
                 f"{indent}if ({'is_outer_first' if compound else 'is_inner_first'}) {{",
                 f"{indent}    {out}[out_off] = macro_step_index;",
-                f"{indent}    {aux}[out_off] = {value};",
+                f"{indent}    {aux}[out_off] = {candidate};",
                 f"{indent}}} else {{",
                 f"{indent}    {ctype} old_v = {aux}[out_off];",
-                f"{indent}    if ({value} {cmp} old_v) {{ {aux}[out_off] = {value}; {out}[out_off] = macro_step_index; }}",
+                f"{indent}    if ({candidate} {cmp} old_v) {{ {aux}[out_off] = {candidate}; {out}[out_off] = macro_step_index; }}",
                 f"{indent}}}",
             ]
         elif outer["base"] == "mean":
@@ -827,7 +855,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             aux = f"p_{_c_ident(op['aux_key'])}"
             return [
                 f"{indent}long k_base = out_off * {k};",
-                f"{indent}{ctype} new_v = {value};",
+                f"{indent}{ctype} new_v = hf_ignore_nan<{ctype}>({value}, {init});",
                 f"{indent}int32_t new_i = macro_step_index;",
                 f"{indent}if ({reset}) {{",
                 f"{indent}    {aux}[k_base] = new_v; {out}[k_base] = new_i;",
@@ -843,7 +871,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         out = f"p_{_c_ident(op['out_key'])}"
         return [
             f"{indent}long k_base = out_off * {k};",
-            f"{indent}{ctype} new_v = {value};",
+            f"{indent}{ctype} new_v = hf_ignore_nan<{ctype}>({value}, {init});",
             f"{indent}if ({reset}) {{",
             f"{indent}    {out}[k_base] = new_v;",
             f"{indent}    for (int kk = 1; kk < {k}; ++kk) {{ {out}[k_base + kk] = {init}; }}",

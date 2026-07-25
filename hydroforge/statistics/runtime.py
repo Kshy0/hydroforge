@@ -26,8 +26,8 @@ import torch
 from hydroforge.data.distributed import torch_to_numpy_dtype
 from hydroforge.contracts import ResourceCleanupError
 from hydroforge.statistics.ir import (
-    ExpressionSource, ScatterSource, StorageDType, StorageInitialization,
-    TensorSource, build_variable_storage_plan,
+    ExpressionSource, Reduction, ScatterSource, StorageDType,
+    StorageInitialization, TensorSource, build_variable_storage_plan,
 )
 from hydroforge.statistics.compiler import StatisticsCompiler
 from hydroforge.statistics.layout import StatisticsCompilation
@@ -37,7 +37,7 @@ from hydroforge.serialization.netcdf import (
 )
 from hydroforge.serialization.files import atomic_write_text
 from hydroforge.contracts.fields import RuntimeTensorMetadata
-from hydroforge.contracts.naming import sanitize_symbol
+from hydroforge.contracts.naming import RESERVED_CONTROL_STATE, sanitize_symbol
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,8 +281,7 @@ class StatisticsRuntime:
 
                 # For explicit argmax/argmin operations, add their auxiliary storage
                 if operation.stores_index:
-                    suffix = "" if operation.k == 1 else str(operation.k)
-                    aux_name = f"{var_name}_{operation.outer.value}{suffix}_aux"
+                    aux_name = f"{var_name}_{operation.spelling}_aux"
                     if aux_name in self._storage:
                         required_tensors[aux_name] = self._storage[aux_name]
 
@@ -309,11 +308,9 @@ class StatisticsRuntime:
                 if isinstance(dim_name, str):
                     required_dims.add(dim_name)
 
-        # Add scatter buffers and their source/index tensors
-        for variable in ir.variables:
+        # Include scatter buffers from hidden virtual dependencies.
+        for variable in ir.ordered_scatters():
             scatter = variable.source
-            if not isinstance(scatter, ScatterSource):
-                continue
             var_name = variable.name
             buf_key = f"__scatter_buf_{var_name}"
             if buf_key in self._storage:
@@ -391,6 +388,9 @@ class StatisticsRuntime:
                 "statistics runtime requires a StatisticsCompilation; "
                 "raw variable mappings must be compiled first"
             )
+        execution = getattr(self, "_execution", None)
+        if execution is not None:
+            execution.capture.invalidate_statistics(self)
         # Reset generic state
         self._variables = set()
         self._variable_ops = {
@@ -413,6 +413,41 @@ class StatisticsRuntime:
         # Release a previous generated specialization before rebuilding.
         self._cleanup_generated_modules()
 
+        for var_name, source in self._statistics_program.sources.items():
+            if isinstance(source, ScatterSource):
+                scatter_layout = self._statistics_layouts[var_name]
+                if (
+                    self.backend == "metal"
+                    and scatter_layout.dtype != torch.float32
+                ):
+                    raise TypeError(
+                        f"Metal scatter statistics for {var_name!r} require "
+                        "float32 materialization; atomic_float buffers cannot "
+                        f"alias {scatter_layout.dtype} storage"
+                    )
+            if (
+                not isinstance(source, ScatterSource)
+                or var_name in self._variable_ops
+            ):
+                continue
+            layout = self._statistics_layouts[var_name]
+            full_target_size = layout.scatter_extent
+            if full_target_size is None:
+                raise RuntimeError(
+                    f"Scatter layout for {var_name!r} has no target extent"
+                )
+            shape = (
+                (self.num_trials, full_target_size)
+                if self.num_trials > 1 else (full_target_size,)
+            )
+            self._storage[f"__scatter_buf_{var_name}"] = torch.zeros(
+                shape, dtype=layout.dtype, device=self.device,
+            )
+            if source.reduction is Reduction.MEAN:
+                self._storage[f"__scatter_cnt_{var_name}"] = torch.zeros(
+                    shape, dtype=layout.dtype, device=self.device,
+                )
+
         # Validate and setup each variable
         for var_name, ops in self._variable_ops.items():
             operation_nodes = self._statistics_program.operations[var_name]
@@ -432,6 +467,35 @@ class StatisticsRuntime:
             full_output = output_index is None
             actual_shape = layout.actual_shape
             actual_ndim = layout.actual_ndim
+
+            if not target_dtype.is_floating_point:
+                unsupported = next((
+                    operation for operation in operation_nodes
+                    if (
+                        (
+                            operation.inner is None
+                            and operation.outer in {Reduction.MEAN, Reduction.SUM}
+                        )
+                        or (
+                            operation.inner is not None
+                            and (
+                                operation.inner in {
+                                    Reduction.MEAN, Reduction.SUM,
+                                    Reduction.MAX, Reduction.MIN,
+                                }
+                                or operation.outer is Reduction.MEAN
+                                or operation.k > 1
+                            )
+                        )
+                    )
+                ), None)
+                if unsupported is not None:
+                    raise TypeError(
+                        f"Statistics operation {unsupported.spelling!r} for "
+                        f"non-floating field {var_name!r} with dtype "
+                        f"{target_dtype} requires floating-point accumulator "
+                        "semantics"
+                    )
 
             # Track
             self._variables.add(var_name)
@@ -466,12 +530,22 @@ class StatisticsRuntime:
                     else target_dtype
                 )
                 if slot.initialization is StorageInitialization.NEGATIVE_INFINITY:
+                    initial = (
+                        -torch.inf if dtype.is_floating_point
+                        else False if dtype is torch.bool
+                        else torch.iinfo(dtype).min
+                    )
                     tensor = torch.full(
-                        slot.shape, -torch.inf, dtype=dtype, device=self.device,
+                        slot.shape, initial, dtype=dtype, device=self.device,
                     )
                 elif slot.initialization is StorageInitialization.POSITIVE_INFINITY:
+                    initial = (
+                        torch.inf if dtype.is_floating_point
+                        else True if dtype is torch.bool
+                        else torch.iinfo(dtype).max
+                    )
                     tensor = torch.full(
-                        slot.shape, torch.inf, dtype=dtype, device=self.device,
+                        slot.shape, initial, dtype=dtype, device=self.device,
                     )
                 else:
                     tensor = torch.zeros(
@@ -552,6 +626,43 @@ class StatisticsRuntime:
                     f"NetCDF variable '{safe_name}'."
                 )
             safe_outputs[safe_name] = out_name
+
+        kernel_inputs: Set[str] = set()
+        for var_name in self._variables:
+            kernel_inputs.update(
+                self._statistics_program.leaf_tensors(var_name)
+            )
+            output_index = self._field_registry[var_name].output_index
+            if output_index is not None:
+                kernel_inputs.add(output_index)
+
+        reserved_collision = kernel_inputs.intersection(RESERVED_CONTROL_STATE)
+        if reserved_collision:
+            raise ValueError(
+                "Statistics input names collide with reserved control state: "
+                f"{sorted(reserved_collision)}"
+            )
+
+        storage_collision = kernel_inputs.intersection(self._storage)
+        if storage_collision:
+            raise ValueError(
+                "Statistics inputs collide with generated accumulator state: "
+                f"{sorted(storage_collision)}"
+            )
+
+        symbol_names = (
+            kernel_inputs | set(self._storage) | set(self._variables)
+        )
+        symbols: Dict[str, str] = {}
+        for name in sorted(symbol_names):
+            symbol = sanitize_symbol(name)
+            previous = symbols.get(symbol)
+            if previous is not None and previous != name:
+                raise ValueError(
+                    f"Statistics names {previous!r} and {name!r} both map "
+                    f"to generated symbol {symbol!r}"
+                )
+            symbols[symbol] = name
 
         # Generate kernels and prepare states for all requested variables/ops
         self._compiler.compile()

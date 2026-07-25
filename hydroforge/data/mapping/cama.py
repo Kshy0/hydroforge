@@ -27,8 +27,7 @@ def read_cama_catchments(
 
     Returns ``(catchment_id, nx, ny, nextxy_data)`` where ``catchment_id`` is the
     C-order ``ix*ny+iy`` index of every active cell and ``nextxy_data`` is the
-    raw ``(nx, ny, 2)`` downstream-pointer array (reused for the uniform-hires
-    fallback).
+    raw ``(nx, ny, 2)`` downstream-pointer array.
     """
     map_dir = Path(map_dir)
     with open(map_dir / "mapdim.txt", "r") as f:

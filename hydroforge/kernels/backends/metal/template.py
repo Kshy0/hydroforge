@@ -29,43 +29,35 @@ _NAMED_BODY_PATTERN = re.compile(
 def _split_template_source(
     spec: KernelSpec, source: str,
 ) -> tuple[str, str]:
-    """Select one canonical body from a legacy or grouped Metal source."""
+    """Select the named body for ``spec`` from a Metal source."""
 
     named = tuple(_NAMED_BODY_PATTERN.finditer(source))
-    if named:
-        marker_lines = tuple(
-            line.strip() for line in source.splitlines()
-            if METAL_KERNEL_BODY_MARKER in line
-        )
-        if len(marker_lines) != len(named):
-            raise ValueError(
-                "grouped Metal source may contain only named body markers"
-            )
-        names = tuple(match.group("name") for match in named)
-        if len(names) != len(set(names)):
-            raise ValueError(
-                f"grouped Metal source has duplicate bodies: {names}"
-            )
-        try:
-            selected = names.index(spec.name)
-        except ValueError as error:
-            raise ValueError(
-                f"grouped Metal source has no body for {spec.name!r}; "
-                f"available={names}"
-            ) from error
-        start = named[selected].end()
-        end = (
-            named[selected + 1].start()
-            if selected + 1 < len(named) else len(source)
-        )
-        return source[:named[0].start()], source[start:end]
-
-    if source.count(METAL_KERNEL_BODY_MARKER) != 1:
+    marker_lines = tuple(
+        line.strip() for line in source.splitlines()
+        if METAL_KERNEL_BODY_MARKER in line
+    )
+    if not named or len(marker_lines) != len(named):
         raise ValueError(
-            "Metal template source must contain exactly one legacy marker or "
-            "one or more unique named body markers"
+            "Metal template source requires one or more named body markers"
         )
-    return tuple(source.split(METAL_KERNEL_BODY_MARKER, 1))
+    names = tuple(match.group("name") for match in named)
+    if len(names) != len(set(names)):
+        raise ValueError(
+            f"Metal template source has duplicate bodies: {names}"
+        )
+    try:
+        selected = names.index(spec.name)
+    except ValueError as error:
+        raise ValueError(
+            f"Metal template source has no body for {spec.name!r}; "
+            f"available={names}"
+        ) from error
+    start = named[selected].end()
+    end = (
+        named[selected + 1].start()
+        if selected + 1 < len(named) else len(source)
+    )
+    return source[:named[0].start()], source[start:end]
 
 
 def _physics_source(source: str) -> str:
@@ -78,8 +70,7 @@ def _physics_source(source: str) -> str:
 class SpecMetalTemplateDispatcher:
     """Generate one exact Metal ABI after canonical arguments are bound.
 
-    One authored source contains local value-only helpers followed by either
-    one legacy body or multiple named bodies for related physical operators.
+    One source contains local value-only helpers and named operator bodies.
     Buffer/scalar declarations, function constants, argument order and access
     are emitted from KernelSpec; no Python-side source assembly is part of the
     downstream adapter.

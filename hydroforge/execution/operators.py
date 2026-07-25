@@ -163,17 +163,26 @@ class CollectiveOperator:
     operation: str
     reduction: str
     destination: int | None
+    signature: tuple[int, int, int]
     reads: tuple[torch.Tensor, ...]
     writes: tuple[torch.Tensor, ...]
 
     def launch(self) -> None:
         from hydroforge.execution.collectives import (
-            _launch_all_reduce, _launch_reduce,
+            _event_kind, _launch_all_reduce, _launch_reduce,
         )
+        from hydroforge.execution.step import synchronize_collective
 
         if self.operation == "all_reduce":
+            synchronize_collective(
+                _event_kind("all_reduce", self.reduction), self.signature,
+            )
             _launch_all_reduce(self.tensor, self.reduction)
         elif self.operation == "reduce" and self.destination is not None:
+            synchronize_collective(
+                _event_kind("reduce", self.reduction, self.destination),
+                self.signature,
+            )
             _launch_reduce(
                 self.tensor, self.reduction, destination=self.destination,
             )
@@ -482,6 +491,7 @@ class _OperatorRecorder:
     def record_collective(
         self, tensor: torch.Tensor, reduction: str, *,
         operation: str = "all_reduce", destination: int | None = None,
+        signature: tuple[int, int, int],
     ) -> None:
         """Record one communication operation at its physical sequence point."""
 
@@ -492,7 +502,7 @@ class _OperatorRecorder:
             )
         self.operators.append(CollectiveOperator(
             tensor=tensor, operation=operation, reduction=reduction,
-            destination=destination,
+            destination=destination, signature=signature,
             reads=(tensor,), writes=(tensor,),
         ))
 

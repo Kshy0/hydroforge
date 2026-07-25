@@ -249,11 +249,10 @@ def lower_statistics(
                 operation.phase is SamplePhase.EVERY_SUBSTEP
                 or (
                     operation.value_reduction is not None
-                    and operation.value_reduction
-                    not in {Reduction.FIRST, Reduction.LAST, Reduction.MID}
+                    and operation.value_reduction is not Reduction.LAST
                 )
                 for operation in operations
-            ),
+            ) or len({operation.phase for operation in operations}) > 1,
         )
         variables.append(lowered)
         groups.setdefault(variable.output_group, []).append(lowered)

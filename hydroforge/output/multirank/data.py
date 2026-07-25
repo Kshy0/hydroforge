@@ -45,14 +45,19 @@ class MultiRankDataAccess:
         if info["has_levels"]:
             if type(level) is not int:
                 raise TypeError(
-                    "level must be an exact int for an output with levels"
+                    "level must be an exact int for output dimension "
+                    f"{info['level_dimension']!r}"
                 )
             if not 0 <= level < info["n_levels"]:
                 raise IndexError(
-                    f"level out of range [0, {info['n_levels'] - 1}]"
+                    f"level for dimension {info['level_dimension']!r} is out "
+                    f"of range [0, {info['n_levels'] - 1}]"
                 )
         elif level is not None:
-            raise ValueError("level must be None for an output without levels")
+            raise ValueError(
+                "level must be None for an output without a trailing value "
+                "dimension"
+            )
 
     def _validate_request(
         self, *, t_index: int | None, level: Optional[int], trial: int,
@@ -126,7 +131,7 @@ class MultiRankDataAccess:
             else:
                 data = self._get_data_from_files(info, t_index, level, trial)
 
-            arr = self._array(data, source=info["path"].name)
+            arr = self._array(data, source=info["paths"][0].name)
             arr = arr.astype(target_dtype, copy=False)
             parts.append(arr)
         return np.concatenate(parts, axis=0) if parts else np.array([])
@@ -161,7 +166,10 @@ class MultiRankDataAccess:
             x = info.get("x")
             y = info.get("y")
             if x is None or y is None:
-                raise RuntimeError(f"{info['path'].name} missing (x,y); set map_shape or coord converter.")
+                raise RuntimeError(
+                    f"rank {info['rank_id']} missing (x,y); set map_shape or "
+                    "coord converter"
+                )
 
             cache_arr = info.get("cache")
             if cache_arr is not None:
@@ -178,7 +186,7 @@ class MultiRankDataAccess:
                 vals = self._get_data_from_files(info, t_index, level, trial)
 
             grid[x, y] = self._array(
-                vals, source=info["path"].name,
+                vals, source=info["paths"][0].name,
             ).astype(target_dtype, copy=False)
         return grid
 
@@ -207,7 +215,7 @@ class MultiRankDataAccess:
         if info["has_levels"]:
             indices.append(level)
         chunk = self._array(
-            cache_arr[tuple(indices)], source=info["path"].name,
+            cache_arr[tuple(indices)], source=info["paths"][0].name,
         )
         out[:, out_cols] = chunk.astype(target_dtype, copy=False)
 
@@ -383,7 +391,7 @@ class MultiRankDataAccess:
                     local_start = req_start - file_start_global
                     local_end = req_end - file_start_global
 
-                    # out is indexed 0..self.owner._time_len-1 corresponding to self.owner._slice_start..self.owner._slice_end
+                    # Translate the global slice into the output row offset.
                     out_start = req_start - self.owner._slice_start
 
                     self._copy_series_from_row_chunks(

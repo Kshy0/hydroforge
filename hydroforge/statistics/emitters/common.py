@@ -43,6 +43,7 @@ class StatisticsEmitter:
         self.kernels_dir = owner.kernels_dir
         self._variables = owner._variables
         self._metadata = owner._metadata
+        self._statistics_layouts = owner._statistics_layouts
         self._storage = owner._storage
         self._tensor_registry = owner._tensor_registry
         self._safe_name_cache = owner._safe_name_cache
@@ -66,6 +67,24 @@ class StatisticsEmitter:
         if name not in self._safe_name_cache:
             self._safe_name_cache[name] = sanitize_symbol(name)
         return self._safe_name_cache[name]
+
+    def _stride_input(self, name: str) -> int:
+        """Return one output variable's trial stride from its compiled layout."""
+        for metadata in self._metadata.values():
+            if metadata["original_variable"] == name:
+                return int(metadata.get("stride_input", 0))
+        raise KeyError(f"No compiled statistics metadata exists for {name!r}")
+
+    def _source_stride(self, name: str) -> int:
+        """Return the logical-axis stride for one materialized input buffer."""
+        tensor = self._tensor_registry.get(name)
+        if tensor is None:
+            tensor = self._storage.get(name)
+        if tensor is None:
+            raise KeyError(f"No materialized statistics input exists for {name!r}")
+        if self.num_trials > 1 and tensor.ndim >= 2:
+            return int(tensor.shape[1])
+        return 0
 
     def _generate_unique_name(self) -> str:
         timestamp = datetime.now().strftime("%H%M%S")
@@ -111,9 +130,7 @@ class StatisticsEmitter:
         sys.modules[module_name] = module
         try:
             with warnings.catch_warnings():
-                # PyTorch 2.x imports its legacy MKLDNN ScriptModule while
-                # initializing torch.compile on Python 3.14. HydroForge does
-                # not use that API; suppress only this upstream import warning.
+                # Ignore the unrelated torch.jit warning raised by torch.compile.
                 warnings.filterwarnings(
                     "ignore",
                     message=r"`torch\.jit\.script_method` is not supported.*",

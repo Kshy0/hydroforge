@@ -101,9 +101,8 @@ def build_hires_aggregate_mapping(
 ) -> MappingTable:
     """Build an area-weighted catchment x source mapping from hires pixels.
 
-    Weights are raw pixel areas (no per-row normalization), matching the legacy
-    CaMa ``generate_mapping_table`` semantics.  ``target_ids`` defines both the
-    row order and the catchment subset to keep.
+    Weights are raw pixel areas without per-row normalization. ``target_ids``
+    defines the row order and catchment subset.
     """
     target_ids = np.asarray(target_ids, dtype=np.int64)
     rows, cols, data = aggregate_hires_coo(

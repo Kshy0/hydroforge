@@ -85,8 +85,10 @@ def TensorField(
             "TensorField no longer accepts checkpoint; only category="
             "'init_state' fields are persisted"
         )
-    legacy = {"group_by", "save_idx", "save_coord", "partition", "locality"}
-    unsupported = sorted(legacy.intersection(kwargs))
+    removed_options = {
+        "group_by", "save_idx", "save_coord", "partition", "locality",
+    }
+    unsupported = sorted(removed_options.intersection(kwargs))
     if unsupported:
         names = ", ".join(unsupported)
         raise TypeError(
@@ -270,11 +272,11 @@ def computed_tensor_field(
             "computed_tensor_field no longer accepts checkpoint; computed "
             "fields are reconstructed after restart"
         )
-    legacy = {
+    removed_options = {
         "group_by", "save_idx", "save_coord", "partition", "locality",
         "static_output",
     }
-    unsupported = sorted(legacy.intersection(kwargs))
+    unsupported = sorted(removed_options.intersection(kwargs))
     if unsupported:
         names = ", ".join(unsupported)
         raise TypeError(

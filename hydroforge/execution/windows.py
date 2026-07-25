@@ -45,11 +45,6 @@ class StatisticsWindowController:
         self._outer_open = False
         self.fingerprint = self._fingerprint()
 
-    @property
-    def open_windows(self) -> tuple[bool, bool]:
-        """Whether inner/outer accumulators are incomplete after the last step."""
-        return self._inner_open, self._outer_open
-
     def _fingerprint(self) -> str:
         definition = {
             "schedule": self.schedule.fingerprint,
@@ -285,7 +280,7 @@ class StatisticsWindowController:
                 "manual outer statistics flags require stat_is_last=True"
             )
 
-    def checkpoint_state(self) -> dict[str, Any]:
+    def snapshot_state(self) -> dict[str, Any]:
         return {
             "fingerprint": self.fingerprint,
             "last_step_index": -1 if self._last_step_index is None
@@ -295,7 +290,7 @@ class StatisticsWindowController:
             "outer_open": int(self._outer_open),
         }
 
-    def _checkpoint_position(
+    def _snapshot_position(
         self, state: dict[str, Any],
     ) -> tuple[int | None, bool, Any, Any, bool, bool]:
         expected = {
@@ -303,31 +298,31 @@ class StatisticsWindowController:
             "inner_open", "outer_open",
         }
         if not isinstance(state, dict) or set(state) != expected:
-            raise ValueError("checkpoint statistics cursor has an invalid schema")
+            raise ValueError("statistics snapshot has an invalid schema")
         if state["fingerprint"] != self.fingerprint:
-            raise ValueError("checkpoint statistics plan does not match the model plan")
+            raise ValueError("statistics snapshot does not match the model plan")
         index = state["last_step_index"]
         if type(index) is not int:
-            raise TypeError("checkpoint statistics step index must be an exact int")
+            raise TypeError("statistics snapshot step index must be an exact int")
         if index < -1 or index >= len(self.schedule):
-            raise ValueError("checkpoint statistics step index is outside the schedule")
+            raise ValueError("statistics snapshot step is outside the schedule")
         bits = {
             name: state[name]
             for name in ("output_active", "inner_open", "outer_open")
         }
         if any(type(value) is not int or value not in {0, 1} for value in bits.values()):
             raise TypeError(
-                "checkpoint statistics flags must be exact integer bits"
+                "statistics snapshot flags must be exact integer bits"
             )
         active = bool(bits["output_active"])
         inner_open = bool(bits["inner_open"])
         outer_open = bool(bits["outer_open"])
         if (inner_open or outer_open) and not active:
-            raise ValueError("checkpoint has open statistics but inactive output")
+            raise ValueError("statistics snapshot has inactive open windows")
         if index == -1:
             if active:
                 raise ValueError(
-                    "checkpoint cannot have active statistics without a step"
+                    "statistics snapshot cannot be active without a step"
                 )
             return None, False, None, None, False, False
         if not active:
@@ -338,17 +333,13 @@ class StatisticsWindowController:
         inner = self._locate(self.plan.inner, step.start)
         outer = self._locate(self.plan.outer or self.plan.inner, step.start)
         if inner is None or outer is None:
-            raise ValueError("checkpoint points outside configured statistics windows")
+            raise ValueError("statistics snapshot is outside configured windows")
         return index, True, inner[0], outer[0], inner_open, outer_open
 
-    def validate_checkpoint_state(self, state: dict[str, Any]) -> None:
-        """Validate persisted cursor state without mutating this controller."""
-        self._checkpoint_position(state)
-
-    def restore_checkpoint_state(self, state: dict[str, Any]) -> None:
+    def restore_snapshot_state(self, state: dict[str, Any]) -> None:
         (
             index, active, inner_key, outer_key, inner_open, outer_open,
-        ) = self._checkpoint_position(state)
+        ) = self._snapshot_position(state)
         self._last_step_index = index
         self._output_active = active
         self._last_inner_key = inner_key

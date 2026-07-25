@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from math import prod
 from typing import TYPE_CHECKING
 
 from hydroforge.statistics.ir import (
@@ -65,6 +66,8 @@ class MetalStatisticsEmitter(StatisticsEmitter):
         tensor = self._tensor_registry.get(var_name)
         if tensor is not None:
             dt = tensor.dtype
+        elif var_name in self._statistics_layouts:
+            dt = self._statistics_layouts[var_name].dtype
         else:
             stored = self._storage.get(var_name)
             dt = stored.dtype if stored is not None else torch.float32
@@ -115,14 +118,10 @@ class MetalStatisticsEmitter(StatisticsEmitter):
         """Generate a Metal kernel for variables saved at full tensor shape."""
         kernel_name = f"aggr_kernel_{self._get_safe_name(output_index)}"
 
-        sorted_inputs = []
-        for var in var_list:
-            if var not in self._tensor_registry:
-                raise ValueError(
-                    f"Full-output Metal aggregation requires '{var}' to be a registered tensor"
-                )
-            sorted_inputs.append(var)
-        sorted_inputs = sorted(dict.fromkeys(sorted_inputs))
+        sorted_inputs = sorted({
+            name for var in var_list
+            for name in self._statistics_ir.materialized_inputs(var)
+        })
 
         out_tensors = []
         seen_out = set()
@@ -155,7 +154,10 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                         out_tensors.append((weight_key, ctype, f"p_{safe_var}_{inner}_weight_state"))
                         seen_out.add(weight_key)
 
-        full_total = max(int(self._tensor_registry[var].numel()) for var in var_list)
+        full_total = max(
+            prod(self._statistics_layouts[var].actual_shape)
+            for var in var_list
+        )
 
         arg_order = []
         abi_fields = []
@@ -172,11 +174,13 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             arg_order.append(('tensor', state_key, 'read_write'))
 
         varying_scalar_params = [
-            ('weight', 'float', '__weight'), ('total_weight', 'float', '__total_weight'),
-            ('num_macro_steps', 'float', '__num_macro_steps'),
-            ('sub_step', 'int', '__sub_step'), ('num_sub_steps', 'int', '__num_sub_steps'),
-            ('flags', 'int', '__flags'),
-            ('macro_step_index', 'int', '__macro_step_index'),
+            ('__hf_weight', 'float', '__weight'),
+            ('__hf_total_weight', 'float', '__total_weight'),
+            ('__hf_num_macro_steps', 'float', '__num_macro_steps'),
+            ('__hf_sub_step', 'int', '__sub_step'),
+            ('__hf_num_sub_steps', 'int', '__num_sub_steps'),
+            ('__hf_flags', 'int', '__flags'),
+            ('__hf_macro_step_index', 'int', '__macro_step_index'),
         ]
         for sname, stype, state_key in varying_scalar_params:
             abi_fields.append((f'device const {stype}*', f'p_{sname}_ptr', False))
@@ -188,13 +192,13 @@ class MetalStatisticsEmitter(StatisticsEmitter):
         msl_lines.append(f'{indent}if ((int)tid >= n_elements) return;')
         msl_lines.append(f'{indent}int out_idx = (int)tid;')
         msl_lines.append('')
-        msl_lines.append(f'{indent}float weight = *p_weight_ptr;')
-        msl_lines.append(f'{indent}float total_weight = *p_total_weight_ptr;')
-        msl_lines.append(f'{indent}float num_macro_steps = *p_num_macro_steps_ptr;')
-        msl_lines.append(f'{indent}int sub_step = *p_sub_step_ptr;')
-        msl_lines.append(f'{indent}int num_sub_steps = *p_num_sub_steps_ptr;')
-        msl_lines.append(f'{indent}int flags = *p_flags_ptr;')
-        msl_lines.append(f'{indent}int macro_step_index = *p_macro_step_index_ptr;')
+        msl_lines.append(f'{indent}float weight = *p___hf_weight_ptr;')
+        msl_lines.append(f'{indent}float total_weight = *p___hf_total_weight_ptr;')
+        msl_lines.append(f'{indent}float num_macro_steps = *p___hf_num_macro_steps_ptr;')
+        msl_lines.append(f'{indent}int sub_step = *p___hf_sub_step_ptr;')
+        msl_lines.append(f'{indent}int num_sub_steps = *p___hf_num_sub_steps_ptr;')
+        msl_lines.append(f'{indent}int flags = *p___hf_flags_ptr;')
+        msl_lines.append(f'{indent}int macro_step_index = *p___hf_macro_step_index_ptr;')
         msl_lines.append('')
 
         needed_bools = self._statistics_lowering.required_flags
@@ -215,11 +219,12 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             safe_var = self._get_safe_name(var)
             ctype = self._metal_dtype_str(var)
             operations = self._statistics_lowering.operations(var)
-            var_numel = int(self._tensor_registry[var].numel())
-            var_val = f"{safe_var}_val"
+            var_numel = prod(self._statistics_layouts[var].actual_shape)
             indent2 = indent + "    "
             msl_lines.append(f'{indent}if ((int)tid < {var_numel}) {{')
-            msl_lines.append(f'{indent2}{ctype} {var_val} = p_{safe_var}[out_idx];')
+            var_val = self._metal_emit_val_load(
+                var, msl_lines, set(), indent2, idx_expr="out_idx",
+            )
 
             inner_ops = (
                 reduction.value
@@ -263,7 +268,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     msl_lines.extend([
                         f'{indent2}{{',
                         f'{indent2}    {ctype} old_v = p_{safe_var}_max_inner_state[out_idx];',
-                        f'{indent2}    {ctype} inner_new = is_inner_first ? {var_val} : fmax(old_v, {var_val});',
+                        f'{indent2}    {ctype} inner_new = is_inner_first ? {var_val} : max(old_v, {var_val});',
                         f'{indent2}    if (is_inner_last) {{',
                         f'{indent2}        p_{safe_var}_max_inner_state[out_idx] = ({ctype})(-INFINITY);',
                         f'{indent2}        {val_for} = inner_new;',
@@ -276,7 +281,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     msl_lines.extend([
                         f'{indent2}{{',
                         f'{indent2}    {ctype} old_v = p_{safe_var}_min_inner_state[out_idx];',
-                        f'{indent2}    {ctype} inner_new = is_inner_first ? {var_val} : fmin(old_v, {var_val});',
+                        f'{indent2}    {ctype} inner_new = is_inner_first ? {var_val} : min(old_v, {var_val});',
                         f'{indent2}    if (is_inner_last) {{',
                         f'{indent2}        p_{safe_var}_min_inner_state[out_idx] = ({ctype})(INFINITY);',
                         f'{indent2}        {val_for} = inner_new;',
@@ -309,14 +314,14 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                         msl_lines.extend([
                             f'{indent2}if (is_inner_last) {{',
                             f'{indent2}    if (is_outer_first) {{ {out_ptr}[out_idx] = {val_var}; }}',
-                            f'{indent2}    else {{ {out_ptr}[out_idx] = fmax({out_ptr}[out_idx], {val_var}); }}',
+                            f'{indent2}    else {{ {out_ptr}[out_idx] = max({out_ptr}[out_idx], {val_var}); }}',
                             f'{indent2}}}',
                         ])
                     elif outer == 'min':
                         msl_lines.extend([
                             f'{indent2}if (is_inner_last) {{',
                             f'{indent2}    if (is_outer_first) {{ {out_ptr}[out_idx] = {val_var}; }}',
-                            f'{indent2}    else {{ {out_ptr}[out_idx] = fmin({out_ptr}[out_idx], {val_var}); }}',
+                            f'{indent2}    else {{ {out_ptr}[out_idx] = min({out_ptr}[out_idx], {val_var}); }}',
                             f'{indent2}}}',
                         ])
                     elif outer == 'sum':
@@ -360,12 +365,12 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 elif op == 'max':
                     msl_lines.extend([
                         f'{indent2}if (is_inner_first) {{ {out_ptr}[out_idx] = {var_val}; }}',
-                        f'{indent2}else {{ {out_ptr}[out_idx] = fmax({out_ptr}[out_idx], {var_val}); }}',
+                        f'{indent2}else {{ {out_ptr}[out_idx] = max({out_ptr}[out_idx], {var_val}); }}',
                     ])
                 elif op == 'min':
                     msl_lines.extend([
                         f'{indent2}if (is_inner_first) {{ {out_ptr}[out_idx] = {var_val}; }}',
-                        f'{indent2}else {{ {out_ptr}[out_idx] = fmin({out_ptr}[out_idx], {var_val}); }}',
+                        f'{indent2}else {{ {out_ptr}[out_idx] = min({out_ptr}[out_idx], {var_val}); }}',
                     ])
                 elif op == 'last':
                     msl_lines.append(f'{indent2}if (is_inner_last) {{ {out_ptr}[out_idx] = {var_val}; }}')
@@ -419,20 +424,15 @@ class MetalStatisticsEmitter(StatisticsEmitter):
         for var in var_list:
             safe_var = self._get_safe_name(var)
             ctype = self._metal_dtype_str(var)
-            added_aux = set()
             operations = self._statistics_lowering.operations(var)
             for operation in operations:
                 op = operation.spelling
                 out_key = f'{var}_{op}'
                 if operation.stores_index:
                     out_tensors.append((out_key, "int", f"p_{safe_var}_{op}"))
-                    arg_type = operation.outer.value
-                    arg_k_str = "" if operation.k == 1 else str(operation.k)
-                    aux_name = f"{var}_{arg_type}{arg_k_str or ''}_aux"
-                    safe_aux = f"p_{safe_var}_{arg_type}{arg_k_str or ''}_aux"
-                    if aux_name not in added_aux:
-                        out_tensors.append((aux_name, ctype, safe_aux))
-                        added_aux.add(aux_name)
+                    aux_name = f"{var}_{op}_aux"
+                    safe_aux = f"p_{safe_var}_{op}_aux"
+                    out_tensors.append((aux_name, ctype, safe_aux))
                 else:
                     out_tensors.append((out_key, ctype, f"p_{safe_var}_{op}"))
 
@@ -486,22 +486,20 @@ class MetalStatisticsEmitter(StatisticsEmitter):
 
         # varying scalar params → device buffer pointers (avoids host-device sync)
         varying_scalar_params = [
-            ('weight', 'float', '__weight'), ('total_weight', 'float', '__total_weight'),
-            ('num_macro_steps', 'float', '__num_macro_steps'),
-            ('sub_step', 'int', '__sub_step'), ('num_sub_steps', 'int', '__num_sub_steps'),
-            ('flags', 'int', '__flags'),
-            ('macro_step_index', 'int', '__macro_step_index'),
+            ('__hf_weight', 'float', '__weight'),
+            ('__hf_total_weight', 'float', '__total_weight'),
+            ('__hf_num_macro_steps', 'float', '__num_macro_steps'),
+            ('__hf_sub_step', 'int', '__sub_step'),
+            ('__hf_num_sub_steps', 'int', '__num_sub_steps'),
+            ('__hf_flags', 'int', '__flags'),
+            ('__hf_macro_step_index', 'int', '__macro_step_index'),
         ]
         for sname, stype, state_key in varying_scalar_params:
             abi_fields.append((f'device const {stype}*', f'p_{sname}_ptr', False))
             arg_order.append(('tensor', state_key, 'read'))
 
         # fixed scalar params (truly constant per-capture)
-        fixed_scalar_params = [
-            ('n_saved_points', 'int'), ('stride_input', 'int'),
-        ]
-        if has_2d:
-            fixed_scalar_params.append(('n_levels', 'int'))
+        fixed_scalar_params = [('n_saved_points', 'int')]
 
         for sname, stype in fixed_scalar_params:
             abi_fields.append((stype, sname, True))
@@ -514,13 +512,13 @@ class MetalStatisticsEmitter(StatisticsEmitter):
         msl_lines.append(f'{indent}int idx = p_{safe_save}[tid];')
         msl_lines.append('')
         # Dereference varying scalar device pointers
-        msl_lines.append(f'{indent}float weight = *p_weight_ptr;')
-        msl_lines.append(f'{indent}float total_weight = *p_total_weight_ptr;')
-        msl_lines.append(f'{indent}float num_macro_steps = *p_num_macro_steps_ptr;')
-        msl_lines.append(f'{indent}int sub_step = *p_sub_step_ptr;')
-        msl_lines.append(f'{indent}int num_sub_steps = *p_num_sub_steps_ptr;')
-        msl_lines.append(f'{indent}int flags = *p_flags_ptr;')
-        msl_lines.append(f'{indent}int macro_step_index = *p_macro_step_index_ptr;')
+        msl_lines.append(f'{indent}float weight = *p___hf_weight_ptr;')
+        msl_lines.append(f'{indent}float total_weight = *p___hf_total_weight_ptr;')
+        msl_lines.append(f'{indent}float num_macro_steps = *p___hf_num_macro_steps_ptr;')
+        msl_lines.append(f'{indent}int sub_step = *p___hf_sub_step_ptr;')
+        msl_lines.append(f'{indent}int num_sub_steps = *p___hf_num_sub_steps_ptr;')
+        msl_lines.append(f'{indent}int flags = *p___hf_flags_ptr;')
+        msl_lines.append(f'{indent}int macro_step_index = *p___hf_macro_step_index_ptr;')
         msl_lines.append('')
         needed_bools = self._statistics_lowering.required_flags
         if needed_bools:
@@ -550,8 +548,13 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             msl_lines.append(f'{indent2}// === 1D variables ===')
             emitted = set()
             for var in dims_1d:
-                self._metal_emit_val_load(var, msl_lines, emitted, indent2,
-                                          idx_expr="t * stride_input + idx" if num_trials > 1 else "idx")
+                stride = self._stride_input(var)
+                idx_expr = (
+                    f"t * {stride} + idx" if num_trials > 1 else "idx"
+                )
+                self._metal_emit_val_load(
+                    var, msl_lines, emitted, indent2, idx_expr=idx_expr,
+                )
 
             # Inner aggregation states for compound ops
             for reduction, inner_vars in (
@@ -604,7 +607,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}{ctype} {val_for} = ({ctype})0;',
                             f'{indent2}{{',
                             f'{indent2}    {ctype} inner_old = p_{safe_var}_max_inner_state[{out_idx}];',
-                            f'{indent2}    {ctype} inner_new = (is_inner_first && macro_step_index == 0) ? {var_val} : fmax(inner_old, {var_val});',
+                            f'{indent2}    {ctype} inner_new = (is_inner_first && macro_step_index == 0) ? {var_val} : max(inner_old, {var_val});',
                             f'{indent2}    if (is_inner_last) {{',
                             f'{indent2}        p_{safe_var}_max_inner_state[{out_idx}] = ({ctype})(-INFINITY);',
                             f'{indent2}        {val_for} = inner_new;',
@@ -618,7 +621,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}{ctype} {val_for} = ({ctype})0;',
                             f'{indent2}{{',
                             f'{indent2}    {ctype} inner_old = p_{safe_var}_min_inner_state[{out_idx}];',
-                            f'{indent2}    {ctype} inner_new = (is_inner_first && macro_step_index == 0) ? {var_val} : fmin(inner_old, {var_val});',
+                            f'{indent2}    {ctype} inner_new = (is_inner_first && macro_step_index == 0) ? {var_val} : min(inner_old, {var_val});',
                             f'{indent2}    if (is_inner_last) {{',
                             f'{indent2}        p_{safe_var}_min_inner_state[{out_idx}] = ({ctype})(INFINITY);',
                             f'{indent2}        {val_for} = inner_new;',
@@ -667,19 +670,28 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                         if is_arg:
                             arg_type = outer_base
                             cmp_op = ">" if arg_type == "max" else "<"
-                            arg_k_str = "" if operation.k == 1 else str(operation.k)
-                            aux_ptr = f"p_{safe_var}_{arg_type}{arg_k_str}_aux"
+                            aux_ptr = f"p_{safe_var}_{op}_aux"
                             out_ptr = f"p_{safe_var}_{op}"
                             if operation.k == 1:
+                                sentinel = (
+                                    f'({ctype})(-INFINITY)'
+                                    if arg_type == 'max'
+                                    else f'({ctype})(INFINITY)'
+                                )
+                                candidate = (
+                                    f'(isnan({val_var}) ? {sentinel} : {val_var})'
+                                    if self._statistics_layouts[var].dtype.is_floating_point
+                                    else val_var
+                                )
                                 msl_lines.extend([
                                     f'{indent2}if (is_inner_last) {{',
                                     f'{indent2}    if (is_outer_first) {{',
                                     f'{indent2}        {out_ptr}[{out_idx}] = macro_step_index;',
-                                    f'{indent2}        {aux_ptr}[{out_idx}] = {val_var};',
+                                    f'{indent2}        {aux_ptr}[{out_idx}] = {candidate};',
                                     f'{indent2}    }} else {{',
                                     f'{indent2}        {ctype} old_aux = {aux_ptr}[{out_idx}];',
-                                    f'{indent2}        if ({val_var} {cmp_op} old_aux) {{',
-                                    f'{indent2}            {aux_ptr}[{out_idx}] = {val_var};',
+                                    f'{indent2}        if ({candidate} {cmp_op} old_aux) {{',
+                                    f'{indent2}            {aux_ptr}[{out_idx}] = {candidate};',
                                     f'{indent2}            {out_ptr}[{out_idx}] = macro_step_index;',
                                     f'{indent2}        }}',
                                     f'{indent2}    }}',
@@ -694,7 +706,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                                 msl_lines.extend([
                                     f'{indent2}if (is_inner_last) {{',
                                     f'{indent2}    long k_base = ({out_idx}) * {operation.k};',
-                                    f'{indent2}    {ctype} new_value = {val_var};',
+                                    f'{indent2}    {ctype} new_value = isnan({val_var}) ? {sentinel} : {val_var};',
                                     f'{indent2}    int new_index = macro_step_index;',
                                     f'{indent2}    if (is_outer_first) {{',
                                     f'{indent2}        {aux_ptr}[k_base] = new_value;',
@@ -718,7 +730,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                                     f'{indent2}}}',
                                 ])
                         elif outer_base in ('max', 'min'):
-                            cmp_fn = "fmax" if outer_base == "max" else "fmin"
+                            cmp_fn = "max" if outer_base == "max" else "min"
                             out_ptr = f"p_{safe_var}_{op}"
                             if operation.k == 1:
                                 msl_lines.extend([
@@ -740,7 +752,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                                 msl_lines.extend([
                                     f'{indent2}if (is_inner_last) {{',
                                     f'{indent2}    long k_base = ({out_idx}) * {operation.k};',
-                                    f'{indent2}    {ctype} new_value = {val_var};',
+                                    f'{indent2}    {ctype} new_value = isnan({val_var}) ? {sentinel} : {val_var};',
                                     f'{indent2}    if (is_outer_first) {{',
                                     f'{indent2}        {out_ptr}[k_base] = new_value;',
                                     f'{indent2}        for (int rank = 1; rank < {operation.k}; ++rank) {{',
@@ -813,12 +825,12 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     elif op == 'max':
                         msl_lines.extend([
                             f'{indent2}if (is_inner_first) {{ {out_ptr}[{out_idx}] = {var_val}; }}',
-                            f'{indent2}else {{ {out_ptr}[{out_idx}] = fmax({out_ptr}[{out_idx}], {var_val}); }}',
+                            f'{indent2}else {{ {out_ptr}[{out_idx}] = max({out_ptr}[{out_idx}], {var_val}); }}',
                         ])
                     elif op == 'min':
                         msl_lines.extend([
                             f'{indent2}if (is_inner_first) {{ {out_ptr}[{out_idx}] = {var_val}; }}',
-                            f'{indent2}else {{ {out_ptr}[{out_idx}] = fmin({out_ptr}[{out_idx}], {var_val}); }}',
+                            f'{indent2}else {{ {out_ptr}[{out_idx}] = min({out_ptr}[{out_idx}], {var_val}); }}',
                         ])
                     elif op == 'last':
                         msl_lines.append(f'{indent2}if (is_inner_last) {{ {out_ptr}[{out_idx}] = {var_val}; }}')
@@ -836,32 +848,50 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 for operation in self._statistics_lowering.operations(var):
                     op = operation.spelling
                     out_ptr = f"p_{safe_var}_{op}"
-                    msl_lines.append(f'{indent2}for (int level = 0; level < n_levels; level++) {{')
-                    idx_2d = "(t * stride_input + idx) * n_levels + level" if num_trials > 1 else "idx * n_levels + level"
-                    out_2d = "(t * n_saved_points + tid) * n_levels + level"
-                    msl_lines.append(f'{indent2}    {ctype} val_2d = p_{safe_var}[{idx_2d}];')
+                    n_levels = self._statistics_layouts[var].actual_shape[-1]
+                    stride = self._stride_input(var)
+                    msl_lines.append(
+                        f'{indent2}for (int level = 0; level < {n_levels}; level++) {{'
+                    )
+                    idx_2d = (
+                        f"(t * {stride} + idx) * {n_levels} + level"
+                        if num_trials > 1
+                        else f"idx * {n_levels} + level"
+                    )
+                    out_2d = (
+                        f"(t * n_saved_points + tid) * {n_levels} + level"
+                    )
+                    val_2d = self._metal_emit_val_load(
+                        var, msl_lines, set(), indent2 + "    ",
+                        idx_expr=idx_2d,
+                    )
                     if op == 'mean':
                         msl_lines.extend([
                             f'{indent2}    {ctype} old_2d = is_inner_first ? ({ctype})0 : {out_ptr}[{out_2d}];',
-                            f'{indent2}    {ctype} new_2d = old_2d + val_2d * ({ctype})weight;',
+                            f'{indent2}    {ctype} new_2d = old_2d + {val_2d} * ({ctype})weight;',
                             f'{indent2}    {out_ptr}[{out_2d}] = is_inner_last ? new_2d / ({ctype})total_weight : new_2d;',
+                        ])
+                    elif op == 'sum':
+                        msl_lines.extend([
+                            f'{indent2}    {ctype} old_2d = is_inner_first ? ({ctype})0 : {out_ptr}[{out_2d}];',
+                            f'{indent2}    {out_ptr}[{out_2d}] = old_2d + {val_2d} * ({ctype})weight;',
                         ])
                     elif op == 'max':
                         msl_lines.extend([
-                            f'{indent2}    if (is_inner_first) {{ {out_ptr}[{out_2d}] = val_2d; }}',
-                            f'{indent2}    else {{ {out_ptr}[{out_2d}] = fmax({out_ptr}[{out_2d}], val_2d); }}',
+                            f'{indent2}    if (is_inner_first) {{ {out_ptr}[{out_2d}] = {val_2d}; }}',
+                            f'{indent2}    else {{ {out_ptr}[{out_2d}] = max({out_ptr}[{out_2d}], {val_2d}); }}',
                         ])
                     elif op == 'min':
                         msl_lines.extend([
-                            f'{indent2}    if (is_inner_first) {{ {out_ptr}[{out_2d}] = val_2d; }}',
-                            f'{indent2}    else {{ {out_ptr}[{out_2d}] = fmin({out_ptr}[{out_2d}], val_2d); }}',
+                            f'{indent2}    if (is_inner_first) {{ {out_ptr}[{out_2d}] = {val_2d}; }}',
+                            f'{indent2}    else {{ {out_ptr}[{out_2d}] = min({out_ptr}[{out_2d}], {val_2d}); }}',
                         ])
                     elif op == 'last':
-                        msl_lines.append(f'{indent2}    if (is_inner_last) {{ {out_ptr}[{out_2d}] = val_2d; }}')
+                        msl_lines.append(f'{indent2}    if (is_inner_last) {{ {out_ptr}[{out_2d}] = {val_2d}; }}')
                     elif op == 'first':
-                        msl_lines.append(f'{indent2}    if (is_inner_first) {{ {out_ptr}[{out_2d}] = val_2d; }}')
+                        msl_lines.append(f'{indent2}    if (is_inner_first) {{ {out_ptr}[{out_2d}] = {val_2d}; }}')
                     elif op == 'mid':
-                        msl_lines.append(f'{indent2}    if (is_middle) {{ {out_ptr}[{out_2d}] = val_2d; }}')
+                        msl_lines.append(f'{indent2}    if (is_middle) {{ {out_ptr}[{out_2d}] = {val_2d}; }}')
                     msl_lines.append(f'{indent2}}}')
 
         if num_trials > 1:
@@ -1020,7 +1050,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 divide_name = f"aggr_scatter_divide_{safe}"
                 divide_fields = [
                     ("device float*", "p_buf", False),
-                    ("device atomic_float*", "p_cnt", False),
+                    ("device const float*", "p_cnt", False),
                     ("int", "total", True),
                 ]
                 divide_order = [
@@ -1031,7 +1061,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 _emit_argument_kernel_start(msl_lines, divide_name, divide_fields)
                 msl_lines.extend([
                     "    if ((int)tid >= total) return;",
-                    "    float count = atomic_load_explicit(p_cnt + tid, memory_order_relaxed);",
+                    "    float count = p_cnt[tid];",
                     "    if (count > 0.0f) p_buf[tid] /= count;",
                     "}", "",
                 ])
@@ -1107,23 +1137,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             )
 
         # Build the Python wrapper
-        def _make_wrapper(compiled, scatters, metas, grouped, self_ref):
-            # Pre-compute stride_input for each group
-            strides = {}
-            for meta in metas:
-                si = meta['output_index']
-                if meta.get('full_output'):
-                    strides[si] = 0
-                    continue
-                var_list = grouped[si]
-                first_var = var_list[0]
-                stride = 0
-                for m in self_ref._metadata.values():
-                    if m['original_variable'] == first_var:
-                        stride = m.get('stride_input', 0)
-                        break
-                strides[si] = stride
-
+        def _make_wrapper(compiled, scatters, metas):
             def internal_update_statistics(states, BLOCK_SIZE):
                 for meta in scatters:
                     dispatcher = compiled[meta['kernel_name']]
@@ -1142,11 +1156,9 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     if meta.get('full_output'):
                         n_threads = meta['n_elements_val']
                         n_saved = n_threads
-                        stride = 0
                     else:
                         n_saved = len(states[si])
                         n_threads = n_saved
-                        stride = strides[si]
 
                     args = []
 
@@ -1158,10 +1170,6 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             sname = rest[0]
                             if sname == 'n_saved_points':
                                 args.append(n_saved)
-                            elif sname == 'stride_input':
-                                args.append(stride)
-                            elif sname == 'n_levels':
-                                args.append(meta['n_levels_val'])
                             elif sname == 'n_elements':
                                 args.append(meta['n_elements_val'])
 
@@ -1175,7 +1183,6 @@ class MetalStatisticsEmitter(StatisticsEmitter):
 
         self._aggregator_function = _make_wrapper(
             dispatchers, scatter_metas, group_metas,
-            grouped_by_output_index, self,
         )
         self._aggregator_generated = True
 

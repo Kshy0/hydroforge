@@ -130,6 +130,14 @@ class StatisticsProgram:
 
 
 @dataclass(frozen=True)
+class MaterializedScatter:
+    """One reachable scatter source that must run before aggregation."""
+
+    name: str
+    source: ScatterSource
+
+
+@dataclass(frozen=True)
 class StorageSlot:
     name: str
     shape: tuple[int, ...]
@@ -188,8 +196,7 @@ def build_variable_storage_plan(
             True,
         ))
         if operation.stores_index:
-            suffix = "" if operation.k == 1 else str(operation.k)
-            add_name = f"{variable}_{operation.outer.value}{suffix}_aux"
+            add_name = f"{variable}_{operation.spelling}_aux"
             if add_name not in internal_names:
                 internal_names.add(add_name)
                 slots.append(StorageSlot(
@@ -261,26 +268,30 @@ class StatisticsIR:
             inputs.update(self.materialized_inputs(dependency))
         return tuple(sorted(inputs))
 
-    def ordered_scatters(self) -> tuple[StatisticVariable, ...]:
+    def ordered_scatters(self) -> tuple[MaterializedScatter, ...]:
         """Topologically order scatter materializations by virtual dependency."""
-        result: list[StatisticVariable] = []
+        result: list[MaterializedScatter] = []
         visited: set[str] = set()
 
-        def visit(variable: StatisticVariable) -> None:
-            if variable.name in visited:
+        def visit(name: str) -> None:
+            if name in visited:
                 return
-            source = variable.source
-            if not isinstance(source, ScatterSource):
+            source = self.sources.get(name, TensorSource(name))
+            if isinstance(source, TensorSource):
                 return
-            for dependency in source.value.dependencies:
-                dependency_variable = self.by_name.get(dependency)
-                if dependency_variable is not None:
-                    visit(dependency_variable)
-            visited.add(variable.name)
-            result.append(variable)
+            dependencies = (
+                source.value.dependencies
+                if isinstance(source, ScatterSource)
+                else source.expression.dependencies
+            )
+            for dependency in dependencies:
+                visit(dependency)
+            if isinstance(source, ScatterSource):
+                visited.add(name)
+                result.append(MaterializedScatter(name, source))
 
         for variable in self.variables:
-            visit(variable)
+            visit(variable.name)
         return tuple(result)
 
 

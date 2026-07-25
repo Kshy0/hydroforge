@@ -9,30 +9,32 @@ from typing import Any
 
 @dataclass
 class ProgressState:
-    total_steps: int = 0
     current_step: int = 0
+    phase: str | None = None
     _wall_start: float = 0.0
-    _last_tick: float = 0.0
+    _step_start: float = 0.0
     _recent_dts: list[float] = field(default_factory=list)
     _window_size: int = 50
 
-    def start(self, total: int) -> None:
-        self.total_steps = total
+    def start(self, phase: str) -> None:
+        self.phase = phase
         self.current_step = 0
         self._wall_start = time.perf_counter()
-        self._last_tick = self._wall_start
+        self._step_start = self._wall_start
         self._recent_dts.clear()
 
-    def tick(self) -> None:
+    def begin_step(self, phase: str) -> None:
+        if phase != self.phase:
+            self.start(phase)
+        self._step_start = time.perf_counter()
+
+    def tick(self, phase: str) -> None:
+        if phase != self.phase:
+            self.start(phase)
         now = time.perf_counter()
-        if self.current_step >= self.total_steps > 0:
-            self.start(self.total_steps)
-            now = time.perf_counter()
-        if self.current_step > 0:
-            self._recent_dts.append(now - self._last_tick)
-            if len(self._recent_dts) > self._window_size:
-                self._recent_dts.pop(0)
-        self._last_tick = now
+        self._recent_dts.append(now - self._step_start)
+        if len(self._recent_dts) > self._window_size:
+            self._recent_dts.pop(0)
         self.current_step += 1
 
     @property
@@ -58,36 +60,60 @@ class ProgressState:
             return f"{seconds / 60:.1f}min"
         return f"{seconds / 3600:.1f}h"
 
-    def format_progress(self) -> str:
+    def format_schedule(
+        self, *, fraction: float, completed: int, total: int,
+    ) -> str:
         speed = self.recent_speed
-        remaining = max(0, self.total_steps - self.current_step)
-        eta = remaining / speed if speed > 0 else float("inf")
-        percent = min(
-            self.current_step / max(self.total_steps, 1) * 100,
-            100.0,
+        fraction = min(max(fraction, 0.0), 1.0)
+        eta = (
+            self.elapsed * (1.0 - fraction) / fraction
+            if fraction > 0.0 else float("inf")
         )
         return (
-            f"[{percent:5.1f}% {self.current_step}/{self.total_steps}] "
+            f"[{fraction * 100:5.1f}% model-time {completed}/{total}] "
             f"{speed:.2f} steps/s ETA {self._fmt_duration(eta)}"
+        )
+
+    def format_unbounded(self) -> str:
+        label = "spin-up" if self.phase == "spinup" else "running"
+        unit = "step" if self.current_step == 1 else "steps"
+        return (
+            f"[{label} {self.current_step} {unit}] "
+            f"{self.recent_speed:.2f} steps/s"
         )
 
 
 class ProgressRuntime:
     def __init__(self, owner: Any) -> None:
         self.owner = owner
-
-    def set_total_steps(self, total: int) -> None:
-        if type(total) is not int or total < 1:
-            raise ValueError("total steps must be an exact positive int")
-        self.owner._execution.total_steps = total
         self.owner._progress = ProgressState()
-        self.owner._progress.start(total)
+
+    def _schedule_position(self) -> tuple[Any, int | None]:
+        runtime = self.owner._execution.step
+        index = None if runtime is None else runtime.state.schedule_step
+        return self.owner.simulation_schedule, index
+
+    def _phase(self) -> str:
+        schedule, index = self._schedule_position()
+        if index is not None:
+            return "main"
+        return "spinup" if schedule is not None else "unbounded"
+
+    def begin_step(self) -> None:
+        self.owner._progress.begin_step(self._phase())
 
     def progress_tick(self) -> None:
-        if self.owner._progress is not None:
-            self.owner._progress.tick()
+        self.owner._progress.tick(self._phase())
 
     def format_progress(self) -> str:
-        if self.owner._progress is not None:
-            return self.owner._progress.format_progress()
-        return ""
+        schedule, index = self._schedule_position()
+        if schedule is None or index is None:
+            return self.owner._progress.format_unbounded()
+        step = schedule.step_at(index)
+        elapsed = (step.end - schedule.start).total_seconds()
+        duration = (schedule.end - schedule.start).total_seconds()
+        return self.owner._progress.format_schedule(
+            fraction=elapsed / duration,
+            completed=index + 1,
+            total=len(schedule),
+        )

@@ -7,6 +7,7 @@ from typing import Any, Callable, Iterable
 import torch
 
 from hydroforge.contracts import ResourceCleanupError
+from hydroforge.contracts.naming import RESERVED_CONTROL_STATE
 from hydroforge.kernels.mutation import trace_mutations
 
 
@@ -153,7 +154,8 @@ class CaptureRuntime:
             states = aggregator._kernel_states
             extras = tuple(
                 value for name, value in states.items()
-                if isinstance(value, torch.Tensor) and not name.startswith("__")
+                if isinstance(value, torch.Tensor)
+                and name not in RESERVED_CONTROL_STATE
             )
             graph = self.capture_cuda(
                 lambda: aggregator._aggregator_function(states, block_size),
@@ -161,6 +163,13 @@ class CaptureRuntime:
             )
             self._statistics_graphs[aggregator] = graph
         graph.replay()
+
+    def invalidate_statistics(self, aggregator: Any) -> None:
+        """Release one cached statistics graph before its bindings change."""
+
+        graph = self._statistics_graphs.pop(aggregator, None)
+        if graph is not None:
+            self.release(graph)
 
     def build_conditional_graph(
         self,

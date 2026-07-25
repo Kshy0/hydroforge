@@ -192,6 +192,26 @@ def _restore_compiler_env(old: Dict[str, Optional[str]]) -> None:
             os.environ[key] = val
 
 
+def _activate_python_tools_path() -> Optional[str]:
+    """Expose executables installed beside the active Python interpreter."""
+
+    old_path = os.environ.get("PATH")
+    executable_dir = sysconfig.get_path("scripts") or str(
+        Path(sys.executable).parent
+    )
+    entries = [] if old_path is None else old_path.split(os.pathsep)
+    if executable_dir not in entries:
+        os.environ["PATH"] = os.pathsep.join((executable_dir, *entries))
+    return old_path
+
+
+def _restore_tools_path(old_path: Optional[str]) -> None:
+    if old_path is None:
+        os.environ.pop("PATH", None)
+    else:
+        os.environ["PATH"] = old_path
+
+
 def _import_extension_from_so(name: str, so_path: Path) -> Any:
     import torch  # noqa: F401 - ensure torch shared libraries are loaded first
 
@@ -533,8 +553,16 @@ def load_inline_cu_module(
         _maybe_clear_stale_torch_lock(
             build_dir, env_prefix=env_prefix, env_kind=env_kind, verbose=_verbose
         )
-        old_compiler_env = _activate_system_compiler(compiler_selection)
+        old_path = _activate_python_tools_path()
+        old_compiler_env: Dict[str, Optional[str]] = {}
         try:
+            old_compiler_env = _activate_system_compiler(compiler_selection)
+            if shutil.which("ninja") is None:
+                raise RuntimeError(
+                    "Ninja is unavailable to the active Python interpreter "
+                    f"{sys.executable!r}; install it with "
+                    f"{sys.executable!r} -m pip install ninja"
+                )
             mod = load_inline(
                 name=compiled_name,
                 cpp_sources=cpp_sources,
@@ -548,6 +576,7 @@ def load_inline_cu_module(
             )
         finally:
             _restore_compiler_env(old_compiler_env)
+            _restore_tools_path(old_path)
         atomic_write_text(
             build_dir / f"{compiled_name}.srchash", digest,
         )

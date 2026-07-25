@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import inspect
 from abc import ABC
-from datetime import datetime, timedelta
+from datetime import datetime
 from functools import cache, cached_property
 from pathlib import Path
 from types import MappingProxyType
@@ -28,8 +28,6 @@ from hydroforge.contracts.fields import tensor_is_active
 from hydroforge.contracts.temporal import (
     SimulationSchedule,
     StatisticsPlan,
-    timedelta_microseconds,
-    timedelta_quotient,
 )
 from hydroforge.contracts.events import ConsoleEventSink, EventSink, emit
 from hydroforge.contracts.runtime import (
@@ -168,20 +166,6 @@ class AbstractModel(BaseModel, ABC):
     output_start_time: Optional[Union[datetime, cftime.datetime]] = Field(
         default=None,
         description="Time to start saving output",
-    )
-    statistics_interval: Optional[timedelta] = Field(
-        default=None,
-        description=(
-            "Statistics window aligned to calendar time. None finalizes one "
-            "output per step_advance call."
-        ),
-    )
-    statistics_outer_interval: Optional[timedelta] = Field(
-        default=None,
-        description=(
-            "Outer window for compound statistics. None uses one inner "
-            "statistics window per outer window."
-        ),
     )
     simulation_schedule: Optional[SimulationSchedule] = Field(
         default=None,
@@ -361,17 +345,6 @@ class AbstractModel(BaseModel, ABC):
             tuple(cls.module_list.values()), include_computed=True,
         )
 
-    @field_validator("statistics_interval", "statistics_outer_interval")
-    @classmethod
-    def validate_statistics_interval(
-        cls, value: Optional[timedelta],
-    ) -> Optional[timedelta]:
-        if value is not None and timedelta_microseconds(
-            value, label="statistics interval",
-        ) <= 0:
-            raise ValueError("statistics intervals must be positive")
-        return value
-
     @field_validator(
         "output_netcdf_options", "checkpoint_netcdf_options", mode="before",
     )
@@ -382,37 +355,6 @@ class AbstractModel(BaseModel, ABC):
         )
 
         return normalize_netcdf_variable_options(value)
-
-    @model_validator(mode="after")
-    def validate_statistics_window_nesting(self) -> Self:
-        inner = self.statistics_interval
-        outer = self.statistics_outer_interval
-        if inner is None:
-            if outer is not None:
-                raise ValueError(
-                    "statistics_outer_interval requires statistics_interval"
-                )
-            return self
-        if outer is None:
-            return self
-        try:
-            ratio = timedelta_quotient(
-                outer,
-                inner,
-                duration_label="statistics_outer_interval",
-                interval_label="statistics_interval",
-            )
-        except ValueError as exc:
-            raise ValueError(
-                "statistics_outer_interval must be an integer multiple of "
-                "statistics_interval"
-            ) from exc
-        if ratio < 1:
-            raise ValueError(
-                "statistics_outer_interval must not be shorter than "
-                "statistics_interval"
-            )
-        return self
 
     @model_validator(mode='after')
     def align_output_start_time(self) -> Self:
@@ -732,9 +674,8 @@ class AbstractModel(BaseModel, ABC):
     def summarize_plan(self) -> None:
         self._parameters.summarize_plan()
 
-    @between_steps
-    def set_total_steps(self, total: int) -> None:
-        self._progress_service.set_total_steps(total)
+    def progress_start(self) -> None:
+        self._progress_service.begin_step()
 
     def progress_tick(self) -> None:
         self._progress_service.progress_tick()

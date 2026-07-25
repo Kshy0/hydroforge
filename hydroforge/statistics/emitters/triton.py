@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from math import prod
 from typing import TYPE_CHECKING, Dict, List, Set
 
 from hydroforge.statistics.ir import (
@@ -40,8 +41,10 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     lines, output_index, variables,
                 )
             else:
+                safe_output_index = self._get_safe_name(output_index)
                 self._generate_kernel_for_group(
-                    lines, f"kernel_{output_index}", output_index, variables,
+                    lines, f"kernel_{safe_output_index}", output_index,
+                    variables,
                 )
         self._generate_main_function(lines, groups)
         source = "\n".join(lines)
@@ -67,7 +70,9 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             '- Use idx to access original data: data[idx]',
             '- Store outputs using sequential indexing: out[offs]',
             '- explicit argmax/argmin ops store the macro-step index',
-            '- argmax/argmin indices are converted to datetime on NC file write',
+            '- argmax/argmin store the macro-step index and are written as int32;',
+            '  conversion to datetime (if any) happens at the consumer via the',
+            '  recorded macro-step time mapping, not at NC file write time',
             '- For mid: stores val when is_middle is True',
             '',
             'Optimizations Applied:',
@@ -119,8 +124,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         """
         scatter_virtuals = {
             variable.name: variable.source
-            for variable in self._statistics_ir.variables
-            if isinstance(variable.source, ScatterSource)
+            for variable in self._statistics_ir.ordered_scatters()
         }
         if not scatter_virtuals:
             return
@@ -336,7 +340,24 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             name for name in dims_1d
             if self._statistics_lowering.by_name[name].needs_unconditional_value
         }
-        vars_conditional_only = set(dims_1d).difference(vars_need_val)
+
+        # Materialize dependencies used by unconditional operations first.
+        def _collect_unconditional(name: str, acc: Set[str]) -> None:
+            if name in acc:
+                return
+            acc.add(name)
+            source = self._statistics_ir.sources.get(name, TensorSource(name))
+            if isinstance(source, ExpressionSource):
+                for dependency in source.expression.dependencies:
+                    _collect_unconditional(dependency, acc)
+
+        unconditional_names: Set[str] = set()
+        for name in vars_need_val:
+            _collect_unconditional(name, unconditional_names)
+
+        vars_conditional_only = (
+            set(dims_1d).difference(vars_need_val).difference(unconditional_names)
+        )
 
         # Helper to emit variable value load
         emitted_vars = set()
@@ -349,11 +370,13 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             source = self._statistics_ir.sources.get(v_name, TensorSource(v_name))
             if isinstance(source, TensorSource):
                 # Real data (includes virtual source buffers)
-                in_ptr_loc = f"{safe_v_name}_ptr + t * stride_input + idx"
+                stride = self._source_stride(source.name)
+                in_ptr_loc = f"{safe_v_name}_ptr + t * {stride} + idx"
                 to_lines.append(f"{indent}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
             elif isinstance(source, ScatterSource):
                 buf_safe = self._get_safe_name(f"__scatter_buf_{v_name}")
-                in_ptr_loc = f"{buf_safe}_ptr + t * stride_input + idx"
+                stride = self._source_stride(f"__scatter_buf_{v_name}")
+                in_ptr_loc = f"{buf_safe}_ptr + t * {stride} + idx"
                 to_lines.append(f"{indent}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
             elif isinstance(source, ExpressionSource):
                 names = {
@@ -415,30 +438,42 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     if is_arg_compound:
                         # Compound argmax/argmin (e.g., argmax_mean, argmax3_mean)
                         arg_type = outer_base  # 'max' or 'min'
-                        aux_ptr_base = f"{safe_var}_{arg_type}{k_val if k_val > 1 else ''}_aux_ptr"
+                        aux_ptr_base = f"{safe_var}_{op}_aux_ptr"
 
                         if k_val == 1:
                             aux_ptr = f"{aux_ptr_base} + {out_offset}"
+                            sentinel = (
+                                "-float('inf')"
+                                if arg_type == 'max' else "float('inf')"
+                            )
+                            candidate = (
+                                f"tl.where({val_var} == {val_var}, "
+                                f"{val_var}, {sentinel})"
+                                if self._statistics_layouts[
+                                    var
+                                ].dtype.is_floating_point
+                                else val_var
+                            )
                             if arg_type == 'max':
                                 ops_is_inner_last_is_outer_first.extend([
                                     f"tl.store({out_ptr}, macro_step_index, mask=mask)",
-                                    f"tl.store({aux_ptr}, {val_var}, mask=mask)",
+                                    f"tl.store({aux_ptr}, {candidate}, mask=mask)",
                                 ])
                                 ops_is_inner_last_not_is_outer_first.extend([
-                                    f"{safe_var}_{op}_aux_old = tl.load({aux_ptr}, mask=mask, other={val_var})",
-                                    f"{safe_var}_{op}_cond = {val_var} > {safe_var}_{op}_aux_old",
-                                    f"tl.store({aux_ptr}, tl.where({safe_var}_{op}_cond, {val_var}, {safe_var}_{op}_aux_old), mask=mask)",
+                                    f"{safe_var}_{op}_aux_old = tl.load({aux_ptr}, mask=mask, other={candidate})",
+                                    f"{safe_var}_{op}_cond = {candidate} > {safe_var}_{op}_aux_old",
+                                    f"tl.store({aux_ptr}, tl.where({safe_var}_{op}_cond, {candidate}, {safe_var}_{op}_aux_old), mask=mask)",
                                     f"tl.store({out_ptr}, macro_step_index, mask=mask & {safe_var}_{op}_cond)",
                                 ])
                             else:  # min
                                 ops_is_inner_last_is_outer_first.extend([
                                     f"tl.store({out_ptr}, macro_step_index, mask=mask)",
-                                    f"tl.store({aux_ptr}, {val_var}, mask=mask)",
+                                    f"tl.store({aux_ptr}, {candidate}, mask=mask)",
                                 ])
                                 ops_is_inner_last_not_is_outer_first.extend([
-                                    f"{safe_var}_{op}_aux_old = tl.load({aux_ptr}, mask=mask, other={val_var})",
-                                    f"{safe_var}_{op}_cond = {val_var} < {safe_var}_{op}_aux_old",
-                                    f"tl.store({aux_ptr}, tl.where({safe_var}_{op}_cond, {val_var}, {safe_var}_{op}_aux_old), mask=mask)",
+                                    f"{safe_var}_{op}_aux_old = tl.load({aux_ptr}, mask=mask, other={candidate})",
+                                    f"{safe_var}_{op}_cond = {candidate} < {safe_var}_{op}_aux_old",
+                                    f"tl.store({aux_ptr}, tl.where({safe_var}_{op}_cond, {candidate}, {safe_var}_{op}_aux_old), mask=mask)",
                                     f"tl.store({out_ptr}, macro_step_index, mask=mask & {safe_var}_{op}_cond)",
                                 ])
                         else:
@@ -683,8 +718,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         f"{indent}tl.store({inner_ptr}, {var_val}, mask=mask & is_middle)",
                         f"{indent}{val_for_var_inner} = tl.where(is_inner_last, tl.load({inner_ptr}, mask=mask, other=0.0), {val_for_var_inner})",
                     ])
-                # Note: removed 'break' - now generate for each variable in inner_vars
-
         # Phase 5: Emit unconditional ops
         for line in ops_unconditional:
             kernel_code_lines.append(f"{indent}{line}")
@@ -759,22 +792,30 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             # ================================================================
             # Optimized MaxK/MinK + ArgmaxK/ArgminK bubble insert operations
 
-            # Group by (var, k, out_offset) to share base offset across all operations
+            # Group only operations that consume the exact same inner value.
             from collections import defaultdict
             grouped_by_var_k = defaultdict(lambda: {'max': None, 'min': None, 'argmax': None, 'argmin': None})
 
             for maxk_op in maxk_ops:
-                key = (maxk_op['var'], maxk_op['k'], maxk_op['out_offset'])
+                key = (
+                    maxk_op['var'], maxk_op['k'], maxk_op['out_offset'],
+                    maxk_op['val_var'],
+                )
                 grouped_by_var_k[key][maxk_op['type']] = maxk_op
 
             if argmaxk_ops:
                 for argk_op in argmaxk_ops:
-                    key = (argk_op['var'], argk_op['k'], argk_op['out_offset'])
+                    key = (
+                        argk_op['var'], argk_op['k'], argk_op['out_offset'],
+                        argk_op['val_var'],
+                    )
                     op_type = 'argmax' if 'max' in argk_op['type'] else 'argmin'
                     grouped_by_var_k[key][op_type] = argk_op
 
             # Process grouped operations with shared offset
-            for (safe_var, k_val, out_offset), ops_dict in grouped_by_var_k.items():
+            for (
+                safe_var, k_val, out_offset, _value_expression,
+            ), ops_dict in grouped_by_var_k.items():
                 has_max = ops_dict['max'] is not None
                 has_min = ops_dict['min'] is not None
                 has_argmax = ops_dict['argmax'] is not None
@@ -806,13 +847,13 @@ class TritonStatisticsEmitter(StatisticsEmitter):
 
                 # Initialize new values for bubble insert (using correct val_var for each op type)
                 if has_max:
-                    kernel_code_lines.append(f"{indent2}new_val_max_{safe_var} = {max_val_var}")
+                    kernel_code_lines.append(f"{indent2}new_val_max_{safe_var} = tl.where({max_val_var} == {max_val_var}, {max_val_var}, -float('inf'))")
                 if has_min:
-                    kernel_code_lines.append(f"{indent2}new_val_min_{safe_var} = {min_val_var}")
+                    kernel_code_lines.append(f"{indent2}new_val_min_{safe_var} = tl.where({min_val_var} == {min_val_var}, {min_val_var}, float('inf'))")
                 if has_argmax:
-                    kernel_code_lines.append(f"{indent2}new_val_argmax_{safe_var} = {argmax_val_var}")
+                    kernel_code_lines.append(f"{indent2}new_val_argmax_{safe_var} = tl.where({argmax_val_var} == {argmax_val_var}, {argmax_val_var}, -float('inf'))")
                 if has_argmin:
-                    kernel_code_lines.append(f"{indent2}new_val_argmin_{safe_var} = {argmin_val_var}")
+                    kernel_code_lines.append(f"{indent2}new_val_argmin_{safe_var} = tl.where({argmin_val_var} == {argmin_val_var}, {argmin_val_var}, float('inf'))")
                 if has_argmax or has_argmin:
                     kernel_code_lines.append(f"{indent2}new_idx_{safe_var} = tl.full([BLOCK_SIZE], macro_step_index, dtype=tl.int32)")
 
@@ -828,7 +869,9 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     kernel_code_lines.append(f"{indent3}tl.store({min_ptr} + {safe_var}_k{k_val}_base_offs, new_val_min_{safe_var}, mask=mask)")
                 if has_argmax:
                     argmax_op = ops_dict['argmax']
-                    argmax_aux_ptr = f"{safe_var}_max{k_val}_aux_ptr"
+                    argmax_aux_ptr = (
+                        f"{safe_var}_{argmax_op['op']}_aux_ptr"
+                    )
                     argmax_idx_ptr = f"{safe_var}_{argmax_op['op']}_ptr"
                     kernel_code_lines.append(f"{indent3}tl.store({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs, new_idx_{safe_var}, mask=mask)")
                     kernel_code_lines.append(f"{indent3}tl.store({argmax_aux_ptr} + {safe_var}_k{k_val}_base_offs, new_val_argmax_{safe_var}, mask=mask)")
@@ -836,7 +879,9 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         kernel_code_lines.append(f"{indent3}tl.store({argmax_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs, new_val_argmax_{safe_var}, mask=mask)")
                 if has_argmin:
                     argmin_op = ops_dict['argmin']
-                    argmin_aux_ptr = f"{safe_var}_min{k_val}_aux_ptr"
+                    argmin_aux_ptr = (
+                        f"{safe_var}_{argmin_op['op']}_aux_ptr"
+                    )
                     argmin_idx_ptr = f"{safe_var}_{argmin_op['op']}_ptr"
                     kernel_code_lines.append(f"{indent3}tl.store({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs, new_idx_{safe_var}, mask=mask)")
                     kernel_code_lines.append(f"{indent3}tl.store({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs, new_val_argmin_{safe_var}, mask=mask)")
@@ -921,6 +966,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         dims_1d, dims_2d = self._statistics_lowering.split_indexed(var_list)
 
         # Header
+        safe_output_index = self._get_safe_name(output_index)
         kernel_code_lines.extend([
             f"# Kernel for output_index: {output_index}",
             f"# Variables: {', '.join(var_list)}",
@@ -929,7 +975,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             "",
             "@triton.jit",
             f"def {kernel_name}(",
-            f"    {output_index}_ptr,",
+            f"    {safe_output_index}_ptr,",
         ])
 
         input_ptrs = {
@@ -950,8 +996,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         for var in var_list:
             safe_var = self._get_safe_name(var)
             # Track which extra state pointers have been added to avoid duplicates
-            added_aux_ptrs = set()  # Track aux pointers already added (for explicit argmax/argmin)
-
             variable = self._statistics_lowering.by_name[var]
             for operation in variable.operations:
                 op = operation.spelling
@@ -960,13 +1004,9 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 # For EXPLICIT argmax/argmin operators, add aux pointer for tracking values
                 # NO automatic argmax/argmin generation for max/min operations
                 if operation.stores_index:
-                    arg_type = operation.outer.value
-                    arg_k_str = "" if operation.k == 1 else str(operation.k)
-                    # aux pointer name: {safe_var}_{arg_type}{k}_aux_ptr (e.g., var_max_aux_ptr, var_max3_aux_ptr)
-                    aux_name = f"{arg_type}{arg_k_str}_aux"  # e.g., 'max_aux', 'max3_aux'
-                    if aux_name not in added_aux_ptrs:
-                        kernel_code_lines.append(f"    {safe_var}_{aux_name}_ptr,")
-                        added_aux_ptrs.add(aux_name)
+                    kernel_code_lines.append(
+                        f"    {safe_var}_{op}_aux_ptr,"
+                    )
 
             # Inner state pointers (only for ops that need cross-step state)
             added_inner = set()
@@ -982,34 +1022,31 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         added_inner.add(inner)
 
         kernel_code_lines.extend([
-            "    weight_ptr,",
-            "    total_weight_ptr,",
-            "    num_macro_steps_ptr,",
-            "    sub_step_ptr,",
-            "    num_sub_steps_ptr,",
-            "    flags_ptr,",
-            "    macro_step_index_ptr,",
+            "    __hf_weight_ptr,",
+            "    __hf_total_weight_ptr,",
+            "    __hf_num_macro_steps_ptr,",
+            "    __hf_sub_step_ptr,",
+            "    __hf_num_sub_steps_ptr,",
+            "    __hf_flags_ptr,",
+            "    __hf_macro_step_index_ptr,",
             "    n_saved_points: tl.constexpr,",
         ])
-        if dims_2d:
-            kernel_code_lines.append("    n_levels: tl.constexpr,")
         kernel_code_lines.extend([
             "    BLOCK_SIZE: tl.constexpr,",
             "    num_trials: tl.constexpr,",
-            "    stride_input: tl.constexpr,",
             "):",
             "    pid = tl.program_id(0)",
             "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
             "    mask = offs < n_saved_points",
             "",
             "    # Load scalar parameters from device tensors",
-            "    weight = tl.load(weight_ptr)",
-            "    total_weight = tl.load(total_weight_ptr)",
-            "    num_macro_steps = tl.load(num_macro_steps_ptr)",
-            "    sub_step = tl.load(sub_step_ptr).to(tl.int32)",
-            "    num_sub_steps = tl.load(num_sub_steps_ptr).to(tl.int32)",
-            "    flags = tl.load(flags_ptr).to(tl.int32)",
-            "    macro_step_index = tl.load(macro_step_index_ptr).to(tl.int32)",
+            "    weight = tl.load(__hf_weight_ptr)",
+            "    total_weight = tl.load(__hf_total_weight_ptr)",
+            "    num_macro_steps = tl.load(__hf_num_macro_steps_ptr)",
+            "    sub_step = tl.load(__hf_sub_step_ptr).to(tl.int32)",
+            "    num_sub_steps = tl.load(__hf_num_sub_steps_ptr).to(tl.int32)",
+            "    flags = tl.load(__hf_flags_ptr).to(tl.int32)",
+            "    macro_step_index = tl.load(__hf_macro_step_index_ptr).to(tl.int32)",
             "",
         ])
 
@@ -1030,7 +1067,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             kernel_code_lines.append("")
 
         kernel_code_lines.extend([
-            f"    idx = tl.load({output_index}_ptr + offs, mask=mask)",
+            f"    idx = tl.load({safe_output_index}_ptr + offs, mask=mask)",
             "",
         ])
 
@@ -1073,45 +1110,58 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             last_only_vars = [v for v in dims_2d if is_last_only(v)]
 
             if non_last_only:
-                kernel_code_lines.extend([
-                    f"{indent}# 2D variables (mean/min/max and mixed)",
-                    f"{indent}for level in tl.static_range(n_levels):",
-                ])
-                emitted_vars_2d = set()
-                def emit_val_2d(v_name):
-                    safe_v_name = self._get_safe_name(v_name)
-                    if safe_v_name in emitted_vars_2d:
-                        return f"{safe_v_name}_val"
-
-                    source = self._statistics_ir.sources.get(
-                        v_name, TensorSource(v_name),
-                    )
-                    if isinstance(source, ExpressionSource):
-                        names = {
-                            dependency: emit_val_2d(dependency)
-                            for dependency in source.expression.dependencies
-                        }
-                        expression = render_expression(
-                            source.expression, ExpressionDialect.TRITON, names,
-                        )
-                        kernel_code_lines.append(
-                            f"{indent2}{safe_v_name}_val = {expression}"
-                        )
-                    else:
-                        key = (
-                            f"__scatter_buf_{v_name}"
-                            if isinstance(source, ScatterSource) else source.name
-                        )
-                        pointer = self._get_safe_name(key)
-                        in_ptr_loc = f"{pointer}_ptr + (t * stride_input + idx) * n_levels + level"
-                        kernel_code_lines.append(f"{indent2}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
-
-                    emitted_vars_2d.add(safe_v_name)
-                    return f"{safe_v_name}_val"
-
                 for var in non_last_only:
                     safe_var = self._get_safe_name(var)
-                    out_offset = "(t * n_saved_points + offs) * n_levels + level"
+                    n_levels_var = self._statistics_layouts[var].actual_shape[-1]
+                    kernel_code_lines.extend([
+                        f"{indent}# 2D variable: {var}",
+                        f"{indent}for level in tl.static_range({n_levels_var}):",
+                    ])
+                    emitted_vars_2d: set[str] = set()
+
+                    def emit_val_2d(v_name):
+                        safe_v_name = self._get_safe_name(v_name)
+                        if safe_v_name in emitted_vars_2d:
+                            return f"{safe_v_name}_val"
+
+                        source = self._statistics_ir.sources.get(
+                            v_name, TensorSource(v_name),
+                        )
+                        if isinstance(source, ExpressionSource):
+                            names = {
+                                dependency: emit_val_2d(dependency)
+                                for dependency in source.expression.dependencies
+                            }
+                            expression = render_expression(
+                                source.expression, ExpressionDialect.TRITON,
+                                names,
+                            )
+                            kernel_code_lines.append(
+                                f"{indent2}{safe_v_name}_val = {expression}"
+                            )
+                        else:
+                            key = (
+                                f"__scatter_buf_{v_name}"
+                                if isinstance(source, ScatterSource)
+                                else source.name
+                            )
+                            pointer = self._get_safe_name(key)
+                            stride = self._source_stride(key)
+                            in_ptr_loc = (
+                                f"{pointer}_ptr + (t * {stride} + idx) * "
+                                f"{n_levels_var} + level"
+                            )
+                            kernel_code_lines.append(
+                                f"{indent2}{safe_v_name}_val = tl.load("
+                                f"{in_ptr_loc}, mask=mask, other=0.0)"
+                            )
+
+                        emitted_vars_2d.add(safe_v_name)
+                        return f"{safe_v_name}_val"
+
+                    out_offset = (
+                        f"(t * n_saved_points + offs) * {n_levels_var} + level"
+                    )
 
                     val_name = emit_val_2d(var)
                     kernel_code_lines.append(f"{indent2}val = {val_name}")
@@ -1438,13 +1488,58 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 kernel_code_lines.extend([
                     f"{indent}# 2D variables (last-only)",
                     f"{indent}if is_inner_last:",
-                    f"{indent2}for level in tl.static_range(n_levels):",
                 ])
                 for var in last_only_vars:
                     safe_var = self._get_safe_name(var)
-                    out_offset = "(t * n_saved_points + offs) * n_levels + level"
+                    n_levels_var = self._statistics_layouts[var].actual_shape[-1]
+                    kernel_code_lines.append(
+                        f"{indent2}for level in tl.static_range({n_levels_var}):"
+                    )
+                    emitted_last: set[str] = set()
 
-                    val_name = emit_val_2d(var)
+                    def emit_last_value(v_name: str) -> str:
+                        safe_name = self._get_safe_name(v_name)
+                        if safe_name in emitted_last:
+                            return f"{safe_name}_val"
+                        source = self._statistics_ir.sources.get(
+                            v_name, TensorSource(v_name),
+                        )
+                        if isinstance(source, ExpressionSource):
+                            names = {
+                                dependency: emit_last_value(dependency)
+                                for dependency in source.expression.dependencies
+                            }
+                            expression = render_expression(
+                                source.expression, ExpressionDialect.TRITON,
+                                names,
+                            )
+                            kernel_code_lines.append(
+                                f"{indent3}{safe_name}_val = {expression}"
+                            )
+                        else:
+                            key = (
+                                f"__scatter_buf_{v_name}"
+                                if isinstance(source, ScatterSource)
+                                else source.name
+                            )
+                            pointer = self._get_safe_name(key)
+                            stride = self._source_stride(key)
+                            offset = (
+                                f"(t * {stride} + idx) * {n_levels_var} "
+                                "+ level"
+                            )
+                            kernel_code_lines.append(
+                                f"{indent3}{safe_name}_val = tl.load("
+                                f"{pointer}_ptr + {offset}, mask=mask, "
+                                "other=0.0)"
+                            )
+                        emitted_last.add(safe_name)
+                        return f"{safe_name}_val"
+
+                    out_offset = (
+                        f"(t * n_saved_points + offs) * {n_levels_var} + level"
+                    )
+                    val_name = emit_last_value(var)
                     kernel_code_lines.extend([
                         f"{indent3}val = {val_name}",
                         f"{indent3}tl.store({safe_var}_last_ptr + {out_offset}, val, mask=mask)",
@@ -1466,9 +1561,17 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             f"def {kernel_name}(",
         ])
 
+        sorted_inputs = sorted({
+            name for var in var_list
+            for name in self._statistics_ir.materialized_inputs(var)
+        })
+        for name in sorted_inputs:
+            kernel_code_lines.append(
+                f"    {self._get_safe_name(name)}_ptr,"
+            )
+
         for var in var_list:
             safe_var = self._get_safe_name(var)
-            kernel_code_lines.append(f"    {safe_var}_ptr,")
             operations = self._statistics_lowering.operations(var)
             for operation in operations:
                 kernel_code_lines.append(f"    {safe_var}_{operation.spelling}_ptr,")
@@ -1485,13 +1588,13 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 added_inner.add(inner)
 
         kernel_code_lines.extend([
-            "    weight_ptr,",
-            "    total_weight_ptr,",
-            "    num_macro_steps_ptr,",
-            "    sub_step_ptr,",
-            "    num_sub_steps_ptr,",
-            "    flags_ptr,",
-            "    macro_step_index_ptr,",
+            "    __hf_weight_ptr,",
+            "    __hf_total_weight_ptr,",
+            "    __hf_num_macro_steps_ptr,",
+            "    __hf_sub_step_ptr,",
+            "    __hf_num_sub_steps_ptr,",
+            "    __hf_flags_ptr,",
+            "    __hf_macro_step_index_ptr,",
             "    n_elements: tl.constexpr,",
             "    BLOCK_SIZE: tl.constexpr,",
             "):",
@@ -1499,13 +1602,13 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
             "    mask = offs < n_elements",
             "",
-            "    weight = tl.load(weight_ptr)",
-            "    total_weight = tl.load(total_weight_ptr)",
-            "    num_macro_steps = tl.load(num_macro_steps_ptr)",
-            "    sub_step = tl.load(sub_step_ptr).to(tl.int32)",
-            "    num_sub_steps = tl.load(num_sub_steps_ptr).to(tl.int32)",
-            "    flags = tl.load(flags_ptr).to(tl.int32)",
-            "    macro_step_index = tl.load(macro_step_index_ptr).to(tl.int32)",
+            "    weight = tl.load(__hf_weight_ptr)",
+            "    total_weight = tl.load(__hf_total_weight_ptr)",
+            "    num_macro_steps = tl.load(__hf_num_macro_steps_ptr)",
+            "    sub_step = tl.load(__hf_sub_step_ptr).to(tl.int32)",
+            "    num_sub_steps = tl.load(__hf_num_sub_steps_ptr).to(tl.int32)",
+            "    flags = tl.load(__hf_flags_ptr).to(tl.int32)",
+            "    macro_step_index = tl.load(__hf_macro_step_index_ptr).to(tl.int32)",
             "    is_inner_first = ((flags & 1) != 0) & (sub_step == 0)",
             "    is_inner_last = (((flags >> 1) & 1) != 0) & (sub_step == num_sub_steps - 1)",
             "    is_middle = sub_step == num_sub_steps // 2",
@@ -1518,12 +1621,105 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         indent2 = "        "
         for var in var_list:
             safe_var = self._get_safe_name(var)
-            var_numel = int(self._tensor_registry[var].numel())
+            var_numel = prod(self._statistics_layouts[var].actual_shape)
             kernel_code_lines.extend([
                 f"{indent}# === full tensor variable: {var} ===",
                 f"{indent}var_mask = offs < {var_numel}",
-                f"{indent}{safe_var}_val = tl.load({safe_var}_ptr + offs, mask=var_mask, other=0.0)",
             ])
+
+            emitted: set[str] = set()
+
+            def emit_full_value(name: str) -> str:
+                safe_name = self._get_safe_name(name)
+                if safe_name in emitted:
+                    return f"{safe_name}_val"
+                source = self._statistics_ir.sources.get(
+                    name, TensorSource(name),
+                )
+                if isinstance(source, TensorSource):
+                    kernel_code_lines.append(
+                        f"{indent}{safe_name}_val = tl.load("
+                        f"{safe_name}_ptr + offs, mask=var_mask, other=0.0)"
+                    )
+                elif isinstance(source, ScatterSource):
+                    buffer_name = self._get_safe_name(
+                        f"__scatter_buf_{name}"
+                    )
+                    kernel_code_lines.append(
+                        f"{indent}{safe_name}_val = tl.load("
+                        f"{buffer_name}_ptr + offs, mask=var_mask, other=0.0)"
+                    )
+                else:
+                    names = {
+                        dependency: emit_full_value(dependency)
+                        for dependency in source.expression.dependencies
+                    }
+                    expression = render_expression(
+                        source.expression, ExpressionDialect.TRITON, names,
+                    )
+                    kernel_code_lines.append(
+                        f"{indent}{safe_name}_val = {expression}"
+                    )
+                emitted.add(safe_name)
+                return f"{safe_name}_val"
+
+            emit_full_value(var)
+
+            for reduction in self._statistics_lowering.inner_reductions(var):
+                inner = reduction.value
+                if inner == "last":
+                    continue
+                val_for = f"{safe_var}_{inner}_val"
+                inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + offs"
+                if inner == "mean":
+                    weight_ptr = (
+                        f"{safe_var}_{inner}_weight_state_ptr + offs"
+                    )
+                    kernel_code_lines.extend([
+                        f"{indent}inner_{inner}_old = tl.load({inner_ptr}, mask=var_mask, other=0.0)",
+                        f"{indent}weight_{inner}_old = tl.load({weight_ptr}, mask=var_mask, other=0.0)",
+                        f"{indent}inner_{inner}_new = inner_{inner}_old + {safe_var}_val * weight",
+                        f"{indent}weight_{inner}_new = weight_{inner}_old + weight",
+                        f"{indent}{val_for} = inner_{inner}_new / weight_{inner}_new",
+                        f"{indent}if is_inner_last:",
+                        f"{indent2}tl.store({inner_ptr}, 0.0, mask=var_mask)",
+                        f"{indent2}tl.store({weight_ptr}, 0.0, mask=var_mask)",
+                        f"{indent}else:",
+                        f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=var_mask)",
+                        f"{indent2}tl.store({weight_ptr}, weight_{inner}_new, mask=var_mask)",
+                    ])
+                elif inner == "sum":
+                    kernel_code_lines.extend([
+                        f"{indent}inner_{inner}_old = tl.load({inner_ptr}, mask=var_mask, other=0.0)",
+                        f"{indent}inner_{inner}_new = inner_{inner}_old + {safe_var}_val * weight",
+                        f"{indent}{val_for} = inner_{inner}_new",
+                        f"{indent}if is_inner_last:",
+                        f"{indent2}tl.store({inner_ptr}, 0.0, mask=var_mask)",
+                        f"{indent}else:",
+                        f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=var_mask)",
+                    ])
+                elif inner in {"max", "min"}:
+                    function = "maximum" if inner == "max" else "minimum"
+                    sentinel = "-float('inf')" if inner == "max" else "float('inf')"
+                    kernel_code_lines.extend([
+                        f"{indent}inner_{inner}_old = tl.load({inner_ptr}, mask=var_mask, other={safe_var}_val)",
+                        f"{indent}inner_{inner}_new = tl.where(is_inner_first, {safe_var}_val, tl.{function}(inner_{inner}_old, {safe_var}_val))",
+                        f"{indent}{val_for} = inner_{inner}_new",
+                        f"{indent}if is_inner_last:",
+                        f"{indent2}tl.store({inner_ptr}, {sentinel}, mask=var_mask)",
+                        f"{indent}else:",
+                        f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=var_mask)",
+                    ])
+                elif inner == "first":
+                    kernel_code_lines.extend([
+                        f"{indent}if is_inner_first:",
+                        f"{indent2}tl.store({inner_ptr}, {safe_var}_val, mask=var_mask)",
+                        f"{indent}{val_for} = tl.load({inner_ptr}, mask=var_mask, other=0.0)",
+                    ])
+                else:
+                    raise ValueError(
+                        f"Unsupported full-output inner op '{inner}'."
+                    )
 
             for operation in self._statistics_lowering.operations(var):
                 op = operation.spelling
@@ -1532,68 +1728,10 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 if operation.compound:
                     outer = operation.outer.value
                     inner = operation.inner.value
-                    val_for = f"{safe_var}_{inner}_val"
-                    if inner == "last":
-                        kernel_code_lines.append(f"{indent}{val_for} = {safe_var}_val")
-                    elif inner == "mean":
-                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + offs"
-                        weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + offs"
-                        kernel_code_lines.extend([
-                            f"{indent}inner_old = tl.load({inner_ptr}, mask=var_mask, other=0.0)",
-                            f"{indent}weight_old = tl.load({weight_ptr}, mask=var_mask, other=0.0)",
-                            f"{indent}inner_new = inner_old + {safe_var}_val * weight",
-                            f"{indent}weight_new = weight_old + weight",
-                            f"{indent}{val_for} = inner_new / weight_new",
-                            f"{indent}if is_inner_last:",
-                            f"{indent2}tl.store({inner_ptr}, 0.0, mask=var_mask)",
-                            f"{indent2}tl.store({weight_ptr}, 0.0, mask=var_mask)",
-                            f"{indent}else:",
-                            f"{indent2}tl.store({inner_ptr}, inner_new, mask=var_mask)",
-                            f"{indent2}tl.store({weight_ptr}, weight_new, mask=var_mask)",
-                        ])
-                    elif inner == "sum":
-                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + offs"
-                        kernel_code_lines.extend([
-                            f"{indent}inner_old = tl.load({inner_ptr}, mask=var_mask, other=0.0)",
-                            f"{indent}inner_new = inner_old + {safe_var}_val * weight",
-                            f"{indent}{val_for} = inner_new",
-                            f"{indent}if is_inner_last:",
-                            f"{indent2}tl.store({inner_ptr}, 0.0, mask=var_mask)",
-                            f"{indent}else:",
-                            f"{indent2}tl.store({inner_ptr}, inner_new, mask=var_mask)",
-                        ])
-                    elif inner == "max":
-                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + offs"
-                        kernel_code_lines.extend([
-                            f"{indent}inner_old = tl.load({inner_ptr}, mask=var_mask, other={safe_var}_val)",
-                            f"{indent}inner_new = tl.where(is_inner_first, {safe_var}_val, tl.maximum(inner_old, {safe_var}_val))",
-                            f"{indent}{val_for} = inner_new",
-                            f"{indent}if is_inner_last:",
-                            f"{indent2}tl.store({inner_ptr}, -float('inf'), mask=var_mask)",
-                            f"{indent}else:",
-                            f"{indent2}tl.store({inner_ptr}, inner_new, mask=var_mask)",
-                        ])
-                    elif inner == "min":
-                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + offs"
-                        kernel_code_lines.extend([
-                            f"{indent}inner_old = tl.load({inner_ptr}, mask=var_mask, other={safe_var}_val)",
-                            f"{indent}inner_new = tl.where(is_inner_first, {safe_var}_val, tl.minimum(inner_old, {safe_var}_val))",
-                            f"{indent}{val_for} = inner_new",
-                            f"{indent}if is_inner_last:",
-                            f"{indent2}tl.store({inner_ptr}, float('inf'), mask=var_mask)",
-                            f"{indent}else:",
-                            f"{indent2}tl.store({inner_ptr}, inner_new, mask=var_mask)",
-                        ])
-                    elif inner in ("first", "mid"):
-                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + offs"
-                        cond = "is_inner_first" if inner == "first" else "is_middle"
-                        kernel_code_lines.extend([
-                            f"{indent}if {cond}:",
-                            f"{indent2}tl.store({inner_ptr}, {safe_var}_val, mask=var_mask)",
-                            f"{indent}{val_for} = tl.load({inner_ptr}, mask=var_mask, other=0.0)",
-                        ])
-                    else:
-                        raise ValueError(f"Unsupported full-output inner op '{inner}'.")
+                    val_for = (
+                        f"{safe_var}_val" if inner == "last"
+                        else f"{safe_var}_{inner}_val"
+                    )
 
                     kernel_code_lines.append(f"{indent}if is_inner_last:")
                     if outer == "max":
@@ -1705,11 +1843,12 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 cnt_key = f"__scatter_cnt_{var}"
                 zero_args.append(f"states['{cnt_key}']")
             zero_args.extend([f"_N_{safe_var}", "BLOCK_SIZE", "num_trials"])
-            kernel_code_lines.append(
-                f"    scatter_zero_{safe_var}["
-                f"(triton.cdiv(_N_{safe_var}, BLOCK_SIZE),)]"
-                f"({', '.join(zero_args)})"
-            )
+            if self._storage[buf_key].shape[-1] > 0:
+                kernel_code_lines.append(
+                    f"    scatter_zero_{safe_var}["
+                    f"(triton.cdiv(_N_{safe_var}, BLOCK_SIZE),)]"
+                    f"({', '.join(zero_args)})"
+                )
             add_args = [f"states['{buf_key}']"]
             if is_mean:
                 add_args.append(f"states['{cnt_key}']")
@@ -1727,12 +1866,13 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     add_args.append(str(tensor.shape[1]))
                 else:
                     add_args.append("0")
-            kernel_code_lines.append(
-                f"    scatter_add_{safe_var}["
-                f"(triton.cdiv(_M_{safe_var}, BLOCK_SIZE),)]"
-                f"({', '.join(add_args)})"
-            )
-            if is_mean:
+            if self._tensor_registry[scatter.index].numel() > 0:
+                kernel_code_lines.append(
+                    f"    scatter_add_{safe_var}["
+                    f"(triton.cdiv(_M_{safe_var}, BLOCK_SIZE),)]"
+                    f"({', '.join(add_args)})"
+                )
+            if is_mean and self._storage[buf_key].shape[-1] > 0:
                 div_args = [
                     f"states['{buf_key}']", f"states['{cnt_key}']",
                     f"_N_{safe_var}", "BLOCK_SIZE", "num_trials",
@@ -1746,19 +1886,36 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             kernel_code_lines.append("")
 
         for output_index, var_list in grouped_by_output_index.items():
-            kernel_name = f"kernel_{output_index}"
+            safe_output_index = self._get_safe_name(output_index)
+            kernel_name = f"kernel_{safe_output_index}"
 
             if output_index == "__full__":
-                full_len = max(int(self._tensor_registry[var].numel()) for var in var_list)
+                full_len = max(
+                    prod(self._statistics_layouts[var].actual_shape)
+                    for var in var_list
+                )
+                if full_len == 0:
+                    kernel_code_lines.append(
+                        "    # Skip empty full-output statistics group"
+                    )
+                    continue
                 kernel_code_lines.extend([
                     "    # Launch full-output kernel",
                     f"    full_len = {full_len}",
                     "    grid___full__ = lambda meta: (triton.cdiv(full_len, meta['BLOCK_SIZE']),)",
                     f"    {kernel_name}[grid___full__](",
                 ])
+                sorted_inputs = sorted({
+                    name for var in var_list
+                    for name in self._statistics_ir.materialized_inputs(var)
+                })
+                for name in sorted_inputs:
+                    safe_name = self._get_safe_name(name)
+                    kernel_code_lines.append(
+                        f"        {safe_name}_ptr=states['{name}'],"
+                    )
                 for var in var_list:
                     safe_var = self._get_safe_name(var)
-                    kernel_code_lines.append(f"        {safe_var}_ptr=states['{var}'],")
                     operations = self._statistics_lowering.operations(var)
                     for operation in operations:
                         op = operation.spelling
@@ -1775,13 +1932,13 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                             kernel_code_lines.append(f"        {safe_var}_{inner}_weight_state_ptr=states['{var}_{inner}_weight_state'],")
                         added_inner.add(inner)
                 kernel_code_lines.extend([
-                    "        weight_ptr=states['__weight'],",
-                    "        total_weight_ptr=states['__total_weight'],",
-                    "        num_macro_steps_ptr=states['__num_macro_steps'],",
-                    "        sub_step_ptr=states['__sub_step'],",
-                    "        num_sub_steps_ptr=states['__num_sub_steps'],",
-                    "        flags_ptr=states['__flags'],",
-                    "        macro_step_index_ptr=states['__macro_step_index'],",
+                    "        __hf_weight_ptr=states['__weight'],",
+                    "        __hf_total_weight_ptr=states['__total_weight'],",
+                    "        __hf_num_macro_steps_ptr=states['__num_macro_steps'],",
+                    "        __hf_sub_step_ptr=states['__sub_step'],",
+                    "        __hf_num_sub_steps_ptr=states['__num_sub_steps'],",
+                    "        __hf_flags_ptr=states['__flags'],",
+                    "        __hf_macro_step_index_ptr=states['__macro_step_index'],",
                     "        n_elements=full_len,",
                     "        BLOCK_SIZE=BLOCK_SIZE,",
                     "    )",
@@ -1789,24 +1946,21 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 ])
                 continue
 
-            # Get stride_input from metadata of first variable
-            first_var = var_list[0]
-            stride_input = 0
-            for meta in self._metadata.values():
-                if meta['original_variable'] == first_var:
-                    stride_input = meta.get('stride_input', 0)
-                    break
+            if self._tensor_registry[output_index].numel() == 0:
+                kernel_code_lines.append(
+                    f"    # Skip empty statistics group {output_index}"
+                )
+                continue
 
             kernel_code_lines.extend([
                 f"    # Launch kernel for {output_index}",
                 f"    output_index_len = len(states['{output_index}'])",
-                f"    stride_input = {stride_input}",
             ])
 
             kernel_code_lines.extend([
-                f"    grid_{output_index} = lambda meta: (triton.cdiv(output_index_len, meta['BLOCK_SIZE']),)",
-                f"    {kernel_name}[grid_{output_index}](",
-                f"        {output_index}_ptr=states['{output_index}'],",
+                f"    grid_{safe_output_index} = lambda meta: (triton.cdiv(output_index_len, meta['BLOCK_SIZE']),)",
+                f"    {kernel_name}[grid_{safe_output_index}](",
+                f"        {safe_output_index}_ptr=states['{output_index}'],",
             ])
 
             input_args = {
@@ -1826,7 +1980,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             # Add variable output pointers
             for var in var_list:
                 safe_var = self._get_safe_name(var)
-                added_aux_ptrs = set()  # Track aux pointers for explicit argmax/argmin
                 operations = self._statistics_lowering.operations(var)
                 for operation in operations:
                     op = operation.spelling
@@ -1835,13 +1988,11 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     # For EXPLICIT argmax/argmin operations, add aux pointer
                     # NO automatic argmax/argmin generation for max/min operations
                     if operation.stores_index:
-                        arg_type = operation.outer.value
-                        arg_k_str = "" if operation.k == 1 else str(operation.k)
-                        aux_name = f"{arg_type}{arg_k_str or ''}_aux"  # e.g., 'max_aux', 'max3_aux'
-                        if aux_name not in added_aux_ptrs:
-                            aux_storage_key = f"{var}_{arg_type}{arg_k_str if arg_k_str else ''}_aux"
-                            kernel_code_lines.append(f"        {safe_var}_{aux_name}_ptr=states['{aux_storage_key}'],")
-                            added_aux_ptrs.add(aux_name)
+                        aux_storage_key = f"{var}_{op}_aux"
+                        kernel_code_lines.append(
+                            f"        {safe_var}_{op}_aux_ptr="
+                            f"states['{aux_storage_key}'],"
+                        )
 
                 # Inner state pointers (only for ops that need cross-step state)
                 added_inner = set()
@@ -1857,31 +2008,19 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                              added_inner.add(inner)
 
             kernel_code_lines.extend([
-                "        weight_ptr=states['__weight'],",
-                "        total_weight_ptr=states['__total_weight'],",
-                "        num_macro_steps_ptr=states['__num_macro_steps'],",
-                "        sub_step_ptr=states['__sub_step'],",
-                "        num_sub_steps_ptr=states['__num_sub_steps'],",
-                "        flags_ptr=states['__flags'],",
-                "        macro_step_index_ptr=states['__macro_step_index'],",
+                "        __hf_weight_ptr=states['__weight'],",
+                "        __hf_total_weight_ptr=states['__total_weight'],",
+                "        __hf_num_macro_steps_ptr=states['__num_macro_steps'],",
+                "        __hf_sub_step_ptr=states['__sub_step'],",
+                "        __hf_num_sub_steps_ptr=states['__num_sub_steps'],",
+                "        __hf_flags_ptr=states['__flags'],",
+                "        __hf_macro_step_index_ptr=states['__macro_step_index'],",
                 "        n_saved_points=output_index_len,",
             ])
-
-            # Add second dimension if needed (use actual shape)
-            _, dims_2d = self._statistics_lowering.split_indexed(var_list)
-
-            if dims_2d:
-                var_2d = dims_2d[0]
-                actual_shape = (
-                    self._statistics_lowering.by_name[var_2d].variable.actual_shape
-                )
-                n_levels = actual_shape[-1]
-                kernel_code_lines.append(f"        n_levels={n_levels},")
 
             kernel_code_lines.extend([
                 "        BLOCK_SIZE=BLOCK_SIZE,",
                 "        num_trials=num_trials,",
-                "        stride_input=stride_input,",
                 "    )",
                 "",
             ])

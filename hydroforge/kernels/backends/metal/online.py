@@ -108,7 +108,7 @@ def make_online_metal_dispatcher(
         },
     )
     template = make_spec_metal_dispatcher(
-        spec=spec, source=f"{METAL_KERNEL_BODY_MARKER}\n{body}",
+        spec=spec, source=f"{METAL_KERNEL_BODY_MARKER}: {name}\n{body}",
     )
     source = template.source_for_types({
         field.name: field.dtype
