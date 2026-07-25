@@ -60,9 +60,7 @@ class ProgressState:
             return f"{seconds / 60:.1f}min"
         return f"{seconds / 3600:.1f}h"
 
-    def format_schedule(
-        self, *, fraction: float, completed: int, total: int,
-    ) -> str:
+    def format_schedule(self, *, fraction: float) -> str:
         speed = self.recent_speed
         fraction = min(max(fraction, 0.0), 1.0)
         eta = (
@@ -70,7 +68,7 @@ class ProgressState:
             if fraction > 0.0 else float("inf")
         )
         return (
-            f"[{fraction * 100:5.1f}% model-time {completed}/{total}] "
+            f"[{fraction * 100:5.1f}%] "
             f"{speed:.2f} steps/s ETA {self._fmt_duration(eta)}"
         )
 
@@ -114,6 +112,4 @@ class ProgressRuntime:
         duration = (schedule.end - schedule.start).total_seconds()
         return self.owner._progress.format_schedule(
             fraction=elapsed / duration,
-            completed=index + 1,
-            total=len(schedule),
         )

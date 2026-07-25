@@ -57,17 +57,13 @@ class StatisticsWindowController:
         )
         return hashlib.sha256(encoded.encode()).hexdigest()
 
-    def _validate_step(
-        self, current_time: Any, time_step: float, *, allow_spinup: bool = False,
-    ):
+    def _validate_step(self, current_time: Any, time_step: float):
         require_calendar(
             current_time, self.schedule.calendar, label="model current_time",
         )
         try:
             step = self.schedule.step_at(self.schedule.index_at(current_time))
         except KeyError as exc:
-            if allow_spinup and current_time < self.schedule.start:
-                return None
             raise ValueError(
                 f"current_time {current_time!r} is not a model schedule boundary"
             ) from exc
@@ -172,22 +168,7 @@ class StatisticsWindowController:
         override: StatisticsFlags | None = None,
     ) -> WindowDecision:
         if not output_enabled:
-            step = self._validate_step(
-                current_time, time_step,
-                allow_spinup=self._last_step_index is None,
-            )
-            if step is None:
-                # Pre-main spin-up is intentionally allowed while statistics
-                # are disabled. Once the model schedule has started, however,
-                # disabling output may not become a calendar-validation bypass.
-                self._output_active = False
-                self._last_inner_key = None
-                self._last_outer_key = None
-                self._inner_open = False
-                self._outer_open = False
-                return WindowDecision(
-                    False, StatisticsFlags(False, False, False, False),
-                )
+            step = self._validate_step(current_time, time_step)
             if (
                 self._last_step_index is not None
                 and step.index != self._last_step_index + 1
