@@ -29,7 +29,6 @@ class SamplePhase(str, Enum):
     EVERY_SUBSTEP = "every_substep"
     INNER_FIRST = "inner_first"
     INNER_LAST = "inner_last"
-    MIDDLE = "middle"
 
 
 class ReductionAction(str, Enum):
@@ -41,7 +40,6 @@ class ReductionAction(str, Enum):
     MINIMUM = "minimum"
     TAKE_FIRST = "take_first"
     TAKE_LAST = "take_last"
-    TAKE_MIDDLE = "take_middle"
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,8 +164,6 @@ def _phase(operation: StatisticOperation) -> SamplePhase:
             return SamplePhase.INNER_FIRST
         case Reduction.LAST:
             return SamplePhase.INNER_LAST
-        case Reduction.MID:
-            return SamplePhase.MIDDLE
         case _:
             return SamplePhase.EVERY_SUBSTEP
 
@@ -180,7 +176,6 @@ def _reduction_plan(reduction: Reduction) -> ReductionPlan:
         Reduction.MIN: (ReductionAction.MINIMUM, "positive_infinity"),
         Reduction.FIRST: (ReductionAction.TAKE_FIRST, "zero"),
         Reduction.LAST: (ReductionAction.TAKE_LAST, "zero"),
-        Reduction.MID: (ReductionAction.TAKE_MIDDLE, "zero"),
     }[reduction]
     return ReductionPlan(reduction, action, initialization)
 
@@ -273,8 +268,6 @@ def lower_statistics(
                     flags.update({"is_inner_first", "is_inner_last"})
                 case Reduction.LAST:
                     flags.add("is_inner_last")
-                case Reduction.MID:
-                    flags.update({"is_middle", "is_inner_last"})
                 case Reduction.MEAN:
                     flags.update({
                         "is_inner_first", "is_inner_last", "is_outer_last",

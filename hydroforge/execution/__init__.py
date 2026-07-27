@@ -1,6 +1,8 @@
 """Compiled model orchestration and backend-owned execution."""
 
-from hydroforge.execution.collectives import all_reduce_, reduce_
+from hydroforge.execution.collectives import (
+    all_reduce_, all_reduce_many_, reduce_, reduce_many_,
+)
 from hydroforge.execution.boundaries import between_steps
 from hydroforge.execution.inputs import copy_input
 from hydroforge.execution.parameters import ParameterChangeEffect
@@ -11,7 +13,9 @@ from hydroforge.execution.windows import StatisticsWindowController
 
 __all__ = [
     "all_reduce_",
+    "all_reduce_many_",
     "reduce_",
+    "reduce_many_",
     "between_steps",
     "copy_input",
     "ParameterChangeEffect",

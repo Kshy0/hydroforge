@@ -76,7 +76,9 @@ class MultiRankStatsReader:
                 info["cache"] = None
                 continue
 
-            rank_data_parts = []
+            cache = None
+            cache_rows = self._slice_end - self._slice_start + 1
+            written = np.zeros(cache_rows, dtype=bool)
 
             # Iterate through files and extract relevant parts
             for i, fp in enumerate(info["paths"]):
@@ -102,27 +104,55 @@ class MultiRankStatsReader:
                             # (time, [trial], saved_points, [value_axis]).
                             if self.row_chunk_size is None:
                                 data = var[local_start:local_end, ...]
-                                rank_data_parts.append(
-                                    self._data_access._array(
-                                        data, source=fp.name,
-                                    ).copy()
-                                )
+                                chunks = ((req_start, data),)
                             else:
-                                for t0 in range(local_start, local_end, self.row_chunk_size):
-                                    t1 = min(t0 + self.row_chunk_size, local_end)
-                                    data = var[t0:t1, ...]
-                                    rank_data_parts.append(
-                                        self._data_access._array(
-                                            data, source=fp.name,
-                                        ).copy()
+                                chunks = (
+                                    (
+                                        file_start_global + t0,
+                                        var[
+                                            t0:min(
+                                                t0 + self.row_chunk_size,
+                                                local_end,
+                                            ),
+                                            ...,
+                                        ],
                                     )
+                                    for t0 in range(
+                                        local_start,
+                                        local_end,
+                                        self.row_chunk_size,
+                                    )
+                                )
+
+                            for global_start, chunk in chunks:
+                                array = self._data_access._array(
+                                    chunk, source=fp.name,
+                                )
+                                if cache is None:
+                                    cache = np.empty(
+                                        (cache_rows, *array.shape[1:]),
+                                        dtype=array.dtype,
+                                    )
+                                if (
+                                    array.shape[1:] != cache.shape[1:]
+                                    or array.dtype != cache.dtype
+                                ):
+                                    raise ValueError(
+                                        f"Inconsistent cached shape/dtype in {fp.name}"
+                                    )
+                                destination = global_start - self._slice_start
+                                cache[destination:destination + array.shape[0]] = array
+                                written[
+                                    destination:destination + array.shape[0]
+                                ] = True
                     except (OSError, KeyError, IndexError, ValueError) as exc:
                         raise RuntimeError(f"Failed to cache {fp}") from exc
 
-            if rank_data_parts:
-                info["cache"] = np.concatenate(rank_data_parts, axis=0)
-            else:
-                info["cache"] = None
+            if cache is not None and not np.all(written):
+                raise RuntimeError(
+                    f"Failed to cache {int((~written).sum())} requested row(s)"
+                )
+            info["cache"] = cache
 
     # ----------------------------------------------------------------------------------
     # Constructor
@@ -470,6 +500,62 @@ class MultiRankStatsReader:
     # ----------------------------------------------------------------------------------
     # Visualization
     # ----------------------------------------------------------------------------------
+    @staticmethod
+    def _year_start_like(value, year: int):
+        if isinstance(value, cftime.datetime):
+            kwargs = {}
+            if hasattr(value, "has_year_zero"):
+                kwargs["has_year_zero"] = value.has_year_zero
+            return type(value)(year, 1, 1, **kwargs)
+        return datetime(year, 1, 1)
+
+    def _validate_cama_bin_years(
+        self, year_to_indices: dict[int, List[int]],
+    ) -> None:
+        """Require complete, record-aligned years for CaMa-style binaries."""
+
+        if self._time_values_num is None or len(self._time_values_num) < 2:
+            raise ValueError(
+                "CaMa binary export needs at least two timestamps to infer "
+                "record spacing"
+            )
+        numeric = np.asarray(self._time_values_num, dtype=np.float64)
+        differences = np.diff(numeric)
+        interval = float(differences[0])
+        tolerance = max(abs(interval) * 1e-9, 1e-12)
+        if interval <= 0.0 or not np.allclose(
+            differences, interval, rtol=1e-9, atol=tolerance,
+        ):
+            raise ValueError(
+                "CaMa binary export requires a strictly regular time axis"
+            )
+
+        for year, indices in year_to_indices.items():
+            reference = self.times[indices[0]]
+            start = self._year_start_like(reference, year)
+            end = self._year_start_like(reference, year + 1)
+            start_num, end_num = nc.date2num(
+                (start, end), self._time_units, self._time_calendar,
+            )
+            exact_count = (float(end_num) - float(start_num)) / interval
+            expected_count = int(round(exact_count))
+            if not np.isclose(
+                exact_count, expected_count, rtol=1e-9, atol=1e-9,
+            ):
+                raise ValueError(
+                    f"year {year} is not divisible by the output time interval"
+                )
+            values = numeric[np.asarray(indices, dtype=np.int64)]
+            expected = float(start_num) + interval * np.arange(expected_count)
+            if values.shape != expected.shape or not np.allclose(
+                values, expected, rtol=1e-9, atol=tolerance,
+            ):
+                raise ValueError(
+                    f"CaMa binary export for {year} is a partial or "
+                    "misaligned year; export complete calendar years so record "
+                    "numbers retain their time-of-year meaning"
+                )
+
     def export_to_cama_bin(
         self,
         out_dir: Union[str, Path],
@@ -502,6 +588,7 @@ class MultiRankStatsReader:
         for ti in range(t_start, t_end):
             year = int(self.times[ti].year)
             year_to_indices.setdefault(year, []).append(ti)
+        self._validate_cama_bin_years(year_to_indices)
 
         for year in sorted(year_to_indices.keys()):
             year_path = out_dir / f"{out_var_name}{year}.bin"

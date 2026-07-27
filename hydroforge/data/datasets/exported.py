@@ -92,7 +92,14 @@ class ExportedDataset(AbstractDataset):
         self.unit_factor = unit_factor
         self.time_aggregation = self._normalize_time_aggregation(time_aggregation)
         self._in_memory = in_memory
-        self._memory_cache: Optional[np.ndarray] = None  # Shape: (total_time_steps, num_catchments)
+        self._memory_cache: Optional[Union[np.ndarray, Dict[str, np.ndarray]]] = None
+        self._spin_up_memory_cache: Optional[
+            Union[np.ndarray, Dict[str, np.ndarray]]
+        ] = None
+        # Absolute source-file column indices represented by both caches.
+        # This lets ``in_memory=True`` preload in native order and still
+        # honour a later ``build_local_mapping`` column reorder.
+        self._memory_cache_file_indices: Optional[np.ndarray] = None
 
         # Per-catchment integer day shift applied at read time (None = no shift).
         # Populated by :meth:`build_local_mapping`.
@@ -125,10 +132,18 @@ class ExportedDataset(AbstractDataset):
 
         self._column_bbox: Optional[Tuple[int, int]] = None
         self._column_bbox_local_indices: Optional[np.ndarray] = None
+        self._coordinates_cache: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
         # Auto-detect chunk_len from file's NetCDF time chunking if not provided
         if "chunk_len" not in kwargs:
-            detected = self._detect_chunk_len(base_dir, prefix, suffix, var_name, start_date, time_to_key)
+            detected = self._detect_chunk_len(
+                base_dir,
+                self.prefix,
+                suffix,
+                var_name,
+                start_date,
+                self.time_to_key,
+            )
             if detected is not None:
                 kwargs["chunk_len"] = detected
 
@@ -148,10 +163,21 @@ class ExportedDataset(AbstractDataset):
             time_to_key=self.time_to_key,
             time_aggregation=self.time_aggregation,
         )
-        self._global_times = self._timeline.global_times
+        # ``DatasetTimeline`` scans the envelope containing both spin-up and
+        # main periods.  Its ``global_times`` therefore starts at spin-up when
+        # enabled, while ExportedDataset indexing, window sampling and the
+        # primary cache all require an axis whose row zero is ``start_date``.
+        self._global_times = []
+        current = self.start_date
+        while current <= self.end_date:
+            self._global_times.append(current)
+            current += self.time_interval
         self._plan = self._timeline.plan
         self.source_time_interval = self._timeline.source_time_interval
         self._aggregation_factor = self._timeline.aggregation_factor
+
+        if self._in_memory:
+            self.load_to_memory()
 
     def _ops_from_times(self, times):
         return self._timeline.ops_from_times(times)
@@ -187,6 +213,35 @@ class ExportedDataset(AbstractDataset):
     # -------------------------
     # Coordinates (1D catchment IDs)
     # -------------------------
+    def _validated_catchment_ids(
+        self,
+        value: Any,
+        *,
+        path: Path,
+    ) -> np.ndarray:
+        if np.ma.isMaskedArray(value) and np.any(np.ma.getmaskarray(value)):
+            raise ValueError(
+                f"Coordinate variable {self.coord_name!r} in {path.name} "
+                "contains missing IDs"
+            )
+        array = np.asarray(value)
+        if array.ndim != 1:
+            raise ValueError(
+                f"Coordinate variable {self.coord_name!r} in {path.name} "
+                "must be one-dimensional"
+            )
+        if array.dtype.kind not in "iu":
+            raise TypeError(
+                f"Coordinate variable {self.coord_name!r} in {path.name} "
+                "must use an integer dtype"
+            )
+        if np.unique(array).size != array.size:
+            raise ValueError(
+                f"Coordinate variable {self.coord_name!r} in {path.name} "
+                "contains duplicate IDs"
+            )
+        return array.astype(np.int64, copy=False)
+
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
         """Return catchment coordinate arrays.
 
@@ -194,15 +249,23 @@ class ExportedDataset(AbstractDataset):
           - output_coord: linear catchment id array of shape (C,)
           - index: simple 0..C-1 integer array of shape (C,)
         """
-        key = self.time_to_key(self.start_date)
-        path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
-        with Dataset(path, "r") as ds:
-            if self.coord_name not in ds.variables:
-                raise ValueError(f"Coordinate variable '{self.coord_name}' not found in {path.name}. "
-                               f"Available: {list(ds.variables.keys())}")
-            arr = ds.variables[self.coord_name][:]
-            sc = (arr.filled(0) if isinstance(arr, np.ma.MaskedArray) else np.asarray(arr)).astype(np.int64)
-            return sc, np.arange(sc.shape[0], dtype=np.int64)
+        if self._coordinates_cache is None:
+            key = self.time_to_key(self.start_date)
+            path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
+            with Dataset(path, "r") as ds:
+                if self.coord_name not in ds.variables:
+                    raise ValueError(
+                        f"Coordinate variable '{self.coord_name}' not found in "
+                        f"{path.name}. Available: {list(ds.variables.keys())}"
+                    )
+                coordinates = self._validated_catchment_ids(
+                    ds.variables[self.coord_name][:], path=path
+                )
+            index = np.arange(coordinates.shape[0], dtype=np.int64)
+            coordinates.setflags(write=False)
+            index.setflags(write=False)
+            self._coordinates_cache = (coordinates, index)
+        return self._coordinates_cache
 
     @property
     def data_size(self) -> int:
@@ -316,9 +379,89 @@ class ExportedDataset(AbstractDataset):
                 self.source_time_interval,
                 self.time_aggregation,
             )
-            if isinstance(data, dict):
-                return {name: block / self.unit_factor for name, block in data.items()}
+        if self.unit_factor == 1.0:
+            return data
+        if isinstance(data, dict):
+            return {name: block / self.unit_factor for name, block in data.items()}
         return data / self.unit_factor
+
+    def _as_cache_data(
+        self,
+        data: Union[np.ndarray, Dict[str, np.ndarray]],
+    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        """Normalize one processed cache while preserving aggregation maps."""
+        if isinstance(data, dict):
+            return {
+                name: np.ascontiguousarray(
+                    block.astype(self.out_dtype, copy=False)
+                )
+                for name, block in data.items()
+            }
+        return np.ascontiguousarray(data.astype(self.out_dtype, copy=False))
+
+    @staticmethod
+    def _cache_column_count(
+        cache: Union[np.ndarray, Dict[str, np.ndarray]],
+    ) -> int:
+        if isinstance(cache, dict):
+            first = next(iter(cache.values()))
+            return int(first.shape[1])
+        return int(cache.shape[1])
+
+    @staticmethod
+    def _cache_shape(cache: Union[np.ndarray, Dict[str, np.ndarray]]):
+        if isinstance(cache, dict):
+            return {name: block.shape for name, block in cache.items()}
+        return cache.shape
+
+    @staticmethod
+    def _cache_nbytes(cache: Union[np.ndarray, Dict[str, np.ndarray]]) -> int:
+        if isinstance(cache, dict):
+            return sum(block.nbytes for block in cache.values())
+        return cache.nbytes
+
+    def _source_element_bytes(
+        self, ops: Sequence[Tuple[str, Sequence[int]]],
+    ) -> int:
+        """Return a conservative element width for NetCDF source reads."""
+
+        element_bytes = np.dtype(self.out_dtype).itemsize
+        visited: set[str] = set()
+        for key, _ in ops:
+            if key in visited:
+                continue
+            visited.add(key)
+            path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
+            with Dataset(path, "r") as dataset:
+                variable = dataset.variables[self.var_name]
+                read_dtype = np.dtype(variable.dtype)
+                # netCDF4 applies packing attributes while reading. Include
+                # their dtype in the estimate because a packed integer source
+                # can therefore materialize as floating point in memory.
+                for attribute in ("scale_factor", "add_offset"):
+                    if hasattr(variable, attribute):
+                        read_dtype = np.result_type(
+                            read_dtype,
+                            np.asarray(getattr(variable, attribute)).dtype,
+                        )
+                if not np.issubdtype(read_dtype, np.floating):
+                    # A masked integer source is promoted to float64 when its
+                    # missing values are converted to NaN by _apply_value_policy.
+                    element_bytes = max(element_bytes, 8)
+                element_bytes = max(element_bytes, read_dtype.itemsize)
+        return element_bytes
+
+    @staticmethod
+    def _select_cache_columns(
+        cache: Union[np.ndarray, Dict[str, np.ndarray]],
+        positions: np.ndarray,
+    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        if isinstance(cache, dict):
+            return {
+                name: np.ascontiguousarray(block[:, positions])
+                for name, block in cache.items()
+            }
+        return np.ascontiguousarray(cache[:, positions])
 
     def read_chunk(self, idx: int):
         if idx < 0 or idx >= len(self._plan):
@@ -326,10 +469,7 @@ class ExportedDataset(AbstractDataset):
         return self._finish_read(self._read_ops(self._plan[idx][1]))
 
     def get_data(self, current_time: datetime, chunk_len: int):
-        start = self.get_index_by_time(current_time)
-        times = self._global_times[start:min(start + int(chunk_len), len(self._global_times))]
-        if not times:
-            return np.empty((0, self.data_size), dtype=self.out_dtype)
+        times = self._timeline.contiguous_times(current_time, chunk_len)
         return self._finish_read(self._read_ops(self._timeline.build_entry(times)[1]))
 
     def close(self) -> None:
@@ -359,15 +499,10 @@ class ExportedDataset(AbstractDataset):
             per-catchment shift is derived, which is the correct behaviour
             when no inflow shift is needed.
         """
-        # Load catchment IDs from file
+        # Reuse the validated coordinate cache populated on first access.
         key = self.time_to_key(self.start_date)
         path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
-        with Dataset(path, "r") as ds:
-            if self.coord_name not in ds.variables:
-                raise ValueError(f"Coordinate variable '{self.coord_name}' not found in {path}")
-            arr = ds.variables[self.coord_name][:]
-            file_catchment_ids = (arr.filled(0) if isinstance(arr, np.ma.MaskedArray)
-                                  else np.asarray(arr)).astype(np.int64)
+        file_catchment_ids, _ = self.get_coordinates()
 
         col_pos = find_indices_in(desired_catchment_ids, file_catchment_ids)
         if np.any(col_pos == -1):
@@ -375,6 +510,35 @@ class ExportedDataset(AbstractDataset):
             raise ValueError(
                 f"{missing} desired catchments not found in exported file {path.name}"
             )
+
+        # ``in_memory=True`` loads before callers know the desired model
+        # ordering.  Reindex an existing cache by its absolute file-column
+        # provenance instead of treating already cached columns as if they
+        # were still in native order.
+        if self._memory_cache is not None:
+            cached_file_indices = self._memory_cache_file_indices
+            if cached_file_indices is None:
+                raise RuntimeError(
+                    "ExportedDataset memory cache is missing column provenance"
+                )
+            cache_pos = find_indices_in(col_pos, cached_file_indices)
+            if np.any(cache_pos == -1):
+                # A second mapping can request columns that a previous,
+                # compressed cache no longer contains.  Reload below using
+                # the new mapping rather than silently selecting wrong data.
+                self._memory_cache = None
+                self._spin_up_memory_cache = None
+                self._memory_cache_file_indices = None
+            else:
+                self._memory_cache = self._select_cache_columns(
+                    self._memory_cache, cache_pos
+                )
+                if self._spin_up_memory_cache is not None:
+                    self._spin_up_memory_cache = self._select_cache_columns(
+                        self._spin_up_memory_cache, cache_pos
+                    )
+                self._memory_cache_file_indices = col_pos.copy()
+
         self._local_indices = col_pos.astype(np.int64)
         self._compute_column_bbox_from_indices()
 
@@ -385,6 +549,8 @@ class ExportedDataset(AbstractDataset):
             )
 
         # Derive per-catchment shift from basin_shift (auto after attach_inflow_overlay).
+        self._shift_days = None
+        self._shift_day_groups = None
         if desired_basin_ids is not None and self._basin_shift:
             bids = np.asarray(desired_basin_ids, dtype=np.int64).ravel()
             if bids.shape != (len(desired_catchment_ids),):
@@ -408,7 +574,11 @@ class ExportedDataset(AbstractDataset):
         # Load to memory when inflow overlay is attached (enables large-window
         # reads for val/test) or when per-catchment shift is applied (requires
         # random-access _gather).
-        if self._inflow_data is not None or self._shift_days is not None:
+        if (
+            self._in_memory
+            or self._inflow_data is not None
+            or self._shift_days is not None
+        ):
             self.load_to_memory()
 
         return None
@@ -421,27 +591,60 @@ class ExportedDataset(AbstractDataset):
         Subsequent __getitem__ calls will return slices from this cache instead
         of reading from disk.
 
-        Note: build_local_mapping should be called first to set up
-        the column reordering indices.
+        The cache records its absolute source columns, so callers may invoke
+        this either before or after :meth:`build_local_mapping`.
         """
         if self._memory_cache is not None:
             if is_rank_zero():
                 logger.info("Exported data is already resident in memory")
             return
 
-        # Read ALL time steps across all files using the multi-file infrastructure.
-        ops = self._ops_from_times(self._global_times)
-        all_data = self._read_ops(ops)
+        # Cache the same *output* axis returned by ``read_chunk``: value
+        # policy, temporal aggregation and unit conversion must all happen
+        # before data becomes resident.  Caching raw source frames makes
+        # cache-backed indexing disagree with the disk path whenever either
+        # aggregation or ``unit_factor`` is configured.
+        main_entry = self._timeline.build_entry(self._global_times)
+        all_data = self._finish_read(self._read_ops(main_entry[1]))
 
-        # Store in cache with correct dtype and C-contiguous layout
-        self._memory_cache = np.ascontiguousarray(all_data.astype(self.out_dtype, copy=False))
+        # Spin-up can be disjoint from the main period by years.  Keep one
+        # compact cache for the unique spin-up interval instead of indexing a
+        # main-only cache with offsets relative to ``start_date`` (which used
+        # to zero-fill valid spin-up data), or allocating the intervening gap.
+        spin_data = None
+        if self.spin_up_cycles > 0:
+            spin_times = []
+            current = self.spin_up_start_date
+            while current <= self.spin_up_end_date:
+                spin_times.append(current)
+                current += self.time_interval
+            spin_entry = self._timeline.build_entry(spin_times)
+            spin_data = self._finish_read(self._read_ops(spin_entry[1]))
+
+        # Store in cache with correct dtype and C-contiguous layout.
+        self._memory_cache = self._as_cache_data(all_data)
+        self._spin_up_memory_cache = (
+            None if spin_data is None else self._as_cache_data(spin_data)
+        )
+        if self._local_indices is None:
+            self._memory_cache_file_indices = np.arange(
+                self._cache_column_count(self._memory_cache), dtype=np.int64
+            )
+        else:
+            self._memory_cache_file_indices = self._local_indices.copy()
 
         if is_rank_zero():
-            n_files = len(ops)
-            mem_mb = self._memory_cache.nbytes / (1024 * 1024)
+            n_files = len(main_entry[1])
+            mem_bytes = self._cache_nbytes(self._memory_cache)
+            if self._spin_up_memory_cache is not None:
+                mem_bytes += self._cache_nbytes(self._spin_up_memory_cache)
             logger.info(
-                "Loaded exported data shape=%s from %d file(s) (%.1f MiB)",
-                self._memory_cache.shape, n_files, mem_mb,
+                "Loaded exported data shape=%s, spin_up_shape=%s from %d "
+                "file(s) (%.1f MiB)",
+                self._cache_shape(self._memory_cache),
+                None if self._spin_up_memory_cache is None else
+                self._cache_shape(self._spin_up_memory_cache),
+                n_files, mem_bytes / (1024 * 1024),
             )
 
     def export_quantiles(
@@ -488,11 +691,15 @@ class ExportedDataset(AbstractDataset):
         """
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(self.time_aggregation, dict):
+            raise ValueError(
+                "export_quantiles requires one time-aggregation result; "
+                "create a single-result ExportedDataset first"
+            )
         create_options = normalize_netcdf_variable_options(netcdf_options)
         var_name = var_name or self.var_name
         quantiles_arr = np.asarray(quantiles, dtype=np.float64)
         Q = len(quantiles_arr)
-        elem_bytes = 4 if dtype == "float32" else 8
 
         # ---- catchment IDs (respecting column reorder) ----
         file_catchment_ids, _ = self.get_coordinates()
@@ -502,16 +709,47 @@ class ExportedDataset(AbstractDataset):
             catchment_ids = file_catchment_ids
         C_total = len(catchment_ids)
         T_total = self.num_main_steps
-
         # ---- determine whether full (T, C) fits in buffer ----
         max_buffer_bytes = max_buffer_mb * 1024 * 1024
-        full_size = T_total * C_total * elem_bytes
-        fits_in_memory = (self._memory_cache is not None or full_size <= max_buffer_bytes)
+        main_ops = None
+        source_rows = 0
+        if self._memory_cache is not None:
+            full_size = self._cache_nbytes(self._memory_cache)
+            fits_in_memory = True
+        else:
+            # The peak read is on the expanded source axis, before temporal
+            # aggregation.  Estimate it using the dataset's in-memory dtype,
+            # not the requested NetCDF output dtype.
+            main_ops = self._timeline.build_entry(self._global_times)[1]
+            source_rows = sum(
+                len(abs_indices) for _, abs_indices in main_ops
+            )
+            read_elem_bytes = self._source_element_bytes(main_ops)
+            # Reading, concatenation/aggregation, and exact quantile
+            # selection can briefly coexist. Three element-widths is a
+            # conservative working-set estimate; using one array's size here
+            # would advertise a buffer limit that NumPy immediately exceeds.
+            working_elem_bytes = 3 * read_elem_bytes
+            full_size = source_rows * C_total * working_elem_bytes
+            fits_in_memory = full_size <= max_buffer_bytes
 
         if not fits_in_memory:
+            # ``build_entry`` expands every requested output time into the
+            # source frames required by temporal aggregation.  Reusing these
+            # operations keeps this path identical to ``read_chunk`` and
+            # ``load_to_memory``; ``ops_from_times`` alone would silently skip
+            # the rest of each aggregation window.
             # Column-batch mode: compute batch_size (num catchments per batch)
-            # so that T_total × batch_size × elem_bytes <= max_buffer_bytes
-            batch_size = max(1, int(max_buffer_bytes / (T_total * elem_bytes)))
+            # from the expanded source axis, since aggregation may require
+            # several source rows for every output row.
+            rows_per_batch = max(1, source_rows)
+            batch_size = max(
+                1,
+                int(
+                    max_buffer_bytes
+                    / (rows_per_batch * working_elem_bytes)
+                ),
+            )
             n_batches = (C_total + batch_size - 1) // batch_size
             if is_rank_zero():
                 logger.info(
@@ -551,7 +789,8 @@ class ExportedDataset(AbstractDataset):
                 # ---- too large: batch by catchments (columns) ----
                 # Exact quantile needs full time axis, so we read ALL time steps
                 # for a subset of catchments per batch.
-                ops = self._ops_from_times(self._global_times)
+                if main_ops is None:
+                    raise RuntimeError("column-batch read plan was not built")
                 for c_start in range(0, C_total, batch_size):
                     c_end = min(c_start + batch_size, C_total)
                     batch_cols = slice(c_start, c_end)
@@ -562,7 +801,7 @@ class ExportedDataset(AbstractDataset):
                         file_col_indices = np.arange(c_start, c_end, dtype=np.int64)
 
                     file_chunks: List[np.ndarray] = []
-                    for key, abs_indices in ops:
+                    for key, abs_indices in main_ops:
                         path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
                         with Dataset(path, "r") as ds_in:
                             var_in = ds_in.variables[self.var_name]
@@ -578,9 +817,29 @@ class ExportedDataset(AbstractDataset):
                             batch_data = self._ensure_tc(arr, t_idx, c_idx)
                             file_chunks.append(batch_data)
 
-                    all_batch = np.concatenate(file_chunks, axis=0) if len(file_chunks) > 1 else file_chunks[0]
-                    q_batch = np.quantile(all_batch, quantiles_arr, axis=0)
+                    all_batch = (
+                        np.concatenate(file_chunks, axis=0)
+                        if len(file_chunks) > 1 else file_chunks[0]
+                    )
+                    if len(file_chunks) > 1:
+                        # Drop references to the component reads before the
+                        # aggregation/conversion allocation below.
+                        file_chunks.clear()
+                    else:
+                        file_chunks.pop()
+                    processed_batch = self._finish_read(all_batch)
+                    q_batch = np.quantile(
+                        processed_batch,
+                        quantiles_arr,
+                        axis=0,
+                        overwrite_input=True,
+                    )
                     data_var[:, batch_cols] = q_batch.astype(dtype)
+                    # Python loop locals retain the previous batch unless
+                    # explicitly released. Drop every large array before the
+                    # next read so the three-array working-set estimate above
+                    # remains conservative across batch boundaries.
+                    del q_batch, processed_batch, all_batch, batch_data, arr
 
         if is_rank_zero():
             logger.info(
@@ -606,6 +865,11 @@ class ExportedDataset(AbstractDataset):
         """
         if isinstance(batch_data, (tuple, list)):
             return tuple(self.shard_forcing(b) for b in batch_data)
+        if isinstance(batch_data, Mapping):
+            return {
+                name: self.shard_forcing(block)
+                for name, block in batch_data.items()
+            }
         if batch_data.dim() == 3:
             B, T, C = batch_data.shape
             return batch_data.reshape(B * T, C).contiguous()
@@ -618,6 +882,46 @@ class ExportedDataset(AbstractDataset):
     # -------------------------
     # Override __getitem__ - no rank gating for exported data
     # -------------------------
+    def _gather_cache(
+        self,
+        cache: Union[np.ndarray, Dict[str, np.ndarray]],
+        shift: Optional[np.ndarray],
+        base_t: int,
+        length: int,
+        *,
+        groups: Optional[list],
+    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        if isinstance(cache, dict):
+            return {
+                name: self._gather(
+                    block, shift, base_t, length, groups=groups,
+                )
+                for name, block in cache.items()
+            }
+        return self._gather(cache, shift, base_t, length, groups=groups)
+
+    def _pad_disk_data(
+        self,
+        data: Union[np.ndarray, Dict[str, np.ndarray]],
+        length: int,
+    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        if isinstance(data, dict):
+            return {
+                name: self._pad_disk_data(block, length)
+                for name, block in data.items()
+            }
+        if data.ndim != 2 or data.shape[1] != self.data_size:
+            raise ValueError(
+                f"read_chunk returned shape {data.shape}, expected "
+                f"(T, {self.data_size})"
+            )
+        if data.shape[0] < length:
+            pad = np.zeros(
+                (length - data.shape[0], self.data_size), dtype=self.out_dtype,
+            )
+            data = np.vstack([data, pad]) if data.size else pad
+        return np.ascontiguousarray(data)
+
     def __getitem__(self, idx):
         """Fetch a chunk or window (no rank gating for exported data).
 
@@ -636,35 +940,57 @@ class ExportedDataset(AbstractDataset):
         """
         if idx < 0:
             idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(
+                f"ExportedDataset index {idx} out of range for length {len(self)}"
+            )
         if self._window_starts is not None:
             base_t = int(self._window_starts[idx])
             length = int(self._window_len)
+            cache = self._memory_cache
         else:
             base_t = self._chunk_base_t(idx)
             length = int(self.chunk_len)
+            cache = self._memory_cache
+            total_spin_up_chunks = self._spin_up_num_chunks * self.spin_up_cycles
+            if idx < total_spin_up_chunks:
+                cache = self._spin_up_memory_cache
+                base_t = (idx % self._spin_up_num_chunks) * self.chunk_len
+            else:
+                base_t = (idx - total_spin_up_chunks) * self.chunk_len
 
         if self._memory_cache is not None:
-            runoff = self._gather(self._memory_cache, self._shift_days, base_t, length,
-                                  groups=self._shift_day_groups)
+            if cache is None:
+                raise RuntimeError(
+                    "spin-up memory cache is unavailable; call load_to_memory()"
+                )
+            runoff = self._gather_cache(
+                cache, self._shift_days, base_t, length,
+                groups=self._shift_day_groups,
+            )
         else:
             if self._shift_days is not None:
                 raise RuntimeError("per-catchment shift requires in-memory data; "
                                    "call load_to_memory() first")
             # Disk path: contiguous chunk read, zero-padded to `length`.
-            data = self.read_chunk(idx)
-            T = data.shape[0]
-            if T < length:
-                pad = np.zeros((length - T, self.data_size), dtype=self.out_dtype)
-                data = np.vstack([data, pad]) if data.size else pad
-            runoff = np.ascontiguousarray(data)
+            runoff = self._pad_disk_data(self.read_chunk(idx), length)
 
         if self._inflow_data is None:
             return runoff
-        inflow = self._gather(self._inflow_data, self._inflow_shift_days, base_t, length,
+        # Overlays are aligned to the main dataset axis, not to the compact
+        # spin-up cache.  Preserve the physical date-relative offset here.
+        overlay_base_t = (
+            int(self._window_starts[idx])
+            if self._window_starts is not None
+            else self._chunk_base_t(idx)
+        )
+        inflow = self._gather(self._inflow_data, self._inflow_shift_days,
+                              overlay_base_t, length,
                               groups=self._inflow_shift_groups)
         if self._loss_data is None:
             return runoff, inflow
-        loss = self._gather(self._loss_data, self._loss_shift_days, base_t, length,
+        loss = self._gather(self._loss_data, self._loss_shift_days,
+                            overlay_base_t, length,
                             oob_fill=np.nan, groups=self._loss_shift_groups)
         return runoff, inflow, loss
 
@@ -757,6 +1083,10 @@ class ExportedDataset(AbstractDataset):
             raise ValueError(f"window={window} exceeds total time steps {T}")
         self._window_len = window
         self._window_starts = np.arange(0, T - window + 1, stride, dtype=np.int64)
+        # Arbitrary/overlapping windows cannot be represented by the compiled
+        # sequential chunk plan used by ``read_chunk``.  Make window mode
+        # explicitly cache-backed instead of returning unrelated disk chunks.
+        self.load_to_memory()
         if is_rank_zero():
             logger.info(
                 "Enabled window sampling: window=%d, stride=%d, windows=%d, "
@@ -775,19 +1105,24 @@ class ExportedDataset(AbstractDataset):
 
         ``data[0]`` corresponds to ``data_start_date``; output row 0
         corresponds to ``self.start_date`` and output has
-        ``num_main_steps`` rows.  Missing rows are zero-filled; rows
-        beyond the dataset window are dropped.  The daily time
-        interval is assumed (the only case used by gauge overlays).
+        ``num_main_steps`` rows.  Missing rows are NaN-filled so temporal
+        padding cannot be mistaken for a real zero observation; rows beyond
+        the dataset window are dropped.
         """
         T_ds = int(self.num_main_steps)
-        offset = (self.start_date - data_start_date).days
         T_src = int(data.shape[0])
-        out = np.zeros((T_ds, data.shape[1]), dtype=np.float32)
-        # Source row j aligns with output row (j - offset).
-        src_lo = max(offset, 0)
-        src_hi = min(offset + T_ds, T_src)
-        if src_lo < src_hi:
-            out[src_lo - offset: src_hi - offset] = data[src_lo:src_hi]
+        data_offset = timedelta_quotient(
+            data_start_date - self.start_date,
+            self.time_interval,
+            duration_label="overlay start offset",
+            interval_label="time_interval",
+        )
+        out = np.full((T_ds, data.shape[1]), np.nan, dtype=np.float32)
+        src_lo = max(-data_offset, 0)
+        dst_lo = max(data_offset, 0)
+        count = min(T_src - src_lo, T_ds - dst_lo)
+        if count > 0:
+            out[dst_lo:dst_lo + count] = data[src_lo:src_lo + count]
         return out
 
     @staticmethod
@@ -813,6 +1148,8 @@ class ExportedDataset(AbstractDataset):
         data_catchment_ids: np.ndarray,
         desired_catchment_ids: np.ndarray,
         desired_basin_ids: np.ndarray,
+        basin_shift_days: Optional[np.ndarray] = None,
+        valid_length_days: Optional[np.ndarray] = None,
     ) -> None:
         """Attach an inflow overlay from raw gauge data.
 
@@ -821,6 +1158,11 @@ class ExportedDataset(AbstractDataset):
         cropping to the dataset window, column reordering, per-column
         longest-valid-run detection (NaN in the raw data ⇒ invalid),
         per-basin ``(shift, length)`` coordination and NaN→0 filling.
+        A producer that already qualified the native observation spans may
+        pass both ``basin_shift_days`` and ``valid_length_days``; the pair is
+        mapped by ``data_catchment_ids``, cropped to the dataset window and
+        composed with the per-basin coordination instead of being inferred
+        again from filled values.
 
         After this call:
 
@@ -855,6 +1197,12 @@ class ExportedDataset(AbstractDataset):
             column (typically ``model.base.catchment_basin_id["
             "model.inflow.inflow_catchment_idx]``). Used to
             coordinate per-basin (shift, length).
+        basin_shift_days, valid_length_days : np.ndarray, optional
+            Native-axis valid spans corresponding one-for-one with
+            ``data_catchment_ids``. They must be supplied together as
+            non-negative integer arrays, and every span must fit inside
+            ``data``. Despite the historical ``days`` name, values count
+            dataset time steps.
         """
         data = np.asarray(data, dtype=np.float32)
         if data.ndim != 2:
@@ -866,6 +1214,43 @@ class ExportedDataset(AbstractDataset):
             raise ValueError(
                 f"attach_inflow_overlay: data_catchment_ids shape "
                 f"{src_cids.shape} does not match data columns {data.shape[1]}")
+        if (basin_shift_days is None) != (valid_length_days is None):
+            raise ValueError(
+                "attach_inflow_overlay: basin_shift_days and "
+                "valid_length_days must be supplied together"
+            )
+        explicit_spans = basin_shift_days is not None
+        source_shift = source_length = None
+        if explicit_spans:
+            raw_shift = np.asarray(basin_shift_days)
+            raw_length = np.asarray(valid_length_days)
+            expected_shape = (data.shape[1],)
+            if raw_shift.shape != expected_shape or raw_length.shape != expected_shape:
+                raise ValueError(
+                    "attach_inflow_overlay: explicit shift/length arrays must "
+                    f"both have shape {expected_shape}; got "
+                    f"{raw_shift.shape} and {raw_length.shape}"
+                )
+            if not np.issubdtype(raw_shift.dtype, np.integer) or not np.issubdtype(
+                raw_length.dtype, np.integer
+            ):
+                raise TypeError(
+                    "attach_inflow_overlay: explicit shift/length arrays must "
+                    "contain integers"
+                )
+            source_shift = raw_shift.astype(np.int64, copy=False)
+            source_length = raw_length.astype(np.int64, copy=False)
+            if np.any(source_shift < 0) or np.any(source_length < 0):
+                raise ValueError(
+                    "attach_inflow_overlay: explicit shift/length values must "
+                    "be non-negative"
+                )
+            source_end = source_shift + source_length
+            if np.any(source_end < source_shift) or np.any(source_end > data.shape[0]):
+                raise ValueError(
+                    "attach_inflow_overlay: every explicit valid span must fit "
+                    "inside the native data time axis"
+                )
         dst_cids = np.asarray(desired_catchment_ids, dtype=np.int64)
         if np.unique(dst_cids).size != dst_cids.size:
             raise ValueError(
@@ -900,16 +1285,38 @@ class ExportedDataset(AbstractDataset):
         # Align time axis to the dataset window.
         aligned_raw = self._align_overlay_data(data_reordered, data_start_date)
 
-        # 3. Per-column longest valid run on the aligned (dataset-window)
-        #    axis.  NaN → invalid.
+        # 3. Determine per-column valid spans on the aligned dataset axis.
+        #    Without explicit producer metadata, NaN (including alignment
+        #    padding) is invalid. With metadata, duplicate source columns use
+        #    the intersection because all contributors must be present for an
+        #    aggregate to be fully observed.
         C = dst_cids.size
         per_col_shift = np.zeros(C, dtype=np.int64)
         per_col_length = np.zeros(C, dtype=np.int64)
-        for c in range(C):
-            valid = ~np.isnan(aligned_raw[:, c])
-            s, ln = self._longest_valid_run(valid)
-            per_col_shift[c] = s
-            per_col_length[c] = ln
+        if explicit_spans:
+            data_offset = timedelta_quotient(
+                data_start_date - self.start_date,
+                self.time_interval,
+                duration_label="inflow valid-span offset",
+                interval_label="time_interval",
+            )
+            T_ds = aligned_raw.shape[0]
+            for c, cols in enumerate(source_groups):
+                native_start = int(source_shift[cols].max())
+                native_end = int(
+                    (source_shift[cols] + source_length[cols]).min()
+                )
+                dataset_start = max(0, data_offset + native_start)
+                dataset_end = min(T_ds, data_offset + native_end)
+                if dataset_start < dataset_end:
+                    per_col_shift[c] = dataset_start
+                    per_col_length[c] = dataset_end - dataset_start
+        else:
+            for c in range(C):
+                valid = ~np.isnan(aligned_raw[:, c])
+                s, ln = self._longest_valid_run(valid)
+                per_col_shift[c] = s
+                per_col_length[c] = ln
 
         # 4. Per-basin coordination: shift = max leading offset,
         #    length = min end minus coord shift (clamped at 0).
@@ -934,7 +1341,7 @@ class ExportedDataset(AbstractDataset):
         out_length = np.zeros(C, dtype=np.int64)
         for c in range(C):
             b = int(dst_basin[c])
-            if b in basin_shift:
+            if per_col_length[c] > 0 and b in basin_shift:
                 out_shift[c] = basin_shift[b]
                 out_length[c] = basin_length[b]
 
@@ -1031,18 +1438,6 @@ class ExportedDataset(AbstractDataset):
                 f"not found in data_catchment_ids")
         data_reordered = np.ascontiguousarray(data[:, col_pos])
         aligned = self._align_overlay_data(data_reordered, data_start_date)
-        # _align_overlay_data zero-fills out-of-window rows; convert those
-        # zeros back to NaN so the loss mask treats them as missing.
-        # We detect out-of-window rows by re-computing the offset.
-        T_ds = aligned.shape[0]
-        offset = (self.start_date - data_start_date).days
-        T_src = int(data.shape[0])
-        oob = np.ones(T_ds, dtype=bool)
-        lo = max(offset, 0)
-        hi = min(offset + T_ds, T_src)
-        if lo < hi:
-            oob[lo - offset: hi - offset] = False
-        aligned[oob, :] = np.nan
 
         shift = np.array(
             [int(self._basin_shift.get(int(b), 0)) for b in dst_basin],

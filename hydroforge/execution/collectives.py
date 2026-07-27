@@ -1,7 +1,14 @@
-"""Explicit distributed operators for compiled substeps."""
+"""Explicit distributed operators for compiled substeps.
+
+Every collective goes through one batched path: a batch costs a single
+managed-step handshake and one NCCL coalescing group rather than one of each
+per tensor.  ``reduce_`` and ``all_reduce_`` are its one-tensor spellings.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from contextlib import nullcontext
 from typing import Literal
 
 import torch
@@ -22,6 +29,13 @@ _DTYPE_CODES = {
 }
 _DEVICE_CODES = {"cpu": 1, "cuda": 2, "mps": 3}
 _COLLECTIVE_DEVICES = frozenset({"cpu", "cuda"})
+_REDUCTION_CODES = {"min": 0, "max": 1, "sum": 2}
+
+# 63-bit FNV-1a parameters: the folded batch signature travels in one int64
+# slot of the managed-step vector, so it must stay non-negative.
+_FNV_OFFSET = 0xCBF29CE484222325
+_FNV_PRIME = 0x100000001B3
+_SIGNATURE_MASK = (1 << 63) - 1
 
 
 def _reduce_op(reduction: Reduction):
@@ -42,7 +56,7 @@ def _require_distributed(operation: str) -> None:
         )
 
 
-def _collective_signature(
+def _tensor_abi(
     tensor: torch.Tensor, *, operation: str,
 ) -> tuple[int, int, int]:
     """Validate and encode the process-group-independent tensor ABI."""
@@ -68,6 +82,27 @@ def _collective_signature(
     return dtype_code, tensor.numel(), device_code
 
 
+def _batch_signature(
+    abis: Sequence[tuple[int, int, int]],
+    reduction: Reduction,
+    destination: int | None,
+) -> tuple[int, int, int]:
+    """Fold a whole batch into the three-int managed-step signature.
+
+    Slots 0 and 2 carry the batch length and total element count; slot 1 hashes
+    each tensor's ABI in order, so any cross-rank difference is still rejected.
+    """
+
+    digest = _FNV_OFFSET
+    for value in (
+        _REDUCTION_CODES[reduction],
+        -1 if destination is None else destination,
+        *(field for abi in abis for field in abi),
+    ):
+        digest = ((digest ^ (value & 0xFFFFFFFFFFFFFFFF)) * _FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return len(abis), digest & _SIGNATURE_MASK, sum(abi[1] for abi in abis)
+
+
 def _validate_collective_runtime(
     tensor: torch.Tensor, *, operation: str, destination: int | None = None,
 ) -> None:
@@ -79,35 +114,129 @@ def _validate_collective_runtime(
             f"{operation} does not support device {tensor.device.type!r}"
         )
     if destination is not None and destination >= dist.get_world_size():
-        raise ValueError("reduce_ destination is outside the process group")
+        raise ValueError(f"{operation} destination is outside the process group")
     backend = str(dist.get_backend()).lower()
     if "nccl" in backend and tensor.device.type != "cuda":
         raise ValueError(f"{operation} with NCCL requires a CUDA tensor")
 
 
-def _launch_all_reduce(tensor: torch.Tensor, reduction: Reduction) -> None:
-    _validate_collective_runtime(tensor, operation="all_reduce_")
-    dist.all_reduce(tensor, op=_reduce_op(reduction))
-
-
-def _launch_reduce(
-    tensor: torch.Tensor, reduction: Reduction, *, destination: int,
-) -> None:
-    _validate_collective_runtime(
-        tensor, operation="reduce_", destination=destination,
-    )
-    dist.reduce(tensor, dst=destination, op=_reduce_op(reduction))
-
-
 def _event_kind(
     operation: str, reduction: Reduction, destination: int | None = None,
 ) -> int:
-    reduction_code = {"min": 0, "max": 1, "sum": 2}[reduction]
+    reduction_code = _REDUCTION_CODES[reduction]
     if operation == "all_reduce":
         return 10 + reduction_code
     if operation == "reduce" and destination is not None:
         return 100 + destination * 3 + reduction_code
     raise ValueError(f"invalid collective operation {operation!r}")
+
+
+def _coalescing_group(device: torch.device):
+    """Group the batch into one NCCL submission when the backend allows it."""
+
+    manager = getattr(dist, "_coalescing_manager", None)
+    if manager is None or device.type != "cuda":
+        return nullcontext()
+    if "nccl" not in str(dist.get_backend()).lower():
+        return nullcontext()
+    return manager(device=device, async_ops=False)
+
+
+def _normalize_batch(
+    tensors: Sequence[torch.Tensor], *, operation: str,
+) -> tuple[torch.Tensor, ...]:
+    if isinstance(tensors, torch.Tensor):
+        raise TypeError(
+            f"{operation} takes a sequence of tensors; pass [tensor] for one"
+        )
+    batch = tuple(tensors)
+    for tensor in batch:
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{operation} tensors must all be torch.Tensor")
+    devices = {tensor.device for tensor in batch}
+    if len(devices) > 1:
+        raise ValueError(
+            f"{operation} tensors must share one device, got {sorted(map(str, devices))}"
+        )
+    return batch
+
+
+def _run_batch(
+    tensors: Sequence[torch.Tensor],
+    *,
+    operation: str,
+    reduction: Reduction,
+    destination: int | None,
+) -> None:
+    """Record, or synchronize once and launch the whole batch."""
+
+    if reduction not in _REDUCTION_CODES:
+        raise ValueError("reduction must be 'min', 'max', or 'sum'")
+    if destination is not None and (
+        type(destination) is not int or destination < 0
+    ):
+        raise ValueError(
+            f"{operation} destination must be a non-negative exact int"
+        )
+    batch = _normalize_batch(tensors, operation=operation)
+    abis = [_tensor_abi(tensor, operation=operation) for tensor in batch]
+
+    recorder = active_operator_recorder()
+    if recorder is not None:
+        # Recording does not require an initialized process group.  Each
+        # tensor stays its own IR operator so replay ordering is unchanged.
+        if (
+            destination is not None and dist.is_available()
+            and dist.is_initialized()
+            and destination >= dist.get_world_size()
+        ):
+            raise ValueError(
+                f"{operation} destination is outside the process group"
+            )
+        for tensor, abi in zip(batch, abis):
+            recorder.record_collective(
+                tensor, reduction, operation=operation,
+                destination=destination, signature=abi,
+            )
+        return
+
+    from hydroforge.execution.step import synchronize_collective
+
+    for tensor in batch:
+        _validate_collective_runtime(
+            tensor, operation=operation, destination=destination,
+        )
+    # The handshake runs even for an empty batch: a rank that contributes no
+    # tensors must still be seen to disagree with one that does.
+    synchronize_collective(
+        _event_kind(operation, reduction, destination),
+        _batch_signature(abis, reduction, destination),
+    )
+    if not batch:
+        return
+    op = _reduce_op(reduction)
+    with _coalescing_group(batch[0].device):
+        for tensor in batch:
+            if destination is None:
+                dist.all_reduce(tensor, op=op)
+            else:
+                dist.reduce(tensor, dst=destination, op=op)
+
+
+def launch_recorded_collective(
+    tensor: torch.Tensor,
+    *,
+    operation: str,
+    reduction: Reduction,
+    destination: int | None,
+) -> None:
+    """Replay one recorded collective through the eager batch-of-one path,
+    so its event kind and signature match the eager spelling."""
+
+    _run_batch(
+        (tensor,), operation=operation, reduction=reduction,
+        destination=destination,
+    )
 
 
 @compiled_operator_entry
@@ -118,20 +247,21 @@ def all_reduce_(tensor: torch.Tensor, *, reduction: Reduction) -> None:
     this operation is recorded once and replayed on every physical iteration.
     """
 
-    if reduction not in {"min", "max", "sum"}:
-        raise ValueError("reduction must be 'min', 'max', or 'sum'")
-    signature = _collective_signature(tensor, operation="all_reduce_")
-    recorder = active_operator_recorder()
-    if recorder is not None:
-        recorder.record_collective(tensor, reduction, signature=signature)
-        return
-    from hydroforge.execution.step import synchronize_collective
-
-    _validate_collective_runtime(tensor, operation="all_reduce_")
-    synchronize_collective(
-        _event_kind("all_reduce", reduction), signature,
+    _run_batch(
+        (tensor,), operation="all_reduce", reduction=reduction,
+        destination=None,
     )
-    _launch_all_reduce(tensor, reduction)
+
+
+@compiled_operator_entry
+def all_reduce_many_(
+    tensors: Sequence[torch.Tensor], *, reduction: Reduction = "sum",
+) -> None:
+    """All-reduce a batch behind one handshake and one coalescing group."""
+
+    _run_batch(
+        tensors, operation="all_reduce", reduction=reduction, destination=None,
+    )
 
 
 @compiled_operator_entry
@@ -140,30 +270,24 @@ def reduce_(
 ) -> None:
     """Reduce one tensor to ``destination`` through the managed-step protocol."""
 
-    if type(destination) is not int or destination < 0:
-        raise ValueError("reduce_ destination must be a non-negative exact int")
-    if reduction not in {"min", "max", "sum"}:
-        raise ValueError("reduction must be 'min', 'max', or 'sum'")
-    signature = _collective_signature(tensor, operation="reduce_")
-    recorder = active_operator_recorder()
-    if recorder is not None:
-        # Recording does not require an initialized process group.
-        if (
-            dist.is_available() and dist.is_initialized()
-            and destination >= dist.get_world_size()
-        ):
-            raise ValueError("reduce_ destination is outside the process group")
-        recorder.record_collective(
-            tensor, reduction, operation="reduce", destination=destination,
-            signature=signature,
-        )
-        return
-    from hydroforge.execution.step import synchronize_collective
+    _run_batch(
+        (tensor,), operation="reduce", reduction=reduction,
+        destination=destination,
+    )
 
-    _validate_collective_runtime(
-        tensor, operation="reduce_", destination=destination,
+
+@compiled_operator_entry
+def reduce_many_(
+    tensors: Sequence[torch.Tensor], *, destination: int,
+    reduction: Reduction = "sum",
+) -> None:
+    """Reduce a batch to ``destination`` behind one handshake.
+
+    All tensors must share a device, and every rank must supply the same batch
+    length, order and ABI; a mismatch raises at the handshake, not in NCCL.
+    """
+
+    _run_batch(
+        tensors, operation="reduce", reduction=reduction,
+        destination=destination,
     )
-    synchronize_collective(
-        _event_kind("reduce", reduction, destination), signature,
-    )
-    _launch_reduce(tensor, reduction, destination=destination)

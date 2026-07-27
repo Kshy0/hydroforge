@@ -23,7 +23,11 @@ from hydroforge.contracts.kernels import (
     buffer_access_semantics,
 )
 from hydroforge.contracts.errors import ResourceCleanupError
-from hydroforge.contracts.runtime import BackendRequirement, ModuleRequirement
+from hydroforge.contracts.runtime import (
+    BackendRequirement,
+    ModuleRequirement,
+    validate_runtime_block_size,
+)
 from hydroforge.contracts.temporal import (
     CalendarWindow,
     DatasetTemporalContract,
@@ -49,6 +53,7 @@ __all__ = [
     "ResourceCleanupError",
     "BackendRequirement",
     "ModuleRequirement",
+    "validate_runtime_block_size",
     "ModuleFieldSchema",
     "ModuleSchema",
     "PartitionSchema",

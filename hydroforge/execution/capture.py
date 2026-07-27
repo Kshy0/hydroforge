@@ -213,12 +213,13 @@ class CaptureRuntime:
                     reset()
                     body(graph, False, stream)
                     graph.set_conditional(continue_flag, False, stream)
-                mutated = trace.mutated()
                 trace.restore_all()
-                mutated_snapshot = trace.snapshots_for(mutated)
 
                 def restore() -> None:
-                    self._restore_extra(mutated, mutated_snapshot)
+                    # Specialized native launchers do not increment Torch
+                    # version counters.  The caller supplied the exact write
+                    # set, so every cold-path warmup must restore it in full.
+                    trace.restore_all()
 
                 for _ in range(max(0, self.warmup_iterations - 1)):
                     reset()

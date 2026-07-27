@@ -557,11 +557,12 @@ class CheckpointRuntime:
                 raise event_error
             self._raise_remote_failure("pre-commit event", event_failures)
 
+        committed_proxy = proxy
         if model.world_size > 1:
             merge_error: BaseException | None = None
             rank_paths = ()
+            merged = model.output_full_dir / f"model_state_{timestamp}.nc"
             if model.rank == 0:
-                merged = model.output_full_dir / f"model_state_{timestamp}.nc"
                 rank_paths = tuple(
                     model.output_full_dir
                     / f"model_state_rank{rank}_{timestamp}.nc"
@@ -629,7 +630,31 @@ class CheckpointRuntime:
                     error = post_commit_error
                 execution.poison(error, phase="checkpoint post-commit event")
                 raise error
-        return proxy
+            # Return the committed, globally merged artifact on every rank.
+            # A rank-local staging proxy omits global fields away from rank 0
+            # and therefore cannot satisfy this service's own load contract.
+            # Once rank 0 broadcasts merge success, absence of the commit
+            # point is an I/O failure; silently returning the staging proxy
+            # would turn a failed save into a value that cannot be loaded.
+            reopen_error: BaseException | None = None
+            reopened_proxy: InputProxy | None = None
+            try:
+                reopened_proxy = InputProxy.from_nc(merged, lazy=True)
+            except BaseException as error:
+                reopen_error = error
+            reopen_failures = self._gather_failures(reopen_error)
+            if reopen_error is not None:
+                raise reopen_error
+            if any(failure is not None for failure in reopen_failures):
+                self._raise_remote_failure(
+                    "merged checkpoint reopen", reopen_failures
+                )
+            if reopened_proxy is None:
+                raise RuntimeError(
+                    "merged checkpoint reopen produced no proxy"
+                )
+            committed_proxy = reopened_proxy
+        return committed_proxy
 
     def _stage_load(
         self, proxy: InputProxy,

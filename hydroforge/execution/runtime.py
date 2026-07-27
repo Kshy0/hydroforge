@@ -133,6 +133,21 @@ class ModelExecution:
         identities: set[int] = set()
         for field_name, owners in fields.owners.items():
             for owner in owners:
+                schema_getter = getattr(owner.owner, "get_tensor_schema", None)
+                schema = (
+                    None if schema_getter is None else schema_getter(field_name)
+                )
+                if (
+                    schema is not None
+                    and schema.tensor is not None
+                    and schema.tensor.category == "virtual"
+                    and field_name not in owner.owner.__dict__
+                ):
+                    # Optional buffer virtuals stay descriptors until an
+                    # output request or initialize_model_state explicitly
+                    # materializes them. Index construction must not turn
+                    # every declared diagnostic into resident model state.
+                    continue
                 try:
                     value = getattr(owner.owner, field_name)
                 except AttributeError as error:
@@ -182,6 +197,38 @@ class ModelExecution:
             statistics._aggregator_function(
                 statistics._kernel_states, block_size,
             )
+
+    def invalidate_statistics(self, aggregator: Any) -> None:
+        """Release every cache that retains a statistics specialization."""
+        self.require_between_steps("statistics invalidation")
+        failures: list[BaseException] = []
+        try:
+            self.statistics.invalidate(aggregator)
+        except BaseException as error:
+            failures.append(error)
+        seen_programs: set[int] = set()
+        for program in tuple(self.programs.values()):
+            identity = id(program)
+            if identity in seen_programs:
+                continue
+            seen_programs.add(identity)
+            invalidate = getattr(program, "invalidate_statistics", None)
+            if invalidate is None:
+                continue
+            try:
+                invalidate(aggregator)
+            except BaseException as error:
+                failures.append(error)
+        try:
+            self.capture.invalidate_statistics(aggregator)
+        except BaseException as error:
+            failures.append(error)
+        if failures:
+            error = ResourceCleanupError(
+                "statistics execution caches", failures,
+            )
+            self.poison(error, phase="statistics invalidation")
+            raise error from failures[0]
 
     def invalidate(self) -> None:
         if self.closed:

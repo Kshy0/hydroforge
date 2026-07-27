@@ -20,6 +20,12 @@ if TYPE_CHECKING:
     from hydroforge.statistics.runtime import StatisticsRuntime
 
 
+_FULL_OUTPUT_GROUP = "__full__"
+# Full-output entry points use a namespace disjoint from indexed
+# ``aggr_kernel_*`` and scatter helpers.
+_FULL_OUTPUT_KERNEL = "hydroforge_full_output_metal_kernel"
+
+
 def _emit_argument_kernel_start(
     lines: list[str], kernel_name: str, fields: list[tuple[str, str, bool]],
 ) -> None:
@@ -116,7 +122,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                                               output_index: str,
                                               var_list: list) -> dict:
         """Generate a Metal kernel for variables saved at full tensor shape."""
-        kernel_name = f"aggr_kernel_{self._get_safe_name(output_index)}"
+        kernel_name = _FULL_OUTPUT_KERNEL
 
         sorted_inputs = sorted({
             name for var in var_list
@@ -207,8 +213,6 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 msl_lines.append(f'{indent}bool is_inner_first = ((flags & 1) != 0) && (sub_step == 0);')
             if 'is_inner_last' in needed_bools:
                 msl_lines.append(f'{indent}bool is_inner_last = (((flags >> 1) & 1) != 0) && (sub_step == num_sub_steps - 1);')
-            if 'is_middle' in needed_bools:
-                msl_lines.append(f'{indent}bool is_middle = (sub_step == num_sub_steps / 2);')
             if 'is_outer_first' in needed_bools:
                 msl_lines.append(f'{indent}bool is_outer_first = (((flags >> 2) & 1) != 0) && is_inner_last;')
             if 'is_outer_last' in needed_bools:
@@ -268,7 +272,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     msl_lines.extend([
                         f'{indent2}{{',
                         f'{indent2}    {ctype} old_v = p_{safe_var}_max_inner_state[out_idx];',
-                        f'{indent2}    {ctype} inner_new = is_inner_first ? {var_val} : max(old_v, {var_val});',
+                        f'{indent2}    {ctype} inner_new = is_inner_first ? {var_val} : hydroforge_maximum(old_v, {var_val});',
                         f'{indent2}    if (is_inner_last) {{',
                         f'{indent2}        p_{safe_var}_max_inner_state[out_idx] = ({ctype})(-INFINITY);',
                         f'{indent2}        {val_for} = inner_new;',
@@ -281,7 +285,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     msl_lines.extend([
                         f'{indent2}{{',
                         f'{indent2}    {ctype} old_v = p_{safe_var}_min_inner_state[out_idx];',
-                        f'{indent2}    {ctype} inner_new = is_inner_first ? {var_val} : min(old_v, {var_val});',
+                        f'{indent2}    {ctype} inner_new = is_inner_first ? {var_val} : hydroforge_minimum(old_v, {var_val});',
                         f'{indent2}    if (is_inner_last) {{',
                         f'{indent2}        p_{safe_var}_min_inner_state[out_idx] = ({ctype})(INFINITY);',
                         f'{indent2}        {val_for} = inner_new;',
@@ -294,11 +298,6 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     msl_lines.extend([
                         f'{indent2}if (is_inner_first) p_{safe_var}_first_inner_state[out_idx] = {var_val};',
                         f'{indent2}if (is_inner_last) {val_for} = p_{safe_var}_first_inner_state[out_idx];',
-                    ])
-                elif inner_type == 'mid':
-                    msl_lines.extend([
-                        f'{indent2}if (is_middle) p_{safe_var}_mid_inner_state[out_idx] = {var_val};',
-                        f'{indent2}if (is_inner_last) {val_for} = p_{safe_var}_mid_inner_state[out_idx];',
                     ])
                 else:
                     raise ValueError(f"Unsupported full-output inner op '{inner_type}'")
@@ -314,14 +313,14 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                         msl_lines.extend([
                             f'{indent2}if (is_inner_last) {{',
                             f'{indent2}    if (is_outer_first) {{ {out_ptr}[out_idx] = {val_var}; }}',
-                            f'{indent2}    else {{ {out_ptr}[out_idx] = max({out_ptr}[out_idx], {val_var}); }}',
+                            f'{indent2}    else {{ {out_ptr}[out_idx] = hydroforge_maximum({out_ptr}[out_idx], {val_var}); }}',
                             f'{indent2}}}',
                         ])
                     elif outer == 'min':
                         msl_lines.extend([
                             f'{indent2}if (is_inner_last) {{',
                             f'{indent2}    if (is_outer_first) {{ {out_ptr}[out_idx] = {val_var}; }}',
-                            f'{indent2}    else {{ {out_ptr}[out_idx] = min({out_ptr}[out_idx], {val_var}); }}',
+                            f'{indent2}    else {{ {out_ptr}[out_idx] = hydroforge_minimum({out_ptr}[out_idx], {val_var}); }}',
                             f'{indent2}}}',
                         ])
                     elif outer == 'sum':
@@ -365,19 +364,17 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 elif op == 'max':
                     msl_lines.extend([
                         f'{indent2}if (is_inner_first) {{ {out_ptr}[out_idx] = {var_val}; }}',
-                        f'{indent2}else {{ {out_ptr}[out_idx] = max({out_ptr}[out_idx], {var_val}); }}',
+                        f'{indent2}else {{ {out_ptr}[out_idx] = hydroforge_maximum({out_ptr}[out_idx], {var_val}); }}',
                     ])
                 elif op == 'min':
                     msl_lines.extend([
                         f'{indent2}if (is_inner_first) {{ {out_ptr}[out_idx] = {var_val}; }}',
-                        f'{indent2}else {{ {out_ptr}[out_idx] = min({out_ptr}[out_idx], {var_val}); }}',
+                        f'{indent2}else {{ {out_ptr}[out_idx] = hydroforge_minimum({out_ptr}[out_idx], {var_val}); }}',
                     ])
                 elif op == 'last':
                     msl_lines.append(f'{indent2}if (is_inner_last) {{ {out_ptr}[out_idx] = {var_val}; }}')
                 elif op == 'first':
                     msl_lines.append(f'{indent2}if (is_inner_first) {{ {out_ptr}[out_idx] = {var_val}; }}')
-                elif op == 'mid':
-                    msl_lines.append(f'{indent2}if (is_middle) {{ {out_ptr}[out_idx] = {var_val}; }}')
                 else:
                     raise ValueError(f"Unsupported full-output op '{op}'")
 
@@ -403,7 +400,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
 
         Returns metadata dict used by the Python wrapper.
         """
-        if output_index == "__full__":
+        if output_index == _FULL_OUTPUT_GROUP:
             return self._generate_metal_full_kernel_for_group(
                 msl_lines, output_index, var_list
             )
@@ -527,8 +524,6 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 msl_lines.append(f'{indent}bool is_inner_first = (flags & 1) && (sub_step == 0);')
             if 'is_inner_last' in needed_bools:
                 msl_lines.append(f'{indent}bool is_inner_last = ((flags >> 1) & 1) && (sub_step == num_sub_steps - 1);')
-            if 'is_middle' in needed_bools:
-                msl_lines.append(f'{indent}bool is_middle = (sub_step == num_sub_steps / 2);')
             if 'is_outer_first' in needed_bools:
                 msl_lines.append(f'{indent}bool is_outer_first = ((flags >> 2) & 1) && is_inner_last;')
             if 'is_outer_last' in needed_bools:
@@ -607,7 +602,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}{ctype} {val_for} = ({ctype})0;',
                             f'{indent2}{{',
                             f'{indent2}    {ctype} inner_old = p_{safe_var}_max_inner_state[{out_idx}];',
-                            f'{indent2}    {ctype} inner_new = (is_inner_first && macro_step_index == 0) ? {var_val} : max(inner_old, {var_val});',
+                            f'{indent2}    {ctype} inner_new = (is_inner_first && macro_step_index == 0) ? {var_val} : hydroforge_maximum(inner_old, {var_val});',
                             f'{indent2}    if (is_inner_last) {{',
                             f'{indent2}        p_{safe_var}_max_inner_state[{out_idx}] = ({ctype})(-INFINITY);',
                             f'{indent2}        {val_for} = inner_new;',
@@ -621,7 +616,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}{ctype} {val_for} = ({ctype})0;',
                             f'{indent2}{{',
                             f'{indent2}    {ctype} inner_old = p_{safe_var}_min_inner_state[{out_idx}];',
-                            f'{indent2}    {ctype} inner_new = (is_inner_first && macro_step_index == 0) ? {var_val} : min(inner_old, {var_val});',
+                            f'{indent2}    {ctype} inner_new = (is_inner_first && macro_step_index == 0) ? {var_val} : hydroforge_minimum(inner_old, {var_val});',
                             f'{indent2}    if (is_inner_last) {{',
                             f'{indent2}        p_{safe_var}_min_inner_state[{out_idx}] = ({ctype})(INFINITY);',
                             f'{indent2}        {val_for} = inner_new;',
@@ -636,13 +631,6 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}if (is_inner_first) p_{safe_var}_first_inner_state[{out_idx}] = {var_val};',
                             f'{indent2}if (is_inner_last) {val_for} = p_{safe_var}_first_inner_state[{out_idx}];',
                         ])
-                    elif inner_type == 'mid':
-                        msl_lines.extend([
-                            f'{indent2}{ctype} {val_for} = ({ctype})0;',
-                            f'{indent2}if (is_middle) p_{safe_var}_mid_inner_state[{out_idx}] = {var_val};',
-                            f'{indent2}if (is_inner_last) {val_for} = p_{safe_var}_mid_inner_state[{out_idx}];',
-                        ])
-
             # Emit actual ops
             for var in dims_1d:
                 safe_var = self._get_safe_name(var)
@@ -679,7 +667,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                                     else f'({ctype})(INFINITY)'
                                 )
                                 candidate = (
-                                    f'(isnan({val_var}) ? {sentinel} : {val_var})'
+                                    f'(hydroforge_isnan({val_var}) ? {sentinel} : {val_var})'
                                     if self._statistics_layouts[var].dtype.is_floating_point
                                     else val_var
                                 )
@@ -706,7 +694,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                                 msl_lines.extend([
                                     f'{indent2}if (is_inner_last) {{',
                                     f'{indent2}    long k_base = ({out_idx}) * {operation.k};',
-                                    f'{indent2}    {ctype} new_value = isnan({val_var}) ? {sentinel} : {val_var};',
+                                    f'{indent2}    {ctype} new_value = hydroforge_isnan({val_var}) ? {sentinel} : {val_var};',
                                     f'{indent2}    int new_index = macro_step_index;',
                                     f'{indent2}    if (is_outer_first) {{',
                                     f'{indent2}        {aux_ptr}[k_base] = new_value;',
@@ -730,7 +718,10 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                                     f'{indent2}}}',
                                 ])
                         elif outer_base in ('max', 'min'):
-                            cmp_fn = "max" if outer_base == "max" else "min"
+                            cmp_fn = (
+                                "hydroforge_maximum"
+                                if outer_base == "max" else "hydroforge_minimum"
+                            )
                             out_ptr = f"p_{safe_var}_{op}"
                             if operation.k == 1:
                                 msl_lines.extend([
@@ -752,7 +743,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                                 msl_lines.extend([
                                     f'{indent2}if (is_inner_last) {{',
                                     f'{indent2}    long k_base = ({out_idx}) * {operation.k};',
-                                    f'{indent2}    {ctype} new_value = isnan({val_var}) ? {sentinel} : {val_var};',
+                                    f'{indent2}    {ctype} new_value = hydroforge_isnan({val_var}) ? {sentinel} : {val_var};',
                                     f'{indent2}    if (is_outer_first) {{',
                                     f'{indent2}        {out_ptr}[k_base] = new_value;',
                                     f'{indent2}        for (int rank = 1; rank < {operation.k}; ++rank) {{',
@@ -825,20 +816,17 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     elif op == 'max':
                         msl_lines.extend([
                             f'{indent2}if (is_inner_first) {{ {out_ptr}[{out_idx}] = {var_val}; }}',
-                            f'{indent2}else {{ {out_ptr}[{out_idx}] = max({out_ptr}[{out_idx}], {var_val}); }}',
+                            f'{indent2}else {{ {out_ptr}[{out_idx}] = hydroforge_maximum({out_ptr}[{out_idx}], {var_val}); }}',
                         ])
                     elif op == 'min':
                         msl_lines.extend([
                             f'{indent2}if (is_inner_first) {{ {out_ptr}[{out_idx}] = {var_val}; }}',
-                            f'{indent2}else {{ {out_ptr}[{out_idx}] = min({out_ptr}[{out_idx}], {var_val}); }}',
+                            f'{indent2}else {{ {out_ptr}[{out_idx}] = hydroforge_minimum({out_ptr}[{out_idx}], {var_val}); }}',
                         ])
                     elif op == 'last':
                         msl_lines.append(f'{indent2}if (is_inner_last) {{ {out_ptr}[{out_idx}] = {var_val}; }}')
                     elif op == 'first':
                         msl_lines.append(f'{indent2}if (is_inner_first) {{ {out_ptr}[{out_idx}] = {var_val}; }}')
-                    elif op == 'mid':
-                        msl_lines.append(f'{indent2}if (is_middle) {{ {out_ptr}[{out_idx}] = {var_val}; }}')
-
         # -- 2D variables --
         if dims_2d:
             msl_lines.append(f'{indent2}// === 2D variables ===')
@@ -879,19 +867,17 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     elif op == 'max':
                         msl_lines.extend([
                             f'{indent2}    if (is_inner_first) {{ {out_ptr}[{out_2d}] = {val_2d}; }}',
-                            f'{indent2}    else {{ {out_ptr}[{out_2d}] = max({out_ptr}[{out_2d}], {val_2d}); }}',
+                            f'{indent2}    else {{ {out_ptr}[{out_2d}] = hydroforge_maximum({out_ptr}[{out_2d}], {val_2d}); }}',
                         ])
                     elif op == 'min':
                         msl_lines.extend([
                             f'{indent2}    if (is_inner_first) {{ {out_ptr}[{out_2d}] = {val_2d}; }}',
-                            f'{indent2}    else {{ {out_ptr}[{out_2d}] = min({out_ptr}[{out_2d}], {val_2d}); }}',
+                            f'{indent2}    else {{ {out_ptr}[{out_2d}] = hydroforge_minimum({out_ptr}[{out_2d}], {val_2d}); }}',
                         ])
                     elif op == 'last':
                         msl_lines.append(f'{indent2}    if (is_inner_last) {{ {out_ptr}[{out_2d}] = {val_2d}; }}')
                     elif op == 'first':
                         msl_lines.append(f'{indent2}    if (is_inner_first) {{ {out_ptr}[{out_2d}] = {val_2d}; }}')
-                    elif op == 'mid':
-                        msl_lines.append(f'{indent2}    if (is_middle) {{ {out_ptr}[{out_2d}] = {val_2d}; }}')
                     msl_lines.append(f'{indent2}}}')
 
         if num_trials > 1:
@@ -966,7 +952,10 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             leaf_inputs = tuple(
                 key for key in ir.scatter_inputs(name) if key != source.index
             )
-            strides: dict[str, int] = {}
+            # Expressions are allowed to reference the (shared) scatter index
+            # itself.  It is already bound above and always has zero trial
+            # stride, but must still participate in value-load addressing.
+            strides: dict[str, int] = {source.index: 0}
             for key in leaf_inputs:
                 ctype = self._metal_dtype_str(key)
                 key_safe = self._get_safe_name(key)
@@ -1062,7 +1051,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 msl_lines.extend([
                     "    if ((int)tid >= total) return;",
                     "    float count = p_cnt[tid];",
-                    "    if (count > 0.0f) p_buf[tid] /= count;",
+                    "    p_buf[tid] = count > 0.0f ? p_buf[tid] / count : nan(0u);",
                     "}", "",
                 ])
                 metas.append({
@@ -1089,6 +1078,24 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             '// Auto-generated Metal aggregation kernels for hydroforge statistics',
             '#include <metal_stdlib>',
             'using namespace metal;',
+            '',
+            '// Extrema treat one NaN as missing and preserve NaN when both are NaN.',
+            '// Inspecting the IEEE bits keeps this contract explicit under fast math.',
+            'inline bool hydroforge_isnan(float value) {',
+            '    return (as_type<uint>(value) & 0x7fffffffu) > 0x7f800000u;',
+            '}',
+            'inline float hydroforge_maximum(float left, float right) {',
+            '    return hydroforge_isnan(left) ? right : (hydroforge_isnan(right) ? left : max(left, right));',
+            '}',
+            'inline float hydroforge_minimum(float left, float right) {',
+            '    return hydroforge_isnan(left) ? right : (hydroforge_isnan(right) ? left : min(left, right));',
+            '}',
+            'inline int hydroforge_maximum(int left, int right) { return max(left, right); }',
+            'inline int hydroforge_minimum(int left, int right) { return min(left, right); }',
+            'inline long hydroforge_maximum(long left, long right) { return max(left, right); }',
+            'inline long hydroforge_minimum(long left, long right) { return min(left, right); }',
+            'inline uchar hydroforge_maximum(uchar left, uchar right) { return max(left, right); }',
+            'inline uchar hydroforge_minimum(uchar left, uchar right) { return min(left, right); }',
             '',
         ]
 

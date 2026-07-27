@@ -77,6 +77,10 @@ class ModelCompiler:
                         and tensor_is_active(
                             schema.tensor, getattr(model, "opened_modules", ()),
                         )
+                        and (
+                            getattr(schema.tensor, "category", None) != "virtual"
+                            or name in module.__dict__
+                        )
                     )
                 )
             } | set(module.get_reference_index_fields()) | {

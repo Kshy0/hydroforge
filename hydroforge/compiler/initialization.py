@@ -16,6 +16,7 @@ from hydroforge.execution.parameters import ParameterPlanRuntime
 from hydroforge.execution.progress import ProgressRuntime
 from hydroforge.execution.runtime import ModelExecution
 from hydroforge.contracts.temporal import canonical_calendar, require_calendar
+from hydroforge.contracts.temporal import convert_calendar_date, date_calendar
 from hydroforge.contracts.runtime import (
     DEFAULT_BACKEND_REQUIREMENT, RUNTIME_BACKEND_REQUIREMENTS,
 )
@@ -129,6 +130,20 @@ class ModelInitializer:
                 )
             model.calendar = schedule.calendar
             if model.output_start_time is not None:
+                if (
+                    schedule.calendar != "standard"
+                    and date_calendar(model.output_start_time) == "standard"
+                ):
+                    try:
+                        model.output_start_time = convert_calendar_date(
+                            model.output_start_time, schedule.calendar,
+                        )
+                    except (TypeError, ValueError, OverflowError) as error:
+                        raise ValueError(
+                            f"output_start_time {model.output_start_time!r} "
+                            f"cannot be represented by calendar "
+                            f"{schedule.calendar!r}"
+                        ) from error
                 require_calendar(
                     model.output_start_time, schedule.calendar,
                     label="output_start_time",
@@ -181,7 +196,7 @@ class ModelInitializer:
                 **model._modules,
                 **module_data,
             )
-            module._event_sink = model.event_sink
+            module._bind_event_sink(model.event_sink)
             model._modules[name] = module
         missing = set(model.opened_modules).difference(model._modules)
         if missing:

@@ -516,7 +516,8 @@ class RankOutputCatalog:
                     info["x"], info["y"] = None, None
                     logger.info(
                         "%s output_coord is not a valid linear index; cannot "
-                        "auto-convert rank %d", info["rank_id"],
+                        "auto-convert rank %d", self.owner.var_name,
+                        info["rank_id"],
                     )
             else:
                 info["x"], info["y"] = None, None

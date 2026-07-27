@@ -17,7 +17,7 @@ AccessMode = Literal[
     "atomic_write", "atomic_add", "atomic_min", "atomic_max",
 ]
 ScalarKind = Literal["bool", "int32", "float32"]
-RuntimeScalarKind = Literal["bool", "int32", "index", "float32"]
+RuntimeScalarKind = Literal["bool", "int32", "uint32", "index", "float32"]
 LoweringMode = Literal["canonical", "plan", "declared"]
 ParameterOrder = Literal["canonical", "native"]
 BufferAccessLowering = Literal["exact", "conservative"]
@@ -80,6 +80,8 @@ def _host_scalar_is_valid(value: Any, kind: RuntimeScalarKind) -> bool:
         return type(value) is bool
     if kind == "int32":
         return type(value) is int and -(2 ** 31) <= value < 2 ** 31
+    if kind == "uint32":
+        return type(value) is int and 0 <= value < 2 ** 32
     if kind == "index":
         return type(value) is int and -(2 ** 63) <= value < 2 ** 63
     if kind == "float32":
@@ -398,7 +400,7 @@ class KernelSpec:
                 f"{sorted(unknown_runtime)}"
             )
         invalid_runtime_kinds = set(self.runtime_scalars.values()).difference(
-            {"bool", "int32", "index", "float32"},
+            {"bool", "int32", "uint32", "index", "float32"},
         )
         if invalid_runtime_kinds:
             raise ValueError(

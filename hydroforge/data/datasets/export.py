@@ -52,6 +52,10 @@ class DatasetExporter:
     def num_spin_up_steps(self):
         return self.owner.num_spin_up_steps
 
+    @property
+    def num_spin_up_chunks(self):
+        return self.owner.num_spin_up_chunks
+
     def get_time_by_index(self, index):
         return self.owner.get_time_by_index(index)
 
@@ -126,11 +130,15 @@ class DatasetExporter:
         t_mapping_T = t_mapping.t().coalesce()
 
         # ----- Accumulate mean over all chunks -----
+        first_chunk = self.num_spin_up_chunks
         n_chunks = len(self)
         total_steps = 0
         accumulator = torch.zeros(n_catch, dtype=torch.float64, device=dev)
 
-        pbar = tqdm(range(n_chunks), desc="Computing climatology", unit="chunk")
+        pbar = tqdm(
+            range(first_chunk, n_chunks),
+            desc="Computing climatology", unit="chunk",
+        )
         for ci in pbar:
             block = self.read_chunk(ci)  # (T, n_grids)
 
@@ -337,7 +345,9 @@ class DatasetExporter:
 
             time_var = ds.createVariable("time", "f8", ("time",))
             time_var.setncattr("units", "seconds since 1900-01-01 00:00:00")
-            time_var.setncattr("calendar", "standard")
+            time_var.setncattr(
+                "calendar", getattr(self.owner, "calendar", "standard"),
+            )
 
             output_coord = ds.createVariable("catchment_id", "i8", ("saved_points",))
             output_coord[:] = catchment_ids
@@ -363,7 +373,7 @@ class DatasetExporter:
         created_files = {name: [] for name in output_methods}
         current_year = None
         write_idx = 0
-        total_steps = self.num_main_steps + self.num_spin_up_steps
+        total_steps = self.num_main_steps
 
         def _close_writers(error=None):
             nonlocal writers, writer_stack
@@ -402,9 +412,10 @@ class DatasetExporter:
             if not split_by_year:
                 _open_writers()
 
+            first_chunk = self.num_spin_up_chunks
             n_chunks = len(self)
             pbar = tqdm(total=total_steps, desc="Exporting", unit="step")
-            for ci in range(n_chunks):
+            for ci in range(first_chunk, n_chunks):
                 base_idx = ci * self.chunk_len
                 read_data = self.read_chunk(ci)
                 if isinstance(read_data, dict):
@@ -442,29 +453,46 @@ class DatasetExporter:
                     agg_block = torch.sparse.mm(t_mapping_T, block_tensor.T)
                     mapped_blocks[name] = agg_block.T.contiguous().to("cpu").numpy()
 
-                # Write each timestep in the block
-                for k in range(T):
-                    dt_k = self.get_time_by_index(base_idx + k)
-
+                # Write maximal same-file runs as blocks.  Chunk data is
+                # already resident, so row-at-a-time writes only add HDF5
+                # extension, chunk lookup and compression overhead.
+                chunk_times = [
+                    self.get_time_by_index(base_idx + k) for k in range(T)
+                ]
+                run_start = 0
+                while run_start < T:
                     if split_by_year:
-                        year = dt_k.year
+                        year = chunk_times[run_start].year
                         if year != current_year:
                             current_year = year
                             _open_writers(current_year)
+                        run_end = run_start + 1
+                        while (
+                            run_end < T
+                            and chunk_times[run_end].year == current_year
+                        ):
+                            run_end += 1
+                    else:
+                        run_end = T
 
+                    _ds, first_time_var, _out_var = next(
+                        iter(writers.values())
+                    )
+                    time_values = nc.date2num(
+                        chunk_times[run_start:run_end],
+                        units=first_time_var.getncattr("units"),
+                        calendar=first_time_var.getncattr("calendar"),
+                    )
+                    write_end = write_idx + run_end - run_start
                     for name in output_methods:
                         _ds, time_var, out_var = writers[name]
-                        out_var[write_idx, :] = mapped_blocks[name][k, :].astype(
-                            numpy_dtype, copy=False
-                        )
-                        time_val = nc.date2num(
-                            dt_k,
-                            units=time_var.getncattr("units"),
-                            calendar=time_var.getncattr("calendar"),
-                        )
-                        time_var[write_idx] = time_val
-                    write_idx += 1
-                    pbar.update(1)
+                        out_var[write_idx:write_end, :] = mapped_blocks[name][
+                            run_start:run_end, :
+                        ].astype(numpy_dtype, copy=False)
+                        time_var[write_idx:write_end] = time_values
+                    pbar.update(run_end - run_start)
+                    write_idx = write_end
+                    run_start = run_end
         except BaseException as error:
             failure = error
             raise

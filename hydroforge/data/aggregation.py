@@ -198,10 +198,14 @@ def aggregate_field_to_nc(
         var = ds.variables[var_name]
         has_time = var.ndim == 3
         ntime = int(var.shape[0]) if has_time else 1
-        field = np.asarray(var[:])
-    if isinstance(field, np.ma.MaskedArray):
-        field = field.filled(np.nan)
-    field = field.astype(np_dtype, copy=False)
+        field = var[:]
+    if np.ma.isMaskedArray(field):
+        # Integer masked arrays cannot represent a NaN fill value.  Convert
+        # while the mask is still attached, then fill in the floating output
+        # dtype used by the sparse aggregation.
+        field = field.astype(np_dtype, copy=False).filled(np.nan)
+    else:
+        field = np.asarray(field, dtype=np_dtype)
     if not has_time:
         field = field[None, ...]
 
@@ -223,6 +227,7 @@ def aggregate_field_to_nc(
         if has_time:
             time_var = ds.createVariable("time", "f8", ("time",))
             time_var.setncattr("units", "months" if ntime == 12 else "unknown")
+            time_var[:] = np.arange(ntime, dtype=np.float64)
 
         output_coord = ds.createVariable("catchment_id", "i8", ("saved_points",))
         output_coord[:] = mapping.target_ids

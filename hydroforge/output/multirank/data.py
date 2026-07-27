@@ -235,8 +235,19 @@ class MultiRankDataAccess:
         out_cols, local_idx = self._sorted_series_indices(pairs)
         with nc.Dataset(fp, "r") as ds:
             var = ds.variables[self.owner.var_name]
-            step = (local_end - local_start
-                    if self.owner.row_chunk_size is None else self.owner.row_chunk_size)
+            if self.owner.row_chunk_size is None:
+                # Bound the unfiltered NetCDF read even when the caller asks
+                # for only one gauge column.  Selection happens after the
+                # block is decoded, so the full saved-point row controls peak
+                # memory.
+                bytes_per_row = max(
+                    1,
+                    int(np.prod(var.shape[1:], dtype=np.int64))
+                    * np.dtype(var.dtype).itemsize,
+                )
+                step = max(1, (256 * 1024 * 1024) // bytes_per_row)
+            else:
+                step = self.owner.row_chunk_size
             for t0 in range(local_start, local_end, step):
                 t1 = min(t0 + step, local_end)
                 slices = [slice(t0, t1)]
@@ -263,12 +274,17 @@ class MultiRankDataAccess:
         target_dtype = self._result_dtype(dtype)
 
         def _as_list(v):
-            # Heuristic: if input is a list/tuple that looks like (N, 2) coordinates, treat as single array
             if isinstance(v, (list, tuple)):
-                arr = np.asarray(v)
-                # If it forms a valid (N, 2) array, wrap it as a single item.
-                if arr.ndim == 2 and arr.shape[1] == 2:
-                    return [arr]
+                # A sequence of ndarrays is the documented multi-ID-array
+                # form, even when every array happens to contain two IDs.
+                # Reserve the compact XY spelling for Python coordinate pairs.
+                if v and all(
+                    isinstance(item, (list, tuple))
+                    and len(item) == 2
+                    and all(np.isscalar(value) for value in item)
+                    for item in v
+                ):
+                    return [np.asarray(v)]
             return [np.asarray(a) for a in v] if isinstance(v, (list, tuple)) else [np.asarray(v)]
         arr_list = _as_list(points)
         if not arr_list:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -74,6 +74,14 @@ class TorchOperator:
     keywords: Any
     outputs: Any
     writes: tuple[torch.Tensor, ...]
+    _output_reference_ids: frozenset[int] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._output_reference_ids = frozenset(
+            id(reference)
+            for reference in _refs(self.outputs)
+            if isinstance(reference, _ValueRef)
+        )
 
     @staticmethod
     def _static(value: Any) -> Any:
@@ -94,12 +102,6 @@ class TorchOperator:
         )
 
     def launch(self, values: dict[int, torch.Tensor]) -> None:
-        output_references = {
-            id(reference)
-            for reference in _refs(self.outputs)
-            if isinstance(reference, _ValueRef)
-        }
-
         def resolve(value: Any) -> Any:
             if isinstance(value, _StableRef):
                 return value.tensor
@@ -109,7 +111,7 @@ class TorchOperator:
                 # been produced earlier in this exact replay. Falling back to
                 # its trace-time tensor would silently consume stale data when
                 # an operator dependency is malformed.
-                if id(value) in output_references:
+                if id(value) in self._output_reference_ids:
                     return value.tensor
                 try:
                     return values[value.index]
@@ -166,30 +168,40 @@ class CollectiveOperator:
     signature: tuple[int, int, int]
     reads: tuple[torch.Tensor, ...]
     writes: tuple[torch.Tensor, ...]
+    cuda_graph_capture_safe: bool = False
 
     def launch(self) -> None:
-        from hydroforge.execution.collectives import (
-            _event_kind, _launch_all_reduce, _launch_reduce,
-        )
-        from hydroforge.execution.step import synchronize_collective
+        from hydroforge.execution.collectives import launch_recorded_collective
 
         if self.operation == "all_reduce":
-            synchronize_collective(
-                _event_kind("all_reduce", self.reduction), self.signature,
-            )
-            _launch_all_reduce(self.tensor, self.reduction)
+            destination = None
         elif self.operation == "reduce" and self.destination is not None:
-            synchronize_collective(
-                _event_kind("reduce", self.reduction, self.destination),
-                self.signature,
-            )
-            _launch_reduce(
-                self.tensor, self.reduction, destination=self.destination,
-            )
+            destination = self.destination
         else:
             raise RuntimeError(
                 f"invalid recorded collective operation {self.operation!r}"
             )
+        launch_recorded_collective(
+            self.tensor, operation=self.operation, reduction=self.reduction,
+            destination=destination,
+        )
+
+
+@dataclass(slots=True)
+class PredicateLoopOperator:
+    """Hierarchical device-predicate loop embedded in an operator program."""
+
+    program: Any
+    reads: tuple[torch.Tensor, ...]
+    writes: tuple[torch.Tensor, ...]
+    cuda_graph_capture_safe: bool = False
+
+    def launch(self) -> None:
+        self.program.execute()
+
+    def close(self, capture: Any) -> None:
+        del capture
+        self.program.close()
 
 
 @dataclass(slots=True)
@@ -272,6 +284,10 @@ class OperatorProgram:
             (tensor, _tensor_abi(tensor))
             for tensor in dict.fromkeys(tensors)
         )
+        self.cuda_graph_capture_safe = all(
+            getattr(operator, "cuda_graph_capture_safe", True)
+            for operator in self.operators
+        )
 
     def require_stable_bindings(self) -> None:
         """Reject storage/metadata drift once per outer-step program launch."""
@@ -334,7 +350,8 @@ class OperatorProgram:
         values: dict[int, torch.Tensor] = {}
         for operator in self._launch_operators:
             if isinstance(operator, (
-                KernelOperator, CollectiveOperator, _MetalKernelSegment,
+                KernelOperator, CollectiveOperator, PredicateLoopOperator,
+                _MetalKernelSegment,
             )):
                 operator.launch()
             else:
@@ -370,6 +387,10 @@ class OperatorProgram:
                 raise SubstepCompileError(
                     "Metal ICB substeps do not support distributed collectives"
                 )
+            elif isinstance(operator, PredicateLoopOperator):
+                raise SubstepCompileError(
+                    "Metal ICB substeps do not support predicate loops"
+                )
             else:
                 commands.extend(lower_metal_aten(operator))
         self._metal_error_flags = tuple(dict.fromkeys(
@@ -392,6 +413,10 @@ class OperatorProgram:
         segments, self._metal_segments = self._metal_segments, ()
         for segment in segments:
             capture.release(segment.icb)
+        for operator in self.operators:
+            close = getattr(operator, "close", None)
+            if close is not None:
+                close(capture)
         # Commands may own online-lowering scratch tensors referenced by an
         # ICB (for example the Metal scatter bounds-error flag).  Drop those
         # references only after every ICB release has been attempted.
@@ -404,8 +429,10 @@ class OperatorProgram:
 class _OperatorRecorder:
     def __init__(
         self, execution: Any, stable_tensors: tuple[torch.Tensor, ...],
+        *, scope_kind: str,
     ) -> None:
         self.execution = execution
+        self.scope_kind = scope_kind
         self.binder = execution.kernel_binding
         self.operators: list[Any] = []
         self.references: dict[int, _StableRef | _ValueRef] = {
@@ -504,6 +531,30 @@ class _OperatorRecorder:
             tensor=tensor, operation=operation, reduction=reduction,
             destination=destination, signature=signature,
             reads=(tensor,), writes=(tensor,),
+        ))
+
+    def record_predicate_loop(self, program: Any) -> None:
+        """Append one nested predicate program to the current lexical IR."""
+
+        body = program.body_operators
+        if body is None:
+            raise RuntimeError("predicate loop body has not been installed")
+        reads = tuple(dict.fromkeys(
+            tensor for tensor, _abi in body._binding_abi
+        ))
+        writes = tuple(dict.fromkeys((
+            program.predicate,
+            program.counter,
+            program.continue_flag,
+            program.has_more,
+            program.under_limit,
+            *body.mutated_tensors,
+        )))
+        self.snapshot_writes(writes)
+        self.operators.append(PredicateLoopOperator(
+            program=program,
+            reads=reads,
+            writes=writes,
         ))
 
     def encode(self, value: Any) -> Any:
@@ -638,14 +689,17 @@ class OperatorRecording:
         *,
         arguments: tuple[Any, ...] = (),
         stable_tensors: tuple[torch.Tensor, ...] = (),
+        scope_kind: str = "generic",
     ) -> None:
+        if not isinstance(scope_kind, str) or not scope_kind:
+            raise ValueError("operator recording scope_kind must be non-empty")
         execution = model._execution
         tensor_arguments = tuple(
             value for value in arguments if isinstance(value, torch.Tensor)
         )
         stable = tuple(dict.fromkeys((*tensor_arguments, *stable_tensors)))
         self.recorder = _OperatorRecorder(
-            execution, stable,
+            execution, stable, scope_kind=scope_kind,
         )
         self.mode = _TorchOperatorMode(self.recorder)
         self.token = None
@@ -694,8 +748,10 @@ def record_operator_scope(
     *,
     arguments: tuple[Any, ...] = (),
     stable_tensors: tuple[torch.Tensor, ...] = (),
+    scope_kind: str = "generic",
 ) -> OperatorRecording:
     """Open an operator recording transaction without requiring a callback."""
     return OperatorRecording(
         model, arguments=arguments, stable_tensors=stable_tensors,
+        scope_kind=scope_kind,
     )

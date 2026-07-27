@@ -145,7 +145,29 @@ def resolve_model_backend(device: Any) -> str:
     return "torch"
 
 
-KERNEL_BACKEND: str = _resolve_backend()
+def _backend_hint() -> str:
+    """Choose the legacy process default without importing an optional JIT.
+
+    Model-owned dispatch uses :func:`resolve_model_backend`, so a CPU model
+    must remain constructible when a CUDA device is visible but Triton is not
+    installed.  Direct, model-free kernel calls retain the historical device
+    preference and will resolve (and diagnose) their hinted backend only when
+    they are actually invoked.
+    """
+
+    env = os.environ.get("HYDROFORGE_BACKEND", "").strip().lower()
+    if env:
+        return _resolve_backend()
+    import torch
+
+    if torch.cuda.is_available():
+        return "triton"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "metal"
+    return "torch"
+
+
+KERNEL_BACKEND: str = _backend_hint()
 
 
 @dataclass(frozen=True)
@@ -175,7 +197,7 @@ class BackendRegistry:
 
     def resolve(self, backend: str | None = None) -> Callable:
         """Build the implementation for ``backend`` or the active backend."""
-        backend = KERNEL_BACKEND if backend is None else backend
+        backend = _backend_hint() if backend is None else backend
         try:
             factory = self.implementations[backend]
         except KeyError as exc:
@@ -191,7 +213,11 @@ class BackendRegistry:
         return self.selected(**kwargs)
 
     def __getitem__(self, grid):
-        return self.selected[grid]
+        del grid
+        raise TypeError(
+            f"{self.name}: grid-subscript kernel launches are not public; "
+            "call the registered kernel through a managed model step"
+        )
 
 
 class KernelEntry:
@@ -210,7 +236,7 @@ class KernelEntry:
         binder = _ACTIVE_AUTO_BINDER.get()
         if binder is not None:
             return binder.model._execution.backend
-        return KERNEL_BACKEND
+        return _backend_hint()
 
     def implementation(self, backend: str | None = None) -> Callable:
         """Return one backend implementation, constructed and checked once."""
@@ -261,7 +287,11 @@ class KernelEntry:
         return self.raw(**kwargs)
 
     def __getitem__(self, grid):
-        return self.raw[grid]
+        del grid
+        raise TypeError(
+            f"{self.registry.name}: grid-subscript kernel launches are not "
+            "public; call the registered kernel through a managed model step"
+        )
 
 
 class StrictImplementation:

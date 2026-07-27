@@ -70,8 +70,8 @@ class MappingTable:
 
     def row_normalized(self) -> "MappingTable":
         """Return a copy with each row scaled to sum 1 (empty rows stay zero)."""
-        matrix = self.matrix.tocsr(copy=True).astype(np.float32)
-        row_sums = np.asarray(matrix.sum(axis=1)).ravel()
+        matrix = self.matrix.tocsr(copy=True).astype(np.float64)
+        row_sums = np.asarray(matrix.sum(axis=1), dtype=np.float64).ravel()
         scale = np.zeros_like(row_sums)
         nz = row_sums > 0
         scale[nz] = 1.0 / row_sums[nz]
@@ -228,21 +228,25 @@ class MappingTable:
                 f"mapping source size {self.matrix.shape[1]}"
             )
 
-        original = self.matrix.tocsr(copy=True).astype(np.float32)
-        original_row_sums = np.asarray(original.sum(axis=1)).ravel()
+        original = self.matrix.tocsr(copy=True).astype(np.float64)
+        original_row_sums = np.asarray(
+            original.sum(axis=1), dtype=np.float64,
+        ).ravel()
 
         coo = original.tocoo()
         keep = valid[coo.col]
         masked = csr_matrix(
             (coo.data[keep], (coo.row[keep], coo.col[keep])),
             shape=original.shape,
-            dtype=np.float32,
+            dtype=np.float64,
         )
-        valid_row_sums = np.asarray(masked.sum(axis=1)).ravel()
+        valid_row_sums = np.asarray(
+            masked.sum(axis=1), dtype=np.float64,
+        ).ravel()
 
         scaled_rows = 0
         if preserve_row_sum:
-            scale = np.ones_like(original_row_sums, dtype=np.float32)
+            scale = np.ones_like(original_row_sums, dtype=np.float64)
             can_scale = (original_row_sums > 0.0) & (valid_row_sums > 0.0)
             changed = can_scale & ~np.isclose(original_row_sums, valid_row_sums)
             scale[can_scale] = original_row_sums[can_scale] / valid_row_sums[can_scale]

@@ -510,6 +510,8 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                     f"        {ctype} cnt = p_{_c_ident(scatter_spec['cnt_key'])}[linear];",
                     "        if (cnt > 0) {",
                     f"            p_{_c_ident(scatter_spec['buf_key'])}[linear] = p_{_c_ident(scatter_spec['buf_key'])}[linear] / cnt;",
+                    "        } else {",
+                    f"            p_{_c_ident(scatter_spec['buf_key'])}[linear] = static_cast<{ctype}>(NAN);",
                     "        }",
                     "    }",
                 ]
@@ -586,7 +588,6 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 "    int32_t macro_step_index = p___macro_step_index[0];",
                 "    bool is_inner_first = ((flags & 1) != 0) && (sub_step == 0);",
                 "    bool is_inner_last = (((flags >> 1) & 1) != 0) && (sub_step == num_sub_steps - 1);",
-                "    bool is_middle = sub_step == (num_sub_steps / 2);",
                 "    bool is_outer_first = (((flags >> 2) & 1) != 0) && is_inner_last;",
                 "    bool is_outer_last = (((flags >> 3) & 1) != 0) && is_inner_last;",
                 "",
@@ -608,7 +609,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 ctype=var["ctype"],
             )
             lines.append(f"        {var['ctype']} val = {val};")
-            lines.extend(self._generate_inner_updates(var))
+            lines.extend(self._generate_inner_updates(var, full_output=False))
             for op in var["ops"]:
                 lines.extend(self._generate_op_update(var, op))
             lines.append("    }")
@@ -657,7 +658,6 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 "    int32_t macro_step_index = p___macro_step_index[0];",
                 "    bool is_inner_first = ((flags & 1) != 0) && (sub_step == 0);",
                 "    bool is_inner_last = (((flags >> 1) & 1) != 0) && (sub_step == num_sub_steps - 1);",
-                "    bool is_middle = sub_step == (num_sub_steps / 2);",
                 "    bool is_outer_first = (((flags >> 2) & 1) != 0) && is_inner_last;",
                 "    bool is_outer_last = (((flags >> 3) & 1) != 0) && is_inner_last;",
                 "",
@@ -674,7 +674,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 n_levels=1, ctype=ctype,
             )
             lines.append(f"        {ctype} val = {val};")
-            lines.extend(self._generate_inner_updates(var))
+            lines.extend(self._generate_inner_updates(var, full_output=True))
             for op in var["ops"]:
                 lines.extend(self._generate_op_update(var, op))
             lines.append("    }")
@@ -687,7 +687,9 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             return f"(t * n_saved_points + offs) * {var['n_levels']} + level"
         return "t * n_saved_points + offs"
 
-    def _generate_inner_updates(self, var: Dict[str, Any]) -> List[str]:
+    def _generate_inner_updates(
+        self, var: Dict[str, Any], *, full_output: bool,
+    ) -> List[str]:
         lines: List[str] = []
         ctype = var["ctype"]
         for inner in var["inner_ops"]:
@@ -724,11 +726,16 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             elif inner in {"max", "min"}:
                 fn = "hf_max" if inner == "max" else "hf_min"
                 reset = f"hf_neg_inf<{ctype}>()" if inner == "max" else f"hf_pos_inf<{ctype}>()"
+                first = (
+                    "is_inner_first"
+                    if full_output
+                    else "(is_inner_first && macro_step_index == 0)"
+                )
                 lines.extend(
                     [
                         "        {",
                         f"            {ctype} old_v = {ptr}[out_off];",
-                        f"            {ctype} new_v = is_inner_first ? val : {fn}(old_v, val);",
+                        f"            {ctype} new_v = {first} ? val : {fn}(old_v, val);",
                         f"            if (is_inner_last) {{ val_for_{inner} = new_v; {ptr}[out_off] = {reset}; }}",
                         f"            else {{ {ptr}[out_off] = new_v; }}",
                         "        }",
@@ -738,13 +745,6 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 lines.extend(
                     [
                         f"        if (is_inner_first) {{ {ptr}[out_off] = val; }}",
-                        f"        if (is_inner_last) {{ val_for_{inner} = {ptr}[out_off]; }}",
-                    ]
-                )
-            elif inner == "mid":
-                lines.extend(
-                    [
-                        f"        if (is_middle) {{ {ptr}[out_off] = val; }}",
                         f"        if (is_inner_last) {{ val_for_{inner} = {ptr}[out_off]; }}",
                     ]
                 )
@@ -828,8 +828,6 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         elif outer["base"] == "last":
             cond = "true" if compound else "is_inner_last"
             body = [f"{indent}if ({cond}) {{ {out}[out_off] = {value}; }}"]
-        elif outer["base"] == "mid":
-            body = [f"{indent}if (is_middle) {{ {out}[out_off] = {value}; }}"]
         else:
             raise ValueError(f"unsupported op '{op['op']}'")
 

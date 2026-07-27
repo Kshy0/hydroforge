@@ -224,7 +224,8 @@ class ModuleSchema:
                     continue
                 try:
                     module_fields[field.name] = tuple(
-                        _resolve_dimension(dimensions, dimension)
+                        str(dimension) if isinstance(dimension, int)
+                        else _resolve_dimension(dimensions, dimension)
                         for dimension in field.shape
                     )
                 except KeyError as exc:

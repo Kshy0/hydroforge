@@ -60,7 +60,7 @@ diagnostic: torch.Tensor | None = TensorField(
 ```
 
 Use a tuple when storage requires multiple modules, for example
-`depends_on=("log", "water_temperature")`. Supplying an inactive conditional
+`depends_on=("log", "routing_diagnostics")`. Supplying an inactive conditional
 field explicitly is an error.
 
 Use `required_by=("bifurcation", "reservoir")` when storage is required if
@@ -138,6 +138,7 @@ statistics_plan = StatisticsPlan(
 ## Statistics and NetCDF output
 
 Models select variables and aggregation operations with `variables_to_save`.
+Supported reductions are `mean`, `sum`, `max`, `min`, `first`, and `last`.
 NetCDF variable options are passed through validated mappings:
 
 ```python

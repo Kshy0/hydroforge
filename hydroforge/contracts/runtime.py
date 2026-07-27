@@ -9,6 +9,21 @@ from types import MappingProxyType
 _PRECISIONS = frozenset({"float32", "float64"})
 
 
+def validate_runtime_block_size(value: int, *, backend: str) -> None:
+    """Validate launch-width constraints intrinsic to one backend runtime."""
+
+    if type(value) is not int or not 1 <= value <= 1024:
+        raise ValueError(
+            f"backend {backend!r} BLOCK_SIZE must be an exact int in "
+            f"[1, 1024], got {value!r}"
+        )
+    if backend == "triton" and value & (value - 1):
+        raise ValueError(
+            "backend 'triton' BLOCK_SIZE must be a power of two, "
+            f"got {value}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class BackendRequirement:
     """Model-wide restrictions not already defined by the backend runtime."""
@@ -57,11 +72,7 @@ class BackendRequirement:
     def validate_block_size(self, value: int, *, backend: str) -> None:
         """Validate one resolved model or per-kernel launch width."""
 
-        if type(value) is not int or not 1 <= value <= 1024:
-            raise ValueError(
-                f"backend {backend!r} BLOCK_SIZE must be an exact int in "
-                f"[1, 1024], got {value!r}"
-            )
+        validate_runtime_block_size(value, backend=backend)
         if self.min_block_size is not None and value < self.min_block_size:
             raise ValueError(
                 f"backend {backend!r} requires BLOCK_SIZE >= "
@@ -109,7 +120,9 @@ DEFAULT_BACKEND_REQUIREMENT = BackendRequirement()
 DEFAULT_MODULE_REQUIREMENT = ModuleRequirement()
 
 # Intrinsic runtime limits belong to HydroForge, not to every downstream
-# model. Model ``backend_requirements`` may only add stricter constraints.
+# model. Launch-width rules are enforced by ``validate_runtime_block_size``;
+# these declarative requirements capture the remaining backend capabilities.
+# Model ``backend_requirements`` may only add stricter constraints.
 RUNTIME_BACKEND_REQUIREMENTS = MappingProxyType({
     "metal": BackendRequirement(
         precision=frozenset({"float32"}), mixed_precision=False,

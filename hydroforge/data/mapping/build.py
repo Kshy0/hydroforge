@@ -115,9 +115,9 @@ def build_hires_aggregate_mapping(
         allow_oob_zero=allow_oob_zero,
     )
     matrix = csr_matrix(
-        (data.astype(np.float32), (rows, cols)),
+        (data.astype(np.float64, copy=False), (rows, cols)),
         shape=(target_ids.size, source.size),
-        dtype=np.float32,
+        dtype=np.float64,
     )
     matrix.eliminate_zeros()
     out_metadata = {

@@ -121,8 +121,10 @@ class MultiVariableDataset(AbstractDataset):
                 precision=precision,
             )
             for dataset in tuple(self._datasets.values())[1:]:
-                dataset._local_indices = reference._local_indices
-                dataset._desired_catchment_ids = reference._desired_catchment_ids
+                dataset._set_local_selection(
+                    reference._local_indices,
+                    reference._desired_catchment_ids,
+                )
             return mapping
         if mapping_file is not None:
             raise ValueError("catchment selection does not accept mapping_file")

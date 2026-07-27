@@ -349,13 +349,7 @@ class NetCDFDataset(GriddedDataset):
         - If _local_indices is set: (T, N) compressed array
         - If _local_indices is None: (T, Y, X) full grid array
         """
-        try:
-            start_abs = self.get_index_by_time(current_time)
-        except ValueError as e:
-            raise ValueError(f"Start time {current_time} not found in global timeline") from e
-
-        end_abs = min(start_abs + int(chunk_len), len(self._global_times))
-        times = self._global_times[start_abs:end_abs]
+        times = self._timeline.contiguous_times(current_time, chunk_len)
         entry = self._build_plan_entry(times)
         ops = entry[1]
         data = self._read_ops(ops)

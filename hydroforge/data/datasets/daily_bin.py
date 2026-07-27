@@ -32,40 +32,42 @@ class DailyBinDataset(GriddedDataset):
 
     def _build_file_mapping(self):
         """Map each simulation date to ``(file_key, frame_index)``."""
-        self._dt_to_loc = {}
-        key_frame_count: dict = {}
+        dates = set()
         t = self.start_date
         while t <= self.end_date:
-            key = self.time_to_key(t)
-            if key not in key_frame_count:
-                key_frame_count[key] = 0
-            self._dt_to_loc[t] = (key, key_frame_count[key])
-            key_frame_count[key] += 1
+            dates.add(t)
             t += self.time_interval
 
         # Also handle spin-up dates
         if self.spin_up_cycles > 0 and self.spin_up_start_date and self.spin_up_end_date:
             t = self.spin_up_start_date
             while t <= self.spin_up_end_date:
-                if t not in self._dt_to_loc:
-                    key = self.time_to_key(t)
-                    if key not in key_frame_count:
-                        key_frame_count[key] = 0
-                    self._dt_to_loc[t] = (key, key_frame_count[key])
-                    key_frame_count[key] += 1
+                dates.add(t)
                 t += self.time_interval
+
+        by_key: dict[str, list] = {}
+        for dt in dates:
+            by_key.setdefault(self.time_to_key(dt), []).append(dt)
+        self._dt_to_loc = {
+            dt: (key, frame_idx)
+            for key, key_dates in by_key.items()
+            for frame_idx, dt in enumerate(sorted(key_dates))
+        }
 
     def _validate_files_exist(self):
         """Validate that all required files exist and match expected size."""
-        unique_files = set()
-        for key, _ in self._dt_to_loc.values():
-            unique_files.add(Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}")
-        self.validate_files_exist(list(unique_files))
+        required_frames = {}
+        for key, frame_idx in self._dt_to_loc.values():
+            path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
+            required_frames[path] = max(
+                required_frames.get(path, 0), frame_idx + 1,
+            )
+        self.validate_files_exist(list(required_frames))
 
         # Validate file sizes are consistent with shape
         ny, nx = self.shape
         frame_bytes = ny * nx * np.dtype(self.bin_dtype).itemsize
-        for fp in unique_files:
+        for fp, minimum_frames in required_frames.items():
             file_bytes = Path(fp).stat().st_size
             if file_bytes % frame_bytes != 0:
                 raise ValueError(
@@ -74,6 +76,12 @@ class DailyBinDataset(GriddedDataset):
                     f"multiples of {frame_bytes} bytes "
                     f"(got {file_bytes / frame_bytes:.4f} frames). "
                     f"Check the 'shape' parameter."
+                )
+            observed_frames = file_bytes // frame_bytes
+            if observed_frames < minimum_frames:
+                raise ValueError(
+                    f"File {fp} contains {observed_frames} frame(s), but the "
+                    f"configured timeline reads at least {minimum_frames}."
                 )
 
     def __init__(self,
@@ -156,6 +164,11 @@ class DailyBinDataset(GriddedDataset):
             file_path, dtype=self.bin_dtype,
             count=frame_size, offset=frame_idx * frame_size * element_size,
         )
+        if data.size != frame_size:
+            raise ValueError(
+                f"Could not read frame {frame_idx} from {file_path}; expected "
+                f"{frame_size} values, got {data.size}"
+            )
         data = data.astype(self.out_dtype) / self.unit_factor
         data = self._apply_value_policy(data)
 

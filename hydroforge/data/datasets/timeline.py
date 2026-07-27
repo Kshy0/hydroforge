@@ -263,12 +263,15 @@ class DatasetTimeline:
     def ops_from_times(self, times: list[DateTime]) -> list[ReadOp]:
         order: list[str] = []
         by_file: dict[str, list[int]] = {}
+        seen_by_file: dict[str, set[int]] = {}
         for dt in times:
             key, index = self.dt_to_loc[dt]
             if key not in by_file:
                 order.append(key)
                 by_file[key] = []
-            if index not in by_file[key]:
+                seen_by_file[key] = set()
+            if index not in seen_by_file[key]:
+                seen_by_file[key].add(index)
                 by_file[key].append(index)
         return [(key, by_file[key]) for key in order]
 
@@ -276,6 +279,49 @@ class DatasetTimeline:
         if self.time_aggregation is None:
             return times[0], self.ops_from_times(times)
         return times[0], self.ops_from_times(self.source_times(times)), len(times)
+
+    def contiguous_times(self, current_time: DateTime, count: int) -> list[DateTime]:
+        """Return an aligned read window without mixing main and spin-up axes.
+
+        ``AbstractDataset.get_index_by_time`` is intentionally relative to the
+        main-run start.  Turning that index into an offset into
+        :attr:`global_times` is therefore incorrect when the timeline scan also
+        includes an earlier spin-up interval.  Normalize the requested time
+        back onto the owner's main origin, then bound it by the phase that
+        actually contains it.
+        """
+        count = int(count)
+        if count <= 0:
+            raise ValueError("chunk_len must be positive")
+
+        index = self.owner.get_index_by_time(current_time)
+        start = self.owner.start_date + self.owner.time_interval * index
+
+        if self.owner.start_date <= start <= self.owner.end_date:
+            phase_end = self.owner.end_date
+        elif (
+            self.owner.spin_up_cycles > 0
+            and self.owner.spin_up_start_date <= start <= self.owner.spin_up_end_date
+        ):
+            phase_end = self.owner.spin_up_end_date
+        else:
+            raise ValueError(
+                f"Start time {current_time} is outside the main and spin-up timelines"
+            )
+
+        available = (
+            timedelta_microseconds(
+                phase_end - start, label="remaining dataset read span",
+            )
+            // timedelta_microseconds(
+                self.owner.time_interval, label="dataset time_interval",
+            )
+            + 1
+        )
+        return [
+            start + self.owner.time_interval * offset
+            for offset in range(min(count, available))
+        ]
 
     def _chunks(self, start_dt: DateTime, end_dt: DateTime) -> list[tuple]:
         times: list[DateTime] = []

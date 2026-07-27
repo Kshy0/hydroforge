@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from dataclasses import dataclass
+from datetime import timedelta
 import hashlib
 import json
 from typing import Any
@@ -127,6 +128,18 @@ class StatisticsWindowController:
     ) -> tuple[Any, bool, bool] | None:
         located = self._locate(rule, start)
         if located is None:
+            if isinstance(rule, ExplicitWindows):
+                starts = self._explicit_starts[id(rule)]
+                next_index = bisect_right(starts, start)
+                if (
+                    next_index < len(rule.windows)
+                    and end > rule.windows[next_index].start
+                ):
+                    window = rule.windows[next_index]
+                    raise ValueError(
+                        f"model step [{start!r}, {end!r}) crosses explicit "
+                        f"window {window.name!r} boundary"
+                    )
             return None
         key, window = located
         if isinstance(rule, EveryStep):
@@ -140,10 +153,14 @@ class StatisticsWindowController:
                         f"model step [{start!r}, {end!r}) crosses a "
                         f"{rule.period} statistics boundary"
                     )
-                # Crossing more than one calendar window cannot be represented
-                # by a single pair of first/last flags.
-                midpoint = start + (end - start) / 2
-                if self._calendar_key(rule, midpoint) not in {key, end_key}:
+                # The instant immediately before an exact end boundary must
+                # still belong to the start window.  A midpoint probe is not
+                # sufficient for unequal month/year lengths (Jan 1 -> Mar 1
+                # has a midpoint that is still in January).
+                preceding_key = self._calendar_key(
+                    rule, end - timedelta(microseconds=1),
+                )
+                if preceding_key != key:
                     raise ValueError("model step crosses multiple statistics windows")
             last = changed or (
                 final_step and self.plan.partial_period == "close"
@@ -314,7 +331,11 @@ class StatisticsWindowController:
         inner = self._locate(self.plan.inner, step.start)
         outer = self._locate(self.plan.outer or self.plan.inner, step.start)
         if inner is None or outer is None:
-            raise ValueError("statistics snapshot is outside configured windows")
+            # Manual overrides are explicitly allowed to activate statistics
+            # in an otherwise configured gap.  Such a snapshot has no window
+            # keys, but its schedule cursor and open/closed flags remain fully
+            # restorable.
+            return index, True, None, None, inner_open, outer_open
         return index, True, inner[0], outer[0], inner_open, outer_open
 
     def restore_snapshot_state(self, state: dict[str, Any]) -> None:

@@ -19,7 +19,6 @@ class Reduction(str, Enum):
     MIN = "min"
     FIRST = "first"
     LAST = "last"
-    MID = "mid"
 
 
 class ExpressionDialect(str, Enum):
@@ -295,7 +294,7 @@ class StatisticsIR:
         return tuple(result)
 
 
-_OP_RE = re.compile(r"^(arg)?(mean|sum|max|min|first|last|mid)(\d*)$")
+_OP_RE = re.compile(r"^(arg)?(mean|sum|max|min|first|last)(\d*)$")
 _INNER = frozenset({Reduction.MEAN, Reduction.SUM, Reduction.MAX,
                     Reduction.MIN, Reduction.FIRST, Reduction.LAST})
 
@@ -317,7 +316,12 @@ def parse_operation(spelling: str) -> StatisticOperation:
     k = int(digits or "1")
     if k < 1:
         raise ValueError(f"top-k must be positive in {spelling!r}")
-    inner = Reduction(parts[1]) if len(parts) == 2 else None
+    try:
+        inner = Reduction(parts[1]) if len(parts) == 2 else None
+    except ValueError as error:
+        raise ValueError(
+            f"unsupported inner reduction in {spelling!r}"
+        ) from error
     if inner is not None and inner not in _INNER:
         raise ValueError(f"unsupported inner reduction in {spelling!r}")
     if inner is None and (stores_index or k > 1):
@@ -325,8 +329,6 @@ def parse_operation(spelling: str) -> StatisticOperation:
             f"{spelling!r} requires an inner statistics window; "
             "use a compound operation such as argmax_mean or max3_last"
         )
-    if inner is not None and outer is Reduction.MID:
-        raise ValueError("mid is valid only as a standalone reduction")
     return StatisticOperation(spelling, outer, inner, k, stores_index)
 
 
@@ -413,8 +415,8 @@ _FUNCTIONS: dict[ExpressionDialect, dict[str, str]] = {
         "abs": "torch.abs", "fabs": "torch.abs", "sqrt": "torch.sqrt",
         "exp": "torch.exp", "log": "torch.log", "sin": "torch.sin",
         "cos": "torch.cos", "tan": "torch.tan", "pow": "torch.pow",
-        "maximum": "torch.maximum", "minimum": "torch.minimum",
-        "max": "torch.maximum", "min": "torch.minimum",
+        "maximum": "torch.fmax", "minimum": "torch.fmin",
+        "max": "torch.fmax", "min": "torch.fmin",
     },
 }
 
@@ -432,9 +434,16 @@ class _ExpressionRenderer:
     def visit(self, node: ast.AST) -> str:
         if isinstance(node, ast.BinOp):
             left, right = self.visit(node.left), self.visit(node.right)
+            if isinstance(node.op, ast.Mod):
+                functions = {
+                    ExpressionDialect.CUDA: "fmod",
+                    ExpressionDialect.METAL: "fmod",
+                    ExpressionDialect.TRITON: "libdevice.fmod",
+                    ExpressionDialect.TORCH: "torch.fmod",
+                }
+                return f"{functions[self.dialect]}({left}, {right})"
             operators = {
                 ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
-                ast.Mod: "%",
             }
             symbol = operators.get(type(node.op))
             if symbol is not None:

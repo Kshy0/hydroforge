@@ -75,7 +75,9 @@ class MetalScalar:
     kind: str
 
     def __post_init__(self) -> None:
-        if self.kind not in {"bool", "int32", "index", "float32"}:
+        if self.kind not in {
+            "bool", "int32", "uint32", "index", "float32",
+        }:
             raise ValueError(f"invalid Metal scalar kind {self.kind!r}")
 
 
