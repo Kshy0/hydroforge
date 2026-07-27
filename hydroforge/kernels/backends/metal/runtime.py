@@ -14,6 +14,9 @@ from typing import Any
 import torch
 
 from hydroforge.contracts import ResourceCleanupError
+from hydroforge.kernels.backends.metal.limits import (
+    validate_metal_launch_extent,
+)
 
 
 _recording_sequence: ContextVar[Any] = ContextVar(
@@ -118,7 +121,10 @@ class MetalCommandSequence:
             raise ValueError("Metal command sequence is empty")
         prepared = []
         for item in self.prepared_commands:
-            if item[3] == 0:
+            threads = validate_metal_launch_extent(
+                "Metal command sequence", item[3],
+            )
+            if threads == 0:
                 # A zero-width dispatch is a semantic no-op. Preserve an
                 # explicit barrier by moving it to the nearest real command;
                 # otherwise it must not occupy an ICB command slot because

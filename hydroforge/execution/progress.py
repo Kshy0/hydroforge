@@ -15,17 +15,28 @@ class ProgressState:
     _step_start: float = 0.0
     _recent_dts: list[float] = field(default_factory=list)
     _window_size: int = 50
+    _schedule_start_fraction: float | None = None
 
-    def start(self, phase: str) -> None:
+    def start(
+        self, phase: str, *, schedule_fraction: float | None = None,
+    ) -> None:
         self.phase = phase
         self.current_step = 0
         self._wall_start = time.perf_counter()
         self._step_start = self._wall_start
         self._recent_dts.clear()
+        self._schedule_start_fraction = schedule_fraction
 
-    def begin_step(self, phase: str) -> None:
+    def begin_step(
+        self, phase: str, *, schedule_fraction: float | None = None,
+    ) -> None:
         if phase != self.phase:
-            self.start(phase)
+            self.start(phase, schedule_fraction=schedule_fraction)
+        elif (
+            self._schedule_start_fraction is None
+            and schedule_fraction is not None
+        ):
+            self._schedule_start_fraction = schedule_fraction
         self._step_start = time.perf_counter()
 
     def tick(self, phase: str) -> None:
@@ -63,9 +74,11 @@ class ProgressState:
     def format_schedule(self, *, fraction: float) -> str:
         speed = self.recent_speed
         fraction = min(max(fraction, 0.0), 1.0)
+        start_fraction = self._schedule_start_fraction or 0.0
+        completed = fraction - start_fraction
         eta = (
-            self.elapsed * (1.0 - fraction) / fraction
-            if fraction > 0.0 else float("inf")
+            self.elapsed * (1.0 - fraction) / completed
+            if completed > 0.0 else float("inf")
         )
         return (
             f"[{fraction * 100:5.1f}%] "
@@ -98,7 +111,16 @@ class ProgressRuntime:
         return "spinup" if schedule is not None else "unbounded"
 
     def begin_step(self) -> None:
-        self.owner._progress.begin_step(self._phase())
+        schedule, index = self._schedule_position()
+        fraction = None
+        if schedule is not None and index is not None:
+            step = schedule.step_at(index)
+            elapsed = (step.start - schedule.start).total_seconds()
+            duration = (schedule.end - schedule.start).total_seconds()
+            fraction = elapsed / duration
+        self.owner._progress.begin_step(
+            self._phase(), schedule_fraction=fraction,
+        )
 
     def progress_tick(self) -> None:
         self.owner._progress.tick(self._phase())

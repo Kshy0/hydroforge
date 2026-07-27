@@ -15,11 +15,14 @@ from hydroforge.contracts import (
     buffer_access_semantics,
 )
 from hydroforge.contracts.kernels import validate_launch_extent
+from hydroforge.kernels.backends.metal.limits import (
+    validate_metal_launch_extent,
+)
 from hydroforge.kernels.backends.metal.types import NATIVE_BUFFER_DTYPES
 from hydroforge.kernels.context import active_kernel_spec, reject_direct_kernel_launch
 
 _MSL_SCALARS = {
-    "bool": "bool", "int": "int32", "uint": "int32",
+    "bool": "bool", "int": "int32", "uint": "uint32",
     "long": "int64", "float": "float32",
 }
 _PACK_FORMATS = {"int": "i", "uint": "I", "long": "q", "float": "f"}
@@ -27,7 +30,8 @@ _PACK_LAYOUTS = {
     "int": (4, 4), "uint": (4, 4), "long": (8, 8), "float": (4, 4),
 }
 _SPEC_TO_NATIVE_SCALAR = {
-    "bool": "bool", "int32": "int32", "index": "int64",
+    "bool": "bool", "int32": "int32", "uint32": "uint32",
+    "index": "int64",
     "float32": "float32",
 }
 
@@ -483,7 +487,8 @@ class MetalDispatcher:
             if name in spec.runtime_scalars:
                 expected_kind = {
                     "bool": "bool", "int32": "int32",
-                    "index": "int64", "float32": "float32",
+                    "uint32": "uint32", "index": "int64",
+                    "float32": "float32",
                 }[spec.runtime_scalars[name]]
             else:
                 raise TypeError(
@@ -746,6 +751,10 @@ class MetalDispatcher:
         return values
 
     def _prepare_values(self, values: dict[str, Any]):
+        # Specialized/raw callers can invoke this path repeatedly after the
+        # initial bind. Recheck host scalars here so an updated MSL ``uint``
+        # can never cross the native boundary through signed reinterpretation.
+        self.spec.validate_runtime_scalars(values)
         arguments = [values[name] for name in self.args]
         constant_values, constants = self._constants(values)
         template_values = self._templates(values)
@@ -755,8 +764,9 @@ class MetalDispatcher:
         )
         # Pure launch validation precedes native runtime loading, pipeline
         # compilation and argument-binding acquisition.
-        threads = validate_launch_extent(
-            self.kernel_name, self.size_key, values,
+        threads = validate_metal_launch_extent(
+            self.kernel_name,
+            validate_launch_extent(self.kernel_name, self.size_key, values),
         )
         if "BLOCK_SIZE" in values:
             group_size = _validated_group_size(values["BLOCK_SIZE"])
@@ -789,6 +799,18 @@ class MetalDispatcher:
     def _submit(self, prepared, values: dict[str, Any]) -> None:
         from hydroforge.kernels.backends.metal.runtime import recording_metal_sequence
 
+        try:
+            validate_metal_launch_extent(self.kernel_name, prepared[3])
+        except BaseException as error:
+            native, _pipeline, binding, _threads, _group_size = prepared
+            try:
+                native.release_argument_binding(binding)
+            except BaseException as cleanup_error:
+                combined = ResourceCleanupError(
+                    "Metal invalid command cleanup", (error, cleanup_error),
+                )
+                raise combined from error
+            raise
         sequence = recording_metal_sequence()
         if sequence is not None:
             buffers = {

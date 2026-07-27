@@ -36,8 +36,10 @@ def _find_variable(ds: NCDataset, names: Sequence[str]) -> str:
 
 
 def _regular_axes(x_coord: np.ndarray, y_coord: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    x_arr = np.asarray(x_coord, dtype=np.float64)
-    y_arr = np.asarray(y_coord, dtype=np.float64)
+    # Preserve the source dtype until validation so float32 coordinate
+    # quantisation can be distinguished from a genuinely irregular axis.
+    x_arr = np.asarray(x_coord)
+    y_arr = np.asarray(y_coord)
     if x_arr.ndim == 1 and y_arr.ndim == 1:
         return x_arr, y_arr
     if x_arr.ndim == 2 and y_arr.ndim == 2 and x_arr.shape == y_arr.shape:
@@ -49,7 +51,8 @@ def _regular_axes(x_coord: np.ndarray, y_coord: np.ndarray) -> tuple[np.ndarray,
 
 
 def _validate_axis(values: np.ndarray, name: str) -> np.ndarray:
-    axis = np.asarray(values, dtype=np.float64).ravel()
+    source = np.asarray(values)
+    axis = np.asarray(source, dtype=np.float64).ravel()
     if axis.size == 0:
         raise ValueError(f"{name} axis must not be empty")
     if axis.size == 1:
@@ -58,7 +61,15 @@ def _validate_axis(values: np.ndarray, name: str) -> np.ndarray:
     if not (np.all(diffs > 0.0) or np.all(diffs < 0.0)):
         raise ValueError(f"{name} axis must be strictly monotonic")
     step = diffs[0]
-    if not np.allclose(diffs, step, rtol=1e-6, atol=1e-12):
+    atol = 1e-12
+    if source.dtype.kind == "f" and source.dtype.itemsize <= 4:
+        # Adjacent differences can contain roughly two float32 rounding
+        # errors.  Scale the absolute tolerance by coordinate magnitude;
+        # using only rtol on the (often small) grid step rejects valid axes at
+        # high latitudes/longitudes.
+        magnitude = max(float(np.max(np.abs(axis))), abs(float(step)), 1.0)
+        atol = 2.0 * np.finfo(np.float32).eps * magnitude
+    if not np.allclose(diffs, step, rtol=1e-6, atol=atol):
         raise ValueError(f"{name} axis must be regularly spaced")
     return axis
 
@@ -179,8 +190,8 @@ class RegularGrid:
         with NCDataset(str(path), "r") as ds:
             x_name = _find_variable(ds, _as_axis_names(x_names))
             y_name = _find_variable(ds, _as_axis_names(y_names))
-            x_coord = np.asarray(ds.variables[x_name][:], dtype=np.float64)
-            y_coord = np.asarray(ds.variables[y_name][:], dtype=np.float64)
+            x_coord = np.asarray(ds.variables[x_name][:])
+            y_coord = np.asarray(ds.variables[y_name][:])
         return cls.from_coordinates(
             x_coord,
             y_coord,
@@ -244,14 +255,26 @@ class RegularGrid:
             iy = np.floor(((self.y[0] + 0.5 * dy) - y_val) / dy).astype(np.int64)
 
         if self.periodic_x:
-            ix[ix == self.x.size] = 0
-        else:
-            ix[(ix == self.x.size) & (x_val <= self.x_bounds[:, 1].max() + 1e-10)] = self.x.size - 1
-            ix[(ix == -1) & (x_val >= self.x_bounds[:, 0].min() - 1e-10)] = 0
-        iy[(iy == self.y.size) & (y_val <= self.y_bounds[:, 1].max() + 1e-10)] = self.y.size - 1
-        iy[(iy == -1) & (y_val >= self.y_bounds[:, 0].min() - 1e-10)] = 0
+            ix = np.mod(ix, self.x.size)
+        elif self.x.size > 1 and self.x[1] > self.x[0]:
+            ix[(ix == -1) & (x_val >= self.x_bounds[0, 0] - 1e-10)] = 0
+            ix[(ix == self.x.size) & (x_val <= self.x_bounds[-1, 1] + 1e-10)] = self.x.size - 1
+        elif self.x.size > 1:
+            ix[(ix == -1) & (x_val <= self.x_bounds[0, 1] + 1e-10)] = 0
+            ix[(ix == self.x.size) & (x_val >= self.x_bounds[-1, 0] - 1e-10)] = self.x.size - 1
 
-        valid = (ix >= 0) & (ix < self.x.size) & (iy >= 0) & (iy < self.y.size)
+        if self.y.size > 1 and self.y[1] > self.y[0]:
+            iy[(iy == -1) & (y_val >= self.y_bounds[0, 0] - 1e-10)] = 0
+            iy[(iy == self.y.size) & (y_val <= self.y_bounds[-1, 1] + 1e-10)] = self.y.size - 1
+        elif self.y.size > 1:
+            iy[(iy == -1) & (y_val <= self.y_bounds[0, 1] + 1e-10)] = 0
+            iy[(iy == self.y.size) & (y_val >= self.y_bounds[-1, 0] - 1e-10)] = self.y.size - 1
+
+        valid = (
+            np.isfinite(x_val) & np.isfinite(y_val)
+            & (ix >= 0) & (ix < self.x.size)
+            & (iy >= 0) & (iy < self.y.size)
+        )
         out = np.full(ix.shape, -1, dtype=np.int64)
         out[valid] = iy[valid] * self.x.size + ix[valid]
         if not allow_oob and np.any(~valid):

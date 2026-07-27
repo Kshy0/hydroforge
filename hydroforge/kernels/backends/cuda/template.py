@@ -19,6 +19,7 @@ from hydroforge.kernels.context import active_kernel_spec
 _SCALAR_TYPES = {
     "bool": "bool",
     "int32": "int",
+    "uint32": "uint32_t",
     "index": "long",
     "float32": "float",
 }
@@ -194,6 +195,7 @@ class SpecCudaTemplateDispatcher:
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
+#include <cstdint>
 #include <optional>
 {constant_source}
 {self.prelude}

@@ -402,6 +402,59 @@ class ParameterPlanRuntime:
             )
         return target_ids
 
+    def _local_target_indices(
+        self,
+        target_ids: torch.Tensor,
+        id_tensor: torch.Tensor,
+        *,
+        variable_name: str,
+        id_field: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve a global ID request to this rank and verify global coverage."""
+        from hydroforge.data.distributed import find_indices_in_torch
+
+        indices = find_indices_in_torch(target_ids, id_tensor)
+        present = indices >= 0
+        world_size = getattr(self.owner, "world_size", 1)
+        if world_size > 1:
+            import torch.distributed as dist
+
+            if not dist.is_available() or not dist.is_initialized():
+                raise RuntimeError(
+                    "distributed target_ids require an initialized "
+                    "torch.distributed process group"
+                )
+            if dist.get_world_size() != world_size:
+                raise RuntimeError(
+                    "model world_size disagrees with the distributed process group"
+                )
+            coverage = present.to(dtype=torch.int32)
+            dist.all_reduce(coverage, op=dist.ReduceOp.SUM)
+            missing = coverage == 0
+        else:
+            missing = ~present
+        if torch.any(missing):
+            missing_ids = target_ids[missing].detach().cpu().tolist()
+            raise ValueError(
+                f"Some target_ids for {variable_name!r} were not found in "
+                f"{id_field!r} on any rank: {missing_ids[:10]}"
+            )
+        positions = torch.nonzero(present, as_tuple=False).flatten()
+        return indices[present], positions
+
+    @staticmethod
+    def _localize_update_value(
+        value: float | torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        index_axis: int,
+    ) -> float | torch.Tensor:
+        if not isinstance(value, torch.Tensor) or value.ndim == 0:
+            return value
+        return value.index_select(
+            index_axis, positions.to(dtype=torch.int64),
+        ).contiguous()
+
     def _assert_field_is_key(self, ref: str, ctx: str) -> None:
         """Assert that ``ref`` (bare or ``module.field``) refers to a field
         declared with ``is_key=True``.  Raises ValueError otherwise."""
@@ -421,8 +474,6 @@ class ParameterPlanRuntime:
             )
 
     def _resolve_plan_item(self, item: PlanItem) -> None:
-        from hydroforge.data.distributed import find_indices_in_torch
-
         module, attr, id_attr, index_axis = self._resolve_parameter(
             item.variable_name,
         )
@@ -466,16 +517,25 @@ class ParameterPlanRuntime:
                 item.target_ids, id_tensor,
                 variable_name=item.variable_name,
             ).detach().clone()
-            indices = find_indices_in_torch(item.target_ids, id_tensor)
-            if torch.any(indices < 0):
-                raise ValueError(
-                    f"ParameterChangePlan Error: Some target_ids for "
-                    f"{item.variable_name} were not found in {lookup_attr}."
-                )
-            item._indices = indices
+            item._indices, local_positions = self._local_target_indices(
+                item.target_ids, id_tensor,
+                variable_name=item.variable_name,
+                id_field=lookup_attr,
+            )
             item._resolved_id_field = lookup_attr
 
         value = item.target_value if item.is_set_value else item.delta
+        if item.target_ids is not None:
+            # Validate the caller's global target-ID-shaped tensor before
+            # selecting the portion owned by this rank.
+            self._validate_update_value(
+                target, value, item.target_ids,
+                variable_name=item.variable_name,
+                index_axis=index_axis,
+            )
+            value = self._localize_update_value(
+                value, local_positions, index_axis=index_axis,
+            )
         self._validate_update_value(
             target, value, item._indices, variable_name=item.variable_name,
             index_axis=index_axis,
@@ -501,13 +561,13 @@ class ParameterPlanRuntime:
                 and existing.start_time == item.start_time
             ):
                 continue
-            if existing._indices is None or item._indices is None:
+            if existing.target_ids is None or item.target_ids is None:
                 raise ValueError(
                     f"parameter {item.variable_name!r} has overlapping SET "
                     f"plans at {item.start_time}: a global SET conflicts with "
                     "every other SET"
                 )
-            if torch.isin(item._indices, existing._indices).any().item():
+            if torch.isin(item.target_ids, existing.target_ids).any().item():
                 raise ValueError(
                     f"parameter {item.variable_name!r} has overlapping SET "
                     f"target_ids at {item.start_time}"
@@ -743,8 +803,6 @@ class ParameterPlanRuntime:
         target_ids: Optional[Union[List[int], torch.Tensor]] = None,
     ) -> ParameterChangeEffect:
         """Directly set the value of a variable for specific IDs immediately."""
-        from hydroforge.data.distributed import find_indices_in_torch
-
         module, attr, id_attr, index_axis = self._resolve_parameter(variable_name)
         current_val = getattr(module, attr)
 
@@ -781,9 +839,17 @@ class ParameterPlanRuntime:
             target_ids, id_tensor, variable_name=variable_name,
         )
 
-        indices = find_indices_in_torch(target_ids, id_tensor)
-        if torch.any(indices < 0):
-            raise ValueError(f"Some target_ids for '{variable_name}' were not found in '{id_attr}'.")
+        indices, local_positions = self._local_target_indices(
+            target_ids, id_tensor,
+            variable_name=variable_name, id_field=id_attr,
+        )
+        self._validate_update_value(
+            current_val, value, target_ids, variable_name=variable_name,
+            index_axis=index_axis,
+        )
+        value = self._localize_update_value(
+            value, local_positions, index_axis=index_axis,
+        )
         self._validate_update_value(
             current_val, value, indices, variable_name=variable_name,
             index_axis=index_axis,

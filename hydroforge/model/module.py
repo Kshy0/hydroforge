@@ -366,6 +366,7 @@ class AbstractModule(BaseModel, ABC):
     )
 
     _event_sink: EventSink = PrivateAttr(default_factory=NullEventSink)
+    _pending_events: List[ModelEvent] = PrivateAttr(default_factory=list)
     _tensors: ModuleTensors = PrivateAttr()
     _sealed_tensor_bindings: Optional[Dict[str, object]] = PrivateAttr(
         default=None,
@@ -459,10 +460,26 @@ class AbstractModule(BaseModel, ABC):
         # identity seal so append/clear cannot diverge the module's public
         # configuration from the compiled model capability plan.
         self.opened_modules = tuple(self.opened_modules)
-        self._sealed_tensor_bindings = {
-            field.name: getattr(self, field.name, None)
-            for field in self.tensor_schema()
-        }
+        bindings: Dict[str, object] = {}
+        for field in self.tensor_schema():
+            if not self.is_tensor_field_active(field):
+                # ``depends_on`` / ``required_by`` explicitly promise that an
+                # inactive computed field is neither evaluated nor validated.
+                # Seal the absent slot without invoking its descriptor.
+                bindings[field.name] = None
+                continue
+            if (
+                field.computed
+                and field.tensor.category == "virtual"
+                and field.name not in self.__dict__
+            ):
+                # Optional output buffers remain cached-property descriptors
+                # unless output setup or initialize_model_state explicitly
+                # requested them.  Sealing must not turn an absent diagnostic
+                # into resident state after the kernel namespace was compiled.
+                continue
+            bindings[field.name] = getattr(self, field.name, None)
+        self._sealed_tensor_bindings = bindings
         self._sealed_declared_fields = {
             name: getattr(self, name)
             for name in type(self).model_fields
@@ -508,7 +525,22 @@ class AbstractModule(BaseModel, ABC):
         return tensor_is_active(schema.tensor, self.opened_modules)
 
     def _emit(self, level: str, name: str, message: str, **fields: Any) -> None:
-        self._event_sink.emit(ModelEvent(level, name, message, fields))
+        event = ModelEvent(level, name, message, fields)
+        if isinstance(self._event_sink, NullEventSink):
+            # Tensor normalization runs during Pydantic construction, before
+            # ModelInitializer can attach the model's configured sink.
+            self._pending_events.append(event)
+            return
+        self._event_sink.emit(event)
+
+    def _bind_event_sink(self, sink: EventSink) -> None:
+        """Attach the model sink and replay construction-time diagnostics."""
+
+        self._event_sink = sink
+        pending = tuple(self._pending_events)
+        self._pending_events.clear()
+        for event in pending:
+            sink.emit(event)
 
     @property
     def high_precision(self) -> torch.dtype:
@@ -582,6 +614,7 @@ class AbstractModule(BaseModel, ABC):
             "category": "topology",
             "mode": "device" if descriptor.device else "cpu",
             "output": "disabled",
+            "allow_empty": source.tensor.allow_empty,
         })
 
     @classmethod
@@ -732,24 +765,33 @@ class AbstractModule(BaseModel, ABC):
         return self
 
 
-    def gather_tensor(self, tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    def gather_tensor(
+        self,
+        tensor: torch.Tensor,
+        indices: torch.Tensor,
+        *,
+        batched: bool,
+    ) -> torch.Tensor:
         """
-        Gather values from a tensor using indices, handling potential batch dimensions.
+        Gather values along the declared coordinate axis.
 
         If tensor is (N, ...), returns (L, ...) where L = len(indices).
         If tensor is (T, N, ...), returns (T, L, ...).
+
+        ``batched`` must come from field metadata (for example
+        ``module.is_batched("field")``). Shape-only inference is ambiguous
+        whenever a shared tensor's leading dimension equals ``num_trials``.
         """
-        if self.num_trials is not None and tensor.shape[0] == self.num_trials:
-            # Batched tensor (T, N, ...)
-            # We want to gather along the second dimension (N)
-            # indices is (L,)
-            # Result should be (T, L, ...)
-            # We can use tensor[:, indices]
+        if type(batched) is not bool:
+            raise TypeError("batched must be an exact bool")
+        if batched:
+            if self.num_trials is None or tensor.ndim < 2:
+                raise ValueError(
+                    "a batched gather requires a tensor with a trial and "
+                    "coordinate axis"
+                )
             return tensor[:, indices]
-        else:
-            # Shared tensor (N, ...)
-            # Result should be (L, ...)
-            return tensor[indices]
+        return tensor[indices]
 
 
     def is_batched(self, field: str | torch.Tensor) -> bool:

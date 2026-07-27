@@ -74,18 +74,22 @@ class CudaExtensionSpec:
             )
         includes = dict(zip(names, self.inline_includes, strict=True))
         emitted: set[Path] = set()
+        include_pattern = re.compile(
+            r'^\s*#include\s+"([^"]+)"', re.MULTILINE,
+        )
 
         def expand(text: str) -> str:
-            for name, path in includes.items():
-                token = f'#include "{name}"'
-                while token in text:
-                    if path in emitted:
-                        replacement = ""
-                    else:
-                        emitted.add(path)
-                        replacement = expand(path.read_text())
-                    text = text.replace(token, replacement, 1)
-            return text
+            def replace(match: re.Match[str]) -> str:
+                name = match.group(1)
+                path = includes.get(name)
+                if path is None:
+                    return match.group(0)
+                if path in emitted:
+                    return ""
+                emitted.add(path)
+                return expand(path.read_text())
+
+            return include_pattern.sub(replace, text)
 
         source = ""
         for path in (*self.source_prefixes, self.source):
@@ -98,9 +102,7 @@ class CudaExtensionSpec:
         )
         if unused:
             raise ValueError(f"CUDA inline includes are not referenced: {unused}")
-        unresolved = sorted(set(re.findall(
-            r'^\s*#include\s+"([^"]+)"', source, re.MULTILINE,
-        )))
+        unresolved = sorted(set(include_pattern.findall(source)))
         if unresolved:
             raise ValueError(
                 "CUDA quoted includes must be declared through "

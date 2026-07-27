@@ -329,8 +329,8 @@ class _StepRuntime:
                 f"duration {step.duration_seconds} at {current_time!r}"
             )
         previous = self.state.schedule_step
-        expected = 0 if previous is None else previous + 1
-        if index != expected:
+        expected = None if previous is None else previous + 1
+        if expected is not None and index != expected:
             raise ValueError(
                 f"model schedule moved from step {previous} to {index}; "
                 f"expected {expected}"
@@ -354,13 +354,16 @@ class _StepRuntime:
             self._substep_program_owner, kind, specialization,
         )
 
-    def claim_outer_scope(self, *, specialization: Any) -> tuple[Any, ...]:
+    def claim_outer_scope(
+        self, *, specialization: Any, site: Any = None,
+    ) -> tuple[Any, ...]:
         """Return the stable cache key for one lexical outer operator scope."""
 
-        ordinal = self._outer_scope_count
-        self._outer_scope_count += 1
+        if site is None:
+            site = self._outer_scope_count
+            self._outer_scope_count += 1
         return (
-            self._substep_program_owner, "outer", ordinal, specialization,
+            self._substep_program_owner, "outer", site, specialization,
         )
 
     @property
@@ -404,6 +407,12 @@ class _StepRuntime:
             self.state.elapsed += float(elapsed)
 
     def finish(self) -> None:
+        if self._substep_scope_claimed and self.completed_substeps is None:
+            raise RuntimeError(
+                "compiled substep scope was exited before recording and "
+                "execution completed; do not break or return from a "
+                "self.substeps.fixed/adaptive loop"
+            )
         if self.run_statistics and not self._substep_scope_claimed:
             raise RuntimeError(
                 "statistics were enabled but the managed step executed no "

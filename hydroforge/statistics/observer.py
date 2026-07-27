@@ -56,6 +56,14 @@ class StatisticsObserver:
         self.aggregator = None
         self._fold_policy_cache = None
 
+    def invalidate(self, aggregator: Any) -> None:
+        """Forget policies compiled from one live aggregator program."""
+        if self.aggregator is not aggregator:
+            raise RuntimeError(
+                "cannot invalidate an aggregator not owned by this execution"
+            )
+        self._fold_policy_cache = None
+
     def enabled(self, output_enabled: bool) -> bool:
         return bool(output_enabled and self.aggregator is not None)
 

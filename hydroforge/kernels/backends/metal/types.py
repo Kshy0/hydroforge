@@ -17,7 +17,8 @@ COMPILE_SCALAR_TYPES = MappingProxyType({
     "bool": "bool", "int32": "int", "float32": "float",
 })
 RUNTIME_SCALAR_TYPES = MappingProxyType({
-    "bool": "bool", "int32": "int", "index": "long", "float32": "float",
+    "bool": "bool", "int32": "int", "uint32": "uint",
+    "index": "long", "float32": "float",
 })
 NATIVE_BUFFER_DTYPES = MappingProxyType({
     "float": frozenset({torch.float32}),

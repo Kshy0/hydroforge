@@ -228,6 +228,12 @@ class StatisticsBindingCompiler:
         adhoc: dict[str, Any] = {}
         for name in variable_ops:
             if name in self.variable_map:
+                if name in explicit_expressions:
+                    raise ValueError(
+                        f"Explicit statistics alias {name!r} shadows an "
+                        "existing model field or declared virtual; choose a "
+                        "different alias"
+                    )
                 module, attribute, _ = self.variable_map[name]
                 field = module.get_tensor_schema(attribute)
                 metadata = field.tensor
@@ -521,16 +527,23 @@ class StatisticsBindingCompiler:
                 )
             if (
                 isinstance(binding, _OutputTensorBinding)
-                and not torch.equal(current, previous)
             ):
-                raise ValueError(
-                    f"Statistics output topology binding {name!r} changed "
-                    "values while accumulators are live; recreate the model/"
-                    "statistics runtime at the topology boundary"
-                )
+                if not torch.equal(current, previous):
+                    raise ValueError(
+                        f"Statistics output topology binding {name!r} changed "
+                        "values while accumulators are live; recreate the model/"
+                        "statistics runtime at the topology boundary"
+                    )
+                # Output selections are immutable topology.  Partition helpers
+                # may recreate a value-equal tensor; retaining the registered
+                # buffer avoids needless kernel-state churn and graph recapture.
+                continue
             replacements[name] = current
 
         if replacements:
+            execution = getattr(self.model, "_execution", None)
+            if execution is not None:
+                execution.invalidate_statistics(aggregator)
             previous = {
                 name: aggregator._tensor_registry[name]
                 for name in replacements

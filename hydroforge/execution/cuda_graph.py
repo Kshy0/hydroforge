@@ -186,8 +186,9 @@ void cwg_fixed_stats_end(at::Tensor count, at::Tensor counter,
 // per-sub-step weight (e.g. dt), writes the aggregator's __weight / __sub_step /
 // __num_sub_steps so its is_inner_first (sub_step == 0) and is_inner_last
 // (sub_step == num_sub_steps - 1) fire without knowing the total count ahead:
-//   first & last -> (0, 1);  first -> (0, 2);  last -> (1, 2);  middle -> (1, 3).
-// Exact for inner ops {last, mean, sum, max, min, first}; not mid / arg*.
+//   first & last -> (0, 1);  first -> (0, 2);  last -> (1, 2);
+//   interior -> (1, 3).
+// Exact for supported inner ops {last, mean, sum, max, min, first}; not arg*.
 template <typename T>
 __global__ void k_stats_control(const T* __restrict__ weight_src,
         const int* __restrict__ cont, const int* __restrict__ counter,

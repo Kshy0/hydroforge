@@ -84,6 +84,17 @@ class GriddedDataset(AbstractDataset, ABC):
         """Return a flat full-grid NaN mask for mapping generation, if supported."""
         return None
 
+    def _set_local_selection(
+        self, source_indices: np.ndarray, target_ids: np.ndarray,
+    ) -> None:
+        """Install a spatial selection and invalidate derived read caches."""
+        self._local_indices = source_indices
+        self._desired_catchment_ids = target_ids
+        if hasattr(self, "_bbox"):
+            self._bbox = None
+        if hasattr(self, "_bbox_local_indices"):
+            self._bbox_local_indices = None
+
     def shard_forcing(
         self,
         batch_data: Union[torch.Tensor, Dict[str, torch.Tensor]],
@@ -162,8 +173,7 @@ class GriddedDataset(AbstractDataset, ABC):
 
         local = mapping.local(desired_catchment_ids)
         self._mapping_file = mapping_path
-        self._local_indices = local.source_indices
-        self._desired_catchment_ids = local.target_ids
+        self._set_local_selection(local.source_indices, local.target_ids)
         dtype = torch.float32 if precision == "float32" else torch.float64
         return local.to_torch(device=device, dtype=dtype)
 

@@ -21,6 +21,11 @@ if TYPE_CHECKING:
     from hydroforge.statistics.runtime import StatisticsRuntime
 
 
+_FULL_OUTPUT_GROUP = "__full__"
+_FULL_OUTPUT_KERNEL = "hydroforge_full_output_kernel"
+_FULL_OUTPUT_GRID = "hydroforge_full_output_grid"
+
+
 class TritonStatisticsEmitter(StatisticsEmitter):
     """Triton JIT kernel code generation for statistics aggregation."""
 
@@ -36,7 +41,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         lines = self._generate_kernel_header()
         self._generate_scatter_kernels(lines)
         for output_index, variables in groups.items():
-            if output_index == "__full__":
+            if output_index == _FULL_OUTPUT_GROUP:
                 self._generate_full_kernel_for_group(
                     lines, output_index, variables,
                 )
@@ -73,7 +78,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             '- argmax/argmin store the macro-step index and are written as int32;',
             '  conversion to datetime (if any) happens at the consumer via the',
             '  recorded macro-step time mapping, not at NC file write time',
-            '- For mid: stores val when is_middle is True',
             '',
             'Optimizations Applied:',
             '- tl.static_range for compile-time loop unrolling (num_trials, bubble sort)',
@@ -85,6 +89,16 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             "import triton",
             "import triton.language as tl",
             "from triton.language.extra import libdevice",
+            "",
+            "@triton.jit",
+            "def hydroforge_maximum(left, right):",
+            "    # Match torch.fmax/CUDA fmax without depending on Triton's default.",
+            "    return tl.where(left != left, right, tl.where(right != right, left, tl.maximum(left, right)))",
+            "",
+            "@triton.jit",
+            "def hydroforge_minimum(left, right):",
+            "    # Match torch.fmin/CUDA fmin without depending on Triton's default.",
+            "    return tl.where(left != left, right, tl.where(right != right, left, tl.minimum(left, right)))",
             "",
             '# ============================================================================',
             f"# Generated Triton kernels for statistics aggregation - Rank {self.rank}",
@@ -270,9 +284,9 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     "    mask = offs < N",
                     "    for t in tl.static_range(num_trials):",
                     f"        _cnt = tl.load({cnt_safe}_ptr + t * N + offs, mask=mask, other=1.0)",
-                    "        _cnt = tl.where(_cnt > 0.0, _cnt, 1.0)",
                     f"        _val = tl.load({buf_safe}_ptr + t * N + offs, mask=mask, other=0.0)",
-                    f"        tl.store({buf_safe}_ptr + t * N + offs, _val / _cnt, mask=mask)",
+                    "        _mean = tl.where(_cnt > 0.0, _val / _cnt, float('nan'))",
+                    f"        tl.store({buf_safe}_ptr + t * N + offs, _mean, mask=mask)",
                 ])
                 kernel_code_lines.append("")
         kernel_code_lines.append("")
@@ -359,12 +373,29 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             set(dims_1d).difference(vars_need_val).difference(unconditional_names)
         )
 
-        # Helper to emit variable value load
+        # Helper to emit variable value loads.  A value defined inside one
+        # dynamic branch is not visible in a sibling branch in Triton SSA, so
+        # memoization must be scoped rather than global.
         emitted_vars = set()
+        emitted_by_scope: dict[str, set[str]] = {}
+        unconditional_safe_names = {
+            self._get_safe_name(name) for name in unconditional_names
+        }
 
-        def emit_val(v_name, to_lines):
+        def emit_val(v_name, to_lines, scope: str | None = None):
             safe_v_name = self._get_safe_name(v_name)
-            if safe_v_name in emitted_vars:
+            scoped = (
+                emitted_vars
+                if scope is None else emitted_by_scope.setdefault(scope, set())
+            )
+            if (
+                safe_v_name in emitted_vars
+                or safe_v_name in scoped
+                or (
+                    scope is not None
+                    and safe_v_name in unconditional_safe_names
+                )
+            ):
                 return f"{safe_v_name}_val"
 
             source = self._statistics_ir.sources.get(v_name, TensorSource(v_name))
@@ -380,7 +411,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 to_lines.append(f"{indent}{safe_v_name}_val = tl.load({in_ptr_loc}, mask=mask, other=0.0)")
             elif isinstance(source, ExpressionSource):
                 names = {
-                    dependency: emit_val(dependency, to_lines)
+                    dependency: emit_val(dependency, to_lines, scope)
                     for dependency in source.expression.dependencies
                 }
                 expression = render_expression(
@@ -388,7 +419,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 )
                 to_lines.append(f"{indent}{safe_v_name}_val = {expression}")
 
-            emitted_vars.add(safe_v_name)
+            scoped.add(safe_v_name)
             return f"{safe_v_name}_val"
 
         # Phase 2: Collect all operations grouped by condition
@@ -404,7 +435,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         ops_is_inner_last_not_is_outer_first = []
         ops_is_inner_last_is_outer_last = []
         ops_is_inner_last_not_is_outer_last = []
-        ops_is_middle = []
 
         # Track which inner aggregations are needed
         inner_aggregations_needed = (
@@ -490,7 +520,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                 f"tl.store({out_ptr}, {val_var}, mask=mask)")
                             ops_is_inner_last_not_is_outer_first.extend([
                                 f"{safe_var}_{op}_old = tl.load({out_ptr}, mask=mask, other={val_var})",
-                                f"tl.store({out_ptr}, tl.maximum({safe_var}_{op}_old, {val_var}), mask=mask)",
+                                f"tl.store({out_ptr}, hydroforge_maximum({safe_var}_{op}_old, {val_var}), mask=mask)",
                             ])
                         else:
                             # maxK bubble insert without arg tracking
@@ -506,7 +536,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                 f"tl.store({out_ptr}, {val_var}, mask=mask)")
                             ops_is_inner_last_not_is_outer_first.extend([
                                 f"{safe_var}_{op}_old = tl.load({out_ptr}, mask=mask, other={val_var})",
-                                f"tl.store({out_ptr}, tl.minimum({safe_var}_{op}_old, {val_var}), mask=mask)",
+                                f"tl.store({out_ptr}, hydroforge_minimum({safe_var}_{op}_old, {val_var}), mask=mask)",
                             ])
                         else:
                             # minK bubble insert without arg tracking
@@ -575,7 +605,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     ])
                     ops_not_is_inner_first.extend([
                         f"{safe_var}_max_old = tl.load({out_ptr}, mask=mask, other={safe_var}_val)",
-                        f"tl.store({out_ptr}, tl.maximum({safe_var}_max_old, {safe_var}_val), mask=mask)",
+                        f"tl.store({out_ptr}, hydroforge_maximum({safe_var}_max_old, {safe_var}_val), mask=mask)",
                     ])
 
                 elif op == 'min':
@@ -584,7 +614,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     ])
                     ops_not_is_inner_first.extend([
                         f"{safe_var}_min_old = tl.load({out_ptr}, mask=mask, other={safe_var}_val)",
-                        f"tl.store({out_ptr}, tl.minimum({safe_var}_min_old, {safe_var}_val), mask=mask)",
+                        f"tl.store({out_ptr}, hydroforge_minimum({safe_var}_min_old, {safe_var}_val), mask=mask)",
                     ])
 
                 elif op == 'last':
@@ -601,7 +631,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         else:
                             # Load inline — use emit_val for scatter virtual support
                             _tmp = []
-                            emit_val(var, _tmp)
+                            emit_val(var, _tmp, "inner_last")
                             ops_is_inner_last.extend(line.lstrip() for line in _tmp)
                             ops_is_inner_last.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                     else:
@@ -619,21 +649,11 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         else:
                             # Load inline — use emit_val for scatter virtual support
                             _tmp = []
-                            emit_val(var, _tmp)
+                            emit_val(var, _tmp, "inner_first")
                             ops_is_inner_first.extend(line.lstrip() for line in _tmp)
                             ops_is_inner_first.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
                     else:
                         ops_is_inner_first.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
-
-                elif op == 'mid':
-                    if var in vars_conditional_only:
-                        # Load inline — use emit_val for scatter virtual support
-                        _tmp = []
-                        emit_val(var, _tmp)
-                        ops_is_middle.extend(line.lstrip() for line in _tmp)
-                        ops_is_middle.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
-                    else:
-                        ops_is_middle.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
 
         # Phase 3: Emit loads for vars that need unconditional val
         for var in vars_need_val:
@@ -690,7 +710,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
                     kernel_code_lines.extend([
                         f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other={var_val})",
-                        f"{indent}{safe_var}_inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), {var_val}, tl.maximum({safe_var}_inner_{inner_type}_old, {var_val}))",
+                        f"{indent}{safe_var}_inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), {var_val}, hydroforge_maximum({safe_var}_inner_{inner_type}_old, {var_val}))",
                         f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, -float('inf'), {safe_var}_inner_{inner_type}_new), mask=mask)",
                         f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new, {val_for_var_inner})",
                     ])
@@ -699,7 +719,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
                     kernel_code_lines.extend([
                         f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other={var_val})",
-                        f"{indent}{safe_var}_inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), {var_val}, tl.minimum({safe_var}_inner_{inner_type}_old, {var_val}))",
+                        f"{indent}{safe_var}_inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), {var_val}, hydroforge_minimum({safe_var}_inner_{inner_type}_old, {var_val}))",
                         f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, float('inf'), {safe_var}_inner_{inner_type}_new), mask=mask)",
                         f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new, {val_for_var_inner})",
                     ])
@@ -709,13 +729,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
                     kernel_code_lines.extend([
                         f"{indent}tl.store({inner_ptr}, {var_val}, mask=mask & is_inner_first)",
-                        f"{indent}{val_for_var_inner} = tl.where(is_inner_last, tl.load({inner_ptr}, mask=mask, other=0.0), {val_for_var_inner})",
-                    ])
-                elif inner_type == 'mid':
-                    inner_ptr = f"{safe_var}_{inner_type}_inner_state_ptr + {out_offset}"
-                    kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
-                    kernel_code_lines.extend([
-                        f"{indent}tl.store({inner_ptr}, {var_val}, mask=mask & is_middle)",
                         f"{indent}{val_for_var_inner} = tl.where(is_inner_last, tl.load({inner_ptr}, mask=mask, other=0.0), {val_for_var_inner})",
                     ])
         # Phase 5: Emit unconditional ops
@@ -736,11 +749,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             for line in ops_not_is_inner_first:
                 kernel_code_lines.append(f"{indent2}{line}")
 
-        if ops_is_middle:
-            kernel_code_lines.append(f"{indent}if is_middle:")
-            for line in ops_is_middle:
-                kernel_code_lines.append(f"{indent2}{line}")
-
         # Nested conditions for is_inner_last with outer conditions
         has_argmaxk_ops = bool(argmaxk_ops)
         has_inner_last_ops = (ops_is_inner_last or ops_is_inner_last_is_outer_first or
@@ -757,13 +765,13 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     var in vars_conditional_only
                     and var in inner_aggregations_needed.get(Reduction.LAST, ())
                 ):
-                    emit_val(var, kernel_code_lines)
-                    # Patch the emitted line to use is_inner_last indentation
-                    # The emit_val appends to kernel_code_lines with 'indent' (8 spaces)
-                    # We need it at indent2 (12 spaces) since we're inside 'if is_inner_last:'
-                    if kernel_code_lines and kernel_code_lines[-1].startswith(indent) and not kernel_code_lines[-1].startswith(indent2):
-                        last_line = kernel_code_lines.pop()
-                        kernel_code_lines.append(f"{indent2}{last_line.lstrip()}")
+                    deferred_lines = []
+                    emit_val(var, deferred_lines, "inner_last")
+                    # An expression can emit several dependency loads before
+                    # its value.  Every emitted line belongs to this branch.
+                    kernel_code_lines.extend(
+                        f"{indent2}{line.lstrip()}" for line in deferred_lines
+                    )
 
             # is_outer_first / not is_outer_first
             if ops_is_inner_last_is_outer_first or ops_is_inner_last_not_is_outer_first:
@@ -854,8 +862,16 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     kernel_code_lines.append(f"{indent2}new_val_argmax_{safe_var} = tl.where({argmax_val_var} == {argmax_val_var}, {argmax_val_var}, -float('inf'))")
                 if has_argmin:
                     kernel_code_lines.append(f"{indent2}new_val_argmin_{safe_var} = tl.where({argmin_val_var} == {argmin_val_var}, {argmin_val_var}, float('inf'))")
-                if has_argmax or has_argmin:
-                    kernel_code_lines.append(f"{indent2}new_idx_{safe_var} = tl.full([BLOCK_SIZE], macro_step_index, dtype=tl.int32)")
+                if has_argmax:
+                    kernel_code_lines.append(
+                        f"{indent2}new_idx_argmax_{safe_var} = "
+                        "tl.full([BLOCK_SIZE], macro_step_index, dtype=tl.int32)"
+                    )
+                if has_argmin:
+                    kernel_code_lines.append(
+                        f"{indent2}new_idx_argmin_{safe_var} = "
+                        "tl.full([BLOCK_SIZE], macro_step_index, dtype=tl.int32)"
+                    )
 
                 # is_outer_first branch: initialize all arrays
                 kernel_code_lines.append(f"{indent2}if is_outer_first:")
@@ -873,7 +889,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         f"{safe_var}_{argmax_op['op']}_aux_ptr"
                     )
                     argmax_idx_ptr = f"{safe_var}_{argmax_op['op']}_ptr"
-                    kernel_code_lines.append(f"{indent3}tl.store({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs, new_idx_{safe_var}, mask=mask)")
+                    kernel_code_lines.append(f"{indent3}tl.store({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs, new_idx_argmax_{safe_var}, mask=mask)")
                     kernel_code_lines.append(f"{indent3}tl.store({argmax_aux_ptr} + {safe_var}_k{k_val}_base_offs, new_val_argmax_{safe_var}, mask=mask)")
                     if argmax_op.get('has_val_output') and argmax_op.get('val_output_ptr'):
                         kernel_code_lines.append(f"{indent3}tl.store({argmax_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs, new_val_argmax_{safe_var}, mask=mask)")
@@ -883,7 +899,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         f"{safe_var}_{argmin_op['op']}_aux_ptr"
                     )
                     argmin_idx_ptr = f"{safe_var}_{argmin_op['op']}_ptr"
-                    kernel_code_lines.append(f"{indent3}tl.store({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs, new_idx_{safe_var}, mask=mask)")
+                    kernel_code_lines.append(f"{indent3}tl.store({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs, new_idx_argmin_{safe_var}, mask=mask)")
                     kernel_code_lines.append(f"{indent3}tl.store({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs, new_val_argmin_{safe_var}, mask=mask)")
                     if argmin_op.get('has_val_output') and argmin_op.get('val_output_ptr'):
                         kernel_code_lines.append(f"{indent3}tl.store({argmin_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs, new_val_argmin_{safe_var}, mask=mask)")
@@ -932,9 +948,9 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         f"{indent4}old_argmax_idx_k = tl.load({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=0)",
                         f"{indent4}swap_argmax = new_val_argmax_{safe_var} > old_argmax_aux_k",
                         f"{indent4}argmax_aux_store = tl.where(swap_argmax, new_val_argmax_{safe_var}, old_argmax_aux_k)",
-                        f"{indent4}argmax_idx_store = tl.where(swap_argmax, new_idx_{safe_var}, old_argmax_idx_k)",
+                        f"{indent4}argmax_idx_store = tl.where(swap_argmax, new_idx_argmax_{safe_var}, old_argmax_idx_k)",
                         f"{indent4}new_val_argmax_{safe_var} = tl.where(swap_argmax, old_argmax_aux_k, new_val_argmax_{safe_var})",
-                        f"{indent4}new_idx_{safe_var} = tl.where(swap_argmax, old_argmax_idx_k, new_idx_{safe_var})",
+                        f"{indent4}new_idx_argmax_{safe_var} = tl.where(swap_argmax, old_argmax_idx_k, new_idx_argmax_{safe_var})",
                         f"{indent4}tl.store({argmax_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, argmax_aux_store, mask=mask & swap_argmax)",
                         f"{indent4}tl.store({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, argmax_idx_store, mask=mask & swap_argmax)",
                     ])
@@ -946,9 +962,9 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         f"{indent4}old_argmin_idx_k = tl.load({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=0)",
                         f"{indent4}swap_argmin = new_val_argmin_{safe_var} < old_argmin_aux_k",
                         f"{indent4}argmin_aux_store = tl.where(swap_argmin, new_val_argmin_{safe_var}, old_argmin_aux_k)",
-                        f"{indent4}argmin_idx_store = tl.where(swap_argmin, new_idx_{safe_var}, old_argmin_idx_k)",
+                        f"{indent4}argmin_idx_store = tl.where(swap_argmin, new_idx_argmin_{safe_var}, old_argmin_idx_k)",
                         f"{indent4}new_val_argmin_{safe_var} = tl.where(swap_argmin, old_argmin_aux_k, new_val_argmin_{safe_var})",
-                        f"{indent4}new_idx_{safe_var} = tl.where(swap_argmin, old_argmin_idx_k, new_idx_{safe_var})",
+                        f"{indent4}new_idx_argmin_{safe_var} = tl.where(swap_argmin, old_argmin_idx_k, new_idx_argmin_{safe_var})",
                         f"{indent4}tl.store({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, argmin_aux_store, mask=mask & swap_argmin)",
                         f"{indent4}tl.store({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, argmin_idx_store, mask=mask & swap_argmin)",
                     ])
@@ -1058,8 +1074,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 kernel_code_lines.append("    is_inner_first = (flags & 1) != 0 and sub_step == 0")
             if 'is_inner_last' in needed_bools:
                 kernel_code_lines.append("    is_inner_last = ((flags >> 1) & 1) != 0 and sub_step == num_sub_steps - 1")
-            if 'is_middle' in needed_bools:
-                kernel_code_lines.append("    is_middle = sub_step == num_sub_steps // 2")
             if 'is_outer_first' in needed_bools:
                 kernel_code_lines.append("    is_outer_first = ((flags >> 2) & 1) != 0 and is_inner_last")
             if 'is_outer_last' in needed_bools:
@@ -1211,7 +1225,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                  f"{indent3}inner_{inner}_new = val",
                                  f"{indent2}else:",
                                  f"{indent3}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
-                                 f"{indent3}inner_{inner}_new = tl.maximum(inner_{inner}_old, val)",
+                                 f"{indent3}inner_{inner}_new = hydroforge_maximum(inner_{inner}_old, val)",
                                  f"{indent2}if is_inner_last:",
                                  f"{indent3}tl.store({inner_ptr}, -float('inf'), mask=mask)",
                                  f"{indent3}val_for_{inner} = inner_{inner}_new",
@@ -1230,7 +1244,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                  f"{indent3}inner_{inner}_new = val",
                                  f"{indent2}else:",
                                  f"{indent3}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
-                                 f"{indent3}inner_{inner}_new = tl.minimum(inner_{inner}_old, val)",
+                                 f"{indent3}inner_{inner}_new = hydroforge_minimum(inner_{inner}_old, val)",
                                  f"{indent2}if is_inner_last:",
                                  f"{indent3}tl.store({inner_ptr}, float('inf'), mask=mask)",
                                  f"{indent3}val_for_{inner} = inner_{inner}_new",
@@ -1271,21 +1285,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                  f"{indent2}else:",
                                  f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
                              ])
-                        elif inner == 'mid':
-                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
-                             kernel_code_lines.extend([
-                                 f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
-                                 f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent2}if is_middle:",
-                                 f"{indent3}tl.store({inner_ptr}, val, mask=mask)",
-                                 f"{indent2}if is_inner_last:",
-                                 f"{indent3}val_for_{inner} = tl.load({inner_ptr}, mask=mask, other=0.0)",
-                                 f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
-                                 f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
-                                 f"{indent2}else:",
-                                 f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
-                             ])
-
                     for operation in self._statistics_lowering.operations(var):
                         op = operation.spelling
                         out_ptr = f"{safe_var}_{op}_ptr + {out_offset}"
@@ -1308,7 +1307,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                         f"{indent3}else:",
                                         f"{indent4}old = tl.load({out_ptr}, mask=mask, other={val_var})",
                                         f"{indent4}cond_mask = {val_var} > old",
-                                        f"{indent4}new = tl.maximum(old, {val_var})",
+                                        f"{indent4}new = hydroforge_maximum(old, {val_var})",
                                         f"{indent4}tl.store({out_ptr}, new, mask=mask)",
                                         f"{indent4}tl.store({argmax_ptr}, macro_step_index, mask=mask & cond_mask)",
                                     ])
@@ -1353,7 +1352,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                         f"{indent3}else:",
                                         f"{indent4}old = tl.load({out_ptr}, mask=mask, other={val_var})",
                                         f"{indent4}cond_mask = {val_var} < old",
-                                        f"{indent4}new = tl.minimum(old, {val_var})",
+                                        f"{indent4}new = hydroforge_minimum(old, {val_var})",
                                         f"{indent4}tl.store({out_ptr}, new, mask=mask)",
                                         f"{indent4}tl.store({argmin_ptr}, macro_step_index, mask=mask & cond_mask)",
                                     ])
@@ -1434,7 +1433,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                 f"{indent3}tl.store({out_ptr}, val, mask=mask)",
                                 f"{indent2}else:",
                                 f"{indent3}old = tl.load({out_ptr}, mask=mask, other=val)",
-                                f"{indent3}new = tl.maximum(old, val)",
+                                f"{indent3}new = hydroforge_maximum(old, val)",
                                 f"{indent3}tl.store({out_ptr}, new, mask=mask)",
                             ])
                         elif op == 'min':
@@ -1443,7 +1442,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                 f"{indent3}tl.store({out_ptr}, val, mask=mask)",
                                 f"{indent2}else:",
                                 f"{indent3}old = tl.load({out_ptr}, mask=mask, other=val)",
-                                f"{indent3}new = tl.minimum(old, val)",
+                                f"{indent3}new = hydroforge_minimum(old, val)",
                                 f"{indent3}tl.store({out_ptr}, new, mask=mask)",
                             ])
                         elif op == 'argmax':
@@ -1475,11 +1474,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         elif op == 'first':
                             kernel_code_lines.extend([
                                 f"{indent2}if is_inner_first:",
-                                f"{indent3}tl.store({out_ptr}, val, mask=mask)",
-                            ])
-                        elif op == 'mid':
-                            kernel_code_lines.extend([
-                                f"{indent2}if is_middle:",
                                 f"{indent3}tl.store({out_ptr}, val, mask=mask)",
                             ])
                 kernel_code_lines.append("")
@@ -1552,13 +1546,12 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         output_index: str, var_list: List[str],
     ) -> None:
         """Generate a flat Triton kernel for variables saved at full tensor shape."""
-        kernel_name = f"kernel_{output_index}"
         kernel_code_lines.extend([
             f"# Full-output kernel: {output_index}",
             f"# Variables: {', '.join(var_list)}",
             "",
             "@triton.jit",
-            f"def {kernel_name}(",
+            f"def {_FULL_OUTPUT_KERNEL}(",
         ])
 
         sorted_inputs = sorted({
@@ -1611,7 +1604,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             "    macro_step_index = tl.load(__hf_macro_step_index_ptr).to(tl.int32)",
             "    is_inner_first = ((flags & 1) != 0) & (sub_step == 0)",
             "    is_inner_last = (((flags >> 1) & 1) != 0) & (sub_step == num_sub_steps - 1)",
-            "    is_middle = sub_step == num_sub_steps // 2",
             "    is_outer_first = (((flags >> 2) & 1) != 0) & is_inner_last",
             "    is_outer_last = (((flags >> 3) & 1) != 0) & is_inner_last",
             "",
@@ -1699,11 +1691,14 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=var_mask)",
                     ])
                 elif inner in {"max", "min"}:
-                    function = "maximum" if inner == "max" else "minimum"
+                    function = (
+                        "hydroforge_maximum"
+                        if inner == "max" else "hydroforge_minimum"
+                    )
                     sentinel = "-float('inf')" if inner == "max" else "float('inf')"
                     kernel_code_lines.extend([
                         f"{indent}inner_{inner}_old = tl.load({inner_ptr}, mask=var_mask, other={safe_var}_val)",
-                        f"{indent}inner_{inner}_new = tl.where(is_inner_first, {safe_var}_val, tl.{function}(inner_{inner}_old, {safe_var}_val))",
+                        f"{indent}inner_{inner}_new = tl.where(is_inner_first, {safe_var}_val, {function}(inner_{inner}_old, {safe_var}_val))",
                         f"{indent}{val_for} = inner_{inner}_new",
                         f"{indent}if is_inner_last:",
                         f"{indent2}tl.store({inner_ptr}, {sentinel}, mask=var_mask)",
@@ -1737,13 +1732,13 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     if outer == "max":
                         kernel_code_lines.extend([
                             f"{indent2}old = tl.load({out_ptr}, mask=var_mask, other={val_for})",
-                            f"{indent2}new = tl.where(is_outer_first, {val_for}, tl.maximum(old, {val_for}))",
+                            f"{indent2}new = tl.where(is_outer_first, {val_for}, hydroforge_maximum(old, {val_for}))",
                             f"{indent2}tl.store({out_ptr}, new, mask=var_mask)",
                         ])
                     elif outer == "min":
                         kernel_code_lines.extend([
                             f"{indent2}old = tl.load({out_ptr}, mask=var_mask, other={val_for})",
-                            f"{indent2}new = tl.where(is_outer_first, {val_for}, tl.minimum(old, {val_for}))",
+                            f"{indent2}new = tl.where(is_outer_first, {val_for}, hydroforge_minimum(old, {val_for}))",
                             f"{indent2}tl.store({out_ptr}, new, mask=var_mask)",
                         ])
                     elif outer == "sum":
@@ -1784,21 +1779,19 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 elif op == "max":
                     kernel_code_lines.extend([
                         f"{indent}old = tl.load({out_ptr}, mask=var_mask, other={safe_var}_val)",
-                        f"{indent}new = tl.where(is_inner_first, {safe_var}_val, tl.maximum(old, {safe_var}_val))",
+                        f"{indent}new = tl.where(is_inner_first, {safe_var}_val, hydroforge_maximum(old, {safe_var}_val))",
                         f"{indent}tl.store({out_ptr}, new, mask=var_mask)",
                     ])
                 elif op == "min":
                     kernel_code_lines.extend([
                         f"{indent}old = tl.load({out_ptr}, mask=var_mask, other={safe_var}_val)",
-                        f"{indent}new = tl.where(is_inner_first, {safe_var}_val, tl.minimum(old, {safe_var}_val))",
+                        f"{indent}new = tl.where(is_inner_first, {safe_var}_val, hydroforge_minimum(old, {safe_var}_val))",
                         f"{indent}tl.store({out_ptr}, new, mask=var_mask)",
                     ])
                 elif op == "last":
                     kernel_code_lines.append(f"{indent}tl.store({out_ptr}, {safe_var}_val, mask=var_mask & is_inner_last)")
                 elif op == "first":
                     kernel_code_lines.append(f"{indent}tl.store({out_ptr}, {safe_var}_val, mask=var_mask & is_inner_first)")
-                elif op == "mid":
-                    kernel_code_lines.append(f"{indent}tl.store({out_ptr}, {safe_var}_val, mask=var_mask & is_middle)")
                 else:
                     raise ValueError(f"Unsupported full-output op '{op}'.")
                 kernel_code_lines.append("")
@@ -1886,10 +1879,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             kernel_code_lines.append("")
 
         for output_index, var_list in grouped_by_output_index.items():
-            safe_output_index = self._get_safe_name(output_index)
-            kernel_name = f"kernel_{safe_output_index}"
-
-            if output_index == "__full__":
+            if output_index == _FULL_OUTPUT_GROUP:
                 full_len = max(
                     prod(self._statistics_layouts[var].actual_shape)
                     for var in var_list
@@ -1902,8 +1892,9 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 kernel_code_lines.extend([
                     "    # Launch full-output kernel",
                     f"    full_len = {full_len}",
-                    "    grid___full__ = lambda meta: (triton.cdiv(full_len, meta['BLOCK_SIZE']),)",
-                    f"    {kernel_name}[grid___full__](",
+                    f"    {_FULL_OUTPUT_GRID} = lambda meta: "
+                    "(triton.cdiv(full_len, meta['BLOCK_SIZE']),)",
+                    f"    {_FULL_OUTPUT_KERNEL}[{_FULL_OUTPUT_GRID}](",
                 ])
                 sorted_inputs = sorted({
                     name for var in var_list
@@ -1946,6 +1937,8 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 ])
                 continue
 
+            safe_output_index = self._get_safe_name(output_index)
+            kernel_name = f"kernel_{safe_output_index}"
             if self._tensor_registry[output_index].numel() == 0:
                 kernel_code_lines.append(
                     f"    # Skip empty statistics group {output_index}"

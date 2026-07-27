@@ -21,6 +21,7 @@ def sanitize_symbol(name: str) -> str:
     ):
         name = name.replace(operator, spelling)
     name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_")
     if name and name[0].isdigit():
         name = "_" + name
-    return re.sub(r"_+", "_", name).strip("_")
+    return name

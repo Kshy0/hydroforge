@@ -1,6 +1,7 @@
 """Cached compiled operator scopes outside the physical substep clock."""
 from __future__ import annotations
 
+import sys
 from typing import Any, Iterator
 
 
@@ -20,7 +21,10 @@ class _OuterProgram:
 
     def launch(self) -> None:
         self.operators.require_stable_bindings()
-        if self.capture_mode == "cuda_graph":
+        if (
+            self.capture_mode == "cuda_graph"
+            and self.operators.cuda_graph_capture_safe
+        ):
             if self.graph is None:
                 self.graph = self.capture.capture_cuda(
                     self.operators.launch,
@@ -53,7 +57,9 @@ class _OnceScope:
         programs = self.runtime.model._execution.programs
         program = programs.get(self.key, _MISSING)
         if program is _MISSING:
-            with record_operator_scope(self.runtime.model) as recording:
+            with record_operator_scope(
+                self.runtime.model, scope_kind="outer",
+            ) as recording:
                 yield None
             program = _OuterProgram(self.runtime.model, recording.program)
             programs[self.key] = program
@@ -74,7 +80,10 @@ class OuterRuntime:
         step = self.model._execution.active_step
         if step is None:
             raise RuntimeError("outer operator scopes require @managed_step")
+        caller = sys._getframe(1)
+        lexical_site = (caller.f_code, caller.f_lasti)
         key = step.claim_outer_scope(
+            site=lexical_site,
             specialization=_specialization_key(specialization),
         )
         return _OnceScope(self, key=key)

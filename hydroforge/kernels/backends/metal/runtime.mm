@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <memory>
 #include <string>
@@ -20,7 +21,9 @@ std::mutex pipeline_mutex;
 struct Pipeline {
   id<MTLComputePipelineState> state = nil;
   id<MTLArgumentEncoder> argument_encoder = nil;
-  enum class ArgumentType : uint8_t { Buffer, Float32, Int32, Int64, Bool };
+  enum class ArgumentType : uint8_t {
+    Buffer, Float32, Int32, UInt32, Int64, Bool
+  };
   std::vector<ArgumentType> argument_types;
   std::vector<MTLResourceUsage> argument_usage;
   ~Pipeline() {
@@ -58,6 +61,14 @@ std::vector<std::shared_ptr<ICBGraph>> graphs;
 std::vector<int64_t> free_graph_ids;
 
 std::shared_ptr<Pipeline> get_pipeline(int64_t pipeline_id);
+
+constexpr uint64_t kMaxMetalGridExtent =
+    std::numeric_limits<uint32_t>::max();
+
+void validate_grid_extent(uint64_t threads) {
+  TORCH_CHECK(threads <= kMaxMetalGridExtent,
+              "Metal launch extent exceeds the uint32 grid range: ", threads);
+}
 
 MTLLanguageVersion latest_stable_msl_version() {
   // Select the newest language revision exposed by the build SDK and host OS.
@@ -151,6 +162,7 @@ int64_t compile_pipeline(
       if (kind == "buffer") encoded_types.push_back(Pipeline::ArgumentType::Buffer);
       else if (kind == "float32") encoded_types.push_back(Pipeline::ArgumentType::Float32);
       else if (kind == "int32") encoded_types.push_back(Pipeline::ArgumentType::Int32);
+      else if (kind == "uint32") encoded_types.push_back(Pipeline::ArgumentType::UInt32);
       else if (kind == "int64") encoded_types.push_back(Pipeline::ArgumentType::Int64);
       else if (kind == "bool") encoded_types.push_back(Pipeline::ArgumentType::Bool);
       else TORCH_CHECK(false, "Unsupported Metal argument type: ", kind);
@@ -238,6 +250,11 @@ int64_t create_argument_binding(
       buffer = [device newBufferWithBytes:&scalar length:sizeof(scalar)
                                   options:MTLResourceStorageModeShared];
       binding->owned_scalar_buffers.push_back(buffer);
+    } else if (kind == Pipeline::ArgumentType::UInt32) {
+      uint32_t scalar = pybind11::cast<uint32_t>(value);
+      buffer = [device newBufferWithBytes:&scalar length:sizeof(scalar)
+                                  options:MTLResourceStorageModeShared];
+      binding->owned_scalar_buffers.push_back(buffer);
     } else if (kind == Pipeline::ArgumentType::Int64) {
       int64_t scalar = pybind11::cast<int64_t>(value);
       buffer = [device newBufferWithBytes:&scalar length:sizeof(scalar)
@@ -281,6 +298,7 @@ void dispatch(
     int64_t binding_id,
     uint64_t threads,
     uint64_t requested_group_size) {
+  validate_grid_extent(threads);
   auto pipeline = get_pipeline(pipeline_id);
   auto binding = get_binding(binding_id);
   if (threads == 0) return;
@@ -293,8 +311,13 @@ void dispatch(
     for (const auto& [resource, usage] : binding->resources) {
       [encoder useResource:resource usage:usage];
     }
-    NSUInteger width = std::min<NSUInteger>(
-        requested_group_size, pipeline->state.maxTotalThreadsPerThreadgroup);
+    TORCH_CHECK(
+        requested_group_size > 0 &&
+            requested_group_size <= pipeline->state.maxTotalThreadsPerThreadgroup,
+        "Requested Metal threadgroup width ", requested_group_size,
+        " exceeds pipeline limit ",
+        pipeline->state.maxTotalThreadsPerThreadgroup);
+    NSUInteger width = static_cast<NSUInteger>(requested_group_size);
     [encoder dispatchThreads:MTLSizeMake(threads, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
   });
@@ -310,6 +333,7 @@ void dispatch_sequence(
   TORCH_CHECK(binding_ids.size() == count && threads.size() == count &&
                   group_sizes.size() == count && barriers.size() == count,
               "Metal sequence arrays must have equal length");
+  for (uint64_t extent : threads) validate_grid_extent(extent);
   auto* stream = at::mps::getCurrentMPSStream();
   at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
     id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
@@ -322,8 +346,13 @@ void dispatch_sequence(
       for (const auto& [resource, usage] : binding->resources) {
         [encoder useResource:resource usage:usage];
       }
-      NSUInteger width = std::min<NSUInteger>(
-          group_sizes[i], pipeline->state.maxTotalThreadsPerThreadgroup);
+      TORCH_CHECK(
+          group_sizes[i] > 0 &&
+              group_sizes[i] <= pipeline->state.maxTotalThreadsPerThreadgroup,
+          "Requested Metal threadgroup width ", group_sizes[i],
+          " exceeds pipeline limit ",
+          pipeline->state.maxTotalThreadsPerThreadgroup);
+      NSUInteger width = static_cast<NSUInteger>(group_sizes[i]);
       [encoder dispatchThreads:MTLSizeMake(threads[i], 1, 1)
           threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
       if (barriers[i]) {
@@ -344,6 +373,7 @@ int64_t create_icb(
   TORCH_CHECK(binding_ids.size() == count && threads.size() == count &&
                   group_sizes.size() == count && barriers.size() == count,
               "Metal ICB arrays must have equal length");
+  for (uint64_t extent : threads) validate_grid_extent(extent);
   auto* stream = at::mps::getCurrentMPSStream();
   id<MTLDevice> device = stream->device();
   NSUInteger max_bindings = 0;
@@ -393,13 +423,27 @@ int64_t create_icb(
     for (const auto& [resource, usage] : binding->resources) {
       add_resource(resource, usage);
     }
-    NSUInteger width = std::min<NSUInteger>(
-        group_sizes[command_index], pipeline->state.maxTotalThreadsPerThreadgroup);
+    TORCH_CHECK(
+        group_sizes[command_index] > 0 &&
+            group_sizes[command_index] <=
+                pipeline->state.maxTotalThreadsPerThreadgroup,
+        "Requested Metal threadgroup width ", group_sizes[command_index],
+        " exceeds pipeline limit ",
+        pipeline->state.maxTotalThreadsPerThreadgroup);
+    NSUInteger width = static_cast<NSUInteger>(group_sizes[command_index]);
     TORCH_CHECK(threads[command_index] > 0 && width > 0,
                 "ICB dispatch dimensions must be positive");
     [command concurrentDispatchThreads:MTLSizeMake(threads[command_index], 1, 1)
                      threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
-    if (barriers[command_index]) [command setBarrier];
+    // MTLIndirectComputeCommand::setBarrier waits for commands *before* the
+    // command it is attached to.  The Python/native sequence ABI records a
+    // barrier *after* command i (matching dispatch_sequence above), so shift
+    // the marker forward by one command.  Wrapping the final marker onto the
+    // first command also preserves the dependency between repeated ICB
+    // executions used by fixed/adaptive substep loops.
+    const size_t preceding_command_index =
+        (command_index + count - 1) % count;
+    if (barriers[preceding_command_index]) [command setBarrier];
   }
   std::lock_guard<std::mutex> guard(graph_mutex);
   if (!free_graph_ids.empty()) {

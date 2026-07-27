@@ -112,7 +112,6 @@ class TorchStatisticsEmitter(StatisticsEmitter):
             '                     sub_step, num_sub_steps, flags, macro_step_index):',
             '    is_inner_first = (flags & 1) != 0 and sub_step == 0',
             '    is_inner_last = ((flags >> 1) & 1) != 0 and sub_step == num_sub_steps - 1',
-            '    is_middle = sub_step == num_sub_steps // 2',
             '    is_outer_first = ((flags >> 2) & 1) != 0 and is_inner_last',
             '    is_outer_last = ((flags >> 3) & 1) != 0 and is_inner_last',
             '',
@@ -285,11 +284,6 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                         '    if is_inner_first:',
                         f'        states["{out_key}"].copy_({safe_var}_val)',
                     ])
-                elif op == 'mid':
-                    lines.extend([
-                        '    if is_middle:',
-                        f'        states["{out_key}"].copy_({safe_var}_val)',
-                    ])
                 else:
                     raise ValueError(f"Unsupported full-output op '{op}'.")
                 lines.append('')
@@ -315,8 +309,6 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                 lines.append('    is_inner_first = (flags & 1) != 0 and sub_step == 0')
             if 'is_inner_last' in needed_bools:
                 lines.append('    is_inner_last = ((flags >> 1) & 1) != 0 and sub_step == num_sub_steps - 1')
-            if 'is_middle' in needed_bools:
-                lines.append('    is_middle = sub_step == num_sub_steps // 2')
             if 'is_outer_first' in needed_bools:
                 lines.append('    is_outer_first = ((flags >> 2) & 1) != 0 and is_inner_last')
             if 'is_outer_last' in needed_bools:
@@ -434,18 +426,6 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                             f'{indent}else:',
                             f'{indent2}{val_for} = torch.zeros_like({var_val})',
                         ])
-                    elif inner_type == 'mid':
-                        inner_key = f'{var}_{inner_type}_inner_state'
-                        lines.extend([
-                            f'{indent}_isl = {sl}',
-                            f'{indent}if is_middle:',
-                            f'{indent2}states["{inner_key}"][_isl] = {var_val}',
-                            f'{indent}if is_inner_last:',
-                            f'{indent2}{val_for} = states["{inner_key}"][_isl].clone()',
-                            f'{indent}else:',
-                            f'{indent2}{val_for} = torch.zeros_like({var_val})',
-                        ])
-
             # Now emit the actual ops
             for var in dims_1d:
                 safe_var = self._get_safe_name(var)
@@ -650,11 +630,6 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                             f'{indent}if is_inner_first:',
                             f'{indent2}states["{out_key}"][_sl] = {var_val}',
                         ])
-                    elif op == 'mid':
-                        lines.extend([
-                            f'{indent}if is_middle:',
-                            f'{indent2}states["{out_key}"][_sl] = {var_val}',
-                        ])
                     lines.append('')
 
         # ---------- 2D variables ----------
@@ -732,11 +707,6 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}if is_inner_first:',
                             f'{indent2}    states["{out_key}"][_out_idx] = _val',
                         ])
-                    elif op == 'mid':
-                        lines.extend([
-                            f'{indent2}if is_middle:',
-                            f'{indent2}    states["{out_key}"][_out_idx] = _val',
-                        ])
                     lines.append('')
 
         lines.append('')
@@ -756,10 +726,12 @@ class TorchStatisticsEmitter(StatisticsEmitter):
             '    weight = states["__weight"]',
             '    total_weight = states["__total_weight"]',
             '    num_macro_steps = states["__num_macro_steps"]',
-            '    sub_step = states["__sub_step"]',
-            '    num_sub_steps = states["__num_sub_steps"]',
-            '    flags = states["__flags"]',
-            '    macro_step_index = states["__macro_step_index"]',
+            '    # Materialize each host control once; repeated Tensor truth tests',
+            '    # otherwise synchronize a CUDA device in every generated branch.',
+            '    sub_step = int(states["__sub_step"].item())',
+            '    num_sub_steps = int(states["__num_sub_steps"].item())',
+            '    flags = int(states["__flags"].item())',
+            '    macro_step_index = int(states["__macro_step_index"].item())',
             f'    num_trials = {num_trials}',
         ])
 
@@ -812,8 +784,11 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                         '    _scatter_cnt.scatter_add_('
                         '0, _scatter_idx, _scatter_ones)'
                     )
-                lines.append('    _scatter_cnt.clamp_(min=1.0)')
                 lines.append(f'    states["{buf_key}"].div_(_scatter_cnt)')
+                lines.append(
+                    f'    states["{buf_key}"].masked_fill_('
+                    '_scatter_cnt == 0, float("nan"))'
+                )
         if scatters:
             lines.append('')
 

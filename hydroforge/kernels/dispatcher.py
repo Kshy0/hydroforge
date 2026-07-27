@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from hydroforge.contracts import (
     BackendLoweringSpec, BufferDTypeABI, KernelMetadata, KernelSpec,
+    validate_runtime_block_size,
 )
 from hydroforge.kernels.context import (
     active_kernel_spec, native_component_factory, reject_direct_kernel_launch,
@@ -15,6 +16,23 @@ from hydroforge.kernels.context import (
 
 def _metadata(callable_: Callable) -> KernelMetadata | None:
     return getattr(callable_, "__hydroforge_kernel__", None)
+
+
+def _reject_unproven_uint32_runtime_scalars(
+    spec: KernelSpec, backend: str,
+) -> None:
+    """Reject a backend that cannot prove fixed-width unsigned semantics."""
+
+    names = sorted(
+        name for name, kind in spec.runtime_scalars.items()
+        if kind == "uint32"
+    )
+    if names:
+        raise TypeError(
+            f"{spec.name}: {backend} backend does not support canonical "
+            f"uint32 runtime scalar(s) {names}; it cannot prove a fixed-width "
+            "unsigned native representation"
+        )
 
 
 def require_specializer(implementation: Any, *, label: str) -> Callable:
@@ -63,6 +81,7 @@ class TorchDispatcher:
     ) -> None:
         import inspect
 
+        _reject_unproven_uint32_runtime_scalars(spec, "Torch")
         signature = inspect.signature(kernel)
         parameters = tuple(signature.parameters)
         if parameters != spec.parameters:
@@ -88,7 +107,7 @@ class TorchDispatcher:
 
     def __call__(self, **kwargs: Any):
         reject_direct_kernel_launch(self.__hydroforge_kernel__.name)
-        supplied = set(kwargs)
+        supplied = set(kwargs).difference({"BLOCK_SIZE"})
         if supplied != self._parameters:
             raise TypeError(
                 "torch kernel ABI mismatch: "
@@ -96,7 +115,9 @@ class TorchDispatcher:
                 f"extra={sorted(supplied - self._parameters)}"
             )
         self.spec.validate_host_arguments(kwargs)
-        return self._kernel(**kwargs)
+        return self._kernel(**{
+            name: kwargs[name] for name in self.spec.parameters
+        })
 
     def specialize(
         self, arguments: dict[str, Any], dynamic: frozenset[str], *,
@@ -165,6 +186,10 @@ class VariantDispatcher:
         batched_metadata = _metadata(batched)
         if shared_metadata is None or batched_metadata is None:
             raise TypeError("variant implementations require KernelMetadata")
+        shared_lowering = getattr(shared, "__hydroforge_lowering__", None)
+        batched_lowering = getattr(batched, "__hydroforge_lowering__", None)
+        if shared_lowering is None or batched_lowering is None:
+            raise TypeError("shared/batched variants require lowering strategies")
         if batch_key not in spec.parameters:
             raise TypeError(
                 f"variant batch key {batch_key!r} is absent from KernelSpec"
@@ -192,43 +217,14 @@ class VariantDispatcher:
                 f"missing={sorted(expected_shared - shared_parameters)}, "
                 f"extra={sorted(shared_parameters - expected_shared)}"
             )
-        for label, metadata in (("shared", shared_metadata), ("batched", batched_metadata)):
-            unknown = set(metadata.parameters).difference(spec.parameters)
-            if unknown:
-                raise TypeError(
-                    f"{spec.name}: {label} variant has parameters outside "
-                    f"KernelSpec: {sorted(unknown)}"
-                )
-            for name, access in metadata.buffers.items():
-                expected_access = spec.buffers.get(name)
-                if expected_access != access:
-                    raise TypeError(
-                        f"{spec.name}: {label} variant buffer {name!r} has "
-                        f"access={access}, KernelSpec requires={expected_access}"
-                    )
-            for name, kind in metadata.compile_time.items():
-                if spec.compile_time.get(name) != kind:
-                    raise TypeError(
-                        f"{spec.name}: {label} variant constant {name!r}={kind} "
-                        "differs from KernelSpec"
-                    )
-            for name, feature in metadata.optional_buffers.items():
-                if spec.optional_buffers.get(name) != feature:
-                    raise TypeError(
-                        f"{spec.name}: {label} variant optional buffer "
-                        f"{name!r} differs from KernelSpec"
-                    )
-            for name, value in metadata.optional_values.items():
-                if spec.optional_values.get(name) != value:
-                    raise TypeError(
-                        f"{spec.name}: {label} variant optional value "
-                        f"{name!r} differs from KernelSpec"
-                    )
+        shared_spec = spec.project(omit=(batch_key,))
+        shared_spec.validate_native(
+            "shared variant", shared_metadata, shared_lowering,
+        )
+        spec.validate_native(
+            "batched variant", batched_metadata, batched_lowering,
+        )
         self.__hydroforge_kernel__ = spec.metadata
-        shared_lowering = getattr(shared, "__hydroforge_lowering__", None)
-        batched_lowering = getattr(batched, "__hydroforge_lowering__", None)
-        if shared_lowering is None or batched_lowering is None:
-            raise TypeError("shared/batched variants require lowering strategies")
         if shared_lowering.buffer_elements != batched_lowering.buffer_elements:
             raise TypeError(
                 "shared/batched variants require identical buffer-element lowering"
@@ -380,6 +376,7 @@ def make_triton_dispatcher(
         )
     else:
         canonical = spec
+    _reject_unproven_uint32_runtime_scalars(canonical, "Triton")
     size_key = canonical.size_key
     if batched_grid not in {"parallel", "loop"}:
         raise ValueError(
@@ -399,10 +396,7 @@ def make_triton_dispatcher(
             raise TypeError(
                 f"{canonical.name}: compiler-owned BLOCK_SIZE was not bound"
             ) from error
-        if type(bs) is not int or not 1 <= bs <= 1024:
-            raise ValueError(
-                "Triton BLOCK_SIZE must be an exact int in [1, 1024]"
-            )
+        validate_runtime_block_size(bs, backend="triton")
         trials = arguments.get("num_trials")
         use_batched = (
             trials is not None and trials > 1 and batched_kernel is not None
@@ -449,21 +443,54 @@ def make_triton_dispatcher(
                 if name in canonical.buffers and hasattr(value, "dtype")
             },
         )()
-    kernel_parameters = tuple(dict.fromkeys(
-        name for candidate in (kernel, batched_kernel)
-        if candidate is not None
-        for name in getattr(candidate, "arg_names", ())
-        if name != "BLOCK_SIZE"
-    ))
-    if batched_kernel is not None and "num_trials" not in kernel_parameters:
-        kernel_parameters = (*kernel_parameters, "num_trials")
-    if set(kernel_parameters) != set(canonical.parameters):
-        raise TypeError(
-            f"{canonical.name}: Triton native parameters differ from "
-            "KernelSpec: "
-            f"missing={sorted(set(canonical.parameters) - set(kernel_parameters))}, "
-            f"extra={sorted(set(kernel_parameters) - set(canonical.parameters))}"
+    canonical_parameters = set(canonical.parameters)
+
+    def validate_variant(candidate, label: str, *, complete: bool) -> None:
+        parameters = tuple(
+            name for name in getattr(candidate, "arg_names", ())
+            if name != "BLOCK_SIZE"
         )
+        if len(parameters) != len(set(parameters)):
+            raise TypeError(
+                f"{canonical.name}: {label} Triton variant has duplicate "
+                "native parameters"
+            )
+        observed = set(parameters)
+        extra = observed.difference(canonical_parameters)
+        missing = canonical_parameters.difference(observed)
+        if extra:
+            raise TypeError(
+                f"{canonical.name}: {label} Triton variant has parameters "
+                f"outside KernelSpec: {sorted(extra)}"
+            )
+        missing_buffers = missing.intersection(canonical.buffers)
+        if missing_buffers:
+            raise TypeError(
+                f"{canonical.name}: {label} Triton variant omits canonical "
+                f"buffers: {sorted(missing_buffers)}"
+            )
+        if complete and missing:
+            raise TypeError(
+                f"{canonical.name}: {label} Triton variant must consume the "
+                f"complete canonical ABI: missing={sorted(missing)}"
+            )
+        if not complete:
+            # Validate the selected shared surface as a real KernelSpec
+            # projection.  This rejects omitted launch extents and orphaned
+            # optional arguments instead of treating any scalar subset as an
+            # implementation detail.
+            canonical.project(omit=tuple(
+                name for name in canonical.parameters if name in missing
+            ))
+
+    if batched_kernel is None:
+        validate_variant(kernel, "single", complete=True)
+    else:
+        # A shared implementation may project out scalar values used only to
+        # select or index the batched layout.  Buffers are never grid-only:
+        # every selectable kernel must consume the complete state ABI.
+        validate_variant(kernel, "shared", complete=False)
+        validate_variant(batched_kernel, "batched", complete=True)
     lowering = BackendLoweringSpec.plan_specialized(
         buffer_elements="tensor",
     )
@@ -496,6 +523,7 @@ def make_triton_sequence_dispatcher(
             "make_triton_sequence_dispatcher requires a KernelSpec outside "
             "a BackendRegistry factory"
         )
+    _reject_unproven_uint32_runtime_scalars(spec, "Triton")
     # Component extents are backend implementation strategy, not alternative
     # public Specs.  Build them in an explicitly isolated native context.
     component_specs = []
@@ -607,6 +635,7 @@ def make_triton_program_dispatcher(
             "make_triton_program_dispatcher requires a KernelSpec outside "
             "a BackendRegistry factory"
         )
+    _reject_unproven_uint32_runtime_scalars(spec, "Triton")
     signature = inspect.signature(prepare)
     if tuple(signature.parameters) != (
         "arguments", "dynamic", "buffer_dtypes",
@@ -620,6 +649,13 @@ def make_triton_program_dispatcher(
         arguments: dict[str, Any], dynamic: frozenset[str], *,
         buffer_dtypes: BufferDTypeABI,
     ) -> Callable:
+        try:
+            block_size = arguments["BLOCK_SIZE"]
+        except KeyError as error:
+            raise TypeError(
+                f"{spec.name}: compiler-owned BLOCK_SIZE was not bound"
+            ) from error
+        validate_runtime_block_size(block_size, backend="triton")
         launch = prepare(arguments, dynamic, buffer_dtypes)
         if not callable(launch):
             raise TypeError(

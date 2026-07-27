@@ -79,7 +79,8 @@ class AbstractModel(BaseModel, ABC):
         default_factory=list,
         description="List of active modules",
     )
-    # Preferred shape: dict[op -> str | list[str]]; op in {mean,max,min,last};
+    # Preferred shape: dict[op -> str | list[str]];
+    # op in {mean,sum,max,min,first,last};
     # one variable can appear under multiple ops.  Use the reserved key
     # ``"static"`` to register per-saved-point static variables — these
     # are materialised once at aggregator init and written into every
@@ -88,7 +89,7 @@ class AbstractModel(BaseModel, ABC):
         default=None,
         description=(
             "Statistics to save, in the form {op: [vars...]}. "
-            "Supported ops: mean, max, min, last, first, mid, sum. "
+            "Supported ops: mean, sum, max, min, first, last. "
             "Use explicit compound operations such as argmax_mean when an "
             "extremum time index is required. "
             "Variables can be strings or {alias: expr} dicts.  The "

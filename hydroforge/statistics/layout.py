@@ -236,6 +236,13 @@ class _StatisticsLayoutCompiler:
                     f"negative value {lower}"
                 )
             extent = upper + 1
+        # The scatter index only describes contributors, not the full target
+        # domain.
+        output_index = self._field_info(name).output_index
+        if output_index is not None:
+            selection = self.aggregator._tensor_registry.get(output_index)
+            if selection is not None and selection.numel():
+                extent = max(extent, int(selection.max().item()) + 1)
         shape = (
             (self.num_trials, extent) if value.batched else (extent,)
         )

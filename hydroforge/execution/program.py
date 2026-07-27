@@ -110,6 +110,19 @@ class FixedSubstepProgram:
         if operators is not None:
             operators.close(self.capture)
 
+    def invalidate_statistics(self, aggregator: Any) -> None:
+        """Release captures that retain one statistics specialization."""
+        graph, self.statistics_graph = self.statistics_graph, None
+        if graph is not None:
+            self.capture.release(graph)
+        if self._metal_fold_aggregator is aggregator:
+            iteration, self.metal_fold_iteration = (
+                self.metal_fold_iteration, None
+            )
+            self._metal_fold_aggregator = None
+            if iteration is not None:
+                self.capture.release(iteration.icb)
+
     def _folded_metal_iteration(self):
         aggregator = self.statistics.aggregator
         if (
@@ -271,6 +284,38 @@ class FixedSubstepProgram:
         step = self.execution.active_step
         if step is None:
             raise RuntimeError("fixed substeps require @managed_step")
+        if self.mode != "eager" and not self.operators.cuda_graph_capture_safe:
+            # A conditional-WHILE graph cannot be launched while an enclosing
+            # CUDA stream capture is active.  Keep the predicate loop as one
+            # device graph launch and execute its surrounding operators in
+            # lexical order without wrapping them in a second CUDA graph.
+            self.count.fill_(count)
+            self.count_value.fill_(count)
+            self.duration.fill_(duration)
+            self.weight.fill_(duration / count)
+            if step.run_statistics and not self.statistics.device_compatible():
+                raise RuntimeError(
+                    "fixed device execution requires device-compatible statistics"
+                )
+            controlled = (
+                self.operators.references_tensor(self.counter)
+                or self.operators.references_tensor(self.midpoint)
+            )
+            if controlled:
+                self._reset()
+            width = duration / count
+            for index in range(count):
+                if controlled:
+                    self._iteration()
+                else:
+                    self.operators.launch()
+                # Nested predicate graphs cannot themselves be captured in an
+                # enclosing fixed-loop graph.  Preserve fixed-loop semantics
+                # by sampling after every host-scheduled physical substep.
+                step.sample_fixed(
+                    sub_step=index, num_sub_steps=count, weight=width,
+                )
+            return count
         if self.mode != "eager" and not step.run_statistics:
             controlled = (
                 self.operators.references_tensor(self.counter)
@@ -294,12 +339,12 @@ class FixedSubstepProgram:
         self.weight.fill_(duration / count)
         fold = False
         if self.metal_iteration is not None:
-            fold = step.run_statistics and self.statistics.should_fold()
-        if self.metal_iteration is not None and fold:
-            if not self.statistics.device_compatible():
+            if step.run_statistics and not self.statistics.device_compatible():
                 raise RuntimeError(
                     "fixed Metal execution requires device-compatible statistics"
                 )
+            fold = step.run_statistics and self.statistics.should_fold()
+        if self.metal_iteration is not None and fold:
             self.statistics.prelaunch(step.flags, step.total_weight)
             self._reset()
             self._folded_metal_iteration().replay(count)
@@ -356,6 +401,117 @@ class FixedSubstepProgram:
             )
         step.advance_device(duration)
         return count
+
+
+class PredicateLoopProgram:
+    """Nested loop controlled by a body-authored device predicate.
+
+    The loop is deliberately independent of physical time and statistics.  It
+    is suitable for nonlinear closure iterations whose body updates a scalar
+    ``predicate`` and whose enclosing fixed/adaptive scope owns time advance.
+    """
+
+    def __init__(self, model: Any, *, maximum_steps: int) -> None:
+        if type(maximum_steps) is not int:
+            raise TypeError("predicate loop maximum_steps must be an exact int")
+        if maximum_steps < 1:
+            raise ValueError("predicate loop maximum_steps must be positive")
+        self.execution = model._execution
+        self.capture = self.execution.capture
+        self.maximum_steps = maximum_steps
+        from torch.utils._python_dispatch import _disable_current_modes
+
+        # Predicate programs are constructed while their parent operator
+        # recorder is active; runtime-owned control allocation is compiler
+        # setup, not part of the parent's physics IR.
+        with _disable_current_modes(), torch.inference_mode(False):
+            options = {"device": self.execution.device, "dtype": torch.int32}
+            self.predicate = torch.zeros(1, **options)
+            self.counter = torch.zeros(1, **options)
+            self.continue_flag = torch.zeros(1, **options)
+            self.maximum_count = torch.full((1,), maximum_steps, **options)
+            self.zero_count = torch.zeros(1, **options)
+            self.one_count = torch.ones(1, **options)
+            self.has_more = torch.zeros(
+                1, device=self.execution.device, dtype=torch.bool,
+            )
+            self.under_limit = torch.zeros_like(self.has_more)
+        self.body_operators = None
+        self.graph = None
+        self.mode = self.execution.loop_mode(
+            world_size=model.world_size,
+            allow_distributed=False,
+        )
+
+    def install(self, body: Any) -> None:
+        if self.body_operators is not None:
+            raise RuntimeError("predicate loop body is already installed")
+        if not body.operators:
+            from hydroforge.execution.operators import SubstepCompileError
+
+            raise SubstepCompileError("predicate loop produced an empty operator IR")
+        self.body_operators = body
+
+    def _reset(self) -> None:
+        self.predicate.zero_()
+        self.counter.zero_()
+        self.continue_flag.fill_(1)
+
+    def _iteration(self) -> None:
+        self.predicate.zero_()
+        self.body_operators.launch()
+        self.counter.add_(self.one_count)
+        torch.ne(self.predicate, self.zero_count, out=self.has_more)
+        torch.lt(self.counter, self.maximum_count, out=self.under_limit)
+        torch.logical_and(
+            self.has_more,
+            self.under_limit,
+            out=self.has_more,
+        )
+        self.continue_flag.copy_(self.has_more)
+
+    def _graph(self) -> Any:
+        if self.graph is not None:
+            return self.graph
+
+        def body(graph: Any, _set_cond: bool, stream: int) -> None:
+            self._iteration()
+
+        self.graph = self.capture.build_conditional_graph(
+            body=body,
+            reset=self._reset,
+            continue_flag=self.continue_flag,
+            extra_state=(
+                self.predicate,
+                self.counter,
+                self.continue_flag,
+                self.has_more,
+                self.under_limit,
+                *self.body_operators.mutated_tensors,
+            ),
+        )
+        return self.graph
+
+    def execute(self) -> None:
+        if self.body_operators is None:
+            raise RuntimeError("predicate loop body has not been recorded")
+        self.body_operators.require_stable_bindings()
+        self._reset()
+        if self.mode == "eager":
+            while True:
+                self._iteration()
+                if int(self.continue_flag.item()) == 0:
+                    break
+            return
+        self.execution.launch_conditional(self._graph())
+
+    def close(self) -> None:
+        graph, self.graph = self.graph, None
+        body, self.body_operators = self.body_operators, None
+        if graph is not None:
+            self.capture.release(graph)
+        if body is not None:
+            body.close(self.capture)
 
 
 class AdaptiveSubstepProgram:
@@ -531,6 +687,13 @@ class AdaptiveSubstepProgram:
                 continue
             operators.close(self.capture)
 
+    def invalidate_statistics(self, aggregator: Any) -> None:
+        """Release only the adaptive graph that folded statistics."""
+        del aggregator
+        graph = self.graphs.pop(True, None)
+        if graph is not None:
+            self.capture.release(graph)
+
     def _reset(self) -> None:
         self.elapsed.zero_()
         self.counter.zero_()
@@ -637,9 +800,8 @@ class AdaptiveSubstepProgram:
             raise RuntimeError("adaptive substeps require @managed_step")
         if self.mode == "eager":
             self._reset()
-            elapsed = 0.0
             count = 0
-            while elapsed < duration:
+            while int(self.continue_flag.item()) != 0:
                 self._iteration()
                 if int(self.error_flag.item()) != 0:
                     raise ValueError(
@@ -648,15 +810,16 @@ class AdaptiveSubstepProgram:
                         f"maximum_sub_steps={self.maximum_steps}"
                     )
                 weight = float(self.time_step.item())
-                if not 0.0 < weight <= duration - elapsed:
+                if not math.isfinite(weight) or weight <= 0.0:
                     raise ValueError(
-                        f"adaptive substep width {weight} is invalid at {elapsed}"
+                        "adaptive substep proposal produced an invalid accepted "
+                        f"width {weight}"
                     )
-                elapsed += weight
                 count += 1
+                continuing = int(self.continue_flag.item()) != 0
                 step.sample_adaptive(
                     weight=weight, first_event=count == 1,
-                    last_event=elapsed >= duration,
+                    last_event=not continuing,
                 )
             self.proposal_operators.check_metal_errors()
             self.body_operators.check_metal_errors()

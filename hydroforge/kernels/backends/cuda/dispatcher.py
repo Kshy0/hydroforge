@@ -426,7 +426,8 @@ class CudaDispatcher:
             **{
                 name: {
                     "bool": "bool", "int32": "int32",
-                    "index": "index", "float32": "float32",
+                    "uint32": "uint32", "index": "index",
+                    "float32": "float32",
                 }[kind]
                 for name, kind in spec.runtime_scalars.items()
             },
@@ -500,6 +501,8 @@ class CudaDispatcher:
             return "bool"
         if normalized in {"int", "int32_t"}:
             return "int32"
+        if normalized in {"uint32_t", "std::uint32_t", "unsigned int"}:
+            return "uint32"
         if normalized in {"long", "int64_t"}:
             return "index"
         if normalized == "float":

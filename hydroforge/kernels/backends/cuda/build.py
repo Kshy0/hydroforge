@@ -11,8 +11,9 @@ import socket
 import sys
 import sysconfig
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -56,6 +57,45 @@ def _normalise_inline_source(src: Union[str, Sequence[str]]) -> str:
     if isinstance(src, str):
         return src
     return "\n".join(src)
+
+
+def _content_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _include_path_fingerprints(paths: Sequence[str]) -> list[dict[str, Any]]:
+    """Fingerprint every file visible through an explicit include path."""
+
+    fingerprints = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        entry: dict[str, Any] = {"path": str(path)}
+        if path.is_file():
+            entry.update(kind="file", sha256=_content_sha256(path))
+        elif path.is_dir():
+            digest = hashlib.sha256()
+            count = 0
+            for candidate in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
+                if not candidate.is_file():
+                    continue
+                relative = candidate.relative_to(path).as_posix().encode()
+                digest.update(len(relative).to_bytes(8, "big"))
+                digest.update(relative)
+                digest.update(bytes.fromhex(_content_sha256(candidate)))
+                count += 1
+            entry.update(
+                kind="directory", sha256=digest.hexdigest(), file_count=count,
+            )
+        else:
+            # Preserve the old compiler-owned error path for a missing include
+            # directory while ensuring its later creation changes the key.
+            entry.update(kind="missing", sha256=None)
+        fingerprints.append(entry)
+    return fingerprints
 
 
 def _normalise_hip_cflags(flags: Sequence[str]) -> List[str]:
@@ -117,6 +157,9 @@ def _build_fingerprint(
         "extra_cuda_cflags": list(extra_cuda_cflags),
         "extra_ldflags": list(extra_ldflags),
         "extra_include_paths": list(extra_include_paths),
+        "extra_include_contents": _include_path_fingerprints(
+            extra_include_paths,
+        ),
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "torch_hip": torch.version.hip,
@@ -317,7 +360,26 @@ def _process_is_alive(pid: Optional[int]) -> bool:
     return True
 
 
-def _maybe_remove_abandoned_compile_lock(
+@contextmanager
+def _compile_lock_guard(lock_path: Path):
+    """Serialize lock-file create/remove decisions on one stable inode."""
+    guard_path = lock_path.with_name(f"{lock_path.name}.guard")
+    descriptor = os.open(str(guard_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        if os.name == "posix":
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        if os.name == "posix":
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _remove_abandoned_compile_lock_unlocked(
     lock_path: Path,
     *,
     stale_after: float,
@@ -330,14 +392,22 @@ def _maybe_remove_abandoned_compile_lock(
         age = time.time() - lock_path.stat().st_mtime
     except OSError:
         return False
-    if age < stale_after:
-        return False
-
     holder_host, holder_pid = _read_compile_lock_holder(lock_path)
     local_host = socket.gethostname()
-    if holder_host == local_host and not _process_is_alive(holder_pid):
+    dead_local_holder = (
+        holder_host == local_host and not _process_is_alive(holder_pid)
+    )
+    if dead_local_holder:
+        grace = max(0.0, _env_float(
+            f"{env_prefix}_CUDA_COMPILE_LOCK_DEAD_PID_GRACE_SECONDS",
+            _env_float(
+                "HYDROFORGE_CUDA_COMPILE_LOCK_DEAD_PID_GRACE_SECONDS", 2.0,
+            ),
+        ))
+        if age < min(stale_after, grace):
+            return False
         reason = f"abandoned by local pid {holder_pid}"
-    elif (
+    elif age >= stale_after and (
         _env_truthy(f"{env_prefix}_CUDA_COMPILE_LOCK_STEAL", False)
         or _env_truthy("HYDROFORGE_CUDA_COMPILE_LOCK_STEAL", False)
     ):
@@ -358,7 +428,26 @@ def _maybe_remove_abandoned_compile_lock(
     return True
 
 
-def _acquire_compile_lock(lock_path: Path, *, env_prefix: str, verbose: bool) -> None:
+def _maybe_remove_abandoned_compile_lock(
+    lock_path: Path,
+    *,
+    stale_after: float,
+    env_prefix: str,
+    verbose: bool,
+) -> bool:
+    with _compile_lock_guard(lock_path):
+        return _remove_abandoned_compile_lock_unlocked(
+            lock_path,
+            stale_after=stale_after,
+            env_prefix=env_prefix,
+            verbose=verbose,
+        )
+
+
+def _acquire_compile_lock(
+    lock_path: Path, *, env_prefix: str, verbose: bool,
+    cache_probe: Callable[[], Any | None] | None = None,
+) -> Any | None:
     stale_after = _env_float(
         f"{env_prefix}_CUDA_COMPILE_LOCK_STALE_SECONDS",
         _env_float("HYDROFORGE_CUDA_COMPILE_LOCK_STALE_SECONDS", 1800.0),
@@ -371,16 +460,40 @@ def _acquire_compile_lock(lock_path: Path, *, env_prefix: str, verbose: bool) ->
     deadline = time.time() + timeout if timeout > 0.0 else None
 
     while True:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            if _maybe_remove_abandoned_compile_lock(
-                lock_path,
-                stale_after=stale_after,
-                env_prefix=env_prefix,
-                verbose=verbose,
-            ):
-                continue
+        if cache_probe is not None:
+            cached = cache_probe()
+            if cached is not None:
+                return cached
+        removed = False
+        with _compile_lock_guard(lock_path):
+            try:
+                fd = os.open(
+                    str(lock_path),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o644,
+                )
+            except FileExistsError:
+                removed = _remove_abandoned_compile_lock_unlocked(
+                    lock_path,
+                    stale_after=stale_after,
+                    env_prefix=env_prefix,
+                    verbose=verbose,
+                )
+            else:
+                try:
+                    os.write(
+                        fd,
+                        (
+                            f"{socket.gethostname()}:{os.getpid()}:"
+                            f"{time.time():.0f}"
+                        ).encode(),
+                    )
+                finally:
+                    os.close(fd)
+                return None
+        if removed:
+            continue
+        if lock_path.exists():
             if deadline is not None and time.time() > deadline:
                 holder_host, holder_pid = _read_compile_lock_holder(lock_path)
                 holder = (
@@ -396,22 +509,14 @@ def _acquire_compile_lock(lock_path: Path, *, env_prefix: str, verbose: bool) ->
                 )
             time.sleep(poll)
             continue
-        else:
-            try:
-                os.write(
-                    fd,
-                    f"{socket.gethostname()}:{os.getpid()}:{time.time():.0f}".encode(),
-                )
-            finally:
-                os.close(fd)
-            return
 
 
 def _release_compile_lock(lock_path: Path) -> None:
-    try:
-        lock_path.unlink()
-    except FileNotFoundError:
-        pass
+    with _compile_lock_guard(lock_path):
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _coordinated_build(
@@ -451,7 +556,18 @@ def _coordinated_build(
 
     canonical.mkdir(parents=True, exist_ok=True)
     lock_path = canonical / ".hydroforge_compile.lock"
-    _acquire_compile_lock(lock_path, env_prefix=env_prefix, verbose=verbose)
+    cached = _acquire_compile_lock(
+        lock_path,
+        env_prefix=env_prefix,
+        verbose=verbose,
+        cache_probe=(
+            None
+            if force_rebuild else
+            lambda: _try_import_cached(compiled_name, digest, search)
+        ),
+    )
+    if cached is not None:
+        return cached
     try:
         # Double-check: a previous holder may have finished between our cache
         # miss and acquiring the lock.

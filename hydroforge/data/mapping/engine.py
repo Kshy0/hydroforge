@@ -57,7 +57,37 @@ def regular_overlap_rows(
 
     rows: list[tuple[np.ndarray, np.ndarray, float]] = []
     for xmin, xmax, ymin, ymax in target.bounds:
-        lon_overlap = np.clip(np.minimum(xmax, x_hi) - np.maximum(xmin, x_lo), 0.0, None)
+        target_width = float(xmax - xmin)
+        if geographic and source.periodic_x:
+            if target_width > 360.0 + 1e-9:
+                raise ValueError(
+                    "geographic target longitude width cannot exceed 360 degrees"
+                )
+            # Align one target copy with the source convention, then include
+            # its neighbours so seam-crossing cells are split across both
+            # ends of a periodic grid.  Summing per source cell avoids
+            # duplicate column indices in the resulting sparse row.
+            source_center = 0.5 * (
+                float(np.min(x_lo)) + float(np.max(x_hi))
+            )
+            target_center = 0.5 * (float(xmin) + float(xmax))
+            base_shift = 360.0 * round(
+                (source_center - target_center) / 360.0
+            )
+            lon_overlap = np.zeros_like(x_lo)
+            for shift in (base_shift - 360.0, base_shift, base_shift + 360.0):
+                shifted_min = xmin + shift
+                shifted_max = xmax + shift
+                lon_overlap += np.clip(
+                    np.minimum(shifted_max, x_hi)
+                    - np.maximum(shifted_min, x_lo),
+                    0.0, None,
+                )
+        else:
+            lon_overlap = np.clip(
+                np.minimum(xmax, x_hi) - np.maximum(xmin, x_lo),
+                0.0, None,
+            )
         lat_lo = np.maximum(ymin, y_lo)
         lat_hi = np.minimum(ymax, y_hi)
         lat_overlap = np.clip(lat_hi - lat_lo, 0.0, None)
@@ -84,7 +114,7 @@ def regular_overlap_rows(
         covered_planar = float(
             np.sum(lat_overlap[row_idx][:, None] * lon_overlap[col_idx][None, :])
         )
-        target_planar = float((xmax - xmin) * (ymax - ymin))
+        target_planar = float(target_width * (ymax - ymin))
         coverage = covered_planar / target_planar if target_planar > 0.0 else 0.0
         rows.append((cols, values, float(coverage)))
     return rows
@@ -131,5 +161,8 @@ def aggregate_hires_coo(
     valid = (catchment_idx != -1) & (source_idx != -1)
     rows = catchment_idx[valid].astype(np.int64)
     cols = source_idx[valid].astype(np.int64)
-    data = np.asarray(pixel_area, dtype=np.float32)[valid]
+    # Keep source areas in float64 until duplicate COO entries have been
+    # coalesced by scipy.  Casting each pixel before that reduction loses
+    # measurable area when hundreds of hires pixels map to one source cell.
+    data = np.asarray(pixel_area, dtype=np.float64)[valid]
     return rows, cols, data

@@ -37,6 +37,14 @@ class AdaptiveSubstepFrame:
         self._resolve()
 
 
+@dataclass(frozen=True, slots=True)
+class PredicateLoopFrame:
+    """Device state exposed to one nested predicate-loop body."""
+
+    index: torch.Tensor
+    continue_flag: torch.Tensor
+
+
 def _specialization_key(value: Any) -> Any:
     """Make an explicit host specialization unambiguous and hashable."""
     if value is None:
@@ -86,6 +94,7 @@ class _FixedScope:
                     program.count, program.counter,
                     program.weight, program.midpoint,
                 ),
+                scope_kind="fixed",
             ) as recording:
                 yield program.frame
             if recording.program is None:
@@ -157,12 +166,14 @@ class _AdaptiveScope:
             proposal = record_operator_scope(
                 self.runtime.model,
                 stable_tensors=(program.candidate,),
+                scope_kind="adaptive proposal",
             )
             physics = record_operator_scope(
                 self.runtime.model,
                 stable_tensors=(
                     program.counter, program.time_step, program.fraction,
                 ),
+                scope_kind="adaptive physics",
             )
             active: Any | None = proposal
             resolved = False
@@ -218,6 +229,70 @@ class _AdaptiveScope:
         step.completed_substeps = self.completed
 
 
+class _PredicateScope:
+    def __init__(
+        self,
+        runtime: SubstepRuntime,
+        *,
+        maximum_steps: int,
+    ) -> None:
+        if type(maximum_steps) is not int:
+            raise TypeError("predicate loop maximum_steps must be an exact int")
+        if maximum_steps < 1:
+            raise ValueError("predicate loop maximum_steps must be positive")
+        self.runtime = runtime
+        self.maximum_steps = maximum_steps
+
+    def __iter__(self) -> Iterator[PredicateLoopFrame]:
+        from hydroforge.execution.operators import record_operator_scope
+        from hydroforge.execution.program import PredicateLoopProgram
+        from hydroforge.kernels.context import active_operator_recorder
+        from torch.utils._python_dispatch import _disable_current_modes
+
+        parent = active_operator_recorder()
+        if parent is None:
+            raise RuntimeError(
+                "predicate loops must be nested directly inside a compiled "
+                "fixed substep scope"
+            )
+        if parent.scope_kind != "fixed":
+            from hydroforge.execution.operators import SubstepCompileError
+
+            raise SubstepCompileError(
+                "predicate loops are supported only directly inside a fixed "
+                f"substep; found {parent.scope_kind!r} operator scope"
+            )
+        program = PredicateLoopProgram(
+            self.runtime.model,
+            maximum_steps=self.maximum_steps,
+        )
+        recording = record_operator_scope(
+            self.runtime.model,
+            stable_tensors=(
+                program.predicate,
+                program.counter,
+                program.continue_flag,
+            ),
+            scope_kind="predicate",
+        )
+        try:
+            # The child recorder replaces, rather than stacks on, the parent
+            # TorchDispatchMode.  Otherwise every child ATen operator would be
+            # intercepted a second time by the outer recorder.
+            with _disable_current_modes(), recording:
+                yield PredicateLoopFrame(
+                    index=program.counter,
+                    continue_flag=program.predicate,
+                )
+            if recording.program is None:
+                raise RuntimeError("predicate loop recording did not complete")
+            program.install(recording.program)
+            parent.record_predicate_loop(program)
+        except BaseException:
+            program.close()
+            raise
+
+
 class SubstepRuntime:
     """Declare compiled loops as ordinary readable Python ``for`` scopes.
 
@@ -259,6 +334,20 @@ class SubstepRuntime:
             self, key=key, duration=duration,
             candidate_dt=candidate_dt, dt=dt,
             maximum_dt=maximum_dt, maximum_steps=maximum_steps,
+        )
+
+    def predicate(self, *, maximum_steps: int) -> _PredicateScope:
+        """Declare a non-temporal loop controlled by a device scalar.
+
+        The body must write ``frame.continue_flag`` on every iteration.  The
+        loop executes at least once and stops when that scalar becomes zero or
+        after ``maximum_steps`` iterations.  It must be nested inside the one
+        lexical fixed substep owned by the managed step.
+        """
+
+        return _PredicateScope(
+            self,
+            maximum_steps=maximum_steps,
         )
 
     def _claim_scope(

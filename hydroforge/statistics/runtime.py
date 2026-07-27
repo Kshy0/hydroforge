@@ -11,15 +11,15 @@ import hashlib
 import linecache
 import random
 import sys
+import weakref
 from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set
 
-import cftime
 import numpy as np
 import torch
 
@@ -38,6 +38,19 @@ from hydroforge.serialization.netcdf import (
 from hydroforge.serialization.files import atomic_write_text
 from hydroforge.contracts.fields import RuntimeTensorMetadata
 from hydroforge.contracts.naming import RESERVED_CONTROL_STATE, sanitize_symbol
+
+
+def _weak_shutdown_callback(runtime: Any):
+    """Return an atexit callback that does not keep ``runtime`` alive."""
+
+    runtime_ref = weakref.ref(runtime)
+
+    def shutdown() -> None:
+        instance = runtime_ref()
+        if instance is not None:
+            instance._shutdown()
+
+    return shutdown
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,10 +185,6 @@ class StatisticsRuntime:
 
         self._macro_step_index = 0  # Current macro step index (outer loop counter)
 
-        # Time index tracking for argmax/argmin conversion
-        # Maps macro step index -> datetime, populated during finalize_time_step
-        self._macro_step_times: List[Union[datetime, cftime.datetime]] = []
-
         # Internal state
         # Generic stats state (for all ops)
         self._variables: Set[str] = set()  # original variable names
@@ -201,6 +210,8 @@ class StatisticsRuntime:
         self._write_executors: List[ProcessPoolExecutor] = []
         self._pending_writes: List = []
         self._write_buffers: Dict[str, Dict[str, Any]] = {}
+        self._write_batch_sizes: Dict[str, int] = {}
+        self._write_executor_assignments: Dict[str, int] = {}
 
         # Kernel state (mean fast-path)
         self._aggregator_function = None
@@ -238,7 +249,8 @@ class StatisticsRuntime:
                 "Generated statistics kernels will be saved",
                 directory=self.kernels_dir,
             )
-        atexit.register(self._shutdown)
+        self._atexit_callback = _weak_shutdown_callback(self)
+        atexit.register(self._atexit_callback)
 
     def _require_open(self) -> None:
         if self._closed:
@@ -388,9 +400,21 @@ class StatisticsRuntime:
                 "statistics runtime requires a StatisticsCompilation; "
                 "raw variable mappings must be compiled first"
             )
+        reserved_output_group = "__full__"
+        reserved_users = sorted(
+            name for name in compilation.variable_ops
+            if self._field_registry[name].output_index == reserved_output_group
+        )
+        if reserved_users:
+            raise ValueError(
+                f"Statistics output index {reserved_output_group!r} is "
+                "reserved for the internal full-output group and cannot be "
+                f"used by variables {reserved_users}; choose a different "
+                "output-index tensor name"
+            )
         execution = getattr(self, "_execution", None)
         if execution is not None:
-            execution.capture.invalidate_statistics(self)
+            execution.invalidate_statistics(self)
         # Reset generic state
         self._variables = set()
         self._variable_ops = {
@@ -802,7 +826,6 @@ class StatisticsRuntime:
                 "reset_time_index() is only available in in_memory_mode"
             )
         self._current_time_index = 0
-        self._macro_step_times.clear()
         for out_name in self._result_tensors:
             self._result_tensors[out_name] = []
 
@@ -870,6 +893,9 @@ class StatisticsRuntime:
             except BaseException as error:
                 failures.append(error)
         executors, self._write_executors = self._write_executors, []
+        assignments = getattr(self, "_write_executor_assignments", None)
+        if assignments is not None:
+            assignments.clear()
         for executor in executors:
             try:
                 executor.shutdown(wait=True)
@@ -885,6 +911,7 @@ class StatisticsRuntime:
 
         if self._write_executors:
             raise RuntimeError("statistics output workers are already started")
+        self._write_executor_assignments.clear()
         created = []
         try:
             for _ in range(self.num_workers):
@@ -907,13 +934,19 @@ class StatisticsRuntime:
             raise
         self._write_executors = created
 
+    def _unregister_atexit(self) -> None:
+        callback = getattr(self, "_atexit_callback", None)
+        if callback is not None:
+            atexit.unregister(callback)
+            self._atexit_callback = None
+
     def _shutdown(self) -> None:
         if self._closed:
             return
         self._closed = True
         failures: list[BaseException] = []
         for cleanup in (
-            lambda: atexit.unregister(self._shutdown),
+            self._unregister_atexit,
             self._cleanup_generated_modules,
             self._cleanup_executor,
             self._cleanup_lock_files,
