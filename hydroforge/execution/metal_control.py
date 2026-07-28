@@ -12,23 +12,6 @@ from hydroforge.kernels.backends.metal.online import (
 
 
 @cache
-def _fixed_begin_dispatcher():
-    return make_online_metal_dispatcher(
-        "hf_fixed_substep_begin",
-        buffers=(
-            MetalBuffer("count_ptr", torch.int32, "read"),
-            MetalBuffer("counter_ptr", torch.int32, "read"),
-            MetalBuffer("midpoint_ptr", torch.float32, "write"),
-        ),
-        scalars=(MetalScalar("n", "index"),), size_key="n",
-        body="""    if (i == 0) {
-        args.midpoint_ptr[0] =
-            ((float)args.counter_ptr[0] + 0.5f) / (float)args.count_ptr[0];
-    }""",
-    )
-
-
-@cache
 def _fixed_end_dispatcher():
     return make_online_metal_dispatcher(
         "hf_fixed_substep_end",
@@ -46,28 +29,19 @@ def _fixed_end_dispatcher():
     )
 
 
-def fixed_control_commands(
+def fixed_control_command(
     *,
     count: torch.Tensor,
     counter: torch.Tensor,
-    midpoint: torch.Tensor,
     continue_flag: torch.Tensor,
-) -> tuple[MetalCommand, MetalCommand]:
-    begin = MetalCommand(
-        _fixed_begin_dispatcher(),
-        {
-            "count_ptr": count, "counter_ptr": counter,
-            "midpoint_ptr": midpoint, "n": 1,
-        },
-    )
-    end = MetalCommand(
+) -> MetalCommand:
+    return MetalCommand(
         _fixed_end_dispatcher(),
         {
             "count_ptr": count, "counter_ptr": counter,
             "continue_ptr": continue_flag, "n": 1,
         },
     )
-    return begin, end
 
 
 @cache
@@ -146,7 +120,6 @@ def _adaptive_accept_dispatcher():
             MetalBuffer("duration_ptr", torch.float32, "read"),
             MetalBuffer("elapsed_ptr", torch.float32, "read"),
             MetalBuffer("dt_ptr", torch.float32, "write"),
-            MetalBuffer("midpoint_ptr", torch.float32, "write"),
             MetalBuffer("error_ptr", torch.int32, "write"),
         ),
         scalars=(MetalScalar("n", "index"),), size_key="n",
@@ -157,8 +130,6 @@ def _adaptive_accept_dispatcher():
         args.error_ptr[0] = invalid;
         if (invalid) dt = remaining;
         args.dt_ptr[0] = dt;
-        args.midpoint_ptr[0] =
-            (args.elapsed_ptr[0] + 0.5f * dt) / args.duration_ptr[0];
     }""",
     )
 
@@ -199,7 +170,6 @@ def adaptive_control_commands(
     duration: torch.Tensor,
     elapsed: torch.Tensor,
     dt: torch.Tensor,
-    midpoint: torch.Tensor,
     counter: torch.Tensor,
     continue_flag: torch.Tensor,
     error_flag: torch.Tensor,
@@ -214,7 +184,7 @@ def adaptive_control_commands(
         {
             "candidate_ptr": candidate, "duration_ptr": duration,
             "elapsed_ptr": elapsed, "dt_ptr": dt,
-            "midpoint_ptr": midpoint, "error_ptr": error_flag, "n": 1,
+            "error_ptr": error_flag, "n": 1,
         },
     )
     end = MetalCommand(

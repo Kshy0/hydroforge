@@ -18,18 +18,16 @@ class SubstepFrame:
 
     index: torch.Tensor
     dt: torch.Tensor
-    midpoint: torch.Tensor
 
 
 class AdaptiveSubstepFrame:
     """Adaptive frame with an explicit proposal/physics phase boundary."""
 
-    __slots__ = ("index", "dt", "midpoint", "_resolve")
+    __slots__ = ("index", "dt", "_resolve")
 
     def __init__(self, frame: SubstepFrame, resolve) -> None:
         self.index = frame.index
         self.dt = frame.dt
-        self.midpoint = frame.midpoint
         self._resolve = resolve
 
     def resolve_dt(self) -> None:
@@ -92,7 +90,7 @@ class _FixedScope:
                 self.runtime.model,
                 stable_tensors=(
                     program.count, program.counter,
-                    program.weight, program.midpoint,
+                    program.weight,
                 ),
                 scope_kind="fixed",
             ) as recording:
@@ -171,7 +169,7 @@ class _AdaptiveScope:
             physics = record_operator_scope(
                 self.runtime.model,
                 stable_tensors=(
-                    program.counter, program.time_step, program.fraction,
+                    program.counter, program.time_step,
                 ),
                 scope_kind="adaptive physics",
             )
