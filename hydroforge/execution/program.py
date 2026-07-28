@@ -30,16 +30,11 @@ class FixedSubstepProgram:
                 1, device=self.execution.device, dtype=dtype,
             )
             self.weight = torch.zeros_like(self.duration)
-            self.midpoint = torch.zeros_like(self.duration)
-            self.half = torch.full_like(self.duration, 0.5)
-            self.position = torch.zeros_like(self.duration)
-            self.count_value = torch.ones_like(self.duration)
-            self.one_value = torch.ones_like(self.duration)
             self.one_count = torch.ones_like(self.count)
         from hydroforge.execution.substeps import SubstepFrame
 
         self.frame = SubstepFrame(
-            index=self.counter, dt=self.weight, midpoint=self.midpoint,
+            index=self.counter, dt=self.weight,
         )
         self.operators = None
         self.metal_iteration = None
@@ -73,16 +68,16 @@ class FixedSubstepProgram:
         self.metal_iteration = metal_iteration
 
     def _build_metal_iteration(self, operators: Any) -> Any:
-        from hydroforge.execution.metal_control import fixed_control_commands
+        from hydroforge.execution.metal_control import fixed_control_command
         from hydroforge.execution.operators import capture_metal_commands
 
-        begin, end = fixed_control_commands(
+        control = fixed_control_command(
             count=self.count, counter=self.counter,
-            midpoint=self.midpoint, continue_flag=self.continue_flag,
+            continue_flag=self.continue_flag,
         )
         return capture_metal_commands(
             self.capture,
-            (begin, *operators.metal_commands(), end),
+            (*operators.metal_commands(), control),
             cyclic=True,
         )
 
@@ -136,13 +131,13 @@ class FixedSubstepProgram:
         if previous is not None:
             self.capture.release(previous.icb)
         from hydroforge.execution.metal_control import (
-            fixed_control_commands, statistics_control_command,
+            fixed_control_command, statistics_control_command,
         )
         from hydroforge.execution.operators import capture_metal_commands
 
-        begin, end = fixed_control_commands(
+        fixed_control = fixed_control_command(
             count=self.count, counter=self.counter,
-            midpoint=self.midpoint, continue_flag=self.continue_flag,
+            continue_flag=self.continue_flag,
         )
         states = aggregator._kernel_states
         control = statistics_control_command(
@@ -156,7 +151,7 @@ class FixedSubstepProgram:
         replacement = capture_metal_commands(
             self.capture,
             (
-                begin, *self.operators.metal_commands(), end,
+                *self.operators.metal_commands(), fixed_control,
                 control, self.statistics.metal_operator(),
             ),
             cyclic=True,
@@ -167,8 +162,6 @@ class FixedSubstepProgram:
 
     def _reset(self) -> None:
         self.counter.zero_()
-        if self.metal_iteration is None:
-            self.position.zero_()
         self.continue_flag.fill_(1)
 
     def _iteration(self) -> None:
@@ -176,40 +169,27 @@ class FixedSubstepProgram:
             self.metal_iteration.launch()
             return
         if self.execution.capture_mode == "cuda_graph":
-            from hydroforge.execution.cuda_graph import (
-                fixed_control_begin, fixed_control_end,
-            )
+            from hydroforge.execution.cuda_graph import fixed_control_end
 
             stream = torch.cuda.current_stream(
                 self.execution.device,
             ).cuda_stream
-            fixed_control_begin(
-                self.count, self.counter, self.midpoint, stream,
-            )
             self.operators.launch()
             fixed_control_end(
                 self.count, self.counter, self.continue_flag, stream,
             )
             return
-        # Keep loop control allocation-free as well as the recorded physics.
-        # These scalar operations are captured once on CUDA and execute eager
-        # without constructing a temporary tensor on CPU/Torch backends.
-        self.midpoint.copy_(self.position).add_(self.half).div_(self.count_value)
         self.operators.launch()
         self.counter.add_(self.one_count)
-        self.position.add_(self.one_value)
         torch.lt(self.counter, self.count, out=self.continue_flag)
 
     def _fixed_iteration_graph(self) -> Any:
         graph = self.iteration_graph
         if graph is None:
-            controlled = (
-                self.operators.references_tensor(self.counter)
-                or self.operators.references_tensor(self.midpoint)
-            )
+            controlled = self.operators.references_tensor(self.counter)
             body = self._iteration if controlled else self.operators.launch
             control_state = (
-                (self.counter, self.continue_flag, self.midpoint, self.position)
+                (self.counter, self.continue_flag)
                 if controlled else ()
             )
             graph = self.capture.capture_cuda(
@@ -229,17 +209,11 @@ class FixedSubstepProgram:
         states = aggregator._kernel_states
 
         def body() -> None:
-            from hydroforge.execution.cuda_graph import (
-                fixed_control_begin, fixed_statistics_end,
-            )
+            from hydroforge.execution.cuda_graph import fixed_statistics_end
 
             stream = torch.cuda.current_stream(
                 self.execution.device,
             ).cuda_stream
-            if self.operators.references_tensor(self.midpoint):
-                fixed_control_begin(
-                    self.count, self.counter, self.midpoint, stream,
-                )
             self.operators.launch()
             fixed_statistics_end(
                 count=self.count,
@@ -258,8 +232,8 @@ class FixedSubstepProgram:
         graph = self.capture.capture_cuda(
             body,
             mutated_state=(
-                self.counter, self.continue_flag, self.midpoint,
-                self.position, *self.operators.mutated_tensors,
+                self.counter, self.continue_flag,
+                *self.operators.mutated_tensors,
                 *(value for value in states.values()
                   if isinstance(value, torch.Tensor)),
             ),
@@ -290,17 +264,13 @@ class FixedSubstepProgram:
             # device graph launch and execute its surrounding operators in
             # lexical order without wrapping them in a second CUDA graph.
             self.count.fill_(count)
-            self.count_value.fill_(count)
             self.duration.fill_(duration)
             self.weight.fill_(duration / count)
             if step.run_statistics and not self.statistics.device_compatible():
                 raise RuntimeError(
                     "fixed device execution requires device-compatible statistics"
                 )
-            controlled = (
-                self.operators.references_tensor(self.counter)
-                or self.operators.references_tensor(self.midpoint)
-            )
+            controlled = self.operators.references_tensor(self.counter)
             if controlled:
                 self._reset()
             width = duration / count
@@ -317,13 +287,9 @@ class FixedSubstepProgram:
                 )
             return count
         if self.mode != "eager" and not step.run_statistics:
-            controlled = (
-                self.operators.references_tensor(self.counter)
-                or self.operators.references_tensor(self.midpoint)
-            )
+            controlled = self.operators.references_tensor(self.counter)
             if controlled:
                 self.count.fill_(count)
-                self.count_value.fill_(count)
                 self._reset()
             if self.operators.references_tensor(self.weight):
                 self.weight.fill_(duration / count)
@@ -333,8 +299,6 @@ class FixedSubstepProgram:
             step.advance_device(duration)
             return count
         self.count.fill_(count)
-        if self.metal_iteration is None:
-            self.count_value.fill_(count)
         self.duration.fill_(duration)
         self.weight.fill_(duration / count)
         fold = False
@@ -385,10 +349,7 @@ class FixedSubstepProgram:
             for _ in range(count):
                 graph.replay()
         else:
-            controlled = (
-                self.operators.references_tensor(self.counter)
-                or self.operators.references_tensor(self.midpoint)
-            )
+            controlled = self.operators.references_tensor(self.counter)
             if controlled:
                 self._reset()
             graph = self._fixed_iteration_graph()
@@ -567,7 +528,6 @@ class AdaptiveSubstepProgram:
             options = dict(device=candidate_dt.device, dtype=candidate_dt.dtype)
             self.duration = torch.zeros(1, **options)
             self.elapsed = torch.zeros(1, **options)
-            self.fraction = torch.zeros(1, **options)
             self.counter = torch.zeros(
                 1, device=candidate_dt.device, dtype=torch.int32,
             )
@@ -587,7 +547,6 @@ class AdaptiveSubstepProgram:
                 (1,), self.maximum, **options,
             )
             self.zero_value = torch.zeros(1, **options)
-            self.half = torch.full((1,), 0.5, **options)
             self.maximum_count = torch.full(
                 (1,), self.maximum_steps,
                 device=candidate_dt.device, dtype=torch.int32,
@@ -596,7 +555,7 @@ class AdaptiveSubstepProgram:
         from hydroforge.execution.substeps import SubstepFrame
 
         self.frame = SubstepFrame(
-            index=self.counter, dt=self.time_step, midpoint=self.fraction,
+            index=self.counter, dt=self.time_step,
         )
         self.graphs: dict[bool, Any] = {}
         self.proposal_operators = None
@@ -659,7 +618,7 @@ class AdaptiveSubstepProgram:
         begin, accept, end = adaptive_control_commands(
             candidate=self.candidate, maximum=self.maximum,
             duration=self.duration, elapsed=self.elapsed,
-            dt=self.time_step, midpoint=self.fraction,
+            dt=self.time_step,
             counter=self.counter, continue_flag=self.continue_flag,
             error_flag=self.error_flag,
             maximum_steps=self.maximum_steps,
@@ -726,8 +685,6 @@ class AdaptiveSubstepProgram:
             self.predicate_a, self.remaining, self.accepted,
             out=self.time_step,
         )
-        self.fraction.copy_(self.time_step).mul_(self.half)
-        self.fraction.add_(self.elapsed).div_(self.duration)
         self.body_operators.launch()
         self.elapsed.add_(self.time_step)
         self.counter.add_(self.one_count)
@@ -769,11 +726,11 @@ class AdaptiveSubstepProgram:
             reset=self._reset,
             continue_flag=self.continue_flag,
             extra_state=(
-                self.duration, self.elapsed, self.fraction, self.counter,
+                self.duration, self.elapsed, self.counter,
                 self.continue_flag, self.error_flag,
                 self.remaining, self.accepted,
                 self.predicate_a, self.predicate_b, self.predicate_c,
-                self.maximum_value, self.zero_value, self.half,
+                self.maximum_value, self.zero_value,
                 self.maximum_count, self.one_count,
                 *self.proposal_operators.mutated_tensors,
                 *self.body_operators.mutated_tensors, *(extra or ()),

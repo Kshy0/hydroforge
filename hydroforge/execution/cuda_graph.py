@@ -40,8 +40,6 @@ int64_t cwg_create();
 void cwg_begin_capture(int64_t h, int64_t stream);
 void cwg_end_capture(int64_t h, int64_t stream);
 void cwg_set_conditional(int64_t h, at::Tensor cont, int64_t set_cond, int64_t stream);
-void cwg_fixed_begin(at::Tensor count, at::Tensor counter,
-                     at::Tensor midpoint, int64_t stream);
 void cwg_fixed_end(at::Tensor count, at::Tensor counter,
                    at::Tensor cont, int64_t stream);
 void cwg_fixed_stats_end(at::Tensor count, at::Tensor counter,
@@ -118,22 +116,6 @@ void cwg_set_conditional(int64_t h, at::Tensor cont, int64_t set_cond, int64_t s
     auto* g = reinterpret_cast<CondWhileGraph*>(h);
     k_set_conditional<<<1, 1, 0, (cudaStream_t)stream>>>(
         g->handle, cont.data_ptr<int>(), (int)set_cond);
-}
-
-template <typename T>
-__global__ void k_fixed_begin(const int* __restrict__ count,
-        const int* __restrict__ counter, T* __restrict__ midpoint) {
-    *midpoint = (static_cast<T>(*counter) + static_cast<T>(0.5))
-        / static_cast<T>(*count);
-}
-
-void cwg_fixed_begin(at::Tensor count, at::Tensor counter,
-                     at::Tensor midpoint, int64_t stream) {
-    AT_DISPATCH_FLOATING_TYPES(midpoint.scalar_type(), "cwg_fixed_begin", [&] {
-        k_fixed_begin<scalar_t><<<1, 1, 0, (cudaStream_t)stream>>>(
-            count.data_ptr<int>(), counter.data_ptr<int>(),
-            midpoint.data_ptr<scalar_t>());
-    });
 }
 
 __global__ void k_fixed_end(const int* __restrict__ count,
@@ -243,18 +225,11 @@ def _cond_ext():
         cpp_sources=_COND_CPP,
         cuda_sources=_COND_CUDA,
         functions=["cwg_create", "cwg_begin_capture", "cwg_end_capture",
-                   "cwg_set_conditional", "cwg_fixed_begin", "cwg_fixed_end",
+                   "cwg_set_conditional", "cwg_fixed_end",
                    "cwg_fixed_stats_end", "cwg_stats_control",
                    "cwg_instantiate", "cwg_launch", "cwg_destroy"],
         extra_cuda_cflags=("-O3",),
     )
-
-
-def fixed_control_begin(
-    count: torch.Tensor, counter: torch.Tensor, midpoint: torch.Tensor,
-    stream_ptr: int,
-) -> None:
-    _cond_ext().cwg_fixed_begin(count, counter, midpoint, stream_ptr)
 
 
 def fixed_control_end(
