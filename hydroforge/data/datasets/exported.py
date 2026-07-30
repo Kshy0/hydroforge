@@ -16,7 +16,7 @@ import numpy as np
 from netCDF4 import Dataset
 
 from hydroforge.contracts.temporal import timedelta_quotient
-from hydroforge.data.datasets.base import AbstractDataset
+from hydroforge.data.datasets.base import AbstractDataset, validate_forcing_batch
 from hydroforge.data.datasets.timeline import DatasetTimeline
 from hydroforge.data.netcdf import read_netcdf_var_sliced, single_file_key
 from hydroforge.data.distributed import find_indices_in, is_rank_zero
@@ -852,6 +852,8 @@ class ExportedDataset(AbstractDataset):
     def shard_forcing(
         self,
         batch_data,
+        *,
+        target=None,
     ):
         """Flatten (B, T, C) -> (B*T, C).
 
@@ -864,20 +866,37 @@ class ExportedDataset(AbstractDataset):
         as a tuple in the same order.
         """
         if isinstance(batch_data, (tuple, list)):
-            return tuple(self.shard_forcing(b) for b in batch_data)
+            if target is not None and len(target) != len(batch_data):
+                raise ValueError("forcing target sequence length mismatch")
+            return tuple(
+                self.shard_forcing(
+                    block,
+                    target=None if target is None else target[index],
+                )
+                for index, block in enumerate(batch_data)
+            )
         if isinstance(batch_data, Mapping):
+            if target is not None and not isinstance(target, Mapping):
+                raise TypeError("dict forcing requires a target mapping")
             return {
-                name: self.shard_forcing(block)
+                name: self.shard_forcing(
+                    block,
+                    target=None if target is None else target[name],
+                )
                 for name, block in batch_data.items()
             }
         if batch_data.dim() == 3:
             B, T, C = batch_data.shape
-            return batch_data.reshape(B * T, C).contiguous()
+            out = batch_data.reshape(B * T, C).contiguous()
         elif batch_data.dim() == 4:
             B, T, K, C = batch_data.shape
-            return batch_data.reshape(B * T, K, C).contiguous()
+            out = batch_data.reshape(B * T, K, C).contiguous()
         else:
             raise ValueError(f"Expected 3D or 4D tensor, got {batch_data.dim()}D")
+        return (
+            out if target is None
+            else validate_forcing_batch(out, target)
+        )
 
     # -------------------------
     # Override __getitem__ - no rank gating for exported data

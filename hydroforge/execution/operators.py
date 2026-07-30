@@ -452,7 +452,8 @@ class _OperatorRecorder:
             raise SubstepCompileError(
                 "compiled substep captured a tensor that is neither declared "
                 "model state nor a prior operator result; copy caller inputs "
-                "into model state outside the substep with copy_input()"
+                "into model state outside the substep with an explicit "
+                "tensor.copy_()"
             )
         return reference
 

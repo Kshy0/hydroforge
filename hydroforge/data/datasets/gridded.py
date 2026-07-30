@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from hydroforge.data.aggregation import build_cama_mapping
-from hydroforge.data.datasets.base import AbstractDataset
+from hydroforge.data.datasets.base import AbstractDataset, validate_forcing_batch
 from hydroforge.data.datasets.export import DatasetExporter
 from hydroforge.data.mapping import MappingTable
 from hydroforge.data.distributed import is_rank_zero
@@ -99,6 +99,8 @@ class GriddedDataset(AbstractDataset, ABC):
         self,
         batch_data: Union[torch.Tensor, Dict[str, torch.Tensor]],
         local_mapping: torch.Tensor,
+        *,
+        target: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Map grid data to catchments and handle distributed sync.
@@ -111,8 +113,14 @@ class GriddedDataset(AbstractDataset, ABC):
         Output shape: (M, C) where M is the product of non-spatial dims, C = number of catchments.
         """
         if isinstance(batch_data, dict):
+            if target is not None and not isinstance(target, Mapping):
+                raise TypeError("dict forcing requires a target mapping")
             return {
-                name: self.shard_forcing(block, local_mapping)
+                name: self.shard_forcing(
+                    block,
+                    local_mapping,
+                    target=None if target is None else target[name],
+                )
                 for name, block in batch_data.items()
             }
 
@@ -140,7 +148,10 @@ class GriddedDataset(AbstractDataset, ABC):
             # Reshape to (B*T, K, C) so that out[step] gives (K, C) for all trials
             out = out.view(B * T, K, -1)
 
-        return out
+        return (
+            out if target is None
+            else validate_forcing_batch(out, target)
+        )
 
     def build_local_mapping(
         self,

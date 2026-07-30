@@ -1,6 +1,5 @@
 """Public declarative model API."""
 
-from hydroforge.execution.inputs import copy_input
 from hydroforge.execution.step import managed_step
 from hydroforge.execution.substeps import SubstepFrame
 from hydroforge.contracts.events import (
@@ -30,7 +29,6 @@ __all__ = [
     "TensorField",
     "SubstepFrame",
     "computed_tensor_field",
-    "copy_input",
     "kernel_field",
     "managed_step",
 ]

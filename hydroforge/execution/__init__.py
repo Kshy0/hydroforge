@@ -4,7 +4,6 @@ from hydroforge.execution.collectives import (
     all_reduce_, all_reduce_many_, reduce_, reduce_many_,
 )
 from hydroforge.execution.boundaries import between_steps
-from hydroforge.execution.inputs import copy_input
 from hydroforge.execution.parameters import ParameterChangeEffect
 from hydroforge.execution.substeps import SubstepFrame, SubstepRuntime
 from hydroforge.execution.outer import OuterRuntime
@@ -17,7 +16,6 @@ __all__ = [
     "reduce_",
     "reduce_many_",
     "between_steps",
-    "copy_input",
     "ParameterChangeEffect",
     "SubstepFrame",
     "SubstepRuntime",

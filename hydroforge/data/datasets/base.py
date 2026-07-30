@@ -26,6 +26,39 @@ from hydroforge.contracts.temporal import (
 logger = logging.getLogger(__name__)
 
 
+def validate_forcing_batch(
+    batch: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    name: str = "forcing",
+) -> torch.Tensor:
+    """Validate generated step tensors against one frozen model buffer.
+
+    ``batch`` retains a leading time/batch axis. Every item yielded from it
+    must exactly match the target's shared or trial layout, dtype, and device.
+    Validation belongs here, at forcing generation, so model hot paths can
+    perform only an explicit ``target.copy_(item)``.
+    """
+
+    if not isinstance(batch, torch.Tensor) or not isinstance(target, torch.Tensor):
+        raise TypeError(f"{name} batch and target must both be torch.Tensor")
+    expected = (batch.shape[0], *target.shape)
+    if tuple(batch.shape) != expected:
+        raise ValueError(
+            f"{name} generated step shape {tuple(batch.shape[1:])}, "
+            f"expected {tuple(target.shape)}"
+        )
+    if batch.device != target.device:
+        raise ValueError(
+            f"{name} generated on {batch.device}, expected {target.device}"
+        )
+    if batch.dtype != target.dtype:
+        raise ValueError(
+            f"{name} generated with dtype {batch.dtype}, expected {target.dtype}"
+        )
+    return batch
+
+
 @dataclass(frozen=True, slots=True)
 class DatasetStep:
     """One forcing item positioned on source and model timelines.
