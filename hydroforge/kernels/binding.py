@@ -319,6 +319,19 @@ class KernelBinder:
         if field.startswith("batched_"):
             source = field.removeprefix("batched_")
             matches = self._field_index.get(source, ())
+            if not matches:
+                declared = [
+                    module_name
+                    for module_name in self.model.module_list
+                    if any(
+                        item.name == source
+                        for item in self.model.compiled_schema().fields(module_name)
+                    )
+                ]
+                if len(declared) == 1 and not self.model.has_module(declared[0]):
+                    return BindingResolution(
+                        False, "batched", declared[0],
+                    )
             if len(matches) != 1:
                 self._raise_resolution(
                     parameter, [match.module_name for match in matches],

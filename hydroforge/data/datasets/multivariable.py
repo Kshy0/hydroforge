@@ -135,18 +135,27 @@ class MultiVariableDataset(AbstractDataset):
     def shard_forcing(
         self, batch: Mapping[str, torch.Tensor],
         mapping: torch.Tensor | None = None,
+        *,
+        target: Mapping[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         if self._gridded:
             if mapping is None:
                 raise ValueError("gridded forcing requires its compiled mapping")
             return {
-                name: dataset.shard_forcing(batch[name], mapping)
+                name: dataset.shard_forcing(
+                    batch[name],
+                    mapping,
+                    target=None if target is None else target[name],
+                )
                 for name, dataset in self._datasets.items()
             }
         if mapping is not None:
             raise ValueError("catchment forcing does not accept a grid mapping")
         return {
-            name: dataset.shard_forcing(batch[name])
+            name: dataset.shard_forcing(
+                batch[name],
+                target=None if target is None else target[name],
+            )
             for name, dataset in self._datasets.items()
         }
 

@@ -31,7 +31,6 @@ from hydroforge.model import (
     computed_tensor_field,
     kernel_field,
     managed_step,
-    copy_input,
 )
 ```
 
@@ -41,7 +40,6 @@ from hydroforge.model import (
 - `computed_tensor_field`: declares tensors computed during initialization.
 - `kernel_field`: exposes a precomputed value to kernel argument inference.
 - `managed_step`: manages one public model step.
-- `copy_input`: copies caller data into stable model storage.
 
 Tensor storage can depend on optional modules. A conditional field remains
 `None` and is excluded from input loading, partitioning, runtime namespaces,
@@ -71,9 +69,7 @@ A model defines its physical execution order directly:
 
 ```python
 @managed_step
-def step_advance(self, runoff, time_step, current_time=None):
-    copy_input(self.base.runoff, runoff, name="runoff")
-
+def step_advance(self, time_step, current_time=None):
     for substep in self.substeps.fixed(count=self.num_sub_steps):
         route_flow()
         update_storage()
