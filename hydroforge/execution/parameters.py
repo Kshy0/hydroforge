@@ -107,10 +107,6 @@ class ParameterPlanRuntime:
     def variable_map(self):
         return self.owner.variable_map
 
-    @property
-    def _calendar(self) -> str:
-        return self.owner.calendar
-
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------

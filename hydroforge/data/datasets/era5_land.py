@@ -26,9 +26,9 @@ class ERA5LandAccumDataset(NetCDFDataset):
         start_date = datetime(2000, 1, 1)            # first interval: [00:00, 01:00)
         end_date   = datetime(2000, 12, 31, 23, 0)   # last  interval: [23:00, 00:00 next day)
 
-    get_time_by_index() and DatasetStep.source_time always return these physical
-    (unshifted) times. DatasetStep.model_time follows the same physical time,
-    including replayed spin-up cycles.
+    SourceChunk.source_start and SimulationStep.source_start always return
+    these physical (unshifted) times. SimulationStep.start follows model
+    execution, including replayed spin-up cycles.
 
     Why we shift internally by +time_interval:
     ERA5-Land accumulated variables (e.g., hourly runoff `ro`) are time-stamped
@@ -76,6 +76,7 @@ class ERA5LandAccumDataset(NetCDFDataset):
         base_dir: str,
         start_date: datetime,
         end_date: datetime,
+        model_step: timedelta,
         time_interval: timedelta = timedelta(hours=1),
         chunk_len: int = 24,
         var_name: str = "ro",
@@ -102,7 +103,7 @@ class ERA5LandAccumDataset(NetCDFDataset):
 
         # Configure time resolution first.  Daily cumulative resets can only be
         # represented exactly when the requested interval divides one day.
-        self.num_daily_steps = timedelta_quotient(
+        timedelta_quotient(
             timedelta(days=1),
             time_interval,
             duration_label="one day",
@@ -114,7 +115,8 @@ class ERA5LandAccumDataset(NetCDFDataset):
                 spin_up_start_date, time_interval, "spin_up_start_date",
             )
 
-        # ---- Store the original physical dates for time reporting ----
+        # Keep one logical (physical) support for the immutable temporal
+        # contract. NetCDF timestamps remain shifted by +time_interval for I/O.
         self._physical_start_date = start_date
         self._physical_end_date = end_date
         self._physical_spin_up_start_date = spin_up_start_date
@@ -132,6 +134,7 @@ class ERA5LandAccumDataset(NetCDFDataset):
             start_date=start_date + time_interval,
             end_date=end_date + time_interval,
             time_interval=time_interval,
+            model_step=model_step,
             chunk_len=chunk_len,
             var_name=var_name,
             prefix=prefix,
@@ -151,19 +154,17 @@ class ERA5LandAccumDataset(NetCDFDataset):
     def main_start_time(self):
         return self._convert_to_calendar(self._physical_start_date)
 
-    def get_time_by_index(self, idx: int) -> Union[datetime, cftime.datetime]:
-        """Return the physical simulation time for step `idx`.
+    @property
+    def main_end_time(self):
+        return self._convert_to_calendar(self._physical_end_date)
 
-        The base class stores shifted dates (start_date + Δt) for internal
-        data-reading purposes.  We subtract the shift here so that callers
-        always see the original physical time.
-        """
-        shifted_time = super().get_time_by_index(idx)
-        return shifted_time - self._era5_time_shift
+    @property
+    def spin_up_start_time(self):
+        return self._convert_to_calendar(self._physical_spin_up_start_date)
 
-    def get_index_by_time(self, dt: Union[datetime, cftime.datetime]) -> int:
-        """Return the step index for a physical datetime."""
-        return super().get_index_by_time(dt + self._era5_time_shift)
+    @property
+    def spin_up_end_time(self):
+        return self._convert_to_calendar(self._physical_spin_up_end_date)
 
     @staticmethod
     def _validate_daily_grid_alignment(
@@ -209,11 +210,11 @@ class ERA5LandAccumDataset(NetCDFDataset):
         A non-midnight first interval also needs the cumulative frame immediately
         before that window, which can be in a preceding file partition.
         """
-        if source_time in self._dt_to_loc:
+        if source_time in self._timeline.dt_to_loc:
             return
 
         key = self.time_to_key(source_time)
-        dates = self._file_times.get(key)
+        dates = self._timeline.file_times.get(key)
         path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
         if dates is None:
             self.validate_files_exist([path])
@@ -243,7 +244,7 @@ class ERA5LandAccumDataset(NetCDFDataset):
                 )
             existing_times = {
                 date: existing_key
-                for existing_key, existing_dates in self._file_times.items()
+                for existing_key, existing_dates in self._timeline.file_times.items()
                 if existing_key != key
                 for date in existing_dates
             }
@@ -256,7 +257,7 @@ class ERA5LandAccumDataset(NetCDFDataset):
                     f"{self.prefix}{existing_times[duplicate]}{self.suffix} "
                     f"and {path.name}"
                 )
-            self._file_times[key] = dates
+            self._timeline.file_times[key] = dates
 
         index = next(
             (index for index, date in enumerate(dates) if date == source_time),
@@ -267,7 +268,7 @@ class ERA5LandAccumDataset(NetCDFDataset):
                 f"Missing cumulative predecessor timestamp {source_time} in "
                 f"{path.name}; it is required for a non-midnight ERA5 interval"
             )
-        self._dt_to_loc[source_time] = (key, index)
+        self._timeline.dt_to_loc[source_time] = (key, index)
 
     def _transform_cumulative_to_incremental(
         self,
@@ -326,7 +327,7 @@ class ERA5LandAccumDataset(NetCDFDataset):
             self._ensure_source_time_available(predecessor)
             read_times = [predecessor, *source_times]
 
-        ops = self._ops_from_times(read_times)
+        ops = self._timeline.ops_from_times(read_times)
         data = self._finish_read(self._read_ops(ops))
         if not isinstance(data, np.ndarray):
             raise TypeError(
@@ -340,11 +341,7 @@ class ERA5LandAccumDataset(NetCDFDataset):
         )
 
     def read_chunk(self, idx: int) -> np.ndarray:
-        if idx < 0 or idx >= len(self._plan):
-            raise IndexError(f"Chunk index {idx} out of range (0-{len(self._plan)-1})")
-        entry = self._plan[idx]
-        count = entry[2] if len(entry) > 2 else sum(
-            len(indices) for _key, indices in entry[1]
-        )
-        physical_start = entry[0] - self._era5_time_shift
-        return self.get_data(physical_start, count)
+        """Read one physical chunk through ERA5 cumulative differencing."""
+
+        chunk = self.chunk_plan[idx]
+        return self.get_data(chunk.source_start, chunk.length)

@@ -10,8 +10,9 @@ import numpy as np
 
 
 OUTPUT_FORMAT = "hydroforge.statistics"
-OUTPUT_VERSION = 2
+OUTPUT_VERSION = 3
 COMMITTED_STEPS_ATTR = "hydroforge_committed_steps"
+RUN_ID_ATTR = "hydroforge_run_id"
 
 @dataclass(frozen=True, slots=True)
 class OutputFilePlan:
@@ -41,6 +42,7 @@ class NetCDFCreateRequest:
     time_unit: str
     num_trials: int
     static_variables: Mapping[str, Mapping[str, Any]]
+    run_id: str | None = None
     netcdf_options: Mapping[str, Any] = field(default_factory=dict)
 
 

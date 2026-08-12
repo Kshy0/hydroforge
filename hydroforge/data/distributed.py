@@ -12,6 +12,7 @@ setup) plus low-level numeric utilities shared across modules.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 
 import numpy as np
@@ -26,6 +27,30 @@ LOCAL_PROCESS_RANK_ENV = (
     "SLURM_LOCALID", "OMPI_COMM_WORLD_LOCAL_RANK",
     "MPI_LOCALRANKID", "MV2_COMM_WORLD_LOCAL_RANK",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessTopology:
+    """Immutable process-group identity captured for one model instance."""
+
+    rank: int
+    world_size: int
+
+    def __post_init__(self) -> None:
+        if type(self.rank) is not int or self.rank < 0:
+            raise ValueError("process rank must be an exact non-negative int")
+        if type(self.world_size) is not int or self.world_size < 1:
+            raise ValueError("process world_size must be an exact positive int")
+        if self.rank >= self.world_size:
+            raise ValueError("process rank must be smaller than world_size")
+
+    @classmethod
+    def capture(cls) -> ProcessTopology:
+        """Capture the initialized default group, or the local 0/1 topology."""
+
+        if dist.is_available() and dist.is_initialized():
+            return cls(rank=dist.get_rank(), world_size=dist.get_world_size())
+        return cls(rank=0, world_size=1)
 
 
 def get_local_process_rank() -> int:
@@ -216,6 +241,7 @@ def torch_to_numpy_dtype(torch_dtype: torch.dtype) -> type:
         torch.float16: np.float16,
         torch.int64: np.int64,
         torch.int32: np.int32,
+        torch.bool: np.bool_,
     }
     if torch_dtype not in dtype_mapping:
         raise ValueError(f"Unsupported torch dtype: {torch_dtype}")

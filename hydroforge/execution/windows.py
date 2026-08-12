@@ -5,75 +5,83 @@ from __future__ import annotations
 from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import timedelta
-import hashlib
-import json
 from typing import Any
+
+import cftime
 
 from hydroforge.contracts.temporal import (
     CalendarWindow,
     EveryStep,
     ExplicitWindows,
-    StatisticsFlags,
+    SimulationSchedule,
+    SimulationStep,
     StatisticsPlan,
     WindowRule,
     require_calendar,
-    window_rule_signature,
 )
 
 
 @dataclass(frozen=True, slots=True)
 class WindowDecision:
     output_enabled: bool
-    flags: StatisticsFlags
+    first: bool
+    last: bool
+    outer_first: bool
+    outer_last: bool
 
 
 class StatisticsWindowController:
     """O(1) regular/calendar cursor with explicit-window lookup support."""
 
-    def __init__(self, plan: StatisticsPlan) -> None:
+    def __init__(
+        self, plan: StatisticsPlan, schedule: SimulationSchedule,
+    ) -> None:
+        if not isinstance(plan, StatisticsPlan):
+            raise TypeError("statistics plan must be a StatisticsPlan")
+        if not isinstance(schedule, SimulationSchedule):
+            raise TypeError("statistics schedule must be a SimulationSchedule")
         self.plan = plan
-        self.schedule = plan.schedule
+        self.schedule = schedule
+        self._validate_schedule_contract()
         self._explicit_starts = {
             id(rule): tuple(window.start for window in rule.windows)
             for rule in (plan.inner, plan.outer)
             if isinstance(rule, ExplicitWindows)
         }
-        self._output_active = False
         self._last_inner_key: Any = None
         self._last_outer_key: Any = None
-        self._last_step_index: int | None = None
-        self._inner_open = False
-        self._outer_open = False
-        self.fingerprint = self._fingerprint()
 
-    def _fingerprint(self) -> str:
-        definition = {
-            "schedule": self.schedule.fingerprint,
-            "inner": window_rule_signature(self.plan.inner),
-            "outer": window_rule_signature(self.plan.outer),
-            "partial_period": self.plan.partial_period,
-        }
-        encoded = json.dumps(
-            definition, sort_keys=True, separators=(",", ":"),
-        )
-        return hashlib.sha256(encoded.encode()).hexdigest()
+    def _validate_schedule_contract(self) -> None:
+        """Bind schedule-dependent rule invariants once at runtime setup."""
 
-    def _validate_step(self, current_time: Any, time_step: float):
-        require_calendar(
-            current_time, self.schedule.calendar, label="model current_time",
-        )
-        try:
-            step = self.schedule.step_at(self.schedule.index_at(current_time))
-        except KeyError as exc:
-            raise ValueError(
-                f"current_time {current_time!r} is not a model schedule boundary"
-            ) from exc
-        if abs(step.duration_seconds - float(time_step)) > 1e-9:
-            raise ValueError(
-                f"time_step {time_step} differs from scheduled duration "
-                f"{step.duration_seconds} at {current_time!r}"
-            )
-        return step
+        schedule = self.schedule
+        for rule in (self.plan.inner, self.plan.outer):
+            if isinstance(rule, ExplicitWindows):
+                for window in rule.windows:
+                    require_calendar(
+                        window.start, schedule.calendar,
+                        label=f"explicit window {window.name!r} start",
+                    )
+                    require_calendar(
+                        window.end, schedule.calendar,
+                        label=f"explicit window {window.name!r} end",
+                    )
+                    if type(window.start) is not type(schedule.start):
+                        raise TypeError(
+                            f"explicit window {window.name!r} and simulation "
+                            "schedule must use the same datetime representation"
+                        )
+            if isinstance(rule, CalendarWindow) and rule.period == "year":
+                try:
+                    cftime.datetime(
+                        2001, rule.start_month, rule.start_day,
+                        calendar=schedule.calendar,
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "annual statistics origin must exist in every year of "
+                        f"calendar {schedule.calendar!r}"
+                    ) from exc
 
     @staticmethod
     def _calendar_key(rule: CalendarWindow, value: Any) -> tuple[Any, ...]:
@@ -179,56 +187,18 @@ class StatisticsWindowController:
     def resolve(
         self,
         *,
-        current_time: Any,
-        time_step: float,
+        step: SimulationStep,
         output_enabled: bool,
-        override: StatisticsFlags | None = None,
     ) -> WindowDecision:
+        """Advance windows from the managed step's validated schedule record."""
+
+        if not isinstance(step, SimulationStep):
+            raise TypeError("statistics step must be a SimulationStep")
         if not output_enabled:
-            step = self._validate_step(current_time, time_step)
-            if (
-                self._last_step_index is not None
-                and step.index != self._last_step_index + 1
-            ):
-                raise ValueError(
-                    f"model schedule moved from step {self._last_step_index} "
-                    f"to {step.index}; expected {self._last_step_index + 1}"
-                )
-            self._output_active = False
             self._last_inner_key = None
             self._last_outer_key = None
-            self._last_step_index = step.index
-            self._inner_open = False
-            self._outer_open = False
-            return WindowDecision(False, StatisticsFlags(False, False, False, False))
-        step = self._validate_step(current_time, time_step)
+            return WindowDecision(False, False, False, False, False)
         final_step = step.index == len(self.schedule) - 1
-        if (
-            self._last_step_index is not None
-            and step.index != self._last_step_index + 1
-        ):
-            raise ValueError(
-                f"model schedule moved from step {self._last_step_index} "
-                f"to {step.index}; expected {self._last_step_index + 1}"
-            )
-        if override is not None:
-            self._validate_override(override)
-            self._output_active = True
-            inner_location = self._locate(self.plan.inner, step.start)
-            outer_location = self._locate(
-                self.plan.outer or self.plan.inner, step.start,
-            )
-            self._last_inner_key = (
-                None if inner_location is None else inner_location[0]
-            )
-            self._last_outer_key = (
-                None if outer_location is None else outer_location[0]
-            )
-            self._last_step_index = step.index
-            self._inner_open = not override.last
-            self._outer_open = not override.outer_last
-            return WindowDecision(True, override)
-
         inner_position = self._rule_position(
             self.plan.inner,
             start=step.start,
@@ -245,106 +215,27 @@ class StatisticsWindowController:
             final_step=final_step,
         )
         if inner_position is None or outer_position is None:
-            self._output_active = False
             self._last_inner_key = None
             self._last_outer_key = None
-            # A statistics gap disables output, not schedule validation.  Keep
-            # advancing the execution cursor so a caller cannot silently jump
-            # over model steps while it happens to be outside output windows.
-            self._last_step_index = step.index
-            self._inner_open = False
-            self._outer_open = False
-            return WindowDecision(False, StatisticsFlags(False, False, False, False))
+            return WindowDecision(False, False, False, False, False)
         inner_key, inner_first, inner_last = inner_position
         outer_key, outer_first, outer_last = outer_position
-        if not self._output_active:
+        if self._last_inner_key is None:
             inner_first = True
             outer_first = True
-        self._output_active = True
         self._last_inner_key = inner_key
         self._last_outer_key = outer_key
-        self._last_step_index = step.index
-        flags = StatisticsFlags(
+        return WindowDecision(
+            True,
             inner_first, inner_last, outer_first, outer_last,
         )
-        self._inner_open = not flags.last
-        self._outer_open = not flags.outer_last
-        return WindowDecision(True, flags)
 
-    @staticmethod
-    def _validate_override(flags: StatisticsFlags) -> None:
-        if (flags.outer_first or flags.outer_last) and not flags.last:
-            raise ValueError(
-                "manual outer statistics flags require stat_is_last=True"
-            )
+    def snapshot_state(self) -> tuple[Any, Any]:
+        """Capture only mutable window state for transactional rollback."""
 
-    def snapshot_state(self) -> dict[str, Any]:
-        return {
-            "fingerprint": self.fingerprint,
-            "last_step_index": -1 if self._last_step_index is None
-            else self._last_step_index,
-            "output_active": int(self._output_active),
-            "inner_open": int(self._inner_open),
-            "outer_open": int(self._outer_open),
-        }
+        return self._last_inner_key, self._last_outer_key
 
-    def _snapshot_position(
-        self, state: dict[str, Any],
-    ) -> tuple[int | None, bool, Any, Any, bool, bool]:
-        expected = {
-            "fingerprint", "last_step_index", "output_active",
-            "inner_open", "outer_open",
-        }
-        if not isinstance(state, dict) or set(state) != expected:
-            raise ValueError("statistics snapshot has an invalid schema")
-        if state["fingerprint"] != self.fingerprint:
-            raise ValueError("statistics snapshot does not match the model plan")
-        index = state["last_step_index"]
-        if type(index) is not int:
-            raise TypeError("statistics snapshot step index must be an exact int")
-        if index < -1 or index >= len(self.schedule):
-            raise ValueError("statistics snapshot step is outside the schedule")
-        bits = {
-            name: state[name]
-            for name in ("output_active", "inner_open", "outer_open")
-        }
-        if any(type(value) is not int or value not in {0, 1} for value in bits.values()):
-            raise TypeError(
-                "statistics snapshot flags must be exact integer bits"
-            )
-        active = bool(bits["output_active"])
-        inner_open = bool(bits["inner_open"])
-        outer_open = bool(bits["outer_open"])
-        if (inner_open or outer_open) and not active:
-            raise ValueError("statistics snapshot has inactive open windows")
-        if index == -1:
-            if active:
-                raise ValueError(
-                    "statistics snapshot cannot be active without a step"
-                )
-            return None, False, None, None, False, False
-        if not active:
-            # Inactive can mean an explicit statistics gap.  Retain the model
-            # schedule cursor even though there is no open output window.
-            return index, False, None, None, False, False
-        step = self.schedule.step_at(index)
-        inner = self._locate(self.plan.inner, step.start)
-        outer = self._locate(self.plan.outer or self.plan.inner, step.start)
-        if inner is None or outer is None:
-            # Manual overrides are explicitly allowed to activate statistics
-            # in an otherwise configured gap.  Such a snapshot has no window
-            # keys, but its schedule cursor and open/closed flags remain fully
-            # restorable.
-            return index, True, None, None, inner_open, outer_open
-        return index, True, inner[0], outer[0], inner_open, outer_open
-
-    def restore_snapshot_state(self, state: dict[str, Any]) -> None:
-        (
-            index, active, inner_key, outer_key, inner_open, outer_open,
-        ) = self._snapshot_position(state)
-        self._last_step_index = index
-        self._output_active = active
-        self._last_inner_key = inner_key
-        self._last_outer_key = outer_key
-        self._inner_open = inner_open
-        self._outer_open = outer_open
+    def restore_snapshot_state(self, state: tuple[Any, Any]) -> None:
+        if not isinstance(state, tuple) or len(state) != 2:
+            raise ValueError("statistics rollback snapshot is invalid")
+        self._last_inner_key, self._last_outer_key = state

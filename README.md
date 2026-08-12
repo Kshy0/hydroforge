@@ -69,11 +69,22 @@ A model defines its physical execution order directly:
 
 ```python
 @managed_step
-def step_advance(self, time_step, current_time=None):
+def step_advance(self):
     for substep in self.substeps.fixed(count=self.num_sub_steps):
         route_flow()
         update_storage()
 ```
+
+With a simulation schedule, the driver stages forcing and advances the model:
+
+```python
+model.set_inputs(runoff)
+model.step_advance()
+```
+
+Without a schedule, pass `time_step=timedelta(...)` when calling the method.
+`time_step` and `output_enabled` are framework call options, not parameters of
+the decorated method.
 
 Adaptive models use `self.substeps.adaptive(...)` and call
 `substep.resolve_dt()` between timestep proposal and physical routing.
@@ -115,21 +126,23 @@ Model schedules and statistics windows are explicit:
 from datetime import timedelta
 from hydroforge import (
     CalendarWindow,
-    SimulationSchedule,
     StatisticsPlan,
 )
 
-schedule = SimulationSchedule.from_contract(
-    runoff_dataset.temporal_contract(),
-    step=timedelta(hours=1),
+runoff_dataset = DailyBinDataset(
+    ...,
+    model_step=timedelta(days=1),
 )
+schedule = runoff_dataset.simulation_schedule
 
 statistics_plan = StatisticsPlan(
-    schedule=schedule,
     inner=CalendarWindow("day"),
     outer=CalendarWindow("year"),
 )
 ```
+
+Dataset chunks are not padded; the final chunk may be shorter than `chunk_len`.
+Use `DataLoader(dataset, batch_size=None, ...)` to yield chunks directly.
 
 ## Statistics and NetCDF output
 
@@ -163,6 +176,13 @@ Multi-rank model output can be read with:
 ```python
 from hydroforge.output.multirank import MultiRankStatsReader
 ```
+
+Statistics output uses contract version 3 and one `hydroforge_run_id` across
+ranks and split years. The reader rejects legacy output and mixed-run files.
+Background output failures stop subsequent model steps.
+
+Boolean NetCDF variables use `u1` storage with
+`hydroforge_dtype="bool"`; values must be `0` or `1`.
 
 ## Backend selection
 

@@ -49,20 +49,9 @@ class MutationTrace:
                 self.versions[identity] = tensor._version
             self.native_writes.add(identity)
 
-    def mutated(self) -> tuple[torch.Tensor, ...]:
-        identities = self.native_writes | {
-            identity for identity, tensor in self.tensors.items()
-            if tensor._version != self.versions[identity]
-        }
-        return tuple(self.tensors[identity] for identity in identities)
-
     def restore_all(self) -> None:
         for identity, tensor in self.tensors.items():
             tensor.copy_(self.snapshots[identity])
-
-    def snapshots_for(self, tensors: Iterable[torch.Tensor]) -> list[torch.Tensor]:
-        return [self.snapshots[id(tensor)] for tensor in tensors]
-
 
 @contextmanager
 def trace_mutations(

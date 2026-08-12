@@ -4,13 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from functools import partial
 from types import MappingProxyType
-from typing import Any, Literal, Mapping
+from typing import TYPE_CHECKING, Any, Literal, Mapping
 
 import torch
 
 from hydroforge.contracts.fields import concrete_tensor_dtype
+from hydroforge.contracts.runtime import (
+    DEFAULT_BACKEND_REQUIREMENT,
+    DEFAULT_BLOCK_SIZE,
+)
+
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
 
 
 class UnboundKernelArgument(KeyError):
@@ -29,7 +35,7 @@ class BindingResolution:
 class KernelBinder:
     """Resolve exact KernelSpec names against one immutable model namespace."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: AbstractModel) -> None:
         self.model = model
         # Kernel entries are process-lifetime nominal operator objects.  Keep
         # the object itself as the key: an integer ``id`` can be reused after
@@ -44,30 +50,7 @@ class KernelBinder:
     @property
     def _field_index(self):
         """Use the immutable namespace compiled during model initialization."""
-        return self.model._plan.kernels.fields.owners
-
-    def bind(self, kernel: Any, *, dynamic: tuple[str, ...] = ()) -> Any:
-        metadata = kernel.metadata
-        if len(dynamic) != len(set(dynamic)):
-            raise ValueError("dynamic kernel argument names must be unique")
-        dynamic_names = frozenset(dynamic)
-        unknown = dynamic_names.difference(metadata.parameters)
-        if unknown:
-            raise ValueError(
-                f"dynamic kernel arguments are outside {metadata.name}: "
-                f"{sorted(unknown)}"
-            )
-        for parameter in dynamic_names:
-            self.validate_dynamic(parameter, metadata)
-        bindings = {
-            parameter: self.resolve(
-                parameter, metadata.optional_buffers, metadata.optional_values,
-            ).value
-            for parameter in metadata.parameters
-            if parameter not in dynamic_names
-        }
-        bindings["BLOCK_SIZE"] = self._block_size(kernel)
-        return partial(kernel, **bindings)
+        return self.model._field_namespace
 
     def complete(self, kernel: Any, supplied: dict[str, Any]) -> dict[str, Any]:
         if not supplied:
@@ -81,6 +64,7 @@ class KernelBinder:
                         metadata.optional_values,
                     ).value
                     for parameter in metadata.parameters
+                    if parameter != "BLOCK_SIZE"
                 }
                 values["BLOCK_SIZE"] = self._block_size(kernel)
                 cached = MappingProxyType(values)
@@ -106,6 +90,8 @@ class KernelBinder:
             self.validate_dynamic(parameter, metadata)
         arguments = dict(supplied)
         for parameter in metadata.parameters:
+            if parameter == "BLOCK_SIZE":
+                continue
             if parameter not in arguments:
                 arguments[parameter] = self.resolve(
                     parameter,
@@ -189,6 +175,9 @@ class KernelBinder:
         matches = self._field_index.get(field, ())
         typed = []
         for match in matches:
+            schema_getter = getattr(match.owner, "get_tensor_schema", None)
+            if schema_getter is not None and schema_getter(field) is None:
+                continue
             getter = getattr(match.owner, "get_expected_dtype", None)
             if getter is not None:
                 typed.append((match.module_name, getter(field)))
@@ -202,7 +191,7 @@ class KernelBinder:
 
         if feature is None and optional:
             declared = []
-            for module_name, module_type in self.model.module_list.items():
+            for module_name, module_type in self.model.module_types().items():
                 schema = module_type.get_tensor_schema(field)
                 if (
                     schema is not None
@@ -223,7 +212,7 @@ class KernelBinder:
         if not feature.startswith("HAS_"):
             return None
         module_name = feature.removeprefix("HAS_").lower()
-        module_type = self.model.module_list.get(module_name)
+        module_type = self.model.module_types().get(module_name)
         if module_type is None:
             return None
         schema = module_type.get_tensor_schema(field)
@@ -246,13 +235,12 @@ class KernelBinder:
         """
 
         model = self.model
+        backend = model._execution.backend
         value = model.BLOCK_SIZE
-        if "BLOCK_SIZE" not in model.model_fields_set:
-            backend = model._execution.backend
-            value = kernel.metadata.block_sizes.get(backend, value)
-        else:
-            backend = model._execution.backend
-        from hydroforge.contracts.runtime import DEFAULT_BACKEND_REQUIREMENT
+        if value is None:
+            value = kernel.metadata.block_sizes.get(
+                backend, DEFAULT_BLOCK_SIZE,
+            )
 
         rule = model.backend_requirements.get(
             backend, DEFAULT_BACKEND_REQUIREMENT,
@@ -301,8 +289,6 @@ class KernelBinder:
                 return BindingResolution(
                     None, "optional", feature,
                 )
-        if parameter == "BLOCK_SIZE":
-            return BindingResolution(model.BLOCK_SIZE, "model_config", "model")
         if parameter == "num_trials":
             return BindingResolution(
                 1 if model.num_trials is None else model.num_trials,
@@ -322,13 +308,16 @@ class KernelBinder:
             if not matches:
                 declared = [
                     module_name
-                    for module_name in self.model.module_list
+                    for module_name in self.model.module_types()
                     if any(
                         item.name == source
                         for item in self.model.compiled_schema().fields(module_name)
                     )
                 ]
-                if len(declared) == 1 and not self.model.has_module(declared[0]):
+                if (
+                    len(declared) == 1
+                    and declared[0] not in self.model._capabilities
+                ):
                     return BindingResolution(
                         False, "batched", declared[0],
                     )
@@ -364,12 +353,26 @@ class KernelBinder:
                 f"kernel feature {parameter!r} must use the canonical HAS_* name"
             )
         feature = parameter.removeprefix("HAS_").lower()
-        if feature in model.module_list:
-            return model.has_module(feature)
-        if feature in model.feature_rules:
+        if feature in model.module_types() or feature in model.feature_rules:
             return model.has_feature(feature)
+        flag_name = f"has_{feature}"
+        matches = self._field_index.get(flag_name, ())
+        if len(matches) == 1:
+            value = getattr(matches[0].owner, flag_name)
+            if type(value) is not bool:
+                raise TypeError(
+                    f"kernel feature {parameter!r} resolved "
+                    f"{matches[0].module_name}.{flag_name}, which must be an "
+                    f"exact bool rather than {type(value).__name__}"
+                )
+            return value
+        if len(matches) > 1:
+            self._raise_resolution(
+                parameter, [match.module_name for match in matches],
+            )
         raise KeyError(
-            f"kernel feature {parameter!r} does not name a module or feature rule"
+            f"kernel feature {parameter!r} does not name a module, feature "
+            f"rule, or unique boolean field {flag_name!r}"
         )
 
     @staticmethod

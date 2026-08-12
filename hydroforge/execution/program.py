@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
 
 
 class FixedSubstepProgram:
     """Cached fixed-width loop whose control state is owned by HydroForge."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: AbstractModel) -> None:
         self.execution = model._execution
         self.capture = self.execution.capture
         self.statistics = self.execution.statistics
@@ -226,7 +229,7 @@ class FixedSubstepProgram:
                 stream_ptr=stream,
             )
             aggregator._aggregator_function(
-                states, self.statistics.model.BLOCK_SIZE,
+                states, aggregator.block_size,
             )
 
         graph = self.capture.capture_cuda(
@@ -242,14 +245,6 @@ class FixedSubstepProgram:
         return graph
 
     def execute(self, count: int, duration: float) -> int:
-        if type(count) is not int:
-            raise TypeError("fixed substep count must be an int")
-        if count < 1:
-            raise ValueError("fixed substep count must be positive")
-        if type(duration) not in {int, float}:
-            raise TypeError("fixed substep duration must be an int or float")
-        if not math.isfinite(duration) or duration <= 0:
-            raise ValueError("fixed substep duration must be finite and positive")
         if self.operators is None:
             raise RuntimeError("fixed substep scope has not been recorded")
         self.operators.require_stable_bindings()
@@ -372,7 +367,7 @@ class PredicateLoopProgram:
     ``predicate`` and whose enclosing fixed/adaptive scope owns time advance.
     """
 
-    def __init__(self, model: Any, *, maximum_steps: int) -> None:
+    def __init__(self, model: AbstractModel, *, maximum_steps: int) -> None:
         if type(maximum_steps) is not int:
             raise TypeError("predicate loop maximum_steps must be an exact int")
         if maximum_steps < 1:
@@ -479,7 +474,7 @@ class AdaptiveSubstepProgram:
     """Cached adaptive loop whose control state is owned by HydroForge."""
 
     def __init__(
-        self, model: Any, *, candidate_dt: torch.Tensor, dt: torch.Tensor,
+        self, model: AbstractModel, *, candidate_dt: torch.Tensor, dt: torch.Tensor,
         maximum_dt: float, maximum_steps: int,
     ) -> None:
         self.execution = model._execution

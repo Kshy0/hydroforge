@@ -51,21 +51,12 @@ class DatasetTimeline:
         self.time_to_key = time_to_key
         self.time_aggregation = time_aggregation
         self.file_times: dict[str, list[DateTime]] = {}
-        self.global_times: list[DateTime] = []
         self.dt_to_loc: dict[DateTime, tuple[str, int]] = {}
         self.source_time_interval: timedelta | None = None
         self.aggregation_factor: int | None = None
-        self.plan: list[tuple] = []
-        self.spin_up_chunks_template: list[tuple] = []
+        self.plan: tuple[tuple, ...] = ()
 
-        scan_start = owner.start_date
-        scan_end = owner.end_date
-        if owner.spin_up_cycles > 0:
-            if owner.spin_up_start_date is not None:
-                scan_start = min(scan_start, owner.spin_up_start_date)
-            if owner.spin_up_end_date is not None:
-                scan_end = max(scan_end, owner.spin_up_end_date)
-        self._scan(scan_start, scan_end)
+        self._scan(self._required_output_times())
         self._build_plan()
 
     def _path(self, key: str) -> Path:
@@ -95,18 +86,49 @@ class DatasetTimeline:
                 keys.add(key)
         return keys
 
-    def _scan(self, start_dt: DateTime, end_dt: DateTime) -> None:
+    def _required_output_times(self) -> list[DateTime]:
+        """Return distinct I/O timestamps required by the shared chunk plan."""
+
+        required: list[DateTime] = []
+        seen: set[DateTime] = set()
+        for chunk in self.owner.chunk_plan:
+            for timestamp in self.contiguous_times(
+                chunk.source_start, chunk.length,
+            ):
+                if timestamp not in seen:
+                    seen.add(timestamp)
+                    required.append(timestamp)
+        return required
+
+    @staticmethod
+    def _support_ranges(
+        starts: list[DateTime], width: timedelta,
+    ) -> tuple[tuple[DateTime, DateTime], ...]:
+        """Merge the half-open source windows supporting output timestamps."""
+
+        ranges: list[tuple[DateTime, DateTime]] = []
+        for start in sorted(set(starts)):
+            end = start + width
+            if ranges and start <= ranges[-1][1]:
+                previous_start, previous_end = ranges[-1]
+                ranges[-1] = (previous_start, max(previous_end, end))
+            else:
+                ranges.append((start, end))
+        return tuple(ranges)
+
+    @staticmethod
+    def _inside_supports(
+        timestamp: DateTime,
+        supports: tuple[tuple[DateTime, DateTime], ...],
+    ) -> bool:
+        return any(start <= timestamp < end for start, end in supports)
+
+    def _scan(self, required_times: list[DateTime]) -> None:
         owner = self.owner
         aggregate = self.time_aggregation is not None
-        scan_end = end_dt + owner.time_interval if aggregate else end_dt
-        key_to_first: dict[str, DateTime] = {}
-        current = start_dt
-        while current < scan_end if aggregate else current <= scan_end:
-            key_to_first.setdefault(self.time_to_key(current), current)
-            current += owner.time_interval
-        key_to_first.setdefault(self.time_to_key(scan_end if aggregate else end_dt), scan_end if aggregate else end_dt)
-
-        candidates = set(key_to_first)
+        required_set = set(required_times)
+        supports = self._support_ranges(required_times, owner.time_interval)
+        candidates = {self.time_to_key(timestamp) for timestamp in required_times}
         if aggregate:
             # An output interval can span multiple file partitions. Deriving
             # keys only at output boundaries would skip every interior shard
@@ -139,9 +161,11 @@ class DatasetTimeline:
                     )
                 if owner.calendar != source_calendar:
                     owner.update_calendar(file_calendar)
-                    start_dt = owner._convert_to_calendar(start_dt)
-                    end_dt = owner._convert_to_calendar(end_dt)
-                    scan_end = owner._convert_to_calendar(scan_end)
+                    required_times = self._required_output_times()
+                    required_set = set(required_times)
+                    supports = self._support_ranges(
+                        required_times, owner.time_interval,
+                    )
                 dates = self._decode_dates(time_var, path)
                 if not dates:
                     raise ValueError(f"Time axis is empty in {path.name}")
@@ -165,23 +189,21 @@ class DatasetTimeline:
                 seen_times.update((dt, path) for dt in dates)
                 self.file_times[key] = list(dates)
                 for index, dt in enumerate(dates):
-                    in_range = start_dt <= dt < scan_end if aggregate else start_dt <= dt <= end_dt
+                    in_range = (
+                        self._inside_supports(dt, supports)
+                        if aggregate else dt in required_set
+                    )
                     if in_range:
                         self.dt_to_loc[dt] = (key, index)
                         if aggregate:
                             source_times.append(dt)
 
-        expected: list[DateTime] = []
-        current = start_dt
-        while current <= end_dt:
-            expected.append(current)
-            current += owner.time_interval
         if aggregate:
             self.source_time_interval = self._infer_source_interval(source_times)
             self.aggregation_factor = owner._get_time_aggregation_factor(self.source_time_interval)
-            self._validate_aggregation_times(expected)
+            self._validate_aggregation_times(required_times)
         else:
-            missing = [dt for dt in expected if dt not in self.dt_to_loc]
+            missing = [dt for dt in required_times if dt not in self.dt_to_loc]
             if missing:
                 preview = ", ".join(str(dt) for dt in missing[:10])
                 raise ValueError(
@@ -189,7 +211,6 @@ class DatasetTimeline:
                     f"First missing: {preview} (total {len(missing)}). "
                     "Check start_date alignment and dataset temporal resolution."
                 )
-        self.global_times = expected
 
     @staticmethod
     def _decode_dates(time_var, path: Path) -> list[DateTime]:
@@ -284,11 +305,8 @@ class DatasetTimeline:
         """Return an aligned read window without mixing main and spin-up axes.
 
         ``AbstractDataset.get_index_by_time`` is intentionally relative to the
-        main-run start.  Turning that index into an offset into
-        :attr:`global_times` is therefore incorrect when the timeline scan also
-        includes an earlier spin-up interval.  Normalize the requested time
-        back onto the owner's main origin, then bound it by the phase that
-        actually contains it.
+        main-run start. Normalize the requested time back onto the owner's I/O
+        origin, then bound it by the phase that actually contains it.
         """
         count = int(count)
         if count <= 0:
@@ -323,31 +341,12 @@ class DatasetTimeline:
             for offset in range(min(count, available))
         ]
 
-    def _chunks(self, start_dt: DateTime, end_dt: DateTime) -> list[tuple]:
-        times: list[DateTime] = []
-        current = start_dt
-        while current <= end_dt:
-            times.append(current)
-            current += self.owner.time_interval
-        size = self.owner.chunk_len
-        return [self.build_entry(times[start:start + size]) for start in range(0, len(times), size)]
-
     def _build_plan(self) -> None:
-        owner = self.owner
-        if owner.spin_up_cycles > 0:
-            if owner.spin_up_start_date is None or owner.spin_up_end_date is None:
-                raise ValueError("Spin-up dates must be provided if spin_up_cycles > 0")
-            self.spin_up_chunks_template = self._chunks(owner.spin_up_start_date, owner.spin_up_end_date)
-            for _ in range(owner.spin_up_cycles):
-                self.plan.extend(self.spin_up_chunks_template)
-        self.plan.extend(self._chunks(owner.start_date, owner.end_date))
+        """Compile I/O operations from the owner's shared source chunks."""
 
-    def is_valid_time_index(self, index: int) -> bool:
-        if type(index) is not int or index < 0:
-            return False
-        chunk_index, offset = divmod(index, self.owner.chunk_len)
-        if chunk_index >= len(self.plan):
-            return False
-        entry = self.plan[chunk_index]
-        real_length = sum(len(op[1]) for op in entry[1]) if self.time_aggregation is None else entry[2]
-        return offset < real_length
+        self.plan = tuple(
+            self.build_entry(self.contiguous_times(
+                chunk.source_start, chunk.length,
+            ))
+            for chunk in self.owner.chunk_plan
+        )

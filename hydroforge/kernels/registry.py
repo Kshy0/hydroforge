@@ -33,7 +33,7 @@ from typing import Any, Callable
 from hydroforge.contracts import BufferDTypeABI, KernelMetadata, KernelSpec
 from hydroforge.kernels.context import (
     active_operator_recorder, kernel_factory_contract, registry_factory,
-    require_active_kernel_spec,
+    reject_direct_kernel_launch, require_active_kernel_spec,
 )
 from hydroforge.kernels.devices import devices_match
 from hydroforge.kernels.mutation import record_kernel_writes
@@ -48,7 +48,7 @@ from hydroforge.kernels.backends.metal.template import make_spec_metal_dispatche
 from hydroforge.kernels.backends.cuda.template import make_spec_cuda_dispatcher
 
 __all__ = [
-    "BackendRegistry", "KERNEL_BACKEND", "KernelEntry",
+    "BackendRegistry", "KernelEntry",
     "TorchDispatcher", "VariantDispatcher",
     "devices_match", "make_metal_dispatcher", "make_torch_dispatcher",
     "registry_factory", "require_active_kernel_spec",
@@ -80,39 +80,17 @@ def automatic_kernel_binding(binder: Any):
         _ACTIVE_AUTO_BINDER.reset(token)
 
 
-def _resolve_backend() -> str:
-    """Resolve kernel backend from HYDROFORGE_BACKEND environment variable.
+def _configured_backend() -> str | None:
+    """Return and validate the explicitly configured model backend."""
 
-    When the variable is unset, auto-detect in priority order:
-    ``triton`` → ``metal`` → ``torch``.  Triton handles both NVIDIA and AMD
-    GPUs, so AMD/ROCm users get Triton by default; the compiled ``cuda``
-    backend (which PyTorch hipifies under ROCm) must be requested explicitly.
-    """
     env = os.environ.get("HYDROFORGE_BACKEND", "").strip().lower()
-    if env:
-        supported = {"torch", "triton", "cuda", "metal"}
-        if env not in supported:
-            raise ValueError(
-                "HYDROFORGE_BACKEND must be one of "
-                f"{sorted(supported)}, got {env!r}"
-            )
-        return env
-    import torch
-
-    if torch.cuda.is_available():
-        try:
-            import triton  # noqa: F401
-        except ImportError as exc:
-            raise RuntimeError(
-                "CUDA is available but Triton is not installed; set "
-                "HYDROFORGE_BACKEND=cuda for compiled extensions or "
-                "HYDROFORGE_BACKEND=torch for the formal Torch backend. "
-                "HydroForge will not silently downgrade an accelerator model"
-            ) from exc
-        return "triton"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "metal"
-    return "torch"
+    supported = {"torch", "triton", "cuda", "metal"}
+    if env and env not in supported:
+        raise ValueError(
+            "HYDROFORGE_BACKEND must be one of "
+            f"{sorted(supported)}, got {env!r}"
+        )
+    return env or None
 
 
 def resolve_model_backend(device: Any) -> str:
@@ -124,9 +102,9 @@ def resolve_model_backend(device: Any) -> str:
     coexist without silently assigning a native GPU backend to CPU state.
     """
 
-    env = os.environ.get("HYDROFORGE_BACKEND", "").strip().lower()
-    if env:
-        return _resolve_backend()
+    configured = _configured_backend()
+    if configured is not None:
+        return configured
     import torch
 
     device_type = torch.device(device).type
@@ -143,31 +121,6 @@ def resolve_model_backend(device: Any) -> str:
     if device_type == "mps":
         return "metal"
     return "torch"
-
-
-def _backend_hint() -> str:
-    """Choose the legacy process default without importing an optional JIT.
-
-    Model-owned dispatch uses :func:`resolve_model_backend`, so a CPU model
-    must remain constructible when a CUDA device is visible but Triton is not
-    installed.  Direct, model-free kernel calls retain the historical device
-    preference and will resolve (and diagnose) their hinted backend only when
-    they are actually invoked.
-    """
-
-    env = os.environ.get("HYDROFORGE_BACKEND", "").strip().lower()
-    if env:
-        return _resolve_backend()
-    import torch
-
-    if torch.cuda.is_available():
-        return "triton"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "metal"
-    return "torch"
-
-
-KERNEL_BACKEND: str = _backend_hint()
 
 
 @dataclass(frozen=True)
@@ -195,9 +148,8 @@ class BackendRegistry:
     def available(self) -> tuple[str, ...]:
         return tuple(self.implementations)
 
-    def resolve(self, backend: str | None = None) -> Callable:
-        """Build the implementation for ``backend`` or the active backend."""
-        backend = _backend_hint() if backend is None else backend
+    def resolve(self, backend: str) -> Callable:
+        """Build the implementation for one explicit model backend."""
         try:
             factory = self.implementations[backend]
         except KeyError as exc:
@@ -229,18 +181,8 @@ class KernelEntry:
         self.registry = registry
         self._implementations: dict[str, Callable] = {}
 
-    def _active_backend(self) -> str:
-        recorder = active_operator_recorder()
-        if recorder is not None:
-            return recorder.execution.backend
-        binder = _ACTIVE_AUTO_BINDER.get()
-        if binder is not None:
-            return binder.model._execution.backend
-        return _backend_hint()
-
-    def implementation(self, backend: str | None = None) -> Callable:
+    def implementation(self, backend: str) -> Callable:
         """Return one backend implementation, constructed and checked once."""
-        backend = self._active_backend() if backend is None else backend
         implementation = self._implementations.get(backend)
         if implementation is None:
             implementation = self.registry.resolve(backend)
@@ -248,27 +190,10 @@ class KernelEntry:
         return implementation
 
     @property
-    def raw(self) -> Callable:
-        return self.implementation()
-
-    @property
     def metadata(self) -> KernelMetadata:
         # KernelSpec is the canonical public ABI. Merely inspecting or binding
         # an entry must not construct whichever backend happens to be active.
         return self.registry.spec.metadata
-
-    def metadata_by_backend(self) -> dict[str, KernelMetadata]:
-        result = {}
-        for backend in self.registry.available:
-            callable_ = self.registry.resolve(backend)
-            metadata = _metadata(callable_)
-            if metadata is None:
-                raise TypeError(
-                    f"{self.registry.name}: {backend} implementation has no "
-                    "KernelMetadata"
-                )
-            result[backend] = metadata
-        return result
 
     def __call__(self, **kwargs):
         recorder = active_operator_recorder()
@@ -277,14 +202,16 @@ class KernelEntry:
         binder = _ACTIVE_AUTO_BINDER.get()
         if binder is not None:
             kwargs = binder.complete(self, kwargs)
-            implementation = self.implementation()
+            implementation = self.implementation(
+                binder.model._execution.backend,
+            )
             launch = implementation.specialize(
                 kwargs,
                 frozenset(),
                 buffer_dtypes=binder.buffer_dtypes(self, kwargs),
             )
             return launch()
-        return self.raw(**kwargs)
+        reject_direct_kernel_launch(self.registry.name)
 
     def __getitem__(self, grid):
         del grid

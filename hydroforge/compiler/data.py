@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -11,10 +11,14 @@ from hydroforge.contracts.events import emit
 from hydroforge.contracts.fields import (
     cast_declared_tensor, concrete_tensor_dtype, tensor_is_active,
 )
+from hydroforge.contracts.runtime import MODEL_OWNED_MODULE_FIELDS
+
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
 
 
 class ModelDataCompiler:
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: AbstractModel) -> None:
         self.model = model
 
     def shard(self) -> dict[str, Any]:
@@ -27,6 +31,7 @@ class ModelDataCompiler:
                 if (
                     not field.computed
                     and not field.excluded
+                    and field.name not in MODEL_OWNED_MODULE_FIELDS
                     and tensor_is_active(field.tensor, model.opened_modules)
                 ):
                     fields.setdefault(field.name, field)

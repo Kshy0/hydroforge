@@ -5,7 +5,11 @@ from hydroforge.execution.collectives import (
 )
 from hydroforge.execution.boundaries import between_steps
 from hydroforge.execution.parameters import ParameterChangeEffect
-from hydroforge.execution.substeps import SubstepFrame, SubstepRuntime
+from hydroforge.execution.substeps import (
+    INVALID_SUBSTEP_COUNT,
+    SubstepFrame,
+    SubstepRuntime,
+)
 from hydroforge.execution.outer import OuterRuntime
 from hydroforge.execution.step import managed_step
 from hydroforge.execution.windows import StatisticsWindowController
@@ -17,6 +21,7 @@ __all__ = [
     "reduce_many_",
     "between_steps",
     "ParameterChangeEffect",
+    "INVALID_SUBSTEP_COUNT",
     "SubstepFrame",
     "SubstepRuntime",
     "OuterRuntime",

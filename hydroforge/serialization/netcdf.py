@@ -8,6 +8,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+import numpy as np
 from netCDF4 import Dataset
 
 from hydroforge.serialization.files import atomic_output_path
@@ -23,6 +24,46 @@ DEFAULT_NETCDF_OPTIONS: Mapping[str, Any] = MappingProxyType({
     "compression": "zlib",
     "complevel": 4,
 })
+
+LOGICAL_DTYPE_ATTR = "hydroforge_dtype"
+BOOL_LOGICAL_DTYPE = "bool"
+BOOL_NETCDF_STORAGE_DTYPE = np.dtype("u1")
+BOOL_NETCDF_READ_DTYPES = frozenset({np.dtype("i1"), np.dtype("u1")})
+
+
+def netcdf_dtype_encoding(dtype: Any) -> tuple[np.dtype, str | None]:
+    """Return the physical NetCDF dtype and optional logical dtype marker."""
+
+    normalized = np.dtype(dtype)
+    if normalized == np.dtype(np.bool_):
+        return BOOL_NETCDF_STORAGE_DTYPE, BOOL_LOGICAL_DTYPE
+    return normalized, None
+
+
+def decode_netcdf_logical_array(
+    variable: Any,
+    values: Any,
+    *,
+    name: str,
+) -> np.ndarray | Any:
+    """Decode one explicitly marked logical array without implicit casting."""
+
+    if getattr(variable, LOGICAL_DTYPE_ATTR, None) != BOOL_LOGICAL_DTYPE:
+        return values
+    storage_dtype = np.dtype(variable.dtype)
+    if storage_dtype not in BOOL_NETCDF_READ_DTYPES:
+        raise TypeError(
+            f"boolean NetCDF variable {name!r} must use i1/u1 storage; "
+            f"got {storage_dtype}"
+        )
+    if np.ma.isMaskedArray(values) and np.any(np.ma.getmaskarray(values)):
+        raise ValueError(f"boolean NetCDF variable {name!r} contains missing values")
+    array = np.asarray(values)
+    if array.size and not np.isin(array, (0, 1)).all():
+        raise ValueError(
+            f"boolean NetCDF variable {name!r} contains values outside 0/1"
+        )
+    return array.astype(np.bool_, copy=False)
 
 
 def default_netcdf_options() -> dict[str, Any]:

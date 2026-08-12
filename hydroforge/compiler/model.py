@@ -1,67 +1,35 @@
-"""Cold-path compiler for one concrete model specialization."""
+"""Cold-path field namespace compiler for one model specialization."""
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Mapping
 
 from pydantic import BaseModel
 
-from hydroforge.compiler.plan import (
-    FieldNamespace,
-    FieldOwner,
-    ExecutionPlan,
-    KernelPlan,
-    ModelPlan,
-    ModulePlan,
-    RuntimePlan,
-    StatisticsPlan,
-)
 from hydroforge.contracts.kernel_field import KernelField
 from hydroforge.contracts.fields import tensor_is_active
 
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
 
-class ModelCompiler:
-    """Compile declarative modules into an immutable execution contract."""
 
-    def __init__(self, model: Any) -> None:
+@dataclass(frozen=True, slots=True)
+class FieldOwner:
+    module_name: str
+    field_name: str
+    owner: BaseModel
+
+
+class FieldNamespaceCompiler:
+    """Compile declarative model fields into an immutable lookup index."""
+
+    def __init__(self, model: AbstractModel) -> None:
         self.model = model
 
-    def compile(self) -> ModelPlan:
-        model = self.model
-        missing = set(model.opened_modules).difference(model._modules)
-        if missing:
-            raise RuntimeError(
-                "opened modules were not constructed: " + ", ".join(sorted(missing))
-            )
-        order = tuple(model.opened_modules)
-        dependencies = {
-            name: tuple(model.module_list[name].dependencies)
-            for name in order
-        }
-        runtime = model._execution
-        fields = FieldNamespace(self._field_owners())
-        aggregator = model._statistics.aggregator
-        variables = (
-            () if aggregator is None else tuple(sorted(aggregator._variables))
-        )
-        return ModelPlan(
-            modules=ModulePlan(order=order, dependencies=dependencies),
-            capabilities=frozenset(model._capabilities),
-            fields=fields,
-            runtime=RuntimePlan(
-                backend=runtime.backend,
-                device=runtime.device,
-                capture_mode=runtime.capture_mode,
-            ),
-            kernels=KernelPlan(fields=fields),
-            execution=ExecutionPlan(
-                policy_count=len(model._execution.step_policies),
-            ),
-            statistics=StatisticsPlan(
-                enabled=aggregator is not None,
-                variables=variables,
-            ),
-        )
+    def compile(self) -> Mapping[str, tuple[FieldOwner, ...]]:
+        return MappingProxyType(self._field_owners())
 
     def _field_owners(self) -> dict[str, tuple[FieldOwner, ...]]:
         model = self.model
@@ -75,43 +43,47 @@ class ModelCompiler:
                     or (
                         not schema.tensor.expression
                         and tensor_is_active(
-                            schema.tensor, getattr(model, "opened_modules", ()),
+                            schema.tensor, model.opened_modules,
                         )
                         and (
-                            getattr(schema.tensor, "category", None) != "virtual"
+                            schema.tensor.category != "virtual"
                             or name in module.__dict__
                         )
                     )
                 )
-            } | set(module.get_reference_index_fields()) | {
-                name
-                for name in type(module).model_fields
-                if name not in model.module_list
-            }
+            } | set(module.get_reference_index_fields())
             for field_name in fields:
                 index.setdefault(field_name, []).append(FieldOwner(
                     module_name=module_name,
                     field_name=field_name,
                     owner=module,
                 ))
+            for cls in reversed(type(module).__mro__):
+                for field_name, descriptor in vars(cls).items():
+                    if not isinstance(descriptor, KernelField):
+                        continue
+                    index.setdefault(field_name, []).append(FieldOwner(
+                        module_name=module_name,
+                        field_name=field_name,
+                        owner=module,
+                    ))
         for field_name in model.__class__.model_fields:
-            if field_name not in model.module_list:
-                index.setdefault(field_name, []).append(FieldOwner(
-                    module_name="model",
-                    field_name=field_name,
-                    owner=model,
-                ))
-                value = getattr(model, field_name)
-                if (
-                    isinstance(value, BaseModel)
-                    and type(value).model_config.get("frozen") is True
-                ):
-                    for nested_name in type(value).model_fields:
-                        index.setdefault(nested_name, []).append(FieldOwner(
-                            module_name=f"model.{field_name}",
-                            field_name=nested_name,
-                            owner=value,
-                        ))
+            index.setdefault(field_name, []).append(FieldOwner(
+                module_name="model",
+                field_name=field_name,
+                owner=model,
+            ))
+            value = getattr(model, field_name)
+            if (
+                isinstance(value, BaseModel)
+                and type(value).model_config.get("frozen") is True
+            ):
+                for nested_name in type(value).model_fields:
+                    index.setdefault(nested_name, []).append(FieldOwner(
+                        module_name=f"model.{field_name}",
+                        field_name=nested_name,
+                        owner=value,
+                    ))
         for cls in reversed(type(model).__mro__):
             for field_name, descriptor in vars(cls).items():
                 if not isinstance(descriptor, KernelField):

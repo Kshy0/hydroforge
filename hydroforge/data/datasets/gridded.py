@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from hydroforge.data.aggregation import build_cama_mapping
-from hydroforge.data.datasets.base import AbstractDataset, validate_forcing_batch
+from hydroforge.data.datasets.base import AbstractDataset
 from hydroforge.data.datasets.export import DatasetExporter
 from hydroforge.data.mapping import MappingTable
 from hydroforge.data.distributed import is_rank_zero
@@ -97,41 +97,35 @@ class GriddedDataset(AbstractDataset, ABC):
 
     def shard_forcing(
         self,
-        batch_data: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        chunk_data: Union[torch.Tensor, Dict[str, torch.Tensor]],
         local_mapping: torch.Tensor,
-        *,
-        target: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Map grid data to catchments and handle distributed sync.
 
         Expected input shape:
-          - (B, T, N) for single trial
-          - (B, T, K, N) for K trials
+          - (T, N) for single trial
+          - (T, K, N) for K trials
 
         N should match data_size (compressed source grids after build_local_mapping).
         Output shape: (M, C) where M is the product of non-spatial dims, C = number of catchments.
         """
-        if isinstance(batch_data, dict):
-            if target is not None and not isinstance(target, Mapping):
-                raise TypeError("dict forcing requires a target mapping")
+        if isinstance(chunk_data, dict):
             return {
-                name: self.shard_forcing(
-                    block,
-                    local_mapping,
-                    target=None if target is None else target[name],
-                )
-                for name, block in batch_data.items()
+                name: self.shard_forcing(block, local_mapping)
+                for name, block in chunk_data.items()
             }
 
-        if batch_data.dim() == 3:
-            B, T, N = batch_data.shape
-            flat = batch_data.reshape(B * T, N)
-        elif batch_data.dim() == 4:
-            B, T, K, N = batch_data.shape
-            flat = batch_data.reshape(B * T * K, N)
+        if chunk_data.dim() == 2:
+            flat = chunk_data
+        elif chunk_data.dim() == 3:
+            T, K, N = chunk_data.shape
+            flat = chunk_data.reshape(T * K, N)
         else:
-            raise ValueError(f"batch_data must be 3D or 4D, got shape {tuple(batch_data.shape)}")
+            raise ValueError(
+                "chunk_data must have shape (T, N) or (T, K, N); "
+                f"got {tuple(chunk_data.shape)}"
+            )
 
         if flat.is_floating_point():
             flat = torch.where(torch.isnan(flat), torch.zeros_like(flat), flat)
@@ -140,18 +134,11 @@ class GriddedDataset(AbstractDataset, ABC):
 
         out = (flat @ local_mapping).contiguous()
 
-        # If input was 4D (B, T, K, N), reshape output to (B*T, K, C)
-        # This makes it ready for step-by-step slicing in the main loop
-        if batch_data.dim() == 4:
-            B, T, K, N = batch_data.shape
-            # out is currently (B*T*K, C)
-            # Reshape to (B*T, K, C) so that out[step] gives (K, C) for all trials
-            out = out.view(B * T, K, -1)
+        if chunk_data.dim() == 3:
+            T, K, _ = chunk_data.shape
+            out = out.view(T, K, -1)
 
-        return (
-            out if target is None
-            else validate_forcing_batch(out, target)
-        )
+        return out
 
     def build_local_mapping(
         self,
@@ -183,7 +170,6 @@ class GriddedDataset(AbstractDataset, ABC):
             )
 
         local = mapping.local(desired_catchment_ids)
-        self._mapping_file = mapping_path
         self._set_local_selection(local.source_indices, local.target_ids)
         dtype = torch.float32 if precision == "float32" else torch.float64
         return local.to_torch(device=device, dtype=dtype)

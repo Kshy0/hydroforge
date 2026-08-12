@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Final, Iterator
 
 import torch
 
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
+
 
 _MISSING_PROGRAM = object()
+
+# HydroForge's signed-int32 substep-count ABI reserves its largest value as
+# the backend-independent failure sentinel.  Device kernels that calculate a
+# count may emit this value instead of casting a non-finite or overflowing
+# result; ``SubstepRuntime.fixed`` decodes it before any loop is scheduled.
+INVALID_SUBSTEP_COUNT: Final[int] = (1 << 31) - 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,18 +73,10 @@ class _FixedScope:
         self, runtime: SubstepRuntime, *, key: tuple[Any, ...],
         count: int, duration: float,
     ) -> None:
-        if type(count) is not int:
-            raise TypeError("fixed substep count must be an int")
-        if count < 1:
-            raise ValueError("fixed substep count must be positive")
-        if type(duration) not in {int, float}:
-            raise TypeError("fixed substep duration must be an int or float")
-        if not math.isfinite(duration) or duration <= 0:
-            raise ValueError("fixed substep duration must be finite and positive")
         self.runtime = runtime
         self.key = key
-        self.requested_count = int(count)
-        self.duration = float(duration)
+        self.count = count
+        self.duration = duration
         self.completed = 0
 
     def __iter__(self) -> Iterator[SubstepFrame]:
@@ -109,7 +110,7 @@ class _FixedScope:
         if self.runtime.model.world_size > 1:
             step.synchronize_distributed(1)
         self.completed = program.execute(
-            self.requested_count, self.duration,
+            self.count, self.duration,
         )
         step.completed_substeps = self.completed
 
@@ -301,16 +302,29 @@ class SubstepRuntime:
     meaning.
     """
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: AbstractModel) -> None:
         self.model = model
 
     def fixed(
-        self, *, count: int, specialization: Any = None,
+        self, *, count: object, specialization: Any = None,
     ) -> _FixedScope:
+        """Declare a fixed loop after decoding the shared count ABI.
+
+        Count-producing device kernels may return
+        :data:`INVALID_SUBSTEP_COUNT` to report an invalid or overflowing
+        result without performing an unsafe integer cast.
+        """
         if type(count) is not int:
             raise TypeError("fixed substep count must be an int")
         if count < 1:
             raise ValueError("fixed substep count must be positive")
+        if count == INVALID_SUBSTEP_COUNT:
+            raise RuntimeError(
+                "fixed substep count received HydroForge's reserved "
+                "invalid-count sentinel"
+            )
+        if count > INVALID_SUBSTEP_COUNT:
+            raise ValueError("fixed substep count must fit in a signed int32")
         duration, key = self._claim_scope(
             kind="fixed", specialization=_specialization_key(specialization),
         )

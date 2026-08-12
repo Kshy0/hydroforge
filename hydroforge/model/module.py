@@ -12,7 +12,10 @@ from __future__ import annotations
 
 from abc import ABC
 from functools import cache
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Self, Tuple
+from typing import (
+    Any, ClassVar, Dict, Generic, List, Literal, Optional, Self, Tuple,
+    TypeVar, overload,
+)
 
 import torch
 from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
@@ -21,6 +24,8 @@ from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
 from hydroforge.data.distributed import find_indices_in_torch
 from hydroforge.contracts.events import EventSink, ModelEvent, NullEventSink
 from hydroforge.contracts.fields import tensor_is_active
+from hydroforge.contracts.kernel_field import KernelField
+from hydroforge.contracts.runtime import MODEL_OWNED_MODULE_FIELDS
 from hydroforge.model.tensors import ModuleTensors
 
 
@@ -229,6 +234,97 @@ def ReferenceIndexField(
     """
     return _ReferenceIndexDescriptor(reference, inverse=inverse, device=device)
 
+
+_TModule = TypeVar("_TModule", bound="AbstractModule")
+_TReference = TypeVar("_TReference", covariant=True)
+
+
+class ModuleReference(Generic[_TReference]):
+    """Typed module declaration shared by models and sibling modules."""
+
+    def __init__(
+        self, module_type: type[AbstractModule], *, optional: bool,
+    ) -> None:
+        if (
+            not isinstance(module_type, type)
+            or not issubclass(module_type, AbstractModule)
+        ):
+            raise TypeError("module_ref requires an AbstractModule class")
+        self.module_name = module_type.module_name
+        self.optional = optional
+        self.module_type = module_type
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        if name != self.module_name:
+            raise ValueError(
+                f"module reference attribute {name!r} must match "
+                f"{self.module_type.__name__}.module_name "
+                f"{self.module_name!r}"
+            )
+
+    @classmethod
+    @cache
+    def collect(cls, owner: type) -> Dict[str, ModuleReference]:
+        """Collect active declarations using normal Python MRO lookup."""
+
+        fields: Dict[str, ModuleReference] = {}
+        seen: set[str] = set()
+        for base in owner.mro():
+            for name, value in vars(base).items():
+                if name in seen:
+                    continue
+                seen.add(name)
+                if isinstance(value, cls):
+                    fields[name] = value
+        return fields
+
+    @overload
+    def __get__(self, instance: None, owner: type | None = None) -> Self: ...
+
+    @overload
+    def __get__(
+        self, instance: object, owner: type | None = None,
+    ) -> _TReference: ...
+
+    def __get__(self, instance: Any, owner: type | None = None) -> Any:
+        if instance is None:
+            return self
+        if isinstance(instance, AbstractModule):
+            links = instance._module_references
+        else:
+            links = instance._modules if instance._model_modules_bound else None
+        if links is None:
+            raise RuntimeError(
+                f"Module reference {type(instance).__name__}."
+                f"{self.module_name} was "
+                "accessed before all modules were linked"
+            )
+        return links.get(self.module_name)
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        del value
+        raise AttributeError(
+            f"Module reference {type(instance).__name__}."
+            f"{self.module_name} is read-only"
+        )
+
+
+def module_ref(
+    module_type: type[_TModule],
+) -> ModuleReference[_TModule]:
+    """Declare a required typed module on a model or sibling module."""
+
+    return ModuleReference(module_type, optional=False)
+
+
+def optional_module_ref(
+    module_type: type[_TModule],
+) -> ModuleReference[_TModule | None]:
+    """Declare an optional typed module that is ``None`` when closed."""
+
+    return ModuleReference(module_type, optional=True)
+
+
 def computed_tensor_field(
     description: str,
     shape: Tuple[str, ...],
@@ -324,18 +420,19 @@ class AbstractModule(BaseModel, ABC):
         arbitrary_types_allowed=True,  # Allow torch.Tensor types
         validate_assignment=False,      # Validate on assignment
         extra='ignore',
-        ignored_types=(_ReferenceIndexDescriptor,),
+        ignored_types=(
+            _ReferenceIndexDescriptor,
+            ModuleReference,
+            KernelField,
+        ),
     )
 
     # Module metadata - must be overridden in subclasses
     module_name: ClassVar[str] = "abstract"
     description: ClassVar[str] = "Abstract base module"
-    dependencies: ClassVar[List[str]] = []  # List of modules this module depends on
     conflicts: ClassVar[List[str]] = []  # List of modules that cannot co-exist with this module
-    nc_excluded_fields: ClassVar[List[str]] = [
-        "opened_modules", "device", "precision", "mixed_precision", "rank",
-        "num_trials",
-    ]  # Fields to exclude from HDF5
+    nc_excluded_fields: ClassVar[Tuple[str, ...]] = MODEL_OWNED_MODULE_FIELDS
+    """Fields owned by the model runtime rather than module input data."""
 
     opened_modules: List[str] = Field(
         default_factory=list,
@@ -374,10 +471,13 @@ class AbstractModule(BaseModel, ABC):
     _sealed_declared_fields: Optional[Dict[str, object]] = PrivateAttr(
         default=None,
     )
+    _module_references: Optional[Dict[str, Optional["AbstractModule"]]] = (
+        PrivateAttr(default=None)
+    )
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        for name in ("dependencies", "conflicts", "nc_excluded_fields"):
+        for name in ("conflicts", "nc_excluded_fields"):
             values = tuple(getattr(cls, name))
             if any(not isinstance(value, str) or not value for value in values):
                 raise TypeError(
@@ -400,6 +500,9 @@ class AbstractModule(BaseModel, ABC):
         sealed.
         """
 
+        reference = self.get_module_reference_fields().get(name)
+        if reference is not None:
+            reference.__set__(self, value)
         private = getattr(self, "__pydantic_private__", None)
         sealed = (
             None if private is None
@@ -527,8 +630,9 @@ class AbstractModule(BaseModel, ABC):
     def _emit(self, level: str, name: str, message: str, **fields: Any) -> None:
         event = ModelEvent(level, name, message, fields)
         if isinstance(self._event_sink, NullEventSink):
-            # Tensor normalization runs during Pydantic construction, before
-            # ModelInitializer can attach the model's configured sink.
+            # Standalone and unlinked-independent modules may normalize during
+            # Pydantic construction, before ModelInitializer can attach the
+            # model's configured sink.
             self._pending_events.append(event)
             return
         self._event_sink.emit(event)
@@ -576,12 +680,73 @@ class AbstractModule(BaseModel, ABC):
                 f"All active modules must include themselves in that list."
             )
         self._tensors = ModuleTensors(self)
-        self._tensors.initialize()
-        # Derived reference indices are declared as descriptors rather than
-        # Pydantic computed fields, but retain eager topology validation and
-        # device placement during module initialization.
-        for name in self.get_reference_index_fields():
-            getattr(self, name)
+        linked_by_model = bool(
+            isinstance(__context, dict)
+            and __context.get("hydroforge_model_initialization")
+        )
+        if not linked_by_model:
+            raise RuntimeError(
+                f"module {self.module_name!r} must be initialized through "
+                "an AbstractModel"
+            )
+        references = __context.get("hydroforge_module_references")
+        if not isinstance(references, dict):
+            raise RuntimeError(
+                "model initialization did not provide the constructed module "
+                "reference graph"
+            )
+        self._bind_module_references(references)
+        # Preserve the long-standing module-author contract: Pydantic
+        # mode='after' validators observe normalized TensorField values,
+        # including scalar defaults expanded to their declared shapes.
+        self._tensors.initialize_declared()
+        self._tensors.materialize_computed()
+
+    @classmethod
+    def get_module_reference_fields(
+        cls,
+    ) -> Dict[str, ModuleReference]:
+        return ModuleReference.collect(cls)
+
+    @classmethod
+    def required_modules(cls) -> Tuple[str, ...]:
+        """Return sibling modules that must be open with this module."""
+
+        return tuple(
+            descriptor.module_name
+            for descriptor in cls.get_module_reference_fields().values()
+            if not descriptor.optional
+        )
+
+    def _bind_module_references(
+        self,
+        modules: Dict[str, "AbstractModule"],
+    ) -> None:
+        """Resolve the explicitly declared sibling-module capabilities once."""
+
+        if self._module_references is not None:
+            raise RuntimeError(
+                f"module {self.module_name!r} references are already linked"
+            )
+        references: Dict[str, Optional[AbstractModule]] = {}
+        for name, descriptor in self.get_module_reference_fields().items():
+            target = modules.get(descriptor.module_name)
+            if target is None and not descriptor.optional:
+                raise RuntimeError(
+                    f"Required module reference {self.module_name}.{name} "
+                    f"targets closed module {descriptor.module_name!r}"
+                )
+            if target is not None and not isinstance(target, descriptor.module_type):
+                raise TypeError(
+                    f"Module reference {self.module_name}.{name} requires "
+                    f"{descriptor.module_type.__name__}, got "
+                    f"{type(target).__name__}"
+                )
+            references[name] = target
+        self._module_references = references
+
+    def validate_linked_state(self) -> None:
+        """Validate cross-module invariants after computed tensors are stable."""
 
     @classmethod
     def get_reference_index_fields(cls) -> Dict[str, _ReferenceIndexDescriptor]:
@@ -664,8 +829,8 @@ class AbstractModule(BaseModel, ABC):
             value = getattr(self, attr_name, None)
             if isinstance(value, torch.Tensor):
                 candidates.append(value)
-            for dependency in self.dependencies:
-                owner = getattr(self, dependency, None)
+            for reference in self.get_module_reference_fields():
+                owner = getattr(self, reference)
                 value = getattr(owner, attr_name, None) if owner is not None else None
                 if isinstance(value, torch.Tensor):
                     candidates.append(value)
@@ -732,9 +897,6 @@ class AbstractModule(BaseModel, ABC):
         )
         return inverse
 
-    def get_expected_shape(self, field_name: str) -> Optional[Tuple[int, ...]]:
-        return self._tensors.expected_shape(field_name)
-
     def get_expected_dtype(self, field_name: str) -> torch.dtype:
         return self._tensors.expected_dtype(field_name)
 
@@ -744,14 +906,6 @@ class AbstractModule(BaseModel, ABC):
         if self.module_name not in v:
             raise ValueError(
                 f"Current module '{self.module_name}' must be included in opened_modules. "
-                f"Available modules: {v}"
-            )
-
-        missing_deps = [dep for dep in self.dependencies if dep not in v]
-        if missing_deps:
-            raise ValueError(
-                f"Module '{self.module_name}' has missing dependencies in opened_modules: {missing_deps}. "
-                f"Required dependencies: {self.dependencies}. "
                 f"Available modules: {v}"
             )
 

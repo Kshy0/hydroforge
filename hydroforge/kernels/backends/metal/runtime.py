@@ -273,10 +273,3 @@ def record_metal_commands(sequence: MetalCommandSequence):
 def recording_metal_sequence() -> MetalCommandSequence | None:
     """Return the sequence active in this Python context, if any."""
     return _recording_sequence.get()
-
-
-def mark_metal_barrier() -> None:
-    """Mark a model-declared dependency boundary while recording an ICB."""
-    sequence = _recording_sequence.get()
-    if sequence is not None:
-        sequence.mark_barrier()

@@ -54,14 +54,6 @@ def _c_ident(name: str) -> str:
     return ident
 
 
-def _dtype_info(tensor: torch.Tensor, *, floating: bool) -> Tuple[str, str]:
-    table = _FLOAT_DTYPES if floating else _INT_DTYPES
-    if tensor.dtype not in table:
-        kind = "floating" if floating else "integer"
-        raise TypeError(f"unsupported {kind} dtype {tensor.dtype}")
-    return table[tensor.dtype]
-
-
 class CudaStatisticsEmitter(StatisticsEmitter):
     """CUDA C++ extension code generation for statistics aggregation.
 

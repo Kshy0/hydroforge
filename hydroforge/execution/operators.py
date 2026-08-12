@@ -165,7 +165,6 @@ class CollectiveOperator:
     operation: str
     reduction: str
     destination: int | None
-    signature: tuple[int, int, int]
     reads: tuple[torch.Tensor, ...]
     writes: tuple[torch.Tensor, ...]
     cuda_graph_capture_safe: bool = False
@@ -519,7 +518,6 @@ class _OperatorRecorder:
     def record_collective(
         self, tensor: torch.Tensor, reduction: str, *,
         operation: str = "all_reduce", destination: int | None = None,
-        signature: tuple[int, int, int],
     ) -> None:
         """Record one communication operation at its physical sequence point."""
 
@@ -530,8 +528,7 @@ class _OperatorRecorder:
             )
         self.operators.append(CollectiveOperator(
             tensor=tensor, operation=operation, reduction=reduction,
-            destination=destination, signature=signature,
-            reads=(tensor,), writes=(tensor,),
+            destination=destination, reads=(tensor,), writes=(tensor,),
         ))
 
     def record_predicate_loop(self, program: Any) -> None:
@@ -664,21 +661,6 @@ class _TorchOperatorMode(TorchDispatchMode):
             tuple(dict.fromkeys((*writes, *output_writes))),
         ))
         return result
-
-
-def record_operator_program(
-    model: Any,
-    body,
-    arguments: tuple[Any, ...],
-    *,
-    stable_tensors: tuple[torch.Tensor, ...] = (),
-) -> OperatorProgram:
-    """Trace one explicit substep, restoring every mutated model tensor."""
-    with record_operator_scope(
-        model, arguments=arguments, stable_tensors=stable_tensors,
-    ) as recording:
-        body(*arguments)
-    return recording.program
 
 
 class OperatorRecording:

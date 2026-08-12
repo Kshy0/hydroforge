@@ -17,7 +17,9 @@ from netCDF4 import Dataset
 
 from hydroforge.data.netcdf import read_netcdf_var_sliced
 from hydroforge.serialization.netcdf import (
-    atomic_netcdf_dataset, normalize_netcdf_variable_options,
+    LOGICAL_DTYPE_ATTR, atomic_netcdf_dataset, decode_netcdf_logical_array,
+    netcdf_dtype_encoding,
+    normalize_netcdf_variable_options,
 )
 
 
@@ -59,6 +61,8 @@ class InputProxy:
             v = read_netcdf_var_sliced(var)
         else:
             v = read_netcdf_var_sliced(var, indices)
+
+        v = decode_netcdf_logical_array(var, v, name=var_name)
 
         if ma.isMaskedArray(v):
             # Fill masked values conservatively
@@ -446,13 +450,8 @@ class InputProxy:
                 else:
                     arr = np.asarray(data)
 
-                # Handle bool
-                if arr.dtype == np.bool_:
-                    vtype = "u1"
-                    arr_to_write = arr.astype("u1")
-                else:
-                    vtype = arr.dtype
-                    arr_to_write = arr
+                vtype, logical_dtype = netcdf_dtype_encoding(arr.dtype)
+                arr_to_write = arr.astype(vtype, copy=False)
 
                 # Define dimensions
                 if arr.ndim == 0:
@@ -466,6 +465,8 @@ class InputProxy:
 
                 # Create variable
                 var = ds.createVariable(name, vtype, dims, **create_options)
+                if logical_dtype is not None:
+                    var.setncattr(LOGICAL_DTYPE_ATTR, logical_dtype)
                 var[:] = arr_to_write
 
             # Write variables
@@ -584,7 +585,13 @@ class InputProxy:
                         )
                     for var_name, var_in in rank_ds.variables.items():
                         is_distributed = var_name in variable_group_mapping
-                        data = np.asarray(var_in[:])
+                        raw_data = var_in[:]
+                        data = np.asarray(decode_netcdf_logical_array(
+                            var_in, raw_data, name=var_name,
+                        ))
+                        storage_dtype, logical_dtype = netcdf_dtype_encoding(
+                            data.dtype,
+                        )
 
                         # Define/create dims and variable in merged file
                         if var_name not in merged_ds.variables:
@@ -605,21 +612,26 @@ class InputProxy:
                                             merged_ds.createDimension(dname, sz)
                                     dims.append(dname)
 
-                            # Dtype handling
-                            if data.dtype == np.bool_:
-                                vtype = "u1"
-                            else:
-                                vtype = data.dtype
-
                             merged_var = merged_ds.createVariable(
-                                var_name, vtype, tuple(dims), **create_options
+                                var_name, storage_dtype, tuple(dims),
+                                **create_options,
                             )
+                            if logical_dtype is not None:
+                                merged_var.setncattr(
+                                    LOGICAL_DTYPE_ATTR, logical_dtype,
+                                )
                         else:
                             merged_var = merged_ds.variables[var_name]
-                            storage_dtype = (
-                                np.dtype("uint8")
-                                if data.dtype == np.bool_ else data.dtype
+                            merged_logical_dtype = getattr(
+                                merged_var, LOGICAL_DTYPE_ATTR, None,
                             )
+                            if logical_dtype != merged_logical_dtype:
+                                raise TypeError(
+                                    f"Rank checkpoint variable {var_name!r} "
+                                    "changes logical dtype from "
+                                    f"{merged_logical_dtype!r} to "
+                                    f"{logical_dtype!r}"
+                                )
                             if storage_dtype != merged_var.dtype:
                                 raise TypeError(
                                     f"Rank checkpoint variable {var_name!r} changes "
@@ -638,24 +650,23 @@ class InputProxy:
                         if data.ndim == 0:
                             # Only copy from rank 0 for non-distributed scalars
                             if r == 0:
-                                if data.dtype == np.bool_:
-                                    merged_var.assignValue(data.astype("u1"))
-                                else:
-                                    merged_var.assignValue(data)
+                                merged_var.assignValue(
+                                    data.astype(storage_dtype, copy=False),
+                                )
                         else:
                             if is_distributed:
                                 off = offsets.get(var_name, 0)
                                 n = data.shape[0]
-                                if data.dtype == np.bool_:
-                                    data = data.astype("u1")
-                                merged_var[off : off + n, ...] = data
+                                merged_var[off : off + n, ...] = data.astype(
+                                    storage_dtype, copy=False,
+                                )
                                 offsets[var_name] = off + n
                             else:
                                 # Only copy non-distributed arrays from rank 0
                                 if r == 0:
-                                    if data.dtype == np.bool_:
-                                        data = data.astype("u1")
-                                    merged_var[:] = data
+                                    merged_var[:] = data.astype(
+                                        storage_dtype, copy=False,
+                                    )
             for coordinate, parts in coordinate_parts.items():
                 combined = np.concatenate(parts)
                 if np.unique(combined).size != combined.size:
@@ -663,38 +674,6 @@ class InputProxy:
                         f"Distributed checkpoint coordinate {coordinate!r} "
                         "contains duplicate IDs across rank files"
                     )
-
-    def set_variable(self, name: str, value: Any, indices: Optional[Any] = None) -> None:
-        """
-        Set or update a variable.
-
-        Args:
-            name: Name of the variable.
-            value: New value.
-            indices: Optional indices to update specific elements.
-                     If None, replaces the entire variable.
-        """
-        if indices is not None:
-            # If lazy and not in memory yet, try to load it first so we can update it
-            if name not in self.data and self.lazy and name in self.visible_vars:
-                self.data[name] = self._load_var(name)
-
-            if name not in self.data:
-                raise KeyError(f"Variable '{name}' not found in InputProxy, cannot update indices.")
-
-            target = self.data[name]
-
-            # Ensure target is mutable (numpy array or torch tensor)
-            if not isinstance(target, (np.ndarray, torch.Tensor)):
-                 raise TypeError(f"Variable '{name}' is of type {type(target)}, which does not support indexed assignment.")
-
-            target[indices] = value
-        else:
-            is_existing = name in self.data or name in self.visible_vars
-            self.data[name] = value
-            self.visible_vars.add(name)
-            if not is_existing:
-                self.injected_vars.add(name)
 
     def get(self, key: str, default: Any = None) -> Any:
         try:

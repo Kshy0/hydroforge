@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from hydroforge.contracts.naming import RESERVED_CONTROL_STATE
+from hydroforge.contracts.temporal import DateLike
 from hydroforge.kernels.backends.metal.protocol import MetalCommandNode
+
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
+    from hydroforge.statistics.runtime import StatisticsRuntime
 
 
 class _MetalStatisticsOperator(MetalCommandNode):
@@ -31,7 +36,7 @@ class _MetalStatisticsOperator(MetalCommandNode):
     def record(self) -> None:
         aggregator = self.observer.aggregator
         aggregator._aggregator_function(
-            aggregator._kernel_states, self.observer.model.BLOCK_SIZE,
+            aggregator._kernel_states, aggregator.block_size,
         )
 
 
@@ -40,23 +45,23 @@ class StatisticsObserver:
 
     _FOLD_INNER_OPS = frozenset({"last", "mean", "sum", "max", "min", "first"})
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: AbstractModel) -> None:
         self.model = model
-        self.aggregator: Any = None
+        self.aggregator: StatisticsRuntime | None = None
         self._fold_policy_cache: tuple[bool, bool] | None = None
 
-    def attach(self, aggregator: Any) -> None:
+    def attach(self, aggregator: StatisticsRuntime) -> None:
         self.aggregator = aggregator
         self._fold_policy_cache = None
 
-    def detach(self, aggregator: Any) -> None:
+    def detach(self, aggregator: StatisticsRuntime) -> None:
         """Release the current aggregator without accepting stale owners."""
         if self.aggregator is not aggregator:
             raise RuntimeError("cannot detach an aggregator not owned by this execution")
         self.aggregator = None
         self._fold_policy_cache = None
 
-    def invalidate(self, aggregator: Any) -> None:
+    def invalidate(self, aggregator: StatisticsRuntime) -> None:
         """Forget policies compiled from one live aggregator program."""
         if self.aggregator is not aggregator:
             raise RuntimeError(
@@ -82,17 +87,21 @@ class StatisticsObserver:
                 sub_step, num_sub_steps, flags, weight, total_weight,
             )
 
-    def finish(self, current_time: Any) -> None:
+    def finish(self, current_time: DateLike) -> None:
         aggregator = self.aggregator
         if aggregator is not None:
             aggregator.finalize_time_step(current_time)
 
-    def check_background_failures(self, current_time: Any) -> None:
+    def check_background_failures(
+        self, current_time: DateLike,
+    ) -> None:
         aggregator = self.aggregator
         if aggregator is not None:
             aggregator.check_background_failures(current_time)
 
-    def ensure_output_durable(self, current_time: Any) -> None:
+    def ensure_output_durable(
+        self, current_time: DateLike,
+    ) -> None:
         aggregator = self.aggregator
         if aggregator is not None:
             aggregator.ensure_output_durable(current_time)
@@ -153,7 +162,7 @@ class StatisticsObserver:
             num_sub_steps=states["__num_sub_steps"],
             stream_ptr=stream_ptr,
         )
-        aggregator._aggregator_function(states, self.model.BLOCK_SIZE)
+        aggregator._aggregator_function(states, aggregator.block_size)
 
     def prelaunch(self, flags: int, total_weight: float) -> None:
         aggregator = self.aggregator

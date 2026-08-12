@@ -36,6 +36,7 @@ class NetCDFDataset(GriddedDataset):
         base_dir: str,
         start_date: Union[datetime, cftime.datetime],
         end_date: Union[datetime, cftime.datetime],
+        model_step: timedelta,
         var_name: str,
         prefix: str,
         time_interval: timedelta = timedelta(days=1),
@@ -62,6 +63,7 @@ class NetCDFDataset(GriddedDataset):
         # Build time metadata and per-chunk minimal-IO plans up-front (cheap).
         super().__init__(
             time_interval=time_interval,
+            model_step=model_step,
             start_date=start_date,
             end_date=end_date,
             chunk_len=chunk_len,
@@ -78,26 +80,6 @@ class NetCDFDataset(GriddedDataset):
             time_to_key=self.time_to_key,
             time_aggregation=self.time_aggregation,
         )
-        self._file_times = self._timeline.file_times
-        self._global_times = self._timeline.global_times
-        self._dt_to_loc = self._timeline.dt_to_loc
-        self.source_time_interval = self._timeline.source_time_interval
-        self._aggregation_factor = self._timeline.aggregation_factor
-        self._plan = self._timeline.plan
-        self._spin_up_chunks_template = self._timeline.spin_up_chunks_template
-        self._aggregation_plan_enabled = self.time_aggregation is not None
-
-    def _ops_from_times(self, times):
-        return self._timeline.ops_from_times(times)
-
-    def _build_plan_entry(self, times):
-        return self._timeline.build_entry(times)
-
-    def is_valid_time_index(self, idx: int) -> bool:
-        """
-        Checks if the given time index corresponds to a valid data step (not padding).
-        """
-        return self._timeline.is_valid_time_index(idx)
 
     # -------------------------
     # Variable shape helpers
@@ -272,11 +254,11 @@ class NetCDFDataset(GriddedDataset):
 
     def _get_first_frame_nan_mask(self) -> Optional[np.ndarray]:
         """Read the first planned source frame and return a flat NaN/mask bitmap."""
-        if not self._plan:
+        if not self._timeline.plan:
             return None
 
         first_op = None
-        for entry in self._plan:
+        for entry in self._timeline.plan:
             for key, abs_indices in entry[1]:
                 if abs_indices:
                     first_op = (key, int(abs_indices[0]))
@@ -313,14 +295,9 @@ class NetCDFDataset(GriddedDataset):
     def _finish_read(self, data: np.ndarray) -> Union[np.ndarray, Dict[str, np.ndarray]]:
         if self.time_aggregation is None:
             return data / self.unit_factor
-        if not self._aggregation_plan_enabled:
-            raise ValueError(
-                "NetCDFDataset must be initialized with time_aggregation before "
-                "time-aggregated chunks can be read."
-            )
         data = self._apply_time_aggregation(
             data,
-            self.source_time_interval,
+            self._timeline.source_time_interval,
             self.time_aggregation,
         )
         if isinstance(data, dict):
@@ -331,10 +308,11 @@ class NetCDFDataset(GriddedDataset):
         """
         Reads the chunk at the specified index using the pre-computed plan.
         """
-        if idx < 0 or idx >= len(self._plan):
-            raise IndexError(f"Chunk index {idx} out of range (0-{len(self._plan)-1})")
+        plan = self._timeline.plan
+        if idx < 0 or idx >= len(plan):
+            raise IndexError(f"Chunk index {idx} out of range (0-{len(plan)-1})")
 
-        entry = self._plan[idx]
+        entry = plan[idx]
         ops = entry[1]
         data = self._read_ops(ops)
         return self._finish_read(data)
@@ -350,7 +328,7 @@ class NetCDFDataset(GriddedDataset):
         - If _local_indices is None: (T, Y, X) full grid array
         """
         times = self._timeline.contiguous_times(current_time, chunk_len)
-        entry = self._build_plan_entry(times)
+        entry = self._timeline.build_entry(times)
         ops = entry[1]
         data = self._read_ops(ops)
         return self._finish_read(data)
@@ -376,6 +354,7 @@ def open_multivariable_netcdf(
     *,
     start_date: Union[datetime, cftime.datetime],
     end_date: Union[datetime, cftime.datetime],
+    model_step: timedelta,
     time_interval: timedelta = timedelta(days=1),
     chunk_len: int = 24,
     unit_factor: float = 1.0,
@@ -392,6 +371,7 @@ def open_multivariable_netcdf(
     shared = {
         "base_dir": base_dir, "start_date": start_date,
         "end_date": end_date, "time_interval": time_interval,
+        "model_step": model_step,
         "chunk_len": chunk_len, "unit_factor": unit_factor,
         "suffix": suffix, "clip_negative": clip_negative,
         "time_to_key": time_to_key, "spin_up_cycles": spin_up_cycles,
@@ -406,4 +386,4 @@ def open_multivariable_netcdf(
         datasets[name] = NetCDFDataset(**options)
     from hydroforge.data.datasets.multivariable import MultiVariableDataset
 
-    return MultiVariableDataset(datasets, loader_strategy="parallel")
+    return MultiVariableDataset(datasets)

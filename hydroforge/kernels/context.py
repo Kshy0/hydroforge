@@ -5,7 +5,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
-import inspect
 from typing import Any
 
 
@@ -87,18 +86,6 @@ def compiled_operator_entry(function):
         )
     function.__hydroforge_compiled_operator__ = True
     return function
-
-
-def is_compiled_operator_entry(value: Any) -> bool:
-    """Return only the explicit nominal marker; names carry no meaning."""
-
-    try:
-        marker = inspect.getattr_static(
-            value, "__hydroforge_compiled_operator__",
-        )
-    except AttributeError:
-        return False
-    return marker is True
 
 
 def reject_direct_kernel_launch(name: str) -> None:

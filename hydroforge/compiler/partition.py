@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -14,6 +14,9 @@ from hydroforge.data.distributed import find_indices_in, find_indices_in_torch
 from hydroforge.contracts.fields import (
     PartitionSchema, RuntimeTensorMetadata, tensor_is_active,
 )
+
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
 
 
 @dataclass(frozen=True)
@@ -63,7 +66,7 @@ def compute_group_to_rank(
 class PartitionCompiler:
     """Own the immutable partition graph and every derived rank-local index."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: AbstractModel) -> None:
         self.model = model
         self._schema: PartitionSchema | None = None
         self._variable_groups: MappingProxyType | None = None

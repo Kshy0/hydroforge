@@ -221,12 +221,6 @@ def _activate_system_compiler(
     return old
 
 
-def _configure_system_compiler(mode: str = "never") -> Dict[str, Optional[str]]:
-    """Temporarily activate one explicit, prevalidated compiler choice."""
-
-    return _activate_system_compiler(_resolve_system_compiler(mode))
-
-
 def _restore_compiler_env(old: Dict[str, Optional[str]]) -> None:
     for key, val in old.items():
         if val is None:
@@ -426,22 +420,6 @@ def _remove_abandoned_compile_lock_unlocked(
             file=sys.stderr,
         )
     return True
-
-
-def _maybe_remove_abandoned_compile_lock(
-    lock_path: Path,
-    *,
-    stale_after: float,
-    env_prefix: str,
-    verbose: bool,
-) -> bool:
-    with _compile_lock_guard(lock_path):
-        return _remove_abandoned_compile_lock_unlocked(
-            lock_path,
-            stale_after=stale_after,
-            env_prefix=env_prefix,
-            verbose=verbose,
-        )
 
 
 def _acquire_compile_lock(

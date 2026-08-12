@@ -27,9 +27,16 @@ _DTYPE_CODES = {
         torch.float16, torch.float32, torch.float64, torch.bfloat16,
     ), start=1)
 }
-_DEVICE_CODES = {"cpu": 1, "cuda": 2, "mps": 3}
+# MPS has an ABI code so a Metal recorder can reject collectives with its
+# backend-specific compile error before any process group exists. Eager
+# communication remains limited to CPU/CUDA below.
+_ABI_DEVICE_CODES = {"cpu": 1, "cuda": 2, "mps": 3}
 _COLLECTIVE_DEVICES = frozenset({"cpu", "cuda"})
-_REDUCTION_CODES = {"min": 0, "max": 1, "sum": 2}
+_REDUCTIONS = {
+    "min": (0, dist.ReduceOp.MIN),
+    "max": (1, dist.ReduceOp.MAX),
+    "sum": (2, dist.ReduceOp.SUM),
+}
 
 # 63-bit FNV-1a parameters: the folded batch signature travels in one int64
 # slot of the managed-step vector, so it must stay non-negative.
@@ -38,13 +45,9 @@ _FNV_PRIME = 0x100000001B3
 _SIGNATURE_MASK = (1 << 63) - 1
 
 
-def _reduce_op(reduction: Reduction):
+def _reduction_spec(reduction: Reduction):
     try:
-        return {
-            "min": dist.ReduceOp.MIN,
-            "max": dist.ReduceOp.MAX,
-            "sum": dist.ReduceOp.SUM,
-        }[reduction]
+        return _REDUCTIONS[reduction]
     except KeyError as error:
         raise ValueError("reduction must be 'min', 'max', or 'sum'") from error
 
@@ -74,7 +77,7 @@ def _tensor_abi(
             f"{operation} does not support tensor dtype {tensor.dtype}"
         ) from error
     try:
-        device_code = _DEVICE_CODES[tensor.device.type]
+        device_code = _ABI_DEVICE_CODES[tensor.device.type]
     except KeyError as error:
         raise ValueError(
             f"{operation} does not support device {tensor.device.type!r}"
@@ -95,7 +98,7 @@ def _batch_signature(
 
     digest = _FNV_OFFSET
     for value in (
-        _REDUCTION_CODES[reduction],
+        _reduction_spec(reduction)[0],
         -1 if destination is None else destination,
         *(field for abi in abis for field in abi),
     ):
@@ -104,17 +107,20 @@ def _batch_signature(
 
 
 def _validate_collective_runtime(
-    tensor: torch.Tensor, *, operation: str, destination: int | None = None,
+    tensor: torch.Tensor | None, *, operation: str,
+    destination: int | None = None,
 ) -> None:
-    """Validate process-group state only when communication will execute."""
+    """Validate batch-invariant process-group state exactly once."""
 
     _require_distributed(operation)
+    if destination is not None and destination >= dist.get_world_size():
+        raise ValueError(f"{operation} destination is outside the process group")
+    if tensor is None:
+        return
     if tensor.device.type not in _COLLECTIVE_DEVICES:
         raise ValueError(
             f"{operation} does not support device {tensor.device.type!r}"
         )
-    if destination is not None and destination >= dist.get_world_size():
-        raise ValueError(f"{operation} destination is outside the process group")
     backend = str(dist.get_backend()).lower()
     if "nccl" in backend and tensor.device.type != "cuda":
         raise ValueError(f"{operation} with NCCL requires a CUDA tensor")
@@ -123,7 +129,7 @@ def _validate_collective_runtime(
 def _event_kind(
     operation: str, reduction: Reduction, destination: int | None = None,
 ) -> int:
-    reduction_code = _REDUCTION_CODES[reduction]
+    reduction_code = _reduction_spec(reduction)[0]
     if operation == "all_reduce":
         return 10 + reduction_code
     if operation == "reduce" and destination is not None:
@@ -170,8 +176,7 @@ def _run_batch(
 ) -> None:
     """Record, or synchronize once and launch the whole batch."""
 
-    if reduction not in _REDUCTION_CODES:
-        raise ValueError("reduction must be 'min', 'max', or 'sum'")
+    _code, op = _reduction_spec(reduction)
     if destination is not None and (
         type(destination) is not int or destination < 0
     ):
@@ -193,19 +198,20 @@ def _run_batch(
             raise ValueError(
                 f"{operation} destination is outside the process group"
             )
-        for tensor, abi in zip(batch, abis):
+        for tensor in batch:
             recorder.record_collective(
                 tensor, reduction, operation=operation,
-                destination=destination, signature=abi,
+                destination=destination,
             )
         return
 
     from hydroforge.execution.step import synchronize_collective
 
-    for tensor in batch:
-        _validate_collective_runtime(
-            tensor, operation=operation, destination=destination,
-        )
+    _validate_collective_runtime(
+        batch[0] if batch else None,
+        operation=operation,
+        destination=destination,
+    )
     # The handshake runs even for an empty batch: a rank that contributes no
     # tensors must still be seen to disagree with one that does.
     synchronize_collective(
@@ -214,7 +220,6 @@ def _run_batch(
     )
     if not batch:
         return
-    op = _reduce_op(reduction)
     with _coalescing_group(batch[0].device):
         for tensor in batch:
             if destination is None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 import torch
 
@@ -10,11 +10,16 @@ from hydroforge.contracts import ResourceCleanupError
 from hydroforge.contracts.naming import RESERVED_CONTROL_STATE
 from hydroforge.kernels.mutation import trace_mutations
 
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
+
 
 class CaptureRuntime:
     """Own every CUDA Graph and Metal ICB created for one model instance."""
 
-    def __init__(self, model: Any, *, warmup_iterations: int = 3) -> None:
+    def __init__(
+        self, model: AbstractModel, *, warmup_iterations: int = 3,
+    ) -> None:
         if type(warmup_iterations) is not int or warmup_iterations < 0:
             raise ValueError(
                 "capture warmup_iterations must be an exact non-negative int"

@@ -549,6 +549,8 @@ class CudaDispatcher:
         self._validate_block_size(values)
         self.spec.validate_host_arguments(values)
         self.projection.validate(values, kernel=self.spec.name)
+        if self.spec.launch_extent(values) == 0:
+            return None
         if self.tensor_vector is not None:
             values[self.tensor_vector.target] = self.tensor_vector.resolve(values)
         record_kernel_writes(self.__hydroforge_kernel__, values)
@@ -587,6 +589,16 @@ class CudaDispatcher:
             raise TypeError(f"missing CUDA kernel arguments: {sorted(missing)}")
         if self.tensor_vector is not None:
             values[self.tensor_vector.target] = self.tensor_vector.resolve(values)
+        size_key = self.spec.size_key
+        size_keys = (size_key,) if isinstance(size_key, str) else size_key
+        static_extent = None
+        if not set(size_keys).intersection(dynamic):
+            static_extent = self.spec.launch_extent(values)
+            if static_extent == 0:
+                def no_op(**_values: Any) -> None:
+                    return None
+
+                return no_op
         launcher = self._launcher
         dynamic_launch = tuple(name for name in self.launch_args if name in dynamic)
         static_launch = {name: values[name] for name in self.launch_args if name not in dynamic_launch}
@@ -596,4 +608,18 @@ class CudaDispatcher:
         )
         namespace = {"_launcher": launcher, "_static": static_launch}
         exec(f"def launch(**_values): return _launcher({args})", namespace)  # noqa: S102
-        return namespace["launch"]
+        invoke = namespace["launch"]
+        if static_extent is not None:
+            return invoke
+
+        static_sizes = {name: values[name] for name in size_keys if name not in dynamic}
+
+        def launch(**_values: Any):
+            extent_values = static_sizes | {
+                name: _values[name] for name in size_keys if name in dynamic
+            }
+            if self.spec.launch_extent(extent_values) == 0:
+                return None
+            return invoke(**_values)
+
+        return launch

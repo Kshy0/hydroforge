@@ -3,13 +3,53 @@
 from __future__ import annotations
 
 import logging
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import netCDF4 as nc
 import numpy as np
 
+from hydroforge.serialization.netcdf import (
+    BOOL_LOGICAL_DTYPE, decode_netcdf_logical_array,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _validated_grid_fill_value(value: Any, dtype: np.dtype) -> Any:
+    """Return one scalar fill value without bool/integer reinterpretation."""
+
+    if dtype.kind == "b":
+        if type(value) is bool or isinstance(value, np.bool_):
+            return bool(value)
+        raise TypeError(
+            "boolean reader fill_value must be an exact bool; pass False "
+            "explicitly for unrepresented grid cells"
+        )
+    if dtype.kind not in "iu":
+        return value
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError("integer reader fill_value must not be boolean")
+    if isinstance(value, Integral):
+        integer = int(value)
+    elif isinstance(value, Real):
+        if not np.isfinite(value) or float(value) != np.trunc(value):
+            raise ValueError(
+                f"fill_value {value!r} is not an exact finite integer"
+            )
+        integer = int(value)
+    else:
+        raise TypeError(
+            "integer reader fill_value must be a real scalar"
+        )
+    limits = np.iinfo(dtype)
+    if integer < limits.min or integer > limits.max:
+        raise OverflowError(
+            f"fill_value {integer} is outside dtype {dtype} range "
+            f"[{limits.min}, {limits.max}]"
+        )
+    return dtype.type(integer)
 
 
 class MultiRankDataAccess:
@@ -22,7 +62,10 @@ class MultiRankDataAccess:
             if result.kind not in "biufc":
                 raise TypeError("reader dtype must be numeric or boolean")
             return result
-        return np.dtype(self.owner._rank_files[0]["dtype"])
+        info = self.owner._rank_files[0]
+        if info["logical_dtype"] == BOOL_LOGICAL_DTYPE:
+            return np.dtype(np.bool_)
+        return np.dtype(info["dtype"])
 
     @staticmethod
     def _array(value: Any, *, source: str) -> np.ndarray:
@@ -94,7 +137,10 @@ class MultiRankDataAccess:
                     if info["has_levels"]:
                         indices.append(level if level is not None else 0)
 
-                    return var[tuple(indices)]
+                    return decode_netcdf_logical_array(
+                        var, var[tuple(indices)],
+                        name=self.owner.var_name,
+                    )
 
         # Should not happen if t_index is valid
         raise IndexError(f"Time index {orig_time} not found in any file.")
@@ -152,8 +198,13 @@ class MultiRankDataAccess:
 
         nx_, ny_ = self.owner._map_shape
         target_dtype = self._result_dtype(dtype)
+        validated_fill = _validated_grid_fill_value(
+            fill_value, target_dtype,
+        )
         try:
-            grid = np.full((nx_, ny_), fill_value, dtype=target_dtype)
+            grid = np.full(
+                (nx_, ny_), validated_fill, dtype=target_dtype,
+            )
         except (OverflowError, TypeError, ValueError) as error:
             raise ValueError(
                 f"fill_value {fill_value!r} cannot be represented by reader "
@@ -256,7 +307,10 @@ class MultiRankDataAccess:
                 slices.append(slice(None))
                 if info["has_levels"]:
                     slices.append(level)
-                block = self._array(var[tuple(slices)], source=fp.name)
+                block = decode_netcdf_logical_array(
+                    var, var[tuple(slices)], name=self.owner.var_name,
+                )
+                block = self._array(block, source=fp.name)
                 selected = block[:, local_idx]
                 o0 = out_start + (t0 - local_start)
                 o1 = o0 + (t1 - t0)

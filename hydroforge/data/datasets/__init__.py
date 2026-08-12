@@ -4,7 +4,8 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-from hydroforge.data.datasets.base import AbstractDataset, DatasetStep
+from hydroforge.data.datasets.base import AbstractDataset
+from hydroforge.data.datasets.chunking import SourceChunk, SourceChunkPlan
 from hydroforge.data.datasets.gridded import GriddedDataset
 from hydroforge.data.datasets.multivariable import MultiVariableDataset
 from hydroforge.data.datasets.expression import DatasetExpression
@@ -19,7 +20,8 @@ from hydroforge.data.datasets.netcdf import (
 
 __all__ = [
     "AbstractDataset",
-    "DatasetStep",
+    "SourceChunk",
+    "SourceChunkPlan",
     "GriddedDataset",
     "MultiVariableDataset",
     "DatasetExpression",
