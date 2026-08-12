@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from functools import wraps
 import inspect
-from typing import Any
+from typing import Any, Callable, TypeVar, cast
 
 
-def between_steps(function):
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def between_steps(function: _F) -> _F:
     """Declare an API valid only at a healthy between-step boundary."""
 
     if getattr(function, "__hydroforge_managed_step__", None) is not None:
@@ -19,7 +22,7 @@ def between_steps(function):
         return function(self, *args, **kwargs)
 
     guarded.__hydroforge_between_steps__ = True
-    return guarded
+    return cast(_F, guarded)
 
 
 def is_between_steps_api(value: Any) -> bool:

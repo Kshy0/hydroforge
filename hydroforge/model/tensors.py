@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from numbers import Integral
-from typing import Any
+from typing import Any, get_args
 
 import torch
 
 from hydroforge.contracts.fields import (
     cast_declared_tensor, concrete_tensor_dtype, tensor_is_active,
 )
-
 
 class ModuleTensors:
     """Materialize and validate a module's declared tensor schema once."""
@@ -19,11 +18,31 @@ class ModuleTensors:
         self.module = module
         self.expanded_parameters: set[str] = set()
 
-    def initialize(self) -> None:
+    def initialize_declared(self) -> None:
+        """Normalize only supplied/default fields during module construction."""
+
         self._deactivate_declared()
         self._normalize_declared()
         self._initialize_optional()
-        self._validate_computed()
+
+    def materialize_computed(self) -> None:
+        """Materialize non-virtual computed tensors after module linking."""
+
+        module = self.module
+        for field in module.tensor_schema():
+            if (
+                not field.computed
+                or field.tensor.category == "virtual"
+                or not module.is_tensor_field_active(field)
+            ):
+                continue
+            self._validate_computed_field(
+                field.name, getattr(module, field.name),
+            )
+        # Derived reference indices are descriptors rather than Pydantic
+        # computed fields, but belong to the same stable cold-start phase.
+        for name in module.get_reference_index_fields():
+            getattr(module, name)
 
     def _deactivate_declared(self) -> None:
         module = self.module
@@ -216,46 +235,56 @@ class ModuleTensors:
                 f"{values[duplicate][:5].tolist()}"
             )
 
-    def _validate_computed(self) -> None:
+    def _validate_computed_field(
+        self, field_name: str, value: Any,
+    ) -> None:
         module = self.module
-        conversions: dict[str, list[str]] = {}
-        for field in module.tensor_schema():
-            if not field.computed or field.tensor.category == "virtual":
-                continue
-            if not module.is_tensor_field_active(field):
-                continue
-            tensor = getattr(module, field.name)
-            if not isinstance(tensor, torch.Tensor):
-                continue
-            if not self._on_device(tensor):
+        field = module.tensor_schema_map().get(field_name)
+        if field is None or not field.computed:
+            raise RuntimeError(
+                f"{module.module_name}.{field_name} is not a computed tensor field"
+            )
+        return_type = type(module).model_computed_fields[field_name].return_type
+        if value is None and type(None) in get_args(return_type):
+            return
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"Computed field {field.name} must be a torch.Tensor, got "
+                f"{type(value).__name__}"
+            )
+        tensor = value
+        if not self._on_device(tensor):
+            raise ValueError(
+                f"Computed field {field.name} must be on device "
+                f"{module.device}, but is on {tensor.device}"
+            )
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+        expected = self.expected_shape(field.name)
+        if expected is not None and tuple(tensor.shape) != expected:
+            if (
+                field.tensor.category == "derived_param"
+                and module.num_trials is not None
+                and tuple(tensor.shape) == (module.num_trials, *expected)
+            ):
+                self.expanded_parameters.add(field.name)
+            else:
                 raise ValueError(
-                    f"Computed field {field.name} must be on device "
-                    f"{module.device}, but is on {tensor.device}"
+                    f"Computed field {field.name} has shape "
+                    f"{tuple(tensor.shape)}, expected {expected}"
                 )
-            if not tensor.is_contiguous():
-                tensor = tensor.contiguous()
-            expected = self.expected_shape(field.name)
-            if expected is not None and tuple(tensor.shape) != expected:
-                if (
-                    module.num_trials is not None
-                    and tuple(tensor.shape) == (module.num_trials, *expected)
-                ):
-                    self.expanded_parameters.add(field.name)
-                else:
-                    raise ValueError(
-                        f"Computed field {field.name} has shape "
-                        f"{tuple(tensor.shape)}, expected {expected}"
-                    )
-            dtype = self.expected_dtype(field.name)
-            if tensor.dtype != dtype:
-                conversion = f"{tensor.dtype} -> {dtype}"
-                conversions.setdefault(conversion, []).append(field.name)
-                tensor = cast_declared_tensor(
-                    tensor, dtype,
-                    name=f"{module.module_name}.{field.name}",
-                )
-            setattr(module, field.name, tensor)
-        self._emit_conversions("module.computed_dtype_fixed", conversions)
+        dtype = self.expected_dtype(field.name)
+        if tensor.dtype != dtype:
+            conversion = f"{tensor.dtype} -> {dtype}"
+            tensor = cast_declared_tensor(
+                tensor, dtype,
+                name=f"{module.module_name}.{field.name}",
+            )
+            self._emit_conversions(
+                "module.computed_dtype_fixed",
+                {conversion: [field.name]},
+            )
+        setattr(module, field.name, tensor)
 
     def _on_device(self, tensor: torch.Tensor) -> bool:
         expected = self.module.device

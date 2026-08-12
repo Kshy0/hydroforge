@@ -109,11 +109,8 @@ class TorchStatisticsEmitter(StatisticsEmitter):
 
         lines.extend([
             'def _update___full__(states, weight, total_weight, num_macro_steps,',
-            '                     sub_step, num_sub_steps, flags, macro_step_index):',
-            '    is_inner_first = (flags & 1) != 0 and sub_step == 0',
-            '    is_inner_last = ((flags >> 1) & 1) != 0 and sub_step == num_sub_steps - 1',
-            '    is_outer_first = ((flags >> 2) & 1) != 0 and is_inner_last',
-            '    is_outer_last = ((flags >> 3) & 1) != 0 and is_inner_last',
+            '                     is_inner_first, is_inner_last,',
+            '                     is_outer_first, is_outer_last):',
             '',
         ])
 
@@ -298,21 +295,11 @@ class TorchStatisticsEmitter(StatisticsEmitter):
         func_name = f"_update_{self._get_safe_name(output_index)}"
         lines.extend([
             f'def {func_name}(states, weight, total_weight, num_macro_steps,',
-            '               sub_step, num_sub_steps, flags,',
+            '               is_inner_first, is_inner_last,',
+            '               is_outer_first, is_outer_last,',
             '               macro_step_index, num_trials):',
             '    states = {key: value.reshape(-1) for key, value in states.items()}',
         ])
-        needed_bools = self._statistics_lowering.required_flags
-        if needed_bools:
-            lines.append('    # Compute boolean flags from sub_step, num_sub_steps, flags')
-            if 'is_inner_first' in needed_bools:
-                lines.append('    is_inner_first = (flags & 1) != 0 and sub_step == 0')
-            if 'is_inner_last' in needed_bools:
-                lines.append('    is_inner_last = ((flags >> 1) & 1) != 0 and sub_step == num_sub_steps - 1')
-            if 'is_outer_first' in needed_bools:
-                lines.append('    is_outer_first = ((flags >> 2) & 1) != 0 and is_inner_last')
-            if 'is_outer_last' in needed_bools:
-                lines.append('    is_outer_last = ((flags >> 3) & 1) != 0 and is_inner_last')
         lines.extend([
             f'    idx = states["{output_index}"]',
             '    n = len(idx)',
@@ -388,8 +375,11 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                         lines.extend([
                             f'{indent}_isl = {sl}',
                             f'{indent}_inner_old = states["{inner_key}"][_isl].clone()',
-                            f'{indent}if is_inner_first and macro_step_index == 0:',
-                            f'{indent2}_inner_new = {var_val}',
+                            f'{indent}if is_inner_first:',
+                            f'{indent2}_inner_new = torch.where(',
+                            f'{indent2}    macro_step_index == 0, {var_val},',
+                            f'{indent2}    torch.fmax(_inner_old, {var_val}),',
+                            f'{indent2})',
                             f'{indent}else:',
                             f'{indent2}_inner_new = torch.fmax(_inner_old, {var_val})',
                             f'{indent}if is_inner_last:',
@@ -404,8 +394,11 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                         lines.extend([
                             f'{indent}_isl = {sl}',
                             f'{indent}_inner_old = states["{inner_key}"][_isl].clone()',
-                            f'{indent}if is_inner_first and macro_step_index == 0:',
-                            f'{indent2}_inner_new = {var_val}',
+                            f'{indent}if is_inner_first:',
+                            f'{indent2}_inner_new = torch.where(',
+                            f'{indent2}    macro_step_index == 0, {var_val},',
+                            f'{indent2}    torch.fmin(_inner_old, {var_val}),',
+                            f'{indent2})',
                             f'{indent}else:',
                             f'{indent2}_inner_new = torch.fmin(_inner_old, {var_val})',
                             f'{indent}if is_inner_last:',
@@ -507,7 +500,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                                     f'{indent2}    _top_indices[:, 1:] = 0',
                                     f'{indent2}else:',
                                     f'{indent2}    _new_value = _candidate.clone()',
-                                    f'{indent2}    _new_index = macro_step_index.to(dtype=_top_indices.dtype).expand_as(_new_value).clone()',
+                                    f'{indent2}    _new_index = macro_step_index.to(dtype=_top_indices.dtype).expand_as(_new_value)',
                                     f'{indent2}    for _rank in range({k_val}):',
                                     f'{indent2}        _old_value = _top_values[:, _rank].clone()',
                                     f'{indent2}        _old_index = _top_indices[:, _rank].clone()',
@@ -721,17 +714,16 @@ class TorchStatisticsEmitter(StatisticsEmitter):
         if not full_vars:
             lines.append('@torch.compile')
         lines.extend([
-            '# Main update function',
-            'def internal_update_statistics(states, BLOCK_SIZE):',
+            '# Tensor update body. Python phase controls have only a finite',
+            '# set of combinations; data values remain device tensors.',
+            'def _compiled_update_statistics(',
+            '    states, BLOCK_SIZE, is_inner_first, is_inner_last,',
+            '    is_outer_first, is_outer_last,',
+            '):',
             '    weight = states["__weight"]',
             '    total_weight = states["__total_weight"]',
             '    num_macro_steps = states["__num_macro_steps"]',
-            '    # Materialize each host control once; repeated Tensor truth tests',
-            '    # otherwise synchronize a CUDA device in every generated branch.',
-            '    sub_step = int(states["__sub_step"].item())',
-            '    num_sub_steps = int(states["__num_sub_steps"].item())',
-            '    flags = int(states["__flags"].item())',
-            '    macro_step_index = int(states["__macro_step_index"].item())',
+            '    macro_step_index = states["__macro_step_index"]',
             f'    num_trials = {num_trials}',
         ])
 
@@ -795,7 +787,8 @@ class TorchStatisticsEmitter(StatisticsEmitter):
         if full_vars:
             lines.extend([
                 '    _update___full__(states, weight, total_weight, num_macro_steps,',
-                '                     sub_step, num_sub_steps, flags, macro_step_index)',
+                '                     is_inner_first, is_inner_last,',
+                '                     is_outer_first, is_outer_last)',
             ])
 
         for output_index, var_list in grouped_by_output_index.items():
@@ -804,10 +797,28 @@ class TorchStatisticsEmitter(StatisticsEmitter):
             safe_output_index = self._get_safe_name(output_index)
             lines.extend([
                 f'    _update_{safe_output_index}(states, weight, total_weight, num_macro_steps,',
-                '                      sub_step, num_sub_steps, flags,',
+                '                      is_inner_first, is_inner_last,',
+                '                      is_outer_first, is_outer_last,',
                 '                      macro_step_index, num_trials)',
             ])
-        lines.append('')
+        lines.extend([
+            '',
+            '# Host dispatcher. Read each control tensor once, outside',
+            '# torch.compile, so exact step/index values do not create guards.',
+            'def internal_update_statistics(states, BLOCK_SIZE):',
+            '    sub_step = int(states["__sub_step"].item())',
+            '    num_sub_steps = int(states["__num_sub_steps"].item())',
+            '    flags = int(states["__flags"].item())',
+            '    is_inner_first = (flags & 1) != 0 and sub_step == 0',
+            '    is_inner_last = (flags & 2) != 0 and sub_step == num_sub_steps - 1',
+            '    is_outer_first = (flags & 4) != 0 and is_inner_last',
+            '    is_outer_last = (flags & 8) != 0 and is_inner_last',
+            '    _compiled_update_statistics(',
+            '        states, BLOCK_SIZE, is_inner_first, is_inner_last,',
+            '        is_outer_first, is_outer_last,',
+            '    )',
+            '',
+        ])
 
     def _generate_pytorch_aggregator_function(
         self: StatisticsRuntime,

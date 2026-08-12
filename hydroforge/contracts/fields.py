@@ -133,10 +133,6 @@ class TensorMetadata:
     required_by: tuple[str, ...]
     expression: str
 
-    def is_active(self, opened_modules: Iterable[str]) -> bool:
-        """Return whether this field is active for the opened module set."""
-        return tensor_is_active(self, opened_modules)
-
     @classmethod
     def compile(cls, raw: Mapping[str, Any]) -> TensorMetadata:
         def dependencies(key: str) -> tuple[str, ...]:
@@ -242,61 +238,6 @@ class ModuleSchema:
             return self.modules[module_name]
         except KeyError as exc:
             raise KeyError(f"Module {module_name!r} is absent from schema") from exc
-
-    def resolve_field_dimensions(
-        self,
-        dimensions: Mapping[DimensionToken, str],
-        *,
-        include: Callable[[ModuleFieldSchema], bool] | None = None,
-    ) -> dict[str, tuple[str, ...]]:
-        """Resolve and flatten fields, rejecting ambiguous duplicate names."""
-        flattened: dict[str, tuple[str, ...]] = {}
-        for module_name, fields in self.resolve_dimensions(
-            dimensions, include=include,
-        ).items():
-            for name, dims in fields.items():
-                previous = flattened.setdefault(name, dims)
-                if previous != dims:
-                    raise ValueError(
-                        f"Field {name!r} has conflicting dimensions "
-                        f"{previous} and {dims} in module {module_name!r}"
-                    )
-        return flattened
-
-    def validate_shapes(
-        self,
-        values: Mapping[str, Any],
-        dimensions: Mapping[DimensionToken, int],
-        *,
-        include: Callable[[ModuleFieldSchema], bool] | None = None,
-    ) -> None:
-        """Validate present values without requiring every schema field."""
-        for fields in self.modules.values():
-            for field in fields:
-                if field.tensor is None:
-                    continue
-                if field.name not in values:
-                    continue
-                if include is not None and not include(field):
-                    continue
-                try:
-                    expected = tuple(
-                        dimension if isinstance(dimension, int)
-                        else _resolve_dimension(dimensions, dimension)
-                        for dimension in field.shape
-                    )
-                except KeyError as exc:
-                    raise ValueError(
-                        f"{field.module_name}.{field.name} uses unresolved size "
-                        f"{exc.args[0]!r}"
-                    ) from exc
-                actual = tuple(getattr(values[field.name], "shape", ()))
-                if actual != expected:
-                    raise ValueError(
-                        f"{field.module_name}.{field.name} has shape {actual}, "
-                        f"expected {expected}"
-                    )
-
 
 def _field_schema(
     module_name: str,

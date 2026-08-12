@@ -6,10 +6,10 @@
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Dict, Iterator, Literal, Optional, Union
+from collections.abc import Mapping
+from typing import Any, Dict, Iterator, Optional, Union
 
 import cftime
 import numpy as np
@@ -17,66 +17,18 @@ import torch
 
 from hydroforge.data.distributed import is_rank_zero
 from hydroforge.contracts.temporal import (
+    UpsamplingMethod,
     DatasetTemporalContract,
+    SimulationSchedule,
+    SpinupSchedule,
+    canonical_calendar,
     timedelta_microseconds,
     timedelta_quotient,
 )
+from hydroforge.data.datasets.chunking import SourceChunkPlan
 
 
 logger = logging.getLogger(__name__)
-
-
-def validate_forcing_batch(
-    batch: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    name: str = "forcing",
-) -> torch.Tensor:
-    """Validate generated step tensors against one frozen model buffer.
-
-    ``batch`` retains a leading time/batch axis. Every item yielded from it
-    must exactly match the target's shared or trial layout, dtype, and device.
-    Validation belongs here, at forcing generation, so model hot paths can
-    perform only an explicit ``target.copy_(item)``.
-    """
-
-    if not isinstance(batch, torch.Tensor) or not isinstance(target, torch.Tensor):
-        raise TypeError(f"{name} batch and target must both be torch.Tensor")
-    expected = (batch.shape[0], *target.shape)
-    if tuple(batch.shape) != expected:
-        raise ValueError(
-            f"{name} generated step shape {tuple(batch.shape[1:])}, "
-            f"expected {tuple(target.shape)}"
-        )
-    if batch.device != target.device:
-        raise ValueError(
-            f"{name} generated on {batch.device}, expected {target.device}"
-        )
-    if batch.dtype != target.dtype:
-        raise ValueError(
-            f"{name} generated with dtype {batch.dtype}, expected {target.dtype}"
-        )
-    return batch
-
-
-@dataclass(frozen=True, slots=True)
-class DatasetStep:
-    """One forcing item positioned on source and model timelines.
-
-    During spin-up, ``model_time`` follows the physical forcing time and may
-    repeat when the source period is replayed.
-    """
-
-    model_time: Union[datetime, cftime.datetime]
-    source_time: Union[datetime, cftime.datetime]
-    valid: bool
-    phase: Literal["spinup", "main"]
-    spinup_cycle: int | None = None
-
-    @property
-    def is_spin_up(self) -> bool:
-        """Return whether this item belongs to a forcing spin-up cycle."""
-        return self.phase == "spinup"
 
 
 def _close_dataset_tree(root: object, *, scope: str) -> None:
@@ -151,20 +103,44 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         """Physical start of the main source support exposed to drivers."""
         return self.start_date
 
+    @property
+    def main_end_time(self):
+        """Physical inclusive end of the main source support."""
+        return self.end_date
+
+    @property
+    def spin_up_start_time(self):
+        """Physical start of the source interval replayed for spin-up."""
+        return self.spin_up_start_date
+
+    @property
+    def spin_up_end_time(self):
+        """Physical inclusive end of the source interval replayed for spin-up."""
+        return self.spin_up_end_date
+
+    @property
     def temporal_contract(self) -> DatasetTemporalContract:
-        """Describe the main forcing support without choosing model steps."""
-        start = self.main_start_time
-        if start is None or self.time_interval is None:
-            raise ValueError(
-                "dataset start_date and time_interval are required for a "
-                "temporal contract"
-            )
-        return DatasetTemporalContract(
-            calendar=self.calendar,
-            start=start,
-            interval=self.time_interval,
-            count=self.num_main_steps,
-        )
+        """Return the immutable source contract compiled during initialization."""
+
+        return self._temporal_contract
+
+    @property
+    def chunk_plan(self) -> SourceChunkPlan:
+        """Return the immutable real-length source-chunk plan."""
+
+        return self._chunk_plan
+
+    @property
+    def simulation_schedule(self) -> SimulationSchedule:
+        """Return the immutable schedule compiled during initialization."""
+
+        return self._simulation_schedule
+
+    @property
+    def reuse_count(self) -> int:
+        """Return the schedule-owned number of model calls per source row."""
+
+        return self._simulation_schedule.reuse_count
 
     @staticmethod
     def _validate_time_aggregation(method: Optional[str]) -> Optional[str]:
@@ -278,6 +254,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         start_date: Union[datetime, cftime.datetime],
         end_date: Union[datetime, cftime.datetime],
         time_interval: timedelta,
+        model_step: timedelta,
         out_dtype: str = "float32",
         chunk_len: int = 1,
         spin_up_cycles: int = 0,
@@ -285,6 +262,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         spin_up_end_date: Optional[Union[datetime, cftime.datetime]] = None,
         calendar: str = "standard",
         clip_negative: bool = False,
+        upsampling: UpsamplingMethod | None = None,
         *args,
         **kwargs,
     ):
@@ -299,6 +277,15 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             time_interval, label="dataset time_interval",
         ) <= 0:
             raise ValueError("dataset time_interval must be positive")
+        model_step_microseconds = timedelta_microseconds(
+            model_step, label="model_step",
+        )
+        if model_step_microseconds <= 0:
+            raise ValueError("model_step must be positive")
+        if model_step_microseconds > timedelta_microseconds(
+            time_interval, label="dataset time_interval",
+        ):
+            raise ValueError("model_step must not exceed dataset time_interval")
         try:
             normalized_dtype = np.dtype(out_dtype)
         except TypeError as error:
@@ -306,6 +293,11 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         if (spin_up_start_date is None) != (spin_up_end_date is None):
             raise ValueError(
                 "spin_up_start_date and spin_up_end_date must be provided together"
+            )
+        if spin_up_cycles > 0 and spin_up_start_date is None:
+            raise ValueError(
+                "spin_up_start_date and spin_up_end_date are required when "
+                "spin_up_cycles is positive"
             )
 
         self.out_dtype = normalized_dtype.name
@@ -316,7 +308,9 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         self.spin_up_start_date = spin_up_start_date
         self.spin_up_end_date = spin_up_end_date
         self.time_interval = time_interval
-        self.calendar = calendar
+        self.model_step = model_step
+        self.upsampling = upsampling
+        self.calendar = canonical_calendar(calendar)
         self.clip_negative = clip_negative
 
         # Local grid indices for spatial compression (set by build_local_mapping)
@@ -349,9 +343,56 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 duration_label="spin-up endpoint span",
                 interval_label="time_interval",
             )
-        self._spin_up_num_chunks = 0
+        self._compile_temporal_state()
+        if self.reuse_count > 1 and upsampling not in {"repeat", "distribute"}:
+            raise ValueError(
+                "upsampling must be explicitly 'repeat' or 'distribute' "
+                "when model_step is shorter than dataset time_interval"
+            )
+        if self.reuse_count == 1 and upsampling is not None:
+            raise ValueError(
+                "upsampling must be None when model_step equals time_interval"
+            )
+
+    def _compile_temporal_state(self) -> None:
+        """Compile all source counts, chunks and model calls from one contract."""
+
+        start = self.main_start_time
+        end = self.main_end_time
+        count = timedelta_quotient(
+            end - start,
+            self.time_interval,
+            duration_label="main dataset endpoint span",
+            interval_label="time_interval",
+        ) + 1
+        spinup = None
         if self.spin_up_cycles > 0:
-            self._calc_spin_up_params()
+            spinup_start = self.spin_up_start_time
+            spinup_end = self.spin_up_end_time
+            if spinup_start is None or spinup_end is None:
+                raise ValueError(
+                    "spin_up_start_date and spin_up_end_date are required "
+                    "when spin_up_cycles is positive"
+                )
+            spinup = SpinupSchedule(
+                source_start=spinup_start,
+                source_end=spinup_end + self.time_interval,
+                cycles=self.spin_up_cycles,
+            )
+        contract = DatasetTemporalContract(
+            calendar=self.calendar,
+            start=start,
+            interval=self.time_interval,
+            count=count,
+            spinup=spinup,
+        )
+        chunk_plan = SourceChunkPlan(contract, self.chunk_len)
+        schedule = SimulationSchedule.from_contract(
+            contract, step=self.model_step,
+        )
+        self._temporal_contract = contract
+        self._chunk_plan = chunk_plan
+        self._simulation_schedule = schedule
 
     @staticmethod
     def _as_nan_array(data: np.ndarray) -> np.ndarray:
@@ -382,15 +423,26 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             np.maximum(arr, 0, out=arr)
         return arr
 
+    def _apply_upsampling_policy(self, data: Any) -> Any:
+        if self.upsampling != "distribute":
+            return data
+        if isinstance(data, Mapping):
+            return {
+                name: self._apply_upsampling_policy(value)
+                for name, value in data.items()
+            }
+        return data / self.reuse_count
+
     def update_calendar(self, calendar: str):
         """
         Updates the calendar and converts all date attributes to the new calendar.
         """
-        self.calendar = calendar
+        self.calendar = canonical_calendar(calendar)
         self.start_date = self._convert_to_calendar(self.start_date)
         self.end_date = self._convert_to_calendar(self.end_date)
         self.spin_up_start_date = self._convert_to_calendar(self.spin_up_start_date)
         self.spin_up_end_date = self._convert_to_calendar(self.spin_up_end_date)
+        self._compile_temporal_state()
 
     def validate_files_exist(self, file_paths: list[Union[str, Path]]) -> None:
         """
@@ -412,94 +464,44 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         if is_rank_zero() and self.spin_up_cycles > 0:
             logger.info("Spin-up enabled: %d cycles", self.spin_up_cycles)
 
-    def step_iter(self) -> Iterator[DatasetStep]:
-        """Yield source samples with explicit spin-up phase metadata."""
-        items_per_cycle = self._spin_up_num_chunks * self.chunk_len
-        spin_up_items = items_per_cycle * self.spin_up_cycles
+    def forcing_blocks(self, chunk: Any) -> Iterator[tuple[Any, int]]:
+        """Yield each source item once with its exact model-call reuse count."""
 
-        # Iterate exactly as many times as the DataLoader will produce data points
-        # This ensures we handle padding steps at the end of the last chunk correctly
-        total_chunks = len(self)
-        total_items = total_chunks * self.chunk_len
-
-        for idx in range(total_items):
-            try:
-                source_time = self.get_time_by_index(idx)
-                valid = self.is_valid_time_index(idx)
-            except IndexError:
-                # Padding steps (out of bounds)
-                source_time = datetime.min
-                valid = False
-
-            is_spin_up = idx < spin_up_items
-            yield DatasetStep(
-                model_time=source_time,
-                source_time=source_time,
-                valid=valid,
-                phase="spinup" if is_spin_up else "main",
-                spinup_cycle=(
-                    idx // items_per_cycle
-                    if is_spin_up and items_per_cycle else None
-                ),
-            )
-
-    def _calc_spin_up_params(self):
-        if self.spin_up_cycles > 0:
-            if self.time_interval is None:
-                 raise ValueError("time_interval must be provided for spin-up calculation")
-            if self.spin_up_start_date is None or self.spin_up_end_date is None:
-                raise ValueError(
-                    "spin_up_start_date and spin_up_end_date are required "
-                    "when spin_up_cycles is positive"
+        if isinstance(chunk, Mapping):
+            lengths = {name: len(value) for name, value in chunk.items()}
+            if len(set(lengths.values())) != 1:
+                raise ValueError(f"forcing variables have different lengths: {lengths}")
+            length = next(iter(lengths.values()))
+            for index in range(length):
+                yield (
+                    {name: value[index] for name, value in chunk.items()},
+                    self.reuse_count,
                 )
-            # Calculate number of chunks in spin-up period
-            total_duration = self.spin_up_end_date - self.spin_up_start_date
-            total_steps = timedelta_quotient(
-                total_duration,
-                self.time_interval,
-                duration_label="spin-up endpoint span",
-                interval_label="time_interval",
-            ) + 1
-            self._spin_up_num_chunks = (total_steps + self.chunk_len - 1) // self.chunk_len
-        else:
-            self._spin_up_num_chunks = 0
+            return
+        for item in chunk:
+            yield item, self.reuse_count
 
     @property
     def num_spin_up_chunks(self) -> int:
-        if self.spin_up_cycles > 0:
-             return self._spin_up_num_chunks * self.spin_up_cycles
-        return 0
+        return self._chunk_plan.num_spinup_chunks
 
     def read_chunk(self, idx: int) -> np.ndarray:
-        """
-        Default implementation of read_chunk that handles spin-up logic.
-        Requires time_interval to be set.
-        """
-        if self.time_interval is None:
-             raise ValueError("time_interval is required for chunked temporal access")
+        """Read one planned real-length chunk, including spin-up replays."""
 
-        if self.spin_up_cycles > 0:
-             total_spin_up_chunks = self._spin_up_num_chunks * self.spin_up_cycles
+        chunk = self._chunk_plan[idx]
+        return self.get_data(chunk.source_start, chunk.length)
 
-             if idx < total_spin_up_chunks:
-                 # In spin-up
-                 cycle_idx = idx % self._spin_up_num_chunks
-                 # Time relative to spin_up_start_date
-                 steps_offset = cycle_idx * self.chunk_len
-                 current_time = self.spin_up_start_date + self.time_interval * steps_offset
-                 return self.get_data(current_time, self.chunk_len)
+    def source_chunk_length(self, idx: int) -> int:
+        """Return the real source-row count for one storage chunk."""
 
-             # Main simulation
-             idx -= total_spin_up_chunks
+        return self._chunk_plan[idx].length
 
-        # Main simulation time
-        steps_offset = idx * self.chunk_len
+    def source_time_at(
+        self, chunk_index: int, offset: int,
+    ) -> Union[datetime, cftime.datetime]:
+        """Return one logical source timestamp from the shared chunk plan."""
 
-        if self.start_date is None:
-            raise ValueError("start_date is required to read the main simulation")
-
-        current_time = self.start_date + self.time_interval * steps_offset
-        return self.get_data(current_time, self.chunk_len)
+        return self._chunk_plan.source_time(chunk_index, offset)
 
     @abstractmethod
     def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
@@ -524,152 +526,42 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
         Implementation notes:
         - Do not read beyond the available time range; truncate instead.
-        - Do not pad to chunk_len here; AbstractDataset.__getitem__ will pad.
+        - Do not pad to chunk_len.
         - Preserve chronological order for the returned timesteps.
         """
         ...
 
     def get_time_by_index(self, idx: int) -> Union[datetime, cftime.datetime]:
+        """Return a source time on the historical chunk-major flat axis.
+
+        Short-chunk padding positions are rejected instead of being assigned a
+        fabricated timestamp. New code should prefer :meth:`source_time_at`.
         """
-        Returns the datetime corresponding to the given index.
-        Default implementation handles spin-up and linear time stepping.
-        """
-        if self.time_interval is None:
-             raise ValueError("time_interval is required for indexed temporal access")
 
-        if self.spin_up_cycles > 0:
-            if self.spin_up_start_date is None or self.spin_up_end_date is None:
-                 raise ValueError("Spin-up dates must be provided")
-
-            # Calculate items (including padding) in one spin-up cycle
-            chunks_per_cycle = self.num_spin_up_chunks // self.spin_up_cycles
-            items_per_cycle = chunks_per_cycle * self.chunk_len
-
-            total_spin_up_items = items_per_cycle * self.spin_up_cycles
-
-            if idx < total_spin_up_items:
-                # In spin-up
-                # cycle_idx is which repetition of spin-up we are in
-                # idx_in_cycle is the index within that repetition (including padding)
-                idx_in_cycle = idx % items_per_cycle
-
-                return self.spin_up_start_date + self.time_interval * idx_in_cycle
-
-            # Main simulation
-            idx -= total_spin_up_items
-
-        if self.start_date is None:
-             raise AttributeError("Dataset must have 'start_date'")
-
-        return self.start_date + self.time_interval * idx
+        if type(idx) is not int:
+            raise TypeError("dataset time index must be an exact int")
+        if idx < 0:
+            raise IndexError(idx)
+        chunk_index, offset = divmod(idx, self.chunk_len)
+        return self.source_time_at(chunk_index, offset)
 
     def get_index_by_time(self, dt: Union[datetime, cftime.datetime]) -> int:
         """Returns the index in the main simulation timeline for a given datetime."""
-        if self.start_date is None or self.time_interval is None:
-             raise ValueError("start_date and time_interval required")
-
-        offset = dt - self.start_date
+        offset = dt - self._temporal_contract.start
         return timedelta_quotient(
             offset,
-            self.time_interval,
+            self._temporal_contract.interval,
             duration_label="requested time offset",
-            interval_label="time_interval",
+            interval_label="dataset sample interval",
         )
 
     @property
-    def num_main_steps(self) -> int:
-        if self.start_date is None or self.end_date is None or self.time_interval is None:
-            return 0
-        duration = self.end_date - self.start_date
-        return timedelta_quotient(
-            duration,
-            self.time_interval,
-            duration_label="main dataset endpoint span",
-            interval_label="time_interval",
-        ) + 1
+    def num_main_source_steps(self) -> int:
+        return self._temporal_contract.count
 
     @property
-    def num_spin_up_steps(self) -> int:
-        if self.spin_up_cycles <= 0:
-            return 0
-        cycle_duration = self.spin_up_end_date - self.spin_up_start_date
-        steps_per_cycle = timedelta_quotient(
-            cycle_duration,
-            self.time_interval,
-            duration_label="spin-up endpoint span",
-            interval_label="time_interval",
-        ) + 1
-        return steps_per_cycle * self.spin_up_cycles
-
-    @property
-    def total_steps(self) -> int:
-        return self.num_spin_up_steps + self.num_main_steps
-
-    def is_valid_time_index(self, idx: int) -> bool:
-        """
-        Checks if the given time index corresponds to a valid data step.
-        Handles padding gaps in spin-up and main simulation.
-        """
-        if idx < 0:
-            return False
-
-        if self.spin_up_cycles > 0:
-            chunks_per_cycle = self._spin_up_num_chunks
-            items_per_cycle = chunks_per_cycle * self.chunk_len
-            total_spin_up_items = items_per_cycle * self.spin_up_cycles
-
-            if idx < total_spin_up_items:
-                # In spin-up region
-                idx_in_cycle = idx % items_per_cycle
-
-                # Calculate valid steps per cycle
-                cycle_duration = self.spin_up_end_date - self.spin_up_start_date
-                steps_per_cycle = timedelta_quotient(
-                    cycle_duration,
-                    self.time_interval,
-                    duration_label="spin-up endpoint span",
-                    interval_label="time_interval",
-                ) + 1
-
-                return idx_in_cycle < steps_per_cycle
-
-            # Move to main simulation region
-            idx -= total_spin_up_items
-
-        # Main simulation region
-        return idx < self.num_main_steps
-
-    def _real_len(self) -> int:
-        """Number of chunks in main simulation."""
-        total = self.num_main_steps
-        return (total + self.chunk_len - 1) // self.chunk_len
-
-    def validate_files_in_range(self, file_path_gen: Callable[[datetime], Path]) -> None:
-        """
-        Validates that files exist for all time steps in the simulation, including spin-up.
-        file_path_gen: function that takes a datetime and returns a Path to the file.
-        """
-        if self.time_interval is None:
-             raise ValueError("time_interval must be provided for validation")
-
-        file_paths = set()
-
-        # Main simulation
-        if self.start_date and self.end_date:
-            curr = self.start_date
-            while curr <= self.end_date:
-                file_paths.add(file_path_gen(curr))
-                curr += self.time_interval
-
-        # Spin-up
-        if self.spin_up_cycles > 0:
-            if self.spin_up_start_date and self.spin_up_end_date:
-                curr = self.spin_up_start_date
-                while curr <= self.spin_up_end_date:
-                    file_paths.add(file_path_gen(curr))
-                    curr += self.time_interval
-
-        self.validate_files_exist(list(file_paths))
+    def num_spin_up_source_steps_per_cycle(self) -> int:
+        return self._chunk_plan.spinup_source_count_per_cycle
 
     @abstractmethod
     def close(self) -> None:
@@ -698,24 +590,40 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         """
         Fetch one chunk (T <= chunk_len) starting at chunk index `idx`.
 
-        Returns:
-        - If build_local_mapping has been called: (chunk_len, N) compressed data
-        - Otherwise: (chunk_len, Y, X) full grid data
-
-        Pads with zeros if the actual data is shorter than chunk_len.
+        The final chunk retains its real time length instead of being padded.
         """
         if idx < 0:
             idx += len(self)
 
         compressed = self._local_indices is not None
+        expected_length = self.source_chunk_length(idx)
         data = self.read_chunk(idx)
 
         if isinstance(data, dict):
-            return {name: self._pad_chunk_array(block, compressed) for name, block in data.items()}
+            return {
+                name: self._prepare_chunk_array(
+                    block, compressed, expected_length=expected_length,
+                )
+                for name, block in data.items()
+            }
 
-        return self._pad_chunk_array(data, compressed)
+        return self._prepare_chunk_array(
+            data, compressed, expected_length=expected_length,
+        )
 
-    def _pad_chunk_array(self, data: np.ndarray, compressed: bool) -> np.ndarray:
+    def _prepare_chunk_array(
+        self,
+        data: np.ndarray,
+        compressed: bool,
+        *,
+        expected_length: int,
+    ) -> np.ndarray:
+
+        if data.shape[0] != expected_length:
+            raise ValueError(
+                f"read_chunk returned {data.shape[0]} rows, expected "
+                f"{expected_length} from the dataset chunk plan"
+            )
 
         if compressed:
             # Expect (T, N)
@@ -724,10 +632,6 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 raise ValueError(
                     f"read_chunk returned shape {tuple(data.shape)}, expected (T, {N})"
                 )
-            T = data.shape[0]
-            if T < self.chunk_len:
-                pad = np.zeros((self.chunk_len - T, N), dtype=self.out_dtype)
-                data = np.vstack([data, pad]) if data.size else pad
         else:
             # Expect (T, Y, X)
             ny, nx = self.grid_shape
@@ -735,16 +639,12 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 raise ValueError(
                     f"read_chunk returned shape {tuple(data.shape)}, expected (T, {ny}, {nx})"
                 )
-            T = data.shape[0]
-            if T < self.chunk_len:
-                pad = np.zeros((self.chunk_len - T, ny, nx), dtype=self.out_dtype)
-                data = np.vstack([data, pad]) if data.size else pad
-
         data = self._apply_value_policy(data)
+        data = self._apply_upsampling_policy(data)
         return np.ascontiguousarray(data)
 
     def __len__(self) -> int:
-        return self._real_len() + self.num_spin_up_chunks
+        return len(self._chunk_plan)
 
     def __add__(self, other):
         return self._combine(other, "add")

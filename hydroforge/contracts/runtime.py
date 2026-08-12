@@ -7,6 +7,15 @@ from types import MappingProxyType
 
 
 _PRECISIONS = frozenset({"float32", "float64"})
+DEFAULT_BLOCK_SIZE = 256
+MODEL_OWNED_MODULE_FIELDS = (
+    "opened_modules",
+    "rank",
+    "device",
+    "precision",
+    "mixed_precision",
+    "num_trials",
+)
 
 
 def validate_runtime_block_size(value: int, *, backend: str) -> None:

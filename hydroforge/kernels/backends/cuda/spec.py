@@ -186,15 +186,6 @@ def cuda_function_signature(
     return tuple(parameters)
 
 
-def cuda_function_parameters(source: str, function: str) -> tuple[str, ...]:
-    """Return exact C++ parameter names for one native launch definition."""
-
-    return tuple(
-        name for name, _native_type
-        in cuda_function_signature(source, function)
-    )
-
-
 def cuda_narrowed_index_parameters(
     source: str, function: str, index_parameters: Sequence[str],
 ) -> tuple[str, ...]:

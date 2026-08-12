@@ -2,31 +2,33 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
 
 from hydroforge.contracts.fields import tensor_is_active
+
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
+    from hydroforge.model.module import AbstractModule
+
+
+NamespaceEntry = tuple["AbstractModule", str, str | None]
 
 
 class NamespaceCompiler:
     """Build qualified mappings and reject ambiguous unqualified fields."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: AbstractModel) -> None:
         self.model = model
-        self._mapping: dict[str, tuple[Any, str, str | None]] | None = None
+        self._mapping: dict[str, NamespaceEntry] | None = None
 
-    def build(self) -> dict[str, tuple[Any, str, str | None]]:
+    def build(self) -> dict[str, NamespaceEntry]:
         if self._mapping is not None:
             return self._mapping
-        mapping: dict[str, tuple[Any, str, str | None]] = {}
+        mapping: dict[str, NamespaceEntry] = {}
         virtual: dict[str, bool] = {}
         ambiguous: set[str] = set()
         for module_name in self.model.opened_modules:
-            module = self.model.get_module(module_name)
-            if module is None:
-                raise RuntimeError(
-                    f"opened module {module_name!r} is absent from the compiled "
-                    "model namespace"
-                )
+            module = self.model._modules[module_name]
             for field in module.tensor_schema():
                 if not tensor_is_active(field.tensor, self.model.opened_modules):
                     continue

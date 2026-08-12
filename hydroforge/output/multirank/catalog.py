@@ -12,7 +12,10 @@ import numpy as np
 
 from hydroforge.contracts.temporal import canonical_calendar
 from hydroforge.output.netcdf.plan import (
-    COMMITTED_STEPS_ATTR, OUTPUT_FORMAT, OUTPUT_VERSION,
+    COMMITTED_STEPS_ATTR, OUTPUT_FORMAT, OUTPUT_VERSION, RUN_ID_ATTR,
+)
+from hydroforge.serialization.netcdf import (
+    BOOL_LOGICAL_DTYPE, LOGICAL_DTYPE_ATTR,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,12 +88,25 @@ class RankOutputCatalog:
                 raise ValueError(
                     f"unsupported output format {output_format!r}"
                 )
-            if type(output_version) not in {int, np.int32, np.int64} or int(
-                output_version,
-            ) != OUTPUT_VERSION:
+            if type(output_version) not in {int, np.int32, np.int64}:
                 raise ValueError(
-                    f"unsupported output version {output_version!r}"
+                    f"unsupported output version {output_version!r}; version "
+                    f"{OUTPUT_VERSION} with a shared run identity is required"
                 )
+            output_version = int(output_version)
+            if output_version != OUTPUT_VERSION:
+                raise ValueError(
+                    f"unsupported output version {output_version}; version "
+                    f"{OUTPUT_VERSION} with a shared run identity is required"
+                )
+            if RUN_ID_ATTR not in ds.ncattrs():
+                raise ValueError(
+                    f"output version {OUTPUT_VERSION} is missing required "
+                    f"run identity attribute {RUN_ID_ATTR!r}"
+                )
+            run_id = ds.getncattr(RUN_ID_ATTR)
+            if not isinstance(run_id, str) or not run_id.strip():
+                raise ValueError(f"{RUN_ID_ATTR} must be a non-empty string")
             if type(rank) not in {int, np.int32, np.int64} or int(rank) < 0:
                 raise ValueError("hydroforge_rank must be a non-negative integer")
             if (
@@ -104,6 +120,13 @@ class RankOutputCatalog:
             if "time" not in ds.variables:
                 raise KeyError("time variable is missing")
             variable = ds.variables[self.owner.var_name]
+            logical_dtype = getattr(variable, LOGICAL_DTYPE_ATTR, None)
+            if logical_dtype is not None:
+                if logical_dtype != BOOL_LOGICAL_DTYPE:
+                    raise ValueError(
+                        f"variable {self.owner.var_name!r} declares "
+                        f"unsupported logical dtype {logical_dtype!r}"
+                    )
             committed = ds.getncattr(COMMITTED_STEPS_ATTR)
             if isinstance(committed, (bool, np.bool_)) or not isinstance(
                 committed, (int, np.integer),
@@ -171,8 +194,10 @@ class RankOutputCatalog:
                 "level_dimension": level_dimension,
                 "dimensions": dimensions,
                 "dtype": np.dtype(variable.dtype),
+                "logical_dtype": logical_dtype,
                 "contract_rank": int(rank),
                 "world_size": int(world_size),
+                "run_id": run_id.strip(),
             }
             if expected is not None and metadata != expected:
                 raise ValueError(
@@ -320,7 +345,7 @@ class RankOutputCatalog:
                 for name in (
                     "years", "has_trials", "n_trials", "has_levels",
                     "n_levels", "level_dimension", "dimensions", "dtype",
-                    "coord_name", "world_size",
+                    "logical_dtype", "coord_name", "world_size", "run_id",
                 ):
                     if info[name] != reference[name]:
                         raise ValueError(

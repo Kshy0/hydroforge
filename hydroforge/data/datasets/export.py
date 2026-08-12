@@ -29,46 +29,6 @@ class DatasetExporter:
     def __init__(self, owner) -> None:
         self.owner = owner
 
-    def __len__(self) -> int:
-        return len(self.owner)
-
-    @property
-    def _desired_catchment_ids(self):
-        return self.owner._desired_catchment_ids
-
-    @property
-    def chunk_len(self):
-        return self.owner.chunk_len
-
-    @property
-    def data_size(self):
-        return self.owner.data_size
-
-    @property
-    def num_main_steps(self):
-        return self.owner.num_main_steps
-
-    @property
-    def num_spin_up_steps(self):
-        return self.owner.num_spin_up_steps
-
-    @property
-    def num_spin_up_chunks(self):
-        return self.owner.num_spin_up_chunks
-
-    def get_time_by_index(self, index):
-        return self.owner.get_time_by_index(index)
-
-    def is_valid_time_index(self, index):
-        return self.owner.is_valid_time_index(index)
-
-    def read_chunk(self, index: int):
-        return self.owner.read_chunk(index)
-
-    @property
-    def supports_time_aggregation(self) -> bool:
-        return bool(self.owner.supports_time_aggregation)
-
     def export_climatology(
         self,
         out_path: Union[str, Path],
@@ -106,7 +66,7 @@ class DatasetExporter:
         Returns:
             Path to the created NetCDF file.
         """
-        if self._desired_catchment_ids is None:
+        if self.owner._desired_catchment_ids is None:
             raise ValueError(
                 "build_local_mapping() must be called before "
                 "export_climatology()."
@@ -115,7 +75,7 @@ class DatasetExporter:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        catchment_ids = self._desired_catchment_ids
+        catchment_ids = self.owner._desired_catchment_ids
         n_catch = len(catchment_ids)
 
         torch_dtype = torch.float32 if dtype == "float32" else torch.float64
@@ -130,8 +90,8 @@ class DatasetExporter:
         t_mapping_T = t_mapping.t().coalesce()
 
         # ----- Accumulate mean over all chunks -----
-        first_chunk = self.num_spin_up_chunks
-        n_chunks = len(self)
+        first_chunk = self.owner.num_spin_up_chunks
+        n_chunks = len(self.owner)
         total_steps = 0
         accumulator = torch.zeros(n_catch, dtype=torch.float64, device=dev)
 
@@ -140,18 +100,13 @@ class DatasetExporter:
             desc="Computing climatology", unit="chunk",
         )
         for ci in pbar:
-            block = self.read_chunk(ci)  # (T, n_grids)
-
-            # Determine how many valid steps in this block
-            base_idx = ci * self.chunk_len
-            T = block.shape[0]
-            valid_T = sum(
-                1 for k in range(T) if self.is_valid_time_index(base_idx + k)
-            )
-            if valid_T == 0:
-                continue
-
-            block = block[:valid_T]
+            block = self.owner.read_chunk(ci)  # (T, n_grids)
+            valid_T = self.owner.source_chunk_length(ci)
+            if block.shape[0] != valid_T:
+                raise ValueError(
+                    f"read_chunk returned {block.shape[0]} rows at chunk {ci}; "
+                    f"the source chunk plan requires {valid_T}"
+                )
 
             # block: (T, n_grids)
             block_t = torch.as_tensor(block, dtype=torch_dtype, device=dev)
@@ -250,14 +205,17 @@ class DatasetExporter:
         active_aggregation = getattr(self.owner, "time_aggregation", None)
 
         if isinstance(active_aggregation, dict):
-            if not self.supports_time_aggregation:
+            if not self.owner.supports_time_aggregation:
                 raise ValueError(
                     f"{type(self).__name__} does not support time aggregation."
                 )
             output_methods = active_aggregation
             returns_mapping = True
         else:
-            if active_aggregation is not None and not self.supports_time_aggregation:
+            if (
+                active_aggregation is not None
+                and not self.owner.supports_time_aggregation
+            ):
                 raise ValueError(
                     f"{type(self).__name__} does not support time aggregation."
                 )
@@ -265,18 +223,18 @@ class DatasetExporter:
             returns_mapping = False
 
         # Require build_local_mapping() to be called first
-        if self._desired_catchment_ids is None:
+        if self.owner._desired_catchment_ids is None:
             raise ValueError(
                 "build_local_mapping() must be called before export_catchment_data(). "
                 "This sets the catchment IDs and grid mapping."
             )
 
-        catchment_ids = self._desired_catchment_ids
+        catchment_ids = self.owner._desired_catchment_ids
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         n_catch = len(catchment_ids)
-        n_cols = self.data_size  # This is the compressed size after build_local_mapping
+        n_cols = self.owner.data_size
 
         # Prepare device and torch types
         torch_dtype = torch.float32 if dtype == "float32" else torch.float64
@@ -373,7 +331,7 @@ class DatasetExporter:
         created_files = {name: [] for name in output_methods}
         current_year = None
         write_idx = 0
-        total_steps = self.num_main_steps
+        total_steps = self.owner.num_main_source_steps
 
         def _close_writers(error=None):
             nonlocal writers, writer_stack
@@ -412,12 +370,11 @@ class DatasetExporter:
             if not split_by_year:
                 _open_writers()
 
-            first_chunk = self.num_spin_up_chunks
-            n_chunks = len(self)
+            first_chunk = self.owner.num_spin_up_chunks
+            n_chunks = len(self.owner)
             pbar = tqdm(total=total_steps, desc="Exporting", unit="step")
             for ci in range(first_chunk, n_chunks):
-                base_idx = ci * self.chunk_len
-                read_data = self.read_chunk(ci)
+                read_data = self.owner.read_chunk(ci)
                 if isinstance(read_data, dict):
                     blocks = read_data
                     if set(blocks) != set(output_methods):
@@ -457,7 +414,8 @@ class DatasetExporter:
                 # already resident, so row-at-a-time writes only add HDF5
                 # extension, chunk lookup and compression overhead.
                 chunk_times = [
-                    self.get_time_by_index(base_idx + k) for k in range(T)
+                    self.owner.source_time_at(ci, k)
+                    for k in range(T)
                 ]
                 run_start = 0
                 while run_start < T:

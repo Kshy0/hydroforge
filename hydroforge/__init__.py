@@ -33,8 +33,11 @@ from hydroforge.model.model import AbstractModel
 from hydroforge.contracts.kernel_field import KernelField, kernel_field
 from hydroforge.model.module import (
     AbstractModule,
+    ModuleReference,
     TensorField,
     computed_tensor_field,
+    module_ref,
+    optional_module_ref,
 )
 from hydroforge.contracts.fields import (
     ModuleFieldSchema,
@@ -49,7 +52,7 @@ from hydroforge.contracts.temporal import (
     ExplicitWindows,
     SimulationSchedule,
     SimulationStep,
-    StatisticsFlags,
+    SpinupSchedule,
     StatisticsPlan,
 )
 
@@ -60,6 +63,7 @@ __all__ = [
     "KernelField",
     "ModuleFieldSchema",
     "ModuleSchema",
+    "ModuleReference",
     "TensorField",
     "CalendarWindow",
     "DatasetTemporalContract",
@@ -68,9 +72,11 @@ __all__ = [
     "ExplicitWindows",
     "SimulationSchedule",
     "SimulationStep",
-    "StatisticsFlags",
+    "SpinupSchedule",
     "StatisticsPlan",
     "computed_tensor_field",
+    "module_ref",
+    "optional_module_ref",
     "kernel_field",
     "find_indices_in",
     "find_indices_in_torch",

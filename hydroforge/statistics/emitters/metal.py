@@ -1051,7 +1051,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 msl_lines.extend([
                     "    if ((int)tid >= total) return;",
                     "    float count = p_cnt[tid];",
-                    "    p_buf[tid] = count > 0.0f ? p_buf[tid] / count : nan(0u);",
+                    "    p_buf[tid] = count > 0.0f ? p_buf[tid] / count : hydroforge_nan();",
                     "}", "",
                 ])
                 metas.append({
@@ -1083,6 +1083,9 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             '// Inspecting the IEEE bits keeps this contract explicit under fast math.',
             'inline bool hydroforge_isnan(float value) {',
             '    return (as_type<uint>(value) & 0x7fffffffu) > 0x7f800000u;',
+            '}',
+            'inline float hydroforge_nan() {',
+            '    return as_type<float>(0x7fc00000u);',
             '}',
             'inline float hydroforge_maximum(float left, float right) {',
             '    return hydroforge_isnan(left) ? right : (hydroforge_isnan(right) ? left : max(left, right));',

@@ -97,41 +97,41 @@ class ProgressState:
 class ProgressRuntime:
     def __init__(self, owner: Any) -> None:
         self.owner = owner
-        self.owner._progress = ProgressState()
+        self.state = ProgressState()
 
-    def _schedule_position(self) -> tuple[Any, int | None]:
+    def _schedule_position(self) -> tuple[Any, Any]:
         runtime = self.owner._execution.step
-        index = None if runtime is None else runtime.state.schedule_step
-        return self.owner.simulation_schedule, index
+        step = None if runtime is None else runtime.scheduled_step
+        return self.owner.simulation_schedule, step
 
     def _phase(self) -> str:
-        schedule, index = self._schedule_position()
-        if index is not None:
-            return "main"
-        return "spinup" if schedule is not None else "unbounded"
+        schedule, step = self._schedule_position()
+        if schedule is None or step is None:
+            return "unbounded"
+        return step.phase
 
     def begin_step(self) -> None:
-        schedule, index = self._schedule_position()
+        schedule, step = self._schedule_position()
         fraction = None
-        if schedule is not None and index is not None:
-            step = schedule.step_at(index)
-            elapsed = (step.start - schedule.start).total_seconds()
-            duration = (schedule.end - schedule.start).total_seconds()
+        if schedule is not None and step is not None:
+            elapsed = (step.start - schedule.execution_start).total_seconds()
+            duration = (
+                schedule.end - schedule.execution_start
+            ).total_seconds()
             fraction = elapsed / duration
-        self.owner._progress.begin_step(
+        self.state.begin_step(
             self._phase(), schedule_fraction=fraction,
         )
 
     def progress_tick(self) -> None:
-        self.owner._progress.tick(self._phase())
+        self.state.tick(self._phase())
 
     def format_progress(self) -> str:
-        schedule, index = self._schedule_position()
-        if schedule is None or index is None:
-            return self.owner._progress.format_unbounded()
-        step = schedule.step_at(index)
-        elapsed = (step.end - schedule.start).total_seconds()
-        duration = (schedule.end - schedule.start).total_seconds()
-        return self.owner._progress.format_schedule(
+        schedule, step = self._schedule_position()
+        if schedule is None or step is None:
+            return self.state.format_unbounded()
+        elapsed = (step.end - schedule.execution_start).total_seconds()
+        duration = (schedule.end - schedule.execution_start).total_seconds()
+        return self.state.format_schedule(
             fraction=elapsed / duration,
         )

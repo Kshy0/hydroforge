@@ -16,7 +16,7 @@ import numpy as np
 from netCDF4 import Dataset
 
 from hydroforge.contracts.temporal import timedelta_quotient
-from hydroforge.data.datasets.base import AbstractDataset, validate_forcing_batch
+from hydroforge.data.datasets.base import AbstractDataset
 from hydroforge.data.datasets.timeline import DatasetTimeline
 from hydroforge.data.netcdf import read_netcdf_var_sliced, single_file_key
 from hydroforge.data.distributed import find_indices_in, is_rank_zero
@@ -61,7 +61,7 @@ class ExportedDataset(AbstractDataset):
     Key differences from grid-based datasets:
       - Data is already at catchment level, no grid-to-catchment mapping needed
       - build_local_mapping only reorders columns to match desired catchment order
-      - shard_forcing simply flattens (B, T, C) -> (B*T, C) without matrix multiplication
+      - shard_forcing validates concatenated (T, C) data without matrix multiplication
       - Each rank can read its own file independently
     """
 
@@ -70,6 +70,7 @@ class ExportedDataset(AbstractDataset):
         base_dir: str,
         start_date: datetime,
         end_date: datetime,
+        model_step: timedelta,
         var_name: str,
         prefix: Optional[str],
         time_interval: timedelta = timedelta(days=1),
@@ -133,6 +134,11 @@ class ExportedDataset(AbstractDataset):
         self._column_bbox: Optional[Tuple[int, int]] = None
         self._column_bbox_local_indices: Optional[np.ndarray] = None
         self._coordinates_cache: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        # Name of the sparse axis in the input variable.  Exporters commonly
+        # use ``saved_points``, but accepting a file's actual one-dimensional
+        # catchment axis makes the reader interoperable with equivalent files
+        # produced by other tools.
+        self._point_dim: Optional[str] = None
 
         # Auto-detect chunk_len from file's NetCDF time chunking if not provided
         if "chunk_len" not in kwargs:
@@ -151,6 +157,7 @@ class ExportedDataset(AbstractDataset):
             start_date=start_date,
             end_date=end_date,
             time_interval=time_interval,
+            model_step=model_step,
             clip_negative=clip_negative,
             *args,
             **kwargs,
@@ -163,27 +170,17 @@ class ExportedDataset(AbstractDataset):
             time_to_key=self.time_to_key,
             time_aggregation=self.time_aggregation,
         )
-        # ``DatasetTimeline`` scans the envelope containing both spin-up and
-        # main periods.  Its ``global_times`` therefore starts at spin-up when
-        # enabled, while ExportedDataset indexing, window sampling and the
-        # primary cache all require an axis whose row zero is ``start_date``.
-        self._global_times = []
-        current = self.start_date
-        while current <= self.end_date:
-            self._global_times.append(current)
-            current += self.time_interval
-        self._plan = self._timeline.plan
-        self.source_time_interval = self._timeline.source_time_interval
-        self._aggregation_factor = self._timeline.aggregation_factor
+        # ExportedDataset indexing, window sampling and the primary cache use
+        # a main-only axis whose row zero is ``start_date``. The shared I/O
+        # timeline separately follows the exact source chunks, including any
+        # replayed spin-up rows.
+        contract = self.temporal_contract
+        self._global_times = [
+            contract.support(index)[0] for index in range(contract.count)
+        ]
 
         if self._in_memory:
             self.load_to_memory()
-
-    def _ops_from_times(self, times):
-        return self._timeline.ops_from_times(times)
-
-    def is_valid_time_index(self, idx: int) -> bool:
-        return self._timeline.is_valid_time_index(idx)
 
     @staticmethod
     def _detect_chunk_len(base_dir, prefix, suffix, var_name, start_date, time_to_key):
@@ -253,19 +250,37 @@ class ExportedDataset(AbstractDataset):
             key = self.time_to_key(self.start_date)
             path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
             with Dataset(path, "r") as ds:
+                point_dim = self._infer_point_dim(ds, path)
                 if self.coord_name not in ds.variables:
                     raise ValueError(
                         f"Coordinate variable '{self.coord_name}' not found in "
                         f"{path.name}. Available: {list(ds.variables.keys())}"
                     )
+                coordinate = ds.variables[self.coord_name]
+                if tuple(coordinate.dimensions) != (point_dim,):
+                    raise ValueError(
+                        f"Coordinate variable {self.coord_name!r} in {path.name} "
+                        f"must have dimensions ({point_dim!r},), got "
+                        f"{coordinate.dimensions}"
+                    )
                 coordinates = self._validated_catchment_ids(
-                    ds.variables[self.coord_name][:], path=path
+                    coordinate[:], path=path
                 )
             index = np.arange(coordinates.shape[0], dtype=np.int64)
             coordinates.setflags(write=False)
             index.setflags(write=False)
             self._coordinates_cache = (coordinates, index)
         return self._coordinates_cache
+
+    @property
+    def point_dim(self) -> str:
+        """Name of the source variable's one-dimensional catchment axis."""
+
+        if self._point_dim is None:
+            self.get_coordinates()
+        if self._point_dim is None:  # pragma: no cover - defensive invariant
+            raise RuntimeError("exported dataset point dimension was not resolved")
+        return self._point_dim
 
     @property
     def data_size(self) -> int:
@@ -298,6 +313,52 @@ class ExportedDataset(AbstractDataset):
                 raise ValueError(f"Unsupported extra dims: shape={out.shape}")
             out = out.reshape(out.shape[0], out.shape[1])
         return out
+
+    def _infer_point_dim(self, dataset: Dataset, path: Path) -> str:
+        """Validate the exported variable and return its sparse point axis."""
+
+        if self.var_name not in dataset.variables:
+            raise KeyError(f"variable {self.var_name!r} is absent from {path}")
+        dimensions = tuple(dataset.variables[self.var_name].dimensions)
+        time_axes = [
+            index for index, dimension in enumerate(dimensions)
+            if dimension.lower() == "time"
+        ]
+        point_axes = [
+            index for index in range(len(dimensions)) if index not in time_axes
+        ]
+        if len(time_axes) != 1 or len(point_axes) != 1:
+            raise ValueError(
+                f"Expected {self.var_name!r} in {path.name} to have one time "
+                f"axis and one point axis, got {dimensions}"
+            )
+        point_dim = dimensions[point_axes[0]]
+        if self._point_dim is None:
+            self._point_dim = point_dim
+        elif self._point_dim != point_dim:
+            raise ValueError(
+                f"Variable {self.var_name!r} uses point dimension "
+                f"{point_dim!r} in {path.name}, expected {self._point_dim!r}"
+            )
+        return point_dim
+
+    def _variable_axes(
+        self,
+        dataset: Dataset,
+        variable: Any,
+        path: Path,
+    ) -> tuple[int, int]:
+        """Return the time and sparse-point axes of one source variable."""
+
+        point_dim = self._infer_point_dim(dataset, path)
+        dimensions = tuple(variable.dimensions)
+        return (
+            next(
+                index for index, dimension in enumerate(dimensions)
+                if dimension.lower() == "time"
+            ),
+            dimensions.index(point_dim),
+        )
 
     def _compute_column_bbox_from_indices(self) -> None:
         """Compute the minimal saved_points slice for mapped catchments."""
@@ -342,13 +403,7 @@ class ExportedDataset(AbstractDataset):
             path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
             with Dataset(path, "r") as ds:
                 var = ds.variables[self.var_name]
-                dims = tuple(d.lower() for d in var.dimensions)
-                if not (len(dims) == 2 and set(dims) == {"time", "saved_points"}):
-                    raise ValueError(
-                        f"Expected dims ('time','saved_points'), got {var.dimensions}"
-                    )
-                t_idx = dims.index("time")
-                c_idx = dims.index("saved_points")
+                t_idx, c_idx = self._variable_axes(ds, var, path)
                 if not abs_indices:
                     continue
                 abs_idx = np.asarray(abs_indices, dtype=np.int32)
@@ -376,7 +431,7 @@ class ExportedDataset(AbstractDataset):
         if self.time_aggregation is not None:
             data = self._apply_time_aggregation(
                 data,
-                self.source_time_interval,
+                self._timeline.source_time_interval,
                 self.time_aggregation,
             )
         if self.unit_factor == 1.0:
@@ -464,9 +519,10 @@ class ExportedDataset(AbstractDataset):
         return np.ascontiguousarray(cache[:, positions])
 
     def read_chunk(self, idx: int):
-        if idx < 0 or idx >= len(self._plan):
-            raise IndexError(f"Chunk index {idx} out of range (0-{len(self._plan) - 1})")
-        return self._finish_read(self._read_ops(self._plan[idx][1]))
+        plan = self._timeline.plan
+        if idx < 0 or idx >= len(plan):
+            raise IndexError(f"Chunk index {idx} out of range (0-{len(plan) - 1})")
+        return self._finish_read(self._read_ops(plan[idx][1]))
 
     def get_data(self, current_time: datetime, chunk_len: int):
         times = self._timeline.contiguous_times(current_time, chunk_len)
@@ -482,6 +538,8 @@ class ExportedDataset(AbstractDataset):
         self,
         desired_catchment_ids: np.ndarray,
         desired_basin_ids: Optional[np.ndarray] = None,
+        *,
+        time_shift_steps: Optional[np.ndarray] = None,
     ) -> None:
         """Set up column reordering and per-catchment shift for runoff.
 
@@ -498,7 +556,16 @@ class ExportedDataset(AbstractDataset):
             ``model.base.catchment_basin_id``).  When *None* (default) no
             per-catchment shift is derived, which is the correct behaviour
             when no inflow shift is needed.
+        time_shift_steps : np.ndarray, shape (C,), optional
+            Explicit integer source-time offset for every mapped column.
+            This is useful when another dataset has already coordinated the
+            temporal spans. It is mutually exclusive with
+            ``desired_basin_ids``.
         """
+        if desired_basin_ids is not None and time_shift_steps is not None:
+            raise ValueError(
+                "desired_basin_ids and time_shift_steps are mutually exclusive"
+            )
         # Reuse the validated coordinate cache populated on first access.
         key = self.time_to_key(self.start_date)
         path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
@@ -551,7 +618,24 @@ class ExportedDataset(AbstractDataset):
         # Derive per-catchment shift from basin_shift (auto after attach_inflow_overlay).
         self._shift_days = None
         self._shift_day_groups = None
-        if desired_basin_ids is not None and self._basin_shift:
+        if time_shift_steps is not None:
+            shifts = np.asarray(time_shift_steps)
+            expected = (len(desired_catchment_ids),)
+            if shifts.shape != expected:
+                raise ValueError(
+                    f"time_shift_steps must have shape {expected}; "
+                    f"got {shifts.shape}"
+                )
+            if (
+                not np.issubdtype(shifts.dtype, np.integer)
+                or np.issubdtype(shifts.dtype, np.bool_)
+            ):
+                raise TypeError("time_shift_steps must contain integers")
+            sh = shifts.astype(np.int64, copy=False)
+            if np.any(sh != 0):
+                self._shift_days = sh
+                self._shift_day_groups = self._compile_groups(sh)
+        elif desired_basin_ids is not None and self._basin_shift:
             bids = np.asarray(desired_basin_ids, dtype=np.int64).ravel()
             if bids.shape != (len(desired_catchment_ids),):
                 raise ValueError(
@@ -564,12 +648,14 @@ class ExportedDataset(AbstractDataset):
             if np.any(sh != 0):
                 self._shift_days = sh
                 self._shift_day_groups = self._compile_groups(sh)
-                if is_rank_zero():
-                    logger.info(
-                        "Registered per-catchment shift: %d unique values, "
-                        "range [%d, %d] days",
-                        np.unique(sh).size, int(sh.min()), int(sh.max()),
-                    )
+        if self._shift_days is not None and is_rank_zero():
+            logger.info(
+                "Registered per-catchment shift: %d unique values, "
+                "range [%d, %d] steps",
+                np.unique(self._shift_days).size,
+                int(self._shift_days.min()),
+                int(self._shift_days.max()),
+            )
 
         # Load to memory when inflow overlay is attached (enables large-window
         # reads for val/test) or when per-catchment shift is applied (requires
@@ -612,12 +698,13 @@ class ExportedDataset(AbstractDataset):
         # main-only cache with offsets relative to ``start_date`` (which used
         # to zero-fill valid spin-up data), or allocating the intervening gap.
         spin_data = None
-        if self.spin_up_cycles > 0:
-            spin_times = []
-            current = self.spin_up_start_date
-            while current <= self.spin_up_end_date:
-                spin_times.append(current)
-                current += self.time_interval
+        spinup = self.temporal_contract.spinup
+        if spinup is not None:
+            spin_count = self.chunk_plan.spinup_source_count_per_cycle
+            spin_times = [
+                spinup.source_start + self.time_interval * index
+                for index in range(spin_count)
+            ]
             spin_entry = self._timeline.build_entry(spin_times)
             spin_data = self._finish_read(self._read_ops(spin_entry[1]))
 
@@ -708,7 +795,7 @@ class ExportedDataset(AbstractDataset):
         else:
             catchment_ids = file_catchment_ids
         C_total = len(catchment_ids)
-        T_total = self.num_main_steps
+        T_total = self.num_main_source_steps
         # ---- determine whether full (T, C) fits in buffer ----
         max_buffer_bytes = max_buffer_mb * 1024 * 1024
         main_ops = None
@@ -805,9 +892,9 @@ class ExportedDataset(AbstractDataset):
                         path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
                         with Dataset(path, "r") as ds_in:
                             var_in = ds_in.variables[self.var_name]
-                            dims_in = tuple(d.lower() for d in var_in.dimensions)
-                            t_idx = dims_in.index("time")
-                            c_idx = dims_in.index("saved_points")
+                            t_idx, c_idx = self._variable_axes(
+                                ds_in, var_in, path,
+                            )
 
                             sel = [slice(None)] * var_in.ndim
                             sel[t_idx] = np.asarray(abs_indices, dtype=np.int64)
@@ -851,52 +938,35 @@ class ExportedDataset(AbstractDataset):
 
     def shard_forcing(
         self,
-        batch_data,
-        *,
-        target=None,
+        chunk_data,
     ):
-        """Flatten (B, T, C) -> (B*T, C).
+        """Validate already-concatenated ``(T, C)`` forcing.
 
         For ExportedDataset, data is already in the correct column order
         (set by build_local_mapping), so no matrix multiply is needed.
 
         When overlays are attached (:meth:`attach_inflow_overlay` and/or
-        :meth:`attach_loss_overlay`), ``batch_data`` is a tuple of
+        :meth:`attach_loss_overlay`), ``chunk_data`` is a tuple of
         per-stream tensors; each is flattened independently and returned
         as a tuple in the same order.
         """
-        if isinstance(batch_data, (tuple, list)):
-            if target is not None and len(target) != len(batch_data):
-                raise ValueError("forcing target sequence length mismatch")
+        if isinstance(chunk_data, (tuple, list)):
             return tuple(
-                self.shard_forcing(
-                    block,
-                    target=None if target is None else target[index],
-                )
-                for index, block in enumerate(batch_data)
+                self.shard_forcing(block) for block in chunk_data
             )
-        if isinstance(batch_data, Mapping):
-            if target is not None and not isinstance(target, Mapping):
-                raise TypeError("dict forcing requires a target mapping")
+        if isinstance(chunk_data, Mapping):
             return {
-                name: self.shard_forcing(
-                    block,
-                    target=None if target is None else target[name],
-                )
-                for name, block in batch_data.items()
+                name: self.shard_forcing(block)
+                for name, block in chunk_data.items()
             }
-        if batch_data.dim() == 3:
-            B, T, C = batch_data.shape
-            out = batch_data.reshape(B * T, C).contiguous()
-        elif batch_data.dim() == 4:
-            B, T, K, C = batch_data.shape
-            out = batch_data.reshape(B * T, K, C).contiguous()
+        if chunk_data.dim() in {2, 3}:
+            out = chunk_data.contiguous()
         else:
-            raise ValueError(f"Expected 3D or 4D tensor, got {batch_data.dim()}D")
-        return (
-            out if target is None
-            else validate_forcing_batch(out, target)
-        )
+            raise ValueError(
+                "forcing must have shape (T, C) or (T, K, C); "
+                f"got {tuple(chunk_data.shape)}"
+            )
+        return out
 
     # -------------------------
     # Override __getitem__ - no rank gating for exported data
@@ -919,14 +989,14 @@ class ExportedDataset(AbstractDataset):
             }
         return self._gather(cache, shift, base_t, length, groups=groups)
 
-    def _pad_disk_data(
+    def _validate_disk_data(
         self,
         data: Union[np.ndarray, Dict[str, np.ndarray]],
         length: int,
     ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
         if isinstance(data, dict):
             return {
-                name: self._pad_disk_data(block, length)
+                name: self._validate_disk_data(block, length)
                 for name, block in data.items()
             }
         if data.ndim != 2 or data.shape[1] != self.data_size:
@@ -934,11 +1004,10 @@ class ExportedDataset(AbstractDataset):
                 f"read_chunk returned shape {data.shape}, expected "
                 f"(T, {self.data_size})"
             )
-        if data.shape[0] < length:
-            pad = np.zeros(
-                (length - data.shape[0], self.data_size), dtype=self.out_dtype,
+        if data.shape[0] != length:
+            raise ValueError(
+                f"read_chunk returned {data.shape[0]} rows, expected {length}"
             )
-            data = np.vstack([data, pad]) if data.size else pad
         return np.ascontiguousarray(data)
 
     def __getitem__(self, idx):
@@ -968,15 +1037,13 @@ class ExportedDataset(AbstractDataset):
             length = int(self._window_len)
             cache = self._memory_cache
         else:
-            base_t = self._chunk_base_t(idx)
-            length = int(self.chunk_len)
-            cache = self._memory_cache
-            total_spin_up_chunks = self._spin_up_num_chunks * self.spin_up_cycles
-            if idx < total_spin_up_chunks:
+            chunk = self.chunk_plan[idx]
+            length = chunk.length
+            base_t = chunk.phase_offset
+            if chunk.phase == "spinup":
                 cache = self._spin_up_memory_cache
-                base_t = (idx % self._spin_up_num_chunks) * self.chunk_len
             else:
-                base_t = (idx - total_spin_up_chunks) * self.chunk_len
+                cache = self._memory_cache
 
         if self._memory_cache is not None:
             if cache is None:
@@ -991,8 +1058,9 @@ class ExportedDataset(AbstractDataset):
             if self._shift_days is not None:
                 raise RuntimeError("per-catchment shift requires in-memory data; "
                                    "call load_to_memory() first")
-            # Disk path: contiguous chunk read, zero-padded to `length`.
-            runoff = self._pad_disk_data(self.read_chunk(idx), length)
+            runoff = self._validate_disk_data(self.read_chunk(idx), length)
+
+        runoff = self._apply_upsampling_policy(runoff)
 
         if self._inflow_data is None:
             return runoff
@@ -1014,28 +1082,9 @@ class ExportedDataset(AbstractDataset):
         return runoff, inflow, loss
 
     def _chunk_base_t(self, idx: int) -> int:
-        """Return read-axis offset for a chunk, including spin-up cycling."""
-        if self.spin_up_cycles <= 0:
-            return idx * self.chunk_len
-        if self.time_interval is None:
-            raise ValueError("time_interval must be provided for spin-up reads")
-        if self.spin_up_start_date is None or self.spin_up_end_date is None:
-            raise ValueError(
-                "spin_up_start_date and spin_up_end_date are required when "
-                "spin_up_cycles > 0"
-            )
-        total_spin_up_chunks = self._spin_up_num_chunks * self.spin_up_cycles
-        if idx < total_spin_up_chunks:
-            cycle_idx = idx % self._spin_up_num_chunks
-            spin_offset = self.spin_up_start_date - self.start_date
-            spin_offset_steps = timedelta_quotient(
-                spin_offset,
-                self.time_interval,
-                duration_label="spin-up read offset",
-                interval_label="time_interval",
-            )
-            return spin_offset_steps + cycle_idx * self.chunk_len
-        return (idx - total_spin_up_chunks) * self.chunk_len
+        """Return a chunk's logical offset from the main source origin."""
+
+        return self.chunk_plan[idx].source_offset
 
     @staticmethod
     def _gather(data: np.ndarray, shift: Optional[np.ndarray],
@@ -1112,6 +1161,22 @@ class ExportedDataset(AbstractDataset):
                 "time_steps=%d", window, stride, self._window_starts.size, T,
             )
 
+    def filter_windows(self, keep: np.ndarray) -> None:
+        """Retain selected sampling windows without exposing private state."""
+
+        if self._window_starts is None:
+            raise RuntimeError("enable_windows must be called before filter_windows")
+        mask = np.asarray(keep)
+        if (
+            not np.issubdtype(mask.dtype, np.bool_)
+            or mask.shape != self._window_starts.shape
+        ):
+            raise ValueError(
+                "window filter must be a boolean array with shape "
+                f"{self._window_starts.shape}; got {mask.shape}"
+            )
+        self._window_starts = self._window_starts[mask]
+
     # -------------------------
     # Overlay helpers
     # -------------------------
@@ -1124,11 +1189,11 @@ class ExportedDataset(AbstractDataset):
 
         ``data[0]`` corresponds to ``data_start_date``; output row 0
         corresponds to ``self.start_date`` and output has
-        ``num_main_steps`` rows.  Missing rows are NaN-filled so temporal
+        ``num_main_source_steps`` rows. Missing rows are NaN-filled so temporal
         padding cannot be mistaken for a real zero observation; rows beyond
         the dataset window are dropped.
         """
-        T_ds = int(self.num_main_steps)
+        T_ds = int(self.num_main_source_steps)
         T_src = int(data.shape[0])
         data_offset = timedelta_quotient(
             data_start_date - self.start_date,
@@ -1394,21 +1459,33 @@ class ExportedDataset(AbstractDataset):
             )
 
     @property
+    def time_shift_steps(self) -> Optional[np.ndarray]:
+        """Per-mapped-column source-time offset, or ``None`` for no shift."""
+
+        return self._shift_days
+
+    @property
     def inflow_valid_length_days(self) -> Optional[np.ndarray]:
         """Per-column number of leading valid read-axis steps, or ``None``."""
+
         return self._inflow_valid_length_days
 
     @property
     def inflow_shift_days(self) -> Optional[np.ndarray]:
-        """Per-column basin-coordinated read-axis shift (days), or ``None``."""
+        """Per-column basin-coordinated read-axis shift, or ``None``."""
+
         return self._inflow_shift_days
 
     @property
     def basin_shift(self) -> dict[int, int]:
+        """Return the coordinated read-axis shift keyed by basin ID."""
+
         return dict(self._basin_shift)
 
     @property
     def basin_length(self) -> dict[int, int]:
+        """Return the coordinated valid length keyed by basin ID."""
+
         return dict(self._basin_length)
 
     # -------------------------
@@ -1484,6 +1561,7 @@ def open_multivariable_exported(
     *,
     start_date: datetime,
     end_date: datetime,
+    model_step: timedelta,
     time_interval: timedelta = timedelta(days=1),
     chunk_len: Optional[int] = None,
     spin_up_cycles: int = 0,
@@ -1499,6 +1577,7 @@ def open_multivariable_exported(
     shared = {
         "base_dir": base_dir, "start_date": start_date,
         "end_date": end_date, "time_interval": time_interval,
+        "model_step": model_step,
         "spin_up_cycles": spin_up_cycles,
         "spin_up_start_date": spin_up_start_date,
         "spin_up_end_date": spin_up_end_date,
@@ -1516,4 +1595,4 @@ def open_multivariable_exported(
         datasets[name] = ExportedDataset(**options)
     from hydroforge.data.datasets.multivariable import MultiVariableDataset
 
-    return MultiVariableDataset(datasets, loader_strategy="combined")
+    return MultiVariableDataset(datasets)

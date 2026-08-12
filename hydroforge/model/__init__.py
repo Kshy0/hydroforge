@@ -13,8 +13,11 @@ from hydroforge.model.model import AbstractModel
 from hydroforge.contracts.kernel_field import KernelField, kernel_field
 from hydroforge.model.module import (
     AbstractModule,
+    ModuleReference,
     TensorField,
     computed_tensor_field,
+    module_ref,
+    optional_module_ref,
 )
 
 __all__ = [
@@ -25,10 +28,13 @@ __all__ = [
     "InputProxy",
     "KernelField",
     "ModelEvent",
+    "ModuleReference",
     "NullEventSink",
     "TensorField",
     "SubstepFrame",
     "computed_tensor_field",
     "kernel_field",
     "managed_step",
+    "module_ref",
+    "optional_module_ref",
 ]

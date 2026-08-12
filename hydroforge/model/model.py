@@ -9,12 +9,12 @@ from __future__ import annotations
 import re
 import inspect
 from abc import ABC
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import cache, cached_property
 from pathlib import Path
 from types import MappingProxyType
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    Mapping, Self, Tuple, Type, Union)
+                    Mapping, Protocol, Self, Tuple, Union)
 
 import cftime
 import torch
@@ -22,6 +22,7 @@ from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
                       field_validator, model_validator)
 
 from hydroforge.statistics.ir import parse_operation
+from hydroforge.data.distributed import ProcessTopology
 from hydroforge.data.input import InputProxy
 from hydroforge.contracts.kernel_field import KernelField
 from hydroforge.contracts.fields import tensor_is_active
@@ -35,12 +36,33 @@ from hydroforge.contracts.runtime import (
     DEFAULT_MODULE_REQUIREMENT,
     ModuleRequirement,
 )
-from hydroforge.model.module import AbstractModule
+from hydroforge.model.module import AbstractModule, ModuleReference
 from hydroforge.execution.boundaries import between_steps
 from hydroforge.serialization.netcdf import default_netcdf_options
 
 if TYPE_CHECKING:
+    from hydroforge.compiler.data import ModelDataCompiler
+    from hydroforge.compiler.namespace import NamespaceCompiler
+    from hydroforge.compiler.partition import (
+        GroupRankLookup,
+        PartitionCompiler,
+    )
+    from hydroforge.compiler.model import FieldOwner
+    from hydroforge.compiler.statistics_binding import StatisticsBindingCompiler
+    from hydroforge.execution.outer import OuterRuntime
     from hydroforge.execution.parameters import ParameterChangeEffect
+    from hydroforge.execution.parameters import ParameterPlanRuntime
+    from hydroforge.execution.progress import ProgressRuntime
+    from hydroforge.execution.runtime import ModelExecution
+    from hydroforge.execution.substeps import SubstepRuntime
+    from hydroforge.output.checkpoint import CheckpointRuntime
+    from hydroforge.contracts.fields import PartitionSchema
+
+
+class FeatureRule(Protocol):
+    """Callable contract for a derived model capability."""
+
+    def __call__(self, model: AbstractModel, /) -> bool: ...
 
 
 class AbstractModel(BaseModel, ABC):
@@ -52,12 +74,11 @@ class AbstractModel(BaseModel, ABC):
         arbitrary_types_allowed=True,
         validate_assignment=False,
         extra='forbid',
-        ignored_types=(KernelField,),
+        ignored_types=(KernelField, ModuleReference),
     )
 
     # Class variables
-    module_list: ClassVar[Dict[str, Type[AbstractModule]]] = {}
-    feature_rules: ClassVar[Dict[str, Any]] = {}
+    feature_rules: ClassVar[Mapping[str, bool | FeatureRule]] = {}
     backend_requirements: ClassVar[Mapping[str, BackendRequirement]] = {}
     module_requirements: ClassVar[Mapping[str, ModuleRequirement]] = {}
     partition_key: ClassVar[Optional[str]] = None
@@ -79,14 +100,14 @@ class AbstractModel(BaseModel, ABC):
         default_factory=list,
         description="List of active modules",
     )
-    # Preferred shape: dict[op -> str | list[str]];
+    # Canonical shape: dict[op -> list[str | {alias: expression}]];
     # op in {mean,sum,max,min,first,last};
     # one variable can appear under multiple ops.  Use the reserved key
     # ``"static"`` to register per-saved-point static variables — these
     # are materialised once at aggregator init and written into every
     # output NC alongside the dynamic results.
-    variables_to_save: Optional[Dict[str, Union[str, List[Union[str, Dict[str, str]]]]]] = Field(
-        default=None,
+    variables_to_save: Dict[str, List[Union[str, Dict[str, str]]]] = Field(
+        default_factory=dict,
         description=(
             "Statistics to save, in the form {op: [vars...]}. "
             "Supported ops: mean, sum, max, min, first, last. "
@@ -103,8 +124,8 @@ class AbstractModel(BaseModel, ABC):
         default="float32",
         description="Base precision of the model",
     )
-    mixed_precision: bool = Field(
-        default=False,
+    mixed_precision: Optional[bool] = Field(
+        default=None,
         description=(
             "Enable mixed precision for hpfloat (storage) tensors.\n"
             "When True, hpfloat tensors are promoted one level above base precision:\n"
@@ -121,14 +142,6 @@ class AbstractModel(BaseModel, ABC):
             "launch directly observable for differentiation and debugging."
         ),
     )
-    world_size: int = Field(
-        default=1,
-        description="Total number of distributed processes",
-    )
-    rank: int = Field(
-        default=0,
-        description="Current process rank in distributed setup",
-    )
     device: torch.device = Field(
         default=torch.device("cpu"),
         description="Device for tensors (e.g., 'cuda:0', 'cpu')",
@@ -137,9 +150,12 @@ class AbstractModel(BaseModel, ABC):
         default_factory=ConsoleEventSink,
         description="Structured lifecycle/progress event destination",
     )
-    BLOCK_SIZE: int = Field(
-        default=256,
-        description="GPU block size for kernels",
+    BLOCK_SIZE: Optional[int] = Field(
+        default=None,
+        description=(
+            "Global GPU block-size override. None lets each kernel select its "
+            "backend default."
+        ),
         ge=1,
         le=1024,
         strict=True,
@@ -164,21 +180,27 @@ class AbstractModel(BaseModel, ABC):
         default=200,
         description="Maximum number of pending time steps for output buffering",
     )
-    output_start_time: Optional[Union[datetime, cftime.datetime]] = Field(
+    current_time: Optional[Union[datetime, cftime.datetime]] = Field(
         default=None,
-        description="Time to start saving output",
+        description=(
+            "Runtime-owned time of the next managed model step. A simulation "
+            "schedule initializes and advances it automatically."
+        ),
     )
     simulation_schedule: Optional[SimulationSchedule] = Field(
         default=None,
-        description="Driver-owned model call schedule and calendar contract",
+        description="Runtime-owned model call schedule and calendar contract",
     )
     statistics_plan: Optional[StatisticsPlan] = Field(
         default=None,
         description="Calendar-aware or explicit statistics window plan",
     )
-    calendar: str = Field(
-        default="standard",
-        description="Calendar type for time handling (e.g., standard, noleap)",
+    calendar: Optional[str] = Field(
+        default=None,
+        description=(
+            "Calendar when no simulation schedule is configured. A schedule "
+            "owns the calendar when present."
+        ),
     )
     in_memory_output: bool = Field(
         default=False,
@@ -204,31 +226,79 @@ class AbstractModel(BaseModel, ABC):
     )
 
     _modules: Dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
+    _model_modules_bound: bool = PrivateAttr(default=False)
+    _process_topology: ProcessTopology = PrivateAttr(
+        default_factory=lambda: ProcessTopology.capture(),
+    )
 
     _capabilities: frozenset[str] = PrivateAttr(default_factory=frozenset)
-    # Concrete compiler/runtime objects are intentionally not imported here:
-    # the declarative model layer must not depend on its consumers.
-    _execution: Any = PrivateAttr()
-    _namespace: Any = PrivateAttr()
-    _statistics: Any = PrivateAttr()
-    _checkpoint: Any = PrivateAttr()
-    _data: Any = PrivateAttr()
-    _partition: Any = PrivateAttr()
-    _plan: Any = PrivateAttr()
-    _parameters: Any = PrivateAttr()
-    _progress_service: Any = PrivateAttr()
+    # Imports remain TYPE_CHECKING-only so the declarative layer does not gain
+    # runtime dependencies on its compiler and execution consumers.
+    _execution: ModelExecution = PrivateAttr()
+    _namespace: NamespaceCompiler = PrivateAttr()
+    _statistics: StatisticsBindingCompiler = PrivateAttr()
+    _checkpoint: CheckpointRuntime = PrivateAttr()
+    _data: ModelDataCompiler = PrivateAttr()
+    _partition: PartitionCompiler = PrivateAttr()
+    _field_namespace: Mapping[str, tuple[FieldOwner, ...]] = PrivateAttr()
+    _parameters: ParameterPlanRuntime = PrivateAttr()
+    _progress_service: ProgressRuntime = PrivateAttr()
+    _substeps: SubstepRuntime = PrivateAttr()
+    _outer: OuterRuntime = PrivateAttr()
 
-    # Progress Tracking
-    _progress: Optional[Any] = PrivateAttr(default=None)
     _sealed_configuration: Optional[Dict[str, object]] = PrivateAttr(
         default=None,
     )
 
+    @property
+    def substeps(self) -> SubstepRuntime:
+        """Typed compiled substep authoring interface."""
+
+        return self._substeps
+
+    @property
+    def rank(self) -> int:
+        """Rank captured from the process group when this model was built."""
+
+        return self._process_topology.rank
+
+    @property
+    def world_size(self) -> int:
+        """World size captured from the process group when this model was built."""
+
+        return self._process_topology.world_size
+
+    @property
+    def outer(self) -> OuterRuntime:
+        """Typed once-per-outer-step operator authoring interface."""
+
+        return self._outer
+
     def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"rank", "world_size"}:
+            raise AttributeError(
+                f"model {name} is read-only process-group topology"
+            )
+        model_module = self.get_module_reference_fields().get(name)
+        if model_module is not None:
+            model_module.__set__(self, value)
+
         private = getattr(self, "__pydantic_private__", None)
         sealed = (
             None if private is None else private.get("_sealed_configuration")
         )
+        if (
+            sealed is not None
+            and name == "current_time"
+            and getattr(self, "simulation_schedule", None) is not None
+        ):
+            current = getattr(self, "current_time", None)
+            if value != current:
+                raise RuntimeError(
+                    "current_time is runtime-owned when simulation_schedule "
+                    "is configured"
+                )
+            return
         if sealed is not None and name in sealed and value is not sealed[name]:
             raise RuntimeError(
                 f"model configuration field {name!r} is sealed after "
@@ -236,7 +306,18 @@ class AbstractModel(BaseModel, ABC):
             )
         super().__setattr__(name, value)
 
+    def _set_runtime_current_time(
+        self, value: Union[datetime, cftime.datetime],
+    ) -> None:
+        """Advance the sealed schedule clock from the managed-step runtime."""
+
+        super().__setattr__("current_time", value)
+
     def __delattr__(self, name: str) -> None:
+        if name in {"rank", "world_size"}:
+            raise AttributeError(
+                f"model {name} is read-only process-group topology"
+            )
         private = getattr(self, "__pydantic_private__", None)
         sealed = (
             None if private is None else private.get("_sealed_configuration")
@@ -255,14 +336,14 @@ class AbstractModel(BaseModel, ABC):
         # point.  Freeze their collection-valued source declarations rather
         # than scanning them on every outer step for in-place mutations.
         self.opened_modules = tuple(self.opened_modules)
-        if self.variables_to_save is not None:
-            self.variables_to_save = MappingProxyType({
-                key: self._freeze_configuration_value(value)
-                for key, value in self.variables_to_save.items()
-            })
+        self.variables_to_save = MappingProxyType({
+            key: self._freeze_configuration_value(value)
+            for key, value in self.variables_to_save.items()
+        })
         self._sealed_configuration = {
             name: getattr(self, name)
             for name in type(self).model_fields
+            if name != "current_time"
         }
 
     @classmethod
@@ -293,6 +374,7 @@ class AbstractModel(BaseModel, ABC):
                 "post-module initialization in initialize_model_state() so "
                 "HydroForge can roll it back transactionally"
             )
+        module_types = cls.module_types()
         unknown_backends = set(cls.backend_requirements).difference({
             "torch", "cuda", "triton", "metal",
         })
@@ -311,7 +393,7 @@ class AbstractModel(BaseModel, ABC):
                 f"{cls.__name__}.backend_requirements must contain "
                 f"BackendRequirement values: {invalid_backends}"
             )
-        unknown_modules = set(cls.module_requirements).difference(cls.module_list)
+        unknown_modules = set(cls.module_requirements).difference(module_types)
         if unknown_modules:
             raise ValueError(
                 f"{cls.__name__}.module_requirements names unknown modules: "
@@ -333,8 +415,23 @@ class AbstractModel(BaseModel, ABC):
         cls.module_requirements = MappingProxyType(
             dict(cls.module_requirements),
         )
-        cls.module_list = MappingProxyType(dict(cls.module_list))
         cls.feature_rules = MappingProxyType(dict(cls.feature_rules))
+
+    @classmethod
+    def get_module_reference_fields(cls) -> Dict[str, ModuleReference]:
+        """Return the model's typed module declarations."""
+
+        return ModuleReference.collect(cls)
+
+    @classmethod
+    @cache
+    def module_types(cls) -> Mapping[str, type[AbstractModule]]:
+        """Return the immutable module catalog derived from declarations."""
+
+        return MappingProxyType({
+            name: reference.module_type
+            for name, reference in cls.get_module_reference_fields().items()
+        })
 
     @classmethod
     @cache
@@ -343,7 +440,7 @@ class AbstractModel(BaseModel, ABC):
         from hydroforge.contracts.fields import parse_module_schema
 
         return parse_module_schema(
-            tuple(cls.module_list.values()), include_computed=True,
+            tuple(cls.module_types().values()), include_computed=True,
         )
 
     @field_validator(
@@ -357,37 +454,50 @@ class AbstractModel(BaseModel, ABC):
 
         return normalize_netcdf_variable_options(value)
 
-    @model_validator(mode='after')
-    def align_output_start_time(self) -> Self:
-        """
-        Ensures output_start_time matches the specified calendar type.
-        """
-        if self.output_start_time is None or self.calendar == "standard":
-            return self
+    @field_validator("variables_to_save", mode="before")
+    @classmethod
+    def validate_variables_to_save_shape(cls, value):
+        """Reject legacy output spellings before Pydantic can coerce them."""
 
-        # If output_start_time is standard datetime but calendar is not standard (e.g. noleap)
-        # we try to convert it to the appropriate cftime object.
-        if isinstance(self.output_start_time, datetime) and not isinstance(self.output_start_time, cftime.datetime):
-            try:
-                # Create a dummy object to get the class type for this calendar
-                dummy = cftime.num2date([0], units="days since 1900-01-01", calendar=self.calendar)[0]
-                Cls = dummy.__class__
-
-                kwargs = {}
-                if hasattr(dummy, "has_year_zero"):
-                    kwargs["has_year_zero"] = dummy.has_year_zero
-
-                self.output_start_time = Cls(
-                    self.output_start_time.year, self.output_start_time.month, self.output_start_time.day,
-                    self.output_start_time.hour, self.output_start_time.minute, self.output_start_time.second,
-                    self.output_start_time.microsecond, **kwargs
-                )
-            except (TypeError, ValueError, OverflowError) as exc:
+        if type(value) is not dict:
+            raise ValueError("variables_to_save must be an exact dict")
+        normalized = {}
+        for operation, items in value.items():
+            if type(operation) is not str or not operation:
                 raise ValueError(
-                    f"output_start_time {self.output_start_time!r} cannot be "
-                    f"represented by calendar '{self.calendar}'"
-                ) from exc
-        return self
+                    "variables_to_save operation names must be non-empty strings"
+                )
+            canonical = operation.lower()
+            if canonical in normalized:
+                raise ValueError(
+                    "variables_to_save contains duplicate normalized "
+                    f"operation {canonical!r}"
+                )
+            if type(items) is not list:
+                raise ValueError(
+                    f"variables_to_save[{operation!r}] must be an exact list"
+                )
+            for item in items:
+                if type(item) is str:
+                    if not item:
+                        raise ValueError("output field names must be non-empty")
+                    continue
+                if type(item) is not dict or len(item) != 1:
+                    raise ValueError(
+                        "output items must be field names or one-item "
+                        "{alias: expression} dicts"
+                    )
+                alias, expression = next(iter(item.items()))
+                if (
+                    type(alias) is not str or not alias
+                    or type(expression) is not str or not expression
+                ):
+                    raise ValueError(
+                        "explicit output aliases and expressions must be "
+                        "non-empty strings"
+                    )
+            normalized[canonical] = items
+        return normalized
 
     @model_validator(mode="after")
     def validate_module_requirements(self) -> Self:
@@ -437,15 +547,16 @@ class AbstractModel(BaseModel, ABC):
         """
         field_definitions = {}
         schema = self.compiled_schema()
+        module_types = self.module_types()
         for module_name in self.opened_modules:
-            excluded = set(self.module_list[module_name].nc_excluded_fields)
+            excluded = set(module_types[module_name].nc_excluded_fields)
             for field in schema.fields(module_name):
                 if field.tensor is not None:
                     unknown_dependencies = sorted(
                         set(
                             (*field.tensor.depends_on,
                              *field.tensor.required_by),
-                        ).difference(self.module_list)
+                        ).difference(module_types)
                     )
                     if unknown_dependencies:
                         raise ValueError(
@@ -558,29 +669,22 @@ class AbstractModel(BaseModel, ABC):
             total_mb=total_memory / (1024 * 1024),
         )
 
-    def get_module(self, module_name: str) -> Optional[AbstractModule]:
-        return self._modules.get(module_name) if module_name in self._capabilities else None
-
-    def has_module(self, module_name: str) -> bool:
-        """Return whether a registered module is open in this specialization."""
-        return module_name in self._capabilities
-
     def has_feature(self, name: str) -> bool:
         """Evaluate a model capability once while a launch plan is built.
 
         Module names are capabilities automatically. Composite capabilities
         are declared in ``feature_rules`` as callables receiving the model.
         """
-        if name not in self.module_list and name not in self.feature_rules:
+        if name not in self.module_types() and name not in self.feature_rules:
             raise KeyError(f"unknown model feature {name!r}")
         return name in self._capabilities
 
     @property
-    def partition_metadata(self):
+    def partition_metadata(self) -> PartitionSchema:
         return self._partition.schema
 
     @property
-    def variable_group_mapping(self) -> Dict[str, str]:
+    def variable_group_mapping(self) -> Mapping[str, str]:
         return self._partition.variable_groups
 
     @cached_property
@@ -597,7 +701,7 @@ class AbstractModel(BaseModel, ABC):
         return self._namespace.build()
 
     @cached_property
-    def group_id_to_rank(self) -> Any:
+    def group_id_to_rank(self) -> GroupRankLookup:
         return self._partition.group_ranks
 
     def close(self) -> None:
@@ -649,7 +753,7 @@ class AbstractModel(BaseModel, ABC):
             target_id_field=target_id_field,
         )
 
-    def get_variable(self, variable_name: str) -> Any:
+    def get_variable(self, variable_name: str) -> torch.Tensor:
         value = self._parameters.get_variable(variable_name)
         if not isinstance(value, torch.Tensor):
             raise TypeError(
@@ -674,6 +778,28 @@ class AbstractModel(BaseModel, ABC):
 
     def summarize_plan(self) -> None:
         self._parameters.summarize_plan()
+
+    @property
+    def step_output_enabled(self) -> bool:
+        """Return the effective output state of the active managed step."""
+
+        context = self._execution.active_step
+        if context is None:
+            raise RuntimeError(
+                "step_output_enabled is available only inside @managed_step"
+            )
+        return context.output_enabled
+
+    @property
+    def step_duration(self) -> timedelta:
+        """Return the exact duration owned by the active managed step."""
+
+        context = self._execution.active_step
+        if context is None:
+            raise RuntimeError(
+                "step_duration is available only inside @managed_step"
+            )
+        return context.duration
 
     def progress_start(self) -> None:
         self._progress_service.begin_step()
@@ -757,11 +883,9 @@ class AbstractModel(BaseModel, ABC):
         return self._data.shard()
 
     @between_steps
-    def save_state(
-        self, current_time: Optional[Union[datetime, cftime.datetime]],
-    ) -> InputProxy:
-        """Persist physical model state without runtime cursors."""
-        return self._checkpoint.save(current_time)
+    def save_state(self) -> InputProxy:
+        """Persist physical state at the committed runtime clock."""
+        return self._checkpoint.save()
 
     @between_steps
     def load_state(self, proxy: InputProxy) -> None:
@@ -774,16 +898,41 @@ class AbstractModel(BaseModel, ABC):
         """Validate module names are valid"""
         if not v:
             raise ValueError("No modules opened. Please specify at least one module in opened_modules.")
+        module_types = cls.module_types()
         for module in v:
-            if module not in cls.module_list:
-                raise ValueError(f"Invalid module name: {module}. Available modules: {list(cls.module_list.keys())}")
+            if module not in module_types:
+                raise ValueError(f"Invalid module name: {module}. Available modules: {list(module_types)}")
+        missing_model_modules = [
+            name
+            for name, reference in cls.get_module_reference_fields().items()
+            if not reference.optional and name not in v
+        ]
+        if missing_model_modules:
+            raise ValueError(
+                "Missing required model modules in opened_modules: "
+                f"{missing_model_modules}. Available modules: {v}"
+            )
         for module in v:
-            module_class = cls.module_list[module]
-            missing_deps = [dep for dep in module_class.dependencies if dep not in v]
+            module_class = module_types[module]
+            references = module_class.get_module_reference_fields().values()
+            unknown_references = sorted({
+                reference.module_name
+                for reference in references
+                if reference.module_name not in module_types
+            })
+            if unknown_references:
+                raise ValueError(
+                    f"Module '{module}' declares references to unknown modules: "
+                    f"{unknown_references}. Available modules: "
+                    f"{list(module_types)}"
+                )
+            required = module_class.required_modules()
+            missing_deps = [dep for dep in required if dep not in v]
             if missing_deps:
                 raise ValueError(
-                    f"Module '{module}' has missing dependencies in opened_modules: {missing_deps}. "
-                    f"Required dependencies: {module_class.dependencies}. "
+                    f"Module '{module}' has missing required modules in "
+                    f"opened_modules: {missing_deps}. "
+                    f"Required modules: {required}. "
                     f"Available modules: {v}"
                 )
             present_conflicts = [
@@ -799,40 +948,22 @@ class AbstractModel(BaseModel, ABC):
 
     @model_validator(mode="after")
     def validate_variables_to_save(self) -> Self:
-        if self.variables_to_save is None:
+        if not self.variables_to_save:
             return self
-        # Validate shape: dict[op -> vars]
-        if not isinstance(self.variables_to_save, dict):
-            # Optional convenience: list[str] => mean
-            names = list(self.variables_to_save) if isinstance(self.variables_to_save, list) else []
-            pairs = [(n, "mean") for n in names]
-        else:
-            pairs = []
-            for op, vs in self.variables_to_save.items():
-                # Static (op=="static") entries bypass op-grammar checks;
-                # the runtime registers them via register_static.
-                if op == "static":
-                    continue
-                op_l = str(op).lower()
-                parse_operation(op_l)
-
-                if isinstance(vs, str):
-                    vars_list = [vs]
-                elif isinstance(vs, list):
-                    vars_list = vs
+        pairs = []
+        for op, variables in self.variables_to_save.items():
+            operation = op
+            # Static entries bypass operation-grammar and dynamic-field checks;
+            # the runtime registers them once through register_static.
+            if operation == "static":
+                continue
+            parse_operation(operation)
+            for variable in variables:
+                if isinstance(variable, dict):
+                    alias, expression = next(iter(variable.items()))
+                    pairs.append((alias, operation, True))
                 else:
-                    raise ValueError(f"variables_to_save['{op}'] must be a string or list of strings/dicts")
-                for var in vars_list:
-                    if isinstance(var, dict):
-                        var_name = next(iter(var.keys()))
-                        # Explicit definition {alias: expr} -> Treat as valid virtual
-                        pairs.append((var_name, op_l, True))
-                    elif isinstance(var, (tuple, list)):
-                        var_name = var[0]
-                         # Explicit definition (alias, expr) -> Treat as valid virtual
-                        pairs.append((var_name, op_l, True))
-                    else:
-                        pairs.append((var, op_l, False))
+                    pairs.append((variable, operation, False))
 
         # Validate each variable exists. Output views are resolved later from
         # dim_coords and the coordinate's SelectionField.
@@ -842,7 +973,7 @@ class AbstractModel(BaseModel, ABC):
 
             found = False
             for module in self.opened_modules:
-                module_class = self.module_list[module]
+                module_class = self.module_types()[module]
                 fields = module_class.model_fields | module_class.model_computed_fields
                 if var in fields:
                     found = True
@@ -857,15 +988,6 @@ class AbstractModel(BaseModel, ABC):
 
             if not found:
                 raise ValueError(f"Variable '{var}' not found in any opened module.")
-        return self
-
-    @model_validator(mode="after")
-    def validate_rank(self) -> Self:
-        """
-        Validate that the current rank is within the world size.
-        """
-        if self.rank < 0 or self.rank >= self.world_size:
-            raise ValueError(f"Invalid rank {self.rank} for world size {self.world_size}.")
         return self
 
     @model_validator(mode="after")

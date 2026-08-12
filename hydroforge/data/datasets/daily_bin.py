@@ -32,18 +32,11 @@ class DailyBinDataset(GriddedDataset):
 
     def _build_file_mapping(self):
         """Map each simulation date to ``(file_key, frame_index)``."""
-        dates = set()
-        t = self.start_date
-        while t <= self.end_date:
-            dates.add(t)
-            t += self.time_interval
-
-        # Also handle spin-up dates
-        if self.spin_up_cycles > 0 and self.spin_up_start_date and self.spin_up_end_date:
-            t = self.spin_up_start_date
-            while t <= self.spin_up_end_date:
-                dates.add(t)
-                t += self.time_interval
+        dates = {
+            chunk.source_time(offset, self.time_interval)
+            for chunk in self.chunk_plan
+            for offset in range(chunk.length)
+        }
 
         by_key: dict[str, list] = {}
         for dt in dates:
@@ -89,6 +82,7 @@ class DailyBinDataset(GriddedDataset):
                  shape: List[int],
                  start_date: datetime,
                  end_date: datetime,
+                 model_step: timedelta,
                  prefix: str,
                  unit_factor: float = 1.0, # mm/day divided by unit_factor to get m/s
                  bin_dtype: str = "float32",
@@ -109,7 +103,17 @@ class DailyBinDataset(GriddedDataset):
         self.lat_south_to_north = lat_south_to_north
         self.lon_0_to_360 = lon_0_to_360
         self.time_to_key = time_to_key if time_to_key is not None else single_file_key
-        super().__init__(out_dtype=out_dtype, chunk_len=1, time_interval=timedelta(days=1), start_date=start_date, end_date=end_date, calendar=calendar, *args, **kwargs)
+        super().__init__(
+            out_dtype=out_dtype,
+            chunk_len=1,
+            time_interval=timedelta(days=1),
+            model_step=model_step,
+            start_date=start_date,
+            end_date=end_date,
+            calendar=calendar,
+            *args,
+            **kwargs,
+        )
         self._build_file_mapping()
         self._validate_files_exist()
 

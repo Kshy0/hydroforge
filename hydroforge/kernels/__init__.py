@@ -2,7 +2,6 @@
 
 from hydroforge.kernels.registry import (
     BackendRegistry,
-    KERNEL_BACKEND,
     KernelEntry,
     make_metal_dispatcher,
     make_torch_dispatcher,
@@ -12,7 +11,6 @@ from hydroforge.kernels.registry import (
 
 __all__ = [
     "BackendRegistry",
-    "KERNEL_BACKEND",
     "KernelEntry",
     "make_metal_dispatcher",
     "make_torch_dispatcher",

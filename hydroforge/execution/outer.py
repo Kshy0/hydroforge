@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import sys
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
+
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
 
 
 _MISSING = object()
 
 
 class _OuterProgram:
-    def __init__(self, model: Any, operators: Any) -> None:
+    def __init__(self, model: AbstractModel, operators: Any) -> None:
         if operators is None or not operators.operators:
             raise RuntimeError("outer operator scope produced an empty program")
         self.capture = model._execution.capture
@@ -71,7 +74,7 @@ class _OnceScope:
 class OuterRuntime:
     """Declare cached once-per-outer-step operator sequences."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: AbstractModel) -> None:
         self.model = model
 
     def once(self, *, specialization: Any = None) -> _OnceScope:

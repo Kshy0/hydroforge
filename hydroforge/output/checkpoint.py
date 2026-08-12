@@ -412,6 +412,10 @@ class CheckpointRuntime:
                     "checkpoint restore rollback",
                     (commit_error, *rollback_errors),
                 )
+                # ``load`` cannot receive the original snapshots when this
+                # method raises. Preserve that loss-of-proof on the original
+                # aggregate without replacing its public error type or causes.
+                error._checkpoint_restore_incomplete = True
                 raise error from commit_error
             raise
         return [
@@ -419,7 +423,41 @@ class CheckpointRuntime:
             for restore, original in zip(restores, originals, strict=True)
         ]
 
-    def _stage_save(self, current_time: Any) -> _CheckpointSaveStage:
+    def _rollback_load(
+        self,
+        originals: list[_TensorRestore] | None,
+        commit_error: BaseException | None,
+    ) -> BaseException | None:
+        """Restore local pre-load state and report any loss of proof."""
+
+        model = self.model
+        rollback_errors: list[BaseException] = []
+        if originals is not None:
+            try:
+                self._commit_restores(originals)
+            except BaseException as rollback_error:
+                rollback_errors.append(rollback_error)
+        rebuild = getattr(model, "rebuild_runtime_state", None)
+        if rebuild is not None:
+            try:
+                rebuild()
+            except BaseException as rollback_error:
+                rollback_errors.append(rollback_error)
+        restore_incomplete = bool(
+            commit_error is not None
+            and getattr(
+                commit_error, "_checkpoint_restore_incomplete", False,
+            )
+        )
+        if not rollback_errors:
+            return commit_error if restore_incomplete else None
+        failures = (
+            (commit_error, *rollback_errors)
+            if restore_incomplete else tuple(rollback_errors)
+        )
+        return ResourceCleanupError("checkpoint load rollback", failures)
+
+    def _stage_save(self) -> _CheckpointSaveStage:
         """Snapshot and validate checkpoint state without publishing a file."""
 
         model = self.model
@@ -429,6 +467,7 @@ class CheckpointRuntime:
             raise ValueError(
                 "Checkpoint save currently requires a non-ensemble model"
             )
+        current_time = model.current_time
         timestamp = (
             current_time.strftime("%Y%m%d_%H%M%S")
             if current_time else "latest"
@@ -480,14 +519,14 @@ class CheckpointRuntime:
             attrs=attrs,
         )
 
-    def save(self, current_time: Any) -> InputProxy:
+    def save(self) -> InputProxy:
         """Persist a checkpoint through rank-synchronous failure phases."""
 
         model = self.model
         stage = None
         stage_error: BaseException | None = None
         try:
-            stage = self._stage_save(current_time)
+            stage = self._stage_save()
         except BaseException as error:
             stage_error = error
         stage_failures, checkpoint_id = self._synchronize_save_identity(
@@ -779,32 +818,62 @@ class CheckpointRuntime:
         except BaseException as error:
             commit_error = error
 
-        commit_failures = self._gather_failures(commit_error)
-        if any(failure is not None for failure in commit_failures):
-            rollback_errors: list[BaseException] = []
-            rollbacks = (
-                lambda: (
-                    None if original_tensors is None
-                    else self._commit_restores(original_tensors)
-                ),
-                lambda: (
-                    None
-                    if getattr(model, "rebuild_runtime_state", None) is None
-                    else model.rebuild_runtime_state()
-                ),
+        try:
+            commit_failures = self._gather_failures(commit_error)
+        except BaseException as coordination_error:
+            rollback_error = self._rollback_load(
+                original_tensors, commit_error,
             )
-            for rollback in rollbacks:
-                try:
-                    rollback()
-                except BaseException as rollback_error:
-                    rollback_errors.append(rollback_error)
-            rollback_error: BaseException | None = None
-            if rollback_errors:
-                rollback_error = ResourceCleanupError(
-                    "checkpoint load rollback",
-                    tuple(rollback_errors),
+            failures: list[BaseException] = []
+            if commit_error is not None:
+                failures.append(commit_error)
+            failures.append(coordination_error)
+            if (
+                rollback_error is not None
+                and rollback_error is not commit_error
+            ):
+                failures.append(rollback_error)
+            failure = (
+                coordination_error
+                if len(failures) == 1 else ResourceCleanupError(
+                    "checkpoint load commit coordination", failures,
                 )
-            rollback_failures = self._gather_failures(rollback_error)
+            )
+            phase = (
+                "checkpoint load commit coordination"
+                if rollback_error is None else "checkpoint load rollback"
+            )
+            execution.poison(failure, phase=phase)
+            if failure is coordination_error:
+                raise
+            raise failure from coordination_error
+        if any(failure is not None for failure in commit_failures):
+            rollback_error = self._rollback_load(
+                original_tensors, commit_error,
+            )
+            try:
+                rollback_failures = self._gather_failures(rollback_error)
+            except BaseException as coordination_error:
+                failures = []
+                if commit_error is not None:
+                    failures.append(commit_error)
+                else:
+                    try:
+                        self._raise_remote_failure(
+                            "load commit", commit_failures,
+                        )
+                    except RuntimeError as remote_commit_error:
+                        failures.append(remote_commit_error)
+                if rollback_error is not None:
+                    failures.append(rollback_error)
+                failures.append(coordination_error)
+                failure = ResourceCleanupError(
+                    "checkpoint load rollback coordination", failures,
+                )
+                execution.poison(
+                    failure, phase="checkpoint load rollback coordination",
+                )
+                raise failure from coordination_error
             if any(failure is not None for failure in rollback_failures):
                 if rollback_error is None:
                     rollback_error = RuntimeError(
@@ -820,6 +889,8 @@ class CheckpointRuntime:
                 execution.poison(
                     rollback_error, phase="checkpoint load rollback",
                 )
+                if rollback_error is commit_error:
+                    raise rollback_error
                 raise rollback_error from commit_error
             if commit_error is not None:
                 raise commit_error
@@ -832,7 +903,22 @@ class CheckpointRuntime:
             )
         except BaseException as error:
             event_error = error
-        event_failures = self._gather_failures(event_error)
+        try:
+            event_failures = self._gather_failures(event_error)
+        except BaseException as coordination_error:
+            failure = (
+                coordination_error
+                if event_error is None else ResourceCleanupError(
+                    "checkpoint post-load event coordination",
+                    (event_error, coordination_error),
+                )
+            )
+            execution.poison(
+                failure, phase="checkpoint post-load event coordination",
+            )
+            if failure is coordination_error:
+                raise
+            raise failure from coordination_error
         if any(failure is not None for failure in event_failures):
             if event_error is None:
                 try:

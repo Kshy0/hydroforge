@@ -3,25 +3,31 @@
 from __future__ import annotations
 
 import inspect
-import math
 from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import timedelta
 from functools import wraps
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast
 
 import torch
 import torch.distributed as dist
 
 from hydroforge.contracts.events import emit
 from hydroforge.contracts.temporal import (
-    StatisticsFlags,
-    require_calendar,
+    SimulationStep,
+    timedelta_microseconds,
 )
 from hydroforge.execution.parameters import (
     ParameterChangeEffect, ParameterPlanRuntime,
 )
 from hydroforge.execution.windows import StatisticsWindowController
+
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
+
+
+_F = TypeVar("_F", bound=Callable[..., Any])
 
 
 _ACTIVE_MANAGED_STEP: ContextVar[_StepRuntime | None] = ContextVar(
@@ -44,27 +50,24 @@ class _StepState:
     elapsed: float = 0.0
     start_time: Any = None
     pending_outer_first: bool = False
-    schedule_step: int | None = None
-    output_active: bool = False
 
 
 class _StepRuntime:
     """Private state for one managed outer step."""
 
-    def __init__(self, model: Any, execution: Any) -> None:
+    def __init__(self, model: AbstractModel, execution: Any) -> None:
         self.model = model
         self.execution = execution
-        self.world_size = getattr(model, "world_size", 1)
-        self.rank = getattr(model, "rank", 0)
+        topology = model._process_topology
+        self.world_size = topology.world_size
+        self.rank = topology.rank
         self.schedule = getattr(model, "simulation_schedule", None)
-        self.output_start_time = getattr(model, "output_start_time", None)
-        if type(self.world_size) is not int or self.world_size < 1:
-            raise ValueError("model world_size must be an exact positive int")
         self.statistics = execution.statistics
         self.state = _StepState()
         plan = getattr(model, "statistics_plan", None)
         self.controller = (
-            None if plan is None else StatisticsWindowController(plan)
+            None if plan is None
+            else StatisticsWindowController(plan, self.schedule)
         )
         self._distributed_sequence = 0
         self._distributed_terminal = False
@@ -72,6 +75,7 @@ class _StepRuntime:
         self._distributed_outputs: tuple[torch.Tensor, ...] = ()
         self.stat_is_last = True
         self.stat_is_outer_last = True
+        self.scheduled_step: SimulationStep | None = None
 
     def prepare_invocation(self) -> None:
         """Reset and validate the rank-synchronous managed-step protocol."""
@@ -86,14 +90,6 @@ class _StepRuntime:
                 "multi-rank managed steps require an initialized "
                 "torch.distributed process group"
             )
-        observed_world = dist.get_world_size()
-        observed_rank = dist.get_rank()
-        if observed_world != world_size or observed_rank != self.rank:
-            raise RuntimeError(
-                "model rank topology disagrees with the initialized process "
-                f"group: model=({self.model.rank}, {world_size}), "
-                f"group=({observed_rank}, {observed_world})"
-            )
         backend = str(dist.get_backend()).lower()
         sync_device = (
             self.execution.device if "nccl" in backend
@@ -102,7 +98,7 @@ class _StepRuntime:
         if (
             self._distributed_input is None
             or self._distributed_input.device != sync_device
-            or len(self._distributed_outputs) != observed_world
+            or len(self._distributed_outputs) != world_size
         ):
             self._distributed_input = torch.empty(
                 5, dtype=torch.int64, device=sync_device,
@@ -170,14 +166,12 @@ class _StepRuntime:
 
         self.synchronize_distributed(0, failed=True)
 
-    def snapshot_state(self) -> tuple[tuple[Any, ...], dict[str, Any] | None]:
+    def snapshot_state(self) -> tuple[tuple[Any, ...], tuple[Any, Any] | None]:
         state = self.state
         local = (
             state.elapsed,
             state.start_time,
             state.pending_outer_first,
-            state.schedule_step,
-            state.output_active,
         )
         controller = (
             None if self.controller is None
@@ -186,25 +180,21 @@ class _StepRuntime:
         return local, controller
 
     def restore_snapshot_state(
-        self, snapshot: tuple[tuple[Any, ...], dict[str, Any] | None],
+        self, snapshot: tuple[tuple[Any, ...], tuple[Any, Any] | None],
     ) -> None:
         local, controller = snapshot
         (
             self.state.elapsed,
             self.state.start_time,
             self.state.pending_outer_first,
-            self.state.schedule_step,
-            self.state.output_active,
         ) = local
         if self.controller is not None and controller is not None:
             self.controller.restore_snapshot_state(controller)
 
     def begin(
-        self, *, current_time: Any, time_step: float,
-        output_enabled: bool,
+        self, *, current_time: Any, time_step: timedelta | None,
+        output_enabled: bool | None,
         program_owner: _ManagedStepDescriptor,
-        spinup: bool = False,
-        override: StatisticsFlags | None = None,
     ) -> _StepRuntime:
         state = self.state
         if not isinstance(program_owner, _ManagedStepDescriptor):
@@ -216,77 +206,60 @@ class _StepRuntime:
         self._outer_scope_count = 0
         self.completed_substeps = None
         self._substep_program_owner = program_owner
-        if type(time_step) not in {int, float}:
-            raise TypeError("time_step must be an int or float")
-        self.time_step = float(time_step)
-        if not math.isfinite(self.time_step) or self.time_step <= 0:
-            raise ValueError("time_step must be finite and positive")
-        if type(spinup) is not bool:
-            raise TypeError("spinup must be an exact bool")
+        scheduled_step = self._resolve_model_schedule(current_time=current_time)
+        self.scheduled_step = scheduled_step
+        if scheduled_step is not None:
+            if time_step is not None:
+                raise TypeError(
+                    "time_step is derived from simulation_schedule and must "
+                    "not be provided"
+                )
+            time_step = scheduled_step.end - scheduled_step.start
+        elif time_step is None:
+            raise TypeError(
+                "time_step is required when simulation_schedule is not "
+                "configured"
+            )
+        microseconds = timedelta_microseconds(time_step, label="time_step")
+        if microseconds <= 0:
+            raise ValueError("time_step must be positive")
+        self.duration = time_step
+        self.time_step = microseconds / 1_000_000
+        spinup = scheduled_step is not None and scheduled_step.is_spin_up
+        self.spinup = spinup
+        if output_enabled is None:
+            output_enabled = not spinup
+        elif type(output_enabled) is not bool:
+            raise TypeError("output_enabled must be an exact bool when provided")
         if spinup and output_enabled:
             raise ValueError("spin-up requires output_enabled=False")
-        if spinup and state.schedule_step is not None:
-            raise ValueError(
-                "spin-up cannot resume after the main schedule starts"
-            )
-        if spinup and override is not None:
-            raise ValueError("spin-up does not accept manual statistics flags")
-        if spinup and self.schedule is not None:
-            require_calendar(
-                current_time, self.schedule.calendar, label="model current_time",
-            )
-        if not spinup and self.controller is None:
-            self._validate_model_schedule(
-                current_time=current_time,
-            )
-        if (
-            self.output_start_time is not None and current_time is not None
-            and current_time < self.output_start_time
-        ):
-            output_enabled = False
-        if override is not None and not output_enabled and any((
-            override.first, override.last,
-            override.outer_first, override.outer_last,
-        )):
-            raise ValueError(
-                "manual statistics flags must be false when output is disabled"
-            )
         if spinup:
             self.stat_is_first = self.stat_is_last = False
             outer_first = outer_last = False
             output_enabled = False
         elif self.controller is not None:
+            if scheduled_step is None:
+                raise RuntimeError(
+                    "statistics controller requires a scheduled model step"
+                )
             decision = self.controller.resolve(
-                current_time=current_time,
-                time_step=self.time_step,
+                step=scheduled_step,
                 output_enabled=output_enabled,
-                override=override,
             )
-            if current_time >= self.schedule.start:
-                state.schedule_step = self.schedule.index_at(current_time)
             output_enabled = decision.output_enabled
-            flags = decision.flags
-            self.stat_is_first = flags.first
-            self.stat_is_last = flags.last
-            outer_first = flags.outer_first
-            outer_last = flags.outer_last
-        elif override is not None:
-            StatisticsWindowController._validate_override(override)
-            self.stat_is_first = override.first
-            self.stat_is_last = override.last
-            outer_first = override.outer_first
-            outer_last = override.outer_last
+            self.stat_is_first = decision.first
+            self.stat_is_last = decision.last
+            outer_first = decision.outer_first
+            outer_last = decision.outer_last
         else:
             self.stat_is_first = self.stat_is_last = True
             outer_first = outer_last = True
-        state.output_active = bool(output_enabled)
-        if override is None:
-            if outer_first and not self.stat_is_last:
-                state.pending_outer_first = True
-                outer_first = False
-            if state.pending_outer_first and self.stat_is_last:
-                outer_first = True
-                state.pending_outer_first = False
+        if outer_first and not self.stat_is_last:
+            state.pending_outer_first = True
+            outer_first = False
+        if state.pending_outer_first and self.stat_is_last:
+            outer_first = True
+            state.pending_outer_first = False
         self.stat_is_outer_first = outer_first
         self.stat_is_outer_last = outer_last
         if self.stat_is_first:
@@ -307,35 +280,36 @@ class _StepRuntime:
         )
         return self
 
-    def _validate_model_schedule(self, *, current_time: Any) -> None:
-        """Advance a schedule cursor when statistics does not already own it."""
+    def _resolve_model_schedule(
+        self, *, current_time: Any,
+    ) -> SimulationStep | None:
+        """Resolve the current call from the sole runtime clock."""
 
         schedule = self.schedule
         if schedule is None:
-            return
-        require_calendar(
-            current_time, schedule.calendar, label="model current_time",
-        )
+            return None
+        if current_time == schedule.end:
+            raise RuntimeError("simulation schedule is exhausted")
         try:
             index = schedule.index_at(current_time)
-        except KeyError as error:
+        except KeyError:
             raise ValueError(
-                f"current_time {current_time!r} is not a model schedule boundary"
-            ) from error
+                f"model current_time {current_time!r} is not the start of a "
+                "simulation schedule step"
+            ) from None
         step = schedule.step_at(index)
-        if abs(step.duration_seconds - self.time_step) > 1e-9:
-            raise ValueError(
-                f"time_step {self.time_step} differs from scheduled "
-                f"duration {step.duration_seconds} at {current_time!r}"
-            )
-        previous = self.state.schedule_step
-        expected = None if previous is None else previous + 1
-        if expected is not None and index != expected:
-            raise ValueError(
-                f"model schedule moved from step {previous} to {index}; "
-                f"expected {expected}"
-            )
-        self.state.schedule_step = index
+        return step
+
+    def commit_clock(self) -> None:
+        """Publish the next model time only after the full step succeeds."""
+
+        if self.scheduled_step is not None:
+            next_time = self.scheduled_step.end
+        elif self.current_time is not None:
+            next_time = self.current_time + self.duration
+        else:
+            return
+        self.model._set_runtime_current_time(next_time)
 
     def claim_substep_scope(
         self, *, kind: str, specialization: Any,
@@ -435,53 +409,28 @@ class _StepRuntime:
 
 
 _MISSING = object()
+_FRAMEWORK_STEP_PARAMETERS = frozenset({
+    "current_time",
+    "spinup",
+    "output_enabled",
+    "time_step",
+})
 
 
 class _StepCallLayout:
-    """Precomputed positional/default access for one step signature."""
+    """Validate that model-authored signatures contain only model inputs."""
 
     def __init__(self, function: Callable) -> None:
         parameters = tuple(inspect.signature(function).parameters.values())
-        self.positions = {
-            parameter.name: index for index, parameter in enumerate(parameters)
-        }
-        self.defaults = {
-            parameter.name: parameter.default
-            for parameter in parameters
-            if parameter.default is not inspect.Parameter.empty
-        }
-        if "self" not in self.positions or "time_step" not in self.positions:
-            raise TypeError("@managed_step requires self and time_step parameters")
-
-    def get(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any], name: str,
-        default: Any = _MISSING,
-    ) -> Any:
-        if name in kwargs:
-            return kwargs[name]
-        position = self.positions.get(name)
-        if position is not None and position < len(args):
-            return args[position]
-        if name in self.defaults:
-            return self.defaults[name]
-        if default is not _MISSING:
-            return default
-        raise TypeError(f"missing required step argument {name!r}")
-
-    def replace(
-        self, args: tuple[Any, ...], kwargs: dict[str, Any],
-        name: str, value: Any,
-    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        if name not in self.positions:
-            return args, kwargs
-        position = self.positions[name]
-        if position < len(args):
-            positional = list(args)
-            positional[position] = value
-            return tuple(positional), kwargs
-        keywords = dict(kwargs)
-        keywords[name] = value
-        return args, keywords
+        names = {parameter.name for parameter in parameters}
+        if "self" not in names:
+            raise TypeError("@managed_step requires a self parameter")
+        owned = names.intersection(_FRAMEWORK_STEP_PARAMETERS)
+        if owned:
+            raise TypeError(
+                "@managed_step framework parameters must not appear in the "
+                f"model method signature: {sorted(owned)}"
+            )
 
 
 class _ManagedStepDescriptor:
@@ -489,18 +438,19 @@ class _ManagedStepDescriptor:
         self.function = function
         self.layout = _StepCallLayout(function)
 
-    def compile(self, model: Any) -> _CompiledStepPolicy:
+    def compile(self, model: AbstractModel) -> _CompiledStepPolicy:
         return _CompiledStepPolicy(model, self)
 
 
 class _CompiledStepPolicy:
     """Cached forcing, window, lifecycle and progress policy for one method."""
 
-    def __init__(self, model: Any, descriptor: _ManagedStepDescriptor) -> None:
+    def __init__(
+        self, model: AbstractModel, descriptor: _ManagedStepDescriptor,
+    ) -> None:
         self.model = model
         self.execution = model._execution
         self.descriptor = descriptor
-        self.layout = descriptor.layout
         parameters = getattr(model, "_parameters", None)
         if parameters is not None and not isinstance(
             parameters, ParameterPlanRuntime,
@@ -573,30 +523,39 @@ class _CompiledStepPolicy:
                 raise combined from error
             raise
         snapshot = context.snapshot_state()
-        layout = self.layout
         try:
             kwargs = dict(kwargs)
-            flag_names = (
-                "stat_is_first", "stat_is_last",
-                "stat_is_outer_first", "stat_is_outer_last",
-            )
-            present = tuple(name for name in flag_names if name in kwargs)
-            if present and len(present) != len(flag_names):
-                missing = sorted(set(flag_names).difference(present))
+            if "current_time" in kwargs:
                 raise TypeError(
-                    "manual statistics control requires all four flags; "
-                    f"missing={missing}"
+                    "current_time is owned by the managed-step runtime and "
+                    "must not be provided"
                 )
-            override = None
-            if present:
-                values = tuple(kwargs.pop(name) for name in flag_names)
-                if any(type(value) is not bool for value in values):
-                    raise TypeError("manual statistics flags must be bool values")
-                override = StatisticsFlags(*values)
-            spinup = kwargs.pop("spinup", False)
-            if type(spinup) is not bool:
-                raise TypeError("spinup must be an exact bool")
-            current_time = layout.get(args, kwargs, "current_time", None)
+            if "spinup" in kwargs:
+                raise TypeError(
+                    "spinup is derived from simulation_schedule and must not "
+                    "be provided"
+                )
+            output_enabled = kwargs.pop("output_enabled", None)
+            if output_enabled is not None and type(output_enabled) is not bool:
+                raise TypeError(
+                    "output_enabled must be an exact bool when provided"
+                )
+            supplied_time_step = kwargs.pop("time_step", _MISSING)
+            if context.schedule is not None:
+                if supplied_time_step is not _MISSING:
+                    raise TypeError(
+                        "time_step is derived from simulation_schedule and "
+                        "must not be provided"
+                    )
+                time_step = None
+            elif supplied_time_step is _MISSING:
+                raise TypeError(
+                    "time_step is required when simulation_schedule is not "
+                    "configured"
+                )
+            else:
+                time_step = supplied_time_step
+            current_time = getattr(model, "current_time", None)
         except BaseException as error:
             resolved = self._coordinate_failure(
                 context, snapshot, error, poison=context.world_size > 1,
@@ -609,16 +568,15 @@ class _CompiledStepPolicy:
             self.execution.statistics.check_background_failures(current_time)
             context.begin(
                 current_time=current_time,
-                time_step=layout.get(args, kwargs, "time_step"),
-                output_enabled=layout.get(args, kwargs, "output_enabled", True),
-                spinup=spinup,
+                time_step=time_step,
+                output_enabled=output_enabled,
                 program_owner=self.descriptor,
-                override=override,
             )
             context.synchronize_distributed(
                 4,
                 signature=(
-                    int(spinup), int(context.output_enabled), context.flags,
+                    int(context.spinup), int(context.output_enabled),
+                    context.flags,
                 ),
             )
             if self._rank == 0:
@@ -628,7 +586,7 @@ class _CompiledStepPolicy:
                     )
                 self._progress_start()
             with self._parameter_transaction():
-                if not spinup:
+                if not context.spinup:
                     parameter_effect = self._execute_parameter_change_plan(
                         current_time,
                     )
@@ -638,9 +596,6 @@ class _CompiledStepPolicy:
                             "ParameterChangeEffect"
                         )
                 self.execution.active_step = context
-                call_args, call_kwargs = layout.replace(
-                    args, kwargs, "output_enabled", context.output_enabled,
-                )
                 from hydroforge.kernels.registry import automatic_kernel_binding
 
                 token = _ACTIVE_MANAGED_STEP.set(context)
@@ -655,7 +610,7 @@ class _CompiledStepPolicy:
                         # arbitrary failure, so the instance must fail closed.
                         entered_user_step = True
                         result = self.descriptor.function(
-                            *call_args, **call_kwargs,
+                            *args, **kwargs,
                         )
                 finally:
                     _ACTIVE_MANAGED_STEP.reset(token)
@@ -677,6 +632,7 @@ class _CompiledStepPolicy:
             context.finish()
             self.execution.statistics.check_background_failures(current_time)
             context.synchronize_distributed(3)
+            context.commit_clock()
             return result
         except BaseException as error:
             resolved = self._coordinate_failure(
@@ -690,7 +646,7 @@ class _CompiledStepPolicy:
             self.execution.active_step = None
 
 
-def compile_step_policies(model: Any) -> None:
+def compile_step_policies(model: AbstractModel) -> None:
     """Compile every managed method after module initialization."""
     execution = model._execution
     execution.step = _StepRuntime(model, execution)
@@ -705,7 +661,7 @@ def compile_step_policies(model: Any) -> None:
                 execution.step_policies[descriptor] = descriptor.compile(model)
 
 
-def managed_step(function: Callable) -> Callable:
+def managed_step(function: _F) -> _F:
     """Compile step lifecycle once; the hot wrapper performs direct lookups."""
     from hydroforge.execution.boundaries import is_between_steps_api
 
@@ -719,4 +675,4 @@ def managed_step(function: Callable) -> Callable:
         return model._execution.step_policies[descriptor].execute(args, kwargs)
 
     setattr(wrapper, "__hydroforge_managed_step__", descriptor)
-    return wrapper
+    return cast(_F, wrapper)

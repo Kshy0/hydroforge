@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from graphlib import TopologicalSorter
-from typing import Any
+from graphlib import CycleError, TopologicalSorter
+from typing import TYPE_CHECKING, Any
 
 from hydroforge.output.checkpoint import CheckpointRuntime
 from hydroforge.compiler.data import ModelDataCompiler
@@ -11,22 +11,24 @@ from hydroforge.contracts.events import emit
 from hydroforge.compiler.namespace import NamespaceCompiler
 from hydroforge.compiler.partition import PartitionCompiler
 from hydroforge.compiler.statistics_binding import StatisticsBindingCompiler
-from hydroforge.compiler.model import ModelCompiler
+from hydroforge.compiler.model import FieldNamespaceCompiler
 from hydroforge.execution.parameters import ParameterPlanRuntime
 from hydroforge.execution.progress import ProgressRuntime
 from hydroforge.execution.runtime import ModelExecution
-from hydroforge.contracts.temporal import canonical_calendar, require_calendar
-from hydroforge.contracts.temporal import convert_calendar_date, date_calendar
+from hydroforge.contracts.temporal import canonical_calendar
 from hydroforge.contracts.runtime import (
     DEFAULT_BACKEND_REQUIREMENT, RUNTIME_BACKEND_REQUIREMENTS,
 )
 from hydroforge.contracts import ResourceCleanupError
 
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
+
 
 class ModelInitializer:
-    """Execute cold-path model setup in explicit dependency order."""
+    """Execute the ordered, exception-safe model initialization pipeline."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: AbstractModel) -> None:
         self.model = model
         self._execution: ModelExecution | None = None
         self._statistics: StatisticsBindingCompiler | None = None
@@ -39,7 +41,7 @@ class ModelInitializer:
             self._validate_schema()
             module_data = model.shard_param()
             self._construct_modules(module_data)
-            self._bind_module_attributes()
+            self._initialize_modules()
             self._specialize_capabilities()
             self._precompile_backend()
             self._apply_tensor_modes()
@@ -51,7 +53,7 @@ class ModelInitializer:
                 )
             self._initialize_output()
             self._compile_execution()
-            self._compile_model_plan()
+            self._compile_field_namespace()
             self._seal_tensor_bindings()
             model.print_memory_summary()
             emit(model, "info", "model.initialized", "All modules initialized")
@@ -83,8 +85,8 @@ class ModelInitializer:
         from hydroforge.execution.substeps import SubstepRuntime
         from hydroforge.execution.outer import OuterRuntime
 
-        object.__setattr__(model, "substeps", SubstepRuntime(model))
-        object.__setattr__(model, "outer", OuterRuntime(model))
+        model._substeps = SubstepRuntime(model)
+        model._outer = OuterRuntime(model)
         model._namespace = NamespaceCompiler(model)
         model._partition = PartitionCompiler(model)
         statistics = StatisticsBindingCompiler(model)
@@ -114,45 +116,27 @@ class ModelInitializer:
         backend = runtime.backend
         plan = model.statistics_plan
         schedule = model.simulation_schedule
-        if plan is not None:
-            if schedule is not None and schedule != plan.schedule:
-                raise ValueError(
-                    "statistics_plan and simulation_schedule use different schedules"
-                )
-            schedule = plan.schedule
-            model.simulation_schedule = schedule
+        if plan is not None and schedule is None:
+            raise ValueError("statistics_plan requires simulation_schedule")
         if schedule is not None:
-            configured = canonical_calendar(model.calendar)
-            if "calendar" in model.model_fields_set and configured != schedule.calendar:
-                raise ValueError(
-                    f"model calendar {configured!r} differs from simulation "
-                    f"schedule calendar {schedule.calendar!r}"
-                )
-            model.calendar = schedule.calendar
-            if model.output_start_time is not None:
-                if (
-                    schedule.calendar != "standard"
-                    and date_calendar(model.output_start_time) == "standard"
-                ):
-                    try:
-                        model.output_start_time = convert_calendar_date(
-                            model.output_start_time, schedule.calendar,
-                        )
-                    except (TypeError, ValueError, OverflowError) as error:
-                        raise ValueError(
-                            f"output_start_time {model.output_start_time!r} "
-                            f"cannot be represented by calendar "
-                            f"{schedule.calendar!r}"
-                        ) from error
-                require_calendar(
-                    model.output_start_time, schedule.calendar,
-                    label="output_start_time",
-                )
-                if model.output_start_time >= schedule.end:
+            if model.calendar is not None:
+                configured = canonical_calendar(model.calendar)
+                if configured != schedule.calendar:
                     raise ValueError(
-                        "output_start_time is outside the simulation schedule"
+                        f"model calendar {configured!r} differs from simulation "
+                        f"schedule calendar {schedule.calendar!r}"
                     )
-        if "mixed_precision" not in model.model_fields_set:
+            model.calendar = schedule.calendar
+            if model.current_time is not None:
+                raise ValueError(
+                    "current_time must not be configured together with "
+                    "simulation_schedule; the schedule initializes the "
+                    "runtime clock"
+                )
+            model.current_time = schedule.execution_start
+        else:
+            model.calendar = canonical_calendar(model.calendar or "standard")
+        if model.mixed_precision is None:
             model.mixed_precision = bool(
                 model.device.type == "cuda" and backend in {"cuda", "triton"}
             )
@@ -169,7 +153,8 @@ class ModelInitializer:
         rule.validate_precision(
             model.precision, model.mixed_precision, backend=backend,
         )
-        rule.validate_block_size(model.BLOCK_SIZE, backend=backend)
+        if model.BLOCK_SIZE is not None:
+            rule.validate_block_size(model.BLOCK_SIZE, backend=backend)
         if not rule.trials and model.num_trials is not None:
             raise ValueError(
                 f"backend {backend!r} does not support ensemble trials"
@@ -177,46 +162,47 @@ class ModelInitializer:
 
     def _construct_modules(self, module_data: dict[str, Any]) -> None:
         model = self.model
+        module_types = model.module_types()
+        opened = frozenset(model.opened_modules)
         sorter: TopologicalSorter[str] = TopologicalSorter()
         for name in model.opened_modules:
-            module_class = model.module_list[name]
-            sorter.add(name, *module_class.dependencies)
-        for name in sorter.static_order():
-            if name not in model.opened_modules:
-                continue
-            module_class = model.module_list[name]
-            module = module_class(
-                opened_modules=model.opened_modules,
-                rank=model.rank,
-                device=model.device,
-                world_size=model.world_size,
-                precision=model.dtype,
-                mixed_precision=model.mixed_precision,
-                num_trials=model.num_trials,
-                **model._modules,
-                **module_data,
+            references = module_types[name].get_module_reference_fields().values()
+            sorter.add(
+                name,
+                *(reference.module_name for reference in references
+                  if reference.module_name in opened),
             )
+        try:
+            construction_order = tuple(sorter.static_order())
+        except CycleError as error:
+            raise ValueError(
+                "opened module references must form an acyclic construction "
+                f"graph: {error.args[1]}"
+            ) from error
+        for name in construction_order:
+            module_class = module_types[name]
+            module = module_class.model_validate({
+                **module_data,
+                "opened_modules": model.opened_modules,
+                "rank": model.rank,
+                "device": model.device,
+                "precision": model.dtype,
+                "mixed_precision": model.mixed_precision,
+                "num_trials": model.num_trials,
+            }, context={
+                "hydroforge_model_initialization": True,
+                "hydroforge_module_references": model._modules,
+            })
             module._bind_event_sink(model.event_sink)
             model._modules[name] = module
-        missing = set(model.opened_modules).difference(model._modules)
-        if missing:
-            raise RuntimeError(
-                "module construction did not produce opened modules: "
-                + ", ".join(sorted(missing))
-            )
 
-    def _bind_module_attributes(self) -> None:
-        """Install every module slot once for zero-reflection model access.
-
-        Downstream orchestration uses ``self.base`` / ``self.reservoir``
-        directly.  Open modules resolve to their instance and closed optional
-        modules resolve to ``None``; model authors never need cached
-        ``get_module`` forwarding properties.
-        """
+    def _initialize_modules(self) -> None:
+        """Expose the complete model graph, then validate cross-module state."""
 
         model = self.model
-        for name in model.module_list:
-            object.__setattr__(model, name, model._modules.get(name))
+        model._model_modules_bound = True
+        for name in model.opened_modules:
+            model._modules[name].validate_linked_state()
 
     def _specialize_capabilities(self) -> None:
         model = self.model
@@ -246,10 +232,10 @@ class ModelInitializer:
             catalogs, model.opened_modules,
         )
 
-    def _compile_model_plan(self) -> None:
-        plan = ModelCompiler(self.model).compile()
-        self.model._plan = plan
-        self.model._execution.install_model_plan(plan)
+    def _compile_field_namespace(self) -> None:
+        namespace = FieldNamespaceCompiler(self.model).compile()
+        self.model._field_namespace = namespace
+        self.model._execution._refresh_model_tensor_index()
 
     def _seal_tensor_bindings(self) -> None:
         """Make compiled storage identities immutable without hot-path scans."""

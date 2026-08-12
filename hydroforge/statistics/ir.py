@@ -9,9 +9,6 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from hydroforge.statistics.expression import parse_scatter_expr
-
-
 class Reduction(str, Enum):
     MEAN = "mean"
     SUM = "sum"
@@ -358,12 +355,18 @@ class _DependencyVisitor(ast.NodeVisitor):
         self.dependencies.add(".".join(reversed(parts)))
 
 
-def parse_expression(source: str, known_fields: set[str]) -> Expression:
+def _parse_expression(source: str) -> tuple[str, ast.Expression]:
     normalized = source.strip().replace("^", "**")
     try:
         tree = ast.parse(normalized, mode="eval")
     except SyntaxError as exc:
         raise ValueError(f"invalid statistics expression {source!r}") from exc
+    return normalized, tree
+
+
+def _compile_expression(
+    source: str, tree: ast.Expression, known_fields: set[str],
+) -> Expression:
     visitor = _DependencyVisitor()
     visitor.visit(tree)
     unknown = visitor.dependencies.difference(known_fields)
@@ -372,22 +375,51 @@ def parse_expression(source: str, known_fields: set[str]) -> Expression:
             f"statistics expression {source!r} references unknown fields: "
             f"{sorted(unknown)}"
         )
-    return Expression(normalized, tree, tuple(sorted(visitor.dependencies)))
+    return Expression(source, tree, tuple(sorted(visitor.dependencies)))
+
+
+def _field_reference(node: ast.AST) -> str:
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        raise ValueError("scatter index must be a field name")
+    parts.append(node.id)
+    return ".".join(reversed(parts))
 
 
 def parse_value_source(source: str, known_fields: set[str]) -> ValueSource:
     """Compile one virtual field expression into its canonical typed source."""
-    scatter = parse_scatter_expr(source)
-    if scatter is None:
-        return ExpressionSource(parse_expression(source, known_fields))
-    if scatter.index_var not in known_fields:
-        raise ValueError(
-            f"scatter index {scatter.index_var!r} is not a registered field"
+    normalized, tree = _parse_expression(source)
+    body = tree.body
+    if not (
+        isinstance(body, ast.Call)
+        and isinstance(body.func, ast.Name)
+        and body.func.id.startswith("scatter_")
+    ):
+        return ExpressionSource(
+            _compile_expression(normalized, tree, known_fields),
         )
+    if (
+        body.func.id not in {"scatter_sum", "scatter_mean"}
+        or len(body.args) != 2
+        or body.keywords
+    ):
+        raise ValueError(
+            "scatter expression must be scatter_sum(value, index) or "
+            "scatter_mean(value, index)"
+        )
+    index = _field_reference(body.args[1])
+    if index not in known_fields:
+        raise ValueError(
+            f"scatter index {index!r} is not a registered field"
+        )
+    value_tree = ast.Expression(body.args[0])
     return ScatterSource(
-        Reduction(scatter.mode),
-        parse_expression(scatter.value_expr, known_fields),
-        scatter.index_var,
+        Reduction(body.func.id.removeprefix("scatter_")),
+        _compile_expression(ast.unparse(body.args[0]), value_tree, known_fields),
+        index,
     )
 
 

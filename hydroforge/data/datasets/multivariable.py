@@ -9,6 +9,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
+from hydroforge.contracts.temporal import DatasetTemporalContract
 from hydroforge.data.datasets.base import AbstractDataset, _close_dataset_tree
 from hydroforge.data.datasets.gridded import GriddedDataset
 
@@ -16,47 +17,60 @@ from hydroforge.data.datasets.gridded import GriddedDataset
 class MultiVariableDataset(AbstractDataset):
     """One validated timeline composed from named single-variable sources."""
 
+    _REFERENCE_CONFIGURATION = frozenset({
+        "start_date", "end_date", "time_interval", "model_step",
+        "out_dtype", "chunk_len", "spin_up_cycles", "spin_up_start_date",
+        "spin_up_end_date", "calendar", "clip_negative", "upsampling",
+        "reuse_count",
+    })
+
     def __init__(
         self,
         datasets: Mapping[str, AbstractDataset],
-        *,
-        loader_strategy: Literal["combined", "parallel"] = "combined",
     ) -> None:
         if not datasets:
             raise ValueError("datasets must contain at least one named source")
         self._datasets = dict(datasets)
+        invalid = {
+            name: type(dataset).__name__
+            for name, dataset in self._datasets.items()
+            if not isinstance(dataset, AbstractDataset)
+        }
+        if invalid:
+            raise TypeError(
+                f"multi-variable sources must be datasets: {invalid}"
+            )
         self._view = MappingProxyType(self._datasets)
-        self.loader_strategy = loader_strategy
         reference = next(iter(self._datasets.values()))
         self.reference = reference
         self._gridded = isinstance(reference, GriddedDataset)
+        self._temporal_contract = DatasetTemporalContract.combine({
+            name: dataset.temporal_contract
+            for name, dataset in self._datasets.items()
+        })
+        self._chunk_plan = reference.chunk_plan
+        self._simulation_schedule = reference.simulation_schedule
         for name, dataset in tuple(self._datasets.items())[1:]:
             self._validate_child(name, dataset)
-        super().__init__(
-            start_date=reference.start_date,
-            end_date=reference.end_date,
-            time_interval=reference.time_interval,
-            out_dtype=reference.out_dtype,
-            chunk_len=reference.chunk_len,
-            spin_up_cycles=reference.spin_up_cycles,
-            spin_up_start_date=reference.spin_up_start_date,
-            spin_up_end_date=reference.spin_up_end_date,
-            calendar=reference.calendar,
-            clip_negative=reference.clip_negative,
-        )
+        self._local_indices = None
+        self._desired_catchment_ids = None
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._REFERENCE_CONFIGURATION:
+            return getattr(self.reference, name)
+        raise AttributeError(name)
 
     def _validate_child(self, name: str, dataset: AbstractDataset) -> None:
         reference = self.reference
-        for attribute in (
-            "start_date", "end_date", "time_interval", "chunk_len",
-            "spin_up_cycles", "spin_up_start_date", "spin_up_end_date",
+        if (
+            dataset.simulation_schedule.cadence
+            != self._simulation_schedule.cadence
         ):
-            if getattr(dataset, attribute) != getattr(reference, attribute):
-                raise ValueError(
-                    f"variable {name!r} has different {attribute}"
-                )
-        if len(dataset) != len(reference):
-            raise ValueError(f"variable {name!r} has a different chunk count")
+            raise ValueError(
+                f"variable {name!r} has a different model cadence"
+            )
+        if dataset.chunk_plan.chunk_len != self._chunk_plan.chunk_len:
+            raise ValueError(f"variable {name!r} has a different chunk length")
         if isinstance(dataset, GriddedDataset) != self._gridded:
             raise TypeError("one multi-variable dataset cannot mix grid and point sources")
         reference_coordinates = np.asarray(reference.get_coordinates()[0])
@@ -133,64 +147,25 @@ class MultiVariableDataset(AbstractDataset):
         return None
 
     def shard_forcing(
-        self, batch: Mapping[str, torch.Tensor],
+        self, chunk: Mapping[str, torch.Tensor],
         mapping: torch.Tensor | None = None,
-        *,
-        target: Mapping[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         if self._gridded:
             if mapping is None:
                 raise ValueError("gridded forcing requires its compiled mapping")
             return {
                 name: dataset.shard_forcing(
-                    batch[name],
+                    chunk[name],
                     mapping,
-                    target=None if target is None else target[name],
                 )
                 for name, dataset in self._datasets.items()
             }
         if mapping is not None:
             raise ValueError("catchment forcing does not accept a grid mapping")
         return {
-            name: dataset.shard_forcing(
-                batch[name],
-                target=None if target is None else target[name],
-            )
+            name: dataset.shard_forcing(chunk[name])
             for name, dataset in self._datasets.items()
         }
-
-    def iter_loaders(
-        self,
-        *,
-        loader_workers: int = 1,
-        prefetch_factor: int = 2,
-        pin_memory: bool = True,
-    ):
-        from torch.utils.data import DataLoader
-
-        kwargs = {
-            "batch_size": max(1, loader_workers),
-            "shuffle": False,
-            "num_workers": loader_workers,
-            "pin_memory": pin_memory,
-            "prefetch_factor": prefetch_factor if loader_workers > 0 else None,
-        }
-        if self.loader_strategy == "combined":
-            yield from DataLoader(self, **kwargs)
-            return
-        loaders = {
-            name: DataLoader(dataset, **kwargs)
-            for name, dataset in self._datasets.items()
-        }
-        for batches in zip(*loaders.values(), strict=True):
-            yield dict(zip(loaders, batches, strict=True))
-
-    @property
-    def total_steps(self) -> int:
-        return self.reference.total_steps
-
-    def step_iter(self):
-        return self.reference.step_iter()
 
     def close(self) -> None:
         _close_dataset_tree(self, scope="multi-variable dataset resources")

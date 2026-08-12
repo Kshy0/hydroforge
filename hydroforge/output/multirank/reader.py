@@ -21,6 +21,7 @@ from hydroforge.output.multirank.plotter import MultiRankPlotter
 from hydroforge.output.multirank.catalog import RankOutputCatalog
 from hydroforge.output.multirank.data import MultiRankDataAccess
 from hydroforge.serialization.files import atomic_output_path
+from hydroforge.serialization.netcdf import decode_netcdf_logical_array
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,9 @@ class MultiRankStatsReader:
                                 )
 
                             for global_start, chunk in chunks:
+                                chunk = decode_netcdf_logical_array(
+                                    var, chunk, name=self.var_name,
+                                )
                                 array = self._data_access._array(
                                     chunk, source=fp.name,
                                 )
@@ -145,7 +149,9 @@ class MultiRankStatsReader:
                                 written[
                                     destination:destination + array.shape[0]
                                 ] = True
-                    except (OSError, KeyError, IndexError, ValueError) as exc:
+                    except (
+                        OSError, KeyError, IndexError, TypeError, ValueError,
+                    ) as exc:
                         raise RuntimeError(f"Failed to cache {fp}") from exc
 
             if cache is not None and not np.all(written):

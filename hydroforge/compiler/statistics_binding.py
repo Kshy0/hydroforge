@@ -2,87 +2,33 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
 
 from hydroforge.statistics.runtime import StatisticsRuntime, StatisticsConfig
 from hydroforge.statistics.ir import (
-    ExpressionSource, ScatterSource, parse_operation, parse_value_source,
+    ExpressionSource, ScatterSource, parse_value_source,
 )
 from hydroforge.statistics.layout import compile_statistics
 from hydroforge.contracts.events import emit
 from hydroforge.contracts.fields import RuntimeTensorMetadata, TensorMetadata
+from hydroforge.contracts.runtime import DEFAULT_BLOCK_SIZE
 
-
-@dataclass(frozen=True, slots=True)
-class _AttributeTensorBinding:
-    owner: Any
-    attribute: str
-
-    def resolve(self, name: str) -> torch.Tensor:
-        value = getattr(self.owner, self.attribute, None)
-        if not isinstance(value, torch.Tensor):
-            raise TypeError(
-                f"Statistics field {name!r} resolved to "
-                f"{type(value).__name__}, expected Tensor"
-            )
-        return value
-
-
-@dataclass(frozen=True, slots=True)
-class _OutputTensorBinding:
-    partition: Any
-    field: Any
-    binding_name: str
-
-    def resolve(self, name: str) -> torch.Tensor:
-        _, tensors = self.partition.bind_output(self.field)
-        try:
-            value = tensors[self.binding_name]
-        except KeyError as exc:
-            raise RuntimeError(
-                f"Statistics output binding {name!r} is no longer resolved"
-            ) from exc
-        if not isinstance(value, torch.Tensor):
-            raise TypeError(
-                f"Statistics output binding {name!r} resolved to "
-                f"{type(value).__name__}, expected Tensor"
-            )
-        return value
-
-
-def _tensor_abi(tensor: torch.Tensor) -> tuple[Any, ...]:
-    return (
-        tensor.dtype,
-        tensor.device,
-        tensor.layout,
-        tuple(tensor.shape),
-        tuple(tensor.stride()),
-    )
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
 
 
 class StatisticsBindingCompiler:
     """Own aggregator construction, request normalization and result access."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: AbstractModel) -> None:
         self.model = model
         self._aggregator: StatisticsRuntime | None = None
-        self._tensor_bindings: dict[
-            str, _AttributeTensorBinding | _OutputTensorBinding
-        ] = {}
 
     @property
     def variable_map(self):
         return self.model._namespace.build()
-
-    def _field(self, name: str):
-        module, attribute, _ = self.variable_map[name]
-        field = module.get_tensor_schema(attribute)
-        if field is None:
-            raise ValueError(f"Model field {name!r} has no tensor schema")
-        return field
 
     @property
     def aggregator(self) -> StatisticsRuntime | None:
@@ -101,6 +47,10 @@ class StatisticsBindingCompiler:
             num_trials=model.num_trials or 1,
             save_kernels=model.save_kernels,
             max_pending_steps=model.max_pending_steps,
+            block_size=(
+                DEFAULT_BLOCK_SIZE
+                if model.BLOCK_SIZE is None else model.BLOCK_SIZE
+            ),
             calendar=model.calendar,
             in_memory=model.in_memory_output,
             result_device=model.result_device,
@@ -131,23 +81,15 @@ class StatisticsBindingCompiler:
         """Compile public output requests and materialize static selections."""
         variable_ops: dict[str, list[str]] = {}
         expressions: dict[str, str] = {}
-        for spelling, values in requests.items():
-            if spelling == "static":
-                self._register_static(values)
+        for operation, items in requests.items():
+            if operation == "static":
+                self._register_static(items)
                 continue
-            normalized = str(spelling).lower()
-            parse_operation(normalized)
-            if isinstance(values, (str, tuple)):
-                items = [values]
-            elif isinstance(values, list):
-                items = values
-            else:
-                raise ValueError(
-                    f"variables_to_save[{spelling!r}] must be a string, "
-                    "(name, expression), or a list"
-                )
             for item in items:
-                name, expression = self._normalize_item(spelling, item)
+                if isinstance(item, str):
+                    name, expression = item, None
+                else:
+                    name, expression = next(iter(item.items()))
                 if expression is not None:
                     previous = expressions.get(name)
                     if previous is not None and previous != expression:
@@ -157,38 +99,16 @@ class StatisticsBindingCompiler:
                         )
                     expressions[name] = expression
                 operations = variable_ops.setdefault(name, [])
-                if normalized not in operations:
-                    operations.append(normalized)
+                if operation not in operations:
+                    operations.append(operation)
         return variable_ops, expressions
-
-    @staticmethod
-    def _normalize_item(
-        spelling: str,
-        item: Any,
-    ) -> tuple[str, str | None]:
-        if isinstance(item, str):
-            return item, None
-        if isinstance(item, (tuple, list)) and len(item) == 2:
-            return str(item[0]), str(item[1])
-        if isinstance(item, dict) and len(item) == 1:
-            name, expression = next(iter(item.items()))
-            return str(name), str(expression)
-        raise ValueError(
-            f"Invalid item in variables_to_save[{spelling!r}]: {item!r}; "
-            "expected a field, {alias: expression}, or (alias, expression)"
-        )
 
     def _register_static(self, values: Any) -> None:
         model = self.model
         aggregator = self.aggregator
         if aggregator is None:
             raise RuntimeError("statistics aggregator has not been created")
-        items = [values] if isinstance(values, str) else list(values)
-        for name in items:
-            if not isinstance(name, str):
-                raise ValueError(
-                    "variables_to_save['static'] entries must be field names"
-                )
+        for name in values:
             try:
                 module, attribute, _ = self.variable_map[name]
             except KeyError as exc:
@@ -326,7 +246,6 @@ class StatisticsBindingCompiler:
             name: str,
             tensor: torch.Tensor,
             info: Any,
-            binding: _AttributeTensorBinding | _OutputTensorBinding,
             *,
             output_coordinate: bool = False,
         ) -> None:
@@ -334,7 +253,6 @@ class StatisticsBindingCompiler:
                 aggregator.register_output_coordinate(name, tensor)
             else:
                 aggregator.register_tensor(name, tensor, info)
-            self._tensor_bindings[name] = binding
             registered.add(name)
             by_shape.setdefault(tuple(tensor.shape), []).append(name)
 
@@ -376,7 +294,6 @@ class StatisticsBindingCompiler:
             elif isinstance(tensor, torch.Tensor):
                 register_tensor(
                     name, tensor, info,
-                    _AttributeTensorBinding(module, attribute),
                 )
             else:
                 raise TypeError(
@@ -395,9 +312,6 @@ class StatisticsBindingCompiler:
                     ) from exc
                 register_tensor(
                     binding_name, binding, {},
-                    _OutputTensorBinding(
-                        model._partition, field, binding_name,
-                    ),
                     output_coordinate=binding_name == info.output_coord,
                 )
 
@@ -476,85 +390,6 @@ class StatisticsBindingCompiler:
 
                 error = ResourceCleanupError("statistics resources", failures)
                 raise error from failures[0]
-
-    def refresh_bindings(self) -> bool:
-        """Transactionally rebind exact-ABI tensor replacements.
-
-        Statistics storage and generated kernels are specialized to tensor
-        shape, dtype, device, layout and stride. Changing any of those while
-        an aggregator is live has no unambiguous accumulator migration, so it
-        is rejected instead of partially rebuilding against stale storage.
-        """
-
-        aggregator = self.aggregator
-        if aggregator is None:
-            return False
-        registered = set(aggregator._tensor_registry)
-        declared = set(self._tensor_bindings)
-        if registered != declared:
-            raise RuntimeError(
-                "Statistics tensor binding registry is inconsistent: "
-                f"missing_resolvers={sorted(registered - declared)}, "
-                f"orphan_resolvers={sorted(declared - registered)}"
-            )
-
-        replacements: dict[str, torch.Tensor] = {}
-        for name, binding in self._tensor_bindings.items():
-            previous = aggregator._tensor_registry[name]
-            current = binding.resolve(name)
-            if current.layout is not torch.strided or not current.is_contiguous():
-                raise ValueError(
-                    f"Statistics tensor {name!r} replacement must retain the "
-                    "canonical contiguous strided buffer ABI"
-                )
-            if current is previous:
-                continue
-            previous_abi = _tensor_abi(previous)
-            current_abi = _tensor_abi(current)
-            if current_abi != previous_abi:
-                labels = ("dtype", "device", "layout", "shape", "stride")
-                changes = {
-                    label: (old, new)
-                    for label, old, new in zip(
-                        labels, previous_abi, current_abi, strict=True,
-                    )
-                    if old != new
-                }
-                raise ValueError(
-                    f"Statistics tensor {name!r} changed compiled ABI: "
-                    f"{changes}. Close and recreate the model/statistics "
-                    "runtime instead of migrating live accumulators"
-                )
-            if (
-                isinstance(binding, _OutputTensorBinding)
-            ):
-                if not torch.equal(current, previous):
-                    raise ValueError(
-                        f"Statistics output topology binding {name!r} changed "
-                        "values while accumulators are live; recreate the model/"
-                        "statistics runtime at the topology boundary"
-                    )
-                # Output selections are immutable topology.  Partition helpers
-                # may recreate a value-equal tensor; retaining the registered
-                # buffer avoids needless kernel-state churn and graph recapture.
-                continue
-            replacements[name] = current
-
-        if replacements:
-            execution = getattr(self.model, "_execution", None)
-            if execution is not None:
-                execution.invalidate_statistics(aggregator)
-            previous = {
-                name: aggregator._tensor_registry[name]
-                for name in replacements
-            }
-            aggregator._tensor_registry.update(replacements)
-            try:
-                aggregator._prepare_kernel_states()
-            except BaseException:
-                aggregator._tensor_registry.update(previous)
-                raise
-        return bool(replacements)
 
     def results(self, *, stacked: bool) -> dict[str, torch.Tensor]:
         if self.aggregator is None:

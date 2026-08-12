@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional, Set
 import numpy as np
 import torch
 
+from hydroforge.contracts.runtime import DEFAULT_BLOCK_SIZE
+
 from hydroforge.data.distributed import torch_to_numpy_dtype
 from hydroforge.contracts import ResourceCleanupError
 from hydroforge.statistics.ir import (
@@ -67,6 +69,7 @@ class StatisticsConfig:
     output_split_by_year: bool = False
     num_trials: int = 1
     max_pending_steps: int = 200
+    block_size: int = DEFAULT_BLOCK_SIZE
     calendar: str = "standard"
     time_unit: str = "days since 1900-01-01 00:00:00"
     in_memory: bool = False
@@ -76,6 +79,7 @@ class StatisticsConfig:
         default_factory=default_netcdf_options,
     )
     event_sink: Any = None
+    run_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.device, torch.device):
@@ -84,7 +88,7 @@ class StatisticsConfig:
             raise ValueError(f"unsupported statistics backend {self.backend!r}")
         for name in (
             "rank", "world_size", "num_workers", "num_trials",
-            "max_pending_steps",
+            "max_pending_steps", "block_size",
         ):
             value = getattr(self, name)
             minimum = 0 if name == "rank" else 1
@@ -94,6 +98,10 @@ class StatisticsConfig:
                 )
         if self.rank >= self.world_size:
             raise ValueError("statistics rank must be smaller than world_size")
+        if self.block_size > 1024:
+            raise ValueError("statistics block_size must be <= 1024")
+        if self.backend == "triton" and self.block_size & (self.block_size - 1):
+            raise ValueError("Triton statistics block_size must be a power of two")
         for name in ("save_kernels", "output_split_by_year", "in_memory"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"statistics {name} must be an exact bool")
@@ -116,6 +124,12 @@ class StatisticsConfig:
             raise ValueError("statistics calendar must be a non-empty string")
         if not isinstance(self.time_unit, str) or not self.time_unit:
             raise ValueError("statistics time_unit must be a non-empty string")
+        if self.run_id is not None and (
+            not isinstance(self.run_id, str) or not self.run_id.strip()
+        ):
+            raise ValueError(
+                "statistics run_id must be a non-empty string or None"
+            )
 
 
 class StatisticsRuntime:
@@ -156,8 +170,10 @@ class StatisticsRuntime:
         self.num_trials = config.num_trials
         self._closed = False
         self.max_pending_steps = config.max_pending_steps
+        self.block_size = config.block_size
         self.calendar = config.calendar
         self.time_unit = config.time_unit
+        self.run_id = config.run_id
         self._current_year = None
 
         # In-memory mode settings
@@ -746,7 +762,7 @@ class StatisticsRuntime:
             raise RuntimeError(
                 "statistics execution runtime is not attached to a model"
             )
-        self._execution.run_statistics(self, self._execution.model.BLOCK_SIZE)
+        self._execution.run_statistics(self, self.block_size)
 
     def _init_result_storage(self) -> None:
         if not self.in_memory_mode:
@@ -829,27 +845,6 @@ class StatisticsRuntime:
         for out_name in self._result_tensors:
             self._result_tensors[out_name] = []
 
-    # Output service
-    def _create_netcdf_files(self, year: int | None = None) -> None:
-        self._output._create_netcdf_files(year)
-
-    def _flush_write_buffer(self, key: str) -> None:
-        self._output._flush_write_buffer(key)
-
-    def _flush_all_write_buffers(self) -> None:
-        self._output._flush_all_write_buffers()
-
-    def _buffer_and_maybe_flush(
-        self, buf_key: str, var_name: str, data: np.ndarray, output_path,
-        dt, batch_size: int,
-    ) -> None:
-        self._output._buffer_and_maybe_flush(
-            buf_key, var_name, data, output_path, dt, batch_size,
-        )
-
-    def _finalize_time_step_in_memory(self, dt) -> None:
-        self._output._finalize_time_step_in_memory(dt)
-
     def finalize_time_step(self, dt) -> None:
         self._require_open()
         self._output.finalize_time_step(dt)
@@ -883,7 +878,7 @@ class StatisticsRuntime:
     def _cleanup_executor(self) -> None:
         failures: list[BaseException] = []
         try:
-            self._flush_all_write_buffers()
+            self._output._flush_all_write_buffers()
         except BaseException as error:
             failures.append(error)
         pending, self._pending_writes = self._pending_writes, []
@@ -968,16 +963,6 @@ class StatisticsRuntime:
                 seen.add(tensor.data_ptr())
                 total += tensor.element_size() * tensor.numel()
         return total
-
-    def get_result_memory_usage(self) -> int:
-        if not self.in_memory_mode:
-            return 0
-        return sum(
-            tensor.element_size() * tensor.numel()
-            for values in self._result_tensors.values()
-            for tensor in values
-            if isinstance(tensor, torch.Tensor)
-        )
 
     def _get_safe_name(self, name: str) -> str:
         if name not in self._safe_name_cache:

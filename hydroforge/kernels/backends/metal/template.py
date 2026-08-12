@@ -19,8 +19,12 @@ from hydroforge.kernels.context import active_kernel_spec, reject_direct_kernel_
 
 
 METAL_KERNEL_BODY_MARKER = "// HYDROFORGE METAL KERNEL BODY"
+_BODY_PATTERN = re.compile(
+    rf"^[ \t]*{re.escape(METAL_KERNEL_BODY_MARKER)}\s*$",
+    re.MULTILINE,
+)
 _NAMED_BODY_PATTERN = re.compile(
-    rf"^{re.escape(METAL_KERNEL_BODY_MARKER)}:\s*"
+    rf"^[ \t]*{re.escape(METAL_KERNEL_BODY_MARKER)}:\s*"
     r"(?P<name>[A-Za-z_]\w*)\s*$",
     re.MULTILINE,
 )
@@ -29,16 +33,25 @@ _NAMED_BODY_PATTERN = re.compile(
 def _split_template_source(
     spec: KernelSpec, source: str,
 ) -> tuple[str, str]:
-    """Select the named body for ``spec`` from a Metal source."""
+    """Select the single or named body for ``spec`` from a Metal source."""
 
     named = tuple(_NAMED_BODY_PATTERN.finditer(source))
+    bodies = tuple(_BODY_PATTERN.finditer(source))
     marker_lines = tuple(
         line.strip() for line in source.splitlines()
         if METAL_KERNEL_BODY_MARKER in line
     )
-    if not named or len(marker_lines) != len(named):
+    if not named:
+        if len(bodies) == 1 and len(marker_lines) == 1:
+            boundary = bodies[0]
+            return source[:boundary.start()], source[boundary.end():]
         raise ValueError(
-            "Metal template source requires one or more named body markers"
+            "Metal template source requires exactly one body marker or one "
+            "or more named body markers"
+        )
+    if bodies or len(marker_lines) != len(named):
+        raise ValueError(
+            "Metal template source may not mix unnamed and named body markers"
         )
     names = tuple(match.group("name") for match in named)
     if len(names) != len(set(names)):

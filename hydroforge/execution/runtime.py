@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -12,11 +12,14 @@ from hydroforge.execution.capture import CaptureRuntime
 from hydroforge.statistics.observer import StatisticsObserver
 from hydroforge.kernels.registry import resolve_model_backend
 
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
+
 
 class ModelExecution:
     """The single explicit owner of one model's runtime plans and resources."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: AbstractModel) -> None:
         self.model = model
         self.device = torch.device(model.device)
         self.backend = resolve_model_backend(self.device)
@@ -44,7 +47,6 @@ class ModelExecution:
         self.step_policies: dict[Any, Any] = {}
         self.programs: dict[Any, Any] = {}
         self._model_tensor_ids: frozenset[int] = frozenset()
-        self._field_namespace: Any = None
         self._tensor_index_valid = False
         self.step: Any = None
         self.active_step: Any = None
@@ -110,28 +112,13 @@ class ModelExecution:
         """
 
         if not self._tensor_index_valid:
-            if self._field_namespace is None:
-                plan = getattr(self.model, "_plan", None)
-                if plan is None:
-                    raise RuntimeError(
-                        "compiled substep recording requires a completed model plan"
-                    )
-                self._field_namespace = plan.kernels.fields
             self._refresh_model_tensor_index()
         return id(tensor) in self._model_tensor_ids
 
-    def install_model_plan(self, plan: Any) -> None:
-        """Install the compiled namespace and materialize its tensor index."""
-
-        self._field_namespace = plan.kernels.fields
-        self._refresh_model_tensor_index()
-
     def _refresh_model_tensor_index(self) -> None:
-        fields = self._field_namespace
-        if fields is None:
-            raise RuntimeError("model tensor indexing requires a compiled model plan")
+        fields = self.model._field_namespace
         identities: set[int] = set()
-        for field_name, owners in fields.owners.items():
+        for field_name, owners in fields.items():
             for owner in owners:
                 schema_getter = getattr(owner.owner, "get_tensor_schema", None)
                 schema = (
@@ -159,21 +146,6 @@ class ModelExecution:
                     identities.add(id(value))
         self._model_tensor_ids = frozenset(identities)
         self._tensor_index_valid = True
-
-    def mark_dependency(self) -> None:
-        if self.capture_mode != "metal_icb":
-            return
-        from hydroforge.kernels.backends.metal.runtime import recording_metal_sequence
-
-        sequence = recording_metal_sequence()
-        if sequence is not None and sequence.prepared_commands:
-            sequence.mark_barrier()
-
-    def nested_capture_active(self) -> bool:
-        return bool(
-            self.capture_mode == "cuda_graph"
-            and torch.cuda.is_current_stream_capturing()
-        )
 
     def loop_mode(
         self, *, world_size: int, allow_distributed: bool,
