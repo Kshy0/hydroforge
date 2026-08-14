@@ -12,9 +12,11 @@ class ProgressState:
     current_step: int = 0
     phase: str | None = None
     _wall_start: float = 0.0
-    _step_start: float = 0.0
+    _last_tick: float = 0.0
+    _last_emit: float = 0.0
     _recent_dts: list[float] = field(default_factory=list)
     _window_size: int = 50
+    _refresh_interval: float = 0.1
     _schedule_start_fraction: float | None = None
 
     def start(
@@ -23,7 +25,8 @@ class ProgressState:
         self.phase = phase
         self.current_step = 0
         self._wall_start = time.perf_counter()
-        self._step_start = self._wall_start
+        self._last_tick = self._wall_start
+        self._last_emit = self._wall_start - self._refresh_interval
         self._recent_dts.clear()
         self._schedule_start_fraction = schedule_fraction
 
@@ -37,16 +40,20 @@ class ProgressState:
             and schedule_fraction is not None
         ):
             self._schedule_start_fraction = schedule_fraction
-        self._step_start = time.perf_counter()
 
-    def tick(self, phase: str) -> None:
+    def tick(self, phase: str, *, force_emit: bool = False) -> bool:
         if phase != self.phase:
             self.start(phase)
         now = time.perf_counter()
-        self._recent_dts.append(now - self._step_start)
+        self._recent_dts.append(now - self._last_tick)
+        self._last_tick = now
         if len(self._recent_dts) > self._window_size:
             self._recent_dts.pop(0)
         self.current_step += 1
+        if not force_emit and now - self._last_emit < self._refresh_interval:
+            return False
+        self._last_emit = now
+        return True
 
     @property
     def elapsed(self) -> float:
@@ -61,7 +68,8 @@ class ProgressState:
     def recent_speed(self) -> float:
         if not self._recent_dts:
             return self.speed
-        return len(self._recent_dts) / sum(self._recent_dts)
+        elapsed = sum(self._recent_dts)
+        return len(self._recent_dts) / elapsed if elapsed > 0 else self.speed
 
     @staticmethod
     def _fmt_duration(seconds: float) -> str:
@@ -123,8 +131,14 @@ class ProgressRuntime:
             self._phase(), schedule_fraction=fraction,
         )
 
-    def progress_tick(self) -> None:
-        self.state.tick(self._phase())
+    def progress_tick(self) -> bool:
+        schedule, step = self._schedule_position()
+        final_step = (
+            schedule is not None
+            and step is not None
+            and step.end == schedule.end
+        )
+        return self.state.tick(self._phase(), force_emit=final_step)
 
     def format_progress(self) -> str:
         schedule, step = self._schedule_position()
