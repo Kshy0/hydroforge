@@ -11,7 +11,6 @@ from hydroforge.kernels.backends.cuda.spec import (
     CudaExtensionSpec, cuda_declarations, cuda_function_signature,
     cuda_narrowed_index_parameters,
 )
-from hydroforge.kernels.mutation import record_kernel_writes
 from hydroforge.contracts import BackendLoweringSpec, BufferDTypeABI, KernelSpec
 from hydroforge.kernels.context import (
     active_kernel_spec, registry_factory, reject_direct_kernel_launch,
@@ -559,7 +558,6 @@ class CudaDispatcher:
             return None
         if self.tensor_vector is not None:
             values[self.tensor_vector.target] = self.tensor_vector.resolve(values)
-        record_kernel_writes(self.__hydroforge_kernel__, values)
         return self._launcher(*(values[name] for name in self.launch_args))
 
     def specialize(
