@@ -695,20 +695,6 @@ class _CompiledStepPolicy:
                         )
                 finally:
                     _ACTIVE_MANAGED_STEP.reset(token)
-            if self._rank == 0:
-                if self._progress_tick is None or self._format_progress is None:
-                    raise RuntimeError(
-                        "rank-zero managed models must define progress_tick() "
-                        "and format_progress()"
-                    )
-                self._progress_tick()
-                progress = self._format_progress()
-                emit(
-                    model, "progress", "step.completed", "Processed step",
-                    current_time=current_time,
-                    adaptive_time_step=context.completed_substeps,
-                    progress=progress,
-                )
             context.synchronize_distributed(_DistributedStepEvent(
                 _DistributedStepKind.USER_STEP_COMPLETE,
             ))
@@ -718,6 +704,20 @@ class _CompiledStepPolicy:
                 _DistributedStepKind.STEP_FINALIZED,
             ))
             context.commit_clock()
+            if self._rank == 0:
+                if self._progress_tick is None or self._format_progress is None:
+                    raise RuntimeError(
+                        "rank-zero managed models must define progress_tick() "
+                        "and format_progress()"
+                    )
+                if self._progress_tick():
+                    progress = self._format_progress()
+                    emit(
+                        model, "progress", "step.completed", "Processed step",
+                        current_time=current_time,
+                        adaptive_time_step=context.completed_substeps,
+                        progress=progress,
+                    )
             return result
         except BaseException as error:
             resolved = self._coordinate_failure(

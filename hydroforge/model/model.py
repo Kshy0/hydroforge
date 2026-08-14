@@ -802,8 +802,8 @@ class AbstractModel(BaseModel, ABC):
     def progress_start(self) -> None:
         self._progress_service.begin_step()
 
-    def progress_tick(self) -> None:
-        self._progress_service.progress_tick()
+    def progress_tick(self) -> bool:
+        return self._progress_service.progress_tick()
 
     def format_progress(self) -> str:
         return self._progress_service.format_progress()
