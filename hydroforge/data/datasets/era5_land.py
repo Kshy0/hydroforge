@@ -5,14 +5,13 @@
 #
 
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Callable, Optional, Union
 
 import cftime
 import numpy as np
-from netCDF4 import Dataset
 
-from hydroforge.contracts.temporal import canonical_calendar, timedelta_quotient
+from hydroforge.contracts.temporal import timedelta_quotient
+from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.netcdf import NetCDFDataset
 from hydroforge.data.netcdf import monthly_time_to_key
 
@@ -115,24 +114,14 @@ class ERA5LandAccumDataset(NetCDFDataset):
                 spin_up_start_date, time_interval, "spin_up_start_date",
             )
 
-        # Keep one logical (physical) support for the immutable temporal
-        # contract. NetCDF timestamps remain shifted by +time_interval for I/O.
-        self._physical_start_date = start_date
-        self._physical_end_date = end_date
-        self._physical_spin_up_start_date = spin_up_start_date
-        self._physical_spin_up_end_date = spin_up_end_date
-        self._era5_time_shift = time_interval   # the +Δt shift applied to data reading
-
-        # Shift spin-up dates if provided, similar to main simulation dates
-        if spin_up_start_date is not None:
-            spin_up_start_date += time_interval
-        if spin_up_end_date is not None:
-            spin_up_end_date += time_interval
+        # Keep the public contract on physical interval starts. NetCDF storage
+        # timestamps are mapped to interval ends by _storage_time().
+        self._era5_time_shift = time_interval
 
         super().__init__(
             base_dir=base_dir,
-            start_date=start_date + time_interval,
-            end_date=end_date + time_interval,
+            start_date=start_date,
+            end_date=end_date,
             time_interval=time_interval,
             model_step=model_step,
             chunk_len=chunk_len,
@@ -147,24 +136,12 @@ class ERA5LandAccumDataset(NetCDFDataset):
             **kwargs,
         )
 
-    # ------------------------------------------------------------------
-    # Time reporting: return physical (unshifted) times
-    # ------------------------------------------------------------------
-    @property
-    def main_start_time(self):
-        return self._convert_to_calendar(self._physical_start_date)
+    def _storage_time(
+        self, logical_time: Union[datetime, cftime.datetime],
+    ) -> Union[datetime, cftime.datetime]:
+        """Map interval-start time to ERA5's interval-end timestamp."""
 
-    @property
-    def main_end_time(self):
-        return self._convert_to_calendar(self._physical_end_date)
-
-    @property
-    def spin_up_start_time(self):
-        return self._convert_to_calendar(self._physical_spin_up_start_date)
-
-    @property
-    def spin_up_end_time(self):
-        return self._convert_to_calendar(self._physical_spin_up_end_date)
+        return logical_time + self._era5_time_shift
 
     @staticmethod
     def _validate_daily_grid_alignment(
@@ -204,71 +181,17 @@ class ERA5LandAccumDataset(NetCDFDataset):
     def _ensure_source_time_available(
         self, source_time: Union[datetime, cftime.datetime],
     ) -> None:
-        """Add one support timestamp to the lookup used by the read planner.
+        """Index the cumulative predecessor needed by a non-midnight read."""
 
-        The normal NetCDF timeline only indexes the requested shifted window.
-        A non-midnight first interval also needs the cumulative frame immediately
-        before that window, which can be in a preceding file partition.
-        """
-        if source_time in self._timeline.dt_to_loc:
-            return
-
-        key = self.time_to_key(source_time)
-        dates = self._timeline.file_times.get(key)
-        path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
-        if dates is None:
-            self.validate_files_exist([path])
-            with Dataset(path, "r") as dataset:
-                time_var = dataset.variables.get("time") or dataset.variables.get("valid_time")
-                if time_var is None:
-                    raise ValueError(f"Time variable not found in file: {path.name}")
-                file_calendar = canonical_calendar(
-                    getattr(time_var, "calendar", "standard"),
-                )
-                if file_calendar != canonical_calendar(self.calendar):
-                    raise ValueError(
-                        "forcing files use inconsistent calendars: "
-                        f"{self.calendar!r} and {file_calendar!r} in {path.name}"
-                    )
-                dates = self._timeline._decode_dates(time_var, path)
-            if not dates:
-                raise ValueError(f"Time axis is empty in {path.name}")
-            non_increasing = [
-                right for left, right in zip(dates, dates[1:])
-                if right <= left
-            ]
-            if non_increasing:
+        try:
+            self._timeline.ensure_support_time(source_time)
+        except ValueError as error:
+            if str(error).startswith("Missing support timestamp"):
                 raise ValueError(
-                    f"Time axis in {path.name} must be strictly increasing; "
-                    f"first invalid timestamp is {non_increasing[0]}"
-                )
-            existing_times = {
-                date: existing_key
-                for existing_key, existing_dates in self._timeline.file_times.items()
-                if existing_key != key
-                for date in existing_dates
-            }
-            duplicate = next(
-                (date for date in dates if date in existing_times), None,
-            )
-            if duplicate is not None:
-                raise ValueError(
-                    f"Timestamp {duplicate} occurs in both "
-                    f"{self.prefix}{existing_times[duplicate]}{self.suffix} "
-                    f"and {path.name}"
-                )
-            self._timeline.file_times[key] = dates
-
-        index = next(
-            (index for index, date in enumerate(dates) if date == source_time),
-            None,
-        )
-        if index is None:
-            raise ValueError(
-                f"Missing cumulative predecessor timestamp {source_time} in "
-                f"{path.name}; it is required for a non-midnight ERA5 interval"
-            )
-        self._timeline.dt_to_loc[source_time] = (key, index)
+                    f"Missing cumulative predecessor timestamp {source_time}; "
+                    "it is required for a non-midnight ERA5 interval"
+                ) from error
+            raise
 
     def _transform_cumulative_to_incremental(
         self,
@@ -312,13 +235,9 @@ class ERA5LandAccumDataset(NetCDFDataset):
             increments[reset] = arr[reset]
         return increments
 
-    def get_data(
-        self,
-        current_time: Union[datetime, cftime.datetime],
-        chunk_len: int,
-    ) -> np.ndarray:
-        source_times = self._timeline.contiguous_times(current_time, chunk_len)
-        physical_times = [dt - self._era5_time_shift for dt in source_times]
+    def _read_chunk(self, chunk: SourceChunk) -> np.ndarray:
+        physical_times = list(chunk.source_times(self.time_interval))
+        source_times = self._timeline.storage_times_for_chunk(chunk)
 
         needs_previous = not self._is_day_start(physical_times[0])
         read_times = source_times
@@ -327,7 +246,7 @@ class ERA5LandAccumDataset(NetCDFDataset):
             self._ensure_source_time_available(predecessor)
             read_times = [predecessor, *source_times]
 
-        ops = self._timeline.ops_from_times(read_times)
+        ops = self._timeline.operations_for_times(read_times)
         data = self._finish_read(self._read_ops(ops))
         if not isinstance(data, np.ndarray):
             raise TypeError(
@@ -339,9 +258,3 @@ class ERA5LandAccumDataset(NetCDFDataset):
         return self._transform_cumulative_to_incremental(
             arr, physical_times, previous,
         )
-
-    def read_chunk(self, idx: int) -> np.ndarray:
-        """Read one physical chunk through ERA5 cumulative differencing."""
-
-        chunk = self.chunk_plan[idx]
-        return self.get_data(chunk.source_start, chunk.length)

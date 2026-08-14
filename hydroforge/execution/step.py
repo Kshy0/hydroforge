@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
+from enum import IntEnum
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast
 
@@ -35,6 +36,54 @@ _ACTIVE_MANAGED_STEP: ContextVar[_StepRuntime | None] = ContextVar(
 )
 
 
+class _DistributedStepKind(IntEnum):
+    ABORT = 0
+    SUBSTEP = 1
+    USER_STEP_COMPLETE = 2
+    STEP_FINALIZED = 3
+    BEGIN = 4
+
+
+@dataclass(frozen=True, slots=True)
+class _DistributedStepEvent:
+    """One logical managed-step handshake before int64 wire encoding."""
+
+    kind: int
+    signature: tuple[int, int, int] = (0, 0, 0)
+    failed: bool = False
+
+    def __post_init__(self) -> None:
+        kind = self.kind
+        if isinstance(kind, _DistributedStepKind):
+            kind = int(kind)
+            object.__setattr__(self, "kind", kind)
+        if type(kind) is not int or kind < 0:
+            raise ValueError("distributed managed-step event kind must be >= 0")
+        if (
+            not isinstance(self.signature, tuple)
+            or len(self.signature) != 3
+            or any(
+                type(value) is not int or value < 0
+                for value in self.signature
+            )
+        ):
+            raise ValueError(
+                "distributed managed-step signature must contain three "
+                "non-negative exact ints"
+            )
+        if type(self.failed) is not bool:
+            raise TypeError("distributed managed-step failed flag must be bool")
+
+    def wire(self, sequence: int) -> tuple[int, int, int, int, int]:
+        """Encode the stable five-int process-group protocol."""
+
+        if type(sequence) is not int or sequence < 0:
+            raise ValueError("distributed managed-step sequence must be >= 0")
+        if self.failed:
+            return sequence, -1, 0, 0, 0
+        return sequence, self.kind, *self.signature
+
+
 def synchronize_collective(
     kind: int, signature: tuple[int, int, int],
 ) -> None:
@@ -42,7 +91,7 @@ def synchronize_collective(
 
     step = _ACTIVE_MANAGED_STEP.get()
     if step is not None:
-        step.synchronize_distributed(kind, signature=signature)
+        step.synchronize_distributed(_DistributedStepEvent(kind, signature))
 
 
 @dataclass
@@ -76,6 +125,7 @@ class _StepRuntime:
         self.stat_is_last = True
         self.stat_is_outer_last = True
         self.scheduled_step: SimulationStep | None = None
+        self.requested_sub_steps: int | None = None
 
     def prepare_invocation(self) -> None:
         """Reset and validate the rank-synchronous managed-step protocol."""
@@ -109,33 +159,24 @@ class _StepRuntime:
             )
 
     def synchronize_distributed(
-        self, kind: int, *, signature: tuple[int, int, int] = (0, 0, 0),
-        failed: bool = False,
+        self, event: _DistributedStepEvent,
     ) -> None:
         """Match the next rank event or propagate a peer's local failure."""
 
         if self.world_size == 1 or self._distributed_terminal:
             return
-        if type(kind) is not int or kind < 0:
-            raise ValueError("distributed managed-step event kind must be >= 0")
-        if (
-            not isinstance(signature, tuple) or len(signature) != 3
-            or any(type(value) is not int or value < 0 for value in signature)
-        ):
-            raise ValueError(
-                "distributed managed-step signature must contain three "
-                "non-negative exact ints"
+        if not isinstance(event, _DistributedStepEvent):
+            raise TypeError(
+                "distributed managed-step synchronization requires an event"
             )
         source = self._distributed_input
         if source is None or not self._distributed_outputs:
             raise RuntimeError(
                 "distributed managed-step synchronization was not prepared"
             )
-        source[0] = self._distributed_sequence
-        source[1] = -1 if failed else kind
-        source[2] = 0 if failed else signature[0]
-        source[3] = 0 if failed else signature[1]
-        source[4] = 0 if failed else signature[2]
+        wire = event.wire(self._distributed_sequence)
+        for index, value in enumerate(wire):
+            source[index] = value
         dist.all_gather(list(self._distributed_outputs), source)
         observed = tuple(
             tuple(map(int, value.tolist()))
@@ -148,7 +189,7 @@ class _StepRuntime:
         )
         if failed_ranks or len(set(observed)) != 1:
             self._distributed_terminal = True
-            if failed:
+            if event.failed:
                 return
             if failed_ranks:
                 raise RuntimeError(
@@ -164,7 +205,9 @@ class _StepRuntime:
     def abort_distributed(self) -> None:
         """Publish a caught local failure at the next synchronization event."""
 
-        self.synchronize_distributed(0, failed=True)
+        self.synchronize_distributed(_DistributedStepEvent(
+            _DistributedStepKind.ABORT, failed=True,
+        ))
 
     def snapshot_state(self) -> tuple[tuple[Any, ...], tuple[Any, Any] | None]:
         state = self.state
@@ -194,6 +237,7 @@ class _StepRuntime:
     def begin(
         self, *, current_time: Any, time_step: timedelta | None,
         output_enabled: bool | None,
+        num_sub_steps: int | None = None,
         program_owner: _ManagedStepDescriptor,
     ) -> _StepRuntime:
         state = self.state
@@ -202,6 +246,7 @@ class _StepRuntime:
                 "managed-step program owner must be a compiled descriptor"
             )
         self.current_time = current_time
+        self.requested_sub_steps = _validate_requested_sub_steps(num_sub_steps)
         self._substep_scope_claimed = False
         self._outer_scope_count = 0
         self.completed_substeps = None
@@ -414,14 +459,35 @@ _FRAMEWORK_STEP_PARAMETERS = frozenset({
     "spinup",
     "output_enabled",
     "time_step",
+    "num_sub_steps",
 })
+
+
+def _validate_requested_sub_steps(value: Any) -> int | None:
+    """Validate the driver-owned fixed sub-step request before user code."""
+
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise TypeError("num_sub_steps must be an exact int or None")
+    if value < 1:
+        raise ValueError("num_sub_steps must be positive when provided")
+    from hydroforge.execution.substeps import INVALID_SUBSTEP_COUNT
+
+    if value >= INVALID_SUBSTEP_COUNT:
+        raise ValueError(
+            "num_sub_steps must be smaller than HydroForge's reserved "
+            "invalid-count sentinel"
+        )
+    return value
 
 
 class _StepCallLayout:
     """Validate that model-authored signatures contain only model inputs."""
 
     def __init__(self, function: Callable) -> None:
-        parameters = tuple(inspect.signature(function).parameters.values())
+        self.signature = inspect.signature(function)
+        parameters = tuple(self.signature.parameters.values())
         names = {parameter.name for parameter in parameters}
         if "self" not in names:
             raise TypeError("@managed_step requires a self parameter")
@@ -431,6 +497,11 @@ class _StepCallLayout:
                 "@managed_step framework parameters must not appear in the "
                 f"model method signature: {sorted(owned)}"
             )
+
+    def validate_call(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        """Validate model arguments before opening the managed lifecycle."""
+
+        self.signature.bind(*args, **kwargs)
 
 
 class _ManagedStepDescriptor:
@@ -541,6 +612,10 @@ class _CompiledStepPolicy:
                     "output_enabled must be an exact bool when provided"
                 )
             supplied_time_step = kwargs.pop("time_step", _MISSING)
+            requested_sub_steps = _validate_requested_sub_steps(
+                kwargs.pop("num_sub_steps", None),
+            )
+            self.descriptor.layout.validate_call(args, kwargs)
             if context.schedule is not None:
                 if supplied_time_step is not _MISSING:
                     raise TypeError(
@@ -570,13 +645,19 @@ class _CompiledStepPolicy:
                 current_time=current_time,
                 time_step=time_step,
                 output_enabled=output_enabled,
+                num_sub_steps=requested_sub_steps,
                 program_owner=self.descriptor,
             )
             context.synchronize_distributed(
-                4,
-                signature=(
-                    int(context.spinup), int(context.output_enabled),
-                    context.flags,
+                _DistributedStepEvent(
+                    _DistributedStepKind.BEGIN,
+                    (
+                        int(context.spinup), int(context.output_enabled),
+                        (
+                            0 if context.requested_sub_steps is None
+                            else context.requested_sub_steps
+                        ) << 4 | context.flags,
+                    ),
                 ),
             )
             if self._rank == 0:
@@ -628,10 +709,14 @@ class _CompiledStepPolicy:
                     adaptive_time_step=context.completed_substeps,
                     progress=progress,
                 )
-            context.synchronize_distributed(2)
+            context.synchronize_distributed(_DistributedStepEvent(
+                _DistributedStepKind.USER_STEP_COMPLETE,
+            ))
             context.finish()
             self.execution.statistics.check_background_failures(current_time)
-            context.synchronize_distributed(3)
+            context.synchronize_distributed(_DistributedStepEvent(
+                _DistributedStepKind.STEP_FINALIZED,
+            ))
             context.commit_clock()
             return result
         except BaseException as error:
@@ -674,5 +759,36 @@ def managed_step(function: _F) -> _F:
         model = args[0] if args else kwargs["self"]
         return model._execution.step_policies[descriptor].execute(args, kwargs)
 
+    authored = inspect.signature(function)
+    parameters = list(authored.parameters.values())
+    insertion = next(
+        (
+            index for index, parameter in enumerate(parameters)
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD
+        ),
+        len(parameters),
+    )
+    framework_options = (
+        inspect.Parameter(
+            "time_step",
+            kind=inspect.Parameter.KEYWORD_ONLY,
+            default=None,
+            annotation=timedelta | None,
+        ),
+        inspect.Parameter(
+            "num_sub_steps",
+            kind=inspect.Parameter.KEYWORD_ONLY,
+            default=None,
+            annotation=int | None,
+        ),
+        inspect.Parameter(
+            "output_enabled",
+            kind=inspect.Parameter.KEYWORD_ONLY,
+            default=None,
+            annotation=bool | None,
+        ),
+    )
+    parameters[insertion:insertion] = framework_options
+    wrapper.__signature__ = authored.replace(parameters=parameters)  # type: ignore[attr-defined]
     setattr(wrapper, "__hydroforge_managed_step__", descriptor)
     return cast(_F, wrapper)

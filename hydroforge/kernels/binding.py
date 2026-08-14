@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal, Mapping
 import torch
 
 from hydroforge.contracts.fields import concrete_tensor_dtype
+from hydroforge.contracts.kernels import ModuleEnabled, ModuleFlag
 from hydroforge.contracts.runtime import (
     DEFAULT_BACKEND_REQUIREMENT,
     DEFAULT_BLOCK_SIZE,
@@ -53,6 +54,7 @@ class KernelBinder:
         return self.model._field_namespace
 
     def complete(self, kernel: Any, supplied: dict[str, Any]) -> dict[str, Any]:
+        spec = kernel.registry.spec
         if not supplied:
             cached = self._complete_cache.get(kernel)
             if cached is None:
@@ -62,6 +64,7 @@ class KernelBinder:
                         parameter,
                         metadata.optional_buffers,
                         metadata.optional_values,
+                        spec.feature_sources,
                     ).value
                     for parameter in metadata.parameters
                     if parameter != "BLOCK_SIZE"
@@ -82,12 +85,8 @@ class KernelBinder:
                 f"{metadata.name}.BLOCK_SIZE is compiler-owned; configure "
                 "model.BLOCK_SIZE once instead of overriding a kernel launch"
             )
-        # A call-site value is dynamic only when the canonical model namespace
-        # has no matching field.  Never let an explicit value override a
-        # unique field, a capability decision, or a disabled optional value;
-        # those would create two competing sources for one ABI parameter.
         for parameter in supplied:
-            self.validate_dynamic(parameter, metadata)
+            self.validate_dynamic(parameter, spec)
         arguments = dict(supplied)
         for parameter in metadata.parameters:
             if parameter == "BLOCK_SIZE":
@@ -97,33 +96,27 @@ class KernelBinder:
                     parameter,
                     metadata.optional_buffers,
                     metadata.optional_values,
+                    spec.feature_sources,
                 ).value
         arguments["BLOCK_SIZE"] = self._block_size(kernel)
         return arguments
 
-    def validate_dynamic(self, parameter: str, metadata: Any) -> None:
-        """Prove that one call-site argument has no canonical model source.
-
-        Runtime binding and the explicit ``check_step`` audit share this exact
-        decision; neither is allowed to reinterpret a resolution failure as a
-        dynamic value through a broader exception policy.
-        """
+    def validate_dynamic(self, parameter: str, spec: Any) -> None:
+        """Require a call-site argument to have no model binding."""
 
         try:
             resolution = self.resolve(
                 parameter,
-                metadata.optional_buffers,
-                metadata.optional_values,
+                spec.optional_buffers,
+                spec.optional_values,
+                spec.feature_sources,
             )
         except UnboundKernelArgument:
-            # Capability and batching parameters are compiler-owned by
-            # definition.  A missing declaration is an invalid model contract,
-            # never permission to turn them into caller-provided values.
             if parameter.startswith(("HAS_", "batched_")):
                 raise
             return
         raise TypeError(
-            f"{metadata.name}.{parameter} is already resolved from "
+            f"{spec.name}.{parameter} is already resolved from "
             f"{resolution.source} {resolution.owner!r}; omit the redundant "
             "call-site value"
         )
@@ -131,21 +124,17 @@ class KernelBinder:
     def buffer_dtypes(
         self, kernel: Any, arguments: dict[str, Any],
     ) -> Mapping[str, torch.dtype]:
-        """Compile the concrete buffer ABI from declared model fields once.
-
-        Present tensors are checked against their owning field declaration.
-        Disabled optional buffers have no tensor value, so their declared
-        field dtype is resolved without constructing the disabled module.
-        Backends therefore never infer a pointee type from a null value.
-        """
+        """Compile buffer dtypes from declared model fields."""
 
         metadata = kernel.metadata
+        feature_sources = kernel.registry.spec.feature_sources
         result: dict[str, torch.dtype] = {}
         for parameter in metadata.buffers:
             value = arguments[parameter]
             declared = self._declared_buffer_dtype(
                 parameter,
                 metadata.optional_buffers.get(parameter),
+                feature_sources,
                 optional=parameter in metadata.optional_buffers,
             )
             if isinstance(value, torch.Tensor):
@@ -169,7 +158,8 @@ class KernelBinder:
         return MappingProxyType(result)
 
     def _declared_buffer_dtype(
-        self, parameter: str, feature: str | None, *, optional: bool,
+        self, parameter: str, feature: str | None,
+        feature_sources: Mapping[str, Any], *, optional: bool,
     ) -> torch.dtype | None:
         field = parameter[:-4] if parameter.endswith("_ptr") else parameter
         matches = self._field_index.get(field, ())
@@ -209,9 +199,10 @@ class KernelBinder:
             return None
         if feature is None:
             return None
-        if not feature.startswith("HAS_"):
+        source = feature_sources.get(feature)
+        if not isinstance(source, (ModuleEnabled, ModuleFlag)):
             return None
-        module_name = feature.removeprefix("HAS_").lower()
+        module_name = source.module
         module_type = self.model.module_types().get(module_name)
         if module_type is None:
             return None
@@ -226,13 +217,7 @@ class KernelBinder:
         )
 
     def _block_size(self, kernel: Any) -> int:
-        """Resolve one launch width from the canonical initialization policy.
-
-        An explicit model value is the single user override. Otherwise the
-        logical KernelSpec may choose a backend-specific performance default;
-        kernels without one inherit the model's declared default. Backend
-        adapters never own or infer launch widths.
-        """
+        """Resolve the configured launch width."""
 
         model = self.model
         backend = model._execution.backend
@@ -253,11 +238,12 @@ class KernelBinder:
         parameter: str,
         optional_buffers: Any,
         optional_values: Any,
+        feature_sources: Mapping[str, Any],
     ) -> BindingResolution:
         model = self.model
         if parameter in optional_values:
             flag, disabled = optional_values[parameter]
-            if not self._feature(flag):
+            if not self._feature(flag, feature_sources):
                 return BindingResolution(disabled, "optional", flag)
         if parameter in optional_buffers:
             feature = optional_buffers[parameter]
@@ -285,7 +271,7 @@ class KernelBinder:
                     "optional",
                     f"{match.module_name}.{field}",
                 )
-            if not self._feature(feature):
+            if not self._feature(feature, feature_sources):
                 return BindingResolution(
                     None, "optional", feature,
                 )
@@ -294,9 +280,9 @@ class KernelBinder:
                 1 if model.num_trials is None else model.num_trials,
                 "model_config", "model",
             )
-        if parameter.startswith("HAS_"):
+        if parameter in feature_sources:
             return BindingResolution(
-                self._feature(parameter), "feature", parameter,
+                self._feature(parameter, feature_sources), "feature", parameter,
             )
 
         field = parameter[:-4] if parameter.endswith("_ptr") else parameter
@@ -316,7 +302,7 @@ class KernelBinder:
                 ]
                 if (
                     len(declared) == 1
-                    and declared[0] not in self.model._capabilities
+                    and declared[0] not in self.model.opened_modules
                 ):
                     return BindingResolution(
                         False, "batched", declared[0],
@@ -346,33 +332,53 @@ class KernelBinder:
             f"{match.module_name}.{field}",
         )
 
-    def _feature(self, parameter: str) -> bool:
+    def _feature(
+        self, parameter: str, feature_sources: Mapping[str, Any],
+    ) -> bool:
         model = self.model
-        if not parameter.startswith("HAS_"):
-            raise ValueError(
-                f"kernel feature {parameter!r} must use the canonical HAS_* name"
+        source = feature_sources.get(parameter)
+        if source is None:
+            raise KeyError(
+                f"kernel feature {parameter!r} has no explicit feature_source"
             )
-        feature = parameter.removeprefix("HAS_").lower()
-        if feature in model.module_types() or feature in model.feature_rules:
-            return model.has_feature(feature)
-        flag_name = f"has_{feature}"
-        matches = self._field_index.get(flag_name, ())
-        if len(matches) == 1:
-            value = getattr(matches[0].owner, flag_name)
+        if isinstance(source, ModuleEnabled):
+            if source.module not in model.module_types():
+                raise KeyError(
+                    f"kernel feature {parameter!r} references unknown model "
+                    f"module {source.module!r}"
+                )
+            return source.module in model.opened_modules
+        if isinstance(source, ModuleFlag):
+            module_type = model.module_types().get(source.module)
+            if module_type is None:
+                raise KeyError(
+                    f"kernel feature {parameter!r} references unknown "
+                    f"model module {source.module!r}"
+                )
+            module = model._modules.get(source.module)
+            if module is None:
+                raise KeyError(
+                    f"kernel feature {parameter!r} requires closed module "
+                    f"{source.module!r}"
+                )
+            if source.field not in module_type.model_fields and not hasattr(
+                module_type, source.field,
+            ):
+                raise KeyError(
+                    f"kernel feature {parameter!r} references unknown field "
+                    f"{source.module}.{source.field}"
+                )
+            value = getattr(module, source.field)
             if type(value) is not bool:
                 raise TypeError(
-                    f"kernel feature {parameter!r} resolved "
-                    f"{matches[0].module_name}.{flag_name}, which must be an "
-                    f"exact bool rather than {type(value).__name__}"
+                    f"kernel feature {parameter!r} source "
+                    f"{source.module}.{source.field} must be an exact bool, "
+                    f"got {type(value).__name__}"
                 )
             return value
-        if len(matches) > 1:
-            self._raise_resolution(
-                parameter, [match.module_name for match in matches],
-            )
-        raise KeyError(
-            f"kernel feature {parameter!r} does not name a module, feature "
-            f"rule, or unique boolean field {flag_name!r}"
+        raise TypeError(
+            f"kernel feature {parameter!r} has invalid source "
+            f"{type(source).__name__}"
         )
 
     @staticmethod

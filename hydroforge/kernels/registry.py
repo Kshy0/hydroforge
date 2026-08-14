@@ -148,7 +148,7 @@ class BackendRegistry:
     def available(self) -> tuple[str, ...]:
         return tuple(self.implementations)
 
-    def resolve(self, backend: str) -> Callable:
+    def resolve(self, backend: str, *, precision: str | None = None) -> Callable:
         """Build the implementation for one explicit model backend."""
         try:
             factory = self.implementations[backend]
@@ -157,9 +157,10 @@ class BackendRegistry:
                 f"Backend {backend!r} is not registered for {self.name}; "
                 f"available={self.available}"
             ) from exc
-        with kernel_factory_contract(self.spec):
+        spec = self.spec.resolve_precision(precision)
+        with kernel_factory_contract(spec):
             implementation = factory()
-        return StrictImplementation(implementation, self.spec, backend)
+        return StrictImplementation(implementation, spec, backend)
 
     def __call__(self, **kwargs):
         return self.selected(**kwargs)
@@ -179,14 +180,20 @@ class KernelEntry:
 
     def __init__(self, registry: BackendRegistry):
         self.registry = registry
-        self._implementations: dict[str, Callable] = {}
+        self._implementations: dict[tuple[str, str | None], Callable] = {}
 
-    def implementation(self, backend: str) -> Callable:
+    def implementation(
+        self, backend: str, *, precision: str | None = None,
+    ) -> Callable:
         """Return one backend implementation, constructed and checked once."""
-        implementation = self._implementations.get(backend)
+        precision_key = precision if self.registry.spec.uses_precision else None
+        key = (backend, precision_key)
+        implementation = self._implementations.get(key)
         if implementation is None:
-            implementation = self.registry.resolve(backend)
-            self._implementations[backend] = implementation
+            implementation = self.registry.resolve(
+                backend, precision=precision_key,
+            )
+            self._implementations[key] = implementation
         return implementation
 
     @property
@@ -204,6 +211,7 @@ class KernelEntry:
             kwargs = binder.complete(self, kwargs)
             implementation = self.implementation(
                 binder.model._execution.backend,
+                precision=getattr(binder.model, "precision", None),
             )
             launch = implementation.specialize(
                 kwargs,

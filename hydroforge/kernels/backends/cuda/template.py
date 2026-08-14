@@ -22,6 +22,7 @@ _SCALAR_TYPES = {
     "uint32": "uint32_t",
     "index": "long",
     "float32": "float",
+    "float64": "double",
 }
 CUDA_LAUNCH_BODY_MARKER = "// HYDROFORGE CUDA LAUNCH BODY"
 
@@ -38,6 +39,8 @@ def _constant_literal(kind: str, value: Any) -> str:
         return str(value)
     if kind == "float32":
         return f"{repr(value)}f"
+    if kind == "float64":
+        return repr(value)
     raise TypeError(f"unsupported CUDA compile-time kind {kind!r}")
 
 

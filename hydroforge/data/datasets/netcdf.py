@@ -7,14 +7,15 @@
 from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import cftime
 import numpy as np
 from netCDF4 import Dataset
 
+from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.gridded import GriddedDataset
-from hydroforge.data.datasets.timeline import DatasetTimeline
+from hydroforge.data.datasets.timeline import DatasetTimeline, ReadOp
 from hydroforge.data.netcdf import read_netcdf_var_sliced, single_file_key, yearly_time_to_key
 
 
@@ -81,6 +82,14 @@ class NetCDFDataset(GriddedDataset):
             time_aggregation=self.time_aggregation,
         )
 
+    @staticmethod
+    def _storage_time(
+        logical_time: Union[datetime, cftime.datetime],
+    ) -> Union[datetime, cftime.datetime]:
+        """Map public logical time to the timestamp stored on disk."""
+
+        return logical_time
+
     # -------------------------
     # Variable shape helpers
     # -------------------------
@@ -112,7 +121,7 @@ class NetCDFDataset(GriddedDataset):
     @cached_property
     def _grid_shape(self) -> Tuple[int, int]:
         """Get (ny, nx) grid dimensions from the first file."""
-        key = self.time_to_key(self.start_date)
+        key = self.time_to_key(self._storage_time(self.start_date))
         path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
         with Dataset(path, "r") as ds:
             var = ds.variables[self.var_name]
@@ -162,7 +171,7 @@ class NetCDFDataset(GriddedDataset):
         local_x = x_coords - x_min
         self._bbox_local_indices = (local_y * bbox_nx + local_x).astype(np.int64)
 
-    def _read_ops(self, ops: List[Tuple[str, List[int]]]) -> np.ndarray:
+    def _read_ops(self, ops: Sequence[ReadOp]) -> np.ndarray:
         """Execute per-file reads using absolute time indices.
 
         Each op is (file_key, abs_indices). Sequence indices are converted to
@@ -259,7 +268,7 @@ class NetCDFDataset(GriddedDataset):
 
         first_op = None
         for entry in self._timeline.plan:
-            for key, abs_indices in entry[1]:
+            for key, abs_indices in entry.operations:
                 if abs_indices:
                     first_op = (key, int(abs_indices[0]))
                     break
@@ -304,41 +313,24 @@ class NetCDFDataset(GriddedDataset):
             return {name: block / self.unit_factor for name, block in data.items()}
         return data / self.unit_factor
 
-    def read_chunk(self, idx: int) -> Union[np.ndarray, Dict[str, np.ndarray]]:
-        """
-        Reads the chunk at the specified index using the pre-computed plan.
-        """
-        plan = self._timeline.plan
-        if idx < 0 or idx >= len(plan):
-            raise IndexError(f"Chunk index {idx} out of range (0-{len(plan)-1})")
+    def _read_chunk(
+        self, chunk: SourceChunk,
+    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        """Read one validated source request through the compiled I/O plan."""
 
-        entry = plan[idx]
-        ops = entry[1]
+        ops = self._timeline.read_for_chunk(chunk).operations
         data = self._read_ops(ops)
         return self._finish_read(data)
 
     def close(self) -> None:
         """No persistent open handles are kept; provided for interface completeness."""
 
-    def get_data(self, current_time: Union[datetime, cftime.datetime], chunk_len: int) -> Union[np.ndarray, Dict[str, np.ndarray]]:
-        """Read a contiguous block starting at current_time with minimal NetCDF I/O.
-
-        Returns:
-        - If _local_indices is set: (T, N) compressed array
-        - If _local_indices is None: (T, Y, X) full grid array
-        """
-        times = self._timeline.contiguous_times(current_time, chunk_len)
-        entry = self._timeline.build_entry(times)
-        ops = entry[1]
-        data = self._read_ops(ops)
-        return self._finish_read(data)
-
     # -------------------------
     # Public API
     # -------------------------
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
         """Return (lon, lat) 1D arrays from the first file."""
-        key = self.time_to_key(self.start_date)
+        key = self.time_to_key(self._storage_time(self.start_date))
         path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
         with Dataset(path, "r") as ds:
             lat = ds.variables.get("lat") or ds.variables.get("latitude")

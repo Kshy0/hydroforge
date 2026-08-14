@@ -110,17 +110,17 @@ class StatisticsBindingCompiler:
             raise RuntimeError("statistics aggregator has not been created")
         for name in values:
             try:
-                module, attribute, _ = self.variable_map[name]
+                entry = self.variable_map[name]
             except KeyError as exc:
                 raise ValueError(
                     f"Static variable {name!r} was not found in an opened module"
                 ) from exc
-            tensor = getattr(module, attribute)
+            tensor = getattr(entry.module, entry.field_name)
             if not isinstance(tensor, torch.Tensor) or tensor.ndim != 1:
                 raise ValueError(
                     f"Static variable {name!r} must be a one-dimensional tensor"
                 )
-            field = module.get_tensor_schema(attribute)
+            field = entry.module.get_tensor_schema(entry.field_name)
             if field is None:
                 raise ValueError(f"Static variable {name!r} has no field metadata")
             if field.tensor.output == "disabled":
@@ -154,8 +154,8 @@ class StatisticsBindingCompiler:
                         "existing model field or declared virtual; choose a "
                         "different alias"
                     )
-                module, attribute, _ = self.variable_map[name]
-                field = module.get_tensor_schema(attribute)
+                entry = self.variable_map[name]
+                field = entry.module.get_tensor_schema(entry.field_name)
                 metadata = field.tensor
                 expression = (
                     metadata.expression
@@ -210,8 +210,8 @@ class StatisticsBindingCompiler:
             cursor += 1
             info = adhoc.get(name)
             if info is None and name in self.variable_map:
-                module, attribute, _ = self.variable_map[name]
-                info = module.get_tensor_schema(attribute)
+                entry = self.variable_map[name]
+                info = entry.module.get_tensor_schema(entry.field_name)
             metadata = info.tensor
             expression = (
                 metadata.expression if metadata.category == "virtual" else None
@@ -269,11 +269,11 @@ class StatisticsBindingCompiler:
                 registered.add(name)
                 continue
 
-            module, attribute, _ = self.variable_map[name]
-            if not hasattr(module, attribute):
+            entry = self.variable_map[name]
+            if not hasattr(entry.module, entry.field_name):
                 raise ValueError(f"Output field {name!r} has no runtime value")
-            tensor = getattr(module, attribute)
-            field = module.get_tensor_schema(attribute)
+            tensor = getattr(entry.module, entry.field_name)
+            field = entry.module.get_tensor_schema(entry.field_name)
             if field is None:
                 raise ValueError(f"Output field {name!r} has no tensor metadata")
             if name in variable_ops and field.tensor.output == "disabled":
@@ -323,8 +323,8 @@ class StatisticsBindingCompiler:
             )
 
     def _field_metadata(self, name: str) -> tuple[str | None, str | None]:
-        module, attribute, _ = self.variable_map[name]
-        field = module.get_tensor_schema(attribute)
+        entry = self.variable_map[name]
+        field = entry.module.get_tensor_schema(entry.field_name)
         if field is None:
             return None, None
         coordinate = field.tensor.dim_coords

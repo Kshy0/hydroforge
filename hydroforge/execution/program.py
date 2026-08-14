@@ -40,16 +40,21 @@ class FixedSubstepProgram:
             index=self.counter, dt=self.weight,
         )
         self.operators = None
+        self.final_operators = None
         self.metal_iteration = None
+        self.metal_final_iteration = None
         self.metal_fold_iteration = None
+        self.metal_fold_final_iteration = None
         self._metal_fold_aggregator = None
         self.iteration_graph = None
+        self.final_iteration_graph = None
         self.statistics_graph = None
+        self.final_statistics_graph = None
         self.mode = self.execution.loop_mode(
             world_size=model.world_size, allow_distributed=False,
         )
 
-    def install(self, operators: Any) -> None:
+    def install(self, operators: Any, final_operators: Any | None = None) -> None:
         """Atomically install one recorded fixed-step program."""
         if self.operators is not None:
             raise RuntimeError("fixed substep program is already installed")
@@ -60,17 +65,21 @@ class FixedSubstepProgram:
                 "fixed substep produced an empty operator IR; backend kernels "
                 "must be registered through BackendRegistry + KernelSpec"
             )
-        metal_iteration = (
-            self._build_metal_iteration(operators)
+        metal_iterations = (
+            self._build_metal_iterations(operators, final_operators)
             if self.execution.capture_mode == "metal_icb" else None
         )
         # Commit only after every backend compilation/capture step succeeds.
         # A failed Metal build must remain an uninstalled program, never a
         # partially initialized object that later executes operator-by-operator.
         self.operators = operators
-        self.metal_iteration = metal_iteration
+        self.final_operators = final_operators
+        if metal_iterations is not None:
+            self.metal_iteration, self.metal_final_iteration = metal_iterations
 
-    def _build_metal_iteration(self, operators: Any) -> Any:
+    def _build_metal_iterations(
+        self, operators: Any, final_operators: Any | None,
+    ) -> tuple[Any, Any | None]:
         from hydroforge.execution.metal_control import fixed_control_command
         from hydroforge.execution.operators import capture_metal_commands
 
@@ -78,61 +87,111 @@ class FixedSubstepProgram:
             count=self.count, counter=self.counter,
             continue_flag=self.continue_flag,
         )
-        return capture_metal_commands(
+        iteration = capture_metal_commands(
             self.capture,
             (*operators.metal_commands(), control),
             cyclic=True,
         )
+        try:
+            final_iteration = None
+            if final_operators is not None:
+                final_iteration = capture_metal_commands(
+                    self.capture,
+                    (
+                        *operators.metal_commands(),
+                        *final_operators.metal_commands(),
+                        control,
+                    ),
+                    cyclic=True,
+                )
+        except BaseException as primary:
+            try:
+                self.capture.release(iteration.icb)
+            except BaseException as cleanup_error:
+                from hydroforge.contracts import ResourceCleanupError
+
+                error = ResourceCleanupError(
+                    "fixed Metal final capture", (primary, cleanup_error),
+                )
+                raise error from primary
+            raise
+        return iteration, final_iteration
 
     def close(self) -> None:
         graphs = ()
         if self.iteration_graph is not None:
             graphs = (*graphs, self.iteration_graph)
             self.iteration_graph = None
+        if self.final_iteration_graph is not None:
+            graphs = (*graphs, self.final_iteration_graph)
+            self.final_iteration_graph = None
         if self.statistics_graph is not None:
             graphs = (*graphs, self.statistics_graph)
             self.statistics_graph = None
+        if self.final_statistics_graph is not None:
+            graphs = (*graphs, self.final_statistics_graph)
+            self.final_statistics_graph = None
         operators, self.operators = self.operators, None
+        final_operators, self.final_operators = self.final_operators, None
         metal_iteration, self.metal_iteration = self.metal_iteration, None
+        metal_final_iteration, self.metal_final_iteration = (
+            self.metal_final_iteration, None
+        )
         folded_iteration = self.metal_fold_iteration
         self.metal_fold_iteration = None
+        folded_final_iteration = self.metal_fold_final_iteration
+        self.metal_fold_final_iteration = None
         self._metal_fold_aggregator = None
-        for resource in graphs:
+        for resource in dict.fromkeys(graphs):
             self.capture.release(resource)
         # Loop ICBs can reference online-ATen scratch owned by ``operators``.
         # Release every consumer before allowing the producer to drop it.
-        for iteration in (metal_iteration, folded_iteration):
+        for iteration in (
+            metal_iteration, metal_final_iteration,
+            folded_iteration, folded_final_iteration,
+        ):
             if iteration is None:
                 continue
             self.capture.release(iteration.icb)
-        if operators is not None:
-            operators.close(self.capture)
+        for program in (operators, final_operators):
+            if program is not None:
+                program.close(self.capture)
 
     def invalidate_statistics(self, aggregator: Any) -> None:
         """Release captures that retain one statistics specialization."""
         graph, self.statistics_graph = self.statistics_graph, None
         if graph is not None:
             self.capture.release(graph)
+        graph, self.final_statistics_graph = self.final_statistics_graph, None
+        if graph is not None:
+            self.capture.release(graph)
         if self._metal_fold_aggregator is aggregator:
             iteration, self.metal_fold_iteration = (
                 self.metal_fold_iteration, None
             )
+            final_iteration, self.metal_fold_final_iteration = (
+                self.metal_fold_final_iteration, None
+            )
             self._metal_fold_aggregator = None
-            if iteration is not None:
-                self.capture.release(iteration.icb)
+            for resource in (iteration, final_iteration):
+                if resource is not None:
+                    self.capture.release(resource.icb)
 
-    def _folded_metal_iteration(self):
+    def _folded_metal_iterations(self):
         aggregator = self.statistics.aggregator
         if (
             self.metal_fold_iteration is not None
             and self._metal_fold_aggregator is aggregator
         ):
-            return self.metal_fold_iteration
+            return self.metal_fold_iteration, self.metal_fold_final_iteration
         previous = self.metal_fold_iteration
+        previous_final = self.metal_fold_final_iteration
         self.metal_fold_iteration = None
+        self.metal_fold_final_iteration = None
         self._metal_fold_aggregator = None
-        if previous is not None:
-            self.capture.release(previous.icb)
+        for resource in (previous, previous_final):
+            if resource is not None:
+                self.capture.release(resource.icb)
         from hydroforge.execution.metal_control import (
             fixed_control_command, statistics_control_command,
         )
@@ -159,17 +218,48 @@ class FixedSubstepProgram:
             ),
             cyclic=True,
         )
+        try:
+            final_replacement = None
+            if self.final_operators is not None:
+                final_replacement = capture_metal_commands(
+                    self.capture,
+                    (
+                        *self.operators.metal_commands(),
+                        *self.final_operators.metal_commands(),
+                        fixed_control, control,
+                        self.statistics.metal_operator(),
+                    ),
+                    cyclic=True,
+                )
+        except BaseException as primary:
+            try:
+                self.capture.release(replacement.icb)
+            except BaseException as cleanup_error:
+                from hydroforge.contracts import ResourceCleanupError
+
+                error = ResourceCleanupError(
+                    "fixed Metal statistics final capture",
+                    (primary, cleanup_error),
+                )
+                raise error from primary
+            raise
         self.metal_fold_iteration = replacement
+        self.metal_fold_final_iteration = final_replacement
         self._metal_fold_aggregator = aggregator
-        return replacement
+        return replacement, final_replacement
 
     def _reset(self) -> None:
         self.counter.zero_()
         self.continue_flag.fill_(1)
 
-    def _iteration(self) -> None:
+    def _iteration(self, *, final: bool = False) -> None:
         if self.metal_iteration is not None:
-            self.metal_iteration.launch()
+            iteration = (
+                self.metal_final_iteration
+                if final and self.metal_final_iteration is not None
+                else self.metal_iteration
+            )
+            iteration.launch()
             return
         if self.execution.capture_mode == "cuda_graph":
             from hydroforge.execution.cuda_graph import fixed_control_end
@@ -178,34 +268,64 @@ class FixedSubstepProgram:
                 self.execution.device,
             ).cuda_stream
             self.operators.launch()
+            if final and self.final_operators is not None:
+                self.final_operators.launch()
             fixed_control_end(
                 self.count, self.counter, self.continue_flag, stream,
             )
             return
         self.operators.launch()
+        if final and self.final_operators is not None:
+            self.final_operators.launch()
         self.counter.add_(self.one_count)
         torch.lt(self.counter, self.count, out=self.continue_flag)
 
-    def _fixed_iteration_graph(self) -> Any:
-        graph = self.iteration_graph
+    def _references_counter(self) -> bool:
+        return self.operators.references_tensor(self.counter) or (
+            self.final_operators is not None
+            and self.final_operators.references_tensor(self.counter)
+        )
+
+    def _fixed_iteration_graph(self, *, final: bool = False) -> Any:
+        graph = (
+            self.final_iteration_graph if final else self.iteration_graph
+        )
         if graph is None:
-            controlled = self.operators.references_tensor(self.counter)
-            body = self._iteration if controlled else self.operators.launch
+            controlled = self._references_counter()
+            if controlled:
+                def body() -> None:
+                    self._iteration(final=final)
+            elif final and self.final_operators is not None:
+                def body() -> None:
+                    self.operators.launch()
+                    self.final_operators.launch()
+            else:
+                body = self.operators.launch
             control_state = (
                 (self.counter, self.continue_flag)
                 if controlled else ()
+            )
+            final_state = (
+                self.final_operators.mutated_tensors
+                if final and self.final_operators is not None else ()
             )
             graph = self.capture.capture_cuda(
                 body,
                 mutated_state=(
                     *control_state, *self.operators.mutated_tensors,
+                    *final_state,
                 ),
             )
-            self.iteration_graph = graph
+            if final:
+                self.final_iteration_graph = graph
+            else:
+                self.iteration_graph = graph
         return graph
 
-    def _fixed_statistics_graph(self) -> Any:
-        graph = self.statistics_graph
+    def _fixed_statistics_graph(self, *, final: bool = False) -> Any:
+        graph = (
+            self.final_statistics_graph if final else self.statistics_graph
+        )
         if graph is not None:
             return graph
         aggregator = self.statistics.aggregator
@@ -218,6 +338,8 @@ class FixedSubstepProgram:
                 self.execution.device,
             ).cuda_stream
             self.operators.launch()
+            if final and self.final_operators is not None:
+                self.final_operators.launch()
             fixed_statistics_end(
                 count=self.count,
                 counter=self.counter,
@@ -237,23 +359,50 @@ class FixedSubstepProgram:
             mutated_state=(
                 self.counter, self.continue_flag,
                 *self.operators.mutated_tensors,
+                *(
+                    self.final_operators.mutated_tensors
+                    if final and self.final_operators is not None else ()
+                ),
                 *(value for value in states.values()
                   if isinstance(value, torch.Tensor)),
             ),
         )
-        self.statistics_graph = graph
+        if final:
+            self.final_statistics_graph = graph
+        else:
+            self.statistics_graph = graph
         return graph
+
+    @staticmethod
+    def _replay_with_final(
+        regular: Any, final: Any | None, count: int,
+    ) -> None:
+        if final is None:
+            for _ in range(count):
+                regular.replay()
+            return
+        for _ in range(count - 1):
+            regular.replay()
+        final.replay()
 
     def execute(self, count: int, duration: float) -> int:
         if self.operators is None:
             raise RuntimeError("fixed substep scope has not been recorded")
         self.operators.require_stable_bindings()
+        if self.final_operators is not None:
+            self.final_operators.require_stable_bindings()
         if self.execution.capture_mode == "metal_icb":
             self.operators.reset_metal_errors()
+            if self.final_operators is not None:
+                self.final_operators.reset_metal_errors()
         step = self.execution.active_step
         if step is None:
             raise RuntimeError("fixed substeps require @managed_step")
-        if self.mode != "eager" and not self.operators.cuda_graph_capture_safe:
+        capture_safe = self.operators.cuda_graph_capture_safe and (
+            self.final_operators is None
+            or self.final_operators.cuda_graph_capture_safe
+        )
+        if self.mode != "eager" and not capture_safe:
             # A conditional-WHILE graph cannot be launched while an enclosing
             # CUDA stream capture is active.  Keep the predicate loop as one
             # device graph launch and execute its surrounding operators in
@@ -265,15 +414,18 @@ class FixedSubstepProgram:
                 raise RuntimeError(
                     "fixed device execution requires device-compatible statistics"
                 )
-            controlled = self.operators.references_tensor(self.counter)
+            controlled = self._references_counter()
             if controlled:
                 self._reset()
             width = duration / count
             for index in range(count):
+                final = index == count - 1 and self.final_operators is not None
                 if controlled:
-                    self._iteration()
+                    self._iteration(final=final)
                 else:
                     self.operators.launch()
+                    if final:
+                        self.final_operators.launch()
                 # Nested predicate graphs cannot themselves be captured in an
                 # enclosing fixed-loop graph.  Preserve fixed-loop semantics
                 # by sampling after every host-scheduled physical substep.
@@ -282,15 +434,21 @@ class FixedSubstepProgram:
                 )
             return count
         if self.mode != "eager" and not step.run_statistics:
-            controlled = self.operators.references_tensor(self.counter)
+            controlled = self._references_counter()
             if controlled:
                 self.count.fill_(count)
                 self._reset()
-            if self.operators.references_tensor(self.weight):
+            if self.operators.references_tensor(self.weight) or (
+                self.final_operators is not None
+                and self.final_operators.references_tensor(self.weight)
+            ):
                 self.weight.fill_(duration / count)
             graph = self._fixed_iteration_graph()
-            for _ in range(count):
-                graph.replay()
+            final_graph = (
+                self._fixed_iteration_graph(final=True)
+                if self.final_operators is not None else None
+            )
+            self._replay_with_final(graph, final_graph, count)
             step.advance_device(duration)
             return count
         self.count.fill_(count)
@@ -306,13 +464,26 @@ class FixedSubstepProgram:
         if self.metal_iteration is not None and fold:
             self.statistics.prelaunch(step.flags, step.total_weight)
             self._reset()
-            self._folded_metal_iteration().replay(count)
+            regular, final = self._folded_metal_iterations()
+            if final is None:
+                regular.replay(count)
+            else:
+                if count > 1:
+                    regular.replay(count - 1)
+                final.replay()
             step.advance_device(duration)
             self.operators.check_metal_errors()
+            if self.final_operators is not None:
+                self.final_operators.check_metal_errors()
             return count
         if self.metal_iteration is not None:
             self._reset()
-            self.metal_iteration.replay(count)
+            if self.metal_final_iteration is None:
+                self.metal_iteration.replay(count)
+            else:
+                if count > 1:
+                    self.metal_iteration.replay(count - 1)
+                self.metal_final_iteration.replay()
             if step.run_statistics:
                 self.statistics.sample(
                     sub_step=count - 1, num_sub_steps=count,
@@ -321,16 +492,25 @@ class FixedSubstepProgram:
                 )
             step.advance_device(duration)
             self.operators.check_metal_errors()
+            if self.final_operators is not None:
+                self.final_operators.check_metal_errors()
             return count
         if self.mode == "eager":
             self._reset()
             width = duration / count
             for index in range(count):
-                self._iteration()
+                self._iteration(
+                    final=(
+                        index == count - 1
+                        and self.final_operators is not None
+                    ),
+                )
                 step.sample_fixed(
                     sub_step=index, num_sub_steps=count, weight=width,
                 )
             self.operators.check_metal_errors()
+            if self.final_operators is not None:
+                self.final_operators.check_metal_errors()
             return count
         if step.run_statistics and not self.statistics.device_compatible():
             raise RuntimeError(
@@ -341,15 +521,21 @@ class FixedSubstepProgram:
             self.statistics.prelaunch(step.flags, step.total_weight)
             self._reset()
             graph = self._fixed_statistics_graph()
-            for _ in range(count):
-                graph.replay()
+            final_graph = (
+                self._fixed_statistics_graph(final=True)
+                if self.final_operators is not None else None
+            )
+            self._replay_with_final(graph, final_graph, count)
         else:
-            controlled = self.operators.references_tensor(self.counter)
+            controlled = self._references_counter()
             if controlled:
                 self._reset()
             graph = self._fixed_iteration_graph()
-            for _ in range(count):
-                graph.replay()
+            final_graph = (
+                self._fixed_iteration_graph(final=True)
+                if self.final_operators is not None else None
+            )
+            self._replay_with_final(graph, final_graph, count)
         if step.run_statistics and not fold:
             self.statistics.sample(
                 sub_step=count - 1, num_sub_steps=count, flags=step.flags,
@@ -493,9 +679,10 @@ class AdaptiveSubstepProgram:
             )
         if dt.layout is not torch.strided or not dt.is_contiguous():
             raise ValueError("adaptive dt must be a contiguous strided tensor")
-        if candidate_dt.dtype not in {torch.float32, torch.float64}:
+        if candidate_dt.dtype != model.dtype:
             raise TypeError(
-                "adaptive candidate_dt must have float32 or float64 dtype"
+                "adaptive candidate_dt dtype must match model.dtype; "
+                f"got {candidate_dt.dtype} and {model.dtype}"
             )
         if dt.dtype != candidate_dt.dtype:
             raise TypeError(

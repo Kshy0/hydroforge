@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Mapping
 
 from hydroforge.contracts.fields import tensor_is_active
 
@@ -11,7 +13,13 @@ if TYPE_CHECKING:
     from hydroforge.model.module import AbstractModule
 
 
-NamespaceEntry = tuple["AbstractModule", str, str | None]
+@dataclass(frozen=True, slots=True)
+class NamespaceEntry:
+    """Resolved owner and coordinate metadata for a model field."""
+
+    module: AbstractModule
+    field_name: str
+    coordinate: str | None
 
 
 class NamespaceCompiler:
@@ -19,9 +27,9 @@ class NamespaceCompiler:
 
     def __init__(self, model: AbstractModel) -> None:
         self.model = model
-        self._mapping: dict[str, NamespaceEntry] | None = None
+        self._mapping: Mapping[str, NamespaceEntry] | None = None
 
-    def build(self) -> dict[str, NamespaceEntry]:
+    def build(self) -> Mapping[str, NamespaceEntry]:
         if self._mapping is not None:
             return self._mapping
         mapping: dict[str, NamespaceEntry] = {}
@@ -33,7 +41,11 @@ class NamespaceCompiler:
                 if not tensor_is_active(field.tensor, self.model.opened_modules):
                     continue
                 field_name = field.name
-                entry = (module, field_name, field.tensor.dim_coords)
+                entry = NamespaceEntry(
+                    module=module,
+                    field_name=field_name,
+                    coordinate=field.tensor.dim_coords,
+                )
                 is_virtual = (
                     field.tensor.category == "virtual"
                     and bool(field.tensor.expression)
@@ -55,7 +67,11 @@ class NamespaceCompiler:
 
             for field_name in module.get_reference_index_fields():
                 metadata = module.get_reference_index_metadata(field_name)
-                entry = (module, field_name, metadata.dim_coords)
+                entry = NamespaceEntry(
+                    module=module,
+                    field_name=field_name,
+                    coordinate=metadata.dim_coords,
+                )
                 if field_name not in ambiguous:
                     if field_name in mapping and mapping[field_name] != entry:
                         mapping.pop(field_name)
@@ -63,5 +79,5 @@ class NamespaceCompiler:
                     else:
                         mapping.setdefault(field_name, entry)
                 mapping[f"{module_name}.{field_name}"] = entry
-        self._mapping = mapping
-        return mapping
+        self._mapping = MappingProxyType(mapping)
+        return self._mapping

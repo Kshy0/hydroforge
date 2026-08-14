@@ -301,9 +301,13 @@ class MultiRankStatsReader:
         self, points: Union[np.ndarray, Sequence[np.ndarray]],
         level: Optional[int] = None, trial: int = 0,
         fill_value: float = np.nan, dtype: Optional[np.dtype] = None,
+        *, time_slice: slice | None = None,
     ) -> np.ndarray:
+        """Read point series over a half-open slice of this reader's view."""
+
         return self._data_access.get_series(
             points, level, trial, fill_value, dtype,
+            time_slice=time_slice,
         )
 
     def plot_single_time(

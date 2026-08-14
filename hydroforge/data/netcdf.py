@@ -116,6 +116,8 @@ def _as_integer_array(selector: Any, axis_length: int) -> Optional[np.ndarray]:
         if arr.size != axis_length:
             raise IndexError("Boolean index length must match the indexed axis")
         arr = np.flatnonzero(arr)
+    elif arr.size == 0:
+        arr = np.empty(0, dtype=np.int64)
     elif arr.dtype.kind in "iu":
         arr = arr.astype(np.int64, copy=False)
     else:

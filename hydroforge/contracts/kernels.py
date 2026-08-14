@@ -16,14 +16,51 @@ AccessMode = Literal[
     "read", "write", "read_write",
     "atomic_write", "atomic_add", "atomic_min", "atomic_max",
 ]
-ScalarKind = Literal["bool", "int32", "float32"]
-RuntimeScalarKind = Literal["bool", "int32", "uint32", "index", "float32"]
+Precision = Literal["float32", "float64"]
+ScalarKind = Literal["bool", "int32", "float32", "float64", "precision"]
+RuntimeScalarKind = Literal[
+    "bool", "int32", "uint32", "index", "float32", "float64", "precision",
+]
 LoweringMode = Literal["canonical", "plan", "declared"]
 ParameterOrder = Literal["canonical", "native"]
 BufferAccessLowering = Literal["exact", "conservative"]
 BufferElementLowering = Literal["tensor", "specialized"]
 BufferDTypeABI: TypeAlias = Mapping[str, "torch.dtype"]
 _LAUNCH_BACKENDS = frozenset({"cuda", "triton", "metal"})
+
+
+@dataclass(frozen=True, slots=True)
+class ModuleEnabled:
+    module: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.module, str) or not self.module.isidentifier():
+            raise ValueError(
+                "module_enabled() requires a valid module identifier"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ModuleFlag:
+    module: str
+    field: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.module, str) or not self.module.isidentifier():
+            raise ValueError("module_flag() requires a valid module identifier")
+        if not isinstance(self.field, str) or not self.field.isidentifier():
+            raise ValueError("module_flag() requires a valid field identifier")
+
+
+FeatureSource: TypeAlias = ModuleEnabled | ModuleFlag
+
+
+def module_enabled(module: str) -> ModuleEnabled:
+    return ModuleEnabled(module)
+
+
+def module_flag(module: str, field: str) -> ModuleFlag:
+    return ModuleFlag(module, field)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +127,8 @@ def _host_scalar_is_valid(value: Any, kind: RuntimeScalarKind) -> bool:
             and math.isfinite(value)
             and abs(value) <= 3.4028234663852886e38
         )
+    if kind in {"float64", "precision"}:
+        return type(value) is float and math.isfinite(value)
     raise RuntimeError(f"unknown canonical host scalar kind {kind!r}")
 
 
@@ -217,7 +256,7 @@ class BackendLoweringSpec:
             )
         invalid_kinds = [
             kind for kind in self.native_constants.values()
-            if kind not in ("bool", "int32", "float32")
+            if kind not in ("bool", "int32", "float32", "float64")
         ]
         if invalid_kinds:
             raise ValueError(
@@ -295,16 +334,20 @@ class KernelSpec:
     buffers: Mapping[str, AccessMode]
     optional_buffers: Mapping[str, str | None] = field(default_factory=dict)
     compile_time: Mapping[str, ScalarKind] = field(default_factory=dict)
+    feature_sources: Mapping[str, FeatureSource] = field(default_factory=dict)
     runtime_scalars: Mapping[str, RuntimeScalarKind] = field(default_factory=dict)
     optional_values: Mapping[str, tuple[str, Any]] = field(default_factory=dict)
     block_sizes: Mapping[str, int] = field(default_factory=dict)
+    _precision_parameters: frozenset[str] = field(
+        default_factory=frozenset, init=False, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
         parameters = tuple(self.parameters)
         if not isinstance(self.name, str) or not self.name.isidentifier():
             raise ValueError("KernelSpec.name must be a valid Python identifier")
         for field_name in (
-            "buffers", "optional_buffers", "compile_time",
+            "buffers", "optional_buffers", "compile_time", "feature_sources",
             "runtime_scalars", "optional_values", "block_sizes",
         ):
             if not isinstance(getattr(self, field_name), Mapping):
@@ -377,7 +420,7 @@ class KernelSpec:
                 f"{sorted(unknown_constants)}"
             )
         invalid_constant_kinds = set(self.compile_time.values()).difference(
-            {"bool", "int32", "float32"},
+            {"bool", "int32", "float32", "float64", "precision"},
         )
         if invalid_constant_kinds:
             raise ValueError(
@@ -393,6 +436,46 @@ class KernelSpec:
                 f"{self.name}: uppercase capability flags must use the "
                 f"canonical HAS_* spelling: {noncanonical_features}"
             )
+        unknown_feature_sources = set(self.feature_sources).difference(
+            self.compile_time,
+        )
+        if unknown_feature_sources:
+            raise ValueError(
+                f"{self.name}: feature source(s) are not compile-time "
+                f"parameters: {sorted(unknown_feature_sources)}"
+            )
+        invalid_feature_sources = {
+            name: type(source).__name__
+            for name, source in self.feature_sources.items()
+            if not isinstance(source, (ModuleEnabled, ModuleFlag))
+        }
+        if invalid_feature_sources:
+            raise TypeError(
+                f"{self.name}: feature_sources must contain module_enabled() "
+                f"or module_flag() declarations: {invalid_feature_sources}"
+            )
+        non_boolean_feature_sources = {
+            name: self.compile_time[name]
+            for name in self.feature_sources
+            if self.compile_time[name] != "bool"
+        }
+        if non_boolean_feature_sources:
+            raise ValueError(
+                f"{self.name}: feature source(s) require bool compile-time "
+                f"parameters: {non_boolean_feature_sources}"
+            )
+        declared_feature_flags = {
+            name for name, kind in self.compile_time.items()
+            if kind == "bool" and name.startswith("HAS_")
+        }
+        missing_feature_sources = declared_feature_flags.difference(
+            self.feature_sources,
+        )
+        if missing_feature_sources:
+            raise ValueError(
+                f"{self.name}: HAS_* compile-time flag(s) require explicit "
+                f"feature_sources: {sorted(missing_feature_sources)}"
+            )
         unknown_runtime = set(self.runtime_scalars).difference(parameter_set)
         if unknown_runtime:
             raise ValueError(
@@ -400,7 +483,10 @@ class KernelSpec:
                 f"{sorted(unknown_runtime)}"
             )
         invalid_runtime_kinds = set(self.runtime_scalars.values()).difference(
-            {"bool", "int32", "uint32", "index", "float32"},
+            {
+                "bool", "int32", "uint32", "index", "float32", "float64",
+                "precision",
+            },
         )
         if invalid_runtime_kinds:
             raise ValueError(
@@ -484,12 +570,17 @@ class KernelSpec:
                     f"{self.name}: optional value {argument!r} requires bool "
                     f"feature {feature!r}, got {self.compile_time[feature]!r}"
                 )
-            if argument not in self.runtime_scalars:
+            if (
+                argument not in self.runtime_scalars
+                and argument not in self.compile_time
+            ):
                 raise ValueError(
                     f"{self.name}: optional value {argument!r} must be a "
-                    "runtime scalar"
+                    "scalar"
                 )
-            kind = self.runtime_scalars[argument]
+            kind = self.runtime_scalars.get(
+                argument, self.compile_time.get(argument),
+            )
             if not _host_scalar_is_valid(disabled, kind):
                 raise TypeError(
                     f"{self.name}: optional value {argument!r} disabled "
@@ -523,6 +614,9 @@ class KernelSpec:
         )
         object.__setattr__(self, "compile_time", _frozen_mapping(self.compile_time))
         object.__setattr__(
+            self, "feature_sources", _frozen_mapping(self.feature_sources),
+        )
+        object.__setattr__(
             self, "runtime_scalars", _frozen_mapping(self.runtime_scalars),
         )
         object.__setattr__(
@@ -531,6 +625,53 @@ class KernelSpec:
         object.__setattr__(
             self, "block_sizes", _frozen_mapping(self.block_sizes),
         )
+
+    @cached_property
+    def uses_precision(self) -> bool:
+        return "precision" in self.compile_time.values() or (
+            "precision" in self.runtime_scalars.values()
+        )
+
+    @property
+    def precision_parameters(self) -> frozenset[str]:
+        return self._precision_parameters
+
+    def resolve_precision(self, precision: Precision | None) -> "KernelSpec":
+        if not self.uses_precision:
+            return self
+        if precision not in {"float32", "float64"}:
+            raise ValueError(
+                f"{self.name}: precision-dependent KernelSpec requires "
+                "precision='float32' or 'float64'"
+            )
+        precision_parameters = frozenset(
+            name for name, kind in (
+                *self.compile_time.items(), *self.runtime_scalars.items(),
+            )
+            if kind == "precision"
+        )
+        resolved = KernelSpec(
+            name=self.name,
+            parameters=self.parameters,
+            size_key=self.size_key,
+            buffers=self.buffers,
+            optional_buffers=self.optional_buffers,
+            compile_time={
+                name: precision if kind == "precision" else kind
+                for name, kind in self.compile_time.items()
+            },
+            feature_sources=self.feature_sources,
+            runtime_scalars={
+                name: precision if kind == "precision" else kind
+                for name, kind in self.runtime_scalars.items()
+            },
+            optional_values=self.optional_values,
+            block_sizes=self.block_sizes,
+        )
+        object.__setattr__(
+            resolved, "_precision_parameters", precision_parameters,
+        )
+        return resolved
 
     def _metadata(
         self, compile_time: Mapping[str, ScalarKind],
@@ -689,7 +830,7 @@ class KernelSpec:
                 f"{self.name}: projection omits feature while retaining "
                 f"optional argument(s) {sorted(orphaned)}"
             )
-        return KernelSpec(
+        projected = KernelSpec(
             name=self.name if name is None else name,
             parameters=tuple(
                 parameter for parameter in self.parameters
@@ -710,6 +851,11 @@ class KernelSpec:
                 for parameter, kind in self.compile_time.items()
                 if parameter not in omitted
             },
+            feature_sources={
+                parameter: source
+                for parameter, source in self.feature_sources.items()
+                if parameter not in omitted
+            },
             runtime_scalars={
                 parameter: kind
                 for parameter, kind in self.runtime_scalars.items()
@@ -722,6 +868,12 @@ class KernelSpec:
             },
             block_sizes=self.block_sizes,
         )
+        object.__setattr__(
+            projected,
+            "_precision_parameters",
+            self._precision_parameters.difference(omitted),
+        )
+        return projected
 
     def validate(self, backend: str, actual: KernelMetadata) -> None:
         """Fail if a public kernel ABI differs from this exact specification."""

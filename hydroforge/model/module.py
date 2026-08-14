@@ -13,8 +13,8 @@ from __future__ import annotations
 from abc import ABC
 from functools import cache
 from typing import (
-    Any, ClassVar, Dict, Generic, List, Literal, Optional, Self, Tuple,
-    TypeVar, overload,
+    Any, ClassVar, Dict, Generic, List, Literal, Optional,
+    Self, Tuple, TypeVar, overload,
 )
 
 import torch
@@ -558,10 +558,6 @@ class AbstractModule(BaseModel, ABC):
             raise RuntimeError(
                 f"module {self.module_name!r} tensor bindings are already sealed"
             )
-        # This configuration participates in cached module specialization but
-        # was historically a mutable Pydantic list.  Normalize it before the
-        # identity seal so append/clear cannot diverge the module's public
-        # configuration from the compiled model capability plan.
         self.opened_modules = tuple(self.opened_modules)
         bindings: Dict[str, object] = {}
         for field in self.tensor_schema():
@@ -722,7 +718,7 @@ class AbstractModule(BaseModel, ABC):
         self,
         modules: Dict[str, "AbstractModule"],
     ) -> None:
-        """Resolve the explicitly declared sibling-module capabilities once."""
+        """Resolve declared sibling-module references once."""
 
         if self._module_references is not None:
             raise RuntimeError(

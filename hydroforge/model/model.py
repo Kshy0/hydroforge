@@ -14,7 +14,7 @@ from functools import cache, cached_property
 from pathlib import Path
 from types import MappingProxyType
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    Mapping, Protocol, Self, Tuple, Union)
+                    Mapping, Self, Union)
 
 import cftime
 import torch
@@ -22,6 +22,7 @@ from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
                       field_validator, model_validator)
 
 from hydroforge.statistics.ir import parse_operation
+from hydroforge.compiler.namespace import NamespaceEntry
 from hydroforge.data.distributed import ProcessTopology
 from hydroforge.data.input import InputProxy
 from hydroforge.contracts.kernel_field import KernelField
@@ -59,12 +60,6 @@ if TYPE_CHECKING:
     from hydroforge.contracts.fields import PartitionSchema
 
 
-class FeatureRule(Protocol):
-    """Callable contract for a derived model capability."""
-
-    def __call__(self, model: AbstractModel, /) -> bool: ...
-
-
 class AbstractModel(BaseModel, ABC):
     """
     Generic master controller for hydroforge models using the AbstractModule hierarchy.
@@ -78,7 +73,6 @@ class AbstractModel(BaseModel, ABC):
     )
 
     # Class variables
-    feature_rules: ClassVar[Mapping[str, bool | FeatureRule]] = {}
     backend_requirements: ClassVar[Mapping[str, BackendRequirement]] = {}
     module_requirements: ClassVar[Mapping[str, ModuleRequirement]] = {}
     partition_key: ClassVar[Optional[str]] = None
@@ -231,7 +225,6 @@ class AbstractModel(BaseModel, ABC):
         default_factory=lambda: ProcessTopology.capture(),
     )
 
-    _capabilities: frozenset[str] = PrivateAttr(default_factory=frozenset)
     # Imports remain TYPE_CHECKING-only so the declarative layer does not gain
     # runtime dependencies on its compiler and execution consumers.
     _execution: ModelExecution = PrivateAttr()
@@ -273,6 +266,18 @@ class AbstractModel(BaseModel, ABC):
         """Typed once-per-outer-step operator authoring interface."""
 
         return self._outer
+
+    @property
+    def requested_sub_steps(self) -> int:
+        """Return the active request, defaulting to one fixed sub-step."""
+
+        step = self._execution.active_step
+        if step is None:
+            raise RuntimeError(
+                "requested_sub_steps is available only inside @managed_step"
+            )
+        raw = getattr(step, "requested_sub_steps", None)
+        return 1 if raw is None else raw
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name in {"rank", "world_size"}:
@@ -415,7 +420,6 @@ class AbstractModel(BaseModel, ABC):
         cls.module_requirements = MappingProxyType(
             dict(cls.module_requirements),
         )
-        cls.feature_rules = MappingProxyType(dict(cls.feature_rules))
 
     @classmethod
     def get_module_reference_fields(cls) -> Dict[str, ModuleReference]:
@@ -607,7 +611,11 @@ class AbstractModel(BaseModel, ABC):
         ModelInitializer(self).run()
 
     def initialize_model_state(self) -> None:
-        """Initialize cross-module state inside HydroForge's transaction."""
+        """Initialize ordered model state inside HydroForge's transaction.
+
+        HydroForge does not invoke module initialization hooks automatically;
+        model authors explicitly call any module helpers here in physical order.
+        """
 
     def rebuild_runtime_state(self) -> None:
         """Rebuild non-checkpoint runtime state after checkpoint restoration.
@@ -669,16 +677,6 @@ class AbstractModel(BaseModel, ABC):
             total_mb=total_memory / (1024 * 1024),
         )
 
-    def has_feature(self, name: str) -> bool:
-        """Evaluate a model capability once while a launch plan is built.
-
-        Module names are capabilities automatically. Composite capabilities
-        are declared in ``feature_rules`` as callables receiving the model.
-        """
-        if name not in self.module_types() and name not in self.feature_rules:
-            raise KeyError(f"unknown model feature {name!r}")
-        return name in self._capabilities
-
     @property
     def partition_metadata(self) -> PartitionSchema:
         return self._partition.schema
@@ -688,9 +686,9 @@ class AbstractModel(BaseModel, ABC):
         return self._partition.variable_groups
 
     @cached_property
-    def variable_map(self) -> Dict[str, Tuple[AbstractModule, str, Optional[str]]]:
+    def variable_map(self) -> Mapping[str, NamespaceEntry]:
         """
-        Map variable names to (module_instance, field_name, id_attr).
+        Map variable names to immutable owner and coordinate metadata.
         This provides a unified way to lookup variables across all modules.
 
         When a field name exists in multiple modules, the virtual field

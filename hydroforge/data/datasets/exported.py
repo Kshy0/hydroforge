@@ -17,7 +17,8 @@ from netCDF4 import Dataset
 
 from hydroforge.contracts.temporal import timedelta_quotient
 from hydroforge.data.datasets.base import AbstractDataset
-from hydroforge.data.datasets.timeline import DatasetTimeline
+from hydroforge.data.datasets.chunking import SourceChunk
+from hydroforge.data.datasets.timeline import DatasetTimeline, ReadOp
 from hydroforge.data.netcdf import read_netcdf_var_sliced, single_file_key
 from hydroforge.data.distributed import find_indices_in, is_rank_zero
 from hydroforge.serialization.netcdf import (
@@ -134,6 +135,10 @@ class ExportedDataset(AbstractDataset):
         self._column_bbox: Optional[Tuple[int, int]] = None
         self._column_bbox_local_indices: Optional[np.ndarray] = None
         self._coordinates_cache: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        # Paths whose catchment coordinate axis has been compared with the
+        # canonical shard.  Coordinate access remains lazy, but once requested
+        # it validates every shard already discovered by the temporal timeline.
+        self._validated_coordinate_paths: set[Path] = set()
         # Name of the sparse axis in the input variable.  Exporters commonly
         # use ``saved_points``, but accepting a file's actual one-dimensional
         # catchment axis makes the reader interoperable with equivalent files
@@ -239,6 +244,47 @@ class ExportedDataset(AbstractDataset):
             )
         return array.astype(np.int64, copy=False)
 
+    def _validate_shard_coordinates(
+        self, dataset: Dataset, path: Path, point_dim: str | None = None,
+    ) -> np.ndarray:
+        """Validate one shard's catchment axis against the canonical shard.
+
+        Exported shards are concatenated by time, so accepting a shard whose
+        IDs are merely the same set in a different order silently attaches
+        values to the wrong catchments.  The first opened shard establishes an
+        immutable canonical order; every subsequent shard must match it
+        exactly.
+        """
+        if point_dim is None:
+            point_dim = self._infer_point_dim(dataset, path)
+        if self.coord_name not in dataset.variables:
+            raise ValueError(
+                f"Coordinate variable '{self.coord_name}' not found in "
+                f"{path.name}. Available: {list(dataset.variables.keys())}"
+            )
+        coordinate = dataset.variables[self.coord_name]
+        if tuple(coordinate.dimensions) != (point_dim,):
+            raise ValueError(
+                f"Coordinate variable {self.coord_name!r} in {path.name} "
+                f"must have dimensions ({point_dim!r},), got "
+                f"{coordinate.dimensions}"
+            )
+        values = self._validated_catchment_ids(coordinate[:], path=path)
+        if self._coordinates_cache is None:
+            index = np.arange(values.shape[0], dtype=np.int64)
+            values.setflags(write=False)
+            index.setflags(write=False)
+            self._coordinates_cache = (values, index)
+        else:
+            expected, _ = self._coordinates_cache
+            if values.shape != expected.shape or not np.array_equal(values, expected):
+                raise ValueError(
+                    f"catchment_id coordinates in shard {path.name} do not "
+                    "match the canonical shard in content and order"
+                )
+        self._validated_coordinate_paths.add(path)
+        return values
+
     def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
         """Return catchment coordinate arrays.
 
@@ -246,30 +292,19 @@ class ExportedDataset(AbstractDataset):
           - output_coord: linear catchment id array of shape (C,)
           - index: simple 0..C-1 integer array of shape (C,)
         """
-        if self._coordinates_cache is None:
-            key = self.time_to_key(self.start_date)
+        # The first shard establishes the canonical order; all other shards
+        # discovered by DatasetTimeline must be checked before coordinates are
+        # exposed.  This catches a reordered shard even when no data chunk from
+        # that shard has been requested yet.
+        main_key = self.time_to_key(self.start_date)
+        keys = list(getattr(self._timeline, "file_times", {}))
+        ordered_keys = [main_key, *sorted(key for key in keys if key != main_key)]
+        for key in ordered_keys:
             path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
+            if path in self._validated_coordinate_paths:
+                continue
             with Dataset(path, "r") as ds:
-                point_dim = self._infer_point_dim(ds, path)
-                if self.coord_name not in ds.variables:
-                    raise ValueError(
-                        f"Coordinate variable '{self.coord_name}' not found in "
-                        f"{path.name}. Available: {list(ds.variables.keys())}"
-                    )
-                coordinate = ds.variables[self.coord_name]
-                if tuple(coordinate.dimensions) != (point_dim,):
-                    raise ValueError(
-                        f"Coordinate variable {self.coord_name!r} in {path.name} "
-                        f"must have dimensions ({point_dim!r},), got "
-                        f"{coordinate.dimensions}"
-                    )
-                coordinates = self._validated_catchment_ids(
-                    coordinate[:], path=path
-                )
-            index = np.arange(coordinates.shape[0], dtype=np.int64)
-            coordinates.setflags(write=False)
-            index.setflags(write=False)
-            self._coordinates_cache = (coordinates, index)
+                self._validate_shard_coordinates(ds, path)
         return self._coordinates_cache
 
     @property
@@ -378,7 +413,7 @@ class ExportedDataset(AbstractDataset):
             self._local_indices - col_min
         ).astype(np.int64, copy=False)
 
-    def _read_ops(self, ops: List[Tuple[str, List[int]]]) -> np.ndarray:
+    def _read_ops(self, ops: Sequence[ReadOp]) -> np.ndarray:
         """Read time steps and reorder columns if _local_indices is set."""
         # Determine output size
         if self._local_indices is not None:
@@ -403,6 +438,8 @@ class ExportedDataset(AbstractDataset):
             path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
             with Dataset(path, "r") as ds:
                 var = ds.variables[self.var_name]
+                point_dim = self._infer_point_dim(ds, path)
+                self._validate_shard_coordinates(ds, path, point_dim)
                 t_idx, c_idx = self._variable_axes(ds, var, path)
                 if not abs_indices:
                     continue
@@ -476,7 +513,7 @@ class ExportedDataset(AbstractDataset):
         return cache.nbytes
 
     def _source_element_bytes(
-        self, ops: Sequence[Tuple[str, Sequence[int]]],
+        self, ops: Sequence[ReadOp],
     ) -> int:
         """Return a conservative element width for NetCDF source reads."""
 
@@ -489,6 +526,8 @@ class ExportedDataset(AbstractDataset):
             path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
             with Dataset(path, "r") as dataset:
                 variable = dataset.variables[self.var_name]
+                point_dim = self._infer_point_dim(dataset, path)
+                self._validate_shard_coordinates(dataset, path, point_dim)
                 read_dtype = np.dtype(variable.dtype)
                 # netCDF4 applies packing attributes while reading. Include
                 # their dtype in the estimate because a packed integer source
@@ -518,15 +557,10 @@ class ExportedDataset(AbstractDataset):
             }
         return np.ascontiguousarray(cache[:, positions])
 
-    def read_chunk(self, idx: int):
-        plan = self._timeline.plan
-        if idx < 0 or idx >= len(plan):
-            raise IndexError(f"Chunk index {idx} out of range (0-{len(plan) - 1})")
-        return self._finish_read(self._read_ops(plan[idx][1]))
-
-    def get_data(self, current_time: datetime, chunk_len: int):
-        times = self._timeline.contiguous_times(current_time, chunk_len)
-        return self._finish_read(self._read_ops(self._timeline.build_entry(times)[1]))
+    def _read_chunk(self, chunk: SourceChunk):
+        return self._finish_read(
+            self._read_ops(self._timeline.read_for_chunk(chunk).operations)
+        )
 
     def close(self) -> None:
         """No persistent NetCDF handles are retained."""
@@ -690,8 +724,8 @@ class ExportedDataset(AbstractDataset):
         # before data becomes resident.  Caching raw source frames makes
         # cache-backed indexing disagree with the disk path whenever either
         # aggregation or ``unit_factor`` is configured.
-        main_entry = self._timeline.build_entry(self._global_times)
-        all_data = self._finish_read(self._read_ops(main_entry[1]))
+        main_ops = self._timeline.operations_for_times(self._global_times)
+        all_data = self._finish_read(self._read_ops(main_ops))
 
         # Spin-up can be disjoint from the main period by years.  Keep one
         # compact cache for the unique spin-up interval instead of indexing a
@@ -705,8 +739,8 @@ class ExportedDataset(AbstractDataset):
                 spinup.source_start + self.time_interval * index
                 for index in range(spin_count)
             ]
-            spin_entry = self._timeline.build_entry(spin_times)
-            spin_data = self._finish_read(self._read_ops(spin_entry[1]))
+            spin_ops = self._timeline.operations_for_times(spin_times)
+            spin_data = self._finish_read(self._read_ops(spin_ops))
 
         # Store in cache with correct dtype and C-contiguous layout.
         self._memory_cache = self._as_cache_data(all_data)
@@ -721,7 +755,7 @@ class ExportedDataset(AbstractDataset):
             self._memory_cache_file_indices = self._local_indices.copy()
 
         if is_rank_zero():
-            n_files = len(main_entry[1])
+            n_files = len(main_ops)
             mem_bytes = self._cache_nbytes(self._memory_cache)
             if self._spin_up_memory_cache is not None:
                 mem_bytes += self._cache_nbytes(self._spin_up_memory_cache)
@@ -807,7 +841,7 @@ class ExportedDataset(AbstractDataset):
             # The peak read is on the expanded source axis, before temporal
             # aggregation.  Estimate it using the dataset's in-memory dtype,
             # not the requested NetCDF output dtype.
-            main_ops = self._timeline.build_entry(self._global_times)[1]
+            main_ops = self._timeline.operations_for_times(self._global_times)
             source_rows = sum(
                 len(abs_indices) for _, abs_indices in main_ops
             )
@@ -821,10 +855,10 @@ class ExportedDataset(AbstractDataset):
             fits_in_memory = full_size <= max_buffer_bytes
 
         if not fits_in_memory:
-            # ``build_entry`` expands every requested output time into the
+            # ``operations_for_times`` expands every requested output time into the
             # source frames required by temporal aggregation.  Reusing these
             # operations keeps this path identical to ``read_chunk`` and
-            # ``load_to_memory``; ``ops_from_times`` alone would silently skip
+            # ``load_to_memory``; direct timestamp lookup would silently skip
             # the rest of each aggregation window.
             # Column-batch mode: compute batch_size (num catchments per batch)
             # from the expanded source axis, since aggregation may require
@@ -992,11 +1026,10 @@ class ExportedDataset(AbstractDataset):
     def _validate_disk_data(
         self,
         data: Union[np.ndarray, Dict[str, np.ndarray]],
-        length: int,
     ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
         if isinstance(data, dict):
             return {
-                name: self._validate_disk_data(block, length)
+                name: self._validate_disk_data(block)
                 for name, block in data.items()
             }
         if data.ndim != 2 or data.shape[1] != self.data_size:
@@ -1004,87 +1037,86 @@ class ExportedDataset(AbstractDataset):
                 f"read_chunk returned shape {data.shape}, expected "
                 f"(T, {self.data_size})"
             )
-        if data.shape[0] != length:
-            raise ValueError(
-                f"read_chunk returned {data.shape[0]} rows, expected {length}"
-            )
         return np.ascontiguousarray(data)
 
+    def _cached_or_disk_chunk(
+        self, chunk: SourceChunk,
+    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        """Interpret one planned request through cache or NetCDF storage."""
+
+        cache = (
+            self._spin_up_memory_cache
+            if chunk.phase == "spinup"
+            else self._memory_cache
+        )
+        if self._memory_cache is not None:
+            if cache is None:
+                raise RuntimeError(
+                    "spin-up memory cache is unavailable; call load_to_memory()"
+                )
+            return self._gather_cache(
+                cache, self._shift_days, chunk.phase_offset, chunk.length,
+                groups=self._shift_day_groups,
+            )
+        if self._shift_days is not None:
+            raise RuntimeError(
+                "per-catchment shift requires in-memory data; "
+                "call load_to_memory() first"
+            )
+        return self._validate_disk_data(self.read_chunk(chunk))
+
+    def _with_overlays(self, runoff, *, base_t: int, length: int):
+        """Attach main-axis inflow/loss windows to one prepared runoff block."""
+
+        runoff = self._apply_upsampling_policy(runoff)
+        if self._inflow_data is None:
+            return runoff
+        inflow = self._gather(
+            self._inflow_data, self._inflow_shift_days, base_t, length,
+            groups=self._inflow_shift_groups,
+        )
+        if self._loss_data is None:
+            return runoff, inflow
+        loss = self._gather(
+            self._loss_data, self._loss_shift_days, base_t, length,
+            oob_fill=np.nan, groups=self._loss_shift_groups,
+        )
+        return runoff, inflow, loss
+
+    def get_chunk(self, chunk: SourceChunk):
+        """Return one consumer-ready planned request, including time shifts."""
+
+        self.chunk_plan.validate_chunk(chunk)
+        runoff = self._cached_or_disk_chunk(chunk)
+        # Overlays use the main source origin, not the compact spin-up cache.
+        return self._with_overlays(
+            runoff, base_t=chunk.source_offset, length=chunk.length,
+        )
+
     def __getitem__(self, idx):
-        """Fetch a chunk or window (no rank gating for exported data).
+        """Fetch one planned chunk or one explicit training window."""
 
-        Dispatches on the active mode:
-
-        * Window-sampling (``enable_windows``): ``base_t`` comes from
-          ``_window_starts[idx]`` and length is ``_window_len``.
-        * Chunked (default): ``base_t = idx * chunk_len``.
-
-        Then returns ``_gather(memory_cache, _shift_days, base_t, length)``
-        if data is cached, else a contiguous ``read_chunk(idx)`` slice.
-        When :meth:`attach_inflow_overlay` is active, also gathers the
-        inflow overlay and returns ``(runoff, inflow, inflow_valid)``;
-        if :meth:`attach_loss_overlay` is additionally active, returns
-        ``(runoff, inflow, inflow_valid, loss)``.
-        """
+        self._timeline._assert_current_chunk_plan()
+        if type(idx) is not int:
+            raise TypeError("dataset index must be an exact int")
         if idx < 0:
             idx += len(self)
         if idx < 0 or idx >= len(self):
             raise IndexError(
                 f"ExportedDataset index {idx} out of range for length {len(self)}"
             )
-        if self._window_starts is not None:
-            base_t = int(self._window_starts[idx])
-            length = int(self._window_len)
-            cache = self._memory_cache
-        else:
-            chunk = self.chunk_plan[idx]
-            length = chunk.length
-            base_t = chunk.phase_offset
-            if chunk.phase == "spinup":
-                cache = self._spin_up_memory_cache
-            else:
-                cache = self._memory_cache
+        if self._window_starts is None:
+            return self.get_chunk(self.chunk_plan[idx])
 
-        if self._memory_cache is not None:
-            if cache is None:
-                raise RuntimeError(
-                    "spin-up memory cache is unavailable; call load_to_memory()"
-                )
-            runoff = self._gather_cache(
-                cache, self._shift_days, base_t, length,
-                groups=self._shift_day_groups,
-            )
-        else:
-            if self._shift_days is not None:
-                raise RuntimeError("per-catchment shift requires in-memory data; "
-                                   "call load_to_memory() first")
-            runoff = self._validate_disk_data(self.read_chunk(idx), length)
-
-        runoff = self._apply_upsampling_policy(runoff)
-
-        if self._inflow_data is None:
-            return runoff
-        # Overlays are aligned to the main dataset axis, not to the compact
-        # spin-up cache.  Preserve the physical date-relative offset here.
-        overlay_base_t = (
-            int(self._window_starts[idx])
-            if self._window_starts is not None
-            else self._chunk_base_t(idx)
+        base_t = int(self._window_starts[idx])
+        length = int(self._window_len)
+        if self._memory_cache is None:
+            raise RuntimeError("window sampling requires in-memory data")
+        runoff = self._gather_cache(
+            self._memory_cache, self._shift_days, base_t, length,
+            groups=self._shift_day_groups,
         )
-        inflow = self._gather(self._inflow_data, self._inflow_shift_days,
-                              overlay_base_t, length,
-                              groups=self._inflow_shift_groups)
-        if self._loss_data is None:
-            return runoff, inflow
-        loss = self._gather(self._loss_data, self._loss_shift_days,
-                            overlay_base_t, length,
-                            oob_fill=np.nan, groups=self._loss_shift_groups)
-        return runoff, inflow, loss
-
-    def _chunk_base_t(self, idx: int) -> int:
-        """Return a chunk's logical offset from the main source origin."""
-
-        return self.chunk_plan[idx].source_offset
+        return self._with_overlays(runoff, base_t=base_t, length=length)
 
     @staticmethod
     def _gather(data: np.ndarray, shift: Optional[np.ndarray],
@@ -1128,6 +1160,7 @@ class ExportedDataset(AbstractDataset):
 
     def __len__(self) -> int:
         """Window mode length, or chunk-based length."""
+        self._timeline._assert_current_chunk_plan()
         if self._window_starts is not None:
             return int(self._window_starts.size)
         return super().__len__()

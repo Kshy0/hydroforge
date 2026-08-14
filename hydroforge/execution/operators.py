@@ -488,7 +488,10 @@ class _OperatorRecorder:
         # reductions. Those are cold-path compiler work, not substep operators.
         with _disable_current_modes():
             bound = self.binder.complete(entry, arguments)
-            implementation = entry.implementation(self.execution.backend)
+            implementation = entry.implementation(
+                self.execution.backend,
+                precision=getattr(self.binder.model, "precision", None),
+            )
             specialized = implementation.specialize(
                 bound, frozenset(),
                 buffer_dtypes=self.binder.buffer_dtypes(entry, bound),

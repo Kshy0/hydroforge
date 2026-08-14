@@ -35,7 +35,7 @@ class CompiledStatistics:
 class StatisticsEmitter:
     """Explicit initialization-only context shared by backend emitters."""
 
-    def __init__(self, owner: Any, ir: Any, lowering: Any) -> None:
+    def __init__(self, owner: Any, lowering: Any) -> None:
         self.device = owner.device
         self.rank = owner.rank
         self.num_trials = owner.num_trials
@@ -48,7 +48,7 @@ class StatisticsEmitter:
         self._tensor_registry = owner._tensor_registry
         self._safe_name_cache = owner._safe_name_cache
         self._generated_modules = owner._generated_modules
-        self._statistics_ir = ir
+        self._statistics_ir = lowering.ir
         self._statistics_lowering = lowering
         self._kernel_module = None
         self._aggregator_function = None

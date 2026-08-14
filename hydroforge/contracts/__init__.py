@@ -17,10 +17,15 @@ from hydroforge.contracts.kernels import (
     AccessMode,
     BufferAccessSemantics,
     BackendLoweringSpec,
+    FeatureSource,
     KernelMetadata,
     KernelSpec,
+    ModuleEnabled,
+    ModuleFlag,
     RuntimeScalarKind,
     buffer_access_semantics,
+    module_enabled,
+    module_flag,
 )
 from hydroforge.contracts.errors import ResourceCleanupError
 from hydroforge.contracts.runtime import (
@@ -47,9 +52,11 @@ __all__ = [
     "BUFFER_ACCESS_MODES",
     "BackendLoweringSpec", "BufferDTypeABI", "BufferElementLowering",
     "BufferAccessSemantics", "buffer_access_semantics",
+    "FeatureSource", "ModuleEnabled", "ModuleFlag",
     "KernelMetadata",
     "KernelSpec",
     "RuntimeScalarKind",
+    "module_enabled", "module_flag",
     "ResourceCleanupError",
     "BackendRequirement",
     "ModuleRequirement",

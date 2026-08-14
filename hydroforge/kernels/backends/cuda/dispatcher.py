@@ -427,13 +427,14 @@ class CudaDispatcher:
                 name: {
                     "bool": "bool", "int32": "int32",
                     "uint32": "uint32", "index": "index",
-                    "float32": "float32",
+                    "float32": "float32", "float64": "float64",
                 }[kind]
                 for name, kind in spec.runtime_scalars.items()
             },
             **{
                 name: {
-                    "bool": "bool", "int32": "int32", "float32": "float32",
+                    "bool": "bool", "int32": "int32",
+                    "float32": "float32", "float64": "float64",
                 }[kind]
                 for name, kind in spec.compile_time.items()
             },
@@ -451,7 +452,12 @@ class CudaDispatcher:
             if expected is None:
                 continue
             observed = self._native_kind(native_type)
-            if expected != observed:
+            precision_widening = (
+                name in spec.precision_parameters
+                and expected == "float32"
+                and observed == "float64"
+            )
+            if expected != observed and not precision_widening:
                 raise TypeError(
                     f"{spec.name}: CUDA launcher parameter {name!r} uses "
                     f"{native_type!r} ({observed}), KernelSpec requires "
