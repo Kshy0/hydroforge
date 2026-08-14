@@ -6,7 +6,7 @@ routine (:meth:`RegularGrid.index_of_points`) reused across the package.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Sequence
 
@@ -126,8 +126,6 @@ class RegularGrid:
     order: Literal["C"] = "C"
     x_bounds: np.ndarray | None = None
     y_bounds: np.ndarray | None = None
-    x_edges: np.ndarray = field(init=False)
-    y_edges: np.ndarray = field(init=False)
 
     def __post_init__(self) -> None:
         self.x = _validate_axis(self.x, self.x_name)
@@ -135,19 +133,15 @@ class RegularGrid:
         if self.x_bounds is None:
             if self.x.size < 2:
                 raise ValueError(f"{self.x_name} axis needs bounds when it has one cell")
-            self.x_edges = _axis_edges(self.x)
             self.x_bounds = _axis_bounds(self.x)
         else:
             self.x_bounds = _validate_axis_bounds(self.x_bounds, self.x.size, self.x_name)
-            self.x_edges = np.empty(0, dtype=np.float64)
         if self.y_bounds is None:
             if self.y.size < 2:
                 raise ValueError(f"{self.y_name} axis needs bounds when it has one cell")
-            self.y_edges = _axis_edges(self.y)
             self.y_bounds = _axis_bounds(self.y)
         else:
             self.y_bounds = _validate_axis_bounds(self.y_bounds, self.y.size, self.y_name)
-            self.y_edges = np.empty(0, dtype=np.float64)
         if self.is_geographic is None:
             self.is_geographic = _looks_geographic(self.x, self.y)
         if self.order != "C":

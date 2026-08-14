@@ -381,14 +381,12 @@ class RankOutputCatalog:
           - self.owner._time_datetimes (naive)
           - self.owner._time_units / _time_calendar
           - self.owner._time_len
-          - self.owner._file_time_offsets (list of (start, end) indices for each file in the first rank)
         """
         if not self.owner._rank_files:
             raise RuntimeError("No rank files loaded.")
 
         master_values = None
         master_datetimes = None
-        master_offsets = None
         master_lengths = None
         for info in self.owner._rank_files:
             datetimes = []
@@ -473,7 +471,6 @@ class RankOutputCatalog:
                     datetimes, self.owner._time_units,
                     self.owner._time_calendar,
                 ))
-                master_offsets = offsets
                 master_lengths = lengths
             else:
                 if calendar != self.owner._time_calendar:
@@ -495,7 +492,6 @@ class RankOutputCatalog:
                         f"rank {info['rank_id']} output timestamps differ from rank 0"
                     )
             info["file_time_offsets"] = tuple(offsets)
-        self.owner._file_time_offsets = list(master_offsets)
         self.owner._time_datetimes = list(master_datetimes)
         self.owner._time_values_num = master_values
         self.owner._time_len = len(master_values)

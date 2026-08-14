@@ -642,26 +642,6 @@ class AbstractModule(BaseModel, ABC):
         for event in pending:
             sink.emit(event)
 
-    @property
-    def high_precision(self) -> torch.dtype:
-        """Return the dtype for hpfloat tensors.
-
-        When ``mixed_precision`` is False (default), hpfloat uses the same
-        dtype as ``precision`` — all tensors share one precision level.
-
-        When ``mixed_precision`` is True, hpfloat is promoted one level:
-          float32 → float64, float64 → float64.
-        High-precision storage follows the pattern of Fortran-based solvers
-        (e.g. double-precision for storage variables) (P2RIVSTO, P2FLDSTO, etc.).
-        """
-        if not self.mixed_precision:
-            return self.precision
-        _hp_map = {
-            torch.float32: torch.float64,
-            torch.float64: torch.float64,
-        }
-        return _hp_map.get(self.precision, self.precision)
-
     @field_validator('num_trials')
     @classmethod
     def validate_num_trials(cls, v: Optional[int]) -> Optional[int]:
