@@ -22,7 +22,6 @@ from hydroforge.contracts.temporal import (
     SimulationSchedule,
     SpinupSchedule,
     canonical_calendar,
-    convert_calendar_date,
     timedelta_microseconds,
     timedelta_quotient,
 )
@@ -453,14 +452,11 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
             }
         return data / self.reuse_count
 
-    def update_calendar(self, calendar: str):
-        """
-        Atomically update the calendar and all derived temporal state.
+    def _adopt_source_calendar(self, calendar: str) -> None:
+        """Resolve the on-disk calendar while the I/O timeline is compiling."""
 
-        Conversion and schedule compilation happen against local values first;
-        a failed conversion (for example an invalid date in ``360_day``) can
-        therefore never leave a partially converted dataset instance.
-        """
+        from hydroforge.contracts.temporal import convert_calendar_date
+
         target = canonical_calendar(calendar)
         converted = tuple(
             None if value is None else convert_calendar_date(value, target)

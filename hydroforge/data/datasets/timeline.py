@@ -66,11 +66,6 @@ class DatasetTimeline:
         self.source_time_interval: timedelta | None = None
         self.aggregation_factor: int | None = None
         self.plan: tuple[TimelineRead, ...] = ()
-        # ``AbstractDataset.update_calendar`` can be called after a timeline
-        # has been compiled.  The owner then owns a new SourceChunkPlan; do
-        # not let an old file plan silently interpret a chunk from that new
-        # temporal axis.
-        self._compiled_chunk_plan = None
 
         self._scan(self._required_output_times())
         self._build_plan()
@@ -159,7 +154,7 @@ class DatasetTimeline:
         if probe:
             source_calendar = self._file_calendar(probe[0])
             if owner.calendar != source_calendar:
-                owner.update_calendar(source_calendar)
+                owner._adopt_source_calendar(source_calendar)
                 required_times = self._required_output_times()
                 required_set = set(required_times)
                 supports = self._support_ranges(
@@ -198,7 +193,7 @@ class DatasetTimeline:
                         f"{source_calendar!r} and {file_calendar!r} in {path.name}"
                     )
                 if owner.calendar != source_calendar:
-                    owner.update_calendar(file_calendar)
+                    owner._adopt_source_calendar(file_calendar)
                     required_times = self._required_output_times()
                     required_set = set(required_times)
                     supports = self._support_ranges(
@@ -293,8 +288,6 @@ class DatasetTimeline:
         File discovery and time-axis validation remain the timeline's concern.
         """
 
-        self._assert_current_chunk_plan()
-
         if timestamp in self.dt_to_loc:
             return
 
@@ -366,7 +359,6 @@ class DatasetTimeline:
         return timedelta(microseconds=interval_width)
 
     def source_times(self, output_times: list[DateTime]) -> list[DateTime]:
-        self._assert_current_chunk_plan()
         if self.source_time_interval is None or self.aggregation_factor is None:
             raise RuntimeError(
                 "source_times() requires a compiled time-aggregation plan"
@@ -428,32 +420,17 @@ class DatasetTimeline:
     ) -> tuple[ReadOp, ...]:
         """Compile storage operations for an arbitrary logical time window."""
 
-        self._assert_current_chunk_plan()
         return self._build_read(times).operations
 
     def read_for_chunk(self, chunk: SourceChunk) -> TimelineRead:
         """Return the storage plan owned by one exact source request."""
 
-        self._assert_current_chunk_plan()
         self.owner.chunk_plan.validate_chunk(chunk)
         return self.plan[chunk.index]
-
-    def _assert_current_chunk_plan(self) -> None:
-        """Reject reads compiled against a superseded owner temporal plan."""
-
-        if (
-            self._compiled_chunk_plan is not None
-            and self._compiled_chunk_plan is not self.owner.chunk_plan
-        ):
-            raise RuntimeError(
-                "dataset calendar changed after its timeline was compiled; "
-                "recreate the dataset before reading"
-            )
 
     def storage_times_for_chunk(self, chunk: SourceChunk) -> list[DateTime]:
         """Expand one logical source request into exact storage timestamps."""
 
-        self._assert_current_chunk_plan()
         mapper = getattr(self.owner, "_storage_time", None)
         logical_times = chunk.source_times(self.owner.time_interval)
         if mapper is None:
@@ -467,4 +444,3 @@ class DatasetTimeline:
             self._build_read(self.storage_times_for_chunk(chunk))
             for chunk in self.owner.chunk_plan
         )
-        self._compiled_chunk_plan = self.owner.chunk_plan
