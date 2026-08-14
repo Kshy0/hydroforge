@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -12,10 +12,7 @@ class ProgressState:
     current_step: int = 0
     phase: str | None = None
     _wall_start: float = 0.0
-    _last_tick: float = 0.0
     _last_emit: float = 0.0
-    _recent_dts: list[float] = field(default_factory=list)
-    _window_size: int = 50
     _refresh_interval: float = 0.1
     _schedule_start_fraction: float | None = None
 
@@ -25,9 +22,7 @@ class ProgressState:
         self.phase = phase
         self.current_step = 0
         self._wall_start = time.perf_counter()
-        self._last_tick = self._wall_start
         self._last_emit = self._wall_start - self._refresh_interval
-        self._recent_dts.clear()
         self._schedule_start_fraction = schedule_fraction
 
     def begin_step(
@@ -45,10 +40,6 @@ class ProgressState:
         if phase != self.phase:
             self.start(phase)
         now = time.perf_counter()
-        self._recent_dts.append(now - self._last_tick)
-        self._last_tick = now
-        if len(self._recent_dts) > self._window_size:
-            self._recent_dts.pop(0)
         self.current_step += 1
         if not force_emit and now - self._last_emit < self._refresh_interval:
             return False
@@ -64,13 +55,6 @@ class ProgressState:
         elapsed = self.elapsed
         return self.current_step / elapsed if elapsed > 0 else 0.0
 
-    @property
-    def recent_speed(self) -> float:
-        if not self._recent_dts:
-            return self.speed
-        elapsed = sum(self._recent_dts)
-        return len(self._recent_dts) / elapsed if elapsed > 0 else self.speed
-
     @staticmethod
     def _fmt_duration(seconds: float) -> str:
         if seconds < 60:
@@ -79,13 +63,15 @@ class ProgressState:
             return f"{seconds / 60:.1f}min"
         return f"{seconds / 3600:.1f}h"
 
-    def format_schedule(self, *, fraction: float) -> str:
-        speed = self.recent_speed
+    def format_schedule(self, *, fraction: float, total_steps: int) -> str:
         fraction = min(max(fraction, 0.0), 1.0)
         start_fraction = self._schedule_start_fraction or 0.0
-        completed = fraction - start_fraction
+        completed = max(fraction - start_fraction, 0.0)
+        elapsed = self.elapsed
+        completed_steps = completed * total_steps
+        speed = completed_steps / elapsed if elapsed > 0.0 else 0.0
         eta = (
-            self.elapsed * (1.0 - fraction) / completed
+            elapsed * (1.0 - fraction) / completed
             if completed > 0.0 else float("inf")
         )
         return (
@@ -98,7 +84,7 @@ class ProgressState:
         unit = "step" if self.current_step == 1 else "steps"
         return (
             f"[{label} {self.current_step} {unit}] "
-            f"{self.recent_speed:.2f} steps/s"
+            f"{self.speed:.2f} steps/s"
         )
 
 
@@ -148,4 +134,5 @@ class ProgressRuntime:
         duration = (schedule.end - schedule.execution_start).total_seconds()
         return self.state.format_schedule(
             fraction=elapsed / duration,
+            total_steps=len(schedule),
         )
