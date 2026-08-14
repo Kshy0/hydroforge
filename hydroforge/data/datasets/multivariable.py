@@ -15,6 +15,9 @@ from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.gridded import GriddedDataset
 
 
+_NO_SPATIAL_SELECTION = object()
+
+
 class MultiVariableDataset(AbstractDataset):
     """One validated timeline composed from named single-variable sources."""
 
@@ -59,8 +62,11 @@ class MultiVariableDataset(AbstractDataset):
                 adopter(request_token)
             else:
                 dataset.chunk_plan._accept_provenance(request_token)
-        self._local_indices = None
-        self._desired_catchment_ids = None
+        self._local_indices = getattr(reference, "_local_indices", None)
+        self._desired_catchment_ids = getattr(
+            reference, "_desired_catchment_ids", None,
+        )
+        self._refresh_spatial_selection_snapshot()
 
     def __getattr__(self, name: str) -> Any:
         if name in self._REFERENCE_CONFIGURATION:
@@ -117,6 +123,44 @@ class MultiVariableDataset(AbstractDataset):
                     )
         if not same:
             raise ValueError(f"variable {name!r} uses a different spatial domain")
+        reference_selection = getattr(
+            reference, "_local_indices", _NO_SPATIAL_SELECTION,
+        )
+        selection = getattr(dataset, "_local_indices", _NO_SPATIAL_SELECTION)
+        if reference_selection is _NO_SPATIAL_SELECTION:
+            aligned = selection is _NO_SPATIAL_SELECTION
+        elif selection is _NO_SPATIAL_SELECTION:
+            aligned = False
+        elif reference_selection is None or selection is None:
+            aligned = reference_selection is selection
+        else:
+            aligned = np.array_equal(reference_selection, selection)
+        if not aligned:
+            raise ValueError(
+                f"variable {name!r} uses a different spatial selection"
+            )
+
+    @staticmethod
+    def _selection_handle(dataset: AbstractDataset) -> object:
+        return getattr(dataset, "_local_indices", _NO_SPATIAL_SELECTION)
+
+    def _refresh_spatial_selection_snapshot(self) -> None:
+        self._spatial_selection_snapshot = tuple(
+            self._selection_handle(dataset)
+            for dataset in self._datasets.values()
+        )
+
+    def _assert_spatial_selection_current(self) -> None:
+        for (name, dataset), expected in zip(
+            self._datasets.items(),
+            self._spatial_selection_snapshot,
+            strict=True,
+        ):
+            if self._selection_handle(dataset) is not expected:
+                raise RuntimeError(
+                    f"variable {name!r} spatial selection changed outside "
+                    "the multi-variable dataset; select the composite again"
+                )
 
     @property
     def variables(self) -> tuple[str, ...]:
@@ -134,6 +178,7 @@ class MultiVariableDataset(AbstractDataset):
         return self.reference.data_size
 
     def _read_chunk(self, chunk: SourceChunk):
+        self._assert_spatial_selection_current()
         return {
             name: dataset.read_chunk(chunk)
             for name, dataset in self._datasets.items()
@@ -152,6 +197,7 @@ class MultiVariableDataset(AbstractDataset):
     def get_chunk(self, chunk: SourceChunk):
         """Prepare the same request through every named child source."""
 
+        self._assert_spatial_selection_current()
         self._chunk_plan.validate_chunk(chunk)
         return {
             name: dataset.get_chunk(chunk)
@@ -189,17 +235,26 @@ class MultiVariableDataset(AbstractDataset):
                     reference._local_indices,
                     reference._desired_catchment_ids,
                 )
+            self._local_indices = reference._local_indices
+            self._desired_catchment_ids = reference._desired_catchment_ids
+            self._refresh_spatial_selection_snapshot()
             return mapping
         if mapping_file is not None:
             raise ValueError("catchment selection does not accept mapping_file")
         for dataset in self._datasets.values():
             dataset.build_local_mapping(desired_catchment_ids=desired_ids)
+        for name, dataset in tuple(self._datasets.items())[1:]:
+            self._validate_child(name, dataset)
+        self._local_indices = self.reference._local_indices
+        self._desired_catchment_ids = np.asarray(desired_ids)
+        self._refresh_spatial_selection_snapshot()
         return None
 
     def shard_forcing(
         self, chunk: Mapping[str, torch.Tensor],
         mapping: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
+        self._assert_spatial_selection_current()
         if self._gridded:
             if mapping is None:
                 raise ValueError("gridded forcing requires its compiled mapping")

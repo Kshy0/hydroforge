@@ -1096,7 +1096,6 @@ class ExportedDataset(AbstractDataset):
     def __getitem__(self, idx):
         """Fetch one planned chunk or one explicit training window."""
 
-        self._timeline._assert_current_chunk_plan()
         if type(idx) is not int:
             raise TypeError("dataset index must be an exact int")
         if idx < 0:
@@ -1160,7 +1159,6 @@ class ExportedDataset(AbstractDataset):
 
     def __len__(self) -> int:
         """Window mode length, or chunk-based length."""
-        self._timeline._assert_current_chunk_plan()
         if self._window_starts is not None:
             return int(self._window_starts.size)
         return super().__len__()
