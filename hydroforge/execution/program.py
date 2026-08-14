@@ -702,10 +702,9 @@ class AdaptiveSubstepProgram:
         self.time_step = dt
         self.maximum = float(maximum_dt)
         self.maximum_steps = maximum_steps
-        # The first program build commonly happens under a model's
-        # ``torch.inference_mode`` step. Conditional capture mutation tracing
-        # requires ordinary tensors with version counters, so runtime-owned
-        # state is deliberately allocated outside that mode.
+        # The first program build may happen under ``torch.inference_mode``.
+        # Runtime-owned controls must remain ordinary tensors because they are
+        # also mutated by capture setup and cleanup outside inference mode.
         with torch.inference_mode(False):
             options = dict(device=candidate_dt.device, dtype=candidate_dt.dtype)
             self.duration = torch.zeros(1, **options)

@@ -36,7 +36,6 @@ from hydroforge.kernels.context import (
     reject_direct_kernel_launch, require_active_kernel_spec,
 )
 from hydroforge.kernels.devices import devices_match
-from hydroforge.kernels.mutation import record_kernel_writes
 from hydroforge.kernels.dispatcher import (
     TorchDispatcher, VariantDispatcher, make_metal_dispatcher,
     make_torch_dispatcher, make_triton_dispatcher,
@@ -309,7 +308,6 @@ class StrictImplementation:
             )
         self.spec.validate_host_arguments(kwargs)
         self._validate_buffers(kwargs)
-        record_kernel_writes(self.spec.metadata, kwargs)
         return self.implementation(**kwargs)
 
     def specialize(

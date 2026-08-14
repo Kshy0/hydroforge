@@ -8,7 +8,6 @@ import torch
 
 from hydroforge.contracts import ResourceCleanupError
 from hydroforge.contracts.naming import RESERVED_CONTROL_STATE
-from hydroforge.kernels.mutation import trace_mutations
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -201,7 +200,7 @@ class CaptureRuntime:
             raise ValueError(
                 f"conditional snapshots must be on {device}, got {mismatched}"
             )
-        candidates = (*extras, continue_flag)
+        state = tuple(dict.fromkeys((*extras, continue_flag)))
 
         graph = ConditionalWhileGraph()
         device_index = (
@@ -211,22 +210,17 @@ class CaptureRuntime:
         current = torch.cuda.current_stream(device)
         side = torch.cuda.Stream(device)
         side.wait_stream(current)
+        snapshot: list[torch.Tensor] | None = None
         try:
             with torch.cuda.stream(side):
                 stream = side.cuda_stream
-                with trace_mutations(candidates) as trace:
-                    reset()
-                    body(graph, False, stream)
-                    graph.set_conditional(continue_flag, False, stream)
-                trace.restore_all()
+                saved = self._save_extra(state)
+                snapshot = saved
 
                 def restore() -> None:
-                    # Specialized native launchers do not increment Torch
-                    # version counters.  The caller supplied the exact write
-                    # set, so every cold-path warmup must restore it in full.
-                    trace.restore_all()
+                    self._restore_extra(state, saved)
 
-                for _ in range(max(0, self.warmup_iterations - 1)):
+                for _ in range(self.warmup_iterations):
                     reset()
                     body(graph, False, stream)
                     graph.set_conditional(continue_flag, False, stream)
@@ -257,9 +251,9 @@ class CaptureRuntime:
                 side.synchronize()
             except BaseException as cleanup_error:
                 failures.append(cleanup_error)
-            if "trace" in locals():
+            if snapshot is not None:
                 try:
-                    trace.restore_all()
+                    self._restore_extra(state, snapshot)
                 except BaseException as cleanup_error:
                     failures.append(cleanup_error)
             try:

@@ -11,9 +11,9 @@ Internal CUDA Graph and conditional-WHILE support used by explicit compiled
 substep scopes. Downstream models declare only physical operator order; they
 do not select, capture, or replay backend graphs themselves.
 
-Mutable state discovery is automatic. Registered-kernel access metadata and
-ATen alias schemas provide exact write sets; capture warmup is rolled back
-before the live launch.
+Mutable state is compiled automatically from registered-kernel access metadata
+and ATen alias schemas. Those exact write sets let capture warmup roll back all
+declared state before the live launch.
 
 """
 
