@@ -449,6 +449,7 @@ class StatisticsRuntime:
         self._aggregator_generated = False
         self._kernel_states = None
         self._current_macro_step_count = 0.0
+        self._macro_step_index = 0
         self._outer_flags_ever_seen = False
 
         # Release a previous generated specialization before rebuilding.
@@ -709,41 +710,46 @@ class StatisticsRuntime:
         self._compiler.compile()
         self._prepare_kernel_states()
 
+    def _claim_macro_step(
+        self, *,
+        is_inner_last: bool,
+        is_outer_first: bool,
+        is_outer_last: bool,
+    ) -> tuple[float, int]:
+        if is_outer_first:
+            self._macro_step_index = 0
+            self._current_macro_step_count = 0.0
+            self._outer_flags_ever_seen = True
+        if is_inner_last:
+            self._dirty_outputs.update(
+                name for name, outer in self._output_is_outer.items()
+                if not outer
+            )
+        if is_outer_last:
+            self._dirty_outputs.update(
+                name for name, outer in self._output_is_outer.items()
+                if outer
+            )
+        macro_step_index = self._macro_step_index
+        if is_inner_last:
+            self._current_macro_step_count += 1.0
+            self._macro_step_index += 1
+        return self._current_macro_step_count, macro_step_index
+
     def update_statistics(self, sub_step: int, num_sub_steps: int, flags: int,
                           weight: float, total_weight: float = 0.0) -> None:
         self._require_open()
         if not self._aggregator_generated:
             raise RuntimeError("Statistics aggregation has not been initialized")
 
-        # Compute boolean flags from sub_step, num_sub_steps, flags
-        # flags bits: 0=stat_is_first, 1=stat_is_last, 2=stat_is_outer_first, 3=stat_is_outer_last
         is_inner_last = bool(flags & 2) and (sub_step == num_sub_steps - 1)
         is_outer_first = bool(flags & 4) and is_inner_last
         is_outer_last = bool(flags & 8) and is_inner_last
-
-        # Reset macro_step_index at the start of each outer statistics period
-        # This ensures argmax/argmin indices are always relative to the start of the period
-        if is_outer_first:
-            self._macro_step_index = 0
-            self._current_macro_step_count = 0.0
-            self._outer_flags_ever_seen = True
-
-        if is_inner_last:
-             for out_name, is_outer in self._output_is_outer.items():
-                 # We only trigger dirty for non-outer (Standard) ops when inner loop ends
-                 if not is_outer:
-                     self._dirty_outputs.add(out_name)
-
-        if is_outer_last:
-             for out_name, is_outer in self._output_is_outer.items():
-                 # We trigger dirty for outer ops when outer loop ends
-                 if is_outer:
-                     self._dirty_outputs.add(out_name)
-
-        if is_inner_last:
-            self._current_macro_step_count += 1.0
-
-        num_macro_steps = self._current_macro_step_count
+        num_macro_steps, macro_step_index = self._claim_macro_step(
+            is_inner_last=is_inner_last,
+            is_outer_first=is_outer_first,
+            is_outer_last=is_outer_last,
+        )
 
         # Fill scalar tensors so kernels read updated values from fixed addresses
         states = self._kernel_states
@@ -753,7 +759,7 @@ class StatisticsRuntime:
         states['__sub_step'].fill_(sub_step)
         states['__num_sub_steps'].fill_(num_sub_steps)
         states['__flags'].fill_(flags)
-        states['__macro_step_index'].fill_(self._macro_step_index)
+        states['__macro_step_index'].fill_(macro_step_index)
 
         self._execute_statistics_kernel()
 

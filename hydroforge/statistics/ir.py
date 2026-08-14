@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -295,6 +296,23 @@ _OP_RE = re.compile(r"^(arg)?(mean|sum|max|min|first|last)(\d*)$")
 _INNER = frozenset({Reduction.MEAN, Reduction.SUM, Reduction.MAX,
                     Reduction.MIN, Reduction.FIRST, Reduction.LAST})
 
+_FUNCTION_ARITIES = {
+    "abs": 1,
+    "fabs": 1,
+    "sqrt": 1,
+    "exp": 1,
+    "log": 1,
+    "sin": 1,
+    "cos": 1,
+    "tan": 1,
+    "pow": 2,
+    "maximum": 2,
+    "minimum": 2,
+    "max": 2,
+    "min": 2,
+    "where": 3,
+}
+
 
 def parse_operation(spelling: str) -> StatisticOperation:
     parts = spelling.lower().split("_")
@@ -355,6 +373,113 @@ class _DependencyVisitor(ast.NodeVisitor):
         self.dependencies.add(".".join(reversed(parts)))
 
 
+class _ExpressionValidator(ast.NodeVisitor):
+    """Reject semantics that cannot be rendered identically by every backend."""
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+
+    def _unsupported(self, node: ast.AST) -> ValueError:
+        return ValueError(
+            f"unsupported statistics expression node in {self.source!r}: "
+            f"{type(node).__name__}"
+        )
+
+    def generic_visit(self, node: ast.AST) -> None:
+        raise self._unsupported(node)
+
+    def visit_Expression(self, node: ast.Expression) -> None:
+        self.visit(node.body)
+
+    def visit_BinOp(self, node: ast.BinOp) -> None:
+        if not isinstance(
+            node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow),
+        ):
+            raise self._unsupported(node.op)
+        self.visit(node.left)
+        self.visit(node.right)
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> None:
+        if not isinstance(node.op, (ast.UAdd, ast.USub, ast.Not)):
+            raise self._unsupported(node.op)
+        self.visit(node.operand)
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> None:
+        if not isinstance(node.op, (ast.And, ast.Or)):
+            raise self._unsupported(node.op)
+        for value in node.values:
+            self.visit(value)
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        supported = (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq)
+        if any(not isinstance(operator, supported) for operator in node.ops):
+            unsupported = next(
+                operator for operator in node.ops
+                if not isinstance(operator, supported)
+            )
+            raise self._unsupported(unsupported)
+        self.visit(node.left)
+        for comparator in node.comparators:
+            self.visit(comparator)
+
+    def visit_IfExp(self, node: ast.IfExp) -> None:
+        self.visit(node.test)
+        self.visit(node.body)
+        self.visit(node.orelse)
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if not isinstance(node.value, (bool, int, float)):
+            raise self._unsupported(node)
+        if isinstance(node.value, bool):
+            return
+        try:
+            finite = math.isfinite(float(node.value))
+        except OverflowError:
+            finite = False
+        if not finite:
+            raise ValueError(
+                f"statistics expression {self.source!r} contains a "
+                "non-finite numeric constant"
+            )
+
+    def visit_Name(self, node: ast.Name) -> None:
+        del node
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        current: ast.AST = node
+        while isinstance(current, ast.Attribute):
+            current = current.value
+        if not isinstance(current, ast.Name):
+            raise ValueError(
+                "statistics expressions only support dotted field names"
+            )
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if not isinstance(node.func, ast.Name):
+            raise ValueError(
+                "statistics expression functions must use bare names"
+            )
+        function = node.func.id
+        try:
+            arity = _FUNCTION_ARITIES[function]
+        except KeyError as error:
+            raise ValueError(
+                f"unsupported expression function {function!r}"
+            ) from error
+        if node.keywords:
+            raise ValueError(
+                f"statistics expression function {function!r} does not "
+                "accept keyword arguments"
+            )
+        if len(node.args) != arity:
+            raise ValueError(
+                f"statistics expression function {function!r} expects "
+                f"{arity} arguments, got {len(node.args)}"
+            )
+        for argument in node.args:
+            self.visit(argument)
+
+
 def _parse_expression(source: str) -> tuple[str, ast.Expression]:
     normalized = source.strip().replace("^", "**")
     try:
@@ -367,6 +492,7 @@ def _parse_expression(source: str) -> tuple[str, ast.Expression]:
 def _compile_expression(
     source: str, tree: ast.Expression, known_fields: set[str],
 ) -> Expression:
+    _ExpressionValidator(source).visit(tree)
     visitor = _DependencyVisitor()
     visitor.visit(tree)
     unknown = visitor.dependencies.difference(known_fields)
@@ -473,6 +599,8 @@ class _ExpressionRenderer:
                     ExpressionDialect.TRITON: "libdevice.fmod",
                     ExpressionDialect.TORCH: "torch.fmod",
                 }
+                if self.dialect is ExpressionDialect.TRITON:
+                    left, right = self._triton_promote_binary(left, right)
                 return f"{functions[self.dialect]}({left}, {right})"
             operators = {
                 ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
@@ -482,6 +610,8 @@ class _ExpressionRenderer:
                 return f"({left} {symbol} {right})"
             if isinstance(node.op, ast.Pow):
                 function = _FUNCTIONS[self.dialect]["pow"]
+                if self.dialect is ExpressionDialect.TRITON:
+                    left, right = self._triton_promote_binary(left, right)
                 return f"{function}({left}, {right})"
         if isinstance(node, ast.UnaryOp):
             value = self.visit(node.operand)
@@ -543,7 +673,11 @@ class _ExpressionRenderer:
         if isinstance(node, (ast.Name, ast.Attribute)):
             name = self._name(node)
             if name in {"pi", "M_PI"}:
-                return "torch.pi" if self.dialect is ExpressionDialect.TORCH else "M_PI"
+                if self.dialect is ExpressionDialect.TORCH:
+                    return "torch.pi"
+                if self.dialect is ExpressionDialect.TRITON:
+                    return repr(math.pi)
+                return "M_PI"
             try:
                 return self.names[name]
             except KeyError as exc:
@@ -564,8 +698,21 @@ class _ExpressionRenderer:
                 rendered = _FUNCTIONS[self.dialect][function]
             except KeyError as exc:
                 raise ValueError(f"unsupported expression function {function!r}") from exc
+            if (
+                self.dialect is ExpressionDialect.TRITON
+                and function == "pow"
+            ):
+                arguments = list(self._triton_promote_binary(*arguments))
             return f"{rendered}({', '.join(arguments)})"
         raise ValueError(f"unsupported statistics expression node {ast.dump(node)}")
+
+    @staticmethod
+    def _triton_promote_binary(left: str, right: str) -> tuple[str, str]:
+        """Give libdevice binary operands one common inferred tensor dtype."""
+        return (
+            f"(({left}) + ({right}) * 0.0)",
+            f"(({right}) + ({left}) * 0.0)",
+        )
 
     @staticmethod
     def _name(node: ast.AST) -> str:
@@ -654,15 +801,7 @@ def build_statistics_ir(aggregator: Any) -> StatisticsIR:
     for name in sorted(aggregator._variables):
         info = aggregator._field_registry[name]
         metadata = info.tensor
-        tensor = aggregator._tensor_registry.get(name)
-        if tensor is None:
-            first_output = f"{name}_{aggregator._variable_ops[name][0]}"
-            output_metadata = aggregator._metadata[first_output]
-            actual_shape = tuple(output_metadata["actual_shape"])
-            actual_ndim = int(output_metadata["actual_ndim"])
-        else:
-            actual_shape = tuple(int(size) for size in tensor.shape)
-            actual_ndim = int(tensor.ndim)
+        layout = aggregator._statistics_layouts[name]
         group = info.output_index or "__full__"
         variable = StatisticVariable(
             name=name,
@@ -670,8 +809,8 @@ def build_statistics_ir(aggregator: Any) -> StatisticsIR:
             source=program.sources.get(name, TensorSource(name)),
             operations=program.operations[name],
             tensor_shape=metadata.shape,
-            actual_shape=actual_shape,
-            actual_ndim=actual_ndim,
+            actual_shape=layout.actual_shape,
+            actual_ndim=layout.actual_ndim,
             output_group=group,
         )
         variables.append(variable)

@@ -170,20 +170,15 @@ class StatisticsObserver:
         is_inner_last = bool(flags & 2)
         is_outer_first = bool(flags & 4) and is_inner_last
         is_outer_last = bool(flags & 8) and is_inner_last
-        if is_outer_first:
-            aggregator._macro_step_index = 0
-            aggregator._current_macro_step_count = 0.0
-            aggregator._outer_flags_ever_seen = True
-        if is_inner_last or is_outer_last:
-            for name, outer in aggregator._output_is_outer.items():
-                if (not outer and is_inner_last) or (outer and is_outer_last):
-                    aggregator._dirty_outputs.add(name)
-        if is_inner_last:
-            aggregator._current_macro_step_count += 1.0
+        num_macro_steps, macro_step_index = aggregator._claim_macro_step(
+            is_inner_last=is_inner_last,
+            is_outer_first=is_outer_first,
+            is_outer_last=is_outer_last,
+        )
         states["__total_weight"].fill_(total_weight)
         states["__flags"].fill_(flags)
-        states["__num_macro_steps"].fill_(aggregator._current_macro_step_count)
-        states["__macro_step_index"].fill_(aggregator._macro_step_index)
+        states["__num_macro_steps"].fill_(num_macro_steps)
+        states["__macro_step_index"].fill_(macro_step_index)
 
     def metal_operator(self) -> _MetalStatisticsOperator:
         aggregator = self.aggregator
