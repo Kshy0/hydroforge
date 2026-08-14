@@ -786,10 +786,11 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                     '0, _scatter_idx, _scatter_val)'
                 )
             if scatter.reduction.value == 'mean':
-                lines.append(
-                    f'    _scatter_cnt = states["{buf_key}"].new_zeros('
-                    f'states["{buf_key}"].shape)'
-                )
+                cnt_key = f"__scatter_cnt_{var}"
+                lines.extend([
+                    f'    states["{cnt_key}"].zero_()',
+                    f'    _scatter_cnt = states["{cnt_key}"]',
+                ])
                 lines.append(
                     '    _scatter_ones = _scatter_val.new_ones(_scatter_val.shape)'
                 )

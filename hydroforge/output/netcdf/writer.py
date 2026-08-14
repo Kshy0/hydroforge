@@ -987,9 +987,6 @@ class NetCDFWriter:
         Args:
             dt: Time step to finalize
         """
-        # Increment macro step index for next iteration
-        self.owner._macro_step_index += 1
-
         # Get dirty outputs to write
         keys_to_write = [k for k in self.owner._output_keys if k in self.owner._dirty_outputs]
         self.owner._dirty_outputs.clear()
@@ -1063,10 +1060,6 @@ class NetCDFWriter:
             # Create NetCDF files if not already created
             if not self.owner._files_created:
                 self._create_netcdf_files()
-
-        # Increment macro step index for next iteration
-        # (Note: index is reset to 0 in update_statistics when is_outer_first=True)
-        self.owner._macro_step_index += 1
 
         # Write all outputs that are marked dirty
         # Use explicit list of output keys to maintain order/determinism
