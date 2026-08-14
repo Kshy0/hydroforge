@@ -69,9 +69,6 @@ class MultiRankStatsReader:
         if self._slice_start is None or self._slice_end is None:
             raise RuntimeError("Slice indices not set.")
 
-        # We need to map global slice to file-specific slices
-        # self._file_time_offsets contains [(0, 366), (366, 731), ...]
-
         for info in self._rank_files:
             if info["saved_points"] == 0:
                 info["cache"] = None
