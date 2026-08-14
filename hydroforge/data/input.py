@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -15,12 +16,165 @@ import numpy.ma as ma
 import torch
 from netCDF4 import Dataset
 
-from hydroforge.data.netcdf import read_netcdf_var_sliced
+from hydroforge.data.netcdf import (
+    _as_integer_array,
+    _is_scalar_integer,
+    _normalize_netcdf_index,
+    _output_axis,
+    read_netcdf_var_sliced,
+)
 from hydroforge.serialization.netcdf import (
     LOGICAL_DTYPE_ATTR, atomic_netcdf_dataset, decode_netcdf_logical_array,
     netcdf_dtype_encoding,
     normalize_netcdf_variable_options,
 )
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _NetCDFVariableSource:
+    """One complete lazy-storage binding for an input variable."""
+
+    path: str
+    alignment_dim: str | None = None
+    alignment_indices: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, (str, Path)):
+            raise TypeError("NetCDF variable source path must be a string or Path")
+        if not str(self.path):
+            raise ValueError("NetCDF variable source path cannot be empty")
+        path = str(Path(self.path))
+        object.__setattr__(self, "path", path)
+
+        aligned = self.alignment_indices is not None
+        if aligned != (self.alignment_dim is not None):
+            raise ValueError(
+                "NetCDF variable source alignment dimension and indices must "
+                "be provided together"
+            )
+        if not aligned:
+            return
+        if not isinstance(self.alignment_dim, str) or not self.alignment_dim:
+            raise TypeError("NetCDF alignment dimension must be a non-empty string")
+        indices = np.asarray(self.alignment_indices)
+        if indices.ndim != 1:
+            raise ValueError("NetCDF alignment indices must be one-dimensional")
+        if indices.dtype.kind not in "iu" or indices.dtype.kind == "b":
+            raise TypeError("NetCDF alignment indices must contain integers")
+        if indices.flags.writeable or indices.dtype != np.int64:
+            indices = indices.astype(np.int64, copy=True)
+            indices.setflags(write=False)
+        object.__setattr__(self, "alignment_indices", indices)
+
+    def align_loaded(self, variable: Any, value: np.ndarray) -> np.ndarray:
+        """Apply this source's reference ordering to one eager read."""
+
+        if (
+            self.alignment_indices is None
+            or self.alignment_dim not in variable.dimensions
+        ):
+            return value
+        axis = variable.dimensions.index(self.alignment_dim)
+        return np.take(value, self.alignment_indices, axis=axis)
+
+    def selectors(self, variable: Any, indices: Any) -> Any:
+        """Map one reference-order selection onto the physical file axis."""
+
+        if (
+            self.alignment_indices is None
+            or self.alignment_dim not in variable.dimensions
+        ):
+            return indices
+        axis = variable.dimensions.index(self.alignment_dim)
+        return InputProxy._compose_alignment_indices(
+            indices,
+            ndim=variable.ndim,
+            axis=axis,
+            alignment_idx=self.alignment_indices,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _InputReadRequest:
+    """One orthogonal selection interpreted by resident or lazy storage."""
+
+    name: str
+    selector: Any = Ellipsis
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise TypeError("input read variable name must be a non-empty string")
+
+        raw = self.selector
+        selectors = raw if isinstance(raw, tuple) else (raw,)
+        if any(value is None for value in selectors):
+            raise IndexError("input subset selection does not support new axes")
+        for selector in selectors:
+            if selector is Ellipsis or isinstance(selector, slice):
+                continue
+            if isinstance(selector, (bool, np.bool_)):
+                raise TypeError("input subset scalar boolean selectors are invalid")
+            if isinstance(selector, (int, np.integer)):
+                continue
+            try:
+                array = np.asarray(selector)
+            except (TypeError, ValueError):
+                raise TypeError(
+                    f"unsupported input subset selector {type(selector).__name__}"
+                ) from None
+            if array.ndim == 0 and array.dtype.kind in "iu":
+                continue
+            if array.ndim == 1 and array.size == 0:
+                continue
+            if array.ndim != 1 or array.dtype.kind not in "iub":
+                raise IndexError(
+                    "input subset sequence selectors must be one-dimensional "
+                    "integer or boolean arrays"
+                )
+
+    def select_resident(self, value: Any) -> Any:
+        """Apply the same per-axis orthogonal contract as NetCDF."""
+
+        # ``InputProxy`` accepts Python scalars as resident values. Normalize
+        # shape-less values so they follow the same selection contract as
+        # NumPy/torch residents without changing tensor or masked-array
+        # semantics.
+        if not hasattr(value, "shape"):
+            value = np.asarray(value)
+        shape = tuple(value.shape)
+        selectors = list(_normalize_netcdf_index(self.selector, len(shape)))
+        sequence_indices: list[tuple[int, np.ndarray]] = []
+        for axis, selector in enumerate(selectors):
+            index = _as_integer_array(selector, shape[axis])
+            if index is not None:
+                sequence_indices.append((axis, index))
+                selectors[axis] = slice(None)
+            elif _is_scalar_integer(selector):
+                selectors[axis] = int(selector)
+            elif (
+                isinstance(value, torch.Tensor)
+                and isinstance(selector, slice)
+                and selector.step is not None
+                and selector.step < 0
+            ):
+                sequence_indices.append((
+                    axis,
+                    np.arange(*selector.indices(shape[axis]), dtype=np.int64),
+                ))
+                selectors[axis] = slice(None)
+        selected = value[tuple(selectors)]
+        for axis, index in sequence_indices:
+            output_axis = _output_axis(selectors, axis)
+            if isinstance(selected, torch.Tensor):
+                indices = torch.as_tensor(
+                    index, dtype=torch.int64, device=selected.device,
+                )
+                selected = torch.index_select(selected, output_axis, indices)
+            elif np.ma.isMaskedArray(selected):
+                selected = np.ma.take(selected, index, axis=output_axis)
+            else:
+                selected = np.take(selected, index, axis=output_axis)
+        return selected
 
 
 class InputProxy:
@@ -35,24 +189,67 @@ class InputProxy:
         attrs: Optional[Dict[str, Any]] = None,
         dims: Optional[Dict[str, int]] = None,
         lazy: bool = True,
-        file_path: Optional[Union[str, Path, List[Union[str, Path]]]] = None,
         visible_vars: Optional[Set[str]] = None,
-        file_indices: Optional[Dict[str, np.ndarray]] = None,
-        file_alignment_dims: Optional[Dict[str, str]] = None,
         injected_vars: Optional[Set[str]] = None,
+        *,
+        _sources: Optional[Mapping[str, _NetCDFVariableSource]] = None,
     ):
         self.data = data
         self.attrs = attrs or {}
         self.dims = dims or {}
         self.lazy = lazy
-        self.file_path = file_path
+        self._sources = dict(_sources or {})
+        invalid_sources = {
+            name: type(source).__name__
+            for name, source in self._sources.items()
+            if not isinstance(source, _NetCDFVariableSource)
+        }
+        if invalid_sources:
+            raise TypeError(
+                f"InputProxy sources must be NetCDF variable sources: "
+                f"{invalid_sources}"
+            )
         self.visible_vars = (
-            set(data.keys()) if visible_vars is None else set(visible_vars)
+            set(data).union(self._sources)
+            if visible_vars is None else set(visible_vars)
         )
-        self.file_map: Dict[str, str] = {}
-        self.file_indices = file_indices or {}
-        self.file_alignment_dims = file_alignment_dims or {}
+        unresolved = self.visible_vars.difference(data).difference(self._sources)
+        if unresolved:
+            raise ValueError(
+                "InputProxy visible variables have no resident or lazy source: "
+                f"{sorted(unresolved)}"
+            )
         self.injected_vars = injected_vars or set()
+
+    @property
+    def source_paths(self) -> tuple[Path, ...]:
+        """Return distinct physical paths behind lazy variable sources."""
+
+        return tuple(Path(path) for path in dict.fromkeys(
+            source.path for source in self._sources.values()
+        ))
+
+    @property
+    def file_path(self) -> str | list[str] | None:
+        """Compatibility view of :attr:`source_paths`."""
+
+        paths = tuple(str(path) for path in self.source_paths)
+        if not paths:
+            return None
+        return paths[0] if len(paths) == 1 else list(paths)
+
+    def copy(self) -> InputProxy:
+        """Shallow-copy proxy registries and preserve the concrete proxy type."""
+
+        return type(self)(
+            data=dict(self.data),
+            attrs=dict(self.attrs),
+            dims=dict(self.dims),
+            lazy=self.lazy,
+            visible_vars=set(self.visible_vars),
+            injected_vars=set(self.injected_vars),
+            _sources=dict(self._sources),
+        )
 
     @staticmethod
     def _read_var_from_ds(ds: Dataset, var_name: str, indices: Any = None) -> np.ndarray:
@@ -106,9 +303,7 @@ class InputProxy:
         attrs = {}
         dims = {}
         found_vars = set()
-        file_map = {}
-        file_indices = {}
-        file_alignment_dims = {}
+        sources: dict[str, _NetCDFVariableSource] = {}
 
         # Normalize and validate the requested schema before opening files.
         requested_visible = None if visible_vars is None else set(visible_vars)
@@ -218,9 +413,10 @@ class InputProxy:
                                  raise ValueError(f"Alignment failed: Key variable '{align_on}' in '{path_str}' does not strictly match reference keys.")
 
                             # alignment_idx maps: index in Ref -> index in Current
-                            alignment_idx = sorter[insert_idx]
-                            file_indices[path_str] = alignment_idx
-                            file_alignment_dims[path_str] = alignment_dim
+                            alignment_idx = np.asarray(
+                                sorter[insert_idx], dtype=np.int64,
+                            )
+                            alignment_idx.setflags(write=False)
 
                     # Merge attributes
                     for attr_name in ds.ncattrs():
@@ -247,7 +443,10 @@ class InputProxy:
                             continue
 
                         if var_name in found_vars:
-                             prev_file = file_map.get(var_name)
+                             previous = sources.get(var_name)
+                             prev_file = (
+                                 None if previous is None else previous.path
+                             )
                              # Skip conflict check for align key (we use the first one encountered)
                              if align_on and var_name == align_on:
                                  continue
@@ -256,18 +455,20 @@ class InputProxy:
                                  raise ValueError(f"Naming conflict: Variable '{var_name}' exists in both '{prev_file}' and '{path_str}'")
 
                         found_vars.add(var_name)
-                        file_map[var_name] = path_str
+                        source = _NetCDFVariableSource(
+                            path=path_str,
+                            alignment_dim=(
+                                alignment_dim
+                                if alignment_idx is not None else None
+                            ),
+                            alignment_indices=alignment_idx,
+                        )
+                        sources[var_name] = source
 
                         if not lazy:
                             variable = ds.variables[var_name]
                             val = cls._read_var_from_ds(ds, var_name)
-                            if (
-                                alignment_idx is not None
-                                and alignment_dim in variable.dimensions
-                            ):
-                                axis = variable.dimensions.index(alignment_dim)
-                                val = np.take(val, alignment_idx, axis=axis)
-                            data[var_name] = val
+                            data[var_name] = source.align_loaded(variable, val)
 
             except (OSError, RuntimeError) as exc:
                 exc.add_note(f"while loading InputProxy data from {path_str}")
@@ -291,67 +492,41 @@ class InputProxy:
                 f"{sorted(missing_skip)}"
             )
 
-        stored_paths: str | list[str] = (
-            normalized_paths[0] if len(normalized_paths) == 1
-            else normalized_paths
+        return cls(
+            data, attrs, dims, lazy=lazy, visible_vars=found_vars,
+            _sources=sources,
         )
-        instance = cls(
-            data, attrs, dims, lazy=lazy, file_path=stored_paths,
-            visible_vars=found_vars, file_indices=file_indices,
-            file_alignment_dims=file_alignment_dims,
-        )
-        instance.file_map = file_map
-        return instance
 
-    def _resolve_target_path(self, key: str) -> str:
-        target_path = None
+    def _source_for(self, key: str) -> _NetCDFVariableSource:
+        try:
+            return self._sources[key]
+        except KeyError:
+            raise RuntimeError(
+                f"Cannot lazy load variable {key!r}: no NetCDF source is bound"
+            ) from None
 
-        # Priority 1: Check internal file map (populated if from_nc with multiple files)
-        if self.file_map and key in self.file_map:
-            target_path = self.file_map[key]
-
-        # Priority 2: If single file path is stored, use it
-        elif self.file_path and isinstance(self.file_path, (str, Path)):
-             target_path = self.file_path
-
-        # Priority 3: If file_path is a list and map failed
-        elif self.file_path and isinstance(self.file_path, list):
-             raise RuntimeError(f"Variable '{key}' not found in file map, and multiple files provided. Cannot disambiguate source.")
-
-        if not target_path:
-             # Last resort check: if we only have one file in list?
-             if isinstance(self.file_path, list) and len(self.file_path) == 1:
-                 target_path = self.file_path[0]
-             else:
-                raise RuntimeError(f"Cannot lazy load variable '{key}': file source not mapped and file_path is ambiguous.")
-
-        return str(target_path)
-
-    def _load_var(self, key: str, indices: Any = None) -> np.ndarray:
-        target_path = self._resolve_target_path(key)
-        alignment_idx = self.file_indices.get(target_path)
-        alignment_dim = self.file_alignment_dims.get(target_path)
+    def _read_lazy(self, request: _InputReadRequest) -> np.ndarray:
+        source = self._source_for(request.name)
+        target_path = source.path
 
         try:
             with Dataset(target_path, "r") as ds:
-                if key not in ds.variables:
-                     raise KeyError(f"Variable '{key}' not found in {target_path}")
+                if request.name not in ds.variables:
+                     raise KeyError(
+                         f"Variable '{request.name}' not found in {target_path}"
+                     )
 
-                variable = ds.variables[key]
-                final_indices = indices
-                if (
-                    alignment_idx is not None
-                    and alignment_dim in variable.dimensions
-                ):
-                    axis = variable.dimensions.index(alignment_dim)
-                    final_indices = self._compose_alignment_indices(
-                        indices, ndim=variable.ndim, axis=axis,
-                        alignment_idx=alignment_idx,
-                    )
-
-                return self._read_var_from_ds(ds, key, indices=final_indices)
+                variable = ds.variables[request.name]
+                final_indices = source.selectors(variable, request.selector)
+                return self._read_var_from_ds(
+                    ds,
+                    request.name,
+                    indices=final_indices,
+                )
         except (OSError, RuntimeError) as exc:
-            exc.add_note(f"while lazily loading {key!r} from {target_path}")
+            exc.add_note(
+                f"while lazily loading {request.name!r} from {target_path}"
+            )
             raise
 
     @staticmethod
@@ -391,11 +566,12 @@ class InputProxy:
         If the variable is in memory, slices it.
         If lazy, reads only the requested indices from the file.
         """
+        request = _InputReadRequest(key, indices)
         if key in self.data:
-            return self.data[key][indices]
+            return request.select_resident(self.data[key])
 
         if self.lazy and key in self.visible_vars:
-            return self._load_var(key, indices=indices)
+            return self._read_lazy(request)
 
         raise KeyError(f"Variable '{key}' not found in InputProxy.")
 
@@ -413,10 +589,12 @@ class InputProxy:
 
         # If lazy, peek at file
         if self.lazy and key in self.visible_vars:
-            target_path = self._resolve_target_path(key)
-            with Dataset(target_path, "r") as ds:
+            source = self._source_for(key)
+            with Dataset(source.path, "r") as ds:
                 if key not in ds.variables:
-                     raise KeyError(f"Variable '{key}' not found in {target_path}")
+                     raise KeyError(
+                         f"Variable '{key}' not found in {source.path}"
+                     )
                 return tuple(ds.variables[key].shape)
 
         raise KeyError(f"Variable '{key}' not found in InputProxy.")
@@ -690,7 +868,7 @@ class InputProxy:
 
         if self.lazy and key in self.visible_vars:
             # Cache the loaded data to avoid repeated I/O
-            loaded_data = self._load_var(key)
+            loaded_data = self._read_lazy(_InputReadRequest(key))
             self.data[key] = loaded_data
             return loaded_data
 
@@ -718,11 +896,10 @@ class InputProxy:
     def drop(self, *names: str) -> "InputProxy":
         """Remove one or more variables from every internal registry.
 
-        Clears ``data``, ``visible_vars``, ``file_map`` and
-        ``file_indices`` for each supplied name so downstream consumers
-        (including lazy loaders, validators, and model construction) no
-        longer see the field. Unknown names are rejected before any mutation,
-        so a misspelled field cannot silently alter only part of a batch.
+        Clears resident data, visibility and the complete lazy source binding
+        for each supplied name so downstream consumers no longer see the
+        field. Unknown names are rejected before any mutation, so a misspelled
+        field cannot silently alter only part of a batch.
 
         Returns ``self`` to allow chaining with :meth:`from_nc`.
 
@@ -745,7 +922,7 @@ class InputProxy:
             raise ValueError(
                 f"InputProxy.drop received duplicate names: {duplicates}"
             )
-        known = self.keys().union(self.file_map)
+        known = self.keys().union(self._sources)
         missing = set(names).difference(known)
         if missing:
             raise KeyError(
@@ -754,8 +931,7 @@ class InputProxy:
         for name in names:
             self.data.pop(name, None)
             self.visible_vars.discard(name)
-            self.file_map.pop(name, None)
-            self.file_indices.pop(name, None)
+            self._sources.pop(name, None)
             self.injected_vars.discard(name)
         return self
 

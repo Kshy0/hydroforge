@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 from hydroforge.contracts.runtime import DEFAULT_BLOCK_SIZE
+from hydroforge.contracts.events import emit
 
 from hydroforge.data.distributed import torch_to_numpy_dtype
 from hydroforge.contracts import ResourceCleanupError
@@ -33,7 +34,7 @@ from hydroforge.statistics.ir import (
 )
 from hydroforge.statistics.compiler import StatisticsCompiler
 from hydroforge.statistics.layout import StatisticsCompilation
-from hydroforge.output.netcdf.writer import NetCDFWriter
+from hydroforge.output.netcdf.writer import NetCDFWriter, _NetCDFOutputStream
 from hydroforge.serialization.netcdf import (
     default_netcdf_options, normalize_netcdf_variable_options,
 )
@@ -217,7 +218,11 @@ class StatisticsRuntime:
         self._safe_name_cache: Dict[str, str] = {}
 
         # Streaming mode support
-        self._netcdf_files: Dict[str, Path] = {}  # out_name -> NetCDF file path
+        # Compatibility view for callers that inspect the created paths.
+        self._netcdf_files: Dict[str, Path | list[Path]] = {}
+        self._output_streams: dict[
+            str, tuple[_NetCDFOutputStream, ...]
+        ] = {}
 
         self._all_created_files: Set[Path] = set()
         self._files_created: bool = False
@@ -226,8 +231,6 @@ class StatisticsRuntime:
         self._write_executors: List[ProcessPoolExecutor] = []
         self._pending_writes: List = []
         self._write_buffers: Dict[str, Dict[str, Any]] = {}
-        self._write_batch_sizes: Dict[str, int] = {}
-        self._write_executor_assignments: Dict[str, int] = {}
 
         # Kernel state (mean fast-path)
         self._aggregator_function = None
@@ -245,8 +248,6 @@ class StatisticsRuntime:
         # Only used when in_memory_mode=True
         self._result_tensors: Dict[str, List[torch.Tensor]] = {}
         self._current_time_index: int = 0  # Current time index for in-memory writing
-
-        from hydroforge.contracts.events import emit
 
         emit(
             self, "info", "statistics.initialized",
@@ -888,14 +889,13 @@ class StatisticsRuntime:
             except BaseException as error:
                 failures.append(error)
         executors, self._write_executors = self._write_executors, []
-        assignments = getattr(self, "_write_executor_assignments", None)
-        if assignments is not None:
-            assignments.clear()
         for executor in executors:
             try:
                 executor.shutdown(wait=True)
             except BaseException as error:
                 failures.append(error)
+        self._write_buffers.clear()
+        self._output_streams.clear()
         if len(failures) == 1:
             raise failures[0]
         if failures:
@@ -906,7 +906,6 @@ class StatisticsRuntime:
 
         if self._write_executors:
             raise RuntimeError("statistics output workers are already started")
-        self._write_executor_assignments.clear()
         created = []
         try:
             for _ in range(self.num_workers):

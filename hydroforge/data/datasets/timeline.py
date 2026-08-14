@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,10 +21,20 @@ from hydroforge.contracts.temporal import (
 
 if TYPE_CHECKING:
     from hydroforge.data.datasets.base import AbstractDataset
+    from hydroforge.data.datasets.chunking import SourceChunk
 
 
 DateTime = datetime | cftime.datetime
-ReadOp = tuple[str, list[int]]
+ReadOp = tuple[str, tuple[int, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineRead:
+    """One immutable NetCDF storage plan for a logical time request."""
+
+    storage_start: DateTime
+    operations: tuple[ReadOp, ...]
+    output_length: int
 
 
 class DatasetTimeline:
@@ -54,7 +65,12 @@ class DatasetTimeline:
         self.dt_to_loc: dict[DateTime, tuple[str, int]] = {}
         self.source_time_interval: timedelta | None = None
         self.aggregation_factor: int | None = None
-        self.plan: tuple[tuple, ...] = ()
+        self.plan: tuple[TimelineRead, ...] = ()
+        # ``AbstractDataset.update_calendar`` can be called after a timeline
+        # has been compiled.  The owner then owns a new SourceChunkPlan; do
+        # not let an old file plan silently interpret a chunk from that new
+        # temporal axis.
+        self._compiled_chunk_plan = None
 
         self._scan(self._required_output_times())
         self._build_plan()
@@ -64,6 +80,14 @@ class DatasetTimeline:
 
     def _validate_files(self, keys: set[str]) -> None:
         self.owner.validate_files_exist([self._path(key) for key in sorted(keys)])
+
+    def _file_calendar(self, key: str) -> str:
+        """Read one shard's CF calendar without decoding its heavy variable."""
+
+        path = self._path(key)
+        with Dataset(path, "r") as dataset:
+            time_var = self._time_variable(dataset, path)
+            return canonical_calendar(getattr(time_var, "calendar", "standard"))
 
     def _discover_keys(self) -> set[str]:
         """Discover every flat source shard matching this prefix/suffix."""
@@ -92,9 +116,7 @@ class DatasetTimeline:
         required: list[DateTime] = []
         seen: set[DateTime] = set()
         for chunk in self.owner.chunk_plan:
-            for timestamp in self.contiguous_times(
-                chunk.source_start, chunk.length,
-            ):
+            for timestamp in self.storage_times_for_chunk(chunk):
                 if timestamp not in seen:
                     seen.add(timestamp)
                     required.append(timestamp)
@@ -129,6 +151,24 @@ class DatasetTimeline:
         required_set = set(required_times)
         supports = self._support_ranges(required_times, owner.time_interval)
         candidates = {self.time_to_key(timestamp) for timestamp in required_times}
+
+        # The configured calendar is often a default.  Probe an existing shard
+        # before validating keys so leap-day filenames and cftime conversion
+        # follow the source calendar rather than a guessed standard calendar.
+        probe = sorted(key for key in candidates if self._path(key).exists())
+        if probe:
+            source_calendar = self._file_calendar(probe[0])
+            if owner.calendar != source_calendar:
+                owner.update_calendar(source_calendar)
+                required_times = self._required_output_times()
+                required_set = set(required_times)
+                supports = self._support_ranges(
+                    required_times, owner.time_interval,
+                )
+                candidates = {
+                    self.time_to_key(timestamp) for timestamp in required_times
+                }
+
         if aggregate:
             # An output interval can span multiple file partitions. Deriving
             # keys only at output boundaries would skip every interior shard
@@ -146,9 +186,7 @@ class DatasetTimeline:
         for key in sorted(keys):
             path = self._path(key)
             with Dataset(path, "r") as dataset:
-                time_var = dataset.variables.get("time") or dataset.variables.get("valid_time")
-                if time_var is None:
-                    raise ValueError(f"Time variable not found in file: {path.name}")
+                time_var = self._time_variable(dataset, path)
                 file_calendar = canonical_calendar(
                     getattr(time_var, "calendar", "standard"),
                 )
@@ -166,26 +204,8 @@ class DatasetTimeline:
                     supports = self._support_ranges(
                         required_times, owner.time_interval,
                     )
-                dates = self._decode_dates(time_var, path)
-                if not dates:
-                    raise ValueError(f"Time axis is empty in {path.name}")
-                non_increasing = [
-                    right for left, right in zip(dates, dates[1:])
-                    if right <= left
-                ]
-                if non_increasing:
-                    raise ValueError(
-                        f"Time axis in {path.name} must be strictly increasing; "
-                        f"first invalid timestamp is {non_increasing[0]}"
-                    )
-                duplicate = next(
-                    (dt for dt in dates if dt in seen_times), None,
-                )
-                if duplicate is not None:
-                    raise ValueError(
-                        f"Timestamp {duplicate} occurs in both "
-                        f"{seen_times[duplicate].name} and {path.name}"
-                    )
+                dates = self._validated_dates(time_var, path)
+                self._require_unique(dates, seen_times, path)
                 seen_times.update((dt, path) for dt in dates)
                 self.file_times[key] = list(dates)
                 for index, dt in enumerate(dates):
@@ -213,6 +233,43 @@ class DatasetTimeline:
                 )
 
     @staticmethod
+    def _time_variable(dataset: Dataset, path: Path):
+        time_var = (
+            dataset.variables.get("time")
+            or dataset.variables.get("valid_time")
+        )
+        if time_var is None:
+            raise ValueError(f"Time variable not found in file: {path.name}")
+        return time_var
+
+    @classmethod
+    def _validated_dates(cls, time_var, path: Path) -> list[DateTime]:
+        dates = cls._decode_dates(time_var, path)
+        if not dates:
+            raise ValueError(f"Time axis is empty in {path.name}")
+        non_increasing = [
+            right for left, right in zip(dates, dates[1:])
+            if right <= left
+        ]
+        if non_increasing:
+            raise ValueError(
+                f"Time axis in {path.name} must be strictly increasing; "
+                f"first invalid timestamp is {non_increasing[0]}"
+            )
+        return dates
+
+    @staticmethod
+    def _require_unique(
+        dates: list[DateTime], existing: dict[DateTime, Path], path: Path,
+    ) -> None:
+        duplicate = next((date for date in dates if date in existing), None)
+        if duplicate is not None:
+            raise ValueError(
+                f"Timestamp {duplicate} occurs in both "
+                f"{existing[duplicate].name} and {path.name}"
+            )
+
+    @staticmethod
     def _decode_dates(time_var, path: Path) -> list[DateTime]:
         calendar = getattr(time_var, "calendar", "standard")
         units = getattr(time_var, "units", None)
@@ -227,6 +284,53 @@ class DatasetTimeline:
                 f"Cannot decode CF time axis in {path.name}: "
                 f"units={units!r}, calendar={calendar!r}"
             ) from error
+
+    def ensure_support_time(self, timestamp: DateTime) -> None:
+        """Index one extra support timestamp needed by a storage adapter.
+
+        Normal timeline compilation indexes only planned output support. Some
+        formats, such as cumulative ERA5 records, also need a predecessor.
+        File discovery and time-axis validation remain the timeline's concern.
+        """
+
+        self._assert_current_chunk_plan()
+
+        if timestamp in self.dt_to_loc:
+            return
+
+        key = self.time_to_key(timestamp)
+        dates = self.file_times.get(key)
+        path = self._path(key)
+        if dates is None:
+            self._validate_files({key})
+            with Dataset(path, "r") as dataset:
+                time_var = self._time_variable(dataset, path)
+                file_calendar = canonical_calendar(
+                    getattr(time_var, "calendar", "standard"),
+                )
+                if file_calendar != canonical_calendar(self.owner.calendar):
+                    raise ValueError(
+                        "forcing files use inconsistent calendars: "
+                        f"{self.owner.calendar!r} and {file_calendar!r} in "
+                        f"{path.name}"
+                    )
+                dates = self._validated_dates(time_var, path)
+            existing_times = {
+                date: self._path(existing_key)
+                for existing_key, existing_dates in self.file_times.items()
+                if existing_key != key
+                for date in existing_dates
+            }
+            self._require_unique(dates, existing_times, path)
+            self.file_times[key] = dates
+
+        try:
+            index = dates.index(timestamp)
+        except ValueError:
+            raise ValueError(
+                f"Missing support timestamp {timestamp} in {path.name}"
+            ) from None
+        self.dt_to_loc[timestamp] = (key, index)
 
     @staticmethod
     def _infer_source_interval(source_times: list[DateTime]) -> timedelta:
@@ -262,6 +366,7 @@ class DatasetTimeline:
         return timedelta(microseconds=interval_width)
 
     def source_times(self, output_times: list[DateTime]) -> list[DateTime]:
+        self._assert_current_chunk_plan()
         if self.source_time_interval is None or self.aggregation_factor is None:
             raise RuntimeError(
                 "source_times() requires a compiled time-aggregation plan"
@@ -281,72 +386,85 @@ class DatasetTimeline:
                 f"First missing: {preview} (total {len(missing)})."
             )
 
-    def ops_from_times(self, times: list[DateTime]) -> list[ReadOp]:
-        order: list[str] = []
-        by_file: dict[str, list[int]] = {}
-        seen_by_file: dict[str, set[int]] = {}
+    def _ops_from_times(self, times: list[DateTime]) -> tuple[ReadOp, ...]:
+        # Preserve the logical time order.  Grouping by file globally is
+        # incorrect when a custom key function revisits a shard (A, B, A):
+        # concatenating all A reads before B silently permutes the timeline.
+        operations: list[ReadOp] = []
+        current_key: str | None = None
+        current_indices: list[int] = []
+
+        def flush() -> None:
+            nonlocal current_key, current_indices
+            if current_key is not None and current_indices:
+                operations.append((current_key, tuple(current_indices)))
+            current_key = None
+            current_indices = []
+
         for dt in times:
             key, index = self.dt_to_loc[dt]
-            if key not in by_file:
-                order.append(key)
-                by_file[key] = []
-                seen_by_file[key] = set()
-            if index not in seen_by_file[key]:
-                seen_by_file[key].add(index)
-                by_file[key].append(index)
-        return [(key, by_file[key]) for key in order]
+            if key != current_key:
+                flush()
+                current_key = key
+            current_indices.append(index)
+        flush()
+        return tuple(operations)
 
-    def build_entry(self, times: list[DateTime]) -> tuple:
+    def _build_read(self, times: list[DateTime]) -> TimelineRead:
+        if not times:
+            raise ValueError("timeline read requires at least one timestamp")
         if self.time_aggregation is None:
-            return times[0], self.ops_from_times(times)
-        return times[0], self.ops_from_times(self.source_times(times)), len(times)
-
-    def contiguous_times(self, current_time: DateTime, count: int) -> list[DateTime]:
-        """Return an aligned read window without mixing main and spin-up axes.
-
-        ``AbstractDataset.get_index_by_time`` is intentionally relative to the
-        main-run start. Normalize the requested time back onto the owner's I/O
-        origin, then bound it by the phase that actually contains it.
-        """
-        count = int(count)
-        if count <= 0:
-            raise ValueError("chunk_len must be positive")
-
-        index = self.owner.get_index_by_time(current_time)
-        start = self.owner.start_date + self.owner.time_interval * index
-
-        if self.owner.start_date <= start <= self.owner.end_date:
-            phase_end = self.owner.end_date
-        elif (
-            self.owner.spin_up_cycles > 0
-            and self.owner.spin_up_start_date <= start <= self.owner.spin_up_end_date
-        ):
-            phase_end = self.owner.spin_up_end_date
+            operations = self._ops_from_times(times)
         else:
-            raise ValueError(
-                f"Start time {current_time} is outside the main and spin-up timelines"
+            operations = self._ops_from_times(self.source_times(times))
+        return TimelineRead(
+            storage_start=times[0],
+            operations=operations,
+            output_length=len(times),
+        )
+
+    def operations_for_times(
+        self, times: list[DateTime],
+    ) -> tuple[ReadOp, ...]:
+        """Compile storage operations for an arbitrary logical time window."""
+
+        self._assert_current_chunk_plan()
+        return self._build_read(times).operations
+
+    def read_for_chunk(self, chunk: SourceChunk) -> TimelineRead:
+        """Return the storage plan owned by one exact source request."""
+
+        self._assert_current_chunk_plan()
+        self.owner.chunk_plan.validate_chunk(chunk)
+        return self.plan[chunk.index]
+
+    def _assert_current_chunk_plan(self) -> None:
+        """Reject reads compiled against a superseded owner temporal plan."""
+
+        if (
+            self._compiled_chunk_plan is not None
+            and self._compiled_chunk_plan is not self.owner.chunk_plan
+        ):
+            raise RuntimeError(
+                "dataset calendar changed after its timeline was compiled; "
+                "recreate the dataset before reading"
             )
 
-        available = (
-            timedelta_microseconds(
-                phase_end - start, label="remaining dataset read span",
-            )
-            // timedelta_microseconds(
-                self.owner.time_interval, label="dataset time_interval",
-            )
-            + 1
-        )
-        return [
-            start + self.owner.time_interval * offset
-            for offset in range(min(count, available))
-        ]
+    def storage_times_for_chunk(self, chunk: SourceChunk) -> list[DateTime]:
+        """Expand one logical source request into exact storage timestamps."""
+
+        self._assert_current_chunk_plan()
+        mapper = getattr(self.owner, "_storage_time", None)
+        logical_times = chunk.source_times(self.owner.time_interval)
+        if mapper is None:
+            return list(logical_times)
+        return [mapper(timestamp) for timestamp in logical_times]
 
     def _build_plan(self) -> None:
         """Compile I/O operations from the owner's shared source chunks."""
 
         self.plan = tuple(
-            self.build_entry(self.contiguous_times(
-                chunk.source_start, chunk.length,
-            ))
+            self._build_read(self.storage_times_for_chunk(chunk))
             for chunk in self.owner.chunk_plan
         )
+        self._compiled_chunk_plan = self.owner.chunk_plan

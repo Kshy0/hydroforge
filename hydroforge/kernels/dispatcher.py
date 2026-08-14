@@ -35,6 +35,39 @@ def _reject_unproven_uint32_runtime_scalars(
         )
 
 
+def _validate_triton_float64_scalars(
+    kernel: Any,
+    spec: KernelSpec,
+    parameters: set[str],
+    label: str,
+) -> None:
+    names = {
+        name for name in parameters
+        if spec.runtime_scalars.get(name) == "float64"
+    }
+    if not names:
+        return
+    parameters_by_name = {
+        parameter.name: parameter
+        for parameter in getattr(kernel, "params", ())
+    }
+    invalid = sorted(
+        name for name in names
+        if (
+            parameters_by_name.get(name) is None
+            or (
+                parameters_by_name[name].annotation_type != "fp64"
+                and not getattr(parameters_by_name[name], "is_constexpr", False)
+            )
+        )
+    )
+    if invalid:
+        raise TypeError(
+            f"{spec.name}: {label} Triton float64 runtime scalar(s) require "
+            f"explicit tl.float64 annotations: {invalid}"
+        )
+
+
 def require_specializer(implementation: Any, *, label: str) -> Callable:
     """Return one strict backend specializer or reject Python launch fallback."""
 
@@ -426,6 +459,9 @@ def make_triton_dispatcher(
                 "native parameters"
             )
         observed = set(parameters)
+        _validate_triton_float64_scalars(
+            candidate, canonical, observed, label,
+        )
         extra = observed.difference(canonical_parameters)
         missing = canonical_parameters.difference(observed)
         if extra:

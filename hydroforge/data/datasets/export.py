@@ -100,13 +100,9 @@ class DatasetExporter:
             desc="Computing climatology", unit="chunk",
         )
         for ci in pbar:
-            block = self.owner.read_chunk(ci)  # (T, n_grids)
-            valid_T = self.owner.source_chunk_length(ci)
-            if block.shape[0] != valid_T:
-                raise ValueError(
-                    f"read_chunk returned {block.shape[0]} rows at chunk {ci}; "
-                    f"the source chunk plan requires {valid_T}"
-                )
+            chunk = self.owner.chunk_plan[ci]
+            block = self.owner.read_chunk(chunk)  # (T, n_grids)
+            valid_T = chunk.length
 
             # block: (T, n_grids)
             block_t = torch.as_tensor(block, dtype=torch_dtype, device=dev)
@@ -374,7 +370,8 @@ class DatasetExporter:
             n_chunks = len(self.owner)
             pbar = tqdm(total=total_steps, desc="Exporting", unit="step")
             for ci in range(first_chunk, n_chunks):
-                read_data = self.owner.read_chunk(ci)
+                chunk = self.owner.chunk_plan[ci]
+                read_data = self.owner.read_chunk(chunk)
                 if isinstance(read_data, dict):
                     blocks = read_data
                     if set(blocks) != set(output_methods):
@@ -413,10 +410,9 @@ class DatasetExporter:
                 # Write maximal same-file runs as blocks.  Chunk data is
                 # already resident, so row-at-a-time writes only add HDF5
                 # extension, chunk lookup and compression overhead.
-                chunk_times = [
-                    self.owner.source_time_at(ci, k)
-                    for k in range(T)
-                ]
+                chunk_times = chunk.source_times(
+                    self.owner.chunk_plan.contract.interval,
+                )
                 run_start = 0
                 while run_start < T:
                     if split_by_year:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Final, Iterator
 
 import torch
 
@@ -13,11 +13,8 @@ if TYPE_CHECKING:
 
 
 _MISSING_PROGRAM = object()
+_MISSING_COUNT = object()
 
-# HydroForge's signed-int32 substep-count ABI reserves its largest value as
-# the backend-independent failure sentinel.  Device kernels that calculate a
-# count may emit this value instead of casting a non-finite or overflowing
-# result; ``SubstepRuntime.fixed`` decodes it before any loop is scheduled.
 INVALID_SUBSTEP_COUNT: Final[int] = (1 << 31) - 1
 
 
@@ -42,6 +39,41 @@ class AdaptiveSubstepFrame:
     def resolve_dt(self) -> None:
         """End dt proposal and begin the physics operator region."""
         self._resolve()
+
+
+class _FixedFinalRecorder:
+    def __init__(self, model: AbstractModel, *, stable_tensors) -> None:
+        self.model = model
+        self.stable_tensors = stable_tensors
+        self.claimed = False
+        self.program = None
+
+    def record(self, callback: Callable[[], None]) -> None:
+        if self.claimed:
+            raise RuntimeError(
+                "a fixed substep may declare only one final operator region"
+            )
+        if not callable(callback):
+            raise TypeError("fixed substep final callback must be callable")
+        from hydroforge.execution.operators import record_operator_scope
+
+        self.claimed = True
+        recording = record_operator_scope(
+            self.model,
+            stable_tensors=self.stable_tensors,
+            scope_kind="fixed final",
+        )
+        with recording:
+            callback()
+        if recording.program is None:
+            raise RuntimeError("fixed final recording did not complete")
+        if not recording.program.operators:
+            from hydroforge.execution.operators import SubstepCompileError
+
+            raise SubstepCompileError(
+                "fixed final callback produced an empty operator IR"
+            )
+        self.program = recording.program
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,13 +103,37 @@ def _specialization_key(value: Any) -> Any:
 class _FixedScope:
     def __init__(
         self, runtime: SubstepRuntime, *, key: tuple[Any, ...],
-        count: int, duration: float,
+        count: int, duration: float, defer_final: bool,
     ) -> None:
         self.runtime = runtime
         self.key = key
         self.count = count
         self.duration = duration
+        self.defer_final = defer_final
         self.completed = 0
+        self._program = None
+        self._operators = None
+        self._last = None
+        self._iterated = False
+
+    def _execute(self) -> None:
+        program = self._program
+        if program is None:
+            raise RuntimeError("fixed substep body has not been recorded")
+        step = self.runtime.model._execution.active_step
+        if step is None:
+            raise RuntimeError("fixed substeps require @managed_step")
+        if self.runtime.model.world_size > 1:
+            from hydroforge.execution.step import (
+                _DistributedStepEvent, _DistributedStepKind,
+            )
+            step.synchronize_distributed(_DistributedStepEvent(
+                _DistributedStepKind.SUBSTEP,
+            ))
+        self.completed = program.execute(
+            self.count, self.duration,
+        )
+        step.completed_substeps = self.completed
 
     def __iter__(self) -> Iterator[SubstepFrame]:
         from hydroforge.execution.operators import record_operator_scope
@@ -85,8 +141,19 @@ class _FixedScope:
 
         programs = self.runtime.model._execution.programs
         program = programs.get(self.key, _MISSING_PROGRAM)
+        self._iterated = True
         if program is _MISSING_PROGRAM:
             program = FixedSubstepProgram(self.runtime.model)
+            final = _FixedFinalRecorder(
+                self.runtime.model,
+                stable_tensors=(
+                    program.count, program.counter, program.weight,
+                ),
+            )
+            frame = SubstepFrame(
+                index=program.counter,
+                dt=program.weight,
+            )
             with record_operator_scope(
                 self.runtime.model,
                 stable_tensors=(
@@ -95,24 +162,46 @@ class _FixedScope:
                 ),
                 scope_kind="fixed",
             ) as recording:
-                yield program.frame
+                yield frame
             if recording.program is None:
                 raise RuntimeError("fixed substep recording did not complete")
-            program.install(recording.program)
-            programs[self.key] = program
+            if self.defer_final:
+                self._operators = recording.program
+                self._last = final
+            else:
+                program.install(recording.program, final.program)
+                programs[self.key] = program
         elif not isinstance(program, FixedSubstepProgram):
             raise RuntimeError("cached substep program has the wrong execution kind")
         elif program.operators is None:
             raise RuntimeError("cached fixed substep program is not installed")
-        step = self.runtime.model._execution.active_step
-        if step is None:
-            raise RuntimeError("fixed substeps require @managed_step")
-        if self.runtime.model.world_size > 1:
-            step.synchronize_distributed(1)
-        self.completed = program.execute(
-            self.count, self.duration,
-        )
-        step.completed_substeps = self.completed
+        self._program = program
+        if not self.defer_final:
+            self._execute()
+
+    def after(self, callback: Callable[[], None]) -> None:
+        """Run one compiled callback after the fixed loop."""
+
+        if not callable(callback):
+            raise TypeError("fixed substep final callback must be callable")
+        if not self.defer_final:
+            raise RuntimeError(
+                "fixed scope after() requires fixed(defer_final=True)"
+            )
+        if not self._iterated or self._program is None:
+            raise RuntimeError(
+                "fixed scope after() must follow the completed lexical loop"
+            )
+        if self._operators is not None:
+            last = self._last
+            if last is None:
+                raise RuntimeError("deferred fixed final recorder is missing")
+            last.record(callback)
+            self._program.install(self._operators, last.program)
+            self.runtime.model._execution.programs[self.key] = self._program
+            self._operators = None
+            self._last = None
+        self._execute()
 
 
 class _AdaptiveScope:
@@ -223,7 +312,12 @@ class _AdaptiveScope:
         if step is None:
             raise RuntimeError("adaptive substeps require @managed_step")
         if self.runtime.model.world_size > 1:
-            step.synchronize_distributed(1)
+            from hydroforge.execution.step import (
+                _DistributedStepEvent, _DistributedStepKind,
+            )
+            step.synchronize_distributed(_DistributedStepEvent(
+                _DistributedStepKind.SUBSTEP,
+            ))
         self.completed = program.execute(self.duration)
         step.completed_substeps = self.completed
 
@@ -305,8 +399,21 @@ class SubstepRuntime:
     def __init__(self, model: AbstractModel) -> None:
         self.model = model
 
+    @property
+    def requested_sub_steps(self) -> int:
+        """Return the requested fixed count, defaulting to one."""
+
+        step = self.model._execution.active_step
+        if step is None:
+            raise RuntimeError(
+                "requested_sub_steps is available only inside @managed_step"
+            )
+        raw = getattr(step, "requested_sub_steps", None)
+        return 1 if raw is None else raw
+
     def fixed(
-        self, *, count: object, specialization: Any = None,
+        self, *, count: object = _MISSING_COUNT, specialization: Any = None,
+        defer_final: bool = False,
     ) -> _FixedScope:
         """Declare a fixed loop after decoding the shared count ABI.
 
@@ -314,6 +421,21 @@ class SubstepRuntime:
         :data:`INVALID_SUBSTEP_COUNT` to report an invalid or overflowing
         result without performing an unsafe integer cast.
         """
+        if type(defer_final) is not bool:
+            raise TypeError("defer_final must be an exact bool")
+        step = self.model._execution.active_step
+        requested = (
+            None if step is None else getattr(step, "requested_sub_steps", None)
+        )
+        if count is _MISSING_COUNT:
+            if step is None:
+                raise RuntimeError("compiled substeps require @managed_step")
+            count = self.requested_sub_steps
+        elif requested is not None:
+            raise ValueError(
+                "computed fixed substep count conflicts with explicit "
+                "num_sub_steps request"
+            )
         if type(count) is not int:
             raise TypeError("fixed substep count must be an int")
         if count < 1:
@@ -325,12 +447,18 @@ class SubstepRuntime:
             )
         if count > INVALID_SUBSTEP_COUNT:
             raise ValueError("fixed substep count must fit in a signed int32")
+        if step is None:
+            raise RuntimeError("compiled substeps require @managed_step")
         duration, key = self._claim_scope(
-            kind="fixed", specialization=_specialization_key(specialization),
+            kind="fixed",
+            specialization=(
+                _specialization_key(specialization),
+                ("defer_final", defer_final),
+            ),
         )
         return _FixedScope(
             self, key=key,
-            count=count, duration=duration,
+            count=count, duration=duration, defer_final=defer_final,
         )
 
     def adaptive(
@@ -338,6 +466,14 @@ class SubstepRuntime:
         maximum_dt: float, maximum_steps: int,
         specialization: Any = None,
     ) -> _AdaptiveScope:
+        step = self.model._execution.active_step
+        if step is None:
+            raise RuntimeError("compiled substeps require @managed_step")
+        if getattr(step, "requested_sub_steps", None) is not None:
+            raise ValueError(
+                "adaptive substeps conflict with explicit num_sub_steps "
+                "request; omit num_sub_steps for adaptive timestepping"
+            )
         duration, key = self._claim_scope(
             kind="adaptive",
             specialization=_specialization_key(specialization),

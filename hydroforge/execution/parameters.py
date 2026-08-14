@@ -285,9 +285,9 @@ class ParameterPlanRuntime:
                 return val
 
         if id_attr in self.variable_map:
-            mod_inst, field_name, _ = self.variable_map[id_attr]
-            if hasattr(mod_inst, field_name):
-                val = getattr(mod_inst, field_name)
+            entry = self.variable_map[id_attr]
+            if hasattr(entry.module, entry.field_name):
+                val = getattr(entry.module, entry.field_name)
                 if isinstance(val, torch.Tensor):
                     return val
 
@@ -301,7 +301,10 @@ class ParameterPlanRuntime:
                 f"ParameterChangePlan Error: Variable {variable_name!r} "
                 "not found in model."
             )
-        module, attr, id_attr = self.variable_map[variable_name]
+        entry = self.variable_map[variable_name]
+        module = entry.module
+        attr = entry.field_name
+        id_attr = entry.coordinate
         field = module.get_tensor_schema(attr)
         if (
             field is None or field.tensor is None
@@ -460,8 +463,8 @@ class ParameterPlanRuntime:
                 f"ParameterChangePlan Error: {ctx} '{ref}' does not "
                 f"resolve to any declared field."
             )
-        mod_inst, field_name, _ = self.variable_map[bare]
-        field = mod_inst.get_tensor_schema(field_name)
+        entry = self.variable_map[bare]
+        field = entry.module.get_tensor_schema(entry.field_name)
         if field is None or not field.tensor.is_key:
             raise ValueError(
                 f"ParameterChangePlan Error: {ctx} '{ref}' is not a key "
@@ -789,8 +792,8 @@ class ParameterPlanRuntime:
     def get_variable(self, variable_name: str) -> Any:
         if variable_name not in self.variable_map:
             raise ValueError(f"Variable '{variable_name}' not found in model.")
-        module, attr, _ = self.variable_map[variable_name]
-        return getattr(module, attr)
+        entry = self.variable_map[variable_name]
+        return getattr(entry.module, entry.field_name)
 
     def set_variable_value(
         self,
@@ -888,9 +891,9 @@ class ParameterPlanRuntime:
                 elif plan.target_id_field:
                     id_attr_name = plan.target_id_field
                 elif plan.variable_name in self.variable_map:
-                    _, _, id_attr = self.variable_map[plan.variable_name]
-                    if id_attr:
-                        id_attr_name = id_attr
+                    coordinate = self.variable_map[plan.variable_name].coordinate
+                    if coordinate:
+                        id_attr_name = coordinate
                 if count <= 5:
                     ids_list = (
                         plan.target_ids.tolist()

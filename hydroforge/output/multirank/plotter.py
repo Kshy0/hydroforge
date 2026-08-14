@@ -74,8 +74,12 @@ class MultiRankPlotter:
     def get_series(
         self, points, level=None, trial: int = 0,
         fill_value: float = np.nan, dtype=None,
+        *, time_slice: slice | None = None,
     ):
-        return self.owner.get_series(points, level, trial, fill_value, dtype)
+        return self.owner.get_series(
+            points, level, trial, fill_value, dtype,
+            time_slice=time_slice,
+        )
 
     def plot_single_time(
         self,
@@ -138,7 +142,6 @@ class MultiRankPlotter:
         elif as_scatter_if_no_map:
             xs: List[np.ndarray] = []
             ys: List[np.ndarray] = []
-            vals: List[np.ndarray] = []
             for info in self._rank_files:
                 if info["saved_points"] == 0:
                     continue
@@ -146,23 +149,11 @@ class MultiRankPlotter:
                     raise RuntimeError("map_shape not set and no converter-provided (x,y).")
                 xs.append(info["x"])
                 ys.append(info["y"])
-                cache_arr = info.get("cache")
-                if cache_arr is not None:
-                    indices = [t_index]
-                    if info["has_trials"]:
-                        indices.append(trial)
-                    indices.append(slice(None))
-                    if info["has_levels"]:
-                        indices.append(level if level is not None else 0)
-                    vv = cache_arr[tuple(indices)]
-                else:
-                    vv = self.owner._data_access._get_data_from_files(
-                        info, t_index, level, trial,
-                    )
-                vals.append(np.array(vv))
             x_all = np.concatenate(xs) if xs else np.array([])
             y_all = np.concatenate(ys) if ys else np.array([])
-            v_all = np.concatenate(vals) if vals else np.array([])
+            v_all = self.owner.get_vector(
+                t_index, level=level, trial=trial,
+            )
             sc = ax.scatter(x_all, y_all, c=v_all, s=s, cmap=cmap, vmin=vmin, vmax=vmax)
             fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
             ax.set_title(f"{title_str} (scatter)")

@@ -447,8 +447,8 @@ _FUNCTIONS: dict[ExpressionDialect, dict[str, str]] = {
         "abs": "torch.abs", "fabs": "torch.abs", "sqrt": "torch.sqrt",
         "exp": "torch.exp", "log": "torch.log", "sin": "torch.sin",
         "cos": "torch.cos", "tan": "torch.tan", "pow": "torch.pow",
-        "maximum": "torch.fmax", "minimum": "torch.fmin",
-        "max": "torch.fmax", "min": "torch.fmin",
+        "maximum": "hydroforge_maximum", "minimum": "hydroforge_minimum",
+        "max": "hydroforge_maximum", "min": "hydroforge_minimum",
     },
 }
 

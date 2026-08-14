@@ -34,7 +34,7 @@ class StatisticsCompiler:
         lowering = lower_statistics(ir, num_trials=owner.num_trials)
         owner._statistics_ir = ir
         owner._statistics_lowering = lowering
-        result = _EMITTERS[backend](owner, ir, lowering).emit()
+        result = _EMITTERS[backend](owner, lowering).emit()
         owner._aggregator_function = result.function
         owner._kernel_module = result.module
         owner._aggregator_generated = result.generated

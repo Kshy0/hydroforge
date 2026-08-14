@@ -427,14 +427,18 @@ class PartitionCompiler:
                 raise ValueError(
                     f"Output coordinate '{coordinate}' is not available in opened modules."
                 )
-            module, attribute, _ = variable_map[coordinate]
-            coordinate_tensor = getattr(module, attribute)
+            coordinate_entry = variable_map[coordinate]
+            coordinate_tensor = getattr(
+                coordinate_entry.module, coordinate_entry.field_name,
+            )
             selection = (
                 self.schema.selections.get(coordinate) if policy == "auto" else None
             )
             if selection:
-                module, attribute, _ = variable_map[selection]
-                selected = getattr(module, attribute)
+                selection_entry = variable_map[selection]
+                selected = getattr(
+                    selection_entry.module, selection_entry.field_name,
+                )
                 if selected is not None:
                     indices = (
                         torch.empty(0, dtype=torch.int32, device=self.model.device)

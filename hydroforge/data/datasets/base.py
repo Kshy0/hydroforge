@@ -22,10 +22,11 @@ from hydroforge.contracts.temporal import (
     SimulationSchedule,
     SpinupSchedule,
     canonical_calendar,
+    convert_calendar_date,
     timedelta_microseconds,
     timedelta_quotient,
 )
-from hydroforge.data.datasets.chunking import SourceChunkPlan
+from hydroforge.data.datasets.chunking import SourceChunk, SourceChunkPlan
 
 
 logger = logging.getLogger(__name__)
@@ -343,7 +344,11 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 duration_label="spin-up endpoint span",
                 interval_label="time_interval",
             )
-        self._compile_temporal_state()
+        (
+            self._temporal_contract,
+            self._chunk_plan,
+            self._simulation_schedule,
+        ) = self._compile_temporal_state()
         if self.reuse_count > 1 and upsampling not in {"repeat", "distribute"}:
             raise ValueError(
                 "upsampling must be explicitly 'repeat' or 'distribute' "
@@ -354,11 +359,28 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 "upsampling must be None when model_step equals time_interval"
             )
 
-    def _compile_temporal_state(self) -> None:
-        """Compile all source counts, chunks and model calls from one contract."""
+    def _compile_temporal_state(
+        self,
+        *,
+        calendar: str | None = None,
+        start_date: Union[datetime, cftime.datetime] | None = None,
+        end_date: Union[datetime, cftime.datetime] | None = None,
+        spin_up_start_date: Union[datetime, cftime.datetime] | None = None,
+        spin_up_end_date: Union[datetime, cftime.datetime] | None = None,
+    ) -> tuple[DatasetTemporalContract, SourceChunkPlan, SimulationSchedule]:
+        """Compile temporal state from explicit values without mutating self."""
 
-        start = self.main_start_time
-        end = self.main_end_time
+        calendar = self.calendar if calendar is None else canonical_calendar(calendar)
+        start = self.start_date if start_date is None else start_date
+        end = self.end_date if end_date is None else end_date
+        spin_start = (
+            self.spin_up_start_date
+            if spin_up_start_date is None else spin_up_start_date
+        )
+        spin_end = (
+            self.spin_up_end_date
+            if spin_up_end_date is None else spin_up_end_date
+        )
         count = timedelta_quotient(
             end - start,
             self.time_interval,
@@ -367,8 +389,8 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         ) + 1
         spinup = None
         if self.spin_up_cycles > 0:
-            spinup_start = self.spin_up_start_time
-            spinup_end = self.spin_up_end_time
+            spinup_start = spin_start
+            spinup_end = spin_end
             if spinup_start is None or spinup_end is None:
                 raise ValueError(
                     "spin_up_start_date and spin_up_end_date are required "
@@ -380,7 +402,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
                 cycles=self.spin_up_cycles,
             )
         contract = DatasetTemporalContract(
-            calendar=self.calendar,
+            calendar=calendar,
             start=start,
             interval=self.time_interval,
             count=count,
@@ -390,9 +412,7 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         schedule = SimulationSchedule.from_contract(
             contract, step=self.model_step,
         )
-        self._temporal_contract = contract
-        self._chunk_plan = chunk_plan
-        self._simulation_schedule = schedule
+        return contract, chunk_plan, schedule
 
     @staticmethod
     def _as_nan_array(data: np.ndarray) -> np.ndarray:
@@ -435,14 +455,38 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
     def update_calendar(self, calendar: str):
         """
-        Updates the calendar and converts all date attributes to the new calendar.
+        Atomically update the calendar and all derived temporal state.
+
+        Conversion and schedule compilation happen against local values first;
+        a failed conversion (for example an invalid date in ``360_day``) can
+        therefore never leave a partially converted dataset instance.
         """
-        self.calendar = canonical_calendar(calendar)
-        self.start_date = self._convert_to_calendar(self.start_date)
-        self.end_date = self._convert_to_calendar(self.end_date)
-        self.spin_up_start_date = self._convert_to_calendar(self.spin_up_start_date)
-        self.spin_up_end_date = self._convert_to_calendar(self.spin_up_end_date)
-        self._compile_temporal_state()
+        target = canonical_calendar(calendar)
+        converted = tuple(
+            None if value is None else convert_calendar_date(value, target)
+            for value in (
+                self.start_date, self.end_date,
+                self.spin_up_start_date, self.spin_up_end_date,
+            )
+        )
+        start, end, spin_start, spin_end = converted
+        compiled = self._compile_temporal_state(
+            calendar=target,
+            start_date=start,
+            end_date=end,
+            spin_up_start_date=spin_start,
+            spin_up_end_date=spin_end,
+        )
+        self.calendar = target
+        self.start_date = start
+        self.end_date = end
+        self.spin_up_start_date = spin_start
+        self.spin_up_end_date = spin_end
+        (
+            self._temporal_contract,
+            self._chunk_plan,
+            self._simulation_schedule,
+        ) = compiled
 
     def validate_files_exist(self, file_paths: list[Union[str, Path]]) -> None:
         """
@@ -470,7 +514,9 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
         if isinstance(chunk, Mapping):
             lengths = {name: len(value) for name, value in chunk.items()}
             if len(set(lengths.values())) != 1:
-                raise ValueError(f"forcing variables have different lengths: {lengths}")
+                raise ValueError(
+                    f"forcing variables have different lengths: {lengths}"
+                )
             length = next(iter(lengths.values()))
             for index in range(length):
                 yield (
@@ -485,75 +531,83 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
     def num_spin_up_chunks(self) -> int:
         return self._chunk_plan.num_spinup_chunks
 
-    def read_chunk(self, idx: int) -> np.ndarray:
-        """Read one planned real-length chunk, including spin-up replays."""
+    def read_chunk(
+        self, chunk: SourceChunk,
+    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        """Read exactly one immutable request from this dataset's source plan."""
 
-        chunk = self._chunk_plan[idx]
-        return self.get_data(chunk.source_start, chunk.length)
+        self._chunk_plan.validate_chunk(chunk)
+        data = self._read_chunk(chunk)
+        self._validate_raw_chunk(data, chunk)
+        return data
 
-    def source_chunk_length(self, idx: int) -> int:
-        """Return the real source-row count for one storage chunk."""
+    def get_chunk(
+        self, chunk: SourceChunk,
+    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        """Read and normalize one exact source request for consumption."""
 
-        return self._chunk_plan[idx].length
+        compressed = self._local_indices is not None
+        data = self.read_chunk(chunk)
+        if isinstance(data, dict):
+            return {
+                name: self._prepare_chunk_array(block, compressed)
+                for name, block in data.items()
+            }
+        return self._prepare_chunk_array(data, compressed)
 
-    def source_time_at(
-        self, chunk_index: int, offset: int,
-    ) -> Union[datetime, cftime.datetime]:
-        """Return one logical source timestamp from the shared chunk plan."""
+    @staticmethod
+    def _validate_raw_chunk(
+        data: Union[np.ndarray, Dict[str, np.ndarray]], chunk: SourceChunk,
+    ) -> None:
+        """Validate the temporal shape promised by every storage adapter."""
 
-        return self._chunk_plan.source_time(chunk_index, offset)
+        if isinstance(data, dict):
+            if not data:
+                raise ValueError("read_chunk returned an empty variable mapping")
+            invalid_keys = [
+                name for name in data
+                if not isinstance(name, str) or not name
+            ]
+            if invalid_keys:
+                raise TypeError(
+                    "read_chunk variable names must be non-empty strings"
+                )
+            blocks = data.items()
+        elif isinstance(data, np.ndarray):
+            blocks = (("data", data),)
+        else:
+            raise TypeError(
+                "read_chunk must return a numpy array or a non-empty dict of "
+                "numpy arrays"
+            )
+
+        for name, block in blocks:
+            if not isinstance(block, np.ndarray):
+                raise TypeError(
+                    f"read_chunk variable {name!r} must be a numpy array"
+                )
+            if block.ndim < 1:
+                raise ValueError(
+                    f"read_chunk variable {name!r} must have a time axis"
+                )
+            if block.shape[0] != chunk.length:
+                raise ValueError(
+                    f"read_chunk variable {name!r} returned {block.shape[0]} "
+                    f"rows, expected {chunk.length} from the source request"
+                )
 
     @abstractmethod
-    def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
+    def _read_chunk(
+        self, chunk: SourceChunk,
+    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        """Interpret one validated temporal request through source storage.
+
+        Implementations interpret the same temporal request through their own
+        storage layout. Returned arrays retain ``chunk.length`` real rows and
+        are never padded.
         """
-        Read a contiguous time block starting at current_time.
 
-        Inputs:
-        - current_time: start datetime aligned to the dataset time grid
-        - chunk_len: positive integer upper bound of steps to read
-
-        Returns:
-        - If _local_indices is None (before build_local_mapping):
-            3D numpy array with shape (T, Y, X) where Y=lat, X=lon
-        - If _local_indices is set (after build_local_mapping):
-            2D numpy array with shape (T, N) where N = number of active grids
-        - T ∈ [1, chunk_len]. The final block near the end may have T < chunk_len.
-
-        Spatial convention:
-        - Dimension order: (lat, lon) i.e. (Y, X)
-        - When flattening: C-order (row-major), lon varies fastest
-        - Coordinate arrays from get_coordinates(): (lon, lat)
-
-        Implementation notes:
-        - Do not read beyond the available time range; truncate instead.
-        - Do not pad to chunk_len.
-        - Preserve chronological order for the returned timesteps.
-        """
         ...
-
-    def get_time_by_index(self, idx: int) -> Union[datetime, cftime.datetime]:
-        """Return a source time on the historical chunk-major flat axis.
-
-        Short-chunk padding positions are rejected instead of being assigned a
-        fabricated timestamp. New code should prefer :meth:`source_time_at`.
-        """
-
-        if type(idx) is not int:
-            raise TypeError("dataset time index must be an exact int")
-        if idx < 0:
-            raise IndexError(idx)
-        chunk_index, offset = divmod(idx, self.chunk_len)
-        return self.source_time_at(chunk_index, offset)
-
-    def get_index_by_time(self, dt: Union[datetime, cftime.datetime]) -> int:
-        """Returns the index in the main simulation timeline for a given datetime."""
-        offset = dt - self._temporal_contract.start
-        return timedelta_quotient(
-            offset,
-            self._temporal_contract.interval,
-            duration_label="requested time offset",
-            interval_label="dataset sample interval",
-        )
 
     @property
     def num_main_source_steps(self) -> int:
@@ -592,39 +646,14 @@ class AbstractDataset(torch.utils.data.Dataset, ABC):
 
         The final chunk retains its real time length instead of being padded.
         """
-        if idx < 0:
-            idx += len(self)
-
-        compressed = self._local_indices is not None
-        expected_length = self.source_chunk_length(idx)
-        data = self.read_chunk(idx)
-
-        if isinstance(data, dict):
-            return {
-                name: self._prepare_chunk_array(
-                    block, compressed, expected_length=expected_length,
-                )
-                for name, block in data.items()
-            }
-
-        return self._prepare_chunk_array(
-            data, compressed, expected_length=expected_length,
-        )
+        chunk = self._chunk_plan[idx]
+        return self.get_chunk(chunk)
 
     def _prepare_chunk_array(
         self,
         data: np.ndarray,
         compressed: bool,
-        *,
-        expected_length: int,
     ) -> np.ndarray:
-
-        if data.shape[0] != expected_length:
-            raise ValueError(
-                f"read_chunk returned {data.shape[0]} rows, expected "
-                f"{expected_length} from the dataset chunk plan"
-            )
-
         if compressed:
             # Expect (T, N)
             N = self.data_size

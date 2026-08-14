@@ -6,13 +6,23 @@
 
 from datetime import datetime, timedelta
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Callable, List, Optional, Tuple, Union
 
 import cftime
 import numpy as np
 
+from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.gridded import GriddedDataset
 from hydroforge.data.netcdf import daily_time_to_key, single_file_key
+from hydroforge.contracts.temporal import DateLike, timedelta_quotient
+
+
+FileStartDate = (
+    DateLike
+    | Mapping[str, DateLike]
+    | Callable[[str], DateLike]
+)
 
 
 class DailyBinDataset(GriddedDataset):
@@ -25,27 +35,87 @@ class DailyBinDataset(GriddedDataset):
 
     * **One file per day** (default): ``time_to_key = daily_time_to_key``
       → every date gets a unique key, each file has one frame.
-    * **Single file** (e.g. 365-day climatology): use a constant key
-      ``time_to_key = lambda dt: ""``  (or any constant string).
-      Consecutive frames are read from the file by offset.
+    * **Grouped/single file**: provide ``file_start_date`` (or a key→date
+      mapping/callback) to identify frame zero in each file.  Requested dates
+      are mapped to their absolute offset from that origin; they are never
+      renumbered from zero merely because a run requests a subset of dates.
     """
 
     def _build_file_mapping(self):
-        """Map each simulation date to ``(file_key, frame_index)``."""
+        """Map each simulation date to ``(file_key, absolute frame index)``."""
         dates = {
-            chunk.source_time(offset, self.time_interval)
+            timestamp
             for chunk in self.chunk_plan
-            for offset in range(chunk.length)
+            for timestamp in chunk.source_times(self.time_interval)
         }
 
         by_key: dict[str, list] = {}
         for dt in dates:
             by_key.setdefault(self.time_to_key(dt), []).append(dt)
-        self._dt_to_loc = {
-            dt: (key, frame_idx)
-            for key, key_dates in by_key.items()
-            for frame_idx, dt in enumerate(sorted(key_dates))
-        }
+        daily_layout = (
+            all(
+                len(key_dates) == 1
+                and key == daily_time_to_key(key_dates[0])
+                for key, key_dates in by_key.items()
+            )
+            and len(by_key) == len(dates)
+        )
+        # Only the canonical one-file-per-day layout has an implicit frame
+        # zero. Any grouped/custom layout (including a one-date subset of a
+        # constant file) needs an explicit origin.
+        if not daily_layout and self.file_start_date is None:
+            raise ValueError(
+                "file_start_date is required for grouped or custom binary "
+                "file layouts"
+            )
+
+        locations: dict[DateLike, tuple[str, int]] = {}
+        for key, key_dates in by_key.items():
+            ordered = sorted(key_dates)
+            if daily_layout:
+                for dt in ordered:
+                    locations[dt] = (key, 0)
+                continue
+            origin = self._file_origin(key)
+            for dt in ordered:
+                frame_idx = timedelta_quotient(
+                    dt - origin,
+                    self.time_interval,
+                    duration_label=(
+                        f"file frame offset for key {key!r}"
+                    ),
+                    interval_label="daily binary time_interval",
+                )
+                if frame_idx < 0:
+                    raise ValueError(
+                        f"date {dt!s} precedes file_start_date {origin!s} "
+                        f"for binary file key {key!r}"
+                    )
+                locations[dt] = (key, frame_idx)
+        self._dt_to_loc = locations
+
+    def _file_origin(self, key: str) -> DateLike:
+        """Resolve and validate the explicit origin for one storage key."""
+        configured = self.file_start_date
+        if isinstance(configured, Mapping):
+            try:
+                origin = configured[key]
+            except KeyError as error:
+                raise ValueError(
+                    f"file_start_date has no origin for binary file key {key!r}"
+                ) from error
+        elif callable(configured):
+            origin = configured(key)
+        else:
+            origin = configured
+        if not isinstance(origin, (datetime, cftime.datetime)):
+            raise TypeError(
+                "file_start_date values must be datetime or cftime datetime"
+            )
+        origin = self._convert_to_calendar(origin)
+        if origin is None:
+            raise ValueError(f"file_start_date for key {key!r} cannot be None")
+        return origin
 
     def _validate_files_exist(self):
         """Validate that all required files exist and match expected size."""
@@ -92,6 +162,7 @@ class DailyBinDataset(GriddedDataset):
                  lat_south_to_north: bool = False,  # If True, latitude goes from south to north
                  lon_0_to_360: bool = False,  # If True, longitude goes from 0 to 360 (e.g. ERA5-Land binary)
                  time_to_key: Optional[Callable[[Union[datetime, cftime.datetime]], str]] = daily_time_to_key,
+                 file_start_date: FileStartDate | None = None,
                  *args, **kwargs):
 
         self.base_dir = base_dir
@@ -103,6 +174,7 @@ class DailyBinDataset(GriddedDataset):
         self.lat_south_to_north = lat_south_to_north
         self.lon_0_to_360 = lon_0_to_360
         self.time_to_key = time_to_key if time_to_key is not None else single_file_key
+        self.file_start_date = file_start_date
         super().__init__(
             out_dtype=out_dtype,
             chunk_len=1,
@@ -144,7 +216,7 @@ class DailyBinDataset(GriddedDataset):
             lon = np.linspace(-180 + res_lon / 2, 180 - res_lon / 2, nx)
         return lon, lat
 
-    def get_data(self, current_time: datetime, chunk_len: int) -> np.ndarray:
+    def _read_chunk(self, chunk: SourceChunk) -> np.ndarray:
         """Read one day's data from binary file.
 
         Returns:
@@ -153,10 +225,10 @@ class DailyBinDataset(GriddedDataset):
 
         Spatial convention: (Y, X) = (lat, lon), C-order flatten (lon varies fastest)
         """
-        if chunk_len != 1:
+        if chunk.length != 1:
             raise ValueError("DailyBinDataset only supports chunk_len=1 (one day per file)")
 
-        key, frame_idx = self._dt_to_loc[current_time]
+        key, frame_idx = self._dt_to_loc[chunk.source_start]
         filename = f"{self.prefix}{key}{self.suffix}"
         file_path = Path(self.base_dir) / filename
 

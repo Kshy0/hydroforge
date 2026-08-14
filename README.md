@@ -70,7 +70,7 @@ A model defines its physical execution order directly:
 ```python
 @managed_step
 def step_advance(self):
-    for substep in self.substeps.fixed(count=self.num_sub_steps):
+    for substep in self.substeps.fixed():
         route_flow()
         update_storage()
 ```
@@ -83,8 +83,10 @@ model.step_advance()
 ```
 
 Without a schedule, pass `time_step=timedelta(...)` when calling the method.
-`time_step` and `output_enabled` are framework call options, not parameters of
-the decorated method.
+`time_step`, `num_sub_steps`, and `output_enabled` are framework call options,
+not parameters of the decorated method. Fixed-step models may use
+`model.step_advance(num_sub_steps=360)`; omitting it lets the model choose its
+default. Adaptive models must omit `num_sub_steps`.
 
 Adaptive models use `self.substeps.adaptive(...)` and call
 `substep.resolve_dt()` between timestep proposal and physical routing.

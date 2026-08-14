@@ -12,6 +12,7 @@ import torch
 
 from hydroforge.contracts.temporal import DatasetTemporalContract
 from hydroforge.data.datasets.base import _close_dataset_tree
+from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.gridded import GriddedDataset
 
 
@@ -174,6 +175,13 @@ class DatasetExpression(torch.utils.data.Dataset):
         )
         for position, dataset in enumerate(datasets[1:], start=1):
             self._validate_compatible(dataset, position)
+        request_token = self._chunk_plan[0].provenance
+        for dataset in datasets:
+            adopter = getattr(dataset, "_accept_chunk_provenance", None)
+            if callable(adopter):
+                adopter(request_token)
+            else:
+                dataset.chunk_plan._accept_provenance(request_token)
         self._expression_datasets = datasets
         self._spatial_selection_snapshot = tuple(
             self._selection_handle(dataset) for dataset in datasets
@@ -211,6 +219,15 @@ class DatasetExpression(torch.utils.data.Dataset):
                 )
 
     def _validate_compatible(self, other: Any, position: int) -> None:
+        other_contract = (
+            other.reference.temporal_contract
+            if isinstance(other, DatasetExpression)
+            else other.temporal_contract
+        )
+        if other_contract != self.reference.temporal_contract:
+            raise ValueError(
+                f"dataset operand {position} has a different temporal contract"
+            )
         if (
             other.simulation_schedule.cadence
             != self._simulation_schedule.cadence
@@ -255,26 +272,53 @@ class DatasetExpression(torch.utils.data.Dataset):
         )
 
     @staticmethod
-    def _value(operand: Any, index: int) -> Any:
-        return operand if isinstance(operand, Number) else operand[index]
+    def _value(operand: Any, chunk: SourceChunk) -> Any:
+        if isinstance(operand, Number):
+            return operand
+        getter = getattr(operand, "get_chunk", None)
+        if callable(getter):
+            return getter(chunk)
+        return operand[chunk.index]
 
     def __getitem__(self, index: int):
+        chunk = self._chunk_plan[index]
+        return self.get_chunk(chunk)
+
+    def get_chunk(self, chunk: SourceChunk):
+        """Evaluate one prepared request without degrading it back to an index."""
+
         self._assert_spatial_selection_current()
+        self._chunk_plan.validate_chunk(chunk)
         return _OPERATIONS[self.operation](
-            self._value(self.left, index), self._value(self.right, index),
+            self._value(self.left, chunk), self._value(self.right, chunk),
         )
+
+    def _accept_chunk_provenance(self, provenance: object) -> None:
+        """Propagate a composite request token through the expression tree."""
+        self._chunk_plan._accept_provenance(provenance)
+        for operand in (self.left, self.right):
+            if isinstance(operand, Number):
+                continue
+            adopter = getattr(operand, "_accept_chunk_provenance", None)
+            if callable(adopter):
+                adopter(provenance)
+            else:
+                operand.chunk_plan._accept_provenance(provenance)
 
     def __len__(self) -> int:
         return len(self.reference)
 
-    def get_data(self, current_time: Any, chunk_len: int):
+    def read_chunk(self, chunk: SourceChunk):
+        """Evaluate one request from this expression's shared source plan."""
+
         self._assert_spatial_selection_current()
+        self._chunk_plan.validate_chunk(chunk)
 
         def read(operand: Any):
             return (
                 operand
                 if isinstance(operand, Number)
-                else operand.get_data(current_time, chunk_len)
+                else operand.read_chunk(chunk)
             )
         return _OPERATIONS[self.operation](read(self.left), read(self.right))
 

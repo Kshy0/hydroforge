@@ -11,6 +11,7 @@ import torch
 
 from hydroforge.contracts.temporal import DatasetTemporalContract
 from hydroforge.data.datasets.base import AbstractDataset, _close_dataset_tree
+from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.gridded import GriddedDataset
 
 
@@ -50,8 +51,14 @@ class MultiVariableDataset(AbstractDataset):
         })
         self._chunk_plan = reference.chunk_plan
         self._simulation_schedule = reference.simulation_schedule
+        request_token = self._chunk_plan[0].provenance
         for name, dataset in tuple(self._datasets.items())[1:]:
             self._validate_child(name, dataset)
+            adopter = getattr(dataset, "_accept_chunk_provenance", None)
+            if callable(adopter):
+                adopter(request_token)
+            else:
+                dataset.chunk_plan._accept_provenance(request_token)
         self._local_indices = None
         self._desired_catchment_ids = None
 
@@ -62,6 +69,10 @@ class MultiVariableDataset(AbstractDataset):
 
     def _validate_child(self, name: str, dataset: AbstractDataset) -> None:
         reference = self.reference
+        if dataset.temporal_contract != reference.temporal_contract:
+            raise ValueError(
+                f"variable {name!r} has a different temporal contract"
+            )
         if (
             dataset.simulation_schedule.cadence
             != self._simulation_schedule.cadence
@@ -82,7 +93,28 @@ class MultiVariableDataset(AbstractDataset):
                 reference_y, y,
             )
         else:
-            same = set(reference_coordinates.tolist()) == set(coordinates.tolist())
+            # Point columns are consumed positionally by the composite read.
+            # Comparing only sets would accept ``[A, B]`` versus ``[B, A]``
+            # and silently attach the second variable's values to the wrong
+            # catchment.  Require the canonical order here, just as the
+            # arithmetic expression composite does.
+            same = np.array_equal(reference_coordinates, coordinates)
+            if not same:
+                try:
+                    same_members = (
+                        reference_coordinates.shape == coordinates.shape
+                        and np.array_equal(
+                            np.sort(reference_coordinates),
+                            np.sort(coordinates),
+                        )
+                    )
+                except TypeError:
+                    same_members = False
+                if same_members:
+                    raise ValueError(
+                        f"variable {name!r} uses a different spatial "
+                        "coordinate order"
+                    )
         if not same:
             raise ValueError(f"variable {name!r} uses a different spatial domain")
 
@@ -101,16 +133,34 @@ class MultiVariableDataset(AbstractDataset):
     def data_size(self) -> int:
         return self.reference.data_size
 
-    def get_data(self, current_time: Any, chunk_len: int):
+    def _read_chunk(self, chunk: SourceChunk):
         return {
-            name: dataset.get_data(current_time, chunk_len)
+            name: dataset.read_chunk(chunk)
+            for name, dataset in self._datasets.items()
+        }
+
+    def _accept_chunk_provenance(self, provenance: object) -> None:
+        """Propagate a composite request token to every source child."""
+        self._chunk_plan._accept_provenance(provenance)
+        for dataset in self._datasets.values():
+            adopter = getattr(dataset, "_accept_chunk_provenance", None)
+            if callable(adopter):
+                adopter(provenance)
+            else:
+                dataset.chunk_plan._accept_provenance(provenance)
+
+    def get_chunk(self, chunk: SourceChunk):
+        """Prepare the same request through every named child source."""
+
+        self._chunk_plan.validate_chunk(chunk)
+        return {
+            name: dataset.get_chunk(chunk)
             for name, dataset in self._datasets.items()
         }
 
     def __getitem__(self, index: int):
-        return {
-            name: dataset[index] for name, dataset in self._datasets.items()
-        }
+        chunk = self._chunk_plan[index]
+        return self.get_chunk(chunk)
 
     def __len__(self) -> int:
         return len(self.reference)

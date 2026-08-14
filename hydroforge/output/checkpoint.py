@@ -495,8 +495,8 @@ class CheckpointRuntime:
         for coordinate in sorted(set(groups.values())):
             if coordinate in data:
                 continue
-            module, attribute, _ = variable_map[coordinate]
-            value = getattr(module, attribute)
+            entry = variable_map[coordinate]
+            value = getattr(entry.module, entry.field_name)
             if isinstance(value, torch.Tensor):
                 value = value.detach().cpu().numpy().copy()
             data[coordinate] = value
@@ -726,8 +726,8 @@ class CheckpointRuntime:
             if coordinate is not None and coordinate in proxy:
                 indices = coordinate_indices.get(coordinate)
                 if indices is None:
-                    coord_module, coord_attribute, _ = variable_map[coordinate]
-                    local = getattr(coord_module, coord_attribute)
+                    entry = variable_map[coordinate]
+                    local = getattr(entry.module, entry.field_name)
                     if isinstance(local, torch.Tensor):
                         local = local.detach().cpu().numpy()
                     checkpoint = proxy[coordinate]

@@ -42,7 +42,6 @@ class ModelInitializer:
             module_data = model.shard_param()
             self._construct_modules(module_data)
             self._initialize_modules()
-            self._specialize_capabilities()
             self._precompile_backend()
             self._apply_tensor_modes()
             hook_result = model.initialize_model_state()
@@ -52,11 +51,11 @@ class ModelInitializer:
                     f"state and return None, got {type(hook_result).__name__}"
                 )
             self._initialize_output()
-            self._compile_execution()
             self._compile_field_namespace()
+            self._compile_execution()
             self._seal_tensor_bindings()
             model.print_memory_summary()
-            emit(model, "info", "model.initialized", "All modules initialized")
+            emit(model, "info", "model.initialized", "Model initialized")
         except BaseException as initialization_error:
             cleanup_failures: list[BaseException] = []
             if self._statistics is not None:
@@ -203,16 +202,6 @@ class ModelInitializer:
         model._model_modules_bound = True
         for name in model.opened_modules:
             model._modules[name].validate_linked_state()
-
-    def _specialize_capabilities(self) -> None:
-        model = self.model
-        # Module membership must be available while composite feature rules run.
-        model._capabilities = frozenset(model.opened_modules)
-        capabilities = set(model.opened_modules)
-        for name, rule in model.feature_rules.items():
-            if bool(rule(model) if callable(rule) else rule):
-                capabilities.add(name)
-        model._capabilities = frozenset(capabilities)
 
     def _apply_tensor_modes(self) -> None:
         model = self.model

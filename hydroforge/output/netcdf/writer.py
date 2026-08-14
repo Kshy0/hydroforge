@@ -85,6 +85,17 @@ class PendingNetCDFWrite:
             raise TypeError("pending NetCDF write future must define done()")
 
 
+@dataclass(frozen=True, slots=True)
+class _NetCDFOutputStream:
+    """One compiled route from a statistics output to a NetCDF writer."""
+
+    key: str
+    path: Path
+    batch_size: int
+    component: int | None = None
+    executor_index: int | None = None
+
+
 def _validated_netcdf_options(
     variable: str,
     options: dict[str, Any],
@@ -577,10 +588,12 @@ class NetCDFWriter:
                 f"{sorted(map(str, duplicate_paths))}"
             )
 
-        # Compute batch state up front as part of transaction validation.
-        batch_sizes: dict[str, int] = {}
+        # Compile each output route up front as part of transaction validation.
+        output_streams: dict[str, tuple[_NetCDFOutputStream, ...]] = {}
         batch_events: list[ModelEvent] = []
         storage = getattr(self.owner, "_storage", {})
+        executor_count = len(getattr(self.owner, "_write_executors", ()))
+        stream_index = 0
         for out_name, metadata in self.owner._metadata.items():
             k_val = max(1, int(metadata.get("k", 1)))
             tensor = storage.get(out_name)
@@ -592,12 +605,26 @@ class NetCDFWriter:
                 elements = max(1, tensor.numel() // k_val)
                 element_size = tensor.element_size()
                 batch_size = compute_write_batch_size(elements, element_size)
-            keys = (
-                tuple(f"{out_name}_{index}" for index in range(k_val))
-                if k_val > 1 else (out_name,)
-            )
-            for key in keys:
-                batch_sizes[key] = batch_size
+            paths = planned_by_variable[out_name]
+            if len(paths) != k_val:
+                raise RuntimeError(
+                    f"statistics output {out_name!r} planned {len(paths)} "
+                    f"NetCDF files for order {k_val}"
+                )
+            streams: list[_NetCDFOutputStream] = []
+            for component, path in enumerate(paths):
+                key = f"{out_name}_{component}" if k_val > 1 else out_name
+                streams.append(_NetCDFOutputStream(
+                    key=key,
+                    path=path,
+                    batch_size=batch_size,
+                    component=component if k_val > 1 else None,
+                    executor_index=(
+                        stream_index % executor_count if executor_count else None
+                    ),
+                ))
+                stream_index += 1
+            output_streams[out_name] = tuple(streams)
             batch_events.append(ModelEvent(
                 "info", "output.batch_configured",
                 "Configured NetCDF write batch",
@@ -714,15 +741,7 @@ class NetCDFWriter:
         self.owner._netcdf_files.update(staged_results)
         self.owner._all_created_files.update(planned_paths)
         self.owner._write_buffers.clear()
-        self.owner._write_batch_sizes = batch_sizes
-        executor_count = len(getattr(self.owner, "_write_executors", ()))
-        self.owner._write_executor_assignments = (
-            {
-                key: index % executor_count
-                for index, key in enumerate(batch_sizes)
-            }
-            if executor_count else {}
-        )
+        self.owner._output_streams = output_streams
         self.owner._files_created = True
 
         for event in batch_events:
@@ -732,10 +751,7 @@ class NetCDFWriter:
                 "info", "output.file_created", "Created NetCDF file",
                 {"path": str(path)},
             ))
-        total_files = sum(
-            len(value) if isinstance(value, list) else 1
-            for value in self.owner._netcdf_files.values()
-        )
+        total_files = sum(map(len, output_streams.values()))
         self._emit_event(ModelEvent(
             "info", "output.create_complete",
             "Created NetCDF files for streaming",
@@ -751,13 +767,18 @@ class NetCDFWriter:
 
         data_batch = np.stack(buf['data'], axis=0)
         dt_list = list(buf['dt'])
-        output_path = buf['path']
-        var_name = buf['var_name']
+        stream = buf['stream']
+        if not isinstance(stream, _NetCDFOutputStream):
+            raise TypeError(f"NetCDF write buffer {key!r} has no output stream")
+        if stream.key != key:
+            raise ValueError(
+                f"NetCDF write buffer {key!r} belongs to stream {stream.key!r}"
+            )
 
         request = NetCDFWriteRequest(
-            variable=var_name,
+            variable=stream.key,
             data=data_batch,
-            output_path=output_path,
+            output_path=stream.path,
             times=tuple(dt_list),
         )
 
@@ -765,17 +786,17 @@ class NetCDFWriter:
             raise RuntimeError(
                 "NetCDF write buffer cannot flush without an active executor"
             )
-        assignments = getattr(
-            self.owner, "_write_executor_assignments", None,
-        )
-        if assignments is None:
-            assignments = {}
-            self.owner._write_executor_assignments = assignments
-        idx = assignments.get(key)
-        if idx is None:
-            idx = len(assignments) % len(self.owner._write_executors)
-            assignments[key] = idx
-        future = self.owner._write_executors[idx].submit(
+        executor_index = stream.executor_index
+        if executor_index is None:
+            raise RuntimeError(
+                f"NetCDF output stream {key!r} has no writer executor"
+            )
+        if executor_index >= len(self.owner._write_executors):
+            raise RuntimeError(
+                f"NetCDF output stream {key!r} references unavailable "
+                f"executor {executor_index}"
+            )
+        future = self.owner._write_executors[executor_index].submit(
             _write_netcdf_process, request,
         )
         self.owner._pending_writes.append(PendingNetCDFWrite(
@@ -802,40 +823,46 @@ class NetCDFWriter:
                 raise failures[0]
             raise ResourceCleanupError("NetCDF write buffers", failures)
 
-    def _output_paths(self, out_name: str):
+    def _streams_for_output(
+        self, out_name: str,
+    ) -> tuple[_NetCDFOutputStream, ...]:
         try:
-            return self.owner._netcdf_files[out_name]
+            return self.owner._output_streams[out_name]
         except KeyError as error:
             raise RuntimeError(
                 f"statistics output {out_name!r} is dirty but has no "
-                "created NetCDF file"
+                "created NetCDF output stream"
             ) from error
 
 
     def _buffer_and_maybe_flush(
         self,
-        buf_key: str,
-        var_name: str,
+        stream: _NetCDFOutputStream,
         data: np.ndarray,
-        output_path,
         dt: Union[datetime, cftime.datetime],
-        batch_size: int,
     ) -> None:
         """Append one time step to a write buffer; flush when full."""
         self._raise_if_background_failed()
-        if buf_key not in self.owner._write_buffers:
-            self.owner._write_buffers[buf_key] = dict(data=[], dt=[], path=output_path, var_name=var_name)
+        if stream.key not in self.owner._write_buffers:
+            self.owner._write_buffers[stream.key] = {
+                "stream": stream, "data": [], "dt": [],
+            }
 
-        buf = self.owner._write_buffers[buf_key]
-        # Update path in case of year-split (new file for new year)
-        buf['path'] = output_path
+        buf = self.owner._write_buffers[stream.key]
+        if buf.get("stream") != stream:
+            raise RuntimeError(
+                f"NetCDF write buffer {stream.key!r} is bound to a different "
+                "output stream"
+            )
         buf['data'].append(data.copy())
         buf['dt'].append(dt)
 
-        effective_batch_size = min(batch_size, self.owner.max_pending_steps)
+        effective_batch_size = min(
+            stream.batch_size, self.owner.max_pending_steps,
+        )
         if len(buf['data']) >= effective_batch_size:
             try:
-                self._flush_write_buffer(buf_key)
+                self._flush_write_buffer(stream.key)
             except BaseException as error:
                 self._latch_failures(
                     "NetCDF write submission", [error],
@@ -1050,13 +1077,11 @@ class NetCDFWriter:
 
         for out_name in keys_to_write:
             tensor = self.owner._storage[out_name]
-
-            output_paths = self._output_paths(out_name)
+            streams = self._streams_for_output(out_name)
 
             # Check if this is a time index variable (argmax/argmin)
             metadata = self.owner._metadata.get(out_name, {})
             is_time_index = metadata.get('is_time_index', False)
-            k_val = metadata.get('k', 1)
 
             # Convert tensor to numpy
             raw_data = tensor.detach().cpu().numpy()
@@ -1068,34 +1093,13 @@ class NetCDFWriter:
             else:
                 time_step_data = raw_data
 
-            # Handle k > 1 case: write to separate files
-            if k_val > 1 and isinstance(output_paths, list):
-                for k_idx, output_path in enumerate(output_paths):
-                    # Extract k-th slice (last dimension is k)
-                    if time_step_data.ndim == 2:
-                        k_data = time_step_data[:, k_idx]
-                    elif time_step_data.ndim == 3:
-                        k_data = time_step_data[:, :, k_idx]
-                    elif time_step_data.ndim == 4:
-                        k_data = time_step_data[:, :, :, k_idx]
-                    else:
-                        k_data = time_step_data[..., k_idx]
-
-                    buf_key = f"{out_name}_{k_idx}"
-                    file_var_name = f"{out_name}_{k_idx}"
-                    batch_size = self.owner._write_batch_sizes[buf_key]
-                    self._buffer_and_maybe_flush(
-                        buf_key, file_var_name, k_data, output_path, dt,
-                        batch_size,
-                    )
-            else:
-                # Single output file.
-                output_path = output_paths if not isinstance(output_paths, list) else output_paths[0]
-                batch_size = self.owner._write_batch_sizes[out_name]
-                self._buffer_and_maybe_flush(
-                    out_name, out_name, time_step_data, output_path, dt,
-                    batch_size,
+            for stream in streams:
+                stream_data = (
+                    time_step_data
+                    if stream.component is None
+                    else time_step_data[..., stream.component]
                 )
+                self._buffer_and_maybe_flush(stream, stream_data, dt)
 
         # Note: _current_macro_step_count is reset in update_statistics when is_outer_first=True
 
