@@ -27,13 +27,16 @@ from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.base import (
-    _SourceChunkPayload,
     _TrustedSourceChunk,
+    _trusted_source_chunk_payload,
     positive_finite_real,
 )
 from hydroforge.data.datasets.gridded import GriddedDataset
 from hydroforge.data.datasets.timeline import DatasetTimeline, ReadOp
 from hydroforge.data.netcdf import (
+    _NetCDFReadHandlePool,
+    _configure_netcdf_variable_cache,
+    _planned_netcdf_chunk_len,
     _read_netcdf_var_sliced_trusted,
     yearly_time_to_key,
 )
@@ -59,7 +62,7 @@ class NetCDFDataset(GriddedDataset):
     base_dir: str | Path
     var_name: str
     prefix: str
-    chunk_len: int = Field(default=24, strict=True, ge=1)
+    chunk_len: int | None = Field(default=None, strict=True, ge=1)
     unit_factor: float = 1.0
     suffix: str = ".nc"
     time_to_key: Callable[[DateLike], str] = yearly_time_to_key
@@ -79,6 +82,9 @@ class NetCDFDataset(GriddedDataset):
         default_factory=dict
     )
     _timeline: DatasetTimeline = PrivateAttr()
+    _read_handles: _NetCDFReadHandlePool = PrivateAttr(
+        default_factory=_NetCDFReadHandlePool,
+    )
 
     @field_validator("unit_factor")
     @classmethod
@@ -95,6 +101,18 @@ class NetCDFDataset(GriddedDataset):
 
     @model_validator(mode="after")
     def _inspect_netcdf_storage(self):
+        if self.chunk_len is None:
+            storage_start = self._storage_time(self.start_date)
+            key = self.time_to_key(storage_start)
+            if type(key) is not str:
+                raise TypeError("time_to_key must return an exact string")
+            path = Path(self.base_dir, f"{self.prefix}{key}{self.suffix}")
+            object.__setattr__(
+                self,
+                "chunk_len",
+                _planned_netcdf_chunk_len(path, self.var_name),
+            )
+            self._install_temporal_domain(self._temporal_domain)
         self._timeline = DatasetTimeline(
             self,
             base_dir=self.base_dir,
@@ -385,7 +403,7 @@ class NetCDFDataset(GriddedDataset):
             path = self._checked_source_path(
                 Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
             )
-            with Dataset(path, "r") as ds:
+            with self._read_handles.acquire(path) as ds:
                 var = ds.variables[self.var_name]
                 t_idx, y_idx, x_idx = self._variable_axes_by_path[path]
 
@@ -402,19 +420,21 @@ class NetCDFDataset(GriddedDataset):
                     sel[y_idx] = slice(y_min, y_max + 1)
                     sel[x_idx] = slice(x_min, x_max + 1)
 
-                arr = _read_netcdf_var_sliced_trusted(var, tuple(sel))
+                selectors = tuple(sel)
+                _configure_netcdf_variable_cache(
+                    var, selectors, time_axis=t_idx,
+                )
+                arr = _read_netcdf_var_sliced_trusted(var, selectors)
 
-                # Normalize to (T, Y, X) - note: Y, X may be bbox dimensions if use_bbox
+                # Normalize to (T, Y, X); Y/X may describe only the bbox.
                 arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
 
                 if compressed:
                     # Flatten and extract active columns: (T, Y, X) -> (T, N)
                     T, Y, X = arr.shape
                     flat = arr.reshape(T, Y * X)
-
                     out = flat[:, self._bbox_local_indices]
                 else:
-                    # Keep as (T, Y, X)
                     out = arr
 
                 out = self._as_nan_array(out)
@@ -423,13 +443,13 @@ class NetCDFDataset(GriddedDataset):
                     if np.any(missing):
                         out = np.array(out, order="C", copy=True)
                         out[missing] = 0.0
-                out = _SourceChunkPayload(
-                    data=out,
+                out = _trusted_source_chunk_payload(
+                    out,
                     expected_rows=len(abs_indices),
                     clip_negative=self.clip_negative,
-                ).data
+                )
 
-                chunks.append(out)
+            chunks.append(out)
             self._verify_source_path(path)
 
         return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
@@ -455,13 +475,15 @@ class NetCDFDataset(GriddedDataset):
         path = self._checked_source_path(
             Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
         )
-        with Dataset(path, "r") as ds:
+        with self._read_handles.acquire(path) as ds:
             var = ds.variables[self.var_name]
             t_idx, y_idx, x_idx = self._variable_axes_by_path[path]
 
             sel = [slice(None)] * var.ndim
             sel[t_idx] = np.asarray([abs_index], dtype=np.int64)
-            arr = _read_netcdf_var_sliced_trusted(var, tuple(sel))
+            selectors = tuple(sel)
+            _configure_netcdf_variable_cache(var, selectors, time_axis=t_idx)
+            arr = _read_netcdf_var_sliced_trusted(var, selectors)
             arr = self._as_nan_array(arr)
             arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
         self._verify_source_path(path)
@@ -478,7 +500,8 @@ class NetCDFDataset(GriddedDataset):
             label="NetCDF dataset input",
         )
         if self.time_aggregation is None:
-            converted = calculation / self.unit_factor
+            np.divide(calculation, self.unit_factor, out=calculation)
+            converted = calculation
         else:
             aggregated = self._apply_time_aggregation(
                 calculation,
@@ -486,11 +509,12 @@ class NetCDFDataset(GriddedDataset):
                 self.time_aggregation,
             )
             if isinstance(aggregated, dict):
-                converted = {
-                    name: block / self.unit_factor for name, block in aggregated.items()
-                }
+                for block in aggregated.values():
+                    np.divide(block, self.unit_factor, out=block)
+                converted = aggregated
             else:
-                converted = aggregated / self.unit_factor
+                np.divide(aggregated, self.unit_factor, out=aggregated)
+                converted = aggregated
         return self._finalize_output_data(
             converted,
             label="NetCDF dataset output",
@@ -507,7 +531,9 @@ class NetCDFDataset(GriddedDataset):
         return _TrustedSourceChunk(self._finish_read(data))
 
     def close(self) -> None:
-        """No persistent open handles are kept; provided for interface completeness."""
+        """Close this process's persistent NetCDF read handles."""
+
+        self._read_handles.close()
 
     # -------------------------
     # Public API
@@ -529,7 +555,7 @@ class _OpenMultivariableNetCDFRequest(HydroForgeModel):
     spin_up_cycles: int = Field(default=0, strict=True, ge=0)
     spin_up_start_date: DateLike | None = None
     spin_up_end_date: DateLike | None = None
-    chunk_len: int = Field(default=24, ge=1, strict=True)
+    chunk_len: int | None = Field(default=None, ge=1, strict=True)
     unit_factor: float = 1.0
     suffix: str = ".nc"
     clip_negative: bool = Field(default=False, strict=True)
@@ -563,7 +589,7 @@ def open_multivariable_netcdf(
     spin_up_cycles: int = 0,
     spin_up_start_date: DateLike | None = None,
     spin_up_end_date: DateLike | None = None,
-    chunk_len: int = 24,
+    chunk_len: int | None = None,
     unit_factor: float = 1.0,
     suffix: str = ".nc",
     clip_negative: bool = False,
@@ -607,6 +633,19 @@ def open_multivariable_netcdf(
         "clip_negative": request.clip_negative,
         "time_to_key": request.time_to_key,
     }
+    if request.chunk_len is None:
+        first_name, first_spec = request.compiled_specs[0]
+        first_prefix = first_spec.get("prefix", f"{first_name}_")
+        first_suffix = first_spec.get("suffix", request.suffix)
+        first_key = request.time_to_key(request.start_date)
+        first_path = Path(
+            request.base_dir,
+            f"{first_prefix}{first_key}{first_suffix}",
+        )
+        shared["chunk_len"] = _planned_netcdf_chunk_len(
+            first_path,
+            first_name,
+        )
     datasets = {}
     for name, spec in request.compiled_specs:
         options = shared | spec

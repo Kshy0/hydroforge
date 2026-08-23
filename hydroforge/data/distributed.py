@@ -23,6 +23,7 @@ from pydantic import PrivateAttr, field_validator, model_validator
 from torch import distributed as dist
 
 from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.kernels.devices import devices_match
 
 # ---------------------------------------------------------------------------
 # Rank / world-size helpers
@@ -829,7 +830,7 @@ class _TorchIndexLookup(HydroForgeModel):
             raise ValueError("torch index lookup tensors must contain integers")
         if self.query.dtype != self.target.dtype:
             raise ValueError("torch index lookup tensors must have identical dtypes")
-        if self.query.device != self.target.device:
+        if not devices_match(self.query.device, self.target.device):
             raise ValueError("torch index lookup tensors must share one device")
         unique_target = (
             self.target.to(torch.int64)

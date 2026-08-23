@@ -20,6 +20,7 @@ import netCDF4 as nc
 import numpy as np
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 
+from hydroforge.data.netcdf import _NetCDFReadHandlePool
 from hydroforge.output.multirank.catalog import RankOutputCatalog
 from hydroforge.output.multirank.data import (
     MultiRankDataAccess, _OutputTimeRequest,
@@ -192,6 +193,9 @@ class MultiRankStatsReader(HydroForgeModel):
         default_factory=dict,
     )
     _cache_materialized: bool = PrivateAttr(default=False)
+    _read_handles: _NetCDFReadHandlePool = PrivateAttr(
+        default_factory=_NetCDFReadHandlePool,
+    )
 
     @property
     def _rank_files(self):
@@ -338,7 +342,7 @@ class MultiRankStatsReader(HydroForgeModel):
                     local_end = req_end - file_start_global
 
                     path = self._checked_source_path(fp)
-                    with nc.Dataset(path, "r") as ds:
+                    with self._read_handles.acquire(path) as ds:
                         var = ds.variables[self.var_name]
                         # Slicing logic: always take all spatial/trial dims.
                         # Dimensions are
@@ -378,7 +382,9 @@ class MultiRankStatsReader(HydroForgeModel):
                                     dtype=array.dtype,
                                 )
                             destination = global_start - self._slice_start
-                            cache[destination:destination + array.shape[0]] = array
+                            cache[
+                                destination:destination + array.shape[0]
+                            ] = array
                     self._verify_source_path(path)
 
             self._rank_cache[info["rank_id"]] = cache
@@ -586,6 +592,11 @@ class MultiRankStatsReader(HydroForgeModel):
         """Return the immutable validated reader timeline."""
 
         return tuple(self._time_datetimes)
+
+    def close(self) -> None:
+        """Close process-local NetCDF handles retained by this reader."""
+
+        self._read_handles.close()
 
     @staticmethod
     def _map_extent(value, *, label: str) -> int:

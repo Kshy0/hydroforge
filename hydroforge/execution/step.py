@@ -22,6 +22,7 @@ from hydroforge.contracts.errors import (
     distributed_failure_error,
 )
 from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.kernels.devices import devices_match
 from hydroforge.contracts.temporal import (
     DateLike,
     SimulationStep,
@@ -141,7 +142,7 @@ class _StepRuntime:
         )
         if (
             self._distributed_input is None
-            or self._distributed_input.device != sync_device
+            or not devices_match(self._distributed_input.device, sync_device)
             or len(self._distributed_outputs) != world_size
         ):
             self._distributed_input = torch.empty(

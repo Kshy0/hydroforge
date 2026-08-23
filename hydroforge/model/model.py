@@ -79,6 +79,7 @@ from hydroforge.contracts.runtime import (
     BackendRequirement,
     DEFAULT_BACKEND_REQUIREMENT,
     DEFAULT_MODULE_REQUIREMENT,
+    _effective_block_size,
     ModuleRequirement,
     RUNTIME_BACKEND_REQUIREMENTS,
 )
@@ -964,8 +965,14 @@ class AbstractModel(HydroForgeModel, ABC):
             mixed_precision,
             backend=backend,
         )
-        if self.BLOCK_SIZE is not None:
-            model_rule._validate_block_size(self.BLOCK_SIZE, backend=backend)
+        if self.BLOCK_SIZE is not None or backend == "metal":
+            block_size = _effective_block_size(
+                self.BLOCK_SIZE,
+                backend=backend,
+            )
+            if backend == "metal":
+                object.__setattr__(self, "BLOCK_SIZE", block_size)
+            model_rule._validate_block_size(block_size, backend=backend)
         if not model_rule.trials and self.num_trials is not None:
             raise ValueError(f"backend {backend!r} does not support ensemble trials")
         return self

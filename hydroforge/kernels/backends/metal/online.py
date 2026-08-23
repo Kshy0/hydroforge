@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from hydroforge.contracts.kernels import KernelSpec, buffer_access_semantics
+from hydroforge.contracts.runtime import DEFAULT_BLOCK_SIZE
 from hydroforge.kernels.backends.metal.dispatcher import make_metal_dispatcher
 from hydroforge.kernels.backends.metal.protocol import MetalCommandNode
 from hydroforge.kernels.backends.metal.types import (
@@ -16,6 +17,30 @@ from hydroforge.kernels.backends.metal.types import (
 from hydroforge.kernels.backends.metal.template import (
     METAL_KERNEL_BODY_MARKER, make_spec_metal_dispatcher,
 )
+
+
+def launch_metal_dispatcher(
+    dispatcher: Any,
+    arguments: dict[str, Any],
+) -> None:
+    """Validate, specialize and launch one directly constructed dispatcher."""
+
+    arguments = {**arguments, "BLOCK_SIZE": DEFAULT_BLOCK_SIZE}
+    metadata = dispatcher.__hydroforge_kernel__
+    buffer_dtypes = {
+        name: getattr(arguments.get(name), "dtype", None)
+        for name in metadata.buffers
+    }
+    dispatcher._validate_specialization_input(
+        arguments,
+        buffer_dtypes=buffer_dtypes,
+    )
+    launch = dispatcher.specialize(
+        arguments,
+        buffer_dtypes=buffer_dtypes,
+    )
+    launch()
+
 
 @dataclass(frozen=True, slots=True)
 class MetalCommand(MetalCommandNode):
@@ -47,8 +72,10 @@ class MetalCommand(MetalCommandNode):
 
     def record(self) -> None:
         # Online framework kernels are not bound through a model KernelBinder,
-        # but the Metal dispatcher still requires an explicit threadgroup size.
-        self.dispatcher(BLOCK_SIZE=256, **self.arguments)
+        # but the Metal dispatcher still requires the same specialization
+        # inputs as registered kernels, plus an explicit threadgroup size.
+        arguments = {**self.arguments, "BLOCK_SIZE": DEFAULT_BLOCK_SIZE}
+        launch_metal_dispatcher(self.dispatcher, arguments)
 
 
 @dataclass(frozen=True, slots=True)

@@ -42,6 +42,7 @@ from hydroforge.contracts.temporal import (
     _timedelta_quotient_trusted,
 )
 from hydroforge.data.datasets.chunking import SourceChunk, SourceChunkPlan
+from hydroforge.kernels.devices import devices_match
 
 
 _DatasetOperand = Any
@@ -154,7 +155,7 @@ class _ForcingShardRequest(HydroForgeModel):
                 raise ValueError(
                     f"{label} has dtype {value.dtype}; expected {dtype}"
                 )
-            if device is not None and value.device != device:
+            if device is not None and not devices_match(value.device, device):
                 raise ValueError(
                     f"{label} is on device {value.device}; expected {device}"
                 )
@@ -243,6 +244,48 @@ class _SourceChunkPayload(HydroForgeModel):
             canonical(self.data, label="source chunk"),
         )
         return self
+
+
+def _trusted_source_chunk_payload(
+    data: Any,
+    *,
+    expected_rows: int,
+    clip_negative: bool,
+) -> Any:
+    """Validate one storage-owned result without an unconditional copy."""
+
+    def canonical(value: Any, *, label: str) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                name: canonical(block, label=f"{label}.{name}")
+                for name, block in value.items()
+            }
+        if np.ma.isMaskedArray(value):
+            mask = np.ma.getmaskarray(value)
+            if np.any(mask):
+                value = (
+                    value.filled(np.nan)
+                    if np.issubdtype(value.dtype, np.floating)
+                    else value.astype(np.float64).filled(np.nan)
+                )
+            else:
+                value = value.data
+        array = np.asarray(value)
+        if array.ndim < 1 or array.shape[0] != expected_rows:
+            raise ValueError(
+                f"{label} must have {expected_rows} rows on its time axis"
+            )
+        if array.dtype.kind not in {"f", "i", "u"}:
+            raise ValueError(f"{label} must contain real numeric values")
+        if np.issubdtype(array.dtype, np.inexact) and not np.isfinite(array).all():
+            raise ValueError(f"{label} contains missing or non-finite values")
+        if not array.flags.c_contiguous or not array.flags.writeable:
+            array = np.array(array, order="C", copy=True)
+        if clip_negative:
+            np.maximum(array, 0, out=array)
+        return array
+
+    return canonical(data, label="source chunk")
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,7 +515,7 @@ class AbstractDataset(HydroForgeModel, ABC):
             )
         self._chunk_plan = SourceChunkPlan(
             temporal_domain=temporal_domain,
-            chunk_len=self.chunk_len,
+            chunk_len=1 if self.chunk_len is None else self.chunk_len,
         )
         self._simulation_schedule = SimulationSchedule._from_domain(
             temporal_domain,
