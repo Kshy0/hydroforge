@@ -8,30 +8,181 @@
 Abstract base class for hydroforge physics modules using Pydantic v2.
 This is the highest level abstraction that all modules inherit from.
 """
+
 from __future__ import annotations
 
 from abc import ABC
+from collections.abc import Mapping
 from functools import cache
+from types import MappingProxyType
 from typing import (
-    Any, ClassVar, Dict, Generic, List, Literal, Optional,
-    Self, Tuple, TypeVar, overload,
+    Any,
+    ClassVar,
+    Dict,
+    Generic,
+    Literal,
+    Optional,
+    Self,
+    Tuple,
+    TypeVar,
+    overload,
 )
 
 import torch
-from pydantic import (BaseModel, ConfigDict, Field, PrivateAttr,
-                      computed_field, field_validator, model_validator)
+from pydantic import (
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationInfo,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
-from hydroforge.data.distributed import find_indices_in_torch
+from hydroforge.data.distributed import _find_indices_in_torch_trusted
 from hydroforge.contracts.events import EventSink, ModelEvent, NullEventSink
 from hydroforge.contracts.fields import tensor_is_active
-from hydroforge.contracts.kernel_field import KernelField
+from hydroforge.contracts.kernel_field import _KernelField
+from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.contracts.runtime import MODEL_OWNED_MODULE_FIELDS
 from hydroforge.model.tensors import ModuleTensors
 
 
+_NO_FIELD_DEFAULT = object()
+_MODULE_INITIALIZATION_CONTEXT = "hydroforge_model_initialization"
+_MODULE_REFERENCES_CONTEXT = "hydroforge_module_references"
+_MODULE_EVENT_SINK_CONTEXT = "hydroforge_module_event_sink"
+_MODULE_REFERENCE_TARGETS_CONTEXT = "hydroforge_module_reference_targets"
+
+
+class _ModuleTensorQuery(HydroForgeModel):
+    """One validated public lookup into a module's compiled tensor schema."""
+
+    module_type: Any = Field(exclude=True)
+    field_name: str
+
+    _schema: Any = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _resolve(self) -> Self:
+        if not self.field_name:
+            raise ValueError("tensor field name must be non-empty")
+        schema = self.module_type._get_tensor_schema(self.field_name)
+        if schema is None:
+            raise ValueError(
+                f"unknown tensor field {self.module_type.module_name}.{self.field_name}"
+            )
+        self._schema = schema
+        return self
+
+    @property
+    def schema(self) -> Any:
+        return self._schema
+
+
+class _ModuleBatchQuery(HydroForgeModel):
+    """One validated public batched-field classification request."""
+
+    module: Any = Field(exclude=True)
+    field: str | torch.Tensor
+
+    _tensor: torch.Tensor = PrivateAttr()
+    _schema: Any = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def _resolve(self) -> Self:
+        if isinstance(self.field, str):
+            query = _ModuleTensorQuery(
+                module_type=type(self.module),
+                field_name=self.field,
+            )
+            self._schema = query.schema
+            self._tensor = getattr(self.module, query.field_name)
+        else:
+            self._tensor = self.field
+        return self
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        return self._tensor
+
+    @property
+    def schema(self) -> Any:
+        return self._schema
+
+
+class _ModuleGatherRequest(HydroForgeModel):
+    """Canonical tensors accepted by the public module gather helper."""
+
+    tensor: torch.Tensor
+    indices: torch.Tensor
+    batched: bool
+    num_trials: int | None = Field(exclude=True)
+
+    @model_validator(mode="after")
+    def _validate_gather(self) -> Self:
+        if self.batched and (
+            self.num_trials is None or self.tensor.shape[0] != self.num_trials
+        ):
+            raise ValueError("batched gather requires the declared leading trial axis")
+        if self.indices.numel() and int(self.indices.min().item()) < 0:
+            raise ValueError("gather indices must be non-negative")
+        return self
+
+
+class _ModuleClassDeclaration(HydroForgeModel):
+    """Validated subclass-authoring declaration for ``AbstractModule``."""
+
+    module_name: str
+    description: str
+    conflicts: tuple[str, ...]
+    nc_excluded_fields: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def _validate_declaration(self) -> Self:
+        if not self.module_name.isidentifier():
+            raise ValueError("module_name must be a Python identifier")
+        if not self.description:
+            raise ValueError("description must be a non-empty string")
+        for label in ("conflicts", "nc_excluded_fields"):
+            values = getattr(self, label)
+            if any(not value or not value.isidentifier() for value in values):
+                raise ValueError(f"{label} must contain Python identifiers")
+            if len(values) != len(set(values)):
+                raise ValueError(f"{label} must not contain duplicates")
+        return self
+
+
+class _TensorFieldDeclaration(HydroForgeModel):
+    """Validated public declaration consumed by the TensorField adapter."""
+
+    description: str
+    shape: tuple[str | int, ...]
+    dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float"
+    dim_coords: str | None = None
+    category: Literal["topology", "param", "init_state", "state"] = "param"
+    mode: Literal["device", "cpu", "discard"] = "device"
+    is_key: bool = False
+    is_coordinate: bool = False
+    partition_by: str | None = None
+    references: str | None = None
+    selects: str | None = None
+    replicated: bool = False
+    allow_empty: bool = False
+    output: Literal["auto", "full", "disabled"] = "auto"
+    depends_on: str | tuple[str, ...] | None = None
+    required_by: str | tuple[str, ...] | None = None
+
+
+class _TensorFieldDefault(HydroForgeModel):
+    """The finite scalar-default grammar accepted by ``TensorField``."""
+
+    value: bool | int | float | None
+
+
 def TensorField(
     description: str,
-    shape: Tuple[str, ...],
+    shape: Tuple[str | int, ...],
     dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
     dim_coords: Optional[str] = None,
     category: Literal["topology", "param", "init_state", "state"] = "param",
@@ -46,7 +197,7 @@ def TensorField(
     output: Literal["auto", "full", "disabled"] = "auto",
     depends_on: str | Tuple[str, ...] | None = None,
     required_by: str | Tuple[str, ...] | None = None,
-    **kwargs
+    default: Any = _NO_FIELD_DEFAULT,
 ):
     """
     Create a tensor field with shape information directly in AbstractModule.
@@ -83,54 +234,63 @@ def TensorField(
                   - 'device': Keep on current device (default)
                   - 'cpu': Move to CPU memory to save GPU memory
                   - 'discard': Set to None after initialization to maximize memory saving
-        **kwargs: Additional Field parameters
+        default: Exact default declaration validated later against the model field.
     """
-    if "checkpoint" in kwargs:
-        raise TypeError(
-            "TensorField no longer accepts checkpoint; only category="
-            "'init_state' fields are persisted"
-        )
-    removed_options = {
-        "group_by", "save_idx", "save_coord", "partition", "locality",
-    }
-    unsupported = sorted(removed_options.intersection(kwargs))
-    if unsupported:
-        names = ", ".join(unsupported)
-        raise TypeError(
-            f"TensorField no longer accepts {names}; declare coordinate relations "
-            "with dim_coords/CoordinateField/ReferenceField/SelectionField instead"
-        )
-    return Field(
+    declaration = _TensorFieldDeclaration(
         description=description,
-        **kwargs,
+        shape=shape,
+        dtype=dtype,
+        dim_coords=dim_coords,
+        category=category,
+        mode=mode,
+        is_key=is_key,
+        is_coordinate=is_coordinate,
+        partition_by=partition_by,
+        references=references,
+        selects=selects,
+        replicated=replicated,
+        allow_empty=allow_empty,
+        output=output,
+        depends_on=depends_on,
+        required_by=required_by,
+    )
+    default_argument = {}
+    if default is not _NO_FIELD_DEFAULT:
+        default_argument["default"] = _TensorFieldDefault(
+            value=default,
+        ).value
+    return Field(
+        **default_argument,
+        description=declaration.description,
         json_schema_extra={
-            "tensor_shape": list(shape),
-            "tensor_dtype": dtype,
-            "dim_coords": dim_coords,
-            "category": category,
-            "mode": mode,
-            "is_key": is_key,
-            "is_coordinate": is_coordinate,
-            "partition_by": partition_by,
-            "references": references,
-            "selects": selects,
-            "replicated": replicated,
-            "allow_empty": allow_empty,
-            "output": output,
-            "depends_on": depends_on,
-            "required_by": required_by,
-        }
+            "tensor_shape": declaration.shape,
+            "tensor_dtype": declaration.dtype,
+            "dim_coords": declaration.dim_coords,
+            "category": declaration.category,
+            "mode": declaration.mode,
+            "is_key": declaration.is_key,
+            "is_coordinate": declaration.is_coordinate,
+            "partition_by": declaration.partition_by,
+            "references": declaration.references,
+            "selects": declaration.selects,
+            "replicated": declaration.replicated,
+            "allow_empty": declaration.allow_empty,
+            "output": declaration.output,
+            "depends_on": declaration.depends_on,
+            "required_by": declaration.required_by,
+        },
     )
 
 
 def CoordinateField(
     description: str,
-    shape: Tuple[str, ...],
+    shape: Tuple[str | int, ...],
     dtype: Literal["int", "idx"] = "int",
     partition_by: Optional[str] = None,
     references: Optional[str] = None,
     replicated: bool = False,
-    **kwargs,
+    allow_empty: bool = False,
+    default: Any = _NO_FIELD_DEFAULT,
 ):
     """Declare an axis coordinate; ownership is inferred from its relations."""
     return TensorField(
@@ -145,17 +305,18 @@ def CoordinateField(
         partition_by=partition_by,
         references=references,
         replicated=replicated,
-        **kwargs,
+        allow_empty=allow_empty,
+        default=default,
     )
 
 
 def SelectionField(
     description: str,
-    shape: Tuple[str, ...],
+    shape: Tuple[str | int, ...],
     selects: str,
     dtype: Literal["int", "idx"] = "int",
     allow_empty: bool = True,
-    **kwargs,
+    default: Any = _NO_FIELD_DEFAULT,
 ):
     """Declare a unique coordinate subset used as the default output view."""
     return TensorField(
@@ -171,17 +332,19 @@ def SelectionField(
         selects=selects,
         allow_empty=allow_empty,
         output="disabled",
-        **kwargs,
+        default=default,
     )
 
 
 def ReferenceField(
     description: str,
-    shape: Tuple[str, ...],
+    shape: Tuple[str | int, ...],
     references: str,
     dim_coords: str,
     dtype: Literal["int", "idx"] = "int",
-    **kwargs,
+    is_key: bool = False,
+    allow_empty: bool = False,
+    default: Any = _NO_FIELD_DEFAULT,
 ):
     """Declare a globally valid foreign key to another coordinate."""
     return TensorField(
@@ -191,8 +354,10 @@ def ReferenceField(
         dim_coords=dim_coords,
         category="topology",
         mode="cpu",
+        is_key=is_key,
         references=references,
-        **kwargs,
+        allow_empty=allow_empty,
+        default=default,
     )
 
 
@@ -215,16 +380,26 @@ class _ReferenceIndexDescriptor:
         cached = instance.__dict__.get(cache_name)
         if cached is None:
             if self.inverse:
-                cached = instance.inverse_reference_index(self.reference)
+                cached = instance._inverse_reference_index(self.reference)
             else:
-                cached = instance.reference_index(self.reference)
+                cached = instance._reference_index(self.reference)
             if self.device:
                 cached = cached.to(instance.device)
             instance.__dict__[cache_name] = cached
         return cached
 
+
+class _ReferenceIndexDeclaration(HydroForgeModel):
+    reference: str
+    inverse: bool = False
+    device: bool = True
+
+
 def ReferenceIndexField(
-    reference: str, *, inverse: bool = False, device: bool = True,
+    reference: str,
+    *,
+    inverse: bool = False,
+    device: bool = True,
 ):
     """Declare an automatically derived local index for a reference field.
 
@@ -232,27 +407,39 @@ def ReferenceIndexField(
     ``inverse=True`` maps every target row back to its unique relation row,
     using ``-1`` when it is not referenced.
     """
-    return _ReferenceIndexDescriptor(reference, inverse=inverse, device=device)
+    declaration = _ReferenceIndexDeclaration(
+        reference=reference,
+        inverse=inverse,
+        device=device,
+    )
+    return _ReferenceIndexDescriptor(
+        declaration.reference,
+        inverse=declaration.inverse,
+        device=declaration.device,
+    )
 
 
 _TModule = TypeVar("_TModule", bound="AbstractModule")
 _TReference = TypeVar("_TReference", covariant=True)
 
 
-class ModuleReference(Generic[_TReference]):
+class ModuleReference(HydroForgeModel, Generic[_TReference]):
     """Typed module declaration shared by models and sibling modules."""
 
-    def __init__(
-        self, module_type: type[AbstractModule], *, optional: bool,
-    ) -> None:
-        if (
-            not isinstance(module_type, type)
-            or not issubclass(module_type, AbstractModule)
+    module_type: type[AbstractModule]
+    optional: bool
+
+    @model_validator(mode="after")
+    def _validate_reference(self) -> Self:
+        if not isinstance(self.module_type, type) or not issubclass(
+            self.module_type, AbstractModule
         ):
-            raise TypeError("module_ref requires an AbstractModule class")
-        self.module_name = module_type.module_name
-        self.optional = optional
-        self.module_type = module_type
+            raise ValueError("module_ref requires an AbstractModule class")
+        return self
+
+    @property
+    def module_name(self) -> str:
+        return self.module_type.module_name
 
     def __set_name__(self, owner: type, name: str) -> None:
         if name != self.module_name:
@@ -263,9 +450,14 @@ class ModuleReference(Generic[_TReference]):
             )
 
     @classmethod
-    @cache
-    def collect(cls, owner: type) -> Dict[str, ModuleReference]:
+    def collect(cls, owner: type) -> Mapping[str, ModuleReference]:
         """Collect active declarations using normal Python MRO lookup."""
+
+        return cls._collect(owner)
+
+    @classmethod
+    @cache
+    def _collect(cls, owner: type) -> Mapping[str, ModuleReference]:
 
         fields: Dict[str, ModuleReference] = {}
         seen: set[str] = set()
@@ -276,14 +468,16 @@ class ModuleReference(Generic[_TReference]):
                 seen.add(name)
                 if isinstance(value, cls):
                     fields[name] = value
-        return fields
+        return MappingProxyType(fields)
 
     @overload
     def __get__(self, instance: None, owner: type | None = None) -> Self: ...
 
     @overload
     def __get__(
-        self, instance: object, owner: type | None = None,
+        self,
+        instance: object,
+        owner: type | None = None,
     ) -> _TReference: ...
 
     def __get__(self, instance: Any, owner: type | None = None) -> Any:
@@ -292,13 +486,10 @@ class ModuleReference(Generic[_TReference]):
         if isinstance(instance, AbstractModule):
             links = instance._module_references
         else:
-            links = instance._modules if instance._model_modules_bound else None
-        if links is None:
-            raise RuntimeError(
-                f"Module reference {type(instance).__name__}."
-                f"{self.module_name} was "
-                "accessed before all modules were linked"
-            )
+            links = instance._module_links
+            if links is None:
+                instance._ensure_runtime_materialized()
+                links = instance._module_links
         return links.get(self.module_name)
 
     def __set__(self, instance: Any, value: Any) -> None:
@@ -309,34 +500,68 @@ class ModuleReference(Generic[_TReference]):
         )
 
 
+@overload
 def module_ref(
     module_type: type[_TModule],
-) -> ModuleReference[_TModule]:
+) -> ModuleReference[_TModule]: ...
+
+
+def module_ref(
+    module_type: type[AbstractModule],
+) -> ModuleReference[AbstractModule]:
     """Declare a required typed module on a model or sibling module."""
 
-    return ModuleReference(module_type, optional=False)
+    return ModuleReference(module_type=module_type, optional=False)
+
+
+@overload
+def optional_module_ref(
+    module_type: type[_TModule],
+) -> ModuleReference[_TModule | None]: ...
 
 
 def optional_module_ref(
-    module_type: type[_TModule],
-) -> ModuleReference[_TModule | None]:
+    module_type: type[AbstractModule],
+) -> ModuleReference[AbstractModule | None]:
     """Declare an optional typed module that is ``None`` when closed."""
 
-    return ModuleReference(module_type, optional=True)
+    return ModuleReference(module_type=module_type, optional=True)
+
+
+class _ComputedTensorFieldDeclaration(HydroForgeModel):
+    description: str
+    shape: tuple[str | int, ...]
+    dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float"
+    dim_coords: str | None = None
+    category: Literal[
+        "topology", "derived_param", "state", "shared_state", "virtual"
+    ] = "derived_param"
+    expr: str | None = None
+    depends_on: str | tuple[str, ...] | None = None
+    required_by: str | tuple[str, ...] | None = None
+    output: Literal["auto", "full", "disabled"] = "auto"
+    allow_empty: bool = False
+
+    @model_validator(mode="after")
+    def _validate_expression(self) -> Self:
+        if self.expr is not None and self.category != "virtual":
+            raise ValueError("expr can only be provided when category is 'virtual'")
+        return self
 
 
 def computed_tensor_field(
     description: str,
-    shape: Tuple[str, ...],
+    shape: Tuple[str | int, ...],
     dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
     dim_coords: Optional[str] = None,
-    category: Literal["topology", "derived_param", "state", "shared_state", "virtual"] = "derived_param",
+    category: Literal[
+        "topology", "derived_param", "state", "shared_state", "virtual"
+    ] = "derived_param",
     expr: Optional[str] = None,
     depends_on: str | Tuple[str, ...] | None = None,
     required_by: str | Tuple[str, ...] | None = None,
     output: Literal["auto", "full", "disabled"] = "auto",
     allow_empty: bool = False,
-    **kwargs
 ):
     """
     Create a computed tensor field with shape information for AbstractModule.
@@ -361,45 +586,37 @@ def computed_tensor_field(
         required_by: Consumer module names. At least one must be active before
             this computed tensor is evaluated or validated.
         allow_empty: Whether a symbolic tensor dimension may resolve to zero.
-        **kwargs: Additional computed_field parameters
     """
-    if "checkpoint" in kwargs:
-        raise TypeError(
-            "computed_tensor_field no longer accepts checkpoint; computed "
-            "fields are reconstructed after restart"
-        )
-    removed_options = {
-        "group_by", "save_idx", "save_coord", "partition", "locality",
-        "static_output",
-    }
-    unsupported = sorted(removed_options.intersection(kwargs))
-    if unsupported:
-        names = ", ".join(unsupported)
-        raise TypeError(
-            f"computed_tensor_field no longer accepts {names}; output selection "
-            "is inferred from dim_coords and SelectionField"
-        )
-    if expr is not None and category != "virtual":
-        raise ValueError("expr can only be provided when category is 'virtual'")
+    declaration = _ComputedTensorFieldDeclaration(
+        description=description,
+        shape=shape,
+        dtype=dtype,
+        dim_coords=dim_coords,
+        category=category,
+        expr=expr,
+        depends_on=depends_on,
+        required_by=required_by,
+        output=output,
+        allow_empty=allow_empty,
+    )
 
     return computed_field(
-        description=description,
+        description=declaration.description,
         json_schema_extra={
-            "tensor_shape": list(shape),
-            "tensor_dtype": dtype,
-            "dim_coords": dim_coords,
-            "category": category,
-            "expr": expr,
-            "depends_on": depends_on,
-            "required_by": required_by,
-            "allow_empty": allow_empty,
-            "output": output,
+            "tensor_shape": declaration.shape,
+            "tensor_dtype": declaration.dtype,
+            "dim_coords": declaration.dim_coords,
+            "category": declaration.category,
+            "expr": declaration.expr,
+            "depends_on": declaration.depends_on,
+            "required_by": declaration.required_by,
+            "allow_empty": declaration.allow_empty,
+            "output": declaration.output,
         },
-        **kwargs
     )
 
 
-class AbstractModule(BaseModel, ABC):
+class AbstractModule(HydroForgeModel, ABC):
     """
     Abstract base class for all hydroforge physics modules.
 
@@ -418,27 +635,33 @@ class AbstractModule(BaseModel, ABC):
     # Pydantic configuration
     model_config = ConfigDict(
         arbitrary_types_allowed=True,  # Allow torch.Tensor types
-        validate_assignment=False,      # Validate on assignment
-        extra='ignore',
+        frozen=True,
+        # The model compiler materializes every TensorField declaration before
+        # Pydantic construction; ordinary scalar defaults are validated here.
+        validate_default=True,
+        extra="forbid",
+        strict=True,
         ignored_types=(
             _ReferenceIndexDescriptor,
             ModuleReference,
-            KernelField,
+            _KernelField,
         ),
     )
 
     # Module metadata - must be overridden in subclasses
     module_name: ClassVar[str] = "abstract"
     description: ClassVar[str] = "Abstract base module"
-    conflicts: ClassVar[List[str]] = []  # List of modules that cannot co-exist with this module
+    conflicts: ClassVar[Tuple[str, ...]] = ()
     nc_excluded_fields: ClassVar[Tuple[str, ...]] = MODEL_OWNED_MODULE_FIELDS
     """Fields owned by the model runtime rather than module input data."""
 
-    opened_modules: List[str] = Field(
-        default_factory=list,
+    opened_modules: tuple[str, ...] = Field(
+        default_factory=tuple,
     )
     rank: int = Field(
         default=0,
+        ge=0,
+        strict=True,
         description="Current process rank in distributed setup",
     )
     device: torch.device = Field(
@@ -451,6 +674,7 @@ class AbstractModule(BaseModel, ABC):
     )
     mixed_precision: bool = Field(
         default=True,
+        strict=True,
         description=(
             "Enable mixed precision for hpfloat tensors (storage variables).\n"
             "When True, hpfloat tensors are promoted one level above base precision:\n"
@@ -459,273 +683,175 @@ class AbstractModule(BaseModel, ABC):
     )
     num_trials: Optional[int] = Field(
         default=None,
+        strict=True,
         description="Number of parallel simulations (ensemble members)",
     )
 
     _event_sink: EventSink = PrivateAttr(default_factory=NullEventSink)
-    _pending_events: List[ModelEvent] = PrivateAttr(default_factory=list)
     _tensors: ModuleTensors = PrivateAttr()
-    _sealed_tensor_bindings: Optional[Dict[str, object]] = PrivateAttr(
-        default=None,
+    _module_references: Dict[str, Optional["AbstractModule"]] = PrivateAttr(
+        default_factory=dict,
     )
-    _sealed_declared_fields: Optional[Dict[str, object]] = PrivateAttr(
-        default=None,
-    )
-    _module_references: Optional[Dict[str, Optional["AbstractModule"]]] = (
-        PrivateAttr(default=None)
-    )
+    _reference_targets: Mapping[str, Any] = PrivateAttr(default_factory=dict)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        for name in ("conflicts", "nc_excluded_fields"):
-            values = tuple(getattr(cls, name))
-            if any(not isinstance(value, str) or not value for value in values):
-                raise TypeError(
-                    f"{cls.__name__}.{name} must contain non-empty strings"
-                )
-            if len(values) != len(set(values)):
-                raise ValueError(
-                    f"{cls.__name__}.{name} contains duplicate declarations"
-                )
-            setattr(cls, name, values)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        """Reject tensor-object replacement after model initialization.
-
-        Native kernels, CUDA graphs, Metal ICBs and recorded ATen nodes retain
-        the tensor objects observed while the sub-step program is compiled.
-        Replacing a declared field would therefore make the public module and
-        the cached program refer to different storage.  Values remain mutable
-        through ordinary in-place tensor operations; only object identity is
-        sealed.
-        """
-
-        reference = self.get_module_reference_fields().get(name)
-        if reference is not None:
-            reference.__set__(self, value)
-        private = getattr(self, "__pydantic_private__", None)
-        sealed = (
-            None if private is None
-            else private.get("_sealed_tensor_bindings")
+        declaration = _ModuleClassDeclaration(
+            module_name=cls.module_name,
+            description=cls.description,
+            conflicts=cls.conflicts,
+            nc_excluded_fields=cls.nc_excluded_fields,
         )
-        if sealed is not None and name in sealed and value is not sealed[name]:
-            raise RuntimeError(
-                f"declared tensor binding {self.module_name}.{name} is sealed; "
-                "update its value in place instead of replacing the tensor "
-                "object"
-            )
-        declared = (
-            None if private is None
-            else private.get("_sealed_declared_fields")
-        )
-        if (
-            declared is not None
-            and name in declared
-            and value is not declared[name]
-        ):
-            raise RuntimeError(
-                f"declared module field {self.module_name}.{name} is sealed "
-                "after initialization"
-            )
-        super().__setattr__(name, value)
-
-    def __delattr__(self, name: str) -> None:
-        private = getattr(self, "__pydantic_private__", None)
-        sealed = (
-            None if private is None
-            else private.get("_sealed_tensor_bindings")
-        )
-        if sealed is not None and name in sealed:
-            raise RuntimeError(
-                f"declared tensor binding {self.module_name}.{name} is sealed "
-                "and cannot be deleted"
-            )
-        declared = (
-            None if private is None
-            else private.get("_sealed_declared_fields")
-        )
-        if declared is not None and name in declared:
-            raise RuntimeError(
-                f"declared module field {self.module_name}.{name} is sealed "
-                "and cannot be deleted"
-            )
-        super().__delattr__(name)
-
-    def _seal_declared_tensor_bindings(self) -> None:
-        """Seal every declared tensor slot once initialization is complete."""
-
-        if self._sealed_tensor_bindings is not None:
-            raise RuntimeError(
-                f"module {self.module_name!r} tensor bindings are already sealed"
-            )
-        self.opened_modules = tuple(self.opened_modules)
-        bindings: Dict[str, object] = {}
-        for field in self.tensor_schema():
-            if not self.is_tensor_field_active(field):
-                # ``depends_on`` / ``required_by`` explicitly promise that an
-                # inactive computed field is neither evaluated nor validated.
-                # Seal the absent slot without invoking its descriptor.
-                bindings[field.name] = None
-                continue
-            if (
-                field.computed
-                and field.tensor.category == "virtual"
-                and field.name not in self.__dict__
-            ):
-                # Optional output buffers remain cached-property descriptors
-                # unless output setup or initialize_model_state explicitly
-                # requested them.  Sealing must not turn an absent diagnostic
-                # into resident state after the kernel namespace was compiled.
-                continue
-            bindings[field.name] = getattr(self, field.name, None)
-        self._sealed_tensor_bindings = bindings
-        self._sealed_declared_fields = {
-            name: getattr(self, name)
-            for name in type(self).model_fields
-        }
+        cls.module_name = declaration.module_name
+        cls.description = declaration.description
+        cls.conflicts = declaration.conflicts
+        cls.nc_excluded_fields = declaration.nc_excluded_fields
 
     @classmethod
     @cache
-    def field_schema(cls):
+    def _field_schema(cls):
         """Return every declared field from the immutable compiled schema."""
         from hydroforge.contracts.fields import parse_module_schema
 
         return parse_module_schema(
-            (cls,), include_computed=True,
+            (cls,),
+            include_computed=True,
         ).fields(cls.module_name)
 
     @classmethod
     @cache
-    def field_schema_map(cls):
-        return {field.name: field for field in cls.field_schema()}
+    def _field_schema_map(cls):
+        return MappingProxyType(
+            {field.name: field for field in cls._field_schema()}
+        )
 
     @classmethod
     @cache
     def tensor_schema(cls):
         """Return the tensor subset of the cached field schema."""
-        return tuple(
-            field for field in cls.field_schema() if field.tensor is not None
-        )
+        return tuple(field for field in cls._field_schema() if field.tensor is not None)
 
     @classmethod
     @cache
-    def tensor_schema_map(cls):
+    def _tensor_schema_map(cls):
         """Index the compiled schema without reparsing ``json_schema_extra``."""
-        return {field.name: field for field in cls.tensor_schema()}
+        return MappingProxyType(
+            {field.name: field for field in cls.tensor_schema()}
+        )
 
-    def is_tensor_field_active(self, field: str | Any) -> bool:
+    def _is_tensor_field_active(self, field: str | Any) -> bool:
         """Return whether a tensor field belongs to this module specialization."""
         schema = (
-            self.tensor_schema_map().get(field)
-            if isinstance(field, str) else field
+            self._tensor_schema_map().get(field) if isinstance(field, str) else field
         )
         if schema is None or schema.tensor is None:
             raise KeyError(f"Unknown tensor field: {field}")
         return tensor_is_active(schema.tensor, self.opened_modules)
 
     def _emit(self, level: str, name: str, message: str, **fields: Any) -> None:
-        event = ModelEvent(level, name, message, fields)
-        if isinstance(self._event_sink, NullEventSink):
-            # Standalone and unlinked-independent modules may normalize during
-            # Pydantic construction, before ModelInitializer can attach the
-            # model's configured sink.
-            self._pending_events.append(event)
-            return
-        self._event_sink.emit(event)
+        self._event_sink.emit(
+            ModelEvent(
+                level=level,
+                name=name,
+                message=message,
+                fields=fields,
+            )
+        )
 
-    def _bind_event_sink(self, sink: EventSink) -> None:
-        """Attach the model sink and replay construction-time diagnostics."""
-
-        self._event_sink = sink
-        pending = tuple(self._pending_events)
-        self._pending_events.clear()
-        for event in pending:
-            sink.emit(event)
-
-    @field_validator('num_trials')
+    @field_validator("num_trials")
     @classmethod
-    def validate_num_trials(cls, v: Optional[int]) -> Optional[int]:
+    def _validate_num_trials(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v <= 1:
-            raise ValueError("num_trials must be greater than 1 if specified. For single trial, use None.")
+            raise ValueError(
+                "num_trials must be greater than 1 if specified. For single trial, use None."
+            )
         return v
 
-    def model_post_init(self, __context: Any):
-        if self.module_name not in self.opened_modules:
+    @model_validator(mode="before")
+    @classmethod
+    def _complete_module_input(
+        cls,
+        values: Any,
+        info: ValidationInfo,
+    ) -> Any:
+        """Complete the tensor payload as the first module validation step."""
+
+        context = info.context
+        if (
+            not isinstance(context, Mapping)
+            or context.get(_MODULE_INITIALIZATION_CONTEXT) is not True
+        ):
             raise ValueError(
-                f"`{self.module_name}` is not listed in `opened_modules`. "
-                f"All active modules must include themselves in that list."
-            )
-        self._tensors = ModuleTensors(self)
-        linked_by_model = bool(
-            isinstance(__context, dict)
-            and __context.get("hydroforge_model_initialization")
-        )
-        if not linked_by_model:
-            raise RuntimeError(
-                f"module {self.module_name!r} must be initialized through "
+                f"module {cls.module_name!r} must be initialized through "
                 "an AbstractModel"
             )
-        references = __context.get("hydroforge_module_references")
+        references = context.get(_MODULE_REFERENCES_CONTEXT)
         if not isinstance(references, dict):
-            raise RuntimeError(
-                "model initialization did not provide the constructed module "
-                "reference graph"
+            raise ValueError(
+                "model initialization must provide the module reference graph"
             )
-        self._bind_module_references(references)
-        # Preserve the long-standing module-author contract: Pydantic
-        # mode='after' validators observe normalized TensorField values,
-        # including scalar defaults expanded to their declared shapes.
-        self._tensors.initialize_declared()
-        self._tensors.materialize_computed()
+        sink = context.get(_MODULE_EVENT_SINK_CONTEXT)
+        if not isinstance(sink, EventSink):
+            raise ValueError("model initialization must provide an EventSink")
+        if not isinstance(values, Mapping):
+            return values
+        try:
+            return ModuleTensors.prepare_payload(
+                cls,
+                dict(values),
+                module_references=references,
+            )
+        except (KeyError, TypeError, OverflowError) as error:
+            raise ValueError(str(error)) from error
+
+    @model_validator(mode="after")
+    def _canonicalize_module_payload(self, info: ValidationInfo) -> Self:
+        """Complete and validate tensor fields inside Pydantic validation.
+
+        Base-class after validators execute before subclass after validators,
+        preserving the model-author guarantee that downstream semantic
+        validators observe canonical tensors rather than scalar declarations.
+        """
+
+        context = info.context
+        references = context[_MODULE_REFERENCES_CONTEXT]
+        try:
+            self._module_references = {
+                name: references.get(descriptor.module_name)
+                for name, descriptor in self._module_reference_fields().items()
+            }
+            self._reference_targets = context[_MODULE_REFERENCE_TARGETS_CONTEXT]
+            self._event_sink = context[_MODULE_EVENT_SINK_CONTEXT]
+            self._tensors = ModuleTensors(self)
+            if self.module_name not in self.opened_modules:
+                raise ValueError(
+                    f"`{self.module_name}` is not listed in `opened_modules`. "
+                    "All active modules must include themselves in that list."
+                )
+            self._tensors.initialize_declared()
+            self._tensors.materialize_computed()
+        except (KeyError, TypeError, OverflowError) as error:
+            raise ValueError(str(error)) from error
+        return self
 
     @classmethod
-    def get_module_reference_fields(
+    def _module_reference_fields(
         cls,
-    ) -> Dict[str, ModuleReference]:
+    ) -> Mapping[str, ModuleReference]:
         return ModuleReference.collect(cls)
 
     @classmethod
-    def required_modules(cls) -> Tuple[str, ...]:
+    def _required_modules(cls) -> Tuple[str, ...]:
         """Return sibling modules that must be open with this module."""
 
         return tuple(
             descriptor.module_name
-            for descriptor in cls.get_module_reference_fields().values()
+            for descriptor in cls._module_reference_fields().values()
             if not descriptor.optional
         )
 
-    def _bind_module_references(
-        self,
-        modules: Dict[str, "AbstractModule"],
-    ) -> None:
-        """Resolve declared sibling-module references once."""
-
-        if self._module_references is not None:
-            raise RuntimeError(
-                f"module {self.module_name!r} references are already linked"
-            )
-        references: Dict[str, Optional[AbstractModule]] = {}
-        for name, descriptor in self.get_module_reference_fields().items():
-            target = modules.get(descriptor.module_name)
-            if target is None and not descriptor.optional:
-                raise RuntimeError(
-                    f"Required module reference {self.module_name}.{name} "
-                    f"targets closed module {descriptor.module_name!r}"
-                )
-            if target is not None and not isinstance(target, descriptor.module_type):
-                raise TypeError(
-                    f"Module reference {self.module_name}.{name} requires "
-                    f"{descriptor.module_type.__name__}, got "
-                    f"{type(target).__name__}"
-                )
-            references[name] = target
-        self._module_references = references
-
-    def validate_linked_state(self) -> None:
-        """Validate cross-module invariants after computed tensors are stable."""
-
     @classmethod
-    def get_reference_index_fields(cls) -> Dict[str, _ReferenceIndexDescriptor]:
+    def _reference_index_fields(cls) -> Dict[str, _ReferenceIndexDescriptor]:
         fields: Dict[str, _ReferenceIndexDescriptor] = {}
         for owner in reversed(cls.mro()):
             for name, value in vars(owner).items():
@@ -734,38 +860,53 @@ class AbstractModule(BaseModel, ABC):
         return fields
 
     @classmethod
-    @cache
-    def get_reference_index_metadata(cls, name: str):
+    def _reference_index_metadata(cls, name: str):
         """Compile derived-index tensor metadata once per module class."""
-        from hydroforge.contracts.fields import TensorMetadata
 
-        descriptor = cls.get_reference_index_fields().get(name)
-        if descriptor is None:
-            return None
-        source = cls.tensor_schema_map().get(descriptor.reference)
-        if source is None:
-            raise TypeError(
-                f"ReferenceIndexField {name!r} refers to non-tensor field "
-                f"{descriptor.reference!r}"
-            )
-        return TensorMetadata.compile({
-            "tensor_shape": source.tensor.shape,
-            "tensor_dtype": "idx",
-            "dim_coords": source.tensor.dim_coords,
-            "category": "topology",
-            "mode": "device" if descriptor.device else "cpu",
-            "output": "disabled",
-            "allow_empty": source.tensor.allow_empty,
-        })
+        return cls._get_reference_index_metadata(name)
 
     @classmethod
     @cache
+    def _get_reference_index_metadata(cls, name: str):
+        from hydroforge.contracts.fields import TensorMetadata
+
+        descriptor = cls._reference_index_fields().get(name)
+        if descriptor is None:
+            return None
+        source = cls._tensor_schema_map().get(descriptor.reference)
+        if source is None:
+            raise ValueError(
+                f"ReferenceIndexField {name!r} refers to non-tensor field "
+                f"{descriptor.reference!r}"
+            )
+        return TensorMetadata.compile(
+            {
+                "tensor_shape": source.tensor.shape,
+                "tensor_dtype": "idx",
+                "dim_coords": source.tensor.dim_coords,
+                "category": "topology",
+                "mode": "device" if descriptor.device else "cpu",
+                "output": "disabled",
+                "allow_empty": source.tensor.allow_empty,
+            }
+        )
+
+    @classmethod
     def get_tensor_schema(cls, name: str):
         """Resolve a regular, computed, or derived-index typed schema."""
-        schema = cls.tensor_schema_map().get(name)
+
+        return _ModuleTensorQuery(
+            module_type=cls,
+            field_name=name,
+        ).schema
+
+    @classmethod
+    @cache
+    def _get_tensor_schema(cls, name: str):
+        schema = cls._tensor_schema_map().get(name)
         if schema is not None:
             return schema
-        metadata = cls.get_reference_index_metadata(name)
+        metadata = cls._reference_index_metadata(name)
         if metadata is None:
             return None
         from hydroforge.contracts.fields import ModuleFieldSchema
@@ -784,71 +925,29 @@ class AbstractModule(BaseModel, ABC):
         )
 
     def _reference_target(self, field_name: str) -> Tuple[str, torch.Tensor]:
-        """Resolve the uniquely visible tensor referenced by ``field_name``."""
-        schema = self.tensor_schema_map().get(field_name)
-        target_name = None if schema is None else schema.tensor.references
-        if not target_name:
-            raise ValueError(f"Field '{field_name}' does not declare references.")
+        """Return the construction-time-resolved local target tensor."""
 
-        parts = target_name.split(".")
-        attr_name = parts[-1]
-        candidates: List[torch.Tensor] = []
-        if len(parts) > 1:
-            owner_name = parts[-2]
-            owner = self if owner_name == self.module_name else getattr(
-                self, owner_name, None
-            )
-            value = getattr(owner, attr_name, None) if owner is not None else None
-            if isinstance(value, torch.Tensor):
-                candidates.append(value)
-        else:
-            value = getattr(self, attr_name, None)
-            if isinstance(value, torch.Tensor):
-                candidates.append(value)
-            for reference in self.get_module_reference_fields():
-                owner = getattr(self, reference)
-                value = getattr(owner, attr_name, None) if owner is not None else None
-                if isinstance(value, torch.Tensor):
-                    candidates.append(value)
-        if len(candidates) != 1:
-            raise ValueError(
-                f"Reference target '{target_name}' for '{field_name}' resolved "
-                f"to {len(candidates)} local tensors; use a qualified reference."
-            )
-        return target_name, candidates[0]
+        plan = self._reference_targets[field_name]
+        owner = (
+            self
+            if plan.target_module == self.module_name
+            else self._module_references[plan.target_module]
+        )
+        return plan.qualified_name, getattr(owner, plan.target_field)
 
-    def reference_index(
+    def _reference_index(
         self,
         field_name: str,
         target: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Resolve a ReferenceField to rank-local indices.
-
-        ``ReferenceField`` itself guarantees only foreign-key semantics.  This
-        method is the explicit request for a local array representation and
-        therefore fails if any referenced ID is not colocated on this rank.
-        """
+        """Resolve a validated ReferenceField to rank-local indices."""
         values = getattr(self, field_name)
-        if not isinstance(values, torch.Tensor):
-            raise TypeError(f"Reference field '{field_name}' is not a tensor.")
 
         if target is None:
-            target_name, target = self._reference_target(field_name)
-        else:
-            schema = self.tensor_schema_map().get(field_name)
-            target_name = None if schema is None else schema.tensor.references
+            _, target = self._reference_target(field_name)
+        return _find_indices_in_torch_trusted(values, target)
 
-        indices = find_indices_in_torch(values, target)
-        missing = indices < 0
-        if torch.any(missing):
-            examples = values[missing][:5].detach().cpu().tolist()
-            raise ValueError(
-                f"Reference field '{field_name}' is not local on rank {self.rank}; "
-                f"IDs absent from '{target_name}' include {examples}."
-            )
-        return indices
-
-    def inverse_reference_index(
+    def _inverse_reference_index(
         self,
         field_name: str,
         target: Optional[torch.Tensor] = None,
@@ -858,34 +957,36 @@ class AbstractModule(BaseModel, ABC):
         """Return referencing-row indices aligned to the target coordinate."""
         if target is None:
             _, target = self._reference_target(field_name)
-        indices = self.reference_index(field_name, target)
-        if indices.numel() and torch.unique(indices).numel() != indices.numel():
-            raise ValueError(
-                f"Reference field '{field_name}' contains duplicate target "
-                "references and therefore has no unique inverse."
-            )
+        indices = self._reference_index(field_name, target)
         inverse = torch.full(
-            (target.shape[0],), fill_value,
-            dtype=torch.int32, device=indices.device,
+            (target.shape[0],),
+            fill_value,
+            dtype=torch.int32,
+            device=indices.device,
         )
         inverse[indices.to(torch.int64)] = torch.arange(
-            indices.numel(), dtype=torch.int32, device=indices.device,
+            indices.numel(),
+            dtype=torch.int32,
+            device=indices.device,
         )
         return inverse
 
     def get_expected_dtype(self, field_name: str) -> torch.dtype:
+        query = _ModuleTensorQuery(
+            module_type=type(self),
+            field_name=field_name,
+        )
+        return self._get_expected_dtype(query.field_name)
+
+    def _get_expected_dtype(self, field_name: str) -> torch.dtype:
         return self._tensors.expected_dtype(field_name)
 
     @model_validator(mode="after")
-    def validate_opened_modules(self) -> Self:
+    def _validate_opened_modules(self) -> Self:
         v = self.opened_modules
-        if self.module_name not in v:
-            raise ValueError(
-                f"Current module '{self.module_name}' must be included in opened_modules. "
-                f"Available modules: {v}"
-            )
-
-        present_conflicts = [c for c in self.conflicts if c in v and c != self.module_name]
+        present_conflicts = [
+            c for c in self.conflicts if c in v and c != self.module_name
+        ]
         if present_conflicts:
             raise ValueError(
                 f"Module '{self.module_name}' conflicts with modules present in opened_modules: {present_conflicts}. "
@@ -893,7 +994,6 @@ class AbstractModule(BaseModel, ABC):
             )
 
         return self
-
 
     def gather_tensor(
         self,
@@ -912,17 +1012,15 @@ class AbstractModule(BaseModel, ABC):
         ``module.is_batched("field")``). Shape-only inference is ambiguous
         whenever a shared tensor's leading dimension equals ``num_trials``.
         """
-        if type(batched) is not bool:
-            raise TypeError("batched must be an exact bool")
-        if batched:
-            if self.num_trials is None or tensor.ndim < 2:
-                raise ValueError(
-                    "a batched gather requires a tensor with a trial and "
-                    "coordinate axis"
-                )
-            return tensor[:, indices]
-        return tensor[indices]
-
+        request = _ModuleGatherRequest(
+            tensor=tensor,
+            indices=indices,
+            batched=batched,
+            num_trials=self.num_trials,
+        )
+        if request.batched:
+            return request.tensor[:, request.indices]
+        return request.tensor[request.indices]
 
     def is_batched(self, field: str | torch.Tensor) -> bool:
         """Return whether a tensor has HydroForge's leading trial axis.
@@ -932,16 +1030,19 @@ class AbstractModule(BaseModel, ABC):
         misclassified. Passing a raw tensor retains the shape-only behavior for
         callers that do not have field metadata.
         """
+        query = _ModuleBatchQuery(module=self, field=field)
+        if query.schema is not None:
+            return self._is_batched_trusted(query.schema.name)
         if self.num_trials is None:
             return False
-        if isinstance(field, str):
-            tensor = getattr(self, field)
-            schema = self.tensor_schema_map().get(field)
-            if schema is None:
-                raise KeyError(f"Unknown tensor field: {field}")
-            if schema.tensor.category == "topology":
-                return False
-            declared_rank = len(schema.tensor.shape)
-            return tensor.ndim == declared_rank + 1
-        tensor = field
+        tensor = query.tensor
         return tensor.ndim > 0 and tensor.shape[0] == self.num_trials
+
+    def _is_batched_trusted(self, field_name: str) -> bool:
+        if self.num_trials is None:
+            return False
+        schema = type(self)._get_tensor_schema(field_name)
+        if schema.tensor.category == "topology":
+            return False
+        tensor = getattr(self, field_name)
+        return tensor.ndim == len(schema.tensor.shape) + 1

@@ -21,12 +21,7 @@ class _MetalStatisticsOperator(MetalCommandNode):
     def __init__(self, observer: StatisticsObserver) -> None:
         self.observer = observer
         states = observer.aggregator._kernel_states
-        tensors = tuple(
-            dict.fromkeys(
-                value for value in states.values()
-                if isinstance(value, torch.Tensor)
-            )
-        )
+        tensors = tuple(dict.fromkeys(states.values()))
         # Exact hazards are derived again by each Metal dispatcher while the
         # aggregator wrapper records. This conservative boundary covers the
         # wrapper as one operator relative to adjacent physics/control nodes.
@@ -45,32 +40,19 @@ class StatisticsObserver:
 
     _FOLD_INNER_OPS = frozenset({"last", "mean", "sum", "max", "min", "first"})
 
-    def __init__(self, model: AbstractModel) -> None:
+    def __init__(
+        self, model: AbstractModel, aggregator: StatisticsRuntime,
+    ) -> None:
         self.model = model
-        self.aggregator: StatisticsRuntime | None = None
+        self.aggregator = aggregator
         self._fold_policy_cache: tuple[bool, bool] | None = None
 
-    def attach(self, aggregator: StatisticsRuntime) -> None:
-        self.aggregator = aggregator
-        self._fold_policy_cache = None
-
-    def detach(self, aggregator: StatisticsRuntime) -> None:
-        """Release the current aggregator without accepting stale owners."""
-        if self.aggregator is not aggregator:
-            raise RuntimeError("cannot detach an aggregator not owned by this execution")
-        self.aggregator = None
-        self._fold_policy_cache = None
-
-    def invalidate(self, aggregator: StatisticsRuntime) -> None:
+    def invalidate(self) -> None:
         """Forget policies compiled from one live aggregator program."""
-        if self.aggregator is not aggregator:
-            raise RuntimeError(
-                "cannot invalidate an aggregator not owned by this execution"
-            )
         self._fold_policy_cache = None
 
     def enabled(self, output_enabled: bool) -> bool:
-        return bool(output_enabled and self.aggregator is not None)
+        return output_enabled
 
     def sample(
         self,
@@ -81,38 +63,23 @@ class StatisticsObserver:
         weight: float,
         total_weight: float,
     ) -> None:
-        aggregator = self.aggregator
-        if aggregator is not None:
-            aggregator.update_statistics(
-                sub_step, num_sub_steps, flags, weight, total_weight,
-            )
+        self.aggregator.update_statistics(
+            sub_step, num_sub_steps, flags, weight, total_weight,
+        )
 
     def finish(self, current_time: DateLike) -> None:
-        aggregator = self.aggregator
-        if aggregator is not None:
-            aggregator.finalize_time_step(current_time)
+        self.aggregator.finalize_time_step(current_time)
 
     def check_background_failures(
         self, current_time: DateLike,
     ) -> None:
-        aggregator = self.aggregator
-        if aggregator is not None:
-            aggregator.check_background_failures(current_time)
-
-    def ensure_output_durable(
-        self, current_time: DateLike,
-    ) -> None:
-        aggregator = self.aggregator
-        if aggregator is not None:
-            aggregator.ensure_output_durable(current_time)
+        self.aggregator.check_background_failures(current_time)
 
     def _fold_policy(self) -> tuple[bool, bool]:
         cached = self._fold_policy_cache
         if cached is not None:
             return cached
         aggregator = self.aggregator
-        if aggregator is None or not aggregator._aggregator_generated:
-            return True, False
         reductions = tuple(
             (operation.inner or operation.outer).value
             for variable in aggregator._statistics_ir.variables
@@ -138,8 +105,7 @@ class StatisticsObserver:
         return [
             value
             for name, value in self.aggregator._kernel_states.items()
-            if isinstance(value, torch.Tensor)
-            and name not in RESERVED_CONTROL_STATE
+            if name not in RESERVED_CONTROL_STATE
         ]
 
     def captured_body(
@@ -166,6 +132,9 @@ class StatisticsObserver:
 
     def prelaunch(self, flags: int, total_weight: float) -> None:
         aggregator = self.aggregator
+        converted_total = aggregator._convert_control_float(
+            "total_weight", total_weight,
+        )
         states = aggregator._kernel_states
         is_inner_last = bool(flags & 2)
         is_outer_first = bool(flags & 4) and is_inner_last
@@ -175,15 +144,42 @@ class StatisticsObserver:
             is_outer_first=is_outer_first,
             is_outer_last=is_outer_last,
         )
-        states["__total_weight"].fill_(total_weight)
+        states["__total_weight"].fill_(converted_total)
         states["__flags"].fill_(flags)
         states["__num_macro_steps"].fill_(num_macro_steps)
         states["__macro_step_index"].fill_(macro_step_index)
 
     def metal_operator(self) -> _MetalStatisticsOperator:
-        aggregator = self.aggregator
-        if aggregator is None or not aggregator._aggregator_generated:
-            raise RuntimeError(
-                "Metal statistics folding requires a generated aggregator"
-            )
         return _MetalStatisticsOperator(self)
+
+
+class DisabledStatisticsObserver:
+    """Fixed no-statistics execution policy for models without a declaration."""
+
+    def __init__(self, model: AbstractModel) -> None:
+        self.model = model
+
+    def enabled(self, output_enabled: bool) -> bool:
+        del output_enabled
+        return False
+
+    def sample(self, **values: Any) -> None:
+        del values
+
+    def finish(self, current_time: DateLike) -> None:
+        del current_time
+
+    def check_background_failures(self, current_time: DateLike) -> None:
+        del current_time
+
+    def device_compatible(self) -> bool:
+        return True
+
+    def should_fold(self) -> bool:
+        return False
+
+    def accumulators(self) -> tuple[()]:
+        return ()
+
+    def invalidate(self) -> None:
+        pass

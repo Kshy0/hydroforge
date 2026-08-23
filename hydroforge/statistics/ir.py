@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import math
 import re
-from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping
+
+import torch
 
 class Reduction(str, Enum):
     MEAN = "mean"
@@ -78,6 +81,53 @@ class ScatterSource:
     index: str
 
 
+def validate_expression_constants(
+    name: str, expression: Expression, dtype: torch.dtype,
+) -> None:
+    """Validate literal meaning once at the public statistics boundary."""
+
+    if not dtype.is_floating_point:
+        raise ValueError(
+            f"statistics expression {name!r} requires a floating dtype"
+        )
+    for node in ast.walk(expression.tree):
+        if (
+            not isinstance(node, ast.Constant)
+            or isinstance(node.value, bool)
+            or not isinstance(node.value, (int, float))
+        ):
+            continue
+        value = node.value
+        if isinstance(value, float) and value == 0.0:
+            literal = ast.get_source_segment(expression.source, node)
+            if literal is not None:
+                try:
+                    intended = Decimal(literal.replace("_", ""))
+                except InvalidOperation:
+                    intended = Decimal(0)
+                if intended != 0:
+                    raise ValueError(
+                        f"statistics expression {name!r} constant "
+                        f"{literal!r} underflows Python float64"
+                    )
+        converted = float(torch.tensor(value, dtype=dtype).item())
+        if value != 0 and converted == 0.0:
+            raise ValueError(
+                f"statistics expression {name!r} constant {value!r} "
+                f"underflows {dtype}"
+            )
+        if not math.isfinite(converted):
+            raise ValueError(
+                f"statistics expression {name!r} constant {value!r} "
+                f"exceeds {dtype} range"
+            )
+        if isinstance(value, int) and int(converted) != value:
+            raise ValueError(
+                f"statistics expression {name!r} integer constant "
+                f"{value!r} cannot be represented exactly in {dtype}"
+            )
+
+
 ValueSource = TensorSource | ExpressionSource | ScatterSource
 
 
@@ -101,18 +151,12 @@ class StatisticsProgram:
     def leaf_tensors(self, name: str) -> tuple[str, ...]:
         """Return concrete model tensors required to evaluate ``name``."""
         leaves: set[str] = set()
-        visiting: set[str] = set()
 
         def visit(field: str) -> None:
-            if field in visiting:
-                raise ValueError(
-                    f"cyclic statistics virtual expression involving {field!r}"
-                )
             source = self.sources.get(field, TensorSource(field))
             if isinstance(source, TensorSource):
                 leaves.add(source.name)
                 return
-            visiting.add(field)
             if isinstance(source, ScatterSource):
                 leaves.add(source.index)
                 dependencies = source.value.dependencies
@@ -120,10 +164,25 @@ class StatisticsProgram:
                 dependencies = source.expression.dependencies
             for dependency in dependencies:
                 visit(dependency)
-            visiting.remove(field)
 
         visit(name)
         return tuple(sorted(leaves))
+
+
+@dataclass(frozen=True, slots=True)
+class _StatisticsDeclaration:
+    """Construction-time statistics semantics owned by a validated model."""
+
+    program: StatisticsProgram
+    static_names: tuple[str, ...]
+    netcdf_options: Mapping[str, Mapping[str, Any]]
+
+    @property
+    def variable_ops(self) -> Mapping[str, tuple[str, ...]]:
+        return MappingProxyType({
+            name: tuple(operation.spelling for operation in operations)
+            for name, operations in self.program.operations.items()
+        })
 
 
 @dataclass(frozen=True)
@@ -199,7 +258,14 @@ def build_variable_storage_plan(
                 slots.append(StorageSlot(
                     add_name, shape, StorageDType.VALUE, initialization, False,
                 ))
-        if operation.inner is None or operation.inner is Reduction.LAST:
+        if operation.inner is None:
+            if operation.outer is Reduction.MEAN:
+                add_internal(
+                    f"{variable}_mean_sample_weight_state",
+                    StorageInitialization.ZERO,
+                )
+            continue
+        if operation.inner is Reduction.LAST:
             continue
         inner_initialization = (
             StorageInitialization.NEGATIVE_INFINITY
@@ -258,8 +324,6 @@ class StatisticsIR:
     def scatter_inputs(self, name: str) -> tuple[str, ...]:
         """Return source and index buffers for one scatter pre-kernel."""
         source = self.sources[name]
-        if not isinstance(source, ScatterSource):
-            raise TypeError(f"{name!r} is not a scatter value")
         inputs = {source.index}
         for dependency in source.value.dependencies:
             inputs.update(self.materialized_inputs(dependency))
@@ -298,7 +362,6 @@ _INNER = frozenset({Reduction.MEAN, Reduction.SUM, Reduction.MAX,
 
 _FUNCTION_ARITIES = {
     "abs": 1,
-    "fabs": 1,
     "sqrt": 1,
     "exp": 1,
     "log": 1,
@@ -308,14 +371,12 @@ _FUNCTION_ARITIES = {
     "pow": 2,
     "maximum": 2,
     "minimum": 2,
-    "max": 2,
-    "min": 2,
     "where": 3,
 }
 
 
 def parse_operation(spelling: str) -> StatisticOperation:
-    parts = spelling.lower().split("_")
+    parts = spelling.split("_")
     if len(parts) > 2:
         raise ValueError(f"invalid statistics operation {spelling!r}")
     match = _OP_RE.fullmatch(parts[0])
@@ -441,6 +502,14 @@ class _ExpressionValidator(ast.NodeVisitor):
                 f"statistics expression {self.source!r} contains a "
                 "non-finite numeric constant"
             )
+        if (
+            isinstance(node.value, int)
+            and int(float(node.value)) != node.value
+        ):
+            raise ValueError(
+                f"statistics expression {self.source!r} contains an integer "
+                "constant that cannot be represented exactly"
+            )
 
     def visit_Name(self, node: ast.Name) -> None:
         del node
@@ -481,7 +550,7 @@ class _ExpressionValidator(ast.NodeVisitor):
 
 
 def _parse_expression(source: str) -> tuple[str, ast.Expression]:
-    normalized = source.strip().replace("^", "**")
+    normalized = source.strip()
     try:
         tree = ast.parse(normalized, mode="eval")
     except SyntaxError as exc:
@@ -551,30 +620,27 @@ def parse_value_source(source: str, known_fields: set[str]) -> ValueSource:
 
 _FUNCTIONS: dict[ExpressionDialect, dict[str, str]] = {
     ExpressionDialect.CUDA: {
-        "abs": "fabs", "fabs": "fabs", "sqrt": "sqrt", "exp": "exp",
+        "abs": "fabs", "sqrt": "sqrt", "exp": "exp",
         "log": "log", "sin": "sin", "cos": "cos", "tan": "tan",
-        "pow": "pow", "maximum": "fmax", "minimum": "fmin",
-        "max": "fmax", "min": "fmin",
+        "pow": "pow", "maximum": "hf_max", "minimum": "hf_min",
     },
     ExpressionDialect.TRITON: {
-        "abs": "tl.abs", "fabs": "tl.abs", "sqrt": "tl.sqrt",
+        "abs": "tl.abs", "sqrt": "tl.sqrt",
         "exp": "tl.exp", "log": "tl.log", "sin": "tl.sin",
         "cos": "tl.cos", "tan": "libdevice.tan", "pow": "libdevice.pow",
-        "maximum": "tl.maximum", "minimum": "tl.minimum",
-        "max": "tl.maximum", "min": "tl.minimum",
+        "maximum": "hydroforge_maximum", "minimum": "hydroforge_minimum",
     },
     ExpressionDialect.METAL: {
-        "abs": "fabs", "fabs": "fabs", "sqrt": "sqrt", "exp": "exp",
+        "abs": "fabs", "sqrt": "sqrt", "exp": "exp",
         "log": "log", "sin": "sin", "cos": "cos", "tan": "tan",
-        "pow": "pow", "maximum": "fmax", "minimum": "fmin",
-        "max": "fmax", "min": "fmin",
+        "pow": "pow", "maximum": "hydroforge_maximum",
+        "minimum": "hydroforge_minimum",
     },
     ExpressionDialect.TORCH: {
-        "abs": "torch.abs", "fabs": "torch.abs", "sqrt": "torch.sqrt",
+        "abs": "torch.abs", "sqrt": "torch.sqrt",
         "exp": "torch.exp", "log": "torch.log", "sin": "torch.sin",
         "cos": "torch.cos", "tan": "torch.tan", "pow": "torch.pow",
         "maximum": "hydroforge_maximum", "minimum": "hydroforge_minimum",
-        "max": "hydroforge_maximum", "min": "hydroforge_minimum",
     },
 }
 
@@ -582,26 +648,81 @@ _FUNCTIONS: dict[ExpressionDialect, dict[str, str]] = {
 class _ExpressionRenderer:
     def __init__(
         self, dialect: ExpressionDialect, names: Mapping[str, str],
+        value_type: str | None,
     ) -> None:
         self.dialect = dialect
         self.names = names
+        self.value_type = value_type
 
     def render(self, expression: Expression) -> str:
-        return self.visit(expression.tree.body)
+        rendered = self.visit(expression.tree.body)
+        return self._cast_tensor(rendered)
+
+    def _cast_tensor(self, value: str) -> str:
+        if self.value_type is None:
+            return value
+        native = {
+            "float32": {
+                ExpressionDialect.CUDA: "float",
+                ExpressionDialect.METAL: "float",
+                ExpressionDialect.TRITON: "tl.float32",
+                ExpressionDialect.TORCH: "torch.float32",
+            },
+            "float64": {
+                ExpressionDialect.CUDA: "double",
+                ExpressionDialect.TRITON: "tl.float64",
+                ExpressionDialect.TORCH: "torch.float64",
+            },
+        }[self.value_type][self.dialect]
+        if self.dialect is ExpressionDialect.CUDA:
+            return f"static_cast<{native}>({value})"
+        if self.dialect is ExpressionDialect.METAL:
+            return f"{native}({value})"
+        return f"({value}).to({native})"
+
+    def _numeric_constant(self, value: int | float) -> str:
+        rendered = repr(float(value))
+        if self.value_type is None:
+            return rendered
+        if self.dialect in {
+            ExpressionDialect.CUDA, ExpressionDialect.METAL,
+        }:
+            return self._cast_tensor(rendered)
+        return rendered
+
+    def _truth(self, node: ast.AST) -> str:
+        """Render the backend-neutral numeric truth-value contract."""
+
+        return f"(({self.visit(node)}) != 0.0)"
 
     def visit(self, node: ast.AST) -> str:
         if isinstance(node, ast.BinOp):
             left, right = self.visit(node.left), self.visit(node.right)
             if isinstance(node.op, ast.Mod):
-                functions = {
-                    ExpressionDialect.CUDA: "fmod",
-                    ExpressionDialect.METAL: "fmod",
-                    ExpressionDialect.TRITON: "libdevice.fmod",
-                    ExpressionDialect.TORCH: "torch.fmod",
-                }
+                if self.dialect is ExpressionDialect.TORCH:
+                    return f"hydroforge_remainder({left}, {right})"
                 if self.dialect is ExpressionDialect.TRITON:
                     left, right = self._triton_promote_binary(left, right)
-                return f"{functions[self.dialect]}({left}, {right})"
+                    remainder = f"libdevice.fmod({left}, {right})"
+                    adjust = (
+                        f"(({remainder} != 0.0) & "
+                        f"(({remainder} < 0.0) != ({right} < 0.0)))"
+                    )
+                    adjusted = (
+                        f"tl.where({adjust}, {remainder} + {right}, "
+                        f"{remainder})"
+                    )
+                    return adjusted
+                remainder = f"fmod({left}, {right})"
+                adjust = (
+                    f"(({remainder} != 0.0) && "
+                    f"(({remainder} < 0.0) != ({right} < 0.0)))"
+                )
+                adjusted = (
+                    f"(({adjust}) ? ({remainder} + {right}) : "
+                    f"({remainder}))"
+                )
+                return adjusted
             operators = {
                 ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
             }
@@ -620,11 +741,7 @@ class _ExpressionRenderer:
             if isinstance(node.op, ast.UAdd):
                 return value
             if isinstance(node.op, ast.Not):
-                if self.dialect in {
-                    ExpressionDialect.TRITON, ExpressionDialect.TORCH,
-                }:
-                    return f"(~({value}))"
-                return f"(!({value}))"
+                return f"({self._truth(node.operand)} == 0)"
         if isinstance(node, ast.BoolOp):
             if self.dialect in {
                 ExpressionDialect.TRITON, ExpressionDialect.TORCH,
@@ -632,7 +749,7 @@ class _ExpressionRenderer:
                 symbol = "&" if isinstance(node.op, ast.And) else "|"
             else:
                 symbol = "&&" if isinstance(node.op, ast.And) else "||"
-            return f"({f' {symbol} '.join(self.visit(value) for value in node.values)})"
+            return f"({f' {symbol} '.join(self._truth(value) for value in node.values)})"
         if isinstance(node, ast.Compare):
             symbols = {
                 ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=",
@@ -642,12 +759,7 @@ class _ExpressionRenderer:
             pieces = []
             for operator, comparator in zip(node.ops, node.comparators, strict=True):
                 right = self.visit(comparator)
-                try:
-                    symbol = symbols[type(operator)]
-                except KeyError as exc:
-                    raise ValueError(
-                        f"unsupported comparison {type(operator).__name__}"
-                    ) from exc
+                symbol = symbols[type(operator)]
                 pieces.append(f"({left} {symbol} {right})")
                 left = right
             conjunction = " & " if self.dialect in {
@@ -655,12 +767,12 @@ class _ExpressionRenderer:
             } else " && "
             return f"({conjunction.join(pieces)})"
         if isinstance(node, ast.IfExp):
-            condition = self.visit(node.test)
+            condition = self._truth(node.test)
             positive, negative = self.visit(node.body), self.visit(node.orelse)
             if self.dialect is ExpressionDialect.TRITON:
                 return f"tl.where({condition}, {positive}, {negative})"
             if self.dialect is ExpressionDialect.TORCH:
-                return f"torch.where({condition}, {positive}, {negative})"
+                return f"hydroforge_where({condition}, {positive}, {negative})"
             return f"(({condition}) ? ({positive}) : ({negative}))"
         if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, float)):
             if isinstance(node.value, bool):
@@ -669,42 +781,36 @@ class _ExpressionRenderer:
                 }:
                     return "True" if node.value else "False"
                 return "true" if node.value else "false"
-            return repr(float(node.value))
+            return self._numeric_constant(node.value)
         if isinstance(node, (ast.Name, ast.Attribute)):
             name = self._name(node)
             if name in {"pi", "M_PI"}:
-                if self.dialect is ExpressionDialect.TORCH:
-                    return "torch.pi"
-                if self.dialect is ExpressionDialect.TRITON:
-                    return repr(math.pi)
-                return "M_PI"
-            try:
-                return self.names[name]
-            except KeyError as exc:
-                raise ValueError(f"unbound expression field {name!r}") from exc
+                # Treat pi exactly like every other numeric literal.  Leaving
+                # M_PI as a double in CUDA/Metal promotes an otherwise float32
+                # expression to double, while Torch/Triton evaluate it in
+                # float32, producing backend-dependent results.
+                return self._numeric_constant(math.pi)
+            return self._cast_tensor(self.names[name])
         if isinstance(node, ast.Call):
             function = self._name(node.func).split(".")[-1]
-            arguments = [self.visit(argument) for argument in node.args]
             if function == "where":
-                if len(arguments) != 3:
-                    raise ValueError("where expects three arguments")
-                condition, positive, negative = arguments
+                condition = self._truth(node.args[0])
+                positive = self.visit(node.args[1])
+                negative = self.visit(node.args[2])
                 if self.dialect is ExpressionDialect.TRITON:
                     return f"tl.where({condition}, {positive}, {negative})"
                 if self.dialect is ExpressionDialect.TORCH:
-                    return f"torch.where({condition}, {positive}, {negative})"
+                    return f"hydroforge_where({condition}, {positive}, {negative})"
                 return f"(({condition}) ? ({positive}) : ({negative}))"
-            try:
-                rendered = _FUNCTIONS[self.dialect][function]
-            except KeyError as exc:
-                raise ValueError(f"unsupported expression function {function!r}") from exc
+            arguments = [self.visit(argument) for argument in node.args]
+            rendered = _FUNCTIONS[self.dialect][function]
             if (
                 self.dialect is ExpressionDialect.TRITON
                 and function == "pow"
             ):
                 arguments = list(self._triton_promote_binary(*arguments))
             return f"{rendered}({', '.join(arguments)})"
-        raise ValueError(f"unsupported statistics expression node {ast.dump(node)}")
+        return ""
 
     @staticmethod
     def _triton_promote_binary(left: str, right: str) -> tuple[str, str]:
@@ -727,74 +833,24 @@ class _ExpressionRenderer:
             if isinstance(current, ast.Name):
                 parts.append(current.id)
                 return ".".join(reversed(parts))
-        raise ValueError("expression callable/field must be a name")
+        return ""
 
 
 def render_expression(
     expression: Expression,
     dialect: ExpressionDialect,
     names: Mapping[str, str],
+    *,
+    value_type: str | None = None,
 ) -> str:
     """Lower one validated expression; only syntax varies by dialect."""
-    return _ExpressionRenderer(dialect, names).render(expression)
-
-
-def compile_statistics_program(
-    aggregator: Any,
-    variable_ops: Mapping[str, list[str] | tuple[str, ...]],
-) -> StatisticsProgram:
-    """Parse all operations and virtual sources exactly once."""
-    known = set(aggregator._field_registry) | set(aggregator._tensor_registry)
-    resolving: set[str] = set()
-    resolved: dict[str, ValueSource] = {}
-
-    def resolve_source(name: str) -> ValueSource:
-        if name in resolved:
-            return resolved[name]
-        if name in resolving:
-            raise ValueError(f"cyclic statistics virtual expression involving {name!r}")
-        resolving.add(name)
-        info = aggregator._field_registry.get(name)
-        metadata = None if info is None else info.tensor
-        expr = (
-            metadata.expression
-            if metadata is not None and metadata.category == "virtual" else ""
-        )
-        if not expr:
-            source: ValueSource = TensorSource(name)
-        else:
-            source = parse_value_source(expr, known)
-            dependencies = (
-                source.expression.dependencies
-                if isinstance(source, ExpressionSource)
-                else source.value.dependencies
-                if isinstance(source, ScatterSource)
-                else ()
-            )
-            for dependency in dependencies:
-                dep_info = aggregator._field_registry.get(dependency)
-                if dep_info is not None and dep_info.tensor.category == "virtual":
-                    resolve_source(dependency)
-        resolving.remove(name)
-        resolved[name] = source
-        return source
-
-    for name in variable_ops:
-        resolve_source(name)
-    operations = MappingProxyType({
-        name: tuple(parse_operation(operation) for operation in values)
-        for name, values in variable_ops.items()
-    })
-    return StatisticsProgram(
-        operations=operations,
-        sources=MappingProxyType(dict(resolved)),
-    )
+    return _ExpressionRenderer(
+        dialect, names, value_type,
+    ).render(expression)
 
 
 def build_statistics_ir(aggregator: Any) -> StatisticsIR:
-    program = getattr(aggregator, "_statistics_program", None)
-    if program is None:
-        program = compile_statistics_program(aggregator, aggregator._variable_ops)
+    program = aggregator._statistics_program
 
     variables: list[StatisticVariable] = []
     groups: dict[str, list[StatisticVariable]] = {}

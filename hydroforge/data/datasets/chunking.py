@@ -8,19 +8,45 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import timedelta
 from typing import Literal
 
+from pydantic import Field, PrivateAttr, model_validator
+
 from hydroforge.contracts.temporal import (
-    DatasetTemporalContract,
+    _DatasetTemporalDomain,
     DateLike,
-    timedelta_quotient,
+    date_calendar,
+    require_calendar,
+    _timedelta_quotient_trusted,
 )
+from hydroforge.contracts.validation import HydroForgeModel
 
 
-@dataclass(frozen=True, slots=True)
-class SourceChunk:
+class _ChunkPlanIndexQuery(HydroForgeModel):
+    index: int = Field(strict=True)
+    length: int = Field(strict=True, ge=0, exclude=True)
+
+    _resolved: int = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _resolve(self):
+        index = self.index
+        if index < 0:
+            index += self.length
+        if not 0 <= index < self.length:
+            raise ValueError(
+                f"chunk-plan index must satisfy -{self.length} <= index < "
+                f"{self.length}; got {self.index}"
+            )
+        self._resolved = index
+        return self
+
+    @property
+    def resolved(self) -> int:
+        return self._resolved
+
+
+class SourceChunk(HydroForgeModel):
     """One real, unpadded source read on a logical dataset timeline."""
 
     index: int
@@ -33,39 +59,96 @@ class SourceChunk:
     # otherwise produce identical offsets for different cadences (for example
     # daily and hourly first chunks), allowing a foreign request to be accepted
     # and read silently against the wrong timeline.
-    contract: DatasetTemporalContract
-    # A contract describes temporal values only; two independent datasets can
-    # therefore still have equal contracts.  This opaque plan token keeps a
-    # request tied to the exact source plan that issued it.
-    provenance: object = field(repr=False)
+    temporal_domain: _DatasetTemporalDomain
     spinup_cycle: int | None = None
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.contract, DatasetTemporalContract):
-            raise TypeError("source chunk requires its DatasetTemporalContract")
+    @model_validator(mode="after")
+    def _validate_chunk(self):
+        if not isinstance(self.temporal_domain, _DatasetTemporalDomain):
+            raise ValueError("source chunk requires its Dataset timeline")
+        if type(self.index) is not int or self.index < 0:
+            raise ValueError("source chunk index must be a non-negative int")
+        if type(self.phase) is not str or self.phase not in {"spinup", "main"}:
+            raise ValueError("source chunk phase must be 'spinup' or 'main'")
+        if type(self.source_start) is not type(self.temporal_domain.start):
+            raise ValueError(
+                "source chunk and dataset contract must use the same datetime "
+                "representation"
+            )
+        require_calendar(
+            self.source_start,
+            self.temporal_domain.calendar,
+            label="source chunk start",
+        )
+        if date_calendar(self.source_start) != date_calendar(
+            self.temporal_domain.start,
+        ):
+            raise ValueError(
+                "source chunk and dataset contract use different calendars"
+            )
+        if type(self.length) is not int or self.length < 1:
+            raise ValueError("source chunk length must be a positive int")
+        if type(self.phase_offset) is not int or self.phase_offset < 0:
+            raise ValueError("source chunk phase offset must be a non-negative int")
+        if type(self.source_offset) is not int:
+            raise ValueError("source chunk source offset must be an exact int")
+        expected_start = (
+            self.temporal_domain.start
+            + self.temporal_domain.interval * self.source_offset
+        )
+        if self.source_start != expected_start:
+            raise ValueError("source chunk start does not match its source offset")
+        if self.phase == "main":
+            if self.spinup_cycle is not None:
+                raise ValueError("main source chunks cannot have a spinup cycle")
+            if self.source_offset != self.phase_offset:
+                raise ValueError(
+                    "main source chunk offsets must refer to the same sample"
+                )
+            if self.phase_offset + self.length > self.temporal_domain.count:
+                raise ValueError(
+                    "main source chunk extends beyond the dataset contract"
+                )
+            return self
 
-    def source_time(self, offset: int, interval: timedelta) -> DateLike:
+        spinup = self.temporal_domain.spinup
+        if spinup is None:
+            raise ValueError("spinup source chunks require a dataset spinup contract")
+        if (
+            type(self.spinup_cycle) is not int
+            or not 0 <= self.spinup_cycle < spinup.cycles
+        ):
+            raise ValueError(
+                "spinup source chunk cycle is outside the dataset contract"
+            )
+        spinup_count = _timedelta_quotient_trusted(
+            spinup.source_end - spinup.source_start,
+            self.temporal_domain.interval,
+            duration_label="spin-up source duration",
+            interval_label="dataset sample interval",
+        )
+        if self.phase_offset + self.length > spinup_count:
+            raise ValueError("spinup source chunk extends beyond the spinup contract")
+        expected_spinup_start = (
+            spinup.source_start + self.temporal_domain.interval * self.phase_offset
+        )
+        if self.source_start != expected_spinup_start:
+            raise ValueError(
+                "spinup source chunk start does not match its phase offset"
+            )
+        return self
+
+    def _source_time(self, offset: int) -> DateLike:
         """Return one logical source timestamp inside this chunk."""
 
-        if type(offset) is not int:
-            raise TypeError("chunk source offset must be an exact int")
-        if not 0 <= offset < self.length:
-            raise IndexError(offset)
-        if interval != self.contract.interval:
-            raise ValueError(
-                "chunk interval differs from its DatasetTemporalContract"
-            )
-        return self.source_start + interval * offset
+        return self.source_start + self.temporal_domain.interval * offset
 
-    def source_times(self, interval: timedelta) -> tuple[DateLike, ...]:
+    def _source_times(self) -> tuple[DateLike, ...]:
         """Return every logical source timestamp in this request."""
 
-        return tuple(
-            self.source_time(offset, interval)
-            for offset in range(self.length)
-        )
+        return tuple(self._source_time(offset) for offset in range(self.length))
 
-    def main_source_slice(self, source_count: int) -> slice:
+    def _main_source_slice(self, source_count: int) -> slice:
         """Return a bounded slice into storage aligned to the main source axis."""
 
         if type(source_count) is not int or source_count < 1:
@@ -79,52 +162,36 @@ class SourceChunk:
         return slice(self.source_offset, stop)
 
 
-@dataclass(frozen=True, slots=True)
-class SourceChunkPlan:
+class SourceChunkPlan(HydroForgeModel):
     """The complete storage-chunk layout for a dataset contract.
 
-    ``DatasetTemporalContract`` uses half-open support, while dataset
+    The internal temporal domain uses half-open support, while Dataset
     constructors retain their historical inclusive ``end_date`` input. The
     boundary conversion happens before this plan is built. Every consumer then
     sees the same real chunk lengths, including each short final chunk.
     """
 
-    contract: DatasetTemporalContract
-    chunk_len: int
-    _chunks: tuple[SourceChunk, ...] = field(init=False, repr=False)
-    _spinup_source_count: int = field(init=False, repr=False)
-    _num_spinup_chunks: int = field(init=False, repr=False)
-    _provenance: object = field(init=False, repr=False, compare=False)
-    # Keep accepted tokens as an identity list rather than a set.  Provenance
-    # is deliberately opaque and identity-owned; set membership would invoke
-    # user-defined ``__hash__``/``__eq__`` methods on a forged token and could
-    # make two independent plans appear equal by accident.
-    _accepted_provenance: list[object] = field(
-        init=False, repr=False, compare=False,
-    )
+    temporal_domain: _DatasetTemporalDomain
+    chunk_len: int = Field(strict=True, ge=1)
+    _chunks: tuple[SourceChunk, ...] = PrivateAttr(default=())
+    _spinup_source_count: int = PrivateAttr(default=0)
+    _num_spinup_chunks: int = PrivateAttr(default=0)
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.contract, DatasetTemporalContract):
-            raise TypeError("chunk plan requires a DatasetTemporalContract")
-        if type(self.chunk_len) is not int or self.chunk_len < 1:
-            raise ValueError("chunk_len must be an exact positive int")
-
-        object.__setattr__(self, "_provenance", object())
-        object.__setattr__(self, "_accepted_provenance", [])
-
+    @model_validator(mode="after")
+    def _compile_chunks(self):
         chunks: list[SourceChunk] = []
         spinup_source_count = 0
-        spinup = self.contract.spinup
+        spinup = self.temporal_domain.spinup
         if spinup is not None:
-            spinup_source_count = timedelta_quotient(
+            spinup_source_count = _timedelta_quotient_trusted(
                 spinup.source_end - spinup.source_start,
-                self.contract.interval,
+                self.temporal_domain.interval,
                 duration_label="spin-up source duration",
                 interval_label="dataset sample interval",
             )
-            source_origin_offset = timedelta_quotient(
-                spinup.source_start - self.contract.start,
-                self.contract.interval,
+            source_origin_offset = _timedelta_quotient_trusted(
+                spinup.source_start - self.temporal_domain.start,
+                self.temporal_domain.interval,
                 duration_label="spin-up source origin offset",
                 interval_label="dataset sample interval",
             )
@@ -142,14 +209,15 @@ class SourceChunkPlan:
         self._append_phase(
             chunks,
             phase="main",
-            start=self.contract.start,
-            count=self.contract.count,
+            start=self.temporal_domain.start,
+            count=self.temporal_domain.count,
             source_origin_offset=0,
             spinup_cycle=None,
         )
-        object.__setattr__(self, "_chunks", tuple(chunks))
-        object.__setattr__(self, "_spinup_source_count", spinup_source_count)
-        object.__setattr__(self, "_num_spinup_chunks", num_spinup_chunks)
+        self._chunks = tuple(chunks)
+        self._spinup_source_count = spinup_source_count
+        self._num_spinup_chunks = num_spinup_chunks
+        return self
 
     def _append_phase(
         self,
@@ -163,17 +231,17 @@ class SourceChunkPlan:
     ) -> None:
         for phase_offset in range(0, count, self.chunk_len):
             length = min(self.chunk_len, count - phase_offset)
-            chunks.append(SourceChunk(
+            chunk = SourceChunk(
                 index=len(chunks),
                 phase=phase,
-                source_start=start + self.contract.interval * phase_offset,
+                source_start=(start + self.temporal_domain.interval * phase_offset),
                 length=length,
                 phase_offset=phase_offset,
                 source_offset=source_origin_offset + phase_offset,
                 spinup_cycle=spinup_cycle,
-                contract=self.contract,
-                provenance=self._provenance,
-            ))
+                temporal_domain=self.temporal_domain,
+            )
+            chunks.append(chunk)
 
     @property
     def spinup_source_count_per_cycle(self) -> int:
@@ -183,91 +251,26 @@ class SourceChunkPlan:
     def num_spinup_chunks(self) -> int:
         return self._num_spinup_chunks
 
-    def validate_main_source_count(self, source_count: int) -> None:
+    def _validate_main_source_count(self, source_count: int) -> None:
         """Validate every planned read against a main-aligned source table."""
 
         for chunk in self._chunks:
             try:
-                chunk.main_source_slice(source_count)
+                chunk._main_source_slice(source_count)
             except IndexError as error:
                 raise ValueError(
                     "chunk plan cannot be served by the main-aligned source "
                     f"table: {error}"
                 ) from error
 
-    def validate_chunk(self, chunk: SourceChunk) -> None:
-        """Require a request to be one exact member of this plan."""
-
-        if not isinstance(chunk, SourceChunk):
-            raise TypeError("read_chunk requires a SourceChunk")
-        if chunk.contract != self.contract:
-            raise ValueError(
-                "source chunk belongs to a different DatasetTemporalContract"
-            )
-        accepted = self._has_accepted_provenance(chunk.provenance)
-        if chunk.provenance is not self._provenance and not accepted:
-            raise ValueError("source chunk belongs to a different SourceChunkPlan")
-        try:
-            expected = self[chunk.index]
-        except (IndexError, TypeError):
-            raise ValueError(
-                "source chunk does not belong to this dataset"
-            ) from None
-        # Dataclass equality is intentionally not used here: Python considers
-        # values such as ``True == 1`` and ``1.0 == 1`` equal.  A forged
-        # request with one of those values could then pass validation and
-        # reach a storage adapter with a malformed offset/length.  Composite
-        # adoption still permits a different object, but every structural
-        # field must have the exact same type and value as the plan member.
-        same_request = self._same_request_fields(chunk, expected)
-        if not same_request:
-            raise ValueError("source chunk does not belong to this dataset")
-
-    @staticmethod
-    def _same_request_fields(
-        actual: SourceChunk, expected: SourceChunk,
-    ) -> bool:
-        return all(
-            type(actual_value) is type(expected_value)
-            and actual_value == expected_value
-            for name in (
-                "index", "phase", "source_start", "length",
-                "phase_offset", "source_offset", "contract",
-                "spinup_cycle",
-            )
-            for actual_value, expected_value in [
-                (getattr(actual, name), getattr(expected, name)),
-            ]
-        )
-
-    def _accept_provenance(self, provenance: object) -> None:
-        """Allow an explicit composite owner to forward its exact request."""
-        if not any(token is provenance for token in self._accepted_provenance):
-            self._accepted_provenance.append(provenance)
-
-    def _has_accepted_provenance(self, provenance: object) -> bool:
-        """Return whether a composite token was explicitly adopted."""
-
-        return any(token is provenance for token in self._accepted_provenance)
-
-    def __copy__(self) -> SourceChunkPlan:
-        """Treat a shallow copy as an alias of this immutable request plan.
-
-        Chunks retain the plan's opaque provenance token.  Letting
-        ``copy.copy`` manufacture a second plan object while sharing that
-        token would make the two plans indistinguishable to provenance checks.
-        ``deepcopy`` remains available when an independent plan is required.
-        """
-
-        return self
-
     def __getitem__(self, index: int) -> SourceChunk:
-        if type(index) is not int:
-            raise TypeError("dataset index must be an exact int")
-        try:
-            return self._chunks[index]
-        except IndexError:
-            raise IndexError(index) from None
+        query = _ChunkPlanIndexQuery(index=index, length=len(self._chunks))
+        return self._at_trusted(query.resolved)
+
+    def _at_trusted(self, index: int) -> SourceChunk:
+        """Return one framework-resolved chunk without another query model."""
+
+        return self._chunks[index]
 
     def __iter__(self):
         return iter(self._chunks)

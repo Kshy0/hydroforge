@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import math
 from numbers import Integral, Real
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple
 
 import netCDF4 as nc
 import numpy as np
@@ -36,8 +37,6 @@ class _OutputTimeRequest:
 
     @property
     def row_index(self) -> int:
-        if self.length != 1:
-            raise ValueError("output row request must select exactly one row")
         return self.start
 
 
@@ -51,8 +50,39 @@ def _validated_grid_fill_value(value: Any, dtype: np.dtype) -> Any:
             "boolean reader fill_value must be an exact bool; pass False "
             "explicitly for unrepresented grid cells"
         )
+    if dtype.kind == "f":
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+            raise TypeError("real reader fill_value must be a real scalar")
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            converted = dtype.type(value)
+        if isinstance(value, Integral):
+            if not np.isfinite(converted):
+                raise OverflowError(
+                    f"fill_value {value!r} is outside dtype {dtype} range"
+                )
+            if int(converted) != int(value):
+                raise ValueError(
+                    f"fill_value {value!r} is not exactly representable "
+                    f"as {dtype}"
+                )
+            return converted
+        try:
+            source = float(value)
+        except (OverflowError, ValueError) as error:
+            raise OverflowError(
+                f"fill_value {value!r} is outside dtype {dtype} range"
+            ) from error
+        if np.isfinite(source) and not np.isfinite(converted):
+            raise OverflowError(
+                f"fill_value {value!r} is outside dtype {dtype} range"
+            )
+        if source != 0.0 and converted == 0.0:
+            raise OverflowError(
+                f"fill_value {value!r} underflows dtype {dtype}"
+            )
+        return converted
     if dtype.kind not in "iu":
-        return value
+        raise TypeError(f"unsupported reader fill dtype {dtype}")
     if isinstance(value, (bool, np.bool_)):
         raise TypeError("integer reader fill_value must not be boolean")
     if isinstance(value, Integral):
@@ -83,7 +113,7 @@ class MultiRankDataAccess:
     def _result_dtype(self, dtype: Optional[np.dtype]) -> np.dtype:
         if dtype is not None:
             result = np.dtype(dtype)
-            if result.kind not in "biufc":
+            if result.kind not in "biuf":
                 raise TypeError("reader dtype must be numeric or boolean")
             return result
         info = self.owner._rank_files[0]
@@ -96,6 +126,80 @@ class MultiRankDataAccess:
         if np.ma.isMaskedArray(value) and np.any(np.ma.getmaskarray(value)):
             raise ValueError(f"statistics data from {source} contains missing values")
         return np.asarray(value)
+
+    @staticmethod
+    def _cast_result(
+        value: np.ndarray, dtype: np.dtype, *, label: str,
+    ) -> np.ndarray:
+        array = np.asarray(value)
+        if array.dtype == dtype:
+            return array
+        if dtype.kind == "b":
+            if array.dtype.kind != "b":
+                raise TypeError(
+                    f"{label} cannot be reinterpreted as boolean output"
+                )
+            return array.astype(dtype, copy=False)
+        if dtype.kind in "iu":
+            if array.dtype.kind not in "iuf":
+                raise TypeError(f"{label} cannot be converted to integer output")
+            if array.dtype.kind == "f":
+                if not np.isfinite(array).all() or np.any(
+                    array != np.trunc(array)
+                ):
+                    raise ValueError(
+                        f"{label} contains non-integral or non-finite values"
+                    )
+                # Compare against an exact power-of-two half-open interval.
+                # Converting int64.max to float64 rounds it up to 2**63, so a
+                # conventional ``value > limits.max`` check accepts 2**63 and
+                # the subsequent cast wraps to int64.min.  uint64 has the same
+                # alias at 2**64.
+                bits = dtype.itemsize * 8
+                signed = dtype.kind == "i"
+                upper = math.ldexp(1.0, bits - int(signed))
+                lower = -upper if signed else 0.0
+                outside = (array < lower) | (array >= upper)
+            else:
+                limits = np.iinfo(dtype)
+                outside = (array < limits.min) | (array > limits.max)
+            if array.size and np.any(outside):
+                raise OverflowError(
+                    f"{label} contains values outside {dtype} range"
+                )
+            return array.astype(dtype, copy=False)
+        if dtype.kind == "f":
+            if array.dtype.kind not in "iuf":
+                raise TypeError(f"{label} cannot be converted to real output")
+            if dtype.itemsize < 8 and array.size:
+                finite = array[np.isfinite(array)]
+                if finite.size and np.any(
+                    np.abs(finite) > np.finfo(dtype).max
+                ):
+                    raise OverflowError(
+                        f"{label} contains values outside {dtype} range"
+                    )
+            converted = array.astype(dtype, copy=False)
+            if np.any(np.isfinite(array) & ~np.isfinite(converted)):
+                raise OverflowError(
+                    f"{label} contains values outside {dtype} range"
+                )
+            if np.any(
+                np.isfinite(array) & (array != 0) & (converted == 0)
+            ):
+                raise OverflowError(
+                    f"{label} contains nonzero values that underflow in "
+                    f"{dtype}"
+                )
+            if array.dtype.kind in "iu" and not np.array_equal(
+                array.astype(object), converted.astype(object),
+            ):
+                raise ValueError(
+                    f"{label} contains integers that are not exactly "
+                    f"representable as {dtype}"
+                )
+            return converted
+        raise TypeError(f"unsupported reader result dtype {dtype}")
 
     def _validate_axes(
         self, info: dict, *, level: Optional[int], trial: int,
@@ -184,9 +288,8 @@ class MultiRankDataAccess:
 
     @staticmethod
     def _read_cache_row(
-        info: dict, request: _OutputTimeRequest,
+        cache_arr: np.ndarray, info: dict, request: _OutputTimeRequest,
     ) -> np.ndarray:
-        cache_arr = info["cache"]
         indices = [request.row_index]
         if info["has_trials"]:
             indices.append(request.trial)
@@ -200,43 +303,34 @@ class MultiRankDataAccess:
     ) -> np.ndarray:
         """Read one requested row from the NetCDF shard that contains it."""
         orig_time = int(self.owner._t_indices[request.row_index])
-
-        # Find which file contains orig_time
-        for i, (start, end) in enumerate(info["file_time_offsets"]):
-            if start <= orig_time < end:
-                local_time = orig_time - start
-                fp = info["paths"][i]
-                with nc.Dataset(fp, "r") as ds:
-                    var = ds.variables[self.owner.var_name]
-
-                    # Build index tuple
-                    # 1. time
-                    indices = [local_time]
-
-                    # 2. trial
-                    if info["has_trials"]:
-                        indices.append(request.trial)
-
-                    # 3. saved_points (all)
-                    indices.append(slice(None))
-
-                    # 4. levels
-                    if info["has_levels"]:
-                        indices.append(request.level)
-
-                    return decode_netcdf_logical_array(
-                        var, var[tuple(indices)],
-                        name=self.owner.var_name,
-                    )
-
-        # Should not happen if t_index is valid
-        raise IndexError(f"Time index {orig_time} not found in any file.")
+        file_index, (start, _end) = next(
+            (index, bounds)
+            for index, bounds in enumerate(info["file_time_offsets"])
+            if bounds[0] <= orig_time < bounds[1]
+        )
+        local_time = orig_time - start
+        fp = self.owner._checked_source_path(info["paths"][file_index])
+        with nc.Dataset(fp, "r") as ds:
+            var = ds.variables[self.owner.var_name]
+            indices = [local_time]
+            if info["has_trials"]:
+                indices.append(request.trial)
+            indices.append(slice(None))
+            if info["has_levels"]:
+                indices.append(request.level)
+            result = decode_netcdf_logical_array(
+                var, var[tuple(indices)],
+                name=self.owner.var_name,
+            )
+        self.owner._verify_source_path(fp)
+        return result
 
     def _read_rank_row(
         self, info: dict, request: _OutputTimeRequest,
     ) -> np.ndarray:
-        if info.get("cache") is not None:
-            return self._read_cache_row(info, request)
+        cache = self.owner._rank_cache_for(info["rank_id"])
+        if cache is not None:
+            return self._read_cache_row(cache, info, request)
         return self._read_netcdf_row(info, request)
 
     def get_vector(
@@ -260,7 +354,9 @@ class MultiRankDataAccess:
             data = self._read_rank_row(info, request)
 
             arr = self._array(data, source=info["paths"][0].name)
-            arr = arr.astype(target_dtype, copy=False)
+            arr = self._cast_result(
+                arr, target_dtype, label="statistics vector",
+            )
             parts.append(arr)
         return np.concatenate(parts, axis=0) if parts else np.array([])
 
@@ -275,23 +371,17 @@ class MultiRankDataAccess:
         request = self._make_row_request(
             time_index=t_index, level=level, trial=trial,
         )
-        if self.owner._map_shape is None:
+        if self.owner.map_shape is None:
             raise RuntimeError("map_shape is not set; cannot project to grid.")
 
-        nx_, ny_ = self.owner._map_shape
+        nx_, ny_ = self.owner.map_shape
         target_dtype = self._result_dtype(dtype)
         validated_fill = _validated_grid_fill_value(
             fill_value, target_dtype,
         )
-        try:
-            grid = np.full(
-                (nx_, ny_), validated_fill, dtype=target_dtype,
-            )
-        except (OverflowError, TypeError, ValueError) as error:
-            raise ValueError(
-                f"fill_value {fill_value!r} cannot be represented by reader "
-                f"dtype {target_dtype}"
-            ) from error
+        grid = np.full(
+            (nx_, ny_), validated_fill, dtype=target_dtype,
+        )
 
         for info in self.owner._rank_files:
             if info["saved_points"] == 0:
@@ -306,9 +396,10 @@ class MultiRankDataAccess:
 
             vals = self._read_rank_row(info, request)
 
-            grid[x, y] = self._array(
-                vals, source=info["paths"][0].name,
-            ).astype(target_dtype, copy=False)
+            values = self._array(vals, source=info["paths"][0].name)
+            grid[x, y] = self._cast_result(
+                values, target_dtype, label="statistics grid",
+            )
         return grid
 
     @staticmethod
@@ -321,6 +412,7 @@ class MultiRankDataAccess:
     def _copy_series_from_cache(
         self,
         out: np.ndarray,
+        cache: np.ndarray,
         info: dict,
         pairs: List[Tuple[int, int]],
         request: _OutputTimeRequest,
@@ -334,9 +426,11 @@ class MultiRankDataAccess:
         if info["has_levels"]:
             indices.append(request.level)
         chunk = self._array(
-            info["cache"][tuple(indices)], source=info["paths"][0].name,
+            cache[tuple(indices)], source=info["paths"][0].name,
         )
-        out[:, out_cols] = chunk.astype(target_dtype, copy=False)
+        out[:, out_cols] = self._cast_result(
+            chunk, target_dtype, label="statistics series",
+        )
 
     def _copy_series_from_netcdf(
         self,
@@ -349,8 +443,6 @@ class MultiRankDataAccess:
         out_cols, local_idx = self._sorted_series_indices(pairs)
         if request.length == 0:
             return
-        if self.owner._slice_start is None or self.owner._slice_end is None:
-            raise RuntimeError("Internal error: time slice is not set.")
 
         global_start = self.owner._slice_start + request.start
         global_stop = self.owner._slice_start + request.stop
@@ -365,7 +457,8 @@ class MultiRankDataAccess:
             local_start = requested_start - file_start
             local_stop = requested_stop - file_start
             output_start = requested_start - global_start
-            with nc.Dataset(fp, "r") as ds:
+            checked_path = self.owner._checked_source_path(fp)
+            with nc.Dataset(checked_path, "r") as ds:
                 var = ds.variables[self.owner.var_name]
                 if self.owner.row_chunk_size is None:
                     # Bound the unfiltered NetCDF read even when the caller asks
@@ -395,73 +488,20 @@ class MultiRankDataAccess:
                     selected = block[:, local_idx]
                     o0 = output_start + (t0 - local_start)
                     o1 = o0 + (t1 - t0)
-                    out[o0:o1, out_cols] = selected.astype(
-                        target_dtype, copy=False,
+                    out[o0:o1, out_cols] = self._cast_result(
+                        selected, target_dtype, label="statistics series",
                     )
+            self.owner._verify_source_path(checked_path)
 
-    def get_series(
+    def resolve_series_points(
         self,
-        points: Union[np.ndarray, Sequence[np.ndarray]],
-        level: Optional[int] = None,
-        trial: int = 0,
-        fill_value: float = np.nan,
-        dtype: Optional[np.dtype] = None,
+        queries: Sequence[int | tuple[int, int]],
         *,
-        time_slice: slice | None = None,
-    ) -> np.ndarray:
-        request = self._make_series_request(
-            time_slice=time_slice, level=level, trial=trial,
-        )
-        target_dtype = self._result_dtype(dtype)
+        use_xy: bool,
+    ) -> dict[int, List[Tuple[int, int]]]:
+        """Resolve a validated query to immutable rank-local column pairs."""
 
-        def _as_list(v):
-            if isinstance(v, (list, tuple)):
-                # A sequence of ndarrays is the documented multi-ID-array
-                # form, even when every array happens to contain two IDs.
-                # Reserve the compact XY spelling for Python coordinate pairs.
-                if v and all(
-                    isinstance(item, (list, tuple))
-                    and len(item) == 2
-                    and all(np.isscalar(value) for value in item)
-                    for item in v
-                ):
-                    return [np.asarray(v)]
-            return [np.asarray(a) for a in v] if isinstance(v, (list, tuple)) else [np.asarray(v)]
-        arr_list = _as_list(points)
-        if not arr_list:
-            return np.empty((request.length, 0), dtype=target_dtype)
-
-        def _kind(a: np.ndarray) -> str:
-            if a.ndim == 2 and a.shape[1] == 2:
-                return "xy"
-            if a.ndim == 1 or a.ndim == 0:
-                return "id"
-            raise ValueError(f"Unsupported points shape: {a.shape}")
-
-        kinds = {_kind(a) for a in arr_list}
-        if len(kinds) != 1:
-            raise ValueError("Provide either all XY (N,2) or all IDs (N,). Do not mix.")
-        use_xy = kinds.pop() == "xy"
-
-        for array in arr_list:
-            if array.dtype.kind not in "iu" or array.dtype.kind == "b":
-                raise TypeError("point IDs and XY coordinates must be integers")
-
-        if use_xy:
-            queries = [
-                (int(px), int(py))
-                for array in arr_list for px, py in np.asarray(array)
-            ]
-        else:
-            queries = [
-                int(value) for array in arr_list
-                for value in np.asarray(array).ravel()
-            ]
-
-        N = len(queries)
-        if len(set(queries)) != N:
-            raise ValueError("Duplicate points not allowed.")
-        col_to_hits: List[Optional[Tuple[int, int]]] = [None] * N
+        col_to_hits: List[Optional[Tuple[int, int]]] = [None] * len(queries)
 
         # Map queries to (rank_idx, local_index) and check all found
         if use_xy:
@@ -508,26 +548,36 @@ class MultiRankDataAccess:
                         col_to_hits[c] = (r_idx, rank_lookup[qid])
 
         if any(hit is None for hit in col_to_hits):
-            raise ValueError("Some points not found in any rank.")
+            raise ValueError("some points were not found in any rank")
 
         logger.debug("Resolved %d statistics points across ranks", len(queries))
-
-        out = np.empty((request.length, N), dtype=target_dtype)
-        if request.length == 0:
-            return out
 
         rank_to_cols: dict[int, List[Tuple[int, int]]] = {}
         for col, hit in enumerate(col_to_hits):
             r_idx, li = hit  # hit is guaranteed not None
             rank_to_cols.setdefault(r_idx, []).append((col, li))
+        return rank_to_cols
+
+    def get_series(self, query: Any) -> np.ndarray:
+        """Execute one already validated and rank-resolved series query."""
+
+        request = query.time_request
+        target_dtype = query.target_dtype
+        rank_to_cols = query.rank_to_columns
+        column_count = sum(len(pairs) for pairs in rank_to_cols.values())
+        out = np.empty(
+            (request.length, column_count), dtype=target_dtype,
+        )
+        if request.length == 0 or column_count == 0:
+            return out
 
         # Fast path for an already materialized in-memory cache.
         for r_idx, pairs in rank_to_cols.items():
             info = self.owner._rank_files[r_idx]
-            cache_arr = info.get("cache")
+            cache_arr = self.owner._rank_cache_for(info["rank_id"])
             if cache_arr is not None:
                 self._copy_series_from_cache(
-                    out, info, pairs, request, target_dtype,
+                    out, cache_arr, info, pairs, request, target_dtype,
                 )
                 continue
 

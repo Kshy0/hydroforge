@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hydroforge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Generic framework for GPU-accelerated hydrological modelling"
 requires-python = ">=3.11"
 authors = [
@@ -38,4 +38,4 @@ namespaces = false
 hydroforge-cuda-precompile = "hydroforge.kernels.backends.cuda.precompile:main"
 
 [project.optional-dependencies]
-dev = ["ipykernel", "matplotlib", "ipympl", "pandas"]
+dev = ["ipykernel", "matplotlib", "ipympl", "pandas", "pytest"]

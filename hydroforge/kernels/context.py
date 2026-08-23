@@ -5,7 +5,25 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
-from typing import Any
+from typing import Any, Callable, TypeVar
+
+from pydantic import InstanceOf
+
+from hydroforge.contracts.kernels import KernelSpec
+from hydroforge.contracts.validation import HydroForgeModel
+
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+class _RegistryFactoryDeclaration(HydroForgeModel):
+    function: Callable[..., Any]
+
+
+class _RegistryFactoryInvocation(HydroForgeModel):
+    """One registry-owned factory invocation with its canonical ABI."""
+
+    spec: InstanceOf[KernelSpec]
 
 
 _ACTIVE_OPERATOR_RECORDER: ContextVar[Any | None] = ContextVar(
@@ -30,27 +48,18 @@ def active_kernel_spec() -> Any | None:
     return _ACTIVE_KERNEL_SPEC.get()
 
 
-def require_active_kernel_spec() -> Any:
-    """Return the registry contract or fail outside backend construction."""
-    spec = active_kernel_spec()
-    if spec is None:
-        raise RuntimeError("no active BackendRegistry KernelSpec")
-    return spec
-
-
-def registry_factory(function):
+def registry_factory(function: _F) -> _F:
     """Declare a helper that is valid only while a registry builds a backend.
 
     This is the explicit source form for lazy native catalogs that consume the
     enclosing registry's KernelSpec instead of repeating it.
     """
+    declaration = _RegistryFactoryDeclaration(function=function)
+    function = declaration.function
+
     @wraps(function)
     def guarded(*args, **kwargs):
-        if active_kernel_spec() is None:
-            raise RuntimeError(
-                f"registry factory {function.__qualname__} was called outside "
-                "BackendRegistry.resolve()"
-            )
+        _RegistryFactoryInvocation(spec=active_kernel_spec())
         return function(*args, **kwargs)
 
     guarded.__hydroforge_registry_factory__ = True
@@ -76,23 +85,8 @@ def active_operator_recorder() -> Any | None:
     return _ACTIVE_OPERATOR_RECORDER.get()
 
 
-def compiled_operator_entry(function):
+def compiled_operator_entry(function: _F) -> _F:
     """Mark a framework function as one nominal substep IR operator entry."""
 
-    if not function.__module__.startswith("hydroforge."):
-        raise TypeError(
-            "compiled_operator_entry is reserved for HydroForge-owned IR "
-            "operators; downstream physics must use BackendRegistry"
-        )
     function.__hydroforge_compiled_operator__ = True
     return function
-
-
-def reject_direct_kernel_launch(name: str) -> None:
-    """Reject native dispatchers that bypass the registered kernel entry."""
-    if active_operator_recorder() is not None:
-        raise RuntimeError(
-            f"kernel {name!r} was launched through a backend dispatcher while "
-            "a compiled substep was being recorded; expose it through "
-            "BackendRegistry + KernelSpec and call the registered entry"
-        )

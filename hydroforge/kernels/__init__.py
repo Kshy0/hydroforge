@@ -1,19 +1,25 @@
-"""Kernel contracts, binding, and backend dispatch."""
+"""Stable physical-kernel authoring API."""
 
 from hydroforge.kernels.registry import (
     BackendRegistry,
-    KernelEntry,
-    make_metal_dispatcher,
+    make_spec_cuda_dispatcher,
+    make_spec_metal_dispatcher,
     make_torch_dispatcher,
     make_triton_dispatcher,
-    make_variant_dispatcher,
+    make_triton_program_dispatcher,
+    make_triton_sequence_dispatcher,
+    registry_factory,
+    resolve_model_backend,
 )
 
 __all__ = [
     "BackendRegistry",
-    "KernelEntry",
-    "make_metal_dispatcher",
+    "make_spec_cuda_dispatcher",
+    "make_spec_metal_dispatcher",
     "make_torch_dispatcher",
     "make_triton_dispatcher",
-    "make_variant_dispatcher",
+    "make_triton_program_dispatcher",
+    "make_triton_sequence_dispatcher",
+    "registry_factory",
+    "resolve_model_backend",
 ]

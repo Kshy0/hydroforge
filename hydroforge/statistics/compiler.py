@@ -37,7 +37,6 @@ class StatisticsCompiler:
         result = _EMITTERS[backend](owner, lowering).emit()
         owner._aggregator_function = result.function
         owner._kernel_module = result.module
-        owner._aggregator_generated = result.generated
         owner._saved_kernel_file = result.saved_kernel_file
         return result
 
@@ -48,10 +47,4 @@ class StatisticsCompiler:
             return "torch"
         if device_type == "mps":
             return "metal"
-        if device_type != "cuda":
-            return "torch"
-        if owner.backend not in {"cuda", "triton", "torch"}:
-            raise ValueError(
-                f"Backend {owner.backend!r} cannot run CUDA tensors."
-            )
         return owner.backend

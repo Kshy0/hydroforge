@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 
-from hydroforge.contracts import ResourceCleanupError
+from hydroforge.contracts.errors import ResourceCleanupError
 from hydroforge.kernels.backends.metal.limits import (
     validate_metal_launch_extent,
 )
@@ -110,15 +110,13 @@ class MetalCommandSequence:
 
     def mark_barrier(self) -> None:
         """Place a dependency barrier after the most recently recorded command."""
-        if not self.prepared_commands:
-            raise RuntimeError("No Metal command has been recorded")
         self.prepared_commands[-1] = (*self.prepared_commands[-1][:-1], True)
         self._pending_reads.clear()
         self._pending_writes.clear()
 
     def _prepare(self):
         if not self.prepared_commands:
-            raise ValueError("Metal command sequence is empty")
+            return None, [], [], [], [], []
         prepared = []
         for item in self.prepared_commands:
             threads = validate_metal_launch_extent(
@@ -136,8 +134,6 @@ class MetalCommandSequence:
         if not prepared:
             return None, [], [], [], [], []
         native = prepared[0][0]
-        if any(item[0] is not native for item in prepared[1:]):
-            raise RuntimeError("Metal commands use different native runtimes")
         return (
             native,
             [item[1] for item in prepared],
@@ -211,16 +207,11 @@ class MetalCommandSequence:
 class MetalNoOpICB:
     """An address-stable empty program produced by zero-width operators."""
 
-    _closed: bool = field(default=False, init=False)
-
     def replay(self, replays: int = 1) -> None:
-        if self._closed:
-            raise RuntimeError("Metal no-op ICB has been released")
-        if type(replays) is not int or replays < 1:
-            raise ValueError("Metal ICB replay count must be a positive int")
+        del replays
 
     def close(self) -> None:
-        self._closed = True
+        return None
 
 
 @dataclass
@@ -232,10 +223,6 @@ class MetalICB:
     _closed: bool = field(default=False, init=False)
 
     def replay(self, replays: int = 1) -> None:
-        if self._closed:
-            raise RuntimeError("Metal ICB has been released")
-        if type(replays) is not int or replays < 1:
-            raise ValueError("Metal ICB replay count must be a positive int")
         self._native.replay_icb(self.graph_id, replays)
 
     def close(self) -> None:

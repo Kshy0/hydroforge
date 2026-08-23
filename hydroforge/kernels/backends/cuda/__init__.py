@@ -1,15 +1,11 @@
 """Declarative CUDA/HIP extension backend."""
 
 from hydroforge.kernels.backends.cuda.dispatcher import (
-    CudaExtensionGroup, CudaNativeProjection,
+    CudaExtensionGroup, CudaNativeProjection, CudaRoute,
 )
 from hydroforge.kernels.backends.cuda.spec import CudaExtensionSpec
-from hydroforge.kernels.backends.cuda.template import (
-    SpecCudaTemplateDispatcher, make_spec_cuda_dispatcher,
-)
 
 __all__ = [
-    "CudaExtensionGroup", "CudaExtensionSpec",
+    "CudaExtensionGroup", "CudaExtensionSpec", "CudaRoute",
     "CudaNativeProjection",
-    "SpecCudaTemplateDispatcher", "make_spec_cuda_dispatcher",
 ]

@@ -16,17 +16,39 @@ from __future__ import annotations
 import numpy as np
 
 from hydroforge.data.mapping.grid import RegularGrid
+from hydroforge.data.numeric import canonical_ids
 from hydroforge.data.mapping.target import TargetSupport
+from hydroforge.data.numeric import (
+    canonical_float64, canonical_floating_array,
+)
 
 
 _EARTH_RADIUS_M = 6371007.2
 
 
 def normalise_row(values: np.ndarray) -> np.ndarray:
-    total = float(values.sum())
-    if total <= 0.0:
-        return values.astype(np.float32, copy=False)
-    return (values / total).astype(np.float32, copy=False)
+    if np.ma.isMaskedArray(values) and np.any(np.ma.getmaskarray(values)):
+        raise ValueError("mapping row weights contain missing values")
+    row = np.asarray(values)
+    if row.ndim != 1:
+        raise ValueError("mapping row weights must be one-dimensional")
+    if row.dtype.kind not in {"f", "i", "u"}:
+        raise TypeError("mapping row weights must contain real numbers")
+    row = canonical_floating_array(
+        row, dtype="float64", label="mapping row weights",
+    )
+    if not np.isfinite(row).all() or np.any(row < 0.0):
+        raise ValueError("mapping row weights must be finite and nonnegative")
+    scale = float(row.max(initial=0.0))
+    if scale <= 0.0:
+        raise ValueError("mapping row weights must have a positive sum")
+    scaled = row / scale
+    total = float(scaled.sum(dtype=np.float64))
+    if not np.isfinite(total) or total <= 0.0:
+        raise OverflowError(
+            "mapping row weights cannot be normalized in float64"
+        )
+    return scaled / total
 
 
 def regular_overlap_rows(
@@ -43,7 +65,8 @@ def regular_overlap_rows(
 
     Returns one ``(source_cols, weights, coverage)`` tuple per target, where
     ``source_cols`` index the C-order ``(y, x)`` flattened source grid and
-    ``coverage`` is the planar covered-area fraction used for validation.
+    ``coverage`` is the covered-area fraction in the same geometry used by
+    the returned weights.
     """
     if target.bounds is None:
         raise ValueError("overlap requires target cell bounds")
@@ -54,11 +77,18 @@ def regular_overlap_rows(
     y_hi = source.y_bounds[:, 1]
     nx = source.x.size
     geographic = bool(source.is_geographic)
+    shifted_longitude_convention = geographic and bool(
+        np.min(source.x) < -180.0 or np.max(source.x) > 180.0
+    )
 
     rows: list[tuple[np.ndarray, np.ndarray, float]] = []
     for xmin, xmax, ymin, ymax in target.bounds:
         target_width = float(xmax - xmin)
-        if geographic and source.periodic_x:
+        if geographic and (ymin < -90.0 or ymax > 90.0):
+            raise ValueError(
+                "geographic target latitude bounds must lie within [-90, 90]"
+            )
+        if geographic and source._periodic_x:
             if target_width > 360.0 + 1e-9:
                 raise ValueError(
                     "geographic target longitude width cannot exceed 360 degrees"
@@ -83,6 +113,21 @@ def regular_overlap_rows(
                     - np.maximum(shifted_min, x_lo),
                     0.0, None,
                 )
+        elif shifted_longitude_convention:
+            source_center = 0.5 * (
+                float(np.min(x_lo)) + float(np.max(x_hi))
+            )
+            target_center = 0.5 * (float(xmin) + float(xmax))
+            shift = 360.0 * round(
+                (source_center - target_center) / 360.0
+            )
+            shifted_min = xmin + shift
+            shifted_max = xmax + shift
+            lon_overlap = np.clip(
+                np.minimum(shifted_max, x_hi)
+                - np.maximum(shifted_min, x_lo),
+                0.0, None,
+            )
         else:
             lon_overlap = np.clip(
                 np.minimum(xmax, x_hi) - np.maximum(xmin, x_lo),
@@ -111,11 +156,21 @@ def regular_overlap_rows(
         cols = (row_idx[:, None] * nx + col_idx[None, :]).ravel().astype(np.int64)
         values = area.ravel().astype(np.float64)
 
-        covered_planar = float(
-            np.sum(lat_overlap[row_idx][:, None] * lon_overlap[col_idx][None, :])
+        if geographic:
+            target_area = (
+                np.radians(target_width)
+                * _EARTH_RADIUS_M * _EARTH_RADIUS_M
+                * (
+                    np.sin(np.radians(ymax))
+                    - np.sin(np.radians(ymin))
+                )
+            )
+        else:
+            target_area = float(target_width * (ymax - ymin))
+        coverage = (
+            float(values.sum(dtype=np.float64)) / target_area
+            if target_area > 0.0 else 0.0
         )
-        target_planar = float(target_width * (ymax - ymin))
-        coverage = covered_planar / target_planar if target_planar > 0.0 else 0.0
         rows.append((cols, values, float(coverage)))
     return rows
 
@@ -139,14 +194,55 @@ def aggregate_hires_coo(
     default; when ``allow_oob_zero`` is true, those pixels are dropped so their
     contribution is zero.
     """
-    from hydroforge.data.distributed import find_indices_in
+    from hydroforge.data.distributed import _find_indices_in_trusted
 
-    target_ids = np.asarray(target_ids, dtype=np.int64)
-    catchment_idx = find_indices_in(np.asarray(pixel_catchment_id, dtype=np.int64), target_ids)
+    if np.asarray(target_ids).ndim != 1:
+        raise ValueError("target_ids must be one-dimensional")
+    target_ids = canonical_ids(target_ids, label="target_ids")
+    if np.unique(target_ids).size != target_ids.size:
+        raise ValueError("target_ids must be unique")
+    if type(allow_oob_zero) is not bool:
+        raise TypeError("allow_oob_zero must be an exact bool")
+    catchment_ids = canonical_ids(
+        pixel_catchment_id, label="pixel_catchment_id",
+    )
+    if np.ma.isMaskedArray(pixel_area) and np.any(
+        np.ma.getmaskarray(pixel_area)
+    ):
+        raise ValueError("pixel_area contains missing values")
+    raw_area = np.asarray(pixel_area)
+    if raw_area.ndim != 1:
+        raise ValueError("pixel_area must be one-dimensional")
+    if raw_area.dtype.kind not in {"f", "i", "u"}:
+        raise TypeError("pixel_area must contain real numbers")
+    areas = canonical_floating_array(
+        raw_area, dtype="float64", label="pixel_area",
+    )
+    raw_longitude = np.asanyarray(pixel_lon)
+    raw_latitude = np.asanyarray(pixel_lat)
+    if raw_longitude.ndim != 1:
+        raise ValueError("pixel_lon must be one-dimensional")
+    if raw_latitude.ndim != 1:
+        raise ValueError("pixel_lat must be one-dimensional")
+    longitude = canonical_float64(pixel_lon, label="pixel_lon")
+    latitude = canonical_float64(pixel_lat, label="pixel_lat")
+    sizes = {
+        "pixel_catchment_id": catchment_ids.size,
+        "pixel_area": areas.size,
+        "pixel_lon": longitude.size,
+        "pixel_lat": latitude.size,
+    }
+    if len(set(sizes.values())) != 1:
+        raise ValueError(f"hires pixel arrays must have equal sizes: {sizes}")
+    if not np.isfinite(areas).all() or np.any(areas < 0.0):
+        raise ValueError("pixel_area must be finite and nonnegative")
+    if not np.isfinite(longitude).all() or not np.isfinite(latitude).all():
+        raise ValueError("pixel coordinates must be finite")
+    catchment_idx = _find_indices_in_trusted(catchment_ids, target_ids)
     try:
-        source_idx = source.index_of_points(
-            pixel_lon,
-            pixel_lat,
+        source_idx = source._index_of_points(
+            longitude,
+            latitude,
             allow_oob=allow_oob_zero,
         )
     except ValueError as exc:
@@ -164,5 +260,5 @@ def aggregate_hires_coo(
     # Keep source areas in float64 until duplicate COO entries have been
     # coalesced by scipy.  Casting each pixel before that reduction loses
     # measurable area when hundreds of hires pixels map to one source cell.
-    data = np.asarray(pixel_area, dtype=np.float64)[valid]
+    data = areas[valid]
     return rows, cols, data

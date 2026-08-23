@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
+import math
 from typing import TYPE_CHECKING, Any, Callable, Final, Iterator
 
 import torch
+from pydantic import Field, PrivateAttr, model_validator
+
+from hydroforge.contracts.validation import HydroForgeModel
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -26,38 +29,14 @@ class SubstepFrame:
     dt: torch.Tensor
 
 
-class AdaptiveSubstepFrame:
-    """Adaptive frame with an explicit proposal/physics phase boundary."""
-
-    __slots__ = ("index", "dt", "_resolve")
-
-    def __init__(self, frame: SubstepFrame, resolve) -> None:
-        self.index = frame.index
-        self.dt = frame.dt
-        self._resolve = resolve
-
-    def resolve_dt(self) -> None:
-        """End dt proposal and begin the physics operator region."""
-        self._resolve()
-
-
 class _FixedFinalRecorder:
     def __init__(self, model: AbstractModel, *, stable_tensors) -> None:
         self.model = model
         self.stable_tensors = stable_tensors
-        self.claimed = False
-        self.program = None
 
-    def record(self, callback: Callable[[], None]) -> None:
-        if self.claimed:
-            raise RuntimeError(
-                "a fixed substep may declare only one final operator region"
-            )
-        if not callable(callback):
-            raise TypeError("fixed substep final callback must be callable")
+    def record(self, callback: Callable[[], None]) -> Any:
         from hydroforge.execution.operators import record_operator_scope
 
-        self.claimed = True
         recording = record_operator_scope(
             self.model,
             stable_tensors=self.stable_tensors,
@@ -65,15 +44,13 @@ class _FixedFinalRecorder:
         )
         with recording:
             callback()
-        if recording.program is None:
-            raise RuntimeError("fixed final recording did not complete")
         if not recording.program.operators:
             from hydroforge.execution.operators import SubstepCompileError
 
             raise SubstepCompileError(
                 "fixed final callback produced an empty operator IR"
             )
-        self.program = recording.program
+        return recording.program
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,35 +71,177 @@ def _specialization_key(value: Any) -> Any:
         return type(value), value
     if isinstance(value, tuple):
         return tuple(_specialization_key(item) for item in value)
-    raise TypeError(
+    raise ValueError(
         "substep specialization must be None, bool, int, float, str, or a "
         "tuple composed from those exact scalar types"
     )
 
 
+class _FixedSubstepRequest(HydroForgeModel):
+    count: int | None = Field(default=None, strict=True, ge=1)
+    requested_sub_steps: int | None = Field(
+        default=None, strict=True, ge=1, exclude=True,
+    )
+    final: Callable[[], None] | None = None
+    specialization: Any = None
+    scope_available: bool = Field(strict=True, exclude=True)
+
+    _specialization: Any = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _resolve(self):
+        if not self.scope_available:
+            raise ValueError(
+                "a managed step may execute only one fixed/adaptive substep "
+                "scope"
+            )
+        if self.count is not None and self.requested_sub_steps is not None:
+            raise ValueError(
+                "computed fixed substep count conflicts with explicit "
+                "num_sub_steps request"
+            )
+        count = (
+            self.requested_sub_steps
+            if self.count is None and self.requested_sub_steps is not None
+            else 1 if self.count is None else self.count
+        )
+        if count >= INVALID_SUBSTEP_COUNT:
+            raise ValueError(
+                "fixed substep count must be smaller than HydroForge's "
+                "reserved int32 sentinel"
+            )
+        object.__setattr__(self, "count", count)
+        self._specialization = _specialization_key(self.specialization)
+        return self
+
+    @property
+    def specialization_key(self) -> Any:
+        return self._specialization
+
+
+class _AdaptiveSubstepRequest(HydroForgeModel):
+    candidate_dt: torch.Tensor
+    dt: torch.Tensor
+    maximum_dt: Any
+    maximum_steps: int = Field(strict=True, ge=1, lt=INVALID_SUBSTEP_COUNT)
+    proposal: Callable[[], None]
+    specialization: Any = None
+    requested_sub_steps: int | None = Field(default=None, exclude=True)
+    model_dtype: Any = Field(exclude=True)
+    model_device: torch.device = Field(exclude=True)
+    scope_available: bool = Field(strict=True, exclude=True)
+
+    _maximum_dt: float = PrivateAttr()
+    _specialization: Any = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _validate_request(self):
+        if not self.scope_available:
+            raise ValueError(
+                "a managed step may execute only one fixed/adaptive substep "
+                "scope"
+            )
+        if self.requested_sub_steps is not None:
+            raise ValueError(
+                "adaptive substeps conflict with explicit num_sub_steps "
+                "request; omit num_sub_steps for adaptive timestepping"
+            )
+        for label, tensor in (
+            ("candidate_dt", self.candidate_dt), ("dt", self.dt),
+        ):
+            if tensor.numel() != 1:
+                raise ValueError(
+                    f"adaptive {label} must be a one-element tensor"
+                )
+            if tensor.layout is not torch.strided or not tensor.is_contiguous():
+                raise ValueError(
+                    f"adaptive {label} must be a contiguous strided tensor"
+                )
+        if self.candidate_dt.dtype != self.model_dtype:
+            raise ValueError(
+                "adaptive candidate_dt dtype must match model dtype"
+            )
+        if self.dt.dtype != self.candidate_dt.dtype:
+            raise ValueError(
+                "adaptive dt and candidate_dt must have identical dtype"
+            )
+        if self.candidate_dt.device != self.model_device:
+            raise ValueError(
+                "adaptive candidate_dt must be on the model device"
+            )
+        if self.dt.device != self.candidate_dt.device:
+            raise ValueError(
+                "adaptive dt and candidate_dt must share one device"
+            )
+        if isinstance(self.maximum_dt, (bool, torch.Tensor)) or type(
+            self.maximum_dt
+        ) not in {int, float}:
+            raise ValueError("adaptive maximum_dt must be an exact real scalar")
+        maximum_dt = float(self.maximum_dt)
+        if not math.isfinite(maximum_dt) or maximum_dt <= 0:
+            raise ValueError("adaptive maximum_dt must be finite and positive")
+        encoded = torch.tensor(maximum_dt, dtype=self.model_dtype).item()
+        if not math.isfinite(encoded) or encoded <= 0:
+            raise ValueError(
+                "adaptive maximum_dt must remain finite and positive in "
+                f"model dtype {self.model_dtype}"
+            )
+        if type(self.maximum_dt) is int and int(encoded) != self.maximum_dt:
+            raise ValueError(
+                "adaptive maximum_dt integer must be exactly representable "
+                f"in model dtype {self.model_dtype}"
+            )
+        self._maximum_dt = maximum_dt
+        self._specialization = _specialization_key(self.specialization)
+        return self
+
+    @property
+    def normalized_maximum_dt(self) -> float:
+        return self._maximum_dt
+
+    @property
+    def specialization_key(self) -> Any:
+        return self._specialization
+
+
+class _PredicateLoopRequest(HydroForgeModel):
+    maximum_steps: int = Field(strict=True, ge=1, lt=INVALID_SUBSTEP_COUNT)
+
+
+class _PredicateIterationRequest(HydroForgeModel):
+    """Validate the lexical compiler context at the iterator boundary."""
+
+    parent: Any
+
+    @model_validator(mode="after")
+    def _validate_parent(self):
+        if self.parent is None:
+            raise ValueError(
+                "predicate loops must be nested directly inside a compiled "
+                "fixed substep scope"
+            )
+        if self.parent.scope_kind != "fixed":
+            raise ValueError(
+                "predicate loops are supported only directly inside a fixed "
+                f"substep; found {self.parent.scope_kind!r} operator scope"
+            )
+        return self
+
+
 class _FixedScope:
     def __init__(
         self, runtime: SubstepRuntime, *, key: tuple[Any, ...],
-        count: int, duration: float, defer_final: bool,
+        count: int, duration: float, final: Callable[[], None] | None,
     ) -> None:
         self.runtime = runtime
         self.key = key
         self.count = count
         self.duration = duration
-        self.defer_final = defer_final
+        self.final = final
         self.completed = 0
-        self._program = None
-        self._operators = None
-        self._last = None
-        self._iterated = False
 
-    def _execute(self) -> None:
-        program = self._program
-        if program is None:
-            raise RuntimeError("fixed substep body has not been recorded")
-        step = self.runtime.model._execution.active_step
-        if step is None:
-            raise RuntimeError("fixed substeps require @managed_step")
+    def _execute(self, program: Any) -> None:
+        step = self.runtime.step
         if self.runtime.model.world_size > 1:
             from hydroforge.execution.step import (
                 _DistributedStepEvent, _DistributedStepKind,
@@ -131,7 +250,7 @@ class _FixedScope:
                 _DistributedStepKind.SUBSTEP,
             ))
         self.completed = program.execute(
-            self.count, self.duration,
+            self.count, self.duration, step,
         )
         step.completed_substeps = self.completed
 
@@ -141,67 +260,34 @@ class _FixedScope:
 
         programs = self.runtime.model._execution.programs
         program = programs.get(self.key, _MISSING_PROGRAM)
-        self._iterated = True
         if program is _MISSING_PROGRAM:
-            program = FixedSubstepProgram(self.runtime.model)
-            final = _FixedFinalRecorder(
-                self.runtime.model,
-                stable_tensors=(
-                    program.count, program.counter, program.weight,
-                ),
-            )
-            frame = SubstepFrame(
-                index=program.counter,
-                dt=program.weight,
-            )
+            draft = FixedSubstepProgram.recording_draft(self.runtime.model)
             with record_operator_scope(
                 self.runtime.model,
                 stable_tensors=(
-                    program.count, program.counter,
-                    program.weight,
+                    draft.count, draft.counter,
+                    draft.weight,
                 ),
                 scope_kind="fixed",
             ) as recording:
-                yield frame
-            if recording.program is None:
-                raise RuntimeError("fixed substep recording did not complete")
-            if self.defer_final:
-                self._operators = recording.program
-                self._last = final
-            else:
-                program.install(recording.program, final.program)
-                programs[self.key] = program
-        elif not isinstance(program, FixedSubstepProgram):
-            raise RuntimeError("cached substep program has the wrong execution kind")
-        elif program.operators is None:
-            raise RuntimeError("cached fixed substep program is not installed")
-        self._program = program
-        if not self.defer_final:
-            self._execute()
-
-    def after(self, callback: Callable[[], None]) -> None:
-        """Run one compiled callback after the fixed loop."""
-
-        if not callable(callback):
-            raise TypeError("fixed substep final callback must be callable")
-        if not self.defer_final:
-            raise RuntimeError(
-                "fixed scope after() requires fixed(defer_final=True)"
+                yield draft.frame
+            final_program = None
+            if self.final is not None:
+                final = _FixedFinalRecorder(
+                    self.runtime.model,
+                    stable_tensors=(
+                        draft.count, draft.counter, draft.weight,
+                    ),
+                )
+                final_program = final.record(self.final)
+            program = FixedSubstepProgram(
+                self.runtime.model,
+                draft,
+                recording.program,
+                final_program,
             )
-        if not self._iterated or self._program is None:
-            raise RuntimeError(
-                "fixed scope after() must follow the completed lexical loop"
-            )
-        if self._operators is not None:
-            last = self._last
-            if last is None:
-                raise RuntimeError("deferred fixed final recorder is missing")
-            last.record(callback)
-            self._program.install(self._operators, last.program)
-            self.runtime.model._execution.programs[self.key] = self._program
-            self._operators = None
-            self._last = None
-        self._execute()
+            programs[self.key] = program
+        self._execute(program)
 
 
 class _AdaptiveScope:
@@ -209,11 +295,8 @@ class _AdaptiveScope:
         self, runtime: SubstepRuntime, *, key: tuple[Any, ...],
         duration: float, candidate_dt: torch.Tensor, dt: torch.Tensor,
         maximum_dt: float, maximum_steps: int,
+        proposal: Callable[[], None],
     ) -> None:
-        if type(duration) not in {int, float}:
-            raise TypeError("adaptive substep duration must be an int or float")
-        if not math.isfinite(duration) or duration <= 0:
-            raise ValueError("adaptive substep duration must be finite and positive")
         self.runtime = runtime
         self.key = key
         self.duration = float(duration)
@@ -221,6 +304,7 @@ class _AdaptiveScope:
         self.dt = dt
         self.maximum_dt = maximum_dt
         self.maximum_steps = maximum_steps
+        self.proposal = proposal
         self.completed = 0
 
     def __iter__(self) -> Iterator[SubstepFrame]:
@@ -231,86 +315,37 @@ class _AdaptiveScope:
         program = programs.get(self.key, _MISSING_PROGRAM)
         new_program = program is _MISSING_PROGRAM
         if new_program:
-            program = AdaptiveSubstepProgram(
-                self.runtime.model,
+            draft = AdaptiveSubstepProgram.recording_draft(
                 candidate_dt=self.candidate_dt,
                 dt=self.dt,
                 maximum_dt=self.maximum_dt,
                 maximum_steps=self.maximum_steps,
             )
-        elif not isinstance(program, AdaptiveSubstepProgram):
-            raise RuntimeError("cached substep program has the wrong execution kind")
-        program.require_binding(
-            candidate_dt=self.candidate_dt,
-            dt=self.dt,
-            maximum_dt=self.maximum_dt,
-            maximum_steps=self.maximum_steps,
-        )
-        installed = (
-            program.proposal_operators is not None
-            and program.body_operators is not None
-        )
         if new_program:
             proposal = record_operator_scope(
                 self.runtime.model,
-                stable_tensors=(program.candidate,),
+                stable_tensors=(draft.candidate,),
                 scope_kind="adaptive proposal",
             )
             physics = record_operator_scope(
                 self.runtime.model,
                 stable_tensors=(
-                    program.counter, program.time_step,
+                    draft.counter, draft.time_step,
                 ),
                 scope_kind="adaptive physics",
             )
-            active: Any | None = proposal
-            resolved = False
-            proposal.__enter__()
-
-            def resolve() -> None:
-                nonlocal active, resolved
-                if resolved:
-                    raise RuntimeError("sub_step.resolve_dt() called more than once")
-                # Relinquish ownership before exit: a failing transactional
-                # rollback must never be exited a second time by the outer
-                # exception path.
-                current, active = active, None
-                if current is not proposal:
-                    raise RuntimeError("adaptive proposal recording is not active")
-                proposal.__exit__(None, None, None)
-                resolved = True
-                physics.__enter__()
-                active = physics
-
-            frame = AdaptiveSubstepFrame(program.frame, resolve)
-            try:
-                yield frame
-            except BaseException as exc:
-                current, active = active, None
-                if current is not None:
-                    current.__exit__(type(exc), exc, exc.__traceback__)
-                raise
-            if not resolved:
-                current, active = active, None
-                if current is proposal:
-                    proposal.__exit__(None, None, None)
-                raise RuntimeError(
-                    "adaptive substep must call sub_step.resolve_dt() exactly "
-                    "once between dt proposal and physics"
-                )
-            current, active = active, None
-            if current is not physics:
-                raise RuntimeError("adaptive physics recording is not active")
-            physics.__exit__(None, None, None)
-            if proposal.program is None or physics.program is None:
-                raise RuntimeError("adaptive substep recording did not complete")
-            program.install(proposal.program, physics.program)
+            with proposal:
+                self.proposal()
+            with physics:
+                yield draft.frame
+            program = AdaptiveSubstepProgram(
+                self.runtime.model,
+                draft=draft,
+                proposal=proposal.program,
+                body=physics.program,
+            )
             programs[self.key] = program
-        elif not installed:
-            raise RuntimeError("cached adaptive substep program is not installed")
-        step = self.runtime.model._execution.active_step
-        if step is None:
-            raise RuntimeError("adaptive substeps require @managed_step")
+        step = self.runtime.step
         if self.runtime.model.world_size > 1:
             from hydroforge.execution.step import (
                 _DistributedStepEvent, _DistributedStepKind,
@@ -318,7 +353,7 @@ class _AdaptiveScope:
             step.synchronize_distributed(_DistributedStepEvent(
                 _DistributedStepKind.SUBSTEP,
             ))
-        self.completed = program.execute(self.duration)
+        self.completed = program.execute(self.duration, step)
         step.completed_substeps = self.completed
 
 
@@ -329,10 +364,6 @@ class _PredicateScope:
         *,
         maximum_steps: int,
     ) -> None:
-        if type(maximum_steps) is not int:
-            raise TypeError("predicate loop maximum_steps must be an exact int")
-        if maximum_steps < 1:
-            raise ValueError("predicate loop maximum_steps must be positive")
         self.runtime = runtime
         self.maximum_steps = maximum_steps
 
@@ -342,47 +373,45 @@ class _PredicateScope:
         from hydroforge.kernels.context import active_operator_recorder
         from torch.utils._python_dispatch import _disable_current_modes
 
-        parent = active_operator_recorder()
-        if parent is None:
-            raise RuntimeError(
-                "predicate loops must be nested directly inside a compiled "
-                "fixed substep scope"
-            )
-        if parent.scope_kind != "fixed":
-            from hydroforge.execution.operators import SubstepCompileError
-
-            raise SubstepCompileError(
-                "predicate loops are supported only directly inside a fixed "
-                f"substep; found {parent.scope_kind!r} operator scope"
-            )
-        program = PredicateLoopProgram(
+        request = _PredicateIterationRequest(
+            parent=active_operator_recorder(),
+        )
+        parent = request.parent
+        draft = PredicateLoopProgram.recording_draft(
             self.runtime.model,
             maximum_steps=self.maximum_steps,
         )
         recording = record_operator_scope(
             self.runtime.model,
             stable_tensors=(
-                program.predicate,
-                program.counter,
-                program.continue_flag,
+                draft.predicate,
+                draft.counter,
+                draft.continue_flag,
             ),
             scope_kind="predicate",
         )
+        program = None
         try:
             # The child recorder replaces, rather than stacks on, the parent
             # TorchDispatchMode.  Otherwise every child ATen operator would be
             # intercepted a second time by the outer recorder.
             with _disable_current_modes(), recording:
                 yield PredicateLoopFrame(
-                    index=program.counter,
-                    continue_flag=program.predicate,
+                    index=draft.counter,
+                    continue_flag=draft.predicate,
                 )
-            if recording.program is None:
-                raise RuntimeError("predicate loop recording did not complete")
-            program.install(recording.program)
+            program = PredicateLoopProgram(
+                self.runtime.model,
+                maximum_steps=self.maximum_steps,
+                draft=draft,
+                body=recording.program,
+            )
             parent.record_predicate_loop(program)
         except BaseException:
-            program.close()
+            if program is not None:
+                program.close()
+            elif recording.program is not None:
+                recording.program.close(self.runtime.model._execution.capture)
             raise
 
 
@@ -396,24 +425,13 @@ class SubstepRuntime:
     meaning.
     """
 
-    def __init__(self, model: AbstractModel) -> None:
+    def __init__(self, model: Any, step: Any) -> None:
         self.model = model
-
-    @property
-    def requested_sub_steps(self) -> int:
-        """Return the requested fixed count, defaulting to one."""
-
-        step = self.model._execution.active_step
-        if step is None:
-            raise RuntimeError(
-                "requested_sub_steps is available only inside @managed_step"
-            )
-        raw = getattr(step, "requested_sub_steps", None)
-        return 1 if raw is None else raw
+        self.step = step
 
     def fixed(
-        self, *, count: object = _MISSING_COUNT, specialization: Any = None,
-        defer_final: bool = False,
+        self, *, count: object = None, specialization: Any = None,
+        final: Callable[[], None] | None = None,
     ) -> _FixedScope:
         """Declare a fixed loop after decoding the shared count ABI.
 
@@ -421,67 +439,62 @@ class SubstepRuntime:
         :data:`INVALID_SUBSTEP_COUNT` to report an invalid or overflowing
         result without performing an unsafe integer cast.
         """
-        if type(defer_final) is not bool:
-            raise TypeError("defer_final must be an exact bool")
-        step = self.model._execution.active_step
-        requested = (
-            None if step is None else getattr(step, "requested_sub_steps", None)
+        request = _FixedSubstepRequest(
+            count=count,
+            requested_sub_steps=self.step.requested_sub_steps,
+            final=final,
+            specialization=specialization,
+            scope_available=not self.step._substep_scope_claimed,
         )
-        if count is _MISSING_COUNT:
-            if step is None:
-                raise RuntimeError("compiled substeps require @managed_step")
-            count = self.requested_sub_steps
-        elif requested is not None:
-            raise ValueError(
-                "computed fixed substep count conflicts with explicit "
-                "num_sub_steps request"
-            )
-        if type(count) is not int:
-            raise TypeError("fixed substep count must be an int")
-        if count < 1:
-            raise ValueError("fixed substep count must be positive")
-        if count == INVALID_SUBSTEP_COUNT:
-            raise RuntimeError(
-                "fixed substep count received HydroForge's reserved "
-                "invalid-count sentinel"
-            )
-        if count > INVALID_SUBSTEP_COUNT:
-            raise ValueError("fixed substep count must fit in a signed int32")
-        if step is None:
-            raise RuntimeError("compiled substeps require @managed_step")
         duration, key = self._claim_scope(
             kind="fixed",
             specialization=(
-                _specialization_key(specialization),
-                ("defer_final", defer_final),
+                request.specialization_key,
+                ("final", request.final is not None),
             ),
         )
         return _FixedScope(
             self, key=key,
-            count=count, duration=duration, defer_final=defer_final,
+            count=request.count,
+            duration=duration,
+            final=request.final,
         )
 
     def adaptive(
         self, *, candidate_dt: torch.Tensor, dt: torch.Tensor,
         maximum_dt: float, maximum_steps: int,
+        proposal: Callable[[], None],
         specialization: Any = None,
     ) -> _AdaptiveScope:
-        step = self.model._execution.active_step
-        if step is None:
-            raise RuntimeError("compiled substeps require @managed_step")
-        if getattr(step, "requested_sub_steps", None) is not None:
-            raise ValueError(
-                "adaptive substeps conflict with explicit num_sub_steps "
-                "request; omit num_sub_steps for adaptive timestepping"
-            )
+        request = _AdaptiveSubstepRequest(
+            candidate_dt=candidate_dt,
+            dt=dt,
+            maximum_dt=maximum_dt,
+            maximum_steps=maximum_steps,
+            proposal=proposal,
+            specialization=specialization,
+            requested_sub_steps=self.step.requested_sub_steps,
+            model_dtype=self.model.dtype,
+            model_device=self.model.device,
+            scope_available=not self.step._substep_scope_claimed,
+        )
         duration, key = self._claim_scope(
             kind="adaptive",
-            specialization=_specialization_key(specialization),
+            specialization=(
+                request.specialization_key,
+                ("candidate_dt", id(request.candidate_dt)),
+                ("dt", id(request.dt)),
+                ("maximum_dt", request.normalized_maximum_dt),
+                ("maximum_steps", request.maximum_steps),
+            ),
         )
         return _AdaptiveScope(
             self, key=key, duration=duration,
-            candidate_dt=candidate_dt, dt=dt,
-            maximum_dt=maximum_dt, maximum_steps=maximum_steps,
+            candidate_dt=request.candidate_dt,
+            dt=request.dt,
+            maximum_dt=request.normalized_maximum_dt,
+            maximum_steps=request.maximum_steps,
+            proposal=request.proposal,
         )
 
     def predicate(self, *, maximum_steps: int) -> _PredicateScope:
@@ -493,9 +506,10 @@ class SubstepRuntime:
         lexical fixed substep owned by the managed step.
         """
 
+        request = _PredicateLoopRequest(maximum_steps=maximum_steps)
         return _PredicateScope(
             self,
-            maximum_steps=maximum_steps,
+            maximum_steps=request.maximum_steps,
         )
 
     def _claim_scope(
@@ -503,18 +517,7 @@ class SubstepRuntime:
     ) -> tuple[float, tuple[Any, ...]]:
         """Claim the managed method's cached compiled-program identity."""
 
-        step = self.model._execution.active_step
-        if step is None:
-            raise RuntimeError("compiled substeps require @managed_step")
-        duration, key = step.claim_substep_scope(
+        duration, key = self.step.claim_substep_scope(
             kind=kind, specialization=specialization,
         )
-        if (
-            type(duration) is not float
-            or not math.isfinite(duration)
-            or duration <= 0
-        ):
-            raise RuntimeError(
-                "active managed step has no valid compiler-owned time_step"
-            )
         return duration, key

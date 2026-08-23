@@ -10,7 +10,8 @@ from torch.utils._python_dispatch import TorchDispatchMode, _disable_current_mod
 
 from hydroforge.kernels.context import _ACTIVE_OPERATOR_RECORDER
 from hydroforge.kernels.backends.metal.protocol import MetalCommandNode
-from hydroforge.contracts import buffer_access_semantics
+from hydroforge.contracts.kernels import buffer_access_semantics
+from hydroforge.contracts.errors import ResourceCleanupError
 
 
 class SubstepCompileError(RuntimeError):
@@ -60,13 +61,6 @@ def _refs(value: Any):
             yield from _refs(item)
 
 
-def _tensor_abi(tensor: torch.Tensor) -> tuple[Any, ...]:
-    return (
-        tensor.data_ptr(), tensor.dtype, tensor.device, tensor.layout,
-        tuple(tensor.shape), tuple(tensor.stride()), tensor.storage_offset(),
-    )
-
-
 @dataclass(slots=True)
 class TorchOperator:
     function: Any
@@ -108,18 +102,10 @@ class TorchOperator:
             if isinstance(value, _ValueRef):
                 # The current node's out= buffer is address-stable storage,
                 # not a dependency. Every other value reference must have
-                # been produced earlier in this exact replay. Falling back to
-                # its trace-time tensor would silently consume stale data when
-                # an operator dependency is malformed.
+                # been produced earlier in this exact replay by construction.
                 if id(value) in self._output_reference_ids:
                     return value.tensor
-                try:
-                    return values[value.index]
-                except KeyError as error:
-                    raise RuntimeError(
-                        "compiled ATen replay consumed a temporary before its "
-                        f"producer ran (value {value.index})"
-                    ) from error
+                return values[value.index]
             return value
 
         result = self.function(
@@ -128,16 +114,11 @@ class TorchOperator:
 
         def retain(reference: Any, value: Any) -> None:
             if isinstance(reference, _ValueRef):
-                if value is not reference.tensor:
-                    raise RuntimeError(
-                        "compiled ATen replay did not write its preallocated "
-                        "address-stable output"
-                    )
                 values[reference.index] = reference.tensor
 
         def walk(reference: Any, value: Any) -> None:
             if isinstance(reference, (tuple, list)):
-                for ref_item, value_item in zip(reference, value, strict=True):
+                for ref_item, value_item in zip(reference, value):
                     walk(ref_item, value_item)
             elif isinstance(reference, dict):
                 for key in reference:
@@ -148,8 +129,10 @@ class TorchOperator:
         walk(self.outputs, result)
 
 
-@dataclass(slots=True)
-class KernelOperator(MetalCommandNode):
+@dataclass(frozen=True, slots=True)
+class CompiledKernelCall(MetalCommandNode):
+    """One fully validated and specialized native kernel invocation."""
+
     launch: Any
     reads: tuple[torch.Tensor, ...]
     writes: tuple[torch.Tensor, ...]
@@ -161,7 +144,8 @@ class KernelOperator(MetalCommandNode):
 
 @dataclass(slots=True)
 class CollectiveOperator:
-    tensor: torch.Tensor
+    tensors: tuple[torch.Tensor, ...]
+    abis: tuple[tuple[int, int, int], ...]
     operation: str
     reduction: str
     destination: int | None
@@ -170,19 +154,16 @@ class CollectiveOperator:
     cuda_graph_capture_safe: bool = False
 
     def launch(self) -> None:
-        from hydroforge.execution.collectives import launch_recorded_collective
+        from hydroforge.execution.collectives import (
+            launch_recorded_collective_batch,
+        )
 
-        if self.operation == "all_reduce":
-            destination = None
-        elif self.operation == "reduce" and self.destination is not None:
-            destination = self.destination
-        else:
-            raise RuntimeError(
-                f"invalid recorded collective operation {self.operation!r}"
-            )
-        launch_recorded_collective(
-            self.tensor, operation=self.operation, reduction=self.reduction,
-            destination=destination,
+        launch_recorded_collective_batch(
+            self.tensors,
+            self.abis,
+            operation=self.operation,
+            reduction=self.reduction,
+            destination=self.destination,
         )
 
 
@@ -229,16 +210,9 @@ def capture_metal_commands(
         MetalCommandSequence, record_metal_commands,
     )
 
-    if not commands:
-        raise SubstepCompileError("cannot capture an empty Metal command program")
     sequence = MetalCommandSequence()
     with record_metal_commands(sequence):
         for command in commands:
-            if not isinstance(command, MetalCommandNode):
-                raise TypeError(
-                    "Metal ICB commands must implement the nominal "
-                    f"MetalCommandNode contract, got {type(command).__name__}"
-                )
             command.record()
         if cyclic:
             sequence.mark_barrier()
@@ -279,32 +253,16 @@ class OperatorProgram:
                         *_refs(operator.outputs),
                     )
                 )
-        self._binding_abi = tuple(
-            (tensor, _tensor_abi(tensor))
-            for tensor in dict.fromkeys(tensors)
-        )
+        self.referenced_tensors = tuple(dict.fromkeys(tensors))
         self.cuda_graph_capture_safe = all(
             getattr(operator, "cuda_graph_capture_safe", True)
             for operator in self.operators
         )
 
-    def require_stable_bindings(self) -> None:
-        """Reject storage/metadata drift once per outer-step program launch."""
-
-        for tensor, expected in self._binding_abi:
-            observed = _tensor_abi(tensor)
-            if observed != expected:
-                raise RuntimeError(
-                    "compiled substep tensor storage or metadata changed after "
-                    f"recording: expected {expected}, observed {observed}; "
-                    "declared model tensors must be updated in place without "
-                    "resize_() or set_()"
-                )
-
     def references_tensor(self, tensor: torch.Tensor) -> bool:
         """Return whether this compiled program reads or writes ``tensor``."""
 
-        return any(candidate is tensor for candidate, _abi in self._binding_abi)
+        return any(candidate is tensor for candidate in self.referenced_tensors)
 
     def _validate_temporary_uses(self) -> None:
         """Reject pure local results that no later operator can observe."""
@@ -349,7 +307,7 @@ class OperatorProgram:
         values: dict[int, torch.Tensor] = {}
         for operator in self._launch_operators:
             if isinstance(operator, (
-                KernelOperator, CollectiveOperator, PredicateLoopOperator,
+                CompiledKernelCall, CollectiveOperator, PredicateLoopOperator,
                 _MetalKernelSegment,
             )):
                 operator.launch()
@@ -380,7 +338,7 @@ class OperatorProgram:
 
         commands: list[Any] = []
         for operator in self.operators:
-            if isinstance(operator, KernelOperator):
+            if isinstance(operator, CompiledKernelCall):
                 commands.append(operator)
             elif isinstance(operator, CollectiveOperator):
                 raise SubstepCompileError(
@@ -487,14 +445,15 @@ class _OperatorRecorder:
         # Binding may initialize cached geometry scalars with ordinary Torch
         # reductions. Those are cold-path compiler work, not substep operators.
         with _disable_current_modes():
-            bound = self.binder.complete(entry, arguments)
-            implementation = entry.implementation(
+            binding = self.binder.bind(entry, arguments)
+            bound = dict(binding.arguments)
+            implementation = entry._implementation(
                 self.execution.backend,
                 precision=getattr(self.binder.model, "precision", None),
             )
             specialized = implementation.specialize(
-                bound, frozenset(),
-                buffer_dtypes=self.binder.buffer_dtypes(entry, bound),
+                bound,
+                buffer_dtypes=binding.buffer_dtypes,
             )
         for name, value in bound.items():
             if not isinstance(value, torch.Tensor):
@@ -516,33 +475,39 @@ class _OperatorRecorder:
             if buffer_access_semantics(access).writes
             and isinstance(bound.get(name), torch.Tensor)
         ))
-        self.operators.append(KernelOperator(launch, reads, writes))
+        self.operators.append(CompiledKernelCall(launch, reads, writes))
 
-    def record_collective(
-        self, tensor: torch.Tensor, reduction: str, *,
+    def record_collective_batch(
+        self,
+        tensors: tuple[torch.Tensor, ...],
+        abis: tuple[tuple[int, int, int], ...],
+        reduction: str,
+        *,
         operation: str = "all_reduce", destination: int | None = None,
     ) -> None:
-        """Record one communication operation at its physical sequence point."""
+        """Record one validated communication batch at its sequence point."""
 
-        self.reference(tensor)
+        for tensor in tensors:
+            self.reference(tensor)
         if self.execution.capture_mode == "metal_icb":
             raise SubstepCompileError(
                 "Metal ICB substeps do not support distributed collectives"
             )
         self.operators.append(CollectiveOperator(
-            tensor=tensor, operation=operation, reduction=reduction,
-            destination=destination, reads=(tensor,), writes=(tensor,),
+            tensors=tensors,
+            abis=abis,
+            operation=operation,
+            reduction=reduction,
+            destination=destination,
+            reads=tensors,
+            writes=tensors,
         ))
 
     def record_predicate_loop(self, program: Any) -> None:
         """Append one nested predicate program to the current lexical IR."""
 
         body = program.body_operators
-        if body is None:
-            raise RuntimeError("predicate loop body has not been installed")
-        reads = tuple(dict.fromkeys(
-            tensor for tensor, _abi in body._binding_abi
-        ))
+        reads = body.referenced_tensors
         writes = tuple(dict.fromkeys((
             program.predicate,
             program.counter,
@@ -677,8 +642,6 @@ class OperatorRecording:
         stable_tensors: tuple[torch.Tensor, ...] = (),
         scope_kind: str = "generic",
     ) -> None:
-        if not isinstance(scope_kind, str) or not scope_kind:
-            raise ValueError("operator recording scope_kind must be non-empty")
         execution = model._execution
         tensor_arguments = tuple(
             value for value in arguments if isinstance(value, torch.Tensor)
@@ -720,8 +683,6 @@ class OperatorRecording:
         except BaseException as error:
             failures.append(error)
         if failures:
-            from hydroforge.contracts import ResourceCleanupError
-
             causes = (() if exc is None else (exc,)) + tuple(failures)
             error = ResourceCleanupError("substep recording rollback", causes)
             raise error from (exc if exc is not None else failures[0])

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
+import time
 from typing import Any
+
 
 
 @dataclass
@@ -64,9 +65,12 @@ class ProgressState:
         return f"{seconds / 3600:.1f}h"
 
     def format_schedule(self, *, fraction: float, total_steps: int) -> str:
-        fraction = min(max(fraction, 0.0), 1.0)
-        start_fraction = self._schedule_start_fraction or 0.0
-        completed = max(fraction - start_fraction, 0.0)
+        start_fraction = (
+            0.0
+            if self._schedule_start_fraction is None
+            else self._schedule_start_fraction
+        )
+        completed = fraction - start_fraction
         elapsed = self.elapsed
         completed_steps = completed * total_steps
         speed = completed_steps / elapsed if elapsed > 0.0 else 0.0
@@ -110,7 +114,7 @@ class ProgressRuntime:
         if schedule is not None and step is not None:
             elapsed = (step.start - schedule.execution_start).total_seconds()
             duration = (
-                schedule.end - schedule.execution_start
+                schedule._end - schedule.execution_start
             ).total_seconds()
             fraction = elapsed / duration
         self.state.begin_step(
@@ -122,7 +126,7 @@ class ProgressRuntime:
         final_step = (
             schedule is not None
             and step is not None
-            and step.end == schedule.end
+            and step.end == schedule._end
         )
         return self.state.tick(self._phase(), force_emit=final_step)
 
@@ -131,7 +135,7 @@ class ProgressRuntime:
         if schedule is None or step is None:
             return self.state.format_unbounded()
         elapsed = (step.end - schedule.execution_start).total_seconds()
-        duration = (schedule.end - schedule.execution_start).total_seconds()
+        duration = (schedule._end - schedule.execution_start).total_seconds()
         return self.state.format_schedule(
             fraction=elapsed / duration,
             total_steps=len(schedule),

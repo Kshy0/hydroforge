@@ -21,16 +21,16 @@ pip install -e .
 
 ## Model API
 
-The main model-building interfaces are available from `hydroforge.model`:
+Model declarations and execution helpers are separated by namespace:
 
 ```python
+from hydroforge.execution import ManagedStep, between_steps, managed_step
 from hydroforge.model import (
     AbstractModel,
     AbstractModule,
     TensorField,
     computed_tensor_field,
     kernel_field,
-    managed_step,
 )
 ```
 
@@ -41,9 +41,7 @@ from hydroforge.model import (
 - `kernel_field`: exposes a precomputed value to kernel argument inference.
 - `managed_step`: manages one public model step.
 
-Tensor storage can depend on optional modules. A conditional field remains
-`None` and is excluded from input loading, partitioning, runtime namespaces,
-kernel ownership, and checkpoints unless every named module is open:
+Tensor storage can depend on optional modules:
 
 ```python
 import torch
@@ -57,46 +55,38 @@ diagnostic: torch.Tensor | None = TensorField(
 )
 ```
 
-Use a tuple when storage requires multiple modules, for example
-`depends_on=("log", "routing_diagnostics")`. Supplying an inactive conditional
-field explicitly is an error.
+Use a tuple for multiple required modules. `required_by` declares storage used
+when any listed consumer is open. Only `init_state` tensors are checkpointed.
 
-Use `required_by=("bifurcation", "reservoir")` when storage is required if
-at least one listed consumer module is open. Only `init_state` tensors are
-checkpointed; runtime workspaces are reconstructed after restoration.
-
-A model defines its physical execution order directly:
+A model defines forcing staging and physical execution directly:
 
 ```python
+@between_steps
+@torch.inference_mode()
+def set_inputs(self, *, runoff: torch.Tensor) -> None:
+    self.base.runoff.copy_(runoff)
+
 @managed_step
-def step_advance(self):
-    for substep in self.substeps.fixed():
+def step_advance(self, step: ManagedStep) -> None:
+    for _substep in step.fixed():
         route_flow()
         update_storage()
 ```
 
-With a simulation schedule, the driver stages forcing and advances the model:
-
 ```python
-model.set_inputs(runoff)
+model.set_inputs(runoff=runoff)
 model.step_advance()
 ```
 
-Without a schedule, pass `time_step=timedelta(...)` when calling the method.
-`time_step`, `num_sub_steps`, and `output_enabled` are framework call options,
-not parameters of the decorated method. Fixed-step models may use
-`model.step_advance(num_sub_steps=360)`; omitting it lets the model choose its
-default. Adaptive models must omit `num_sub_steps`.
-
-Adaptive models use `self.substeps.adaptive(...)` and call
-`substep.resolve_dt()` between timestep proposal and physical routing.
+Without a simulation schedule, pass `time_step=timedelta(...)` to the managed
+step. Fixed-step models may also pass `num_sub_steps`.
 
 ## Inputs and datasets
 
 `InputProxy` loads model parameters eagerly or lazily:
 
 ```python
-from hydroforge import InputProxy
+from hydroforge.data import InputProxy
 
 parameters = InputProxy.from_nc("parameters.nc", lazy=True)
 ```
@@ -105,20 +95,32 @@ Streaming forcing datasets are available from `hydroforge.data.datasets`:
 
 ```python
 from hydroforge.data.datasets import (
-    AbstractDataset,
     DailyBinDataset,
     ERA5LandAccumDataset,
     ExportedDataset,
-    GriddedDataset,
-    MultiVariableDataset,
     NetCDFDataset,
+    SourceDataset,
     open_multivariable_exported,
     open_multivariable_netcdf,
 )
 ```
 
-Gridded datasets provide mapping and export helpers such as
-`select()`, `export_climatology()`, and `export_catchment_data()`.
+Gridded datasets use `build_local_mapping()` for source selection and
+`shard_forcing()` for device-side mapping. Dataset chunks are not padded; use
+`DataLoader(dataset, batch_size=None, ...)` to yield chunks directly.
+
+Distributed drivers select devices explicitly:
+
+```python
+from hydroforge.data import setup_distributed
+
+distributed = setup_distributed(
+    allowed_devices=("cuda", "cpu"),
+)
+device = distributed.device
+rank = distributed.rank
+world_size = distributed.world_size
+```
 
 ## Model and statistics clocks
 
@@ -126,52 +128,45 @@ Model schedules and statistics windows are explicit:
 
 ```python
 from datetime import timedelta
-from hydroforge import (
-    CalendarWindow,
-    StatisticsPlan,
-)
+
+from hydroforge.contracts import CalendarWindow, StatisticsPlan
 
 runoff_dataset = DailyBinDataset(
     ...,
     model_step=timedelta(days=1),
 )
-schedule = runoff_dataset.simulation_schedule
 
-statistics_plan = StatisticsPlan(
-    inner=CalendarWindow("day"),
-    outer=CalendarWindow("year"),
+model = Model(
+    ...,
+    statistics_plan=StatisticsPlan(
+        inner=CalendarWindow(period="day"),
+        outer=CalendarWindow(period="year"),
+    ),
 )
 ```
-
-Dataset chunks are not padded; the final chunk may be shorter than `chunk_len`.
-Use `DataLoader(dataset, batch_size=None, ...)` to yield chunks directly.
 
 ## Statistics and NetCDF output
 
 Models select variables and aggregation operations with `variables_to_save`.
 Supported reductions are `mean`, `sum`, `max`, `min`, `first`, and `last`.
-NetCDF variable options are passed through validated mappings:
+
+The default NetCDF profile is lossless Blosc-Zstd level 5 with byte shuffle:
 
 ```python
-model = Model(
-    ...,
-    variables_to_save={
-        "mean": ["discharge"],
-        "max": ["water_depth"],
-    },
-    output_netcdf_options={
-        "compression": "zlib",
-        "complevel": 4,
-        "chunksizes": (24, 1024),
-    },
-    checkpoint_netcdf_options={
-        "compression": "zlib",
-        "complevel": 4,
-    },
-)
+output_netcdf_options={
+    "compression": "blosc_zstd",
+    "complevel": 5,
+    "blosc_shuffle": 1,
+}
 ```
 
-Dataset export methods use the same `netcdf_options` mapping.
+HydroForge falls back to zlib level 4 when Blosc is unavailable or a fixed
+chunk is too small. Set zlib explicitly for files that must be readable without
+the Blosc plugin. Quantization is not enabled by default.
+
+When `chunksizes` is omitted, streaming output chooses an approximately 4 MiB
+layout aligned with the write batch. Dataset export methods use the same
+`netcdf_options` mapping.
 
 Multi-rank model output can be read with:
 
@@ -179,12 +174,7 @@ Multi-rank model output can be read with:
 from hydroforge.output.multirank import MultiRankStatsReader
 ```
 
-Statistics output uses contract version 3 and one `hydroforge_run_id` across
-ranks and split years. The reader rejects legacy output and mixed-run files.
-Background output failures stop subsequent model steps.
-
-Boolean NetCDF variables use `u1` storage with
-`hydroforge_dtype="bool"`; values must be `0` or `1`.
+Boolean variables use `u1` storage with `hydroforge_dtype="bool"`.
 
 ## Backend selection
 
@@ -196,8 +186,6 @@ export HYDROFORGE_BACKEND=cuda
 export HYDROFORGE_BACKEND=metal
 export HYDROFORGE_BACKEND=torch
 ```
-
-The selected backend and model precision are validated during initialization.
 
 ## License
 

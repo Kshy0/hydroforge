@@ -7,12 +7,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import linecache
 import hashlib
 import random
 import sys
 import warnings
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
@@ -28,7 +28,6 @@ class CompiledStatistics:
 
     function: Any
     module: ModuleType | Any | None
-    generated: bool
     saved_kernel_file: Path | None
 
 
@@ -50,16 +49,14 @@ class StatisticsEmitter:
         self._generated_modules = owner._generated_modules
         self._statistics_ir = lowering.ir
         self._statistics_lowering = lowering
+        self._control_dtype = owner._statistics_control_dtype()
         self._kernel_module = None
-        self._aggregator_function = None
-        self._aggregator_generated = False
         self._saved_kernel_file = None
 
     def result(self) -> CompiledStatistics:
         return CompiledStatistics(
             function=self._aggregator_function,
             module=self._kernel_module,
-            generated=self._aggregator_generated,
             saved_kernel_file=self._saved_kernel_file,
         )
 
@@ -70,18 +67,15 @@ class StatisticsEmitter:
 
     def _stride_input(self, name: str) -> int:
         """Return one output variable's trial stride from its compiled layout."""
-        for metadata in self._metadata.values():
-            if metadata["original_variable"] == name:
-                return int(metadata.get("stride_input", 0))
-        raise KeyError(f"No compiled statistics metadata exists for {name!r}")
+        return int(self._statistics_layouts[name].stride_input)
 
     def _source_stride(self, name: str) -> int:
         """Return the logical-axis stride for one materialized input buffer."""
-        tensor = self._tensor_registry.get(name)
-        if tensor is None:
-            tensor = self._storage.get(name)
-        if tensor is None:
-            raise KeyError(f"No materialized statistics input exists for {name!r}")
+        tensor = (
+            self._tensor_registry[name]
+            if name in self._tensor_registry
+            else self._storage[name]
+        )
         if self.num_trials > 1 and tensor.ndim >= 2:
             return int(tensor.shape[1])
         return 0
@@ -99,8 +93,6 @@ class StatisticsEmitter:
             kernel_code: Generated kernel code as string
         """
         # Use unique name generation
-        if self.kernels_dir is None:
-            raise RuntimeError("save_kernels requires a kernels directory")
         unique_name = self._generate_unique_name()
         filename = f"kern_{unique_name}.py"
 
@@ -153,4 +145,3 @@ class StatisticsEmitter:
         self._aggregator_function = getattr(
             module, "internal_update_statistics",
         )
-        self._aggregator_generated = True

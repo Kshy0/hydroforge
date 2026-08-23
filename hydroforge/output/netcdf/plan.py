@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
+from hydroforge.serialization.netcdf import (
+    COMMITTED_STEPS_ATTR as COMMITTED_STEPS_ATTR,
+    OUTPUT_FORMAT as OUTPUT_FORMAT,
+    OUTPUT_VERSION as OUTPUT_VERSION,
+    RUN_ID_ATTR as RUN_ID_ATTR,
+)
 
-
-OUTPUT_FORMAT = "hydroforge.statistics"
-OUTPUT_VERSION = 3
-COMMITTED_STEPS_ATTR = "hydroforge_committed_steps"
-RUN_ID_ATTR = "hydroforge_run_id"
 
 @dataclass(frozen=True, slots=True)
 class OutputFilePlan:
@@ -32,7 +33,7 @@ class OutputFilePlan:
 @dataclass(frozen=True, slots=True)
 class NetCDFCreateRequest:
     variable: str
-    metadata: Mapping[str, Any]
+    schema: Any
     coordinate_values: Any
     output_dir: Path
     rank: int
@@ -40,10 +41,8 @@ class NetCDFCreateRequest:
     year: int | None
     calendar: str
     time_unit: str
-    num_trials: int
     static_variables: Mapping[str, Mapping[str, Any]]
     run_id: str | None = None
-    netcdf_options: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

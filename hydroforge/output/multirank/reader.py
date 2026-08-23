@@ -7,43 +7,290 @@
 from __future__ import annotations
 
 import logging
-import re
+from collections.abc import Mapping
 from datetime import datetime
-from functools import cached_property
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Tuple, Union
+from types import SimpleNamespace
+from typing import (
+    Any, Callable, List, Optional, Sequence, Tuple, Union,
+)
 
 import cftime
 import netCDF4 as nc
 import numpy as np
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
-from hydroforge.output.multirank.plotter import MultiRankPlotter
 from hydroforge.output.multirank.catalog import RankOutputCatalog
-from hydroforge.output.multirank.data import MultiRankDataAccess
-from hydroforge.serialization.files import atomic_output_path
+from hydroforge.output.multirank.data import (
+    MultiRankDataAccess, _OutputTimeRequest,
+)
+from hydroforge.output.multirank.plan import (
+    _ReaderFileIdentity, _ReaderStoragePlan,
+)
 from hydroforge.serialization.netcdf import decode_netcdf_logical_array
+from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.contracts.temporal import (
+    normalize_calendar_dates,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class MultiRankStatsReader:
+_SERIES_READER_CONTEXT = "hydroforge_multirank_reader"
+
+
+class _ReaderSeriesQuery(HydroForgeModel):
+    """One fully resolved public time-series query."""
+
+    points: Any
+    level: int | None = Field(default=None, ge=0, strict=True)
+    trial: int = Field(default=0, ge=0, strict=True)
+    dtype: Any = None
+    time_slice: slice | None = None
+
+    _time_request: _OutputTimeRequest = PrivateAttr()
+    _target_dtype: np.dtype = PrivateAttr()
+    _rank_to_columns: dict[int, list[tuple[int, int]]] = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _resolve_query(self, info):
+        context = info.context
+        reader = (
+            context.get(_SERIES_READER_CONTEXT)
+            if isinstance(context, Mapping) else None
+        )
+        if reader is None:
+            raise ValueError("reader series query requires reader context")
+
+        request = reader._data_access._make_series_request(
+            time_slice=self.time_slice,
+            level=self.level,
+            trial=self.trial,
+        )
+        target_dtype = reader._data_access._result_dtype(self.dtype)
+
+        raw = self.points
+        if isinstance(raw, (list, tuple)):
+            if raw and all(
+                isinstance(item, (list, tuple))
+                and len(item) == 2
+                and all(np.isscalar(value) for value in item)
+                for item in raw
+            ):
+                arrays = [np.asarray(raw)]
+            else:
+                arrays = [np.asarray(value) for value in raw]
+        else:
+            arrays = [np.asarray(raw)]
+
+        if not arrays:
+            use_xy = False
+            queries: tuple[int | tuple[int, int], ...] = ()
+        else:
+            kinds = set()
+            for array in arrays:
+                if array.ndim == 2 and array.shape[1] == 2:
+                    kinds.add("xy")
+                elif array.ndim in {0, 1}:
+                    kinds.add("id")
+                else:
+                    raise ValueError(
+                        f"unsupported points shape: {array.shape}"
+                    )
+                if array.dtype.kind not in "iu":
+                    raise ValueError(
+                        "point IDs and XY coordinates must be integers"
+                    )
+                if (
+                    array.dtype.kind == "u"
+                    and array.size
+                    and int(array.max()) > np.iinfo(np.int64).max
+                ):
+                    raise ValueError(
+                        "point IDs and XY coordinates exceed int64 range"
+                    )
+            if len(kinds) != 1:
+                raise ValueError(
+                    "provide either all XY (N,2) or all IDs (N,); do not mix"
+                )
+            use_xy = kinds.pop() == "xy"
+            if use_xy:
+                queries = tuple(
+                    (int(x), int(y))
+                    for array in arrays
+                    for x, y in np.asarray(array)
+                )
+            else:
+                queries = tuple(
+                    int(value)
+                    for array in arrays
+                    for value in np.asarray(array).ravel()
+                )
+        if len(queries) != len(set(queries)):
+            raise ValueError("duplicate points are not allowed")
+
+        self._time_request = request
+        self._target_dtype = target_dtype
+        self._rank_to_columns = reader._data_access.resolve_series_points(
+            queries, use_xy=use_xy,
+        )
+        return self
+
+    @property
+    def time_request(self) -> _OutputTimeRequest:
+        return self._time_request
+
+    @property
+    def target_dtype(self) -> np.dtype:
+        return self._target_dtype
+
+    @property
+    def rank_to_columns(self) -> dict[int, list[tuple[int, int]]]:
+        return self._rank_to_columns
+
+
+class MultiRankStatsReader(HydroForgeModel):
     """
     Manage per‑rank NetCDF outputs written by a StatisticsRuntime-like component.
 
     Major Features:
       - Auto-detect rank files: {var_name}_rank{rank}.nc
-      - Derive (x, y) locations for saved_points using one (mutually exclusive) method:
-          * coord_source=(nx, ny) tuple               -> treat coord_raw as linear indices
-          * coord_source=NetCDF file path             -> extract map shape (nx, ny)
-          * coord_source=callable(coord_raw)->(x,y)   -> custom conversion
+      - Derive (x, y) locations using validated construction fields:
+          * map_shape=(nx, ny)                        -> linear indices
+          * map_shape_nc=Path(...)                    -> validated NetCDF shape
+          * coord_converter=callable                  -> custom conversion
       - Provide vector / grid / time series extraction APIs
       - Basic visualization (single time slice + animation)
       - Export time-sliced grids to CaMa-Flood-compatible Fortran-order binary
     """
 
-    @cached_property
-    def _plotter(self) -> MultiRankPlotter:
-        return MultiRankPlotter(self)
+    base_dir: Path
+    var_name: str
+    coord_name: str | None = None
+    map_shape_input: tuple[int, int] | None = Field(
+        default=None,
+        validation_alias="map_shape",
+        serialization_alias="map_shape",
+        repr=False,
+        description="Explicit immutable map shape supplied by the caller",
+    )
+    map_shape_nc: Path | None = None
+    coord_converter: (
+        Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]] | None
+    ) = None
+    time_range: tuple[
+        datetime | cftime.datetime,
+        datetime | cftime.datetime,
+    ] | None = None
+    cache_enabled: bool = False
+    split_by_year: bool = False
+    row_chunk_size: int | None = Field(default=None, ge=1, strict=True)
+
+    _storage_plan: _ReaderStoragePlan = PrivateAttr()
+    _data_access: MultiRankDataAccess = PrivateAttr()
+    _rank_cache: dict[int, np.ndarray | None] = PrivateAttr(
+        default_factory=dict,
+    )
+    _cache_materialized: bool = PrivateAttr(default=False)
+
+    @property
+    def _rank_files(self):
+        return self._storage_plan.rank_files
+
+    @property
+    def _time_units(self) -> str:
+        return self._storage_plan.time_units
+
+    @property
+    def _time_calendar(self) -> str:
+        return self._storage_plan.time_calendar
+
+    @property
+    def _time_values_num(self) -> np.ndarray:
+        return self._storage_plan.time_values_num
+
+    @property
+    def _time_datetimes(self):
+        return self._storage_plan.time_datetimes
+
+    @property
+    def _time_len(self) -> int:
+        return self._storage_plan.time_len
+
+    @property
+    def _slice_start(self) -> int:
+        return self._storage_plan.slice_start
+
+    @property
+    def _slice_end(self) -> int:
+        return self._storage_plan.slice_end
+
+    @property
+    def _t_indices(self) -> np.ndarray:
+        return self._storage_plan.time_indices
+
+    @field_validator("map_shape_input")
+    @classmethod
+    def _validate_map_shape(
+        cls, value: tuple[int, int] | None,
+    ) -> tuple[int, int] | None:
+        if value is None:
+            return None
+        if type(value) is not tuple or len(value) != 2:
+            raise ValueError("map_shape must be an exact (nx, ny) tuple")
+        if any(type(extent) is not int or extent < 1 for extent in value):
+            raise ValueError("map_shape values must be exact positive ints")
+        return value
+
+    @property
+    def map_shape(self) -> tuple[int, int] | None:
+        """Return the construction-time-resolved coordinate grid shape."""
+
+        return self._storage_plan.map_shape
+
+    @model_validator(mode="after")
+    def _validate_reader_declaration(self):
+        if not self.var_name:
+            raise ValueError("var_name must be non-empty")
+        if (
+            Path(self.var_name).name != self.var_name
+            or "/" in self.var_name
+            or "\\" in self.var_name
+        ):
+            raise ValueError("var_name must not contain path separators")
+        if self.coord_name is not None and not self.coord_name:
+            raise ValueError("coord_name must be None or non-empty")
+        coordinate_sources = sum(
+            source is not None
+            for source in (
+                self.map_shape_input,
+                self.map_shape_nc,
+                self.coord_converter,
+            )
+        )
+        if coordinate_sources > 1:
+            raise ValueError(
+                "map_shape, map_shape_nc and coord_converter are mutually "
+                "exclusive coordinate identity sources"
+            )
+        if self.time_range is not None:
+            start, end = self.time_range
+            _calendar, normalized, _defaulted = normalize_calendar_dates(
+                {
+                    "time_range start": start,
+                    "time_range end": end,
+                },
+                calendar=None,
+                preserve_cftime_declaration=True,
+            )
+            start = normalized["time_range start"]
+            end = normalized["time_range end"]
+            if start > end:
+                raise ValueError(
+                    "time_range start must be <= end (closed interval)"
+                )
+            object.__setattr__(self, "time_range", (start, end))
+        return self
 
     # ----------------------------------------------------------------------------------
     # Internal helpers
@@ -66,17 +313,13 @@ class MultiRankStatsReader:
 
     def _preload_cache(self) -> None:
         """Preload only the chosen inclusive slice [self._slice_start, self._slice_end]."""
-        if self._slice_start is None or self._slice_end is None:
-            raise RuntimeError("Slice indices not set.")
-
         for info in self._rank_files:
             if info["saved_points"] == 0:
-                info["cache"] = None
+                self._rank_cache[info["rank_id"]] = None
                 continue
 
             cache = None
             cache_rows = self._slice_end - self._slice_start + 1
-            written = np.zeros(cache_rows, dtype=bool)
 
             # Iterate through files and extract relevant parts
             for i, fp in enumerate(info["paths"]):
@@ -94,165 +337,137 @@ class MultiRankStatsReader:
                     local_start = req_start - file_start_global
                     local_end = req_end - file_start_global
 
-                    try:
-                        with nc.Dataset(fp, "r") as ds:
-                            var = ds.variables[self.var_name]
-                            # Slicing logic: always take all spatial/trial dims.
-                            # Dimensions are
-                            # (time, [trial], saved_points, [value_axis]).
-                            if self.row_chunk_size is None:
-                                data = var[local_start:local_end, ...]
-                                chunks = ((req_start, data),)
-                            else:
-                                chunks = (
-                                    (
-                                        file_start_global + t0,
-                                        var[
-                                            t0:min(
-                                                t0 + self.row_chunk_size,
-                                                local_end,
-                                            ),
-                                            ...,
-                                        ],
-                                    )
-                                    for t0 in range(
-                                        local_start,
-                                        local_end,
-                                        self.row_chunk_size,
-                                    )
+                    path = self._checked_source_path(fp)
+                    with nc.Dataset(path, "r") as ds:
+                        var = ds.variables[self.var_name]
+                        # Slicing logic: always take all spatial/trial dims.
+                        # Dimensions are
+                        # (time, [trial], saved_points, [value_axis]).
+                        if self.row_chunk_size is None:
+                            data = var[local_start:local_end, ...]
+                            chunks = ((req_start, data),)
+                        else:
+                            chunks = (
+                                (
+                                    file_start_global + t0,
+                                    var[
+                                        t0:min(
+                                            t0 + self.row_chunk_size,
+                                            local_end,
+                                        ),
+                                        ...,
+                                    ],
                                 )
+                                for t0 in range(
+                                    local_start,
+                                    local_end,
+                                    self.row_chunk_size,
+                                )
+                            )
 
-                            for global_start, chunk in chunks:
-                                chunk = decode_netcdf_logical_array(
-                                    var, chunk, name=self.var_name,
+                        for global_start, chunk in chunks:
+                            chunk = decode_netcdf_logical_array(
+                                var, chunk, name=self.var_name,
+                            )
+                            array = self._data_access._array(
+                                chunk, source=fp.name,
+                            )
+                            if cache is None:
+                                cache = np.empty(
+                                    (cache_rows, *array.shape[1:]),
+                                    dtype=array.dtype,
                                 )
-                                array = self._data_access._array(
-                                    chunk, source=fp.name,
-                                )
-                                if cache is None:
-                                    cache = np.empty(
-                                        (cache_rows, *array.shape[1:]),
-                                        dtype=array.dtype,
-                                    )
-                                if (
-                                    array.shape[1:] != cache.shape[1:]
-                                    or array.dtype != cache.dtype
-                                ):
-                                    raise ValueError(
-                                        f"Inconsistent cached shape/dtype in {fp.name}"
-                                    )
-                                destination = global_start - self._slice_start
-                                cache[destination:destination + array.shape[0]] = array
-                                written[
-                                    destination:destination + array.shape[0]
-                                ] = True
-                    except (
-                        OSError, KeyError, IndexError, TypeError, ValueError,
-                    ) as exc:
-                        raise RuntimeError(f"Failed to cache {fp}") from exc
+                            destination = global_start - self._slice_start
+                            cache[destination:destination + array.shape[0]] = array
+                    self._verify_source_path(path)
 
-            if cache is not None and not np.all(written):
-                raise RuntimeError(
-                    f"Failed to cache {int((~written).sum())} requested row(s)"
-                )
-            info["cache"] = cache
+            self._rank_cache[info["rank_id"]] = cache
+
+    def _ensure_cache_materialized(self) -> None:
+        """Lazily acquire the optional resident cache after validation."""
+
+        if not self.cache_enabled or self._cache_materialized:
+            return
+        self._preload_cache()
+        self._cache_materialized = True
 
     # ----------------------------------------------------------------------------------
-    # Constructor
+    # Validated source construction
     # ----------------------------------------------------------------------------------
-    def __init__(
-        self,
-        base_dir: Union[str, Path],
-        var_name: str,
-        coord_name: Optional[str] = None,
-        coord_source: Optional[
-            Union[
-                Tuple[int, int],
-                str,
-                Path,
-                Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray]],
-            ]
-        ] = None,
-        time_range: Optional[Tuple[Union[datetime, cftime.datetime], Union[datetime, cftime.datetime]]] = None,
-        cache_enabled: bool = False,
-        split_by_year: bool = False,
-        row_chunk_size: Optional[int] = None,
-    ):
+    def _compile_storage_plan(
+        self, resolved_map_shape: tuple[int, int] | None,
+    ) -> _ReaderStoragePlan:
         """
         time_range: CLOSED interval (start_dt, end_dt), both inclusive.
         """
-        self.base_dir = Path(base_dir)
-        self.var_name = var_name
-        self.coord_name = coord_name
-
-        self._map_shape: Optional[Tuple[int, int]] = None
-        self._coord_converter: Optional[Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray]]] = None
-
-        self._rank_files: List[dict] = []
-        self._time_units: str | None = None
-        self._time_calendar: str | None = None
-        self._time_values_num: np.ndarray | None = None
-        if type(cache_enabled) is not bool or type(split_by_year) is not bool:
-            raise TypeError("cache_enabled and split_by_year must be exact bools")
-        if row_chunk_size is not None and (
-            type(row_chunk_size) is not int or row_chunk_size < 1
-        ):
-            raise ValueError("row_chunk_size must be an exact positive int")
-        self.cache_enabled = cache_enabled
-        self.split_by_year = split_by_year
-        self.row_chunk_size = row_chunk_size
-
-        self._slice_start: Optional[int] = None
-        self._slice_end: Optional[int] = None
-        self._t_indices: Optional[np.ndarray] = None
-
-        # Interpret coord_source
-        if coord_source is not None:
-            if callable(coord_source):
-                self._coord_converter = coord_source
-            elif isinstance(coord_source, (str, Path)):
-                self.load_map_shape_from_nc(coord_source)
-            else:
-                self.set_map_shape(coord_source)  # type: ignore[arg-type]
-
-        self._catalog = RankOutputCatalog(self)
-        self._data_access = MultiRankDataAccess(self)
-        self._rank_files = self._catalog.scan()
-        if not self._rank_files:
+        candidate_paths = tuple(
+            path.absolute()
+            for path in sorted(
+                self.base_dir.glob(f"{self.var_name}_rank*.nc")
+            )
+        )
+        identities = {
+            path: _ReaderFileIdentity.capture(path)
+            for path in candidate_paths
+        }
+        state = SimpleNamespace(
+            base_dir=self.base_dir,
+            var_name=self.var_name,
+            coord_name=self.coord_name,
+            split_by_year=self.split_by_year,
+            coord_converter=self.coord_converter,
+            map_shape=resolved_map_shape,
+            _rank_files=[],
+            _time_units=None,
+            _time_calendar=None,
+            _time_values_num=None,
+            _time_datetimes=[],
+            _time_len=0,
+        )
+        catalog = RankOutputCatalog(state)
+        state._rank_files = catalog.scan()
+        if not state._rank_files:
             raise FileNotFoundError(
                 f"No files found in {self.base_dir} matching: {self.var_name}_rank*.nc"
             )
 
-        self._catalog.read_timeline()
+        catalog.read_timeline()
 
         # Apply closed datetime slice with strict range checking (no clamping)
-        if time_range is not None:
+        if self.time_range is not None:
             # Strategy: Convert input range to numeric values using the NetCDF unit/calendar.
-            start_in, end_in = time_range
+            start_in, end_in = self.time_range
+            _calendar, normalized, _defaulted = normalize_calendar_dates(
+                {
+                    "time_range start": start_in,
+                    "time_range end": end_in,
+                },
+                calendar=state._time_calendar,
+            )
+            start_in = normalized["time_range start"]
+            end_in = normalized["time_range end"]
+            object.__setattr__(self, "time_range", (start_in, end_in))
 
             t_start_val = nc.date2num(
-                start_in, self._time_units, self._time_calendar,
+                start_in, state._time_units, state._time_calendar,
             )
             t_end_val = nc.date2num(
-                end_in, self._time_units, self._time_calendar,
+                end_in, state._time_units, state._time_calendar,
             )
-            if t_start_val > t_end_val:
-                raise ValueError("time_range start must be <= end (closed interval).")
-
-            file_min = self._time_values_num[0]
-            file_max = self._time_values_num[-1]
+            file_min = state._time_values_num[0]
+            file_max = state._time_values_num[-1]
             if t_start_val < file_min or t_end_val > file_max:
                 raise ValueError(
                     "time_range outside available coverage. "
                     f"Requested [{self._safe_time_str(start_in)} .. "
                     f"{self._safe_time_str(end_in)}] but coverage is "
-                    f"[{self._safe_time_str(self._time_datetimes[0])} .. "
-                    f"{self._safe_time_str(self._time_datetimes[-1])}]."
+                    f"[{self._safe_time_str(state._time_datetimes[0])} .. "
+                    f"{self._safe_time_str(state._time_datetimes[-1])}]."
                 )
 
             valid_mask = (
-                (self._time_values_num >= t_start_val)
-                & (self._time_values_num <= t_end_val)
+                (state._time_values_num >= t_start_val)
+                & (state._time_values_num <= t_end_val)
             )
             indices = np.flatnonzero(valid_mask)
             if indices.size == 0:
@@ -260,36 +475,81 @@ class MultiRankStatsReader:
             left = int(indices[0])
             right = int(indices[-1])
 
-            self._slice_start = left
-            self._slice_end = right
-            self._t_indices = np.arange(left, right + 1, dtype=np.int64)
-
-            self._time_values_num = self._time_values_num[self._t_indices]
-            self._time_datetimes = [self._time_datetimes[i] for i in self._t_indices]
-            self._time_len = len(self._t_indices)
+            slice_start = left
+            slice_end = right
+            time_indices = np.arange(left, right + 1, dtype=np.int64)
+            time_values = state._time_values_num[time_indices]
+            time_datetimes = [
+                state._time_datetimes[index] for index in time_indices
+            ]
         else:
-            self._slice_start = 0
-            self._slice_end = self._time_len - 1
-            self._t_indices = np.arange(self._time_len, dtype=np.int64)
+            slice_start = 0
+            slice_end = state._time_len - 1
+            time_indices = np.arange(state._time_len, dtype=np.int64)
+            time_values = state._time_values_num
+            time_datetimes = state._time_datetimes
 
-        self._catalog.compute_coordinates(force=True)
+        catalog.compute_coordinates()
+        for identity_path, identity in identities.items():
+            identity.verify(identity_path)
+        return _ReaderStoragePlan.compile(
+            rank_files=state._rank_files,
+            time_units=state._time_units,
+            time_calendar=state._time_calendar,
+            time_values_num=time_values,
+            time_datetimes=time_datetimes,
+            slice_start=slice_start,
+            slice_end=slice_end,
+            time_indices=time_indices,
+            map_shape=resolved_map_shape,
+            file_identities=identities,
+        )
 
-        if self.cache_enabled:
-            self._preload_cache()
+    def _checked_source_path(self, path: str | Path) -> Path:
+        return self._storage_plan.checked_path(path)
+
+    def _verify_source_path(self, path: str | Path) -> None:
+        self._storage_plan.verify_path(path)
+
+    def _rank_cache_for(self, rank_id: int) -> np.ndarray | None:
+        return self._rank_cache.get(rank_id)
+
+    @model_validator(mode="after")
+    def _inspect_reader_storage(self):
+        """Resolve external sources after every semantic validator succeeds."""
+
+        try:
+            resolved_map_shape = (
+                self._read_map_shape_from_nc(self.map_shape_nc)
+                if self.map_shape_nc is not None
+                else self.map_shape_input
+            )
+            self._storage_plan = self._compile_storage_plan(
+                resolved_map_shape,
+            )
+            self._data_access = MultiRankDataAccess(self)
+        except (
+            KeyError, IndexError, OSError, RuntimeError, TypeError, ValueError,
+            OverflowError,
+        ) as error:
+            raise ValueError(str(error)) from error
+        return self
 
     # ----------------------------------------------------------------------------------
     # Data getters
     # ----------------------------------------------------------------------------------
-    def get_vector(
+    def _get_vector(
         self, t_index: int, level: Optional[int] = None, trial: int = 0,
         dtype: Optional[np.dtype] = None,
     ) -> np.ndarray:
+        self._ensure_cache_materialized()
         return self._data_access.get_vector(t_index, level, trial, dtype)
 
-    def get_grid(
+    def _get_grid(
         self, t_index: int, level: Optional[int] = None, trial: int = 0,
         fill_value: float = np.nan, dtype: Optional[np.dtype] = None,
     ) -> np.ndarray:
+        self._ensure_cache_materialized()
         return self._data_access.get_grid(
             t_index, level, trial, fill_value, dtype,
         )
@@ -297,321 +557,116 @@ class MultiRankStatsReader:
     def get_series(
         self, points: Union[np.ndarray, Sequence[np.ndarray]],
         level: Optional[int] = None, trial: int = 0,
-        fill_value: float = np.nan, dtype: Optional[np.dtype] = None,
+        dtype: Optional[np.dtype] = None,
         *, time_slice: slice | None = None,
     ) -> np.ndarray:
         """Read point series over a half-open slice of this reader's view."""
 
-        return self._data_access.get_series(
-            points, level, trial, fill_value, dtype,
-            time_slice=time_slice,
+        query = _ReaderSeriesQuery.model_validate(
+            {
+                "points": points,
+                "level": level,
+                "trial": trial,
+                "dtype": dtype,
+                "time_slice": time_slice,
+            },
+            context={_SERIES_READER_CONTEXT: self},
         )
-
-    def plot_single_time(
-        self,
-        t_index: int = 0,
-        level: Optional[int] = None,
-        trial: int = 0,
-        vmin: Optional[float] = None,
-        vmax: Optional[float] = None,
-        cmap: str = "viridis",
-        figsize: Tuple[int, int] = (8, 6),
-        as_scatter_if_no_map: bool = True,
-        s: float = 1.0,
-        auto_crop: bool = True,
-        crop_pad: int = 10,
-    ) -> None:
-        self._plotter.plot_single_time(
-            t_index=t_index, level=level, trial=trial, vmin=vmin, vmax=vmax,
-            cmap=cmap, figsize=figsize,
-            as_scatter_if_no_map=as_scatter_if_no_map, s=s,
-            auto_crop=auto_crop, crop_pad=crop_pad,
-        )
-
-    def animate(
-        self,
-        out_path: Union[str, Path],
-        level: Optional[int] = None,
-        trial: int = 0,
-        x_range: Optional[Tuple[int, int]] = None,
-        y_range: Optional[Tuple[int, int]] = None,
-        t_range: Optional[Tuple[int, int]] = None,
-        fps: int = 10,
-        vmin: Optional[float] = None,
-        vmax: Optional[float] = None,
-        cmap: str = "viridis",
-        figsize: Tuple[int, int] = (8, 6),
-        auto_crop: bool = True,
-        crop_pad: int = 10,
-    ) -> None:
-        self._plotter.animate(
-            out_path=out_path, level=level, trial=trial,
-            x_range=x_range, y_range=y_range, t_range=t_range, fps=fps,
-            vmin=vmin, vmax=vmax, cmap=cmap, figsize=figsize,
-            auto_crop=auto_crop, crop_pad=crop_pad,
-        )
-
-    def plot_series(
-        self,
-        points,
-        level: Optional[int] = None,
-        trial=0,
-        figsize: Tuple[int, int] = (12, 6),
-        title: Optional[str] = None,
-        ax=None,
-        labels: Optional[List[str]] = None,
-        **kwargs,
-    ):
-        return self._plotter.plot_series(
-            points=points, level=level, trial=trial, figsize=figsize,
-            title=title, ax=ax, labels=labels, **kwargs,
-        )
-
-    @staticmethod
-    def discover_k_variants(base_dir: Union[str, Path], base_var_name: str) -> List[str]:
-        """
-        Discover all k-indexed variants of a variable (e.g., for maxK operations).
-
-        For a variable like 'river_depth_max3', this will find:
-        - river_depth_max3_0
-        - river_depth_max3_1
-        - river_depth_max3_2
-
-        Args:
-            base_dir: Directory containing the NetCDF files
-            base_var_name: Base variable name (e.g., 'river_depth_max3')
-
-        Returns:
-            List of variant names sorted by k index, or [base_var_name] if no k variants found
-        """
-        base_dir = Path(base_dir)
-        # Pattern to match k-indexed files: {base_var_name}_{k}_rank*.nc
-        pattern = f"{base_var_name}_*_rank*.nc"
-        files = list(base_dir.glob(pattern))
-
-        # Extract unique k indices
-        k_pattern = re.compile(rf"^{re.escape(base_var_name)}_(\d+)_rank\d+.*\.nc$")
-        k_indices = set()
-        for f in files:
-            m = k_pattern.match(f.name)
-            if m:
-                k_indices.add(int(m.group(1)))
-
-        if k_indices:
-            # Return sorted list of variant names
-            return [f"{base_var_name}_{k}" for k in sorted(k_indices)]
-        else:
-            # No k variants found, check if base file exists
-            base_pattern = f"{base_var_name}_rank*.nc"
-            if list(base_dir.glob(base_pattern)):
-                return [base_var_name]
-            return []
-
-    @staticmethod
-    def list_available_variables(base_dir: Union[str, Path]) -> List[str]:
-        """
-        List all unique variable names available in the directory.
-
-        This scans for files matching *_rank*.nc and extracts variable names.
-
-        Args:
-            base_dir: Directory containing the NetCDF files
-
-        Returns:
-            Sorted list of unique variable names
-        """
-        base_dir = Path(base_dir)
-        files = list(base_dir.glob("*_rank*.nc"))
-
-        # Match the same optional signed year accepted by the catalog.
-        var_pattern = re.compile(r"^(.+)_rank\d+(?:_-?\d+)?\.nc$")
-        var_names = set()
-        for f in files:
-            m = var_pattern.match(f.name)
-            if m:
-                var_names.add(m.group(1))
-
-        return sorted(var_names)
-
-    @property
-    def num_ranks(self) -> int:
-        return len(self._rank_files)
+        self._ensure_cache_materialized()
+        return self._data_access.get_series(query)
 
     @property
     def time_len(self) -> int:
+        """Return the validated reader view's number of time rows."""
+
         return self._time_len
 
     @property
-    def times(self) -> List[datetime]:
-        return self._time_datetimes
+    def times(self) -> tuple[datetime | cftime.datetime, ...]:
+        """Return the immutable validated reader timeline."""
 
-    @property
-    def map_shape(self) -> Optional[Tuple[int, int]]:
-        return self._map_shape
+        return tuple(self._time_datetimes)
 
-    def set_map_shape(self, map_shape: Tuple[int, int]) -> None:
-        if type(map_shape) is not tuple or len(map_shape) != 2:
-            raise ValueError("map_shape must be an exact (nx, ny) tuple")
-        if any(type(value) is not int or value < 1 for value in map_shape):
-            raise ValueError("map_shape values must be exact positive ints")
-        self._map_shape = map_shape
-        if self._rank_files:
-            self._catalog.compute_coordinates(force=True)
+    @staticmethod
+    def _map_extent(value, *, label: str) -> int:
+        if np.ma.isMaskedArray(value) and np.any(
+            np.ma.getmaskarray(value)
+        ):
+            raise ValueError(f"{label} contains missing values")
+        array = np.asarray(value)
+        if array.shape != ():
+            raise ValueError(f"{label} must be a scalar positive integer")
+        scalar = array.item()
+        if isinstance(scalar, (bool, np.bool_)) or not isinstance(
+            scalar, (int, np.integer),
+        ):
+            raise ValueError(f"{label} must be an integer")
+        result = int(scalar)
+        if result < 1:
+            raise ValueError(f"{label} must be positive")
+        return result
 
-    def load_map_shape_from_nc(
-        self,
-        nc_path: Union[str, Path],
-    ) -> None:
+    @classmethod
+    def _read_map_shape_from_nc(
+        cls,
+        nc_path: Path,
+    ) -> tuple[int, int]:
         p = Path(nc_path)
-        if not p.exists():
-            raise FileNotFoundError(f"NetCDF file not found: {p}")
-
-        nx = ny = None
         with nc.Dataset(p, "r") as ds:
             attrs = {a: ds.getncattr(a) for a in ds.ncattrs()}
-            if "nx" in attrs and "ny" in attrs:
-                nx = int(attrs["nx"])
-                ny = int(attrs["ny"])
-            if (nx is None or ny is None) and "nx" in ds.variables and "ny" in ds.variables:
-                nx = int(np.array(ds.variables["nx"][:]).squeeze())
-                ny = int(np.array(ds.variables["ny"][:]).squeeze())
-            if (nx is None or ny is None) and "map_shape" in ds.variables:
-                arr = np.array(ds.variables["map_shape"][:]).squeeze()
-                if arr.size >= 2:
-                    nx = int(arr[0])
-                    ny = int(arr[1])
-            if (nx is None or ny is None) and "map_shape" in attrs:
-                arr = np.array(attrs["map_shape"]).squeeze()
-                if np.size(arr) >= 2:
-                    flat = np.ravel(arr)
-                    nx = int(flat[0])
-                    ny = int(flat[1])
-            if nx is None or ny is None:
-                dim_pairs = [("nx", "ny"), ("x", "y"), ("lon", "lat")]
-                for a, b in dim_pairs:
-                    if a in ds.dimensions and b in ds.dimensions:
-                        nx = int(ds.dimensions[a].size)
-                        ny = int(ds.dimensions[b].size)
-                        break
-        if nx is None or ny is None:
+            candidates: list[tuple[str, tuple[int, int]]] = []
+            if ("nx" in attrs) != ("ny" in attrs):
+                raise ValueError("map-shape attributes must define both nx and ny")
+            if "nx" in attrs:
+                candidates.append(("nx/ny attributes", (
+                    cls._map_extent(attrs["nx"], label="nx attribute"),
+                    cls._map_extent(attrs["ny"], label="ny attribute"),
+                )))
+            if ("nx" in ds.variables) != ("ny" in ds.variables):
+                raise ValueError("map-shape variables must define both nx and ny")
+            if "nx" in ds.variables:
+                candidates.append(("nx/ny variables", (
+                    cls._map_extent(ds.variables["nx"][:], label="nx variable"),
+                    cls._map_extent(ds.variables["ny"][:], label="ny variable"),
+                )))
+            if "map_shape" in ds.variables:
+                raw_shape = ds.variables["map_shape"][:]
+                if np.ma.isMaskedArray(raw_shape) and np.any(
+                    np.ma.getmaskarray(raw_shape)
+                ):
+                    raise ValueError("map_shape variable contains missing values")
+                arr = np.asarray(raw_shape)
+                if arr.shape != (2,):
+                    raise ValueError("map_shape variable must have shape (2,)")
+                candidates.append(("map_shape variable", (
+                    cls._map_extent(arr[0], label="map_shape[0]"),
+                    cls._map_extent(arr[1], label="map_shape[1]"),
+                )))
+            if "map_shape" in attrs:
+                arr = np.asarray(attrs["map_shape"])
+                if arr.shape != (2,):
+                    raise ValueError("map_shape attribute must have shape (2,)")
+                candidates.append(("map_shape attribute", (
+                    cls._map_extent(arr[0], label="map_shape[0]"),
+                    cls._map_extent(arr[1], label="map_shape[1]"),
+                )))
+            for a, b in (("nx", "ny"), ("x", "y"), ("lon", "lat")):
+                if a in ds.dimensions and b in ds.dimensions:
+                    candidates.append((f"{a}/{b} dimensions", (
+                        cls._map_extent(ds.dimensions[a].size, label=a),
+                        cls._map_extent(ds.dimensions[b].size, label=b),
+                    )))
+        if not candidates:
             raise KeyError("Could not find nx/ny or map_shape (attrs/vars/dims).")
-        self.set_map_shape((nx, ny))
-
-    def set_coord_converter(
-        self,
-        converter: Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray]]
-    ) -> None:
-        self._coord_converter = converter
-        self._catalog.compute_coordinates(force=True)
-
-    # ----------------------------------------------------------------------------------
-    # Visualization
-    # ----------------------------------------------------------------------------------
-    @staticmethod
-    def _year_start_like(value, year: int):
-        if isinstance(value, cftime.datetime):
-            kwargs = {}
-            if hasattr(value, "has_year_zero"):
-                kwargs["has_year_zero"] = value.has_year_zero
-            return type(value)(year, 1, 1, **kwargs)
-        return datetime(year, 1, 1)
-
-    def _validate_cama_bin_years(
-        self, year_to_indices: dict[int, List[int]],
-    ) -> None:
-        """Require complete, record-aligned years for CaMa-style binaries."""
-
-        if self._time_values_num is None or len(self._time_values_num) < 2:
+        shapes = {shape for _source, shape in candidates}
+        if len(shapes) != 1:
             raise ValueError(
-                "CaMa binary export needs at least two timestamps to infer "
-                "record spacing"
-            )
-        numeric = np.asarray(self._time_values_num, dtype=np.float64)
-        differences = np.diff(numeric)
-        interval = float(differences[0])
-        tolerance = max(abs(interval) * 1e-9, 1e-12)
-        if interval <= 0.0 or not np.allclose(
-            differences, interval, rtol=1e-9, atol=tolerance,
-        ):
-            raise ValueError(
-                "CaMa binary export requires a strictly regular time axis"
-            )
-
-        for year, indices in year_to_indices.items():
-            reference = self.times[indices[0]]
-            start = self._year_start_like(reference, year)
-            end = self._year_start_like(reference, year + 1)
-            start_num, end_num = nc.date2num(
-                (start, end), self._time_units, self._time_calendar,
-            )
-            exact_count = (float(end_num) - float(start_num)) / interval
-            expected_count = int(round(exact_count))
-            if not np.isclose(
-                exact_count, expected_count, rtol=1e-9, atol=1e-9,
-            ):
-                raise ValueError(
-                    f"year {year} is not divisible by the output time interval"
+                "conflicting map-shape metadata: "
+                + ", ".join(
+                    f"{source}={shape}" for source, shape in candidates
                 )
-            values = numeric[np.asarray(indices, dtype=np.int64)]
-            expected = float(start_num) + interval * np.arange(expected_count)
-            if values.shape != expected.shape or not np.allclose(
-                values, expected, rtol=1e-9, atol=tolerance,
-            ):
-                raise ValueError(
-                    f"CaMa binary export for {year} is a partial or "
-                    "misaligned year; export complete calendar years so record "
-                    "numbers retain their time-of-year meaning"
-                )
-
-    def export_to_cama_bin(
-        self,
-        out_dir: Union[str, Path],
-        out_var_name: str,
-        t_range: Optional[Tuple[int, int]] = None,
-        trial: int = 0,
-        fill_value: float = 1e20,
-        dtype: np.dtype = np.float32,
-        progress: bool = True,
-    ) -> None:
-        if self._map_shape is None:
-            raise RuntimeError("map_shape is required to export .bin files.")
-        if any(info["has_levels"] for info in self._rank_files):
-            raise ValueError(
-                "Variables with a trailing value dimension are not supported "
-                "for CaMa binary export."
             )
-        if not self.times or self._time_len == 0:
-            raise RuntimeError("No time axis available for export.")
-
-        out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        t_start = 0 if t_range is None else max(0, int(t_range[0]))
-        t_end = self._time_len if t_range is None else min(self._time_len, int(t_range[1]))
-        if t_start >= t_end:
-            raise ValueError("Invalid t_range: ensure t_start < t_end")
-
-        year_to_indices: dict[int, List[int]] = {}
-        for ti in range(t_start, t_end):
-            year = int(self.times[ti].year)
-            year_to_indices.setdefault(year, []).append(ti)
-        self._validate_cama_bin_years(year_to_indices)
-
-        for year in sorted(year_to_indices.keys()):
-            year_path = out_dir / f"{out_var_name}{year}.bin"
-            if progress:
-                print(f"[BIN] writing year {year} -> {year_path.name} ({len(year_to_indices[year])} frames)")
-            with atomic_output_path(year_path) as temporary:
-                with temporary.open("wb") as fw:
-                    for ti in year_to_indices[year]:
-                        grid = self.get_grid(
-                            ti, level=None, trial=trial,
-                            fill_value=fill_value, dtype=dtype,
-                        )
-                        grid = np.where(
-                            np.isfinite(grid), grid, fill_value,
-                        ).astype(dtype, copy=False)
-                        fw.write(np.asfortranarray(grid).tobytes(order="F"))
+        return candidates[0][1]
 
     # ----------------------------------------------------------------------------------
     # Utilities
@@ -639,31 +694,3 @@ class MultiRankStatsReader:
         if not cids:
             return None
         return np.concatenate(cids)
-
-    def summary(self) -> str:
-        slice_info = f"[{self._slice_start} .. {self._slice_end}] (inclusive)" if self._slice_start is not None else "N/A"
-        lines = [
-            f"Variable         : {self.var_name}",
-            f"Base dir         : {self.base_dir}",
-            f"Ranks            : {self.num_ranks}",
-            f"Local time len   : {self.time_len}",
-            f"Time slice idx   : {slice_info}",
-            f"First time (loc) : {self._time_datetimes[0] if self._time_datetimes else 'N/A'}",
-            f"Last  time (loc) : {self._time_datetimes[-1] if self._time_datetimes else 'N/A'}",
-            f"Map shape        : {self._map_shape}",
-            f"Coord converter  : {'yes' if self._coord_converter is not None else 'no'}",
-        ]
-        for i, info in enumerate(self._rank_files):
-            files = ", ".join(path.name for path in info["paths"])
-            value_axis = (
-                f"{info['level_dimension']} ({info['n_levels']})"
-                if info["has_levels"] else "N/A"
-            )
-            lines.append(
-                f"  - rank[{i}]: files={files}, "
-                f"saved_points={info['saved_points']}, "
-                f"trials={info['n_trials'] if info['has_trials'] else 'no'}, "
-                f"value_axis={value_axis}, "
-                f"coord={info['coord_name'] or 'N/A'}"
-            )
-        return "\n".join(lines)

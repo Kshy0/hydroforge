@@ -1,6 +1,8 @@
 """Deterministic names shared by compilers and output schemas."""
 
 import re
+from pathlib import Path
+from typing import Any
 
 
 # Read-only launch controls excluded from accumulator snapshots.
@@ -25,3 +27,19 @@ def sanitize_symbol(name: str) -> str:
     if name and name[0].isdigit():
         name = "_" + name
     return name
+
+
+def validate_safe_path_component(value: Any, *, label: str) -> str:
+    """Return one exact filename component with no traversal semantics."""
+
+    if type(value) is not str or not value:
+        raise ValueError(f"{label} must be a non-empty exact string")
+    if (
+        value in {".", ".."}
+        or Path(value).name != value
+        or "/" in value
+        or "\\" in value
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ValueError(f"{label} must be one safe path component")
+    return value

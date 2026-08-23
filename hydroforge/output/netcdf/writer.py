@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import atexit
+from collections import OrderedDict
+from collections.abc import Mapping
 import os
 import logging
 import shutil
@@ -20,29 +23,101 @@ from uuid import uuid4
 import cftime
 import netCDF4 as nc
 import numpy as np
-import torch.distributed as dist
+import torch
 
-from hydroforge.contracts import ResourceCleanupError
+from hydroforge.contracts.errors import ResourceCleanupError
 from hydroforge.contracts.naming import sanitize_symbol
 from hydroforge.output.netcdf.plan import (
-    COMMITTED_STEPS_ATTR, OUTPUT_FORMAT, OUTPUT_VERSION,
-    RUN_ID_ATTR, NetCDFCreateRequest, NetCDFWriteRequest, OutputFilePlan,
+    NetCDFCreateRequest, NetCDFWriteRequest, OutputFilePlan,
 )
-from hydroforge.output.netcdf.schema import NetCDFSchema
 from hydroforge.contracts.events import ModelEvent
 from hydroforge.serialization.netcdf import (
-    LOGICAL_DTYPE_ATTR, atomic_netcdf_dataset,
-    normalize_netcdf_variable_options,
+    BOOL_LOGICAL_DTYPE, COMMITTED_STEPS_ATTR, LOGICAL_DTYPE_ATTR,
+    OUTPUT_FORMAT, OUTPUT_VERSION, RUN_ID_ATTR,
+    _atomic_netcdf_dataset_trusted, _create_netcdf_variable_trusted,
+    netcdf_dtype_encoding,
 )
 
 
 logger = logging.getLogger(__name__)
 
 
-def _validate_run_id(value: Any, *, label: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{label} must be a non-empty string")
-    return value.strip()
+_TORCH_NUMPY_DTYPES = {
+    torch.bool: np.dtype(np.bool_),
+    torch.int32: np.dtype(np.int32),
+    torch.int64: np.dtype(np.int64),
+    torch.float32: np.dtype(np.float32),
+    torch.float64: np.dtype(np.float64),
+}
+
+
+def _checked_output_array(
+    tensor: torch.Tensor, target_dtype: torch.dtype, *, name: str,
+) -> np.ndarray:
+    """Materialize one output without allowing a finite value to overflow."""
+
+    target = _TORCH_NUMPY_DTYPES[target_dtype]
+    source = tensor.detach().cpu().numpy()
+    if source.dtype == target:
+        return source
+    finite = np.isfinite(source)
+    if target == np.dtype(np.float32) and source.size:
+        if np.any(np.abs(source[finite]) > np.finfo(np.float32).max):
+            raise OverflowError(
+                f"statistics output {name!r} contains values outside "
+                "float32 range"
+            )
+    converted = source.astype(target, copy=False)
+    if source.size and np.any(finite & ~np.isfinite(converted)):
+        raise OverflowError(
+            f"statistics output {name!r} overflowed {target}"
+        )
+    if source.size and np.any(
+        finite & (source != 0) & (converted == 0)
+    ):
+        raise OverflowError(
+            f"statistics output {name!r} contains nonzero values that "
+            f"underflow in {target}"
+        )
+    return converted
+
+
+def _checked_output_tensor_copy(
+    tensor: torch.Tensor,
+    *,
+    target_device: torch.device,
+    target_dtype: torch.dtype,
+    name: str,
+) -> torch.Tensor:
+    """Copy an in-memory result after validating a narrowing conversion."""
+
+    if tensor.dtype != target_dtype:
+        if target_dtype == torch.float32 and tensor.numel():
+            finite = torch.isfinite(tensor)
+            outside = finite & (
+                torch.abs(tensor) > torch.finfo(torch.float32).max
+            )
+            if bool(outside.any().item()):
+                raise OverflowError(
+                    f"statistics output {name!r} contains values outside "
+                    "float32 range"
+                )
+    if tensor.dtype != target_dtype and target_dtype == torch.float32:
+        narrowed = tensor.to(dtype=target_dtype)
+        if bool(
+            (
+                torch.isfinite(tensor)
+                & (tensor != 0)
+                & (narrowed == 0)
+            ).any().item()
+        ):
+            raise OverflowError(
+                f"statistics output {name!r} contains nonzero values that "
+                "underflow in torch.float32"
+            )
+    return tensor.detach().to(
+        device=target_device, dtype=target_dtype, copy=True,
+    )
 
 
 def _is_wsl() -> bool:
@@ -64,26 +139,16 @@ def _is_wsl() -> bool:
 # copies.  256 MB is a safe default for machines with ≥8 GB RAM.
 # ---------------------------------------------------------------------------
 _DEFAULT_MAX_IPC_BYTES: int = 256 * 1024 * 1024
+_DEFAULT_MAX_PENDING_OUTPUT_BYTES: int = 512 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
 class PendingNetCDFWrite:
-    """One background write with an exact per-output timestep weight."""
+    """One background task with exact timestep weights for every stream."""
 
-    key: str
-    step_count: int
+    step_counts: tuple[tuple[str, int], ...]
+    payload_bytes: int
     future: Any
-
-    def __post_init__(self) -> None:
-        if not self.key:
-            raise ValueError("pending NetCDF write key must be non-empty")
-        if type(self.step_count) is not int or self.step_count < 1:
-            raise ValueError("pending NetCDF write step_count must be positive")
-        if not callable(getattr(self.future, "result", None)):
-            raise TypeError("pending NetCDF write future must define result()")
-        if not callable(getattr(self.future, "done", None)):
-            raise TypeError("pending NetCDF write future must define done()")
-
 
 @dataclass(frozen=True, slots=True)
 class _NetCDFOutputStream:
@@ -96,19 +161,50 @@ class _NetCDFOutputStream:
     executor_index: int | None = None
 
 
-def _validated_netcdf_options(
-    variable: str,
-    options: dict[str, Any],
-    dimensions: list[str],
-) -> dict[str, Any]:
-    create_options = normalize_netcdf_variable_options(options)
-    chunksizes = create_options.get("chunksizes")
-    if chunksizes is not None and len(chunksizes) != len(dimensions):
-        raise ValueError(
-            f"NetCDF chunksizes for {variable!r} have rank {len(chunksizes)}, "
-            f"but dimensions {dimensions} have rank {len(dimensions)}"
-        )
-    return create_options
+@dataclass(slots=True)
+class _NetCDFWriteBuffer:
+    """One fixed-capacity contiguous batch owned by the submitting process."""
+
+    stream: _NetCDFOutputStream
+    data: np.ndarray
+    count: int
+    times: list[Any]
+
+    @classmethod
+    def allocate(
+        cls,
+        stream: _NetCDFOutputStream,
+        row: np.ndarray,
+        *,
+        max_pending_steps: int,
+    ) -> _NetCDFWriteBuffer:
+        capacity = min(stream.batch_size, max_pending_steps)
+        data = np.empty((capacity, *row.shape), dtype=row.dtype)
+        return cls(stream=stream, data=data, count=0, times=[])
+
+    @property
+    def payload_bytes(self) -> int:
+        return self.count * int(self.data[0].nbytes)
+
+    @property
+    def allocated_bytes(self) -> int:
+        return int(self.data.nbytes)
+
+    def append(self, row: np.ndarray, dt: Any) -> None:
+        if self.count >= len(self.data):
+            raise RuntimeError(
+                f"NetCDF buffer for {self.stream.key!r} exceeded its capacity"
+            )
+        if row.dtype != self.data.dtype or row.shape != self.data.shape[1:]:
+            raise TypeError(
+                f"NetCDF buffer row for {self.stream.key!r} changed dtype or shape"
+            )
+        np.copyto(self.data[self.count], row, casting="no")
+        self.count += 1
+        self.times.append(dt)
+
+    def request_data(self) -> np.ndarray:
+        return self.data[:self.count]
 
 
 def _static_variable_applies(
@@ -122,13 +218,6 @@ def _static_variable_applies(
 
     if specification["coordinate"] != output_coordinate:
         return False
-    dimension = specification["dim"]
-    if dimension not in dimensions:
-        raise ValueError(
-            f"static variable {name!r} targets coordinate "
-            f"{output_coordinate!r} and dimension {dimension!r}, but that "
-            "dimension is absent from the output schema"
-        )
     return True
 _DEFAULT_MAX_BATCH: int = 30
 
@@ -148,6 +237,99 @@ def compute_write_batch_size(
     per_step = saved_points * dtype_bytes
     batch = int(max_ipc_bytes / max(per_step, 1))
     return max(1, min(batch, max_batch))
+
+
+def constrain_write_batch_sizes(
+    desired: Mapping[str, int],
+    *,
+    row_bytes: Mapping[str, int],
+    stream_counts: Mapping[str, int],
+    max_pending_bytes: int,
+) -> dict[str, int]:
+    """Fit aggregate buffer capacities into one process-wide byte budget."""
+
+    batches = dict(desired)
+    total = sum(
+        row_bytes[name] * stream_counts[name] * batch
+        for name, batch in batches.items()
+    )
+    while total > max_pending_bytes:
+        candidates = [name for name, batch in batches.items() if batch > 1]
+        if not candidates:
+            break
+        name = max(
+            candidates,
+            key=lambda item: (
+                row_bytes[item] * stream_counts[item] * batches[item], item,
+            ),
+        )
+        old = batches[name]
+        new = max(1, old // 2)
+        batches[name] = new
+        total -= row_bytes[name] * stream_counts[name] * (old - new)
+    return batches
+
+
+_WORKER_FILE_CACHE_SIZE = 32
+_WORKER_NETCDF_FILES: OrderedDict[
+    Path, tuple[nc.Dataset, tuple[int, int]],
+] = OrderedDict()
+
+
+def _worker_file_identity(path: Path) -> tuple[int, int]:
+    status = path.stat()
+    return status.st_dev, status.st_ino
+
+
+def _close_worker_netcdf_files() -> None:
+    """Close every Dataset cached inside one writer subprocess."""
+
+    entries = tuple(_WORKER_NETCDF_FILES.values())
+    _WORKER_NETCDF_FILES.clear()
+    failures: list[BaseException] = []
+    for dataset, _identity in entries:
+        try:
+            dataset.close()
+        except BaseException as error:
+            failures.append(error)
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise ResourceCleanupError("NetCDF worker file cache", failures)
+
+
+def _initialize_netcdf_worker() -> None:
+    """Install deterministic cleanup in one spawned output process."""
+
+    atexit.register(_close_worker_netcdf_files)
+
+
+def _evict_worker_netcdf_file(path: Path) -> None:
+    entry = _WORKER_NETCDF_FILES.pop(path, None)
+    if entry is not None:
+        entry[0].close()
+
+
+def _cached_worker_netcdf_file(path: Path) -> nc.Dataset:
+    """Return an append handle, reopening if the path was externally replaced."""
+
+    canonical = path.absolute()
+    identity = _worker_file_identity(canonical)
+    entry = _WORKER_NETCDF_FILES.pop(canonical, None)
+    if entry is not None:
+        dataset, cached_identity = entry
+        if cached_identity == identity:
+            _WORKER_NETCDF_FILES[canonical] = entry
+            return dataset
+        dataset.close()
+    dataset = nc.Dataset(canonical, "a")
+    _WORKER_NETCDF_FILES[canonical] = (dataset, identity)
+    while len(_WORKER_NETCDF_FILES) > _WORKER_FILE_CACHE_SIZE:
+        _old_path, (old_dataset, _old_identity) = (
+            _WORKER_NETCDF_FILES.popitem(last=False)
+        )
+        old_dataset.close()
+    return dataset
 
 
 def _find_data_variable(ncfile, var_name: str):
@@ -172,56 +354,126 @@ def _wsl_drop_cache(output_path) -> None:
             pass
 
 
-def _write_netcdf_process(request: NetCDFWriteRequest) -> tuple[str, int]:
-    """Append one already-batched request in a single file transaction."""
-    if request.data.ndim < 1 or request.data.shape[0] != len(request.times):
+def _append_netcdf_request(
+    ncfile: nc.Dataset, request: NetCDFWriteRequest,
+) -> tuple[str, int]:
+    """Append one batch through an already-open validated Dataset handle."""
+
+    time_var = ncfile.variables["time"]
+    target = _find_data_variable(ncfile, request.variable)
+    variable = ncfile.variables[target]
+    if time_var.dimensions != ("time",):
         raise ValueError(
-            "NetCDF write batch data/time lengths must be identical"
+            f"time variable in {request.output_path} must have dimensions "
+            "('time',)"
         )
-    if not request.times:
-        raise ValueError("NetCDF write batch must contain at least one row")
-    with nc.Dataset(request.output_path, "a") as ncfile:
-        time_var = ncfile.variables["time"]
-        target = _find_data_variable(ncfile, request.variable)
-        variable = ncfile.variables[target]
-        committed = ncfile.getncattr(COMMITTED_STEPS_ATTR)
-        if isinstance(committed, (bool, np.bool_)) or not isinstance(
-            committed, (int, np.integer),
-        ):
-            raise TypeError(
-                f"{COMMITTED_STEPS_ATTR} must be an integer in "
-                f"{request.output_path}"
-            )
-        current_len = int(committed)
-        physical_len = len(time_var)
-        if current_len < 0 or len(variable) != physical_len:
+    if not variable.dimensions or variable.dimensions[0] != "time":
+        raise ValueError(
+            f"NetCDF variable {target!r} in {request.output_path} must "
+            "start with the time dimension"
+        )
+    logical_dtype = getattr(variable, LOGICAL_DTYPE_ATTR, None)
+    expected_dtype = (
+        np.dtype(np.bool_)
+        if logical_dtype == BOOL_LOGICAL_DTYPE
+        else np.dtype(variable.dtype)
+    )
+    if request.data.dtype != expected_dtype:
+        raise TypeError(
+            f"NetCDF write batch for {request.variable!r} has dtype "
+            f"{request.data.dtype}, expected exact dtype {expected_dtype}"
+        )
+    expected_row_shape = tuple(variable.shape[1:])
+    observed_row_shape = tuple(request.data.shape[1:])
+    if observed_row_shape != expected_row_shape:
+        raise ValueError(
+            f"NetCDF write rows for {request.variable!r} have shape "
+            f"{observed_row_shape}, expected {expected_row_shape}"
+        )
+    if len(request.data) != len(request.times) or not request.times:
+        raise ValueError(
+            "NetCDF write batch must contain matching non-empty data and times"
+        )
+    committed = ncfile.getncattr(COMMITTED_STEPS_ATTR)
+    if isinstance(committed, (bool, np.bool_)) or not isinstance(
+        committed, (int, np.integer),
+    ):
+        raise TypeError(
+            f"{COMMITTED_STEPS_ATTR} must be an integer in "
+            f"{request.output_path}"
+        )
+    current_len = int(committed)
+    physical_len = len(time_var)
+    if current_len < 0 or len(variable) != physical_len:
+        raise ValueError(
+            f"invalid NetCDF append lengths in {request.output_path}: "
+            f"committed={current_len}, time={physical_len}, "
+            f"data={len(variable)}"
+        )
+    if physical_len != current_len:
+        raise RuntimeError(
+            f"NetCDF output {request.output_path} contains an "
+            f"uncommitted append tail: committed={current_len}, "
+            f"physical={physical_len}"
+        )
+    units = time_var.getncattr("units")
+    calendar = time_var.getncattr("calendar")
+    numeric_times = np.asarray(nc.date2num(
+        request.times, units=units, calendar=calendar,
+    ))
+    if not np.isfinite(numeric_times).all():
+        raise ValueError("NetCDF write timestamps must be finite datetimes")
+    if len(numeric_times) > 1 and np.any(np.diff(numeric_times) <= 0):
+        raise ValueError("NetCDF write timestamps must be strictly increasing")
+    if current_len:
+        previous = time_var[current_len - 1]
+        if np.ma.is_masked(previous) or not np.isfinite(previous):
             raise ValueError(
-                f"invalid NetCDF append lengths in {request.output_path}: "
-                f"committed={current_len}, time={physical_len}, "
-                f"data={len(variable)}"
+                f"last committed timestamp in {request.output_path} is invalid"
             )
-        if physical_len != current_len:
-            raise RuntimeError(
-                f"NetCDF output {request.output_path} contains an "
-                f"uncommitted append tail: committed={current_len}, "
-                f"physical={physical_len}"
+        if numeric_times[0] <= previous:
+            raise ValueError(
+                "NetCDF write timestamps must be strictly increasing "
+                "across batches"
             )
-        units = time_var.getncattr("units")
-        calendar = time_var.getncattr("calendar")
-        for offset, (row, timestamp) in enumerate(
-            zip(request.data, request.times, strict=True),
-        ):
-            index = current_len + offset
-            variable[index, ...] = row
-            time_var[index] = nc.date2num(
-                timestamp, units=units, calendar=calendar,
-            )
-        ncfile.sync()
-        committed_len = current_len + len(request.times)
-        ncfile.setncattr(COMMITTED_STEPS_ATTR, committed_len)
-        ncfile.sync()
+    committed_len = current_len + len(request.times)
+    variable[current_len:committed_len, ...] = request.data
+    time_var[current_len:committed_len] = numeric_times
+    ncfile.sync()
+    ncfile.setncattr(COMMITTED_STEPS_ATTR, committed_len)
+    ncfile.sync()
     _wsl_drop_cache(request.output_path)
     return request.variable, committed_len - 1
+
+
+def _write_netcdf_process(request: NetCDFWriteRequest) -> tuple[str, int]:
+    """Append one already-batched request in a single file transaction."""
+
+    with nc.Dataset(request.output_path, "a") as ncfile:
+        return _append_netcdf_request(ncfile, request)
+
+
+def _write_netcdf_group_process(
+    requests: tuple[NetCDFWriteRequest, ...],
+) -> tuple[tuple[str, int], ...]:
+    """Write several streams through worker-local persistent file handles."""
+
+    results = []
+    for request in requests:
+        path = request.output_path.absolute()
+        try:
+            dataset = _cached_worker_netcdf_file(path)
+            results.append(_append_netcdf_request(dataset, request))
+        except BaseException:
+            try:
+                _evict_worker_netcdf_file(path)
+            except BaseException:
+                logger.exception(
+                    "failed to evict NetCDF worker handle after append failure: %s",
+                    path,
+                )
+            raise
+    return tuple(results)
 
 
 def _create_netcdf_file_process(
@@ -238,7 +490,7 @@ def _create_netcdf_file_process(
         Path or List[Path] to the created NetCDF file(s)
     """
     mean_var_name = request.variable
-    metadata = request.metadata
+    schema = request.schema
     coord_values = request.coordinate_values
     output_dir = request.output_dir
     rank = request.rank
@@ -246,23 +498,16 @@ def _create_netcdf_file_process(
     year = request.year
     calendar = request.calendar
     time_unit = request.time_unit
-    num_trials = request.num_trials
     static_vars = request.static_variables
-    netcdf_options = request.netcdf_options
-    run_id = _validate_run_id(
-        str(uuid4()) if request.run_id is None else request.run_id,
-        label="NetCDF output run_id",
-    )
+    run_id = str(uuid4()) if request.run_id is None else request.run_id
 
     safe_name = sanitize_symbol(mean_var_name)
-
-    schema = NetCDFSchema.compile(metadata)
-    actual_shape = schema.actual_shape
     tensor_shape = schema.tensor_shape
     # nc_coord_name is derived from dim_coords (e.g. "catchment_id").
     coord_name = schema.coordinate_name
-    dtype = schema.dtype
     k_val = schema.order
+    dtype = schema.dtype
+    file_actual_shape = schema.file_actual_shape
 
     # Helper to create a single NetCDF file
     def create_single_file(file_safe_name: str, file_var_name: str, description_suffix: str = "") -> Path:
@@ -274,15 +519,9 @@ def _create_netcdf_file_process(
         ).path
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        reserved = {coord_name} if coord_name else set()
-        reserved.update((static_vars or {}).keys())
-        if file_safe_name in reserved:
-            raise ValueError(
-                f"Output variable '{file_safe_name}' conflicts with coordinate "
-                "or static metadata of the same name."
-            )
-
-        with atomic_netcdf_dataset(output_path, format="NETCDF4") as ncfile:
+        with _atomic_netcdf_dataset_trusted(
+            output_path, format="NETCDF4",
+        ) as ncfile:
             # Write global attributes
             ncfile.setncattr('title', f'Time series for rank {rank}: {file_var_name}')
             ncfile.setncattr('original_variable_name', file_var_name)
@@ -296,71 +535,11 @@ def _create_netcdf_file_process(
             # Create time dimension (unlimited for streaming)
             ncfile.createDimension('time', None)
 
-            # Create spatial/vertical dimensions based on actual shape
-            dim_names = ['time']  # Always start with time
-
-            if metadata.get('full_output'):
-                actual_shape_tuple = tuple(int(v) for v in actual_shape)
-                if num_trials > 1 and actual_shape_tuple and actual_shape_tuple[0] == num_trials:
-                    dim_names.append('trial')
-                    ncfile.createDimension('trial', num_trials)
-                    data_shape = actual_shape_tuple[1:]
-                else:
-                    data_shape = actual_shape_tuple
-
-                logical_dims = list(tensor_shape or ())
-                if len(logical_dims) == len(actual_shape_tuple):
-                    logical_dims = logical_dims[-len(data_shape):]
-                elif len(logical_dims) != len(data_shape):
-                    logical_dims = [f"dim_{i}" for i in range(len(data_shape))]
-
-                # Full coordinate output uses the same axis as selected output.
-                if coord_name and data_shape:
-                    logical_dims[0] = 'saved_points'
-
-                used_dims = set(dim_names)
-                for i, (dim_name, dim_size) in enumerate(
-                    zip(logical_dims, data_shape, strict=True)
-                ):
-                    nc_dim = sanitize_symbol(str(dim_name)) or f"dim_{i}"
-                    if nc_dim in used_dims:
-                        nc_dim = f"{nc_dim}_{i}"
-                    used_dims.add(nc_dim)
-                    dim_names.append(nc_dim)
-                    ncfile.createDimension(nc_dim, int(dim_size))
-
-            elif num_trials > 1:
-                dim_names.append('trial')
-                ncfile.createDimension('trial', num_trials)
-
-                dim_names.append('saved_points')
-                ncfile.createDimension('saved_points', actual_shape[1])
-
-                if len(actual_shape) > 2:
-                    dim_names.append('levels')
-                    ncfile.createDimension('levels', actual_shape[2])
-            else:
-                if len(actual_shape) == 1:
-                    # 1D spatial: time + saved points
-                    dim_names.append('saved_points')
-                    ncfile.createDimension('saved_points', actual_shape[0])
-                elif len(actual_shape) == 2:
-                    # 2D: time + saved points + levels
-                    dim_names.extend(['saved_points', 'levels'])
-                    ncfile.createDimension('saved_points', actual_shape[0])
-                    ncfile.createDimension('levels', actual_shape[1])
+            dim_names = list(schema.data_dimensions)
+            for dimension, extent in schema.dimensions:
+                ncfile.createDimension(dimension, extent)
 
             if coord_name and coord_values is not None:
-                if 'saved_points' not in ncfile.dimensions:
-                    raise ValueError(
-                        f"Output coordinate '{coord_name}' requires saved_points."
-                    )
-                expected_coord_size = ncfile.dimensions['saved_points'].size
-                if len(coord_values) != expected_coord_size:
-                    raise ValueError(
-                        f"Output coordinate '{coord_name}' length "
-                        f"{len(coord_values)} != saved_points {expected_coord_size}."
-                    )
                 coord_var = ncfile.createVariable(
                     coord_name,
                     coord_values.dtype,
@@ -372,27 +551,25 @@ def _create_netcdf_file_process(
             # decides applicability; once applicable, dimension mismatch is a
             # schema error rather than a silent omission.
             for sv_name, sv_spec in (static_vars or {}).items():
-                sv_dim = sv_spec.get("dim", "saved_points")
-                output_coord = metadata.get("output_coord")
+                sv_dim = sv_spec["dim"]
+                output_coord = schema.output_coordinate
                 if not _static_variable_applies(
                     sv_name, sv_spec,
                     output_coordinate=output_coord,
                     dimensions=ncfile.dimensions,
                 ):
                     continue
-                sv_values = np.asarray(sv_spec["values"])
-                expected = ncfile.dimensions[sv_dim].size
-                if sv_values.shape[0] != expected:
-                    raise ValueError(
-                        f"static_vars['{sv_name}'] length {sv_values.shape[0]} "
-                        f"!= dim '{sv_dim}' size {expected} in {output_path.name}"
-                    )
-                sv_var = ncfile.createVariable(
-                    sv_name, sv_spec.get("dtype", sv_values.dtype.str.lstrip("<>|")),
-                    (sv_dim,),
+                sv_values = sv_spec["values"]
+                storage_dtype, logical_dtype = netcdf_dtype_encoding(
+                    sv_values.dtype,
                 )
+                sv_var = ncfile.createVariable(
+                    sv_name, storage_dtype, (sv_dim,),
+                )
+                if logical_dtype is not None:
+                    sv_var.setncattr(LOGICAL_DTYPE_ATTR, logical_dtype)
                 sv_var[:] = sv_values
-                for ak, av in sv_spec.get("attrs", {}).items():
+                for ak, av in sv_spec["attrs"].items():
                     sv_var.setncattr(ak, av)
 
             time_var = ncfile.createVariable('time', 'f8', ('time',))
@@ -400,17 +577,18 @@ def _create_netcdf_file_process(
             time_var.setncattr('calendar', calendar)
 
             # Create single data variable
-            create_options = _validated_netcdf_options(
-                file_var_name, netcdf_options, dim_names,
-            )
-            nc_var = ncfile.createVariable(
-                file_safe_name, dtype, dim_names, **create_options,
+            nc_var = _create_netcdf_variable_trusted(
+                ncfile,
+                file_safe_name,
+                dtype,
+                dim_names,
+                options=schema.create_options,
             )
             if schema.logical_dtype is not None:
                 nc_var.setncattr(LOGICAL_DTYPE_ATTR, schema.logical_dtype)
-            desc = metadata.get("description", "") + description_suffix
+            desc = schema.description + description_suffix
             nc_var.setncattr('description', desc)
-            nc_var.setncattr('actual_shape', str(actual_shape))
+            nc_var.setncattr('actual_shape', str(file_actual_shape))
             nc_var.setncattr('tensor_shape', str(tensor_shape))
             nc_var.setncattr('long_name', file_var_name)
 
@@ -431,12 +609,35 @@ def _create_netcdf_file_process(
 
 
 
-class NetCDFWriter:
+class _NetCDFWriter:
     """Own streaming and in-memory finalization for one aggregator."""
 
     def __init__(self, owner) -> None:
         self.owner = owner
         self._background_failure: BaseException | None = None
+        self._last_time_number: float | None = None
+
+    def reset_timeline(self) -> None:
+        """Reset finalized-time ordering for a newly initialized output run."""
+
+        self._last_time_number = None
+
+    def _validate_next_time(
+        self, dt: Union[datetime, cftime.datetime],
+    ) -> float:
+        value = float(nc.date2num(
+            dt, units=self.owner.time_unit, calendar=self.owner.calendar,
+        ))
+        if not np.isfinite(value):
+            raise ValueError("statistics output time must be finite")
+        if (
+            self._last_time_number is not None
+            and value <= self._last_time_number
+        ):
+            raise ValueError(
+                "statistics output times must be strictly increasing"
+            )
+        return value
 
     def _emit_event(self, event: ModelEvent) -> None:
         """Keep observability failures outside the output transaction."""
@@ -477,38 +678,17 @@ class NetCDFWriter:
 
         existing = getattr(self.owner, "_output_run_id", None)
         if existing is not None:
-            return _validate_run_id(existing, label="locked output run_id")
+            return existing
 
         explicit = getattr(self.owner, "run_id", None)
         if explicit is not None:
-            run_id = _validate_run_id(
-                explicit, label="statistics run_id",
-            )
+            run_id = explicit
         elif self.owner.world_size == 1:
             run_id = str(uuid4())
         else:
-            if not dist.is_available() or not dist.is_initialized():
-                raise RuntimeError(
-                    "multi-rank statistics output requires either an explicit "
-                    "shared run_id or an initialized torch.distributed process "
-                    "group"
-                )
-            observed_rank = dist.get_rank()
-            observed_world_size = dist.get_world_size()
-            if (
-                observed_rank != self.owner.rank
-                or observed_world_size != self.owner.world_size
-            ):
-                raise RuntimeError(
-                    "statistics output topology disagrees with the initialized "
-                    "process group: "
-                    f"configured=({self.owner.rank}, {self.owner.world_size}), "
-                    f"group=({observed_rank}, {observed_world_size})"
-                )
-            shared = [str(uuid4()) if observed_rank == 0 else None]
-            dist.broadcast_object_list(shared, src=0)
-            run_id = _validate_run_id(
-                shared[0], label="broadcast output run_id",
+            raise RuntimeError(
+                "multi-rank statistics output run ID was not installed by the "
+                "rank-synchronous runtime materialization transaction"
             )
 
         self.owner._output_run_id = run_id
@@ -529,8 +709,8 @@ class NetCDFWriter:
 
         self._raise_if_background_failed()
         self._emit_event(ModelEvent(
-            "info", "output.create_start", "Creating NetCDF file structure",
-            {"year": year},
+            level="info", name="output.create_start",
+            message="Creating NetCDF file structure", fields={"year": year},
         ))
 
         # Resolve once and retain across every variable, rank, and split year.
@@ -541,12 +721,17 @@ class NetCDFWriter:
         requests: list[NetCDFCreateRequest] = []
         planned_by_variable: dict[str, tuple[Path, ...]] = {}
         planned_paths: list[Path] = []
-        for out_name, metadata in self.owner._metadata.items():
-            coord_name = metadata.get('output_coord')
-            coord_values = self.owner._coord_cache.get(coord_name, None)
+        for out_name in self.owner._metadata:
+            schema = self.owner._netcdf_schemas[out_name]
+            coord_name = schema.output_coordinate
+            coord_values = (
+                None
+                if coord_name is None
+                else self.owner._coord_cache[coord_name]
+            )
             request = NetCDFCreateRequest(
                 variable=out_name,
-                metadata=metadata,
+                schema=schema,
                 coordinate_values=coord_values,
                 output_dir=self.owner.output_dir,
                 rank=self.owner.rank,
@@ -554,14 +739,12 @@ class NetCDFWriter:
                 year=year,
                 calendar=self.owner.calendar,
                 time_unit=self.owner.time_unit,
-                num_trials=self.owner.num_trials,
                 static_variables=self.owner.static_vars,
                 run_id=run_id,
-                netcdf_options=self.owner.output_netcdf_options,
             )
             requests.append(request)
             safe_name = sanitize_symbol(out_name)
-            order = NetCDFSchema.compile(metadata).order
+            order = schema.order
             names = (
                 tuple(f"{safe_name}_{index}" for index in range(order))
                 if order > 1 else (safe_name,)
@@ -577,40 +760,18 @@ class NetCDFWriter:
             )
             planned_by_variable[out_name] = output_paths
             planned_paths.extend(output_paths)
-        if not requests:
-            raise RuntimeError("cannot create statistics output without variables")
-        duplicate_paths = {
-            path for path in planned_paths if planned_paths.count(path) > 1
-        }
-        if duplicate_paths:
-            raise ValueError(
-                "statistics outputs resolve to duplicate file paths: "
-                f"{sorted(map(str, duplicate_paths))}"
-            )
-
-        # Compile each output route up front as part of transaction validation.
+        # Compile each output route up front before mutating final paths.
         output_streams: dict[str, tuple[_NetCDFOutputStream, ...]] = {}
         batch_events: list[ModelEvent] = []
-        storage = getattr(self.owner, "_storage", {})
-        executor_count = len(getattr(self.owner, "_write_executors", ()))
+        executor_count = len(self.owner._write_executors)
         stream_index = 0
-        for out_name, metadata in self.owner._metadata.items():
-            k_val = max(1, int(metadata.get("k", 1)))
-            tensor = storage.get(out_name)
-            if tensor is None:
-                elements = 1
-                element_size = np.dtype(metadata.get("dtype", "f4")).itemsize
-                batch_size = 1
-            else:
-                elements = max(1, tensor.numel() // k_val)
-                element_size = tensor.element_size()
-                batch_size = compute_write_batch_size(elements, element_size)
+        for out_name in self.owner._metadata:
+            schema = self.owner._netcdf_schemas[out_name]
+            k_val = schema.order
+            elements = max(1, int(np.prod(schema.file_actual_shape)))
+            element_size = np.dtype(schema.dtype).itemsize
+            batch_size = schema.write_batch_size
             paths = planned_by_variable[out_name]
-            if len(paths) != k_val:
-                raise RuntimeError(
-                    f"statistics output {out_name!r} planned {len(paths)} "
-                    f"NetCDF files for order {k_val}"
-                )
             streams: list[_NetCDFOutputStream] = []
             for component, path in enumerate(paths):
                 key = f"{out_name}_{component}" if k_val > 1 else out_name
@@ -626,9 +787,9 @@ class NetCDFWriter:
                 stream_index += 1
             output_streams[out_name] = tuple(streams)
             batch_events.append(ModelEvent(
-                "info", "output.batch_configured",
-                "Configured NetCDF write batch",
-                {
+                level="info", name="output.batch_configured",
+                message="Configured NetCDF write batch",
+                fields={
                     "output": out_name,
                     "steps": batch_size,
                     "elements_per_step": elements,
@@ -651,35 +812,21 @@ class NetCDFWriter:
         try:
             for request in requests:
                 expected = planned_by_variable[request.variable]
-                result = _create_netcdf_file_process(replace(
+                _create_netcdf_file_process(replace(
                     request, output_dir=stage_output,
                 ))
-                returned = result if isinstance(result, list) else [result]
                 expected_staged = [
                     stage_output / final_path.name for final_path in expected
                 ]
-                if [Path(path) for path in returned] != expected_staged:
-                    raise RuntimeError(
-                        f"NetCDF creation for {request.variable!r} returned "
-                        f"unexpected staging paths {returned!r}; expected "
-                        f"{expected_staged!r}"
-                    )
                 if any(not path.is_file() for path in expected_staged):
                     raise RuntimeError(
                         f"NetCDF creation for {request.variable!r} did not "
                         "materialize every staged file"
                     )
                 staged_results[request.variable] = (
-                    list(expected) if isinstance(result, list) else expected[0]
+                    list(expected) if len(expected) > 1 else expected[0]
                 )
                 moves.extend(zip(expected_staged, expected, strict=True))
-
-            if set(staged_results) != {
-                request.variable for request in requests
-            }:
-                raise RuntimeError(
-                    "NetCDF file creation returned an incomplete result set"
-                )
             for _source, target in moves:
                 if (
                     os.path.lexists(target)
@@ -748,91 +895,146 @@ class NetCDFWriter:
             self._emit_event(event)
         for path in planned_paths:
             self._emit_event(ModelEvent(
-                "info", "output.file_created", "Created NetCDF file",
-                {"path": str(path)},
+                level="info", name="output.file_created",
+                message="Created NetCDF file", fields={"path": str(path)},
             ))
         total_files = sum(map(len, output_streams.values()))
         self._emit_event(ModelEvent(
-            "info", "output.create_complete",
-            "Created NetCDF files for streaming",
-            {"files": total_files},
+            level="info", name="output.create_complete",
+            message="Created NetCDF files for streaming",
+            fields={"files": total_files},
         ))
 
-    def _flush_write_buffer(self, key: str) -> None:
-        """Submit a buffered batch to its configured writer executor."""
+    @staticmethod
+    def _buffer_payload_bytes(buffer: _NetCDFWriteBuffer) -> int:
+        return buffer.payload_bytes
+
+    def _partition_write_groups(
+        self, keys: list[str],
+    ) -> tuple[tuple[str, ...], ...]:
+        """Group small buffers by executor without exceeding the IPC cap."""
+
+        grouped: dict[int | None, list[list[Any]]] = {}
+        for key in keys:
+            buffer = self.owner._write_buffers.get(key)
+            if buffer is None or not buffer.count:
+                continue
+            executor_index = buffer.stream.executor_index
+            payload_bytes = self._buffer_payload_bytes(buffer)
+            partitions = grouped.setdefault(executor_index, [])
+            if (
+                not partitions
+                or (
+                    partitions[-1][0]
+                    and partitions[-1][1] + payload_bytes
+                    > _DEFAULT_MAX_IPC_BYTES
+                )
+            ):
+                partitions.append([[], 0])
+            partitions[-1][0].append(key)
+            partitions[-1][1] += payload_bytes
+        return tuple(
+            tuple(partition[0])
+            for partitions in grouped.values()
+            for partition in partitions
+        )
+
+    def _submit_write_group(self, keys: tuple[str, ...]) -> None:
+        """Submit multiple buffered streams as one worker task."""
+
         self._raise_if_background_failed()
-        buf = self.owner._write_buffers.get(key)
-        if not buf or len(buf['data']) == 0:
+        if not keys:
             return
 
-        data_batch = np.stack(buf['data'], axis=0)
-        dt_list = list(buf['dt'])
-        stream = buf['stream']
-        if not isinstance(stream, _NetCDFOutputStream):
-            raise TypeError(f"NetCDF write buffer {key!r} has no output stream")
-        if stream.key != key:
-            raise ValueError(
-                f"NetCDF write buffer {key!r} belongs to stream {stream.key!r}"
-            )
+        requests: list[NetCDFWriteRequest] = []
+        step_counts: list[tuple[str, int]] = []
+        buffers: list[_NetCDFWriteBuffer] = []
+        buffer_keys: list[str] = []
+        executor_index: int | None = None
+        for key in keys:
+            buffer = self.owner._write_buffers.get(key)
+            if buffer is None or not buffer.count:
+                continue
+            stream = buffer.stream
+            if not buffers:
+                executor_index = stream.executor_index
+            elif stream.executor_index != executor_index:
+                raise RuntimeError(
+                    "one NetCDF write group cannot span writer executors"
+                )
+            times = tuple(buffer.times)
+            requests.append(NetCDFWriteRequest(
+                variable=stream.key,
+                data=buffer.request_data(),
+                output_path=stream.path,
+                times=times,
+            ))
+            step_counts.append((key, len(times)))
+            buffers.append(buffer)
+            buffer_keys.append(key)
+        if not requests:
+            return
 
-        request = NetCDFWriteRequest(
-            variable=stream.key,
-            data=data_batch,
-            output_path=stream.path,
-            times=tuple(dt_list),
-        )
-
-        if not self.owner._write_executors:
-            raise RuntimeError(
-                "NetCDF write buffer cannot flush without an active executor"
-            )
-        executor_index = stream.executor_index
+        request_group = tuple(requests)
         if executor_index is None:
-            raise RuntimeError(
-                f"NetCDF output stream {key!r} has no writer executor"
+            for request in request_group:
+                _write_netcdf_process(request)
+        else:
+            future = self.owner._write_executors[executor_index].submit(
+                _write_netcdf_group_process, request_group,
             )
-        if executor_index >= len(self.owner._write_executors):
-            raise RuntimeError(
-                f"NetCDF output stream {key!r} references unavailable "
-                f"executor {executor_index}"
-            )
-        future = self.owner._write_executors[executor_index].submit(
-            _write_netcdf_process, request,
-        )
-        self.owner._pending_writes.append(PendingNetCDFWrite(
-            key=key, step_count=len(dt_list), future=future,
-        ))
+            self.owner._pending_writes.append(PendingNetCDFWrite(
+                step_counts=tuple(step_counts),
+                payload_bytes=sum(buffer.payload_bytes for buffer in buffers),
+                future=future,
+            ))
 
-        buf['data'].clear()
-        buf['dt'].clear()
+        for key, buffer in zip(buffer_keys, buffers, strict=True):
+            if self.owner._write_buffers.get(key) is buffer:
+                self.owner._write_buffers.pop(key)
+
+    def _flush_write_buffers(self, keys: list[str]) -> None:
+        """Flush selected buffers, aggregating submissions where practical."""
+
+        failures: list[BaseException] = []
+        for group in self._partition_write_groups(keys):
+            try:
+                self._submit_write_group(group)
+            except BaseException as error:
+                failures.append(error)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise ResourceCleanupError("NetCDF write buffer groups", failures)
+
+    def _flush_ready_write_buffers(self) -> None:
+        """Flush every buffer that reached its effective time batch size."""
+
+        ready = [
+            key
+            for key, buffer in self.owner._write_buffers.items()
+            if buffer.count >= min(
+                buffer.stream.batch_size,
+                self.owner.max_pending_steps,
+            )
+        ]
+        self._flush_write_buffers(ready)
 
 
     def _flush_all_write_buffers(self, *, latch: bool = True) -> None:
         """Flush every pending write buffer (called on year transition / shutdown)."""
         self._raise_if_background_failed()
-        failures: list[BaseException] = []
-        for key in list(self.owner._write_buffers):
-            try:
-                self._flush_write_buffer(key)
-            except BaseException as error:
-                failures.append(error)
-        if failures:
+        try:
+            self._flush_write_buffers(list(self.owner._write_buffers))
+        except BaseException as error:
             if latch:
-                self._latch_failures("NetCDF write buffers", failures)
-            if len(failures) == 1:
-                raise failures[0]
-            raise ResourceCleanupError("NetCDF write buffers", failures)
+                self._latch_failures("NetCDF write buffers", [error])
+            raise
 
     def _streams_for_output(
         self, out_name: str,
     ) -> tuple[_NetCDFOutputStream, ...]:
-        try:
-            return self.owner._output_streams[out_name]
-        except KeyError as error:
-            raise RuntimeError(
-                f"statistics output {out_name!r} is dirty but has no "
-                "created NetCDF output stream"
-            ) from error
+        return self.owner._output_streams[out_name]
 
 
     def _buffer_and_maybe_flush(
@@ -841,51 +1043,52 @@ class NetCDFWriter:
         data: np.ndarray,
         dt: Union[datetime, cftime.datetime],
     ) -> None:
-        """Append one time step to a write buffer; flush when full."""
+        """Append one time step; ready buffers are flushed as one group."""
         self._raise_if_background_failed()
         if stream.key not in self.owner._write_buffers:
-            self.owner._write_buffers[stream.key] = {
-                "stream": stream, "data": [], "dt": [],
-            }
+            self.owner._write_buffers[stream.key] = _NetCDFWriteBuffer.allocate(
+                stream,
+                data,
+                max_pending_steps=self.owner.max_pending_steps,
+            )
 
         buf = self.owner._write_buffers[stream.key]
-        if buf.get("stream") != stream:
-            raise RuntimeError(
-                f"NetCDF write buffer {stream.key!r} is bound to a different "
-                "output stream"
-            )
-        buf['data'].append(data.copy())
-        buf['dt'].append(dt)
+        buf.append(data, dt)
 
-        effective_batch_size = min(
-            stream.batch_size, self.owner.max_pending_steps,
+    def _buffered_allocated_bytes(self) -> int:
+        return sum(
+            buffer.allocated_bytes
+            for buffer in self.owner._write_buffers.values()
         )
-        if len(buf['data']) >= effective_batch_size:
-            try:
-                self._flush_write_buffer(stream.key)
-            except BaseException as error:
-                self._latch_failures(
-                    "NetCDF write submission", [error],
-                )
+
+    def _unfinished_payload_bytes(self) -> int:
+        return self._buffered_allocated_bytes() + sum(
+            pending.payload_bytes for pending in self.owner._pending_writes
+        )
 
     def _pending_step_counts(self) -> dict[str, int]:
         counts = {
-            key: len(buffer["data"])
+            key: buffer.count
             for key, buffer in self.owner._write_buffers.items()
-            if buffer["data"]
+            if buffer.count
         }
         for pending in self.owner._pending_writes:
-            counts[pending.key] = counts.get(pending.key, 0) + pending.step_count
+            for key, step_count in pending.step_counts:
+                counts[key] = counts.get(key, 0) + step_count
         return counts
 
     def _wait_for(self, pending: PendingNetCDFWrite, *, dt) -> None:
         try:
             pending.future.result()
         except Exception as exc:
+            outputs = tuple(key for key, _count in pending.step_counts)
             self._emit_event(ModelEvent(
-                "error", "output.write_failed", "Failed to write time step",
-                {
-                    "output": pending.key, "steps": pending.step_count,
+                level="error", name="output.write_failed",
+                message="Failed to write time step",
+                fields={
+                    "output": outputs[0] if len(outputs) == 1 else outputs,
+                    "outputs": outputs,
+                    "steps": dict(pending.step_counts),
                     "time": str(dt), "error": str(exc),
                 },
             ))
@@ -931,6 +1134,35 @@ class NetCDFWriter:
                 "NetCDF output durability boundary", failures,
             )
 
+    def _limit_pending_output_bytes(self, *, dt) -> None:
+        """Bound aggregate buffered and submitted output memory."""
+
+        limit = getattr(
+            self.owner,
+            "max_pending_output_bytes",
+            _DEFAULT_MAX_PENDING_OUTPUT_BYTES,
+        )
+        if self._unfinished_payload_bytes() <= limit:
+            return
+        if self.owner._write_buffers:
+            try:
+                self._flush_all_write_buffers(latch=False)
+            except BaseException as error:
+                self._latch_failures(
+                    "byte-bounded NetCDF write buffers", [error],
+                )
+        while (
+            self.owner._pending_writes
+            and self._unfinished_payload_bytes() > limit
+        ):
+            pending = self.owner._pending_writes.pop(0)
+            try:
+                self._wait_for(pending, dt=dt)
+            except BaseException as error:
+                self._latch_failures(
+                    "byte-bounded NetCDF pending writes", [error],
+                )
+
     def _limit_pending_steps(self, *, dt) -> None:
         """Bound each output stream by its exact unfinished timestep count."""
 
@@ -961,13 +1193,10 @@ class NetCDFWriter:
             index = next((
                 index
                 for index, pending in enumerate(self.owner._pending_writes)
-                if pending.key in overfull
-            ), None)
-            if index is None:
-                raise RuntimeError(
-                    "NetCDF pending-step accounting exceeded its limit "
-                    "without a submitted write to drain"
+                if any(
+                    key in overfull for key, _count in pending.step_counts
                 )
+            ))
             pending = self.owner._pending_writes.pop(index)
             try:
                 self._wait_for(pending, dt=dt)
@@ -975,9 +1204,10 @@ class NetCDFWriter:
                 self._latch_failures(
                     "bounded NetCDF pending writes", [error],
                 )
-            counts[pending.key] -= pending.step_count
-            if counts[pending.key] == 0:
-                counts.pop(pending.key)
+            for key, step_count in pending.step_counts:
+                counts[key] -= step_count
+                if counts[key] == 0:
+                    counts.pop(key)
 
 
     def _finalize_time_step_in_memory(self, dt: Union[datetime, cftime.datetime]) -> None:
@@ -987,28 +1217,22 @@ class NetCDFWriter:
         Args:
             dt: Time step to finalize
         """
-        # Get dirty outputs to write
-        keys_to_write = [k for k in self.owner._output_keys if k in self.owner._dirty_outputs]
-        self.owner._dirty_outputs.clear()
-
-        # Append storage tensors to result lists
+        keys_to_write = [
+            key for key in self.owner._output_keys
+            if key in self.owner._dirty_outputs
+        ]
+        result_copies: dict[str, Any] = {}
         for out_name in keys_to_write:
-            if out_name not in self.owner._result_tensors:
-                continue
-
             storage_tensor = self.owner._storage[out_name]
-
-            # Transfer an ownership-isolated snapshot in the exact declared
-            # output precision. ``copy=True`` is required even when the output
-            # device/dtype already match the accumulator.
-            result_copy = storage_tensor.detach().to(
-                device=self.owner.result_device,
-                dtype=self.owner._result_dtype(out_name),
-                copy=True,
+            result_copies[out_name] = _checked_output_tensor_copy(
+                storage_tensor,
+                target_device=self.owner.result_device,
+                target_dtype=self.owner._result_dtype(out_name),
+                name=out_name,
             )
+        for out_name, result_copy in result_copies.items():
             self.owner._result_tensors[out_name].append(result_copy)
-
-        # Advance time index
+        self.owner._dirty_outputs.clear()
         self.owner._current_time_index += 1
 
         # Note: _current_macro_step_count is reset in update_statistics when is_outer_first=True
@@ -1024,24 +1248,12 @@ class NetCDFWriter:
         Args:
             dt: Time step to finalize (datetime or cftime.datetime)
         """
-        # Error if compound ops are configured but outer flags have never been set
-        if (self.owner._has_compound_ops
-                and not self.owner._outer_flags_ever_seen):
-            compound_ops = [
-                f"{meta['original_variable']}.{meta['op']}"
-                for name, meta in self.owner._metadata.items()
-                if self.owner._output_is_outer.get(name, False)
-            ]
-            raise RuntimeError(
-                f"Compound statistics {compound_ops} are configured but "
-                "the managed step policy has not observed an outer statistics "
-                "window. Configure statistics_plan on the model and advance "
-                "through @managed_step."
-            )
+        time_number = self._validate_next_time(dt)
 
         # Handle in-memory mode
         if self.owner.in_memory_mode:
             self._finalize_time_step_in_memory(dt)
+            self._last_time_number = time_number
             return
 
         self._raise_if_background_failed()
@@ -1061,30 +1273,21 @@ class NetCDFWriter:
             if not self.owner._files_created:
                 self._create_netcdf_files()
 
-        # Write all outputs that are marked dirty
-        # Use explicit list of output keys to maintain order/determinism
-        keys_to_write = [k for k in self.owner._output_keys if k in self.owner._dirty_outputs]
-
-        # Clear dirty set for next step
-        self.owner._dirty_outputs.clear()
-
+        # Resolve and materialize every output before mutating any buffer.  This
+        # prevents a bad later output from leaving earlier outputs half-staged.
+        keys_to_write = [
+            key for key in self.owner._output_keys
+            if key in self.owner._dirty_outputs
+        ]
+        prepared: list[tuple[_NetCDFOutputStream, np.ndarray]] = []
         for out_name in keys_to_write:
             tensor = self.owner._storage[out_name]
             streams = self._streams_for_output(out_name)
 
-            # Check if this is a time index variable (argmax/argmin)
-            metadata = self.owner._metadata.get(out_name, {})
-            is_time_index = metadata.get('is_time_index', False)
-
             # Convert tensor to numpy
-            raw_data = tensor.detach().cpu().numpy()
-
-            # For time index variables, keep as integer indices (no conversion to time)
-            # They will be stored as int32 in the NC file
-            if is_time_index:
-                time_step_data = raw_data.astype(np.int32)
-            else:
-                time_step_data = raw_data
+            time_step_data = _checked_output_array(
+                tensor, self.owner._result_dtype(out_name), name=out_name,
+            )
 
             for stream in streams:
                 stream_data = (
@@ -1092,8 +1295,19 @@ class NetCDFWriter:
                     if stream.component is None
                     else time_step_data[..., stream.component]
                 )
-                self._buffer_and_maybe_flush(stream, stream_data, dt)
+                prepared.append((stream, stream_data))
+
+        for stream, stream_data in prepared:
+            self._buffer_and_maybe_flush(stream, stream_data, dt)
+        try:
+            self._flush_ready_write_buffers()
+        except BaseException as error:
+            self._latch_failures("NetCDF write submission", [error])
+        self.owner._dirty_outputs.difference_update(keys_to_write)
 
         # Note: _current_macro_step_count is reset in update_statistics when is_outer_first=True
 
+        self._limit_pending_output_bytes(dt=dt)
         self._limit_pending_steps(dt=dt)
+        self.owner._current_time_index += 1
+        self._last_time_number = time_number

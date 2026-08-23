@@ -36,15 +36,24 @@ _INT_DTYPES = {
     torch.int32: ("int32_t", "at::kInt"),
     torch.int64: ("int64_t", "at::kLong"),
 }
-_SCALAR_TYPES = {
-    "__weight": ("float", "at::kFloat"),
-    "__total_weight": ("float", "at::kFloat"),
-    "__num_macro_steps": ("float", "at::kFloat"),
+_CONTROL_FLOAT_KEYS = (
+    "__weight", "__total_weight",
+)
+_INTEGER_SCALAR_TYPES = {
+    "__num_macro_steps": ("int64_t", "at::kLong"),
     "__sub_step": ("int32_t", "at::kInt"),
     "__num_sub_steps": ("int32_t", "at::kInt"),
     "__flags": ("int32_t", "at::kInt"),
-    "__macro_step_index": ("int32_t", "at::kInt"),
+    "__macro_step_index": ("int64_t", "at::kLong"),
 }
+
+
+def _scalar_types(dtype: torch.dtype) -> dict[str, tuple[str, str]]:
+    floating = _FLOAT_DTYPES[dtype]
+    return {
+        **{key: floating for key in _CONTROL_FLOAT_KEYS},
+        **_INTEGER_SCALAR_TYPES,
+    }
 
 
 def _c_ident(name: str) -> str:
@@ -70,9 +79,6 @@ class CudaStatisticsEmitter(StatisticsEmitter):
     def _generate_cuda_aggregator_function(
         self: StatisticsRuntime,
     ) -> None:
-        if not self._variables:
-            raise ValueError("No variables initialized for statistics aggregation")
-
         cpp_sources, cuda_sources = self._generate_cuda_extension_sources()
 
         from hydroforge.kernels.backends.cuda.build import load_inline_cu_module
@@ -84,20 +90,14 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             cpp_sources=cpp_sources,
             cuda_sources=cuda_sources,
             functions=["launch_update"],
-            extra_cuda_cflags=("-O3", "--use_fast_math"),
+            extra_cuda_cflags=("-O3",),
         )
 
         def internal_update_statistics(states, BLOCK_SIZE):
-            if type(BLOCK_SIZE) is not int or not 1 <= BLOCK_SIZE <= 1024:
-                raise ValueError(
-                    "CUDA statistics BLOCK_SIZE must be an exact int in "
-                    f"[1, 1024], got {BLOCK_SIZE!r}"
-                )
             ext.launch_update(states, BLOCK_SIZE)
 
         self._kernel_module = ext
         self._aggregator_function = internal_update_statistics
-        self._aggregator_generated = True
 
         if self.save_kernels:
             self._save_cuda_kernel_file(cpp_sources, cuda_sources)
@@ -111,8 +111,6 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             ident = _c_ident(key)
             old = params.get(key)
             if old is not None:
-                if old["ctype"] != ctype:
-                    raise TypeError(f"state '{key}' is used with incompatible dtypes")
                 old["const"] = old["const"] and const
                 return
             params[key] = {
@@ -124,7 +122,9 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 "const": const,
             }
 
-        for key, (ctype, scalar_type) in _SCALAR_TYPES.items():
+        for key, (ctype, scalar_type) in _scalar_types(
+            self._control_dtype,
+        ).items():
             add_param(key, ctype, scalar_type, const=True)
 
         specs = self._build_cuda_specs(add_param)
@@ -145,6 +145,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             "#include <c10/cuda/CUDAStream.h>",
             "#include <cmath>",
             "#include <cstdint>",
+            "#include <limits>",
             "",
             "#ifndef M_PI",
             "#define M_PI 3.14159265358979323846",
@@ -154,15 +155,13 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             "",
             "template <typename T> __device__ inline T hf_max(T a, T b) { return a > b ? a : b; }",
             "template <typename T> __device__ inline T hf_min(T a, T b) { return a < b ? a : b; }",
-            "template <> __device__ inline float hf_max<float>(float a, float b) { return fmaxf(a, b); }",
-            "template <> __device__ inline float hf_min<float>(float a, float b) { return fminf(a, b); }",
-            "template <> __device__ inline double hf_max<double>(double a, double b) { return fmax(a, b); }",
-            "template <> __device__ inline double hf_min<double>(double a, double b) { return fmin(a, b); }",
+            "template <> __device__ inline float hf_max<float>(float a, float b) { if (isnan(a)) return b; if (isnan(b)) return a; return a > b ? a : b; }",
+            "template <> __device__ inline float hf_min<float>(float a, float b) { if (isnan(a)) return b; if (isnan(b)) return a; return a < b ? a : b; }",
+            "template <> __device__ inline double hf_max<double>(double a, double b) { if (isnan(a)) return b; if (isnan(b)) return a; return a > b ? a : b; }",
+            "template <> __device__ inline double hf_min<double>(double a, double b) { if (isnan(a)) return b; if (isnan(b)) return a; return a < b ? a : b; }",
+            "template <typename T> __device__ inline T hf_weighted_mean(T old_v, T old_w, T value, T weight) { T new_w = old_w + weight; return old_v * (old_w / new_w) + value * (weight / new_w); }",
             "template <typename T> __device__ inline T hf_neg_inf() { return static_cast<T>(-INFINITY); }",
             "template <typename T> __device__ inline T hf_pos_inf() { return static_cast<T>(INFINITY); }",
-            "template <typename T> __device__ inline T hf_ignore_nan(T value, T replacement) { return value; }",
-            "template <> __device__ inline float hf_ignore_nan<float>(float value, float replacement) { return isnan(value) ? replacement : value; }",
-            "template <> __device__ inline double hf_ignore_nan<double>(double value, double replacement) { return isnan(value) ? replacement : value; }",
             "",
         ]
 
@@ -283,11 +282,18 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                         add_tensor_param(weight_key, const=False)
                         inner_states[inner]["weight_key"] = weight_key
 
-                stride_input = 0
-                for meta in self._metadata.values():
-                    if meta["original_variable"] == var:
-                        stride_input = int(meta.get("stride_input", 0))
-                        break
+                sample_weight_key = None
+                if any(
+                    operation.inner is None
+                    and operation.outer.value == "mean"
+                    for operation in variable.operations
+                ):
+                    sample_weight_key = f"{var}_mean_sample_weight_state"
+                    add_tensor_param(sample_weight_key, const=False)
+
+                stride_input = int(
+                    self._statistics_layouts[var].stride_input
+                )
 
                 group_vars.append(
                     {
@@ -300,6 +306,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                         "ops": ops,
                         "inner_ops": inner_ops,
                         "inner_states": inner_states,
+                        "sample_weight_key": sample_weight_key,
                         "numel": var_numel,
                     }
                 )
@@ -351,8 +358,9 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         return "float"
 
     def _state_ctype(self: StatisticsRuntime, key: str) -> Tuple[str, str]:
-        if key in _SCALAR_TYPES:
-            return _SCALAR_TYPES[key]
+        scalar_types = _scalar_types(self._control_dtype)
+        if key in scalar_types:
+            return scalar_types[key]
         tensor = self._tensor_registry.get(key)
         if tensor is None:
             tensor = self._storage[key]
@@ -406,6 +414,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             }
             rendered = render_expression(
                 source.expression, ExpressionDialect.CUDA, names,
+                value_type=("float32" if ctype == "float" else "float64"),
             )
             lines.append(f"    {ctype} {safe} = static_cast<{ctype}>({rendered});")
 
@@ -428,10 +437,16 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         scatter = scatter_spec["scatter"]
         safe = scatter_spec["safe"]
         ctype = scatter_spec["ctype"]
+        cnt_ctype = (
+            self._state_ctype(scatter_spec["cnt_key"])[0]
+            if scatter_spec["cnt_key"] else None
+        )
         index_ctype = self._state_ctype(scatter.index)[0]
         zero_params = [f"{ctype}* p_{_c_ident(scatter_spec['buf_key'])}"]
         if scatter_spec["cnt_key"]:
-            zero_params.append(f"{ctype}* p_{_c_ident(scatter_spec['cnt_key'])}")
+            zero_params.append(
+                f"{cnt_ctype}* p_{_c_ident(scatter_spec['cnt_key'])}"
+            )
         zero_params.append("long total")
         lines = [f"__global__ void hf_scatter_zero_{safe}("]
         for i, param in enumerate(zero_params):
@@ -446,7 +461,10 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             ]
         )
         if scatter_spec["cnt_key"]:
-            lines.append(f"    p_{_c_ident(scatter_spec['cnt_key'])}[linear] = static_cast<{ctype}>(0);")
+            lines.append(
+                f"    p_{_c_ident(scatter_spec['cnt_key'])}[linear] = "
+                f"static_cast<{cnt_ctype}>(0);"
+            )
         lines.extend(["}", ""])
 
         add_params = [
@@ -454,7 +472,9 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             f"const {index_ctype}* p_{_c_ident(scatter.index)}",
         ]
         if scatter_spec["cnt_key"]:
-            add_params.append(f"{ctype}* p_{_c_ident(scatter_spec['cnt_key'])}")
+            add_params.append(
+                f"{cnt_ctype}* p_{_c_ident(scatter_spec['cnt_key'])}"
+            )
         for key in self._statistics_ir.scatter_inputs(scatter_spec["name"]):
             if key != scatter.index:
                 pc, _ = self._state_ctype(key)
@@ -481,13 +501,16 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         val = self._scatter_value_expr(scatter.value, lines, emitted, ctype)
         lines.append(f"    atomicAdd(p_{_c_ident(scatter_spec['buf_key'])} + t * target_size + dst, {val});")
         if scatter_spec["cnt_key"]:
-            lines.append(f"    atomicAdd(p_{_c_ident(scatter_spec['cnt_key'])} + t * target_size + dst, static_cast<{ctype}>(1));")
+            lines.append(
+                f"    atomicAdd(p_{_c_ident(scatter_spec['cnt_key'])} + "
+                f"t * target_size + dst, static_cast<{cnt_ctype}>(1));"
+            )
         lines.append("}")
 
         if scatter_spec["cnt_key"]:
             div_params = [
                 f"{ctype}* p_{_c_ident(scatter_spec['buf_key'])}",
-                f"const {ctype}* p_{_c_ident(scatter_spec['cnt_key'])}",
+                f"const {cnt_ctype}* p_{_c_ident(scatter_spec['cnt_key'])}",
                 "long total",
             ]
             lines.extend(["", f"__global__ void hf_scatter_divide_{safe}("])
@@ -499,9 +522,9 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                     ") {",
                     "    long linear = blockIdx.x * blockDim.x + threadIdx.x;",
                     "    if (linear >= total) return;",
-                    f"        {ctype} cnt = p_{_c_ident(scatter_spec['cnt_key'])}[linear];",
+                    f"        {cnt_ctype} cnt = p_{_c_ident(scatter_spec['cnt_key'])}[linear];",
                     "        if (cnt > 0) {",
-                    f"            p_{_c_ident(scatter_spec['buf_key'])}[linear] = p_{_c_ident(scatter_spec['buf_key'])}[linear] / cnt;",
+                    f"            p_{_c_ident(scatter_spec['buf_key'])}[linear] = p_{_c_ident(scatter_spec['buf_key'])}[linear] / static_cast<{ctype}>(cnt);",
                     "        } else {",
                     f"            p_{_c_ident(scatter_spec['buf_key'])}[linear] = static_cast<{ctype}>(NAN);",
                     "        }",
@@ -524,7 +547,10 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             )
             for dependency in expression.dependencies
         }
-        return render_expression(expression, ExpressionDialect.CUDA, names)
+        return render_expression(
+            expression, ExpressionDialect.CUDA, names,
+            value_type=("float32" if ctype == "float" else "float64"),
+        )
 
     def _collect_value_param_keys(self: StatisticsRuntime, name: str) -> List[str]:
         return list(self._statistics_ir.materialized_inputs(name))
@@ -533,6 +559,8 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         if group.get("full_output"):
             return self._generate_full_group_kernel(group)
 
+        scalar_types = _scalar_types(self._control_dtype)
+        control_ctype = _FLOAT_DTYPES[self._control_dtype][0]
         params = [f"const {self._state_ctype(group['output_index'])[0]}* p_{_c_ident(group['output_index'])}"]
         for var in group["vars"]:
             for key in self._collect_value_param_keys(var["name"]):
@@ -550,7 +578,12 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 if "weight_key" in state:
                     wc, _ = self._state_ctype(state["weight_key"])
                     params.append(f"{wc}* p_{_c_ident(state['weight_key'])}")
-        for key, (ctype, _) in _SCALAR_TYPES.items():
+            if var["sample_weight_key"] is not None:
+                wc, _ = self._state_ctype(var["sample_weight_key"])
+                params.append(
+                    f"{wc}* p_{_c_ident(var['sample_weight_key'])}"
+                )
+        for key, (ctype, _) in scalar_types.items():
             params.append(f"const {ctype}* p_{_c_ident(key)}")
         params.extend(["long n_saved_points", "long num_trials"])
         params = list(dict.fromkeys(params))
@@ -571,13 +604,13 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 "    long t = point_linear / n_saved_points;",
                 "    long offs = point_linear - t * n_saved_points;",
                 f"    long idx = static_cast<long>(p_{_c_ident(group['output_index'])}[offs]);",
-                "    float weight = p___weight[0];",
-                "    float total_weight = p___total_weight[0];",
-                "    float num_macro_steps = p___num_macro_steps[0];",
+                f"    {control_ctype} weight = p___weight[0];",
+                f"    {control_ctype} total_weight = p___total_weight[0];",
+                "    int64_t num_macro_steps = p___num_macro_steps[0];",
                 "    int32_t sub_step = p___sub_step[0];",
                 "    int32_t num_sub_steps = p___num_sub_steps[0];",
                 "    int32_t flags = p___flags[0];",
-                "    int32_t macro_step_index = p___macro_step_index[0];",
+                "    int64_t macro_step_index = p___macro_step_index[0];",
                 "    bool is_inner_first = ((flags & 1) != 0) && (sub_step == 0);",
                 "    bool is_inner_last = (((flags >> 1) & 1) != 0) && (sub_step == num_sub_steps - 1);",
                 "    bool is_outer_first = (((flags >> 2) & 1) != 0) && is_inner_last;",
@@ -601,7 +634,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 ctype=var["ctype"],
             )
             lines.append(f"        {var['ctype']} val = {val};")
-            lines.extend(self._generate_inner_updates(var, full_output=False))
+            lines.extend(self._generate_inner_updates(var))
             for op in var["ops"]:
                 lines.extend(self._generate_op_update(var, op))
             lines.append("    }")
@@ -610,6 +643,8 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         return lines
 
     def _generate_full_group_kernel(self: StatisticsRuntime, group: Dict[str, Any]) -> List[str]:
+        scalar_types = _scalar_types(self._control_dtype)
+        control_ctype = _FLOAT_DTYPES[self._control_dtype][0]
         params = []
         for var in group["vars"]:
             for key in self._collect_value_param_keys(var["name"]):
@@ -627,7 +662,12 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 if "weight_key" in state:
                     wc, _ = self._state_ctype(state["weight_key"])
                     params.append(f"{wc}* p_{_c_ident(state['weight_key'])}")
-        for key, (ctype, _) in _SCALAR_TYPES.items():
+            if var["sample_weight_key"] is not None:
+                wc, _ = self._state_ctype(var["sample_weight_key"])
+                params.append(
+                    f"{wc}* p_{_c_ident(var['sample_weight_key'])}"
+                )
+        for key, (ctype, _) in scalar_types.items():
             params.append(f"const {ctype}* p_{_c_ident(key)}")
         params.append("long n_elements")
         params = list(dict.fromkeys(params))
@@ -641,13 +681,13 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 ") {",
                 "    long linear = blockIdx.x * blockDim.x + threadIdx.x;",
                 "    if (linear >= n_elements) return;",
-                "    float weight = p___weight[0];",
-                "    float total_weight = p___total_weight[0];",
-                "    float num_macro_steps = p___num_macro_steps[0];",
+                f"    {control_ctype} weight = p___weight[0];",
+                f"    {control_ctype} total_weight = p___total_weight[0];",
+                "    int64_t num_macro_steps = p___num_macro_steps[0];",
                 "    int32_t sub_step = p___sub_step[0];",
                 "    int32_t num_sub_steps = p___num_sub_steps[0];",
                 "    int32_t flags = p___flags[0];",
-                "    int32_t macro_step_index = p___macro_step_index[0];",
+                "    int64_t macro_step_index = p___macro_step_index[0];",
                 "    bool is_inner_first = ((flags & 1) != 0) && (sub_step == 0);",
                 "    bool is_inner_last = (((flags >> 1) & 1) != 0) && (sub_step == num_sub_steps - 1);",
                 "    bool is_outer_first = (((flags >> 2) & 1) != 0) && is_inner_last;",
@@ -666,7 +706,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 n_levels=1, ctype=ctype,
             )
             lines.append(f"        {ctype} val = {val};")
-            lines.extend(self._generate_inner_updates(var, full_output=True))
+            lines.extend(self._generate_inner_updates(var))
             for op in var["ops"]:
                 lines.extend(self._generate_op_update(var, op))
             lines.append("    }")
@@ -679,9 +719,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             return f"(t * n_saved_points + offs) * {var['n_levels']} + level"
         return "t * n_saved_points + offs"
 
-    def _generate_inner_updates(
-        self, var: Dict[str, Any], *, full_output: bool,
-    ) -> List[str]:
+    def _generate_inner_updates(self, var: Dict[str, Any]) -> List[str]:
         lines: List[str] = []
         ctype = var["ctype"]
         for inner in var["inner_ops"]:
@@ -698,9 +736,9 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                         "        {",
                         f"            {ctype} old_v = {ptr}[out_off];",
                         f"            {ctype} old_w = {wptr}[out_off];",
-                        f"            {ctype} new_v = old_v + val * static_cast<{ctype}>(weight);",
                         f"            {ctype} new_w = old_w + static_cast<{ctype}>(weight);",
-                        f"            if (is_inner_last) {{ val_for_{inner} = new_v / new_w; {ptr}[out_off] = static_cast<{ctype}>(0); {wptr}[out_off] = static_cast<{ctype}>(0); }}",
+                        f"            {ctype} new_v = hf_weighted_mean(old_v, old_w, val, static_cast<{ctype}>(weight));",
+                        f"            if (is_inner_last) {{ val_for_{inner} = new_v; {ptr}[out_off] = static_cast<{ctype}>(0); {wptr}[out_off] = static_cast<{ctype}>(0); }}",
                         f"            else {{ {ptr}[out_off] = new_v; {wptr}[out_off] = new_w; }}",
                         "        }",
                     ]
@@ -718,16 +756,11 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             elif inner in {"max", "min"}:
                 fn = "hf_max" if inner == "max" else "hf_min"
                 reset = f"hf_neg_inf<{ctype}>()" if inner == "max" else f"hf_pos_inf<{ctype}>()"
-                first = (
-                    "is_inner_first"
-                    if full_output
-                    else "(is_inner_first && macro_step_index == 0)"
-                )
                 lines.extend(
                     [
                         "        {",
                         f"            {ctype} old_v = {ptr}[out_off];",
-                        f"            {ctype} new_v = {first} ? val : {fn}(old_v, val);",
+                        f"            {ctype} new_v = is_inner_first ? val : {fn}(old_v, val);",
                         f"            if (is_inner_last) {{ val_for_{inner} = new_v; {ptr}[out_off] = {reset}; }}",
                         f"            else {{ {ptr}[out_off] = new_v; }}",
                         "        }",
@@ -767,38 +800,43 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         if outer["is_arg"]:
             aux = f"p_{_c_ident(op['aux_key'])}"
             cmp = ">" if outer["base"] == "max" else "<"
-            sentinel = (
-                f"hf_neg_inf<{ctype}>()"
-                if outer["base"] == "max"
-                else f"hf_pos_inf<{ctype}>()"
-            )
-            candidate = (
-                f"hf_ignore_nan<{ctype}>({value}, {sentinel})"
-                if self._statistics_layouts[
-                    var["name"]
-                ].dtype.is_floating_point
-                else value
-            )
-            body = [
-                f"{indent}if ({'is_outer_first' if compound else 'is_inner_first'}) {{",
-                f"{indent}    {out}[out_off] = macro_step_index;",
-                f"{indent}    {aux}[out_off] = {candidate};",
-                f"{indent}}} else {{",
-                f"{indent}    {ctype} old_v = {aux}[out_off];",
-                f"{indent}    if ({candidate} {cmp} old_v) {{ {aux}[out_off] = {candidate}; {out}[out_off] = macro_step_index; }}",
-                f"{indent}}}",
-            ]
-        elif outer["base"] == "mean":
-            if not compound:
+            reset = "is_outer_first" if compound else "is_inner_first"
+            if self._statistics_layouts[
+                var["name"]
+            ].dtype.is_floating_point:
                 body = [
-                    f"{indent}{ctype} old_v = is_inner_first ? static_cast<{ctype}>(0) : {out}[out_off];",
-                    f"{indent}{ctype} new_v = old_v + {value} * static_cast<{ctype}>(weight);",
-                    f"{indent}{out}[out_off] = is_inner_last ? new_v / static_cast<{ctype}>(total_weight) : new_v;",
+                    f"{indent}{ctype} candidate = {value};",
+                    f"{indent}if ({reset}) {{ {out}[out_off] = -1; {aux}[out_off] = static_cast<{ctype}>(NAN); }}",
+                    f"{indent}{ctype} old_v = {aux}[out_off];",
+                    f"{indent}if (!isnan(candidate) && (isnan(old_v) || candidate {cmp} old_v)) {{ {aux}[out_off] = candidate; {out}[out_off] = macro_step_index; }}",
                 ]
             else:
                 body = [
-                    f"{indent}{ctype} accum = is_outer_first ? {value} : ({out}[out_off] + {value});",
-                    f"{indent}{out}[out_off] = is_outer_last ? accum / static_cast<{ctype}>(num_macro_steps) : accum;",
+                    f"{indent}if ({reset}) {{",
+                    f"{indent}    {out}[out_off] = macro_step_index;",
+                    f"{indent}    {aux}[out_off] = {value};",
+                    f"{indent}}} else {{",
+                    f"{indent}    {ctype} old_v = {aux}[out_off];",
+                    f"{indent}    if ({value} {cmp} old_v) {{ {aux}[out_off] = {value}; {out}[out_off] = macro_step_index; }}",
+                    f"{indent}}}",
+                ]
+        elif outer["base"] == "mean":
+            if not compound:
+                weight_ptr = (
+                    f"p_{_c_ident(var['sample_weight_key'])}"
+                )
+                body = [
+                    f"{indent}{ctype} old_v = is_inner_first ? static_cast<{ctype}>(0) : {out}[out_off];",
+                    f"{indent}{ctype} old_w = is_inner_first ? static_cast<{ctype}>(0) : {weight_ptr}[out_off];",
+                    f"{indent}{ctype} new_w = old_w + static_cast<{ctype}>(weight);",
+                    f"{indent}{ctype} new_v = hf_weighted_mean(old_v, old_w, {value}, static_cast<{ctype}>(weight));",
+                    f"{indent}{out}[out_off] = new_v;",
+                    f"{indent}{weight_ptr}[out_off] = is_inner_last ? static_cast<{ctype}>(0) : new_w;",
+                ]
+            else:
+                body = [
+                    f"{indent}{ctype} count = static_cast<{ctype}>(num_macro_steps);",
+                    f"{indent}{out}[out_off] = is_outer_first ? {value} : hf_weighted_mean({out}[out_off], count - static_cast<{ctype}>(1), {value}, static_cast<{ctype}>(1));",
                 ]
         elif outer["base"] == "sum":
             reset = "is_outer_first" if compound else "is_inner_first"
@@ -820,9 +858,6 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         elif outer["base"] == "last":
             cond = "true" if compound else "is_inner_last"
             body = [f"{indent}if ({cond}) {{ {out}[out_off] = {value}; }}"]
-        else:
-            raise ValueError(f"unsupported op '{op['op']}'")
-
         body = [f"{indent}{{"] + body + [f"{indent}}}"]
         if guard:
             lines.append(guard.rstrip())
@@ -838,42 +873,39 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         ctype = var["ctype"]
         is_max = outer["base"] == "max"
         cmp = ">" if is_max else "<"
-        init = f"hf_neg_inf<{ctype}>()" if is_max else f"hf_pos_inf<{ctype}>()"
+        missing = f"static_cast<{ctype}>(NAN)"
         reset = "is_inner_first" if "_" not in op["op"] else "is_outer_first"
         if outer["is_arg"]:
             out = f"p_{_c_ident(op['out_key'])}"
             aux = f"p_{_c_ident(op['aux_key'])}"
             return [
                 f"{indent}long k_base = out_off * {k};",
-                f"{indent}{ctype} new_v = hf_ignore_nan<{ctype}>({value}, {init});",
-                f"{indent}int32_t new_i = macro_step_index;",
+                f"{indent}{ctype} new_v = {value};",
+                f"{indent}int64_t new_i = macro_step_index;",
                 f"{indent}if ({reset}) {{",
-                f"{indent}    {aux}[k_base] = new_v; {out}[k_base] = new_i;",
-                f"{indent}    for (int kk = 1; kk < {k}; ++kk) {{ {aux}[k_base + kk] = {init}; {out}[k_base + kk] = 0; }}",
-                f"{indent}}} else {{",
-                f"{indent}    for (int kk = 0; kk < {k}; ++kk) {{",
-                f"{indent}        {ctype} old_v = {aux}[k_base + kk];",
-                f"{indent}        int32_t old_i = {out}[k_base + kk];",
-                f"{indent}        if (new_v {cmp} old_v) {{ {aux}[k_base + kk] = new_v; {out}[k_base + kk] = new_i; new_v = old_v; new_i = old_i; }}",
-                f"{indent}    }}",
+                f"{indent}    for (int kk = 0; kk < {k}; ++kk) {{ {aux}[k_base + kk] = {missing}; {out}[k_base + kk] = -1; }}",
+                f"{indent}}}",
+                f"{indent}for (int kk = 0; kk < {k}; ++kk) {{",
+                f"{indent}    {ctype} old_v = {aux}[k_base + kk];",
+                f"{indent}    int64_t old_i = {out}[k_base + kk];",
+                f"{indent}    if (!isnan(new_v) && (isnan(old_v) || new_v {cmp} old_v || (new_v == old_v && new_i < old_i))) {{ {aux}[k_base + kk] = new_v; {out}[k_base + kk] = new_i; new_v = old_v; new_i = old_i; }}",
                 f"{indent}}}",
             ]
         out = f"p_{_c_ident(op['out_key'])}"
         return [
             f"{indent}long k_base = out_off * {k};",
-            f"{indent}{ctype} new_v = hf_ignore_nan<{ctype}>({value}, {init});",
+            f"{indent}{ctype} new_v = {value};",
             f"{indent}if ({reset}) {{",
-            f"{indent}    {out}[k_base] = new_v;",
-            f"{indent}    for (int kk = 1; kk < {k}; ++kk) {{ {out}[k_base + kk] = {init}; }}",
-            f"{indent}}} else {{",
-            f"{indent}    for (int kk = 0; kk < {k}; ++kk) {{",
-            f"{indent}        {ctype} old_v = {out}[k_base + kk];",
-            f"{indent}        if (new_v {cmp} old_v) {{ {out}[k_base + kk] = new_v; new_v = old_v; }}",
-            f"{indent}    }}",
+            f"{indent}    for (int kk = 0; kk < {k}; ++kk) {{ {out}[k_base + kk] = {missing}; }}",
+            f"{indent}}}",
+            f"{indent}for (int kk = 0; kk < {k}; ++kk) {{",
+            f"{indent}    {ctype} old_v = {out}[k_base + kk];",
+            f"{indent}    if (!isnan(new_v) && (isnan(old_v) || new_v {cmp} old_v)) {{ {out}[k_base + kk] = new_v; new_v = old_v; }}",
             f"{indent}}}",
         ]
 
     def _generate_launcher(self, specs: Dict[str, Any], params: Sequence[Dict[str, str]]) -> List[str]:
+        scalar_types = _scalar_types(self._control_dtype)
         lines = [
             "static void hf_check_tensor(const at::Tensor& t, const char* name, at::ScalarType dtype) {",
             "    TORCH_CHECK(t.is_cuda(), name, \" must be a CUDA/HIP tensor\");",
@@ -881,8 +913,28 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             "    TORCH_CHECK(t.scalar_type() == dtype, name, \" has unexpected dtype\");",
             "}",
             "",
+            "static long hf_checked_product(long lhs, long rhs, const char* name) {",
+            "    TORCH_CHECK(lhs >= 0 && rhs >= 0, name, \" has a negative launch extent\");",
+            "    TORCH_CHECK(lhs == 0 || rhs <= std::numeric_limits<long>::max() / lhs,",
+            "                name, \" launch extent exceeds signed long range\");",
+            "    return lhs * rhs;",
+            "}",
+            "",
+            "static int hf_grid_blocks(long total, int threads) {",
+            "    TORCH_CHECK(total >= 0, \"kernel launch extent must be nonnegative\");",
+            "    TORCH_CHECK(threads >= 1 && threads <= 1024,",
+            "                \"CUDA statistics block_size must be in [1, 1024]\");",
+            "    if (total == 0) return 0;",
+            "    long blocks = total / threads + (total % threads != 0);",
+            "    TORCH_CHECK(blocks <= std::numeric_limits<int>::max(),",
+            "                \"CUDA statistics grid exceeds the supported block count\");",
+            "    return static_cast<int>(blocks);",
+            "}",
+            "",
             "void launch_update(py::dict states, long block_size) {",
-            "    int threads = block_size > 0 ? static_cast<int>(block_size) : 128;",
+            "    TORCH_CHECK(block_size >= 1 && block_size <= 1024,",
+            "                \"CUDA statistics block_size must be in [1, 1024]\");",
+            "    int threads = static_cast<int>(block_size);",
             "    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();",
         ]
         for param in sorted(params, key=lambda p: p["key"]):
@@ -907,7 +959,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 [
                     "    {",
                     f"        long total = {scatter['target_size'] * scatter['num_trials']};",
-                    "        int blocks = static_cast<int>((total + threads - 1) / threads);",
+                    "        int blocks = hf_grid_blocks(total, threads);",
                     f"        if (blocks > 0) hf_scatter_zero_{scatter['safe']}<<<blocks, threads, 0, stream>>>({', '.join(zero_args)});",
                     "    }",
                 ]
@@ -928,7 +980,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 [
                     "    {",
                     f"        long total = {scatter['source_size'] * scatter['num_trials']};",
-                    "        int blocks = static_cast<int>((total + threads - 1) / threads);",
+                    "        int blocks = hf_grid_blocks(total, threads);",
                     f"        if (blocks > 0) hf_scatter_add_{scatter['safe']}<<<blocks, threads, 0, stream>>>({', '.join(add_args)});",
                     "    }",
                 ]
@@ -943,7 +995,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                     [
                         "    {",
                         f"        long total = {scatter['target_size'] * scatter['num_trials']};",
-                        "        int blocks = static_cast<int>((total + threads - 1) / threads);",
+                        "        int blocks = hf_grid_blocks(total, threads);",
                         f"        if (blocks > 0) hf_scatter_divide_{scatter['safe']}<<<blocks, threads, 0, stream>>>({', '.join(divide_args)});",
                         "    }",
                     ]
@@ -961,7 +1013,11 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                     args.append(f"p_{_c_ident(state['state_key'])}")
                     if "weight_key" in state:
                         args.append(f"p_{_c_ident(state['weight_key'])}")
-            for key in _SCALAR_TYPES:
+                if var["sample_weight_key"] is not None:
+                    args.append(
+                        f"p_{_c_ident(var['sample_weight_key'])}"
+                    )
+            for key in scalar_types:
                 args.append(f"p_{_c_ident(key)}")
             args = list(dict.fromkeys(args))
             if group.get("full_output"):
@@ -970,7 +1026,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                     [
                         "    {",
                         f"        long total = {group['full_total']};",
-                        "        int blocks = static_cast<int>((total + threads - 1) / threads);",
+                        "        int blocks = hf_grid_blocks(total, threads);",
                         f"        if (blocks > 0) {group['kernel_name']}<<<blocks, threads, 0, stream>>>({', '.join(args)});",
                         "    }",
                     ]
@@ -980,8 +1036,9 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 lines.extend(
                     [
                         "    {",
-                        f"        long total = t_{_c_ident(group['output_index'])}.numel() * {group['num_trials']} * {group['max_levels']};",
-                        "        int blocks = static_cast<int>((total + threads - 1) / threads);",
+                        f"        long total = hf_checked_product(t_{_c_ident(group['output_index'])}.numel(), {group['num_trials']}, \"{group['kernel_name']}\");",
+                        f"        total = hf_checked_product(total, {group['max_levels']}, \"{group['kernel_name']}\");",
+                        "        int blocks = hf_grid_blocks(total, threads);",
                         f"        if (blocks > 0) {group['kernel_name']}<<<blocks, threads, 0, stream>>>({', '.join(args)});",
                         "    }",
                     ]

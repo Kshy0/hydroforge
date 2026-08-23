@@ -11,11 +11,9 @@ import netCDF4 as nc
 import numpy as np
 
 from hydroforge.contracts.temporal import canonical_calendar
-from hydroforge.output.netcdf.plan import (
-    COMMITTED_STEPS_ATTR, OUTPUT_FORMAT, OUTPUT_VERSION, RUN_ID_ATTR,
-)
 from hydroforge.serialization.netcdf import (
-    BOOL_LOGICAL_DTYPE, LOGICAL_DTYPE_ATTR,
+    BOOL_LOGICAL_DTYPE, COMMITTED_STEPS_ATTR, LOGICAL_DTYPE_ATTR,
+    OUTPUT_FORMAT, OUTPUT_VERSION, RUN_ID_ATTR,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,10 +25,6 @@ class RankOutputCatalog:
     def _select_coord_name(self, ds: nc.Dataset, saved_points: int) -> Optional[str]:
         """Pick a ('saved_points',) variable to serve as output_coord."""
         if self.owner.coord_name:
-            if self.owner.coord_name not in ds.variables:
-                raise KeyError(
-                    f"requested coordinate {self.owner.coord_name!r} is missing"
-                )
             variable = ds.variables[self.owner.coord_name]
             if (
                 variable.dimensions != ("saved_points",)
@@ -51,6 +45,11 @@ class RankOutputCatalog:
                 if np.ma.isMaskedArray(value) and np.any(
                     np.ma.getmaskarray(value)
                 ):
+                    if np.dtype(v.dtype).kind in "iu":
+                        raise ValueError(
+                            f"coordinate candidate {name!r} contains "
+                            "missing values"
+                        )
                     continue
                 array = np.asarray(value)
                 if (
@@ -69,17 +68,6 @@ class RankOutputCatalog:
         self, path: Path, *, expected: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with nc.Dataset(path, "r") as ds:
-            required_attrs = {
-                "hydroforge_output_format", "hydroforge_output_version",
-                "hydroforge_rank", "hydroforge_world_size",
-                COMMITTED_STEPS_ATTR,
-            }
-            missing_attrs = required_attrs.difference(ds.ncattrs())
-            if missing_attrs:
-                raise ValueError(
-                    f"missing HydroForge output contract attributes: "
-                    f"{sorted(missing_attrs)}"
-                )
             output_format = ds.getncattr("hydroforge_output_format")
             output_version = ds.getncattr("hydroforge_output_version")
             rank = ds.getncattr("hydroforge_rank")
@@ -99,14 +87,13 @@ class RankOutputCatalog:
                     f"unsupported output version {output_version}; version "
                     f"{OUTPUT_VERSION} with a shared run identity is required"
                 )
-            if RUN_ID_ATTR not in ds.ncattrs():
-                raise ValueError(
-                    f"output version {OUTPUT_VERSION} is missing required "
-                    f"run identity attribute {RUN_ID_ATTR!r}"
-                )
             run_id = ds.getncattr(RUN_ID_ATTR)
-            if not isinstance(run_id, str) or not run_id.strip():
+            if not isinstance(run_id, str) or not run_id:
                 raise ValueError(f"{RUN_ID_ATTR} must be a non-empty string")
+            if run_id != run_id.strip():
+                raise ValueError(
+                    f"{RUN_ID_ATTR} must not contain surrounding whitespace"
+                )
             if type(rank) not in {int, np.int32, np.int64} or int(rank) < 0:
                 raise ValueError("hydroforge_rank must be a non-negative integer")
             if (
@@ -115,10 +102,6 @@ class RankOutputCatalog:
                 or int(rank) >= int(world_size)
             ):
                 raise ValueError("invalid hydroforge_world_size/rank contract")
-            if self.owner.var_name not in ds.variables:
-                raise KeyError(f"variable {self.owner.var_name!r} is missing")
-            if "time" not in ds.variables:
-                raise KeyError("time variable is missing")
             variable = ds.variables[self.owner.var_name]
             logical_dtype = getattr(variable, LOGICAL_DTYPE_ATTR, None)
             if logical_dtype is not None:
@@ -137,7 +120,7 @@ class RankOutputCatalog:
             data_length = len(variable)
             if (
                 committed < 0
-                or committed != time_length
+                or committed > time_length
                 or data_length != time_length
             ):
                 raise ValueError(
@@ -197,20 +180,22 @@ class RankOutputCatalog:
                 "logical_dtype": logical_dtype,
                 "contract_rank": int(rank),
                 "world_size": int(world_size),
-                "run_id": run_id.strip(),
+                "run_id": run_id,
+                "committed_steps": committed,
             }
-            if expected is not None and metadata != expected:
-                raise ValueError(
-                    f"rank output schema differs from {expected}: {metadata}"
-                )
+            if expected is not None:
+                schema = dict(metadata)
+                schema.pop("committed_steps")
+                if schema != expected:
+                    raise ValueError(
+                        f"rank output schema differs from {expected}: {schema}"
+                    )
             return metadata
 
     @staticmethod
     def _read_coordinate(
         dataset: nc.Dataset, name: str, saved_points: int,
     ) -> np.ndarray:
-        if name not in dataset.variables:
-            raise KeyError(f"coordinate {name!r} is missing")
         variable = dataset.variables[name]
         if (
             variable.dimensions != ("saved_points",)
@@ -225,9 +210,17 @@ class RankOutputCatalog:
         coordinate = np.asarray(raw)
         if coordinate.dtype.kind not in "iu":
             raise TypeError(f"coordinate {name!r} must be integer")
+        if coordinate.dtype.kind == "u" and coordinate.size and np.any(
+            coordinate > np.iinfo(np.int64).max
+        ):
+            raise OverflowError(
+                f"coordinate {name!r} contains values outside int64 range"
+            )
         if np.unique(coordinate).size != coordinate.size:
             raise ValueError(f"coordinate {name!r} contains duplicate IDs")
-        return coordinate
+        return np.array(
+            coordinate, dtype=np.int64, order="C", copy=True,
+        )
 
     def scan(self) -> List[dict]:
         """Locate rank files and collect basic structural metadata."""
@@ -284,13 +277,15 @@ class RankOutputCatalog:
 
             try:
                 metadata = self._inspect_rank_file(first_fp)
+                committed_steps = [metadata.pop("committed_steps")]
                 if metadata["contract_rank"] != rank_id:
                     raise ValueError(
                         f"file name rank {rank_id} disagrees with contract rank "
                         f"{metadata['contract_rank']}"
                     )
                 for path in paths[1:]:
-                    self._inspect_rank_file(path, expected=metadata)
+                    observed = self._inspect_rank_file(path, expected=metadata)
+                    committed_steps.append(observed["committed_steps"])
                 with nc.Dataset(first_fp, "r") as ds:
                     saved_points = metadata["saved_points"]
                     coord_name = self._select_coord_name(ds, saved_points)
@@ -327,6 +322,7 @@ class RankOutputCatalog:
                         "rank_id": rank_id,
                         "years": years,
                         "paths": paths,
+                        "file_committed_steps": tuple(committed_steps),
                         **metadata,
                         "coord_name": coord_name,
                         "coord_raw": coord_raw,
@@ -334,8 +330,10 @@ class RankOutputCatalog:
                         "y": None,
                     }
                 )
-            except (OSError, KeyError, TypeError, ValueError) as exc:
-                raise RuntimeError(
+            except (
+                OSError, KeyError, OverflowError, TypeError, ValueError,
+            ) as exc:
+                raise ValueError(
                     f"Failed to inspect rank {rank_id} file {first_fp}"
                 ) from exc
 
@@ -382,21 +380,18 @@ class RankOutputCatalog:
           - self.owner._time_units / _time_calendar
           - self.owner._time_len
         """
-        if not self.owner._rank_files:
-            raise RuntimeError("No rank files loaded.")
-
-        master_values = None
-        master_datetimes = None
-        master_lengths = None
+        rank_timelines = []
         for info in self.owner._rank_files:
             datetimes = []
             offsets = []
-            lengths = []
             current_offset = 0
             calendar = None
             first_units = None
-            for path, declared_year in zip(
-                info["paths"], info["years"], strict=True,
+            for path, declared_year, committed_steps in zip(
+                info["paths"],
+                info["years"],
+                info["file_committed_steps"],
+                strict=True,
             ):
                 with nc.Dataset(path, "r") as dataset:
                     variable = dataset.variables["time"]
@@ -417,7 +412,7 @@ class RankOutputCatalog:
                             f"rank {info['rank_id']} files use inconsistent "
                             "calendars"
                         )
-                    raw_values = variable[:]
+                    raw_values = variable[:committed_steps]
                     if np.ma.isMaskedArray(raw_values) and np.any(
                         np.ma.getmaskarray(raw_values)
                     ):
@@ -425,9 +420,9 @@ class RankOutputCatalog:
                             f"time variable in {path.name} contains missing values"
                         )
                     values = np.asarray(raw_values)
-                    if values.ndim != 1 or values.size == 0:
+                    if values.ndim != 1:
                         raise ValueError(
-                            f"time variable in {path.name} must be non-empty and 1-D"
+                            f"time variable in {path.name} must be 1-D"
                         )
                     if values.dtype.kind not in "iuf" or not np.isfinite(
                         values,
@@ -452,7 +447,6 @@ class RankOutputCatalog:
                         )
                     datetimes.extend(decoded)
                     length = len(decoded)
-                    lengths.append(length)
                     offsets.append((current_offset, current_offset + length))
                     current_offset += length
             if any(
@@ -463,83 +457,109 @@ class RankOutputCatalog:
                     f"rank {info['rank_id']} output time axis must be strictly "
                     "increasing across files"
                 )
-            if master_datetimes is None:
-                self.owner._time_units = first_units
-                self.owner._time_calendar = calendar
-                master_datetimes = datetimes
-                master_values = np.asarray(nc.date2num(
-                    datetimes, self.owner._time_units,
-                    self.owner._time_calendar,
-                ))
-                master_lengths = lengths
-            else:
-                if calendar != self.owner._time_calendar:
-                    raise ValueError(
-                        f"rank {info['rank_id']} output calendar {calendar!r} "
-                        f"differs from rank 0 {self.owner._time_calendar!r}"
-                    )
-                if lengths != master_lengths:
-                    raise ValueError(
-                        f"rank {info['rank_id']} output file time lengths "
-                        f"{lengths} differ from rank 0 {master_lengths}"
-                    )
-                observed = np.asarray(nc.date2num(
-                    datetimes, self.owner._time_units,
-                    self.owner._time_calendar,
-                ))
-                if not np.array_equal(observed, master_values):
-                    raise ValueError(
-                        f"rank {info['rank_id']} output timestamps differ from rank 0"
-                    )
             info["file_time_offsets"] = tuple(offsets)
+            rank_timelines.append((info, datetimes, first_units, calendar))
+
+        common_length = min(
+            len(datetimes) for _info, datetimes, _units, _calendar in rank_timelines
+        )
+        if common_length == 0:
+            raise ValueError(
+                "rank outputs have no common committed time steps"
+            )
+        reference_info, reference_datetimes, time_units, time_calendar = (
+            rank_timelines[0]
+        )
+        del reference_info
+        master_datetimes = reference_datetimes[:common_length]
+        master_values = np.asarray(nc.date2num(
+            master_datetimes, time_units, time_calendar,
+        ))
+        for info, datetimes, _units, calendar in rank_timelines[1:]:
+            if calendar != time_calendar:
+                raise ValueError(
+                    f"rank {info['rank_id']} output calendar {calendar!r} "
+                    f"differs from rank 0 {time_calendar!r}"
+                )
+            observed = np.asarray(nc.date2num(
+                datetimes[:common_length], time_units, time_calendar,
+            ))
+            if not np.array_equal(observed, master_values):
+                raise ValueError(
+                    f"rank {info['rank_id']} output timestamps differ from rank 0 "
+                    "within the common committed prefix"
+                )
+        self.owner._time_units = time_units
+        self.owner._time_calendar = time_calendar
         self.owner._time_datetimes = list(master_datetimes)
         self.owner._time_values_num = master_values
-        self.owner._time_len = len(master_values)
+        self.owner._time_len = common_length
 
-    def compute_coordinates(self, force: bool = False) -> None:
+    @staticmethod
+    def _coordinate_int64(
+        value: Any, *, label: str, expected_shape: tuple[int, ...],
+    ) -> np.ndarray:
+        if np.ma.isMaskedArray(value):
+            raise TypeError(f"{label} must not be a masked array")
+        array = np.asarray(value)
+        if array.shape != expected_shape:
+            raise ValueError(
+                f"{label} must have shape {expected_shape}; got {array.shape}"
+            )
+        if array.dtype.kind not in "iu":
+            raise TypeError(f"{label} must contain integers")
+        if array.dtype.kind == "u" and np.any(
+            array > np.iinfo(np.int64).max
+        ):
+            raise OverflowError(f"{label} contains values outside int64 range")
+        return np.array(array, dtype=np.int64, order="C", copy=True)
+
+    def compute_coordinates(self) -> None:
         """Compute (x, y) for each rank (custom converter -> unravel -> None)."""
         for info in self.owner._rank_files:
             if info["coord_raw"] is None or info["saved_points"] == 0:
                 info["x"], info["y"] = None, None
                 continue
-            if (info["x"] is not None and info["y"] is not None) and not force:
-                continue
-
-            if self.owner._coord_converter is not None:
-                x, y = self.owner._coord_converter(info["coord_raw"])
-                x = np.asarray(x)
-                y = np.asarray(y)
+            if self.owner.coord_converter is not None:
+                x, y = self.owner.coord_converter(info["coord_raw"])
                 expected = (info["saved_points"],)
-                if x.shape != expected or y.shape != expected:
-                    raise ValueError(
-                        f"coordinate converter for rank {info['rank_id']} returned "
-                        f"shapes {x.shape}/{y.shape}, expected {expected}"
-                    )
-                if x.dtype.kind not in "iu" or y.dtype.kind not in "iu":
-                    raise TypeError(
-                        "coordinate converter must return integer x/y arrays"
-                    )
-                info["x"], info["y"] = (
-                    x.astype(np.int64, copy=False),
-                    y.astype(np.int64, copy=False),
+                info["x"] = self._coordinate_int64(
+                    x,
+                    label=(
+                        "coordinate converter x output for rank "
+                        f"{info['rank_id']}"
+                    ),
+                    expected_shape=expected,
+                )
+                info["y"] = self._coordinate_int64(
+                    y,
+                    label=(
+                        "coordinate converter y output for rank "
+                        f"{info['rank_id']}"
+                    ),
+                    expected_shape=expected,
                 )
                 continue
 
-            if self.owner._map_shape is not None:
-                nx_, ny_ = self.owner._map_shape
+            if self.owner.map_shape is not None:
+                nx_, ny_ = self.owner.map_shape
                 total = nx_ * ny_
-                flat = np.asarray(info["coord_raw"]).astype(np.int64)
-                if flat.ndim == 1 and np.all((flat >= 0) & (flat < total)):
-                    x, y = np.unravel_index(flat, (nx_, ny_))
-                    info["x"] = x.astype(np.int64)
-                    info["y"] = y.astype(np.int64)
-                else:
-                    info["x"], info["y"] = None, None
-                    logger.info(
-                        "%s output_coord is not a valid linear index; cannot "
-                        "auto-convert rank %d", self.owner.var_name,
-                        info["rank_id"],
+                flat = self._coordinate_int64(
+                    info["coord_raw"],
+                    label=f"linear coordinate for rank {info['rank_id']}",
+                    expected_shape=(info["saved_points"],),
+                )
+                valid = (flat >= 0) & (flat < total)
+                if not np.all(valid):
+                    invalid = int(flat[np.flatnonzero(~valid)[0]])
+                    raise ValueError(
+                        f"linear coordinate {invalid} for rank "
+                        f"{info['rank_id']} is outside map_shape index range "
+                        f"[0, {total})"
                     )
+                x, y = np.unravel_index(flat, (nx_, ny_))
+                info["x"] = x.astype(np.int64, copy=False)
+                info["y"] = y.astype(np.int64, copy=False)
             else:
                 info["x"], info["y"] = None, None
 
@@ -551,8 +571,8 @@ class RankOutputCatalog:
         if not coordinate_parts:
             return
         coordinates = np.concatenate(coordinate_parts, axis=0)
-        if self.owner._map_shape is not None:
-            nx, ny = self.owner._map_shape
+        if self.owner.map_shape is not None:
+            nx, ny = self.owner.map_shape
             valid = (
                 (coordinates[:, 0] >= 0) & (coordinates[:, 0] < nx)
                 & (coordinates[:, 1] >= 0) & (coordinates[:, 1] < ny)

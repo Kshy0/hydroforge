@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
+import math
 from types import MappingProxyType
 from typing import Any
 
 import torch
 
 
+
 FORBIDDEN_SUBSTEP_CONVERSIONS = frozenset({
     "bfloat16", "cpu", "cuda", "double", "float", "half", "mps",
-    "to", "type", "type_as",
+    "to", "type", "type_as", "xpu",
 })
 FORBIDDEN_SUBSTEP_CONSTRUCTORS = frozenset({
     "arange", "as_tensor", "empty", "full", "ones", "tensor", "zeros",
@@ -20,7 +21,7 @@ FORBIDDEN_SUBSTEP_CONSTRUCTORS = frozenset({
 
 
 @dataclass(frozen=True, slots=True)
-class CompiledAtenContract:
+class _CompiledAtenPlan:
     """Exact overloads and backend-neutral value semantics for one operator."""
 
     semantics: str
@@ -32,23 +33,8 @@ def _contract(
     semantics: str,
     *overloads: str,
     preallocated: tuple[tuple[str, str], ...] = (),
-) -> CompiledAtenContract:
-    if semantics not in {"binary", "copy", "fill", "lerp", "scatter", "zero"}:
-        raise ValueError(f"unknown compiled ATen semantics {semantics!r}")
-    if not overloads or len(overloads) != len(set(overloads)):
-        raise ValueError("compiled ATen overloads must be non-empty and unique")
-    sources = tuple(source for source, _target in preallocated)
-    targets = tuple(target for _source, target in preallocated)
-    if (
-        len(sources) != len(set(sources))
-        or len(targets) != len(set(targets))
-        or not set((*sources, *targets)).issubset(overloads)
-    ):
-        raise ValueError(
-            "compiled ATen preallocated source/target overloads must be unique "
-            "and supported"
-        )
-    return CompiledAtenContract(
+) -> _CompiledAtenPlan:
+    return _CompiledAtenPlan(
         semantics, frozenset(overloads), preallocated,
     )
 
@@ -102,20 +88,6 @@ COMPILED_ATEN = frozenset(
     for name, contract in COMPILED_ATEN_CONTRACTS.items()
     for overload in contract.overloads
 )
-for _name, _contract_value in COMPILED_ATEN_CONTRACTS.items():
-    if _name.endswith("_"):
-        continue
-    _covered = {
-        overload
-        for pair in _contract_value.preallocated
-        for overload in pair
-    }
-    if _covered != _contract_value.overloads:
-        raise RuntimeError(
-            f"out-of-place compiled ATen {_name} must define exact "
-            f"preallocated replay coverage: supported="
-            f"{sorted(_contract_value.overloads)}, covered={sorted(_covered)}"
-        )
 
 COMPILED_ATEN_DTYPES = frozenset({
     torch.bool, torch.float32, torch.float64, torch.int32, torch.int64,
@@ -178,8 +150,8 @@ def _require_tensor_scalar_shape(
 def normalize_float32_scalar(name: str, value: Any) -> float:
     """Return the one canonical host representation used by all backends."""
 
-    if type(value) not in {bool, int, float}:
-        _error(f"Compiled ATen {name} scalar must be bool, int, or float")
+    if type(value) not in {int, float}:
+        _error(f"Compiled ATen {name} scalar must be an exact int or float")
     try:
         result = float(value)
     except OverflowError:
@@ -187,6 +159,14 @@ def normalize_float32_scalar(name: str, value: Any) -> float:
     if not math.isfinite(result) or abs(result) > torch.finfo(torch.float32).max:
         _error(
             f"Compiled ATen {name} scalar must be finite and within float32 range"
+        )
+    encoded = torch.tensor(result, dtype=torch.float32).item()
+    if result != 0.0 and encoded == 0.0:
+        _error(f"Compiled ATen {name} scalar underflows float32 storage")
+    if type(value) is int and int(encoded) != value:
+        _error(
+            f"Compiled ATen {name} integer scalar cannot be represented "
+            "exactly in float32"
         )
     return result
 
@@ -200,8 +180,8 @@ def normalize_floating_scalar(
         return normalize_float32_scalar(name, value)
     if dtype != torch.float64:
         _error(f"Compiled ATen {name} requires a floating tensor dtype")
-    if type(value) not in {bool, int, float}:
-        _error(f"Compiled ATen {name} scalar must be bool, int, or float")
+    if type(value) not in {int, float}:
+        _error(f"Compiled ATen {name} scalar must be an exact int or float")
     try:
         result = float(value)
     except OverflowError:
@@ -210,36 +190,30 @@ def normalize_floating_scalar(
         _error(
             f"Compiled ATen {name} scalar must be finite and within float64 range"
         )
+    if type(value) is int and int(result) != value:
+        _error(
+            f"Compiled ATen {name} integer scalar cannot be represented "
+            "exactly in float64"
+        )
     return result
 
 
 def normalize_fill_scalar(dtype: torch.dtype, value: Any) -> bool | int | float:
     """Normalize ``fill_`` exactly once before backend lowering."""
 
-    if type(value) not in {bool, int, float}:
-        _error("Compiled ATen fill_ scalar must be bool, int, or float")
     if dtype in {torch.float32, torch.float64}:
-        label = "float32" if dtype == torch.float32 else "float64"
-        try:
-            result = float(value)
-        except OverflowError:
-            _error(f"Compiled ATen fill_ scalar is outside {label} range")
-        if not math.isfinite(result) or abs(result) > torch.finfo(dtype).max:
-            _error(
-                "Compiled ATen fill_ scalar must be finite and within "
-                f"{label} range"
-            )
-        return result
+        return normalize_floating_scalar("fill_", value, dtype)
     if dtype == torch.bool:
-        return bool(value)
+        if type(value) is not bool:
+            _error("Compiled ATen bool fill_ scalar must be an exact bool")
+        return value
     if dtype in {torch.int32, torch.int64}:
-        if isinstance(value, float) and not math.isfinite(value):
-            _error("Compiled ATen fill_ cannot convert a non-finite integer value")
-        result = int(value)
+        if type(value) is not int:
+            _error("Compiled ATen integer fill_ scalar must be an exact int")
         bits = 32 if dtype == torch.int32 else 64
-        if not -(2 ** (bits - 1)) <= result < 2 ** (bits - 1):
+        if not -(2 ** (bits - 1)) <= value < 2 ** (bits - 1):
             _error(f"Compiled ATen fill_ scalar is outside int{bits} range")
-        return result
+        return value
     _error(f"Compiled ATen fill_ does not support dtype {dtype}")
 
 

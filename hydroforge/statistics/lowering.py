@@ -138,12 +138,8 @@ class StatisticsLowering:
             layout = self.by_name[name].layout
             if layout is OutputLayout.INDEXED_VECTOR:
                 vectors.append(name)
-            elif layout is OutputLayout.INDEXED_LEVEL:
-                levels.append(name)
             else:
-                raise ValueError(
-                    f"full-output variable {name!r} entered an indexed group"
-                )
+                levels.append(name)
         return vectors, levels
 
 
@@ -180,32 +176,6 @@ def _reduction_plan(reduction: Reduction) -> ReductionPlan:
     return ReductionPlan(reduction, action, initialization)
 
 
-def _validate_layout(
-    variable: StatisticVariable,
-    layout: OutputLayout,
-) -> None:
-    if layout is OutputLayout.INDEXED_LEVEL:
-        unsupported = next((
-            operation for operation in variable.operations
-            if operation.compound or operation.k > 1 or operation.stores_index
-        ), None)
-        if unsupported is not None:
-            raise ValueError(
-                f"Level variable {variable.name!r} does not support compound, "
-                f"top-k, or arg operation {unsupported.spelling!r}"
-            )
-    if layout is OutputLayout.FULL:
-        unsupported = next((
-            operation for operation in variable.operations
-            if operation.k > 1 or operation.stores_index
-        ), None)
-        if unsupported is not None:
-            raise ValueError(
-                f"Full-output variable {variable.name!r} does not support "
-                f"top-k or arg operation {unsupported.spelling!r}"
-            )
-
-
 def lower_statistics(
     ir: StatisticsIR,
     *,
@@ -216,7 +186,6 @@ def lower_statistics(
     groups: dict[str, list[LoweredVariable]] = {}
     for variable in ir.variables:
         layout = _layout(variable, num_trials)
-        _validate_layout(variable, layout)
         operations = tuple(
             LoweredOperation(
                 spelling=operation.spelling,

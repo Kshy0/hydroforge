@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Callable, Protocol, runtime_checkable
+from collections.abc import Mapping
+from typing import Any, Callable, Protocol, Self, runtime_checkable
+
+from pydantic import model_validator
+
+from hydroforge.contracts.validation import HydroForgeModel, _immutable_dict
 
 
-@dataclass(frozen=True)
-class ModelEvent:
+class ModelEvent(HydroForgeModel):
     level: str
     name: str
     message: str
-    fields: dict[str, Any]
+    fields: Mapping[str, Any]
+
+    @model_validator(mode="after")
+    def _freeze_fields(self) -> Self:
+        object.__setattr__(self, "fields", _immutable_dict(self.fields))
+        return self
 
 
 @runtime_checkable
@@ -69,4 +77,6 @@ def emit(
     message: str,
     **fields: Any,
 ) -> None:
-    model.event_sink.emit(ModelEvent(level, name, message, fields))
+    model.event_sink.emit(
+        ModelEvent(level=level, name=name, message=message, fields=fields),
+    )
