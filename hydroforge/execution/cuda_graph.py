@@ -131,10 +131,11 @@ void cwg_fixed_end(at::Tensor count, at::Tensor counter,
         count.data_ptr<int>(), counter.data_ptr<int>(), cont.data_ptr<int>());
 }
 
-template <typename T>
+template <typename SourceT, typename DestinationT>
 __global__ void k_fixed_stats_end(const int* __restrict__ count,
         int* __restrict__ counter, int* __restrict__ cont,
-        const T* __restrict__ weight_src, float* __restrict__ weight,
+        const SourceT* __restrict__ weight_src,
+        DestinationT* __restrict__ weight,
         int* __restrict__ sub_step, int* __restrict__ num_sub_steps) {
     int next = *counter + 1;
     bool first = next == 1;
@@ -146,7 +147,7 @@ __global__ void k_fixed_stats_end(const int* __restrict__ count,
     else if (first)    { ss = 0; n = 2; }
     else if (last)     { ss = 1; n = 2; }
     else               { ss = 1; n = 3; }
-    *weight = static_cast<float>(*weight_src);
+    *weight = static_cast<DestinationT>(*weight_src);
     *sub_step = ss;
     *num_sub_steps = n;
 }
@@ -155,11 +156,15 @@ void cwg_fixed_stats_end(at::Tensor count, at::Tensor counter,
                          at::Tensor cont, at::Tensor weight_src,
                          at::Tensor weight, at::Tensor sub_step,
                          at::Tensor num_sub_steps, int64_t stream) {
-    AT_DISPATCH_FLOATING_TYPES(weight_src.scalar_type(), "cwg_fixed_stats_end", [&] {
-        k_fixed_stats_end<scalar_t><<<1, 1, 0, (cudaStream_t)stream>>>(
-            count.data_ptr<int>(), counter.data_ptr<int>(), cont.data_ptr<int>(),
-            weight_src.data_ptr<scalar_t>(), weight.data_ptr<float>(),
-            sub_step.data_ptr<int>(), num_sub_steps.data_ptr<int>());
+    AT_DISPATCH_FLOATING_TYPES(weight_src.scalar_type(), "cwg_fixed_stats_end_source", [&] {
+        using source_t = scalar_t;
+        AT_DISPATCH_FLOATING_TYPES(weight.scalar_type(), "cwg_fixed_stats_end_destination", [&] {
+            using destination_t = scalar_t;
+            k_fixed_stats_end<source_t, destination_t><<<1, 1, 0, (cudaStream_t)stream>>>(
+                count.data_ptr<int>(), counter.data_ptr<int>(), cont.data_ptr<int>(),
+                weight_src.data_ptr<source_t>(), weight.data_ptr<destination_t>(),
+                sub_step.data_ptr<int>(), num_sub_steps.data_ptr<int>());
+        });
     });
 }
 
@@ -171,10 +176,10 @@ void cwg_fixed_stats_end(at::Tensor count, at::Tensor counter,
 //   first & last -> (0, 1);  first -> (0, 2);  last -> (1, 2);
 //   interior -> (1, 3).
 // Exact for supported inner ops {last, mean, sum, max, min, first}; not arg*.
-template <typename T>
-__global__ void k_stats_control(const T* __restrict__ weight_src,
+template <typename SourceT, typename DestinationT>
+__global__ void k_stats_control(const SourceT* __restrict__ weight_src,
         const int* __restrict__ cont, const int* __restrict__ counter,
-        float* __restrict__ weight, int* __restrict__ sub_step,
+        DestinationT* __restrict__ weight, int* __restrict__ sub_step,
         int* __restrict__ num_sub_steps) {
     bool first = (*counter == 1);
     bool last = (*cont == 0);
@@ -183,7 +188,7 @@ __global__ void k_stats_control(const T* __restrict__ weight_src,
     else if (first)    { ss = 0; n = 2; }
     else if (last)     { ss = 1; n = 2; }
     else               { ss = 1; n = 3; }
-    *weight = (float)(*weight_src);
+    *weight = static_cast<DestinationT>(*weight_src);
     *sub_step = ss;
     *num_sub_steps = n;
 }
@@ -191,10 +196,15 @@ __global__ void k_stats_control(const T* __restrict__ weight_src,
 void cwg_stats_control(at::Tensor weight_src, at::Tensor cont, at::Tensor counter,
                        at::Tensor weight, at::Tensor sub_step, at::Tensor num_sub_steps,
                        int64_t stream) {
-    AT_DISPATCH_FLOATING_TYPES(weight_src.scalar_type(), "cwg_stats_control", [&] {
-        k_stats_control<scalar_t><<<1, 1, 0, (cudaStream_t)stream>>>(
-            weight_src.data_ptr<scalar_t>(), cont.data_ptr<int>(), counter.data_ptr<int>(),
-            weight.data_ptr<float>(), sub_step.data_ptr<int>(), num_sub_steps.data_ptr<int>());
+    AT_DISPATCH_FLOATING_TYPES(weight_src.scalar_type(), "cwg_stats_control_source", [&] {
+        using source_t = scalar_t;
+        AT_DISPATCH_FLOATING_TYPES(weight.scalar_type(), "cwg_stats_control_destination", [&] {
+            using destination_t = scalar_t;
+            k_stats_control<source_t, destination_t><<<1, 1, 0, (cudaStream_t)stream>>>(
+                weight_src.data_ptr<source_t>(), cont.data_ptr<int>(), counter.data_ptr<int>(),
+                weight.data_ptr<destination_t>(), sub_step.data_ptr<int>(),
+                num_sub_steps.data_ptr<int>());
+        });
     });
 }
 
@@ -274,7 +284,6 @@ class ConditionalWhileGraph:
     def __init__(self) -> None:
         self._ext = _cond_ext()
         self._h = self._ext.cwg_create()
-        self._instantiated = False
 
     def begin_capture(self, stream_ptr: int) -> None:
         self._ext.cwg_begin_capture(self._h, stream_ptr)
@@ -302,11 +311,8 @@ class ConditionalWhileGraph:
 
     def instantiate(self) -> None:
         self._ext.cwg_instantiate(self._h)
-        self._instantiated = True
 
     def launch(self, stream_ptr: int) -> None:
-        if not self._instantiated:
-            raise RuntimeError("ConditionalWhileGraph.instantiate() must run before launch()")
         self._ext.cwg_launch(self._h, stream_ptr)
 
     def destroy(self) -> None:

@@ -10,9 +10,16 @@ import secrets
 import stat
 
 
+
 @contextmanager
-def atomic_output_path(file_path: str | Path) -> Iterator[Path]:
-    """Yield a same-directory temporary path and publish it on success."""
+def atomic_output_path(
+    file_path: str | Path, *, preserve_suffix: bool = False,
+) -> Iterator[Path]:
+    """Yield a same-directory temporary path and publish it on success.
+
+    ``preserve_suffix`` keeps the target suffix at the end of the temporary
+    name for writers that select their container format from the filename.
+    """
 
     target = Path(file_path)
     existing_mode = None
@@ -26,9 +33,13 @@ def atomic_output_path(file_path: str | Path) -> Iterator[Path]:
     # permissions of newly published artifacts.
     temporary = None
     for _ in range(100):
-        candidate = target.parent / (
-            f".{target.name}.{secrets.token_hex(8)}.tmp"
-        )
+        token = secrets.token_hex(8)
+        if preserve_suffix and target.suffix:
+            stem = target.name[:-len(target.suffix)]
+            temporary_name = f".{stem}.{token}.tmp{target.suffix}"
+        else:
+            temporary_name = f".{target.name}.{token}.tmp"
+        candidate = target.parent / temporary_name
         try:
             descriptor = os.open(
                 candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666,
@@ -43,9 +54,9 @@ def atomic_output_path(file_path: str | Path) -> Iterator[Path]:
         raise FileExistsError(
             f"could not allocate a temporary output beside {target}"
         )
-    if existing_mode is not None:
-        os.chmod(temporary, existing_mode)
     try:
+        if existing_mode is not None:
+            os.chmod(temporary, existing_mode)
         yield temporary
 
         # Writers using this primitive (including netCDF/HDF5) have closed the

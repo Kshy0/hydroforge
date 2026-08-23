@@ -8,13 +8,14 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Mapping
 
 import torch
+from pydantic import Field, PrivateAttr, model_validator
 
 from hydroforge.contracts.fields import concrete_tensor_dtype
 from hydroforge.contracts.kernels import ModuleEnabled, ModuleFlag
 from hydroforge.contracts.runtime import (
-    DEFAULT_BACKEND_REQUIREMENT,
     DEFAULT_BLOCK_SIZE,
 )
+from hydroforge.contracts.validation import HydroForgeModel
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -31,6 +32,40 @@ class BindingResolution:
     value: Any
     source: Literal["field", "feature", "optional", "model_config", "batched"]
     owner: str | None = None
+
+
+class _KernelBindingRequest(HydroForgeModel):
+    """One complete model-bound kernel call validated during recording."""
+
+    binder: Any = Field(exclude=True)
+    kernel: Any = Field(exclude=True)
+    supplied: Mapping[str, Any]
+
+    _arguments: Mapping[str, Any] = PrivateAttr()
+    _buffer_dtypes: Mapping[str, torch.dtype] = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _bind(self):
+        try:
+            arguments = self.binder._complete_trusted(
+                self.kernel, dict(self.supplied),
+            )
+            buffer_dtypes = self.binder._buffer_dtypes_trusted(
+                self.kernel, arguments,
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise ValueError(str(error)) from error
+        self._arguments = MappingProxyType(arguments)
+        self._buffer_dtypes = buffer_dtypes
+        return self
+
+    @property
+    def arguments(self) -> Mapping[str, Any]:
+        return self._arguments
+
+    @property
+    def buffer_dtypes(self) -> Mapping[str, torch.dtype]:
+        return self._buffer_dtypes
 
 
 class KernelBinder:
@@ -53,8 +88,17 @@ class KernelBinder:
         """Use the immutable namespace compiled during model initialization."""
         return self.model._field_namespace
 
-    def complete(self, kernel: Any, supplied: dict[str, Any]) -> dict[str, Any]:
-        spec = kernel.registry.spec
+    def bind(
+        self, kernel: Any, supplied: dict[str, Any],
+    ) -> _KernelBindingRequest:
+        return _KernelBindingRequest(
+            binder=self, kernel=kernel, supplied=supplied,
+        )
+
+    def _complete_trusted(
+        self, kernel: Any, supplied: dict[str, Any],
+    ) -> dict[str, Any]:
+        spec = kernel._spec
         if not supplied:
             cached = self._complete_cache.get(kernel)
             if cached is None:
@@ -74,17 +118,6 @@ class KernelBinder:
                 self._complete_cache[kernel] = cached
             return dict(cached)
         metadata = kernel.metadata
-        extra = set(supplied).difference(metadata.parameters, {"BLOCK_SIZE"})
-        if extra:
-            raise TypeError(
-                f"{metadata.name} received arguments outside its KernelSpec: "
-                f"{sorted(extra)}"
-            )
-        if "BLOCK_SIZE" in supplied:
-            raise TypeError(
-                f"{metadata.name}.BLOCK_SIZE is compiler-owned; configure "
-                "model.BLOCK_SIZE once instead of overriding a kernel launch"
-            )
         for parameter in supplied:
             self.validate_dynamic(parameter, spec)
         arguments = dict(supplied)
@@ -121,13 +154,13 @@ class KernelBinder:
             "call-site value"
         )
 
-    def buffer_dtypes(
+    def _buffer_dtypes_trusted(
         self, kernel: Any, arguments: dict[str, Any],
     ) -> Mapping[str, torch.dtype]:
         """Compile buffer dtypes from declared model fields."""
 
         metadata = kernel.metadata
-        feature_sources = kernel.registry.spec.feature_sources
+        feature_sources = kernel._spec.feature_sources
         result: dict[str, torch.dtype] = {}
         for parameter in metadata.buffers:
             value = arguments[parameter]
@@ -165,10 +198,10 @@ class KernelBinder:
         matches = self._field_index.get(field, ())
         typed = []
         for match in matches:
-            schema_getter = getattr(match.owner, "get_tensor_schema", None)
+            schema_getter = getattr(match.owner, "_get_tensor_schema", None)
             if schema_getter is not None and schema_getter(field) is None:
                 continue
-            getter = getattr(match.owner, "get_expected_dtype", None)
+            getter = getattr(match.owner, "_get_expected_dtype", None)
             if getter is not None:
                 typed.append((match.module_name, getter(field)))
         if len(typed) == 1:
@@ -181,8 +214,8 @@ class KernelBinder:
 
         if feature is None and optional:
             declared = []
-            for module_name, module_type in self.model.module_types().items():
-                schema = module_type.get_tensor_schema(field)
+            for module_name, module_type in self.model._module_types().items():
+                schema = module_type._get_tensor_schema(field)
                 if (
                     schema is not None
                     and schema.tensor is not None
@@ -203,10 +236,10 @@ class KernelBinder:
         if not isinstance(source, (ModuleEnabled, ModuleFlag)):
             return None
         module_name = source.module
-        module_type = self.model.module_types().get(module_name)
+        module_type = self.model._module_types().get(module_name)
         if module_type is None:
             return None
-        schema = module_type.get_tensor_schema(field)
+        schema = module_type._get_tensor_schema(field)
         if schema is None or schema.tensor is None:
             return None
         return self._concrete_dtype(schema.tensor.dtype)
@@ -227,10 +260,6 @@ class KernelBinder:
                 backend, DEFAULT_BLOCK_SIZE,
             )
 
-        rule = model.backend_requirements.get(
-            backend, DEFAULT_BACKEND_REQUIREMENT,
-        )
-        rule.validate_block_size(value, backend=backend)
         return value
 
     def resolve(
@@ -286,18 +315,16 @@ class KernelBinder:
             )
 
         field = parameter[:-4] if parameter.endswith("_ptr") else parameter
-        if parameter.isupper() and field not in self._field_index:
-            field = field.lower()
         if field.startswith("batched_"):
             source = field.removeprefix("batched_")
             matches = self._field_index.get(source, ())
             if not matches:
                 declared = [
                     module_name
-                    for module_name in self.model.module_types()
+                    for module_name in self.model._module_types()
                     if any(
                         item.name == source
-                        for item in self.model.compiled_schema().fields(module_name)
+                        for item in self.model._compiled_schema().fields(module_name)
                     )
                 ]
                 if (
@@ -312,7 +339,7 @@ class KernelBinder:
                     parameter, [match.module_name for match in matches],
                 )
             return BindingResolution(
-                matches[0].owner.is_batched(source),
+                matches[0].owner._is_batched_trusted(source),
                 "batched",
                 f"{matches[0].module_name}.{source}",
             )
@@ -342,14 +369,14 @@ class KernelBinder:
                 f"kernel feature {parameter!r} has no explicit feature_source"
             )
         if isinstance(source, ModuleEnabled):
-            if source.module not in model.module_types():
+            if source.module not in model._module_types():
                 raise KeyError(
                     f"kernel feature {parameter!r} references unknown model "
                     f"module {source.module!r}"
                 )
             return source.module in model.opened_modules
         if isinstance(source, ModuleFlag):
-            module_type = model.module_types().get(source.module)
+            module_type = model._module_types().get(source.module)
             if module_type is None:
                 raise KeyError(
                     f"kernel feature {parameter!r} references unknown "
@@ -390,5 +417,6 @@ class KernelBinder:
             )
         raise UnboundKernelArgument(
             f"kernel argument {parameter!r} has no model/module field; "
-            "rename the ABI/field to match or mark the argument dynamic"
+            "rename the ABI/field to match or supply it explicitly at the "
+            "recording call site"
         )

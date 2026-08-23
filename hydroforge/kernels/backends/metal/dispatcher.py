@@ -8,18 +8,18 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
-from hydroforge.contracts import (
-    BackendLoweringSpec, BufferDTypeABI, KernelSpec, ResourceCleanupError,
-    buffer_access_semantics,
+from hydroforge.contracts.kernels import (
+    BackendLoweringSpec, BufferDTypeABI, KernelSpec, buffer_access_semantics,
 )
+from hydroforge.contracts.errors import ResourceCleanupError
 from hydroforge.contracts.kernels import validate_launch_extent
 from hydroforge.kernels.backends.metal.limits import (
     validate_metal_launch_extent,
 )
 from hydroforge.kernels.backends.metal.types import NATIVE_BUFFER_DTYPES
-from hydroforge.kernels.context import active_kernel_spec, reject_direct_kernel_launch
+from hydroforge.kernels.context import active_kernel_spec
 
 _MSL_SCALARS = {
     "bool": "bool", "int": "int32", "uint": "uint32",
@@ -331,7 +331,14 @@ class MetalDispatcher:
     """Own one Metal kernel's immutable ABI and specialization caches."""
 
     def __init__(
-        self, msl_source, kernel_name: str, *, spec: KernelSpec,
+        self,
+        msl_source: str | os.PathLike[str],
+        kernel_name: str,
+        *,
+        spec: KernelSpec,
+        parallel_axes: tuple[str, ...] = (),
+        variant_role: Literal["standalone", "shared", "batched"] = "standalone",
+        batch_key: str | None = None,
     ) -> None:
         self.source = (
             Path(msl_source).read_text()
@@ -510,17 +517,42 @@ class MetalDispatcher:
             for name, kind in zip(parsed_args, observed_types, strict=True)
             if name not in spec.buffers and name not in packed_names
         }
+        if variant_role != "standalone" and batch_key is None:
+            raise ValueError("Metal variant construction requires batch_key")
+        expected_omitted = (
+            frozenset({batch_key})
+            if variant_role == "shared" else frozenset()
+        )
+        if frozenset(omitted) != expected_omitted:
+            raise TypeError(
+                f"{kernel_name}: {variant_role} Metal construction has an "
+                "invalid canonical projection: "
+                f"omitted={sorted(omitted)}, "
+                f"expected={sorted(expected_omitted)}"
+            )
+        if variant_role != "standalone" and parallel_axes:
+            raise ValueError(
+                f"{kernel_name}: variant role and explicit parallel axes "
+                "cannot be combined"
+            )
         self.args = tuple(parsed_args)
-        self.size_key = spec.size_key
+        if variant_role == "batched":
+            base_axes = (
+                (spec.size_key,) if isinstance(spec.size_key, str)
+                else tuple(spec.size_key)
+            )
+            axes = () if batch_key in base_axes else (batch_key,)
+        else:
+            axes = parallel_axes
+        self.size_key = spec._execution_size_key(axes)
         self.spec = spec
         self.template_vars = MappingProxyType(dict(template_vars))
         self.pack_info = MappingProxyType(dict(packed_layouts))
         self.function_constants = MappingProxyType(dict(function_constants))
         self._runtime = None
         self._pipeline_cache: dict[tuple[Any, ...], int] = {}
-        self._variant_batch_key: str | None = None
-        self._omitted = frozenset(omitted)
-        self._variant_projection_bound = not omitted
+        self.variant_role = variant_role
+        self.batch_key = batch_key
 
         invalid = set(buffer_access.values()).difference(
             {"read", "write", "read_write"},
@@ -571,68 +603,10 @@ class MetalDispatcher:
             "buffer" if name in self.buffer_args else scalar_kinds[name]
             for name in parsed_args
         )
-        self.__hydroforge_kernel__ = spec.metadata
+        self.__hydroforge_kernel__ = spec._canonical_metadata
         self.__hydroforge_lowering__ = BackendLoweringSpec.canonical(
             buffer_elements="specialized",
         )
-
-    def bind_variant_role(self, batch_key: str, *, batched: bool) -> None:
-        """Authorize the one projection owned by a nominal variant pair."""
-
-        if self._variant_batch_key is not None:
-            if self._variant_batch_key != batch_key:
-                raise RuntimeError(
-                    f"{self.kernel_name}: Metal variant batch key changed from "
-                    f"{self._variant_batch_key!r} to {batch_key!r}"
-                )
-            return
-        expected_omitted = frozenset() if batched else frozenset({batch_key})
-        if self._omitted != expected_omitted:
-            raise TypeError(
-                f"{self.kernel_name}: {'batched' if batched else 'shared'} "
-                "Metal variant has an invalid canonical projection: "
-                f"omitted={sorted(self._omitted)}, "
-                f"expected={sorted(expected_omitted)}"
-            )
-        if batched:
-            if batch_key not in self.__hydroforge_kernel__.parameters:
-                raise TypeError(
-                    f"{self.kernel_name}: batch key {batch_key!r} is absent "
-                    "from the batched Metal variant"
-                )
-            keys = (
-                (self.size_key,) if isinstance(self.size_key, str)
-                else tuple(self.size_key)
-            )
-            if batch_key not in keys:
-                self.size_key = (*keys, batch_key)
-        self._variant_batch_key = batch_key
-        self._variant_projection_bound = True
-
-    def bind_parallel_axes(self, axes: tuple[str, ...]) -> None:
-        """Bind backend execution axes without redefining the public ABI.
-
-        ``KernelSpec.size_key`` describes the logical item domain.  A native
-        backend may map an already-declared index scalar (for example
-        ``num_trials``) onto an additional parallel grid axis instead of
-        looping over it inside each item.  This changes only launch layout;
-        argument identity, type, access and public metadata remain canonical.
-        """
-
-        if self._variant_batch_key is not None:
-            raise RuntimeError(
-                f"{self.kernel_name}: explicit parallel axes cannot be mixed "
-                "with a shared/batched variant projection"
-            )
-        self.size_key = self.spec.execution_size_key(axes)
-
-    def _require_bound_projection(self) -> None:
-        if not self._variant_projection_bound:
-            raise RuntimeError(
-                f"{self.kernel_name}: partial Metal ABI omits canonical inputs "
-                f"{sorted(self._omitted)} and may only execute as the shared "
-                "member of an exact VariantDispatcher"
-            )
 
     @staticmethod
     def _literal(value: Any) -> str:
@@ -681,80 +655,42 @@ class MetalDispatcher:
             result.append(_scalar_value(values[name]))
         return result
 
-    def _validate_buffer_dtypes(self, values: dict[str, Any]) -> None:
-        import torch
-
-        for name, native_type in self.buffer_native_types.items():
-            value = values[name]
-            if value is None:
-                continue
-            if not isinstance(value, torch.Tensor):
-                raise TypeError(f"Metal buffer {name!r} requires a tensor")
-            allowed = NATIVE_BUFFER_DTYPES.get(native_type)
-            if allowed is None:
-                raise TypeError(
-                    f"Metal buffer {name!r} has unsupported native pointee "
-                    f"type {native_type!r}"
-                )
-            if value.dtype not in allowed:
-                choices = ", ".join(sorted(str(dtype) for dtype in allowed))
-                raise TypeError(
-                    f"Metal buffer {name!r} uses native {native_type} but "
-                    f"received {value.dtype}; expected {choices}"
-                )
-
-    def _validate_declared_buffer_dtypes(
-        self, buffer_dtypes: BufferDTypeABI,
+    def _validate_specialization_input(
+        self, values: dict[str, Any], *, buffer_dtypes: BufferDTypeABI,
     ) -> None:
-        """Match the field-derived ABI even when an optional value is null."""
+        """Validate Metal-only ABI limits inside the Pydantic call request."""
 
-        missing = set(self.buffer_native_types).difference(buffer_dtypes)
-        if missing:
-            raise TypeError(
-                f"{self.kernel_name}: missing canonical buffer dtype(s) "
-                f"{sorted(missing)}"
-            )
         for name, native_type in self.buffer_native_types.items():
             dtype = buffer_dtypes[name]
             allowed = NATIVE_BUFFER_DTYPES.get(native_type)
-            if allowed is None:
-                raise TypeError(
-                    f"{self.kernel_name}.{name} has unsupported Metal "
-                    f"pointee type {native_type!r}"
-                )
             if dtype not in allowed:
                 choices = ", ".join(sorted(str(item) for item in allowed))
-                raise TypeError(
+                raise ValueError(
                     f"{self.kernel_name}.{name} field declares {dtype}, but "
                     f"the Metal source uses {native_type}; expected {choices}"
                 )
+        validate_metal_launch_extent(
+            self.kernel_name,
+            validate_launch_extent(self.kernel_name, self.size_key, values),
+        )
+        _validated_group_size(values["BLOCK_SIZE"])
 
-    def _validated_values(self, kwargs: dict[str, Any]) -> dict[str, Any]:
-        values = dict(kwargs)
-        public = set(self.__hydroforge_kernel__.parameters)
-        extra = set(values).difference(public, {"BLOCK_SIZE"})
-        if extra:
-            raise TypeError(
-                f"{self.kernel_name}: unexpected Metal arguments {sorted(extra)}"
-            )
-        missing = public.difference(values)
-        if missing:
-            raise TypeError(
-                f"{self.kernel_name}: missing Metal arguments {sorted(missing)}"
-            )
-        # Native scalar kinds were proven equal to KernelSpec while parsing
-        # the MSL argument ABI.  KernelSpec therefore owns the only host-value
-        # type/range rules; repeating them here would create a second scalar
-        # contract that could drift from other backends.
-        self.spec.validate_host_arguments(values)
-        self._validate_buffer_dtypes(values)
-        return values
+    def _trusted_launch_geometry(
+        self, values: dict[str, Any],
+    ) -> tuple[int, int]:
+        keys = (self.size_key,) if isinstance(self.size_key, str) else self.size_key
+        threads = 1
+        for name in keys:
+            threads *= values[name]
+        return threads, values["BLOCK_SIZE"]
 
-    def _prepare_values(self, values: dict[str, Any]):
-        # Specialized/raw callers can invoke this path repeatedly after the
-        # initial bind. Recheck host scalars here so an updated MSL ``uint``
-        # can never cross the native boundary through signed reinterpretation.
-        self.spec.validate_runtime_scalars(values)
+    def _prepare_values(
+        self,
+        values: dict[str, Any],
+        *,
+        threads: int,
+        group_size: int,
+    ):
         arguments = [values[name] for name in self.args]
         constant_values, constants = self._constants(values)
         template_values = self._templates(values)
@@ -762,18 +698,6 @@ class MetalDispatcher:
             _specialization_cache_value(value)
             for value in (*template_values, *constant_values)
         )
-        # Pure launch validation precedes native runtime loading, pipeline
-        # compilation and argument-binding acquisition.
-        threads = validate_metal_launch_extent(
-            self.kernel_name,
-            validate_launch_extent(self.kernel_name, self.size_key, values),
-        )
-        if "BLOCK_SIZE" in values:
-            group_size = _validated_group_size(values["BLOCK_SIZE"])
-        else:
-            raise TypeError(
-                f"{self.kernel_name}: compiler-owned BLOCK_SIZE was not bound"
-            )
         native = self._native()
         pipeline = self._pipeline_cache.get(cache_key)
         if pipeline is None:
@@ -790,27 +714,9 @@ class MetalDispatcher:
         binding = native.create_argument_binding(pipeline, arguments)
         return native, pipeline, binding, threads, group_size
 
-    def prepare(self, **kwargs):
-        self._require_bound_projection()
-        values = self._validated_values(kwargs)
-        values.update(self._packed_values(values))
-        return self._prepare_values(values)
-
     def _submit(self, prepared, values: dict[str, Any]) -> None:
         from hydroforge.kernels.backends.metal.runtime import recording_metal_sequence
 
-        try:
-            validate_metal_launch_extent(self.kernel_name, prepared[3])
-        except BaseException as error:
-            native, _pipeline, binding, _threads, _group_size = prepared
-            try:
-                native.release_argument_binding(binding)
-            except BaseException as cleanup_error:
-                combined = ResourceCleanupError(
-                    "Metal invalid command cleanup", (error, cleanup_error),
-                )
-                raise combined from error
-            raise
         sequence = recording_metal_sequence()
         if sequence is not None:
             buffers = {
@@ -849,54 +755,30 @@ class MetalDispatcher:
             native.release_argument_binding(binding)
 
     def specialize(
-        self, arguments: dict[str, Any], dynamic: frozenset[str], *,
+        self, arguments: dict[str, Any], *,
         buffer_dtypes: BufferDTypeABI,
     ):
         """Own packed tensors in the model-local specialized launch."""
 
-        self._require_bound_projection()
-        self._validate_declared_buffer_dtypes(buffer_dtypes)
-
-        values = self._validated_values(arguments)
-        packed_sources = {
-            name for _format, source_names in self.pack_info.values()
-            for name in source_names
-        }
-        invalid = packed_sources.intersection(dynamic)
-        if invalid:
-            raise TypeError(
-                f"{self.kernel_name}: packed Metal values must be static: "
-                f"{sorted(invalid)}"
-            )
+        values = dict(arguments)
         packed = self._packed_values(values)
-        static = {
-            name: value for name, value in values.items()
-            if name not in dynamic
-        }
+        static = values | packed
+        threads, group_size = self._trusted_launch_geometry(static)
 
-        def launch(**updates: Any) -> None:
-            supplied = set(updates)
-            if supplied != dynamic:
-                raise TypeError(
-                    f"{self.kernel_name}: dynamic Metal ABI mismatch: "
-                    f"missing={sorted(dynamic - supplied)}, "
-                    f"extra={sorted(supplied - dynamic)}"
-                )
-            merged = static | updates | packed
-            self._submit(self._prepare_values(merged), merged)
+        def launch() -> None:
+            prepared = self._prepare_values(
+                static,
+                threads=threads,
+                group_size=group_size,
+            )
+            self._submit(prepared, static)
 
         return launch
 
-    def __call__(self, **kwargs) -> None:
-        reject_direct_kernel_launch(self.kernel_name)
-        values = self._validated_values(kwargs)
-        values.update(self._packed_values(values))
-        self._submit(self._prepare_values(values), values)
-
-
 def make_metal_dispatcher(
-    msl_source, kernel_name: str, *,
+    msl_source: str, kernel_name: str, *,
     spec: KernelSpec | None = None,
+    parallel_axes: tuple[str, ...] = (),
 ) -> MetalDispatcher:
     active = active_kernel_spec()
     if active is not None:
@@ -909,4 +791,6 @@ def make_metal_dispatcher(
         raise TypeError(
             f"{kernel_name}: Metal dispatch requires one canonical KernelSpec"
         )
-    return MetalDispatcher(msl_source, kernel_name, spec=spec)
+    return MetalDispatcher(
+        msl_source, kernel_name, spec=spec, parallel_axes=parallel_axes,
+    )

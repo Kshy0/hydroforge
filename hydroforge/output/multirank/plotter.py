@@ -2,25 +2,33 @@
 
 from __future__ import annotations
 
+from numbers import Real
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple, Union
 
 import netCDF4 as nc
 import numpy as np
 
+from hydroforge.data.numeric import (
+    finite_float64,
+    positive_finite_float64,
+)
+from hydroforge.serialization.files import atomic_output_path
+
 if TYPE_CHECKING:
     import matplotlib.pyplot as plt
+    from hydroforge.output.multirank.reader import MultiRankStatsReader
 
 
 class MultiRankPlotter:
     """Explicit plotting service for one multi-rank reader."""
 
-    def __init__(self, owner) -> None:
+    def __init__(self, owner: MultiRankStatsReader) -> None:
         self.owner = owner
 
     @property
     def _map_shape(self):
-        return self.owner._map_shape
+        return self.owner.map_shape
 
     @property
     def _rank_files(self):
@@ -52,11 +60,11 @@ class MultiRankPlotter:
 
     @property
     def time_len(self):
-        return self.owner.time_len
+        return self.owner._time_len
 
     @property
     def times(self):
-        return self.owner.times
+        return self.owner._time_datetimes
 
     @property
     def var_name(self):
@@ -66,20 +74,94 @@ class MultiRankPlotter:
         return self.owner._safe_time_str(value)
 
     def get_grid(
-        self, t_index: int, level=None, trial: int = 0,
-        fill_value: float = np.nan, dtype=None,
-    ):
-        return self.owner.get_grid(t_index, level, trial, fill_value, dtype)
+        self, t_index: int, level: int | None = None, trial: int = 0,
+        fill_value: float = np.nan, dtype: Any = None,
+    ) -> np.ndarray:
+        return self.owner._get_grid(t_index, level, trial, fill_value, dtype)
 
     def get_series(
-        self, points, level=None, trial: int = 0,
-        fill_value: float = np.nan, dtype=None,
+        self,
+        points: Union[np.ndarray, Sequence[np.ndarray], List[int]],
+        level: int | None = None,
+        trial: int = 0,
+        fill_value: float = np.nan,
+        dtype: Any = None,
         *, time_slice: slice | None = None,
-    ):
+    ) -> np.ndarray:
+        del fill_value
         return self.owner.get_series(
-            points, level, trial, fill_value, dtype,
-            time_slice=time_slice,
+            points, level, trial, dtype, time_slice=time_slice,
         )
+
+    @staticmethod
+    def _strict_half_open_range(
+        value: tuple[int, int] | None, *, length: int, label: str,
+    ) -> tuple[int, int]:
+        if length <= 0:
+            raise ValueError(f"{label} cannot select from an empty timeline")
+        if value is None:
+            return 0, length
+        if type(value) is not tuple or len(value) != 2:
+            raise TypeError(f"{label} must be an exact (start, end) tuple")
+        start, end = value
+        if type(start) is not int or type(end) is not int:
+            raise TypeError(f"{label} bounds must be exact ints")
+        if start < 0 or end > length or start >= end:
+            raise ValueError(
+                f"{label} must satisfy 0 <= start < end <= {length}; "
+                f"got {value}"
+            )
+        return start, end
+
+    @staticmethod
+    def _strict_inclusive_range(
+        value: tuple[int, int] | None, *, length: int, label: str,
+    ) -> tuple[int, int] | None:
+        if value is None:
+            return None
+        if type(value) is not tuple or len(value) != 2:
+            raise TypeError(f"{label} must be an exact (start, end) tuple")
+        start, end = value
+        if type(start) is not int or type(end) is not int:
+            raise TypeError(f"{label} bounds must be exact ints")
+        if start < 0 or end >= length or start > end:
+            raise ValueError(
+                f"{label} must satisfy 0 <= start <= end < {length}; "
+                f"got {value}"
+            )
+        return start, end
+
+    @staticmethod
+    def _validate_figsize(value: tuple[Real, Real]) -> tuple[float, float]:
+        if type(value) is not tuple or len(value) != 2:
+            raise TypeError("figsize must be an exact two-element tuple")
+        width = positive_finite_float64(
+            value[0], label="figsize width",
+        )
+        height = positive_finite_float64(
+            value[1], label="figsize height",
+        )
+        return width, height
+
+    @staticmethod
+    def _validate_color_limit(value: Real | None, *, label: str) -> float | None:
+        if value is None:
+            return None
+        return finite_float64(value, label=label)
+
+    @staticmethod
+    def _validate_crop(auto_crop: bool, crop_pad: int) -> None:
+        if type(auto_crop) is not bool:
+            raise TypeError("auto_crop must be an exact bool")
+        if type(crop_pad) is not int:
+            raise TypeError("crop_pad must be an exact int")
+        if crop_pad < 0:
+            raise ValueError("crop_pad must be non-negative")
+
+    @staticmethod
+    def _validate_cmap(cmap: str) -> None:
+        if type(cmap) is not str or not cmap:
+            raise TypeError("cmap must be a non-empty exact str")
 
     def plot_single_time(
         self,
@@ -97,12 +179,26 @@ class MultiRankPlotter:
     ) -> None:
         import matplotlib.pyplot as plt
 
-        if t_index < 0 or t_index >= self._time_len:
-            raise IndexError(f"t_index out of range [0, {self._time_len - 1}]")
+        if type(t_index) is not int:
+            raise TypeError("t_index must be an exact int")
+        if not 0 <= t_index < self._time_len:
+            raise IndexError(
+                f"t_index out of range [0, {self._time_len - 1}]"
+            )
+        if type(as_scatter_if_no_map) is not bool:
+            raise TypeError("as_scatter_if_no_map must be an exact bool")
+        s = positive_finite_float64(s, label="s")
+        self._validate_crop(auto_crop, crop_pad)
+        self._validate_cmap(cmap)
+        figsize = self._validate_figsize(figsize)
+        vmin = self._validate_color_limit(vmin, label="vmin")
+        vmax = self._validate_color_limit(vmax, label="vmax")
+        if vmin is not None and vmax is not None and vmax <= vmin:
+            raise ValueError("vmax must be greater than vmin")
 
         t_str = f"t={t_index}"
-        if self.times:
-             t_str = self._safe_time_str(self.times[t_index])
+        if len(self.times) > 0:
+            t_str = self._safe_time_str(self.times[t_index])
 
         # Check if we have trials to display in title
         has_trials = False
@@ -151,9 +247,15 @@ class MultiRankPlotter:
                 ys.append(info["y"])
             x_all = np.concatenate(xs) if xs else np.array([])
             y_all = np.concatenate(ys) if ys else np.array([])
-            v_all = self.owner.get_vector(
+            v_all = self.owner._get_vector(
                 t_index, level=level, trial=trial,
             )
+            if not isinstance(v_all, np.ndarray) or v_all.ndim != 1:
+                raise ValueError("get_vector() must return a one-dimensional ndarray")
+            if v_all.shape[0] != x_all.shape[0]:
+                raise ValueError(
+                    "scatter coordinate and value counts do not match"
+                )
             sc = ax.scatter(x_all, y_all, c=v_all, s=s, cmap=cmap, vmin=vmin, vmax=vmax)
             fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
             ax.set_title(f"{title_str} (scatter)")
@@ -166,7 +268,6 @@ class MultiRankPlotter:
 
                 ax.set_xlim(xmin - crop_pad, xmax + crop_pad)
                 ax.set_ylim(ymax + crop_pad, ymin - crop_pad)
-                ax.invert_yaxis()
 
         else:
             raise RuntimeError(
@@ -195,97 +296,147 @@ class MultiRankPlotter:
 
         if self._map_shape is None:
             raise RuntimeError("Animation requires map_shape.")
-        t_start = 0 if t_range is None else max(0, int(t_range[0]))
-        t_end = self._time_len if t_range is None else min(self._time_len, int(t_range[1]))
-        if t_start >= t_end:
-            raise ValueError("Invalid t_range: ensure t_start < t_end")
+        if type(fps) is not int:
+            raise TypeError("fps must be an exact int")
+        if fps <= 0:
+            raise ValueError("fps must be positive")
+        self._validate_crop(auto_crop, crop_pad)
+        self._validate_cmap(cmap)
+        figsize = self._validate_figsize(figsize)
+        vmin = self._validate_color_limit(vmin, label="vmin")
+        vmax = self._validate_color_limit(vmax, label="vmax")
+        if vmin is not None and vmax is not None and vmax <= vmin:
+            raise ValueError("vmax must be greater than vmin")
+
+        out_path = Path(out_path)
+
+        t_start, t_end = self._strict_half_open_range(
+            t_range, length=self._time_len, label="t_range",
+        )
 
         nx_, ny_ = self._map_shape
+        strict_x = self._strict_inclusive_range(
+            x_range, length=nx_, label="x_range",
+        )
+        strict_y = self._strict_inclusive_range(
+            y_range, length=ny_, label="y_range",
+        )
 
         xmin = 0
         xmax = nx_ - 1
         ymin = 0
         ymax = ny_ - 1
 
-        if auto_crop and (x_range is None and y_range is None):
-            # Fetch first frame
-            grid_0 = self.get_grid(t_start, level=level, trial=trial)
-            valid_mask = np.isfinite(grid_0)
-            if np.any(valid_mask):
-                xs, ys = np.where(valid_mask)
-                xmin_c, xmax_c = xs.min(), xs.max()
-                ymin_c, ymax_c = ys.min(), ys.max()
+        grid_0 = self.get_grid(t_start, level=level, trial=trial)
+        if auto_crop:
+            crop_xmin, crop_xmax = nx_, -1
+            crop_ymin, crop_ymax = ny_, -1
+            for ti in range(t_start, t_end):
+                grid = grid_0 if ti == t_start else self.get_grid(
+                    ti, level=level, trial=trial,
+                )
+                xs, ys = np.where(np.isfinite(grid))
+                if xs.size:
+                    crop_xmin = min(crop_xmin, int(xs.min()))
+                    crop_xmax = max(crop_xmax, int(xs.max()))
+                    crop_ymin = min(crop_ymin, int(ys.min()))
+                    crop_ymax = max(crop_ymax, int(ys.max()))
+            if crop_xmax >= crop_xmin:
+                xmin = max(0, crop_xmin - crop_pad)
+                xmax = min(nx_ - 1, crop_xmax + crop_pad)
+                ymin = max(0, crop_ymin - crop_pad)
+                ymax = min(ny_ - 1, crop_ymax + crop_pad)
 
-                xmin = max(0, xmin_c - crop_pad)
-                xmax = min(nx_ - 1, xmax_c + crop_pad)
-                ymin = max(0, ymin_c - crop_pad)
-                ymax = min(ny_ - 1, ymax_c + crop_pad)
+        if strict_x is not None:
+            xmin, xmax = strict_x
+        if strict_y is not None:
+            ymin, ymax = strict_y
 
-        # Override with manual ranges if provided
-        if x_range is not None:
-            xmin = max(0, int(x_range[0]))
-            xmax = min(nx_ - 1, int(x_range[1]))
-        if y_range is not None:
-            ymin = max(0, int(y_range[0]))
-            ymax = min(ny_ - 1, int(y_range[1]))
-
-        if xmin > xmax or ymin > ymax:
-            raise ValueError("Invalid x_range or y_range")
-
-        first_grid = self.get_grid(t_start, level=level, trial=trial)
-        window = first_grid[xmin:xmax + 1, ymin:ymax + 1]
-        if vmin is None:
-            vmin = np.nanmin(window) if np.isfinite(window).any() else 0.0
-        if vmax is None:
-            vmax = np.nanmax(window) if np.isfinite(window).any() else 1.0
+        window = grid_0[xmin:xmax + 1, ymin:ymax + 1]
+        if vmin is None or vmax is None:
+            observed_min = np.inf
+            observed_max = -np.inf
+            for ti in range(t_start, t_end):
+                grid = grid_0 if ti == t_start else self.get_grid(
+                    ti, level=level, trial=trial,
+                )
+                current = grid[xmin:xmax + 1, ymin:ymax + 1]
+                finite = current[np.isfinite(current)]
+                if finite.size:
+                    observed_min = min(observed_min, float(finite.min()))
+                    observed_max = max(observed_max, float(finite.max()))
+            if vmin is None:
+                vmin = 0.0 if observed_min == np.inf else observed_min
+            if vmax is None:
+                vmax = 1.0 if observed_max == -np.inf else observed_max
         if not (vmax > vmin):
-            vmax = vmin + 1.0
+            scale = max(abs(vmin), 1.0)
+            expanded_max = vmin + scale * 1e-6
+            if np.isfinite(expanded_max) and expanded_max > vmin:
+                vmax = expanded_max
+            else:
+                expanded_min = vmin - scale * 1e-6
+                if not np.isfinite(expanded_min) or expanded_min >= vmin:
+                    raise ValueError(
+                        "automatic animation color limits cannot be expanded"
+                    )
+                vmax = vmin
+                vmin = expanded_min
 
         extent = (xmin - 0.5, xmax + 0.5, ymax + 0.5, ymin - 0.5)
 
-        fig, ax = plt.subplots(figsize=figsize)
-        im = ax.imshow(window.T, origin="upper", cmap=cmap, vmin=vmin, vmax=vmax, extent=extent)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-        # Use our robust time logic if available
-        t_label = f"t={t_start}"
-        if self.times:
-             t_label = self._safe_time_str(self.times[t_start])
-
-        ttl = ax.set_title(f"{self.var_name} @ {t_label}")
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        fig.tight_layout()
-
-        def _update(frame_idx: int):
-            ti = t_start + frame_idx
-            grid = self.get_grid(ti, level=level, trial=trial)
-            win = grid[xmin:xmax + 1, ymin:ymax + 1]
-            im.set_data(win.T)
-
-            t_lbl = f"t={ti}"
-            if self.times:
-                t_lbl = self._safe_time_str(self.times[ti])
-
-            ttl.set_text(f"{self.var_name} @ {t_lbl}")
-            return [im, ttl]
-
-        frames = t_end - t_start
-        ani = animation.FuncAnimation(fig, _update, frames=frames, interval=1000 / fps, blit=False)
-
-        out_path = Path(out_path)
         if out_path.suffix.lower() == ".gif":
             writer = animation.PillowWriter(fps=fps)
-            ani.save(out_path, writer=writer)
         else:
             if not animation.writers.is_available("ffmpeg"):
-                raise RuntimeError("ffmpeg writer not found. Install ffmpeg or use .gif.")
+                raise RuntimeError(
+                    "ffmpeg writer not found. Install ffmpeg or use .gif."
+                )
             writer_type = animation.writers["ffmpeg"]
             writer = writer_type(
                 fps=fps, metadata={"artist": "MultiRankStatsReader"},
             )
-            ani.save(out_path, writer=writer)
-        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=figsize)
+        try:
+            im = ax.imshow(
+                window.T, origin="upper", cmap=cmap, vmin=vmin, vmax=vmax,
+                extent=extent,
+            )
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+            t_label = f"t={t_start}"
+            if len(self.times) > 0:
+                t_label = self._safe_time_str(self.times[t_start])
+
+            ttl = ax.set_title(f"{self.var_name} @ {t_label}")
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+            fig.tight_layout()
+
+            def _update(frame_idx: int):
+                ti = t_start + frame_idx
+                grid = self.get_grid(ti, level=level, trial=trial)
+                win = grid[xmin:xmax + 1, ymin:ymax + 1]
+                im.set_data(win.T)
+
+                t_lbl = f"t={ti}"
+                if len(self.times) > 0:
+                    t_lbl = self._safe_time_str(self.times[ti])
+
+                ttl.set_text(f"{self.var_name} @ {t_lbl}")
+                return [im, ttl]
+
+            ani = animation.FuncAnimation(
+                fig, _update, frames=t_end - t_start,
+                interval=1000 / fps, blit=False,
+            )
+            with atomic_output_path(
+                out_path, preserve_suffix=True,
+            ) as temporary:
+                ani.save(temporary, writer=writer)
+        finally:
+            plt.close(fig)
 
     def plot_series(
         self,
@@ -296,7 +447,7 @@ class MultiRankPlotter:
         title: Optional[str] = None,
         ax: Optional[plt.Axes] = None,
         labels: Optional[List[str]] = None,
-        **kwargs
+        **kwargs: Any,
     ) -> plt.Axes:
         """
         Plot time series for specified points (IDs or XY coordinates).
@@ -317,15 +468,26 @@ class MultiRankPlotter:
         import matplotlib.pyplot as plt
         from matplotlib.ticker import FuncFormatter
 
-        if isinstance(trial, int):
-            trials = [trial]
+        if type(trial) is int:
+            trials = (trial,)
         else:
-            trials = trial
-
-        created_fig = False
-        if ax is None:
-            fig, ax = plt.subplots(figsize=figsize)
-            created_fig = True
+            if type(trial) is not list or not trial:
+                raise TypeError(
+                    "trial must be an exact int or a non-empty list of ints"
+                )
+            if any(type(value) is not int for value in trial):
+                raise TypeError("trial list entries must be exact ints")
+            if len(set(trial)) != len(trial):
+                raise ValueError("trial list must not contain duplicates")
+            trials = tuple(trial)
+        figsize = self._validate_figsize(figsize)
+        if title is not None and type(title) is not str:
+            raise TypeError("title must be an exact str or None")
+        if labels is not None:
+            if type(labels) is not list:
+                raise TypeError("labels must be a list of strings or None")
+            if any(type(label) is not str or not label for label in labels):
+                raise ValueError("labels must contain non-empty exact strings")
 
         use_numeric_time = False
         if (
@@ -335,26 +497,55 @@ class MultiRankPlotter:
         ):
             times_to_plot = self._time_values_num
             use_numeric_time = True
-        elif self.times:
+        elif len(self.times) > 0:
             times_to_plot = self.times
         else:
             times_to_plot = np.arange(self.time_len)
 
-        # Ensure points is in a format suitable for get_series
-
+        datasets = []
+        expected_points = None
         for t in trials:
-            # Fetch data: shape (time_len, num_points)
             data = self.get_series(points, level=level, trial=t)
+            if not isinstance(data, np.ndarray) or data.ndim != 2:
+                raise ValueError(
+                    "get_series() must return a two-dimensional ndarray"
+                )
+            if data.shape[0] != len(times_to_plot):
+                raise ValueError(
+                    "series time dimension does not match the reader timeline"
+                )
             num_points = data.shape[1]
+            if expected_points is None:
+                expected_points = num_points
+            elif num_points != expected_points:
+                raise ValueError(
+                    "series point count differs between requested trials"
+                )
+            datasets.append((t, data))
 
+        if labels is not None and len(labels) != expected_points:
+            raise ValueError(
+                f"labels length {len(labels)} does not match point count "
+                f"{expected_points}"
+            )
+        if expected_points == 0:
+            raise ValueError("points must select at least one series")
+
+        created_fig = False
+        if ax is None:
+            _fig, ax = plt.subplots(figsize=figsize)
+            created_fig = True
+
+        for t, data in datasets:
+            num_points = data.shape[1]
             for i in range(num_points):
                 # Construct label
                 # If multiple trials, include trial info. If multiple points, include point info.
                 lbl_parts = []
 
                 # Point Label
-                if labels and i < len(labels):
-                    lbl_parts.append(str(labels[i]))
+                if labels is not None:
+                    lbl_parts.append(labels[i])
                 else:
                     # Try to give a sensible default label from points
                     if isinstance(points, (list, tuple, np.ndarray)):
@@ -371,9 +562,8 @@ class MultiRankPlotter:
                 # Trial Label (only if ambiguous or multiple trials)
                 if len(trials) > 1:
                     lbl_parts.append(f"(Trial {t})")
-                elif not labels and num_points == 1:
-                     # Single point, single trial, explicit label is nice
-                     lbl_parts.append(f"(Trial {t})")
+                elif labels is None and num_points == 1:
+                    lbl_parts.append(f"(Trial {t})")
 
                 label_str = " ".join(lbl_parts)
 
@@ -397,7 +587,7 @@ class MultiRankPlotter:
 
         ax.set_ylabel(self.var_name)
 
-        if title:
+        if title is not None:
             ax.set_title(title)
         elif not ax.get_title():
             # Default title

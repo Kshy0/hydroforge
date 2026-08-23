@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from hydroforge.contracts import KernelSpec, buffer_access_semantics
+from hydroforge.contracts.kernels import KernelSpec, buffer_access_semantics
 from hydroforge.kernels.backends.metal.dispatcher import make_metal_dispatcher
 from hydroforge.kernels.backends.metal.protocol import MetalCommandNode
 from hydroforge.kernels.backends.metal.types import (

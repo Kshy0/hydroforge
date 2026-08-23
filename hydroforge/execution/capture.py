@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 import torch
 
-from hydroforge.contracts import ResourceCleanupError
+from hydroforge.contracts.errors import ResourceCleanupError
 from hydroforge.contracts.naming import RESERVED_CONTROL_STATE
 
 if TYPE_CHECKING:
@@ -19,24 +19,18 @@ class CaptureRuntime:
     def __init__(
         self, model: AbstractModel, *, warmup_iterations: int = 3,
     ) -> None:
-        if type(warmup_iterations) is not int or warmup_iterations < 0:
-            raise ValueError(
-                "capture warmup_iterations must be an exact non-negative int"
-            )
         self.model = model
         self.warmup_iterations = warmup_iterations
         self._graph_pool: Any = None
-        self._statistics_graphs: dict[Any, torch.cuda.CUDAGraph] = {}
-        self._resources: list[Any] = []
+        self._statistics_graphs: dict[
+            int,
+            tuple[Any, torch.cuda.CUDAGraph],
+        ] = {}
+        self._resources: list[tuple[Any, Callable[[], None]]] = []
         self._closed = False
-
-    def _require_open(self) -> None:
-        if self._closed:
-            raise RuntimeError("capture runtime is closed")
 
     @property
     def graph_pool(self) -> Any:
-        self._require_open()
         if self._graph_pool is None:
             self._graph_pool = torch.cuda.graph_pool_handle()
         return self._graph_pool
@@ -44,22 +38,8 @@ class CaptureRuntime:
     def register(self, resource: Any) -> Any:
         """Register a closeable backend resource under model ownership."""
 
-        self._resource_finalizer(resource)
-        if self._closed:
-            primary = RuntimeError(
-                "cannot register a resource after capture close"
-            )
-            try:
-                self._close_resource(resource)
-            except BaseException as cleanup_error:
-                error = ResourceCleanupError(
-                    "closed capture registration", (primary, cleanup_error),
-                )
-                raise error from primary
-            raise primary
-        if any(owned is resource for owned in self._resources):
-            raise RuntimeError("backend resource is already registered")
-        self._resources.append(resource)
+        finalizer = self._resource_finalizer(resource)
+        self._resources.append((resource, finalizer))
         return resource
 
     @staticmethod
@@ -84,16 +64,12 @@ class CaptureRuntime:
     def release(self, resource: Any) -> None:
         """Release one owned resource and remove every retained reference."""
 
-        index = next((
-            index for index, owned in enumerate(self._resources)
+        index = next(
+            index for index, (owned, _finalizer) in enumerate(self._resources)
             if owned is resource
-        ), None)
-        if index is None:
-            raise RuntimeError(
-                "backend resource is not owned or has already been released"
-            )
-        self._resources.pop(index)
-        self._close_resource(resource)
+        )
+        _owned, finalizer = self._resources.pop(index)
+        finalizer()
 
     @staticmethod
     def _save_extra(tensors: Iterable[torch.Tensor]) -> list[torch.Tensor]:
@@ -114,7 +90,6 @@ class CaptureRuntime:
     ) -> torch.cuda.CUDAGraph:
         """Warm and capture while restoring the declared write set exactly."""
 
-        self._require_open()
         state = tuple(dict.fromkeys(mutated_state))
         snapshot = self._save_extra(state)
 
@@ -152,9 +127,9 @@ class CaptureRuntime:
     def run_statistics(self, aggregator: Any, block_size: int) -> None:
         """Execute one statistics kernel through this model's shared capture pool."""
 
-        self._require_open()
-        graph = self._statistics_graphs.get(aggregator)
-        if graph is None:
+        key = id(aggregator)
+        cached = self._statistics_graphs.get(key)
+        if cached is None:
             states = aggregator._kernel_states
             extras = tuple(
                 value for name, value in states.items()
@@ -165,14 +140,25 @@ class CaptureRuntime:
                 lambda: aggregator._aggregator_function(states, block_size),
                 mutated_state=extras,
             )
-            self._statistics_graphs[aggregator] = graph
+            self._statistics_graphs[key] = (aggregator, graph)
+        else:
+            owner, graph = cached
+            if owner is not aggregator:
+                raise RuntimeError(
+                    "statistics capture identity was reused while still active"
+                )
         graph.replay()
 
     def invalidate_statistics(self, aggregator: Any) -> None:
         """Release one cached statistics graph before its bindings change."""
 
-        graph = self._statistics_graphs.pop(aggregator, None)
-        if graph is not None:
+        cached = self._statistics_graphs.pop(id(aggregator), None)
+        if cached is not None:
+            owner, graph = cached
+            if owner is not aggregator:
+                raise RuntimeError(
+                    "statistics capture identity was reused while still active"
+                )
             self.release(graph)
 
     def build_conditional_graph(
@@ -184,22 +170,10 @@ class CaptureRuntime:
         extra_state: Iterable[torch.Tensor] = (),
     ) -> Any:
         """Capture one CUDA conditional-WHILE graph under this owner."""
-        self._require_open()
-        from hydroforge.kernels.devices import devices_match
         from hydroforge.execution.cuda_graph import ConditionalWhileGraph
 
         device = torch.device(self.model.device)
         extras = tuple(extra_state)
-        if not devices_match(continue_flag.device, device):
-            raise ValueError(
-                f"continue_flag is on {continue_flag.device}, expected {device}"
-            )
-        mismatched = [tensor.device for tensor in extras
-                      if not devices_match(tensor.device, device)]
-        if mismatched:
-            raise ValueError(
-                f"conditional snapshots must be on {device}, got {mismatched}"
-            )
         state = tuple(dict.fromkeys((*extras, continue_flag)))
 
         graph = ConditionalWhileGraph()
@@ -284,9 +258,9 @@ class CaptureRuntime:
         resources, self._resources = self._resources, []
         self._statistics_graphs.clear()
         failures: list[BaseException] = []
-        for resource in reversed(resources):
+        for _resource, finalizer in reversed(resources):
             try:
-                self._close_resource(resource)
+                finalizer()
             except BaseException as error:
                 failures.append(error)
         if failures:

@@ -12,25 +12,48 @@ from typing import Any, Iterator, List, Optional, Tuple, Union
 import cftime
 import numpy as np
 
+from hydroforge.contracts.validation import HydroForgeModel
+
+
+class _TimeKeyRequest(HydroForgeModel):
+    value: datetime | cftime.datetime
+
+
+def _single_file_key_trusted(dt: datetime | cftime.datetime) -> str:
+    del dt
+    return ""
+
+
+def _daily_time_to_key_trusted(dt: datetime | cftime.datetime) -> str:
+    return f"{dt.year:04d}{dt.month:02d}{dt.day:02d}"
+
+
+def _yearly_time_to_key_trusted(dt: datetime | cftime.datetime) -> str:
+    return f"{dt.year}"
+
+
+def _monthly_time_to_key_trusted(dt: datetime | cftime.datetime) -> str:
+    return f"{dt.year:04d}_{dt.month:02d}"
+
 
 def single_file_key(dt: Union[datetime, cftime.datetime]) -> str:
     """Constant key for single-file mode."""
-    return ""
+    return _single_file_key_trusted(_TimeKeyRequest(value=dt).value)
 
 
 def daily_time_to_key(dt: Union[datetime, cftime.datetime]) -> str:
     """Default time-to-file key: one file per day (YYYYMMDD)."""
-    return f"{dt.year:04d}{dt.month:02d}{dt.day:02d}"
+    return _daily_time_to_key_trusted(dt)
 
 
 def yearly_time_to_key(dt: Union[datetime, cftime.datetime]) -> str:
     """Default time-to-file key: one file per year."""
-    return f"{dt.year}"
+    return _yearly_time_to_key_trusted(_TimeKeyRequest(value=dt).value)
 
 
-def monthly_time_to_key(dt: datetime) -> str:
+def monthly_time_to_key(dt: Union[datetime, cftime.datetime]) -> str:
     """Default time-to-file key: one file per month (YYYY_MM)."""
-    return dt.strftime("%Y_%m")
+    return _monthly_time_to_key_trusted(_TimeKeyRequest(value=dt).value)
 
 
 def read_netcdf_var_sliced(var: Any, index: Any = None) -> np.ndarray:
@@ -42,12 +65,36 @@ def read_netcdf_var_sliced(var: Any, index: Any = None) -> np.ndarray:
     selectors = list(_normalize_netcdf_index(index, var.ndim))
     shape = tuple(var.shape)
     for axis, selector in enumerate(selectors):
+        if np.ma.isMaskedArray(selector):
+            raise TypeError("NetCDF selectors must not be masked arrays")
+        if isinstance(selector, (bool, np.bool_)):
+            raise TypeError("NetCDF scalar boolean selectors are invalid")
+        if isinstance(selector, slice):
+            selectors[axis] = _normalize_integer_slice(selector)
+            continue
         integer_array = _as_integer_array(selector, shape[axis])
         if integer_array is not None:
             selectors[axis] = integer_array
         elif _is_scalar_integer(selector):
-            selectors[axis] = int(selector)
-    return _read_netcdf_var_sliced_recursive(var, selectors)
+            integer = int(selector)
+            if not -shape[axis] <= integer < shape[axis]:
+                raise IndexError("Integer index exceeds dimension size")
+            selectors[axis] = integer
+        else:
+            raise TypeError(
+                "NetCDF selectors must be integer scalars, integer/boolean "
+                "vectors, or slices"
+            )
+    return _read_netcdf_var_sliced_trusted(var, tuple(selectors))
+
+
+def _read_netcdf_var_sliced_trusted(
+    var: Any,
+    selectors: tuple[Any, ...],
+) -> np.ndarray:
+    """Read with an already normalized and bounded orthogonal selector."""
+
+    return _read_netcdf_var_sliced_recursive(var, list(selectors))
 
 
 def _normalize_netcdf_index(index: Any, ndim: int) -> Tuple[Any, ...]:
@@ -91,6 +138,10 @@ def _normalize_netcdf_index(index: Any, ndim: int) -> Tuple[Any, ...]:
 
 def _is_scalar_integer(value: Any) -> bool:
     """Return True if the selector is a single integer (Python or numpy)."""
+    if np.ma.isMaskedArray(value):
+        return False
+    if isinstance(value, (bool, np.bool_)):
+        return False
     if isinstance(value, (int, np.integer)):
         return True
     try:
@@ -100,8 +151,28 @@ def _is_scalar_integer(value: Any) -> bool:
     return arr.ndim == 0 and arr.dtype.kind in "iu"
 
 
+def _normalize_integer_slice(value: slice) -> slice:
+    """Return a slice whose explicit components are genuine integer values."""
+
+    normalized: list[int | None] = []
+    for component in (value.start, value.stop, value.step):
+        if component is None:
+            normalized.append(None)
+            continue
+        if isinstance(component, (bool, np.bool_)) or not isinstance(
+            component, (int, np.integer),
+        ):
+            raise TypeError("NetCDF slice bounds must be integer values")
+        normalized.append(int(component))
+    if normalized[2] == 0:
+        raise ValueError("NetCDF slice step cannot be zero")
+    return slice(*normalized)
+
+
 def _as_integer_array(selector: Any, axis_length: int) -> Optional[np.ndarray]:
     """Convert a sequence/boolean selector to a 1-D int64 index, else None."""
+    if np.ma.isMaskedArray(selector):
+        raise TypeError("NetCDF selectors must not be masked arrays")
     if isinstance(selector, slice) or _is_scalar_integer(selector):
         return None
     try:
@@ -119,6 +190,11 @@ def _as_integer_array(selector: Any, axis_length: int) -> Optional[np.ndarray]:
     elif arr.size == 0:
         arr = np.empty(0, dtype=np.int64)
     elif arr.dtype.kind in "iu":
+        if arr.dtype.kind == "u":
+            if np.any(arr >= axis_length):
+                raise IndexError("Integer index exceeds dimension size")
+        elif np.any((arr < -axis_length) | (arr >= axis_length)):
+            raise IndexError("Integer index exceeds dimension size")
         arr = arr.astype(np.int64, copy=False)
     else:
         return None

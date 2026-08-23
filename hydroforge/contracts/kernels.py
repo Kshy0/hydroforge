@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from functools import cached_property
 import math
+import struct
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, Mapping, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, Mapping, Self, TypeAlias
+
+from pydantic import Field, PrivateAttr, model_validator
+
+from hydroforge.contracts.validation import HydroForgeModel, _immutable_dict
 
 if TYPE_CHECKING:
     import torch
@@ -25,46 +29,47 @@ LoweringMode = Literal["canonical", "plan", "declared"]
 ParameterOrder = Literal["canonical", "native"]
 BufferAccessLowering = Literal["exact", "conservative"]
 BufferElementLowering = Literal["tensor", "specialized"]
-BufferDTypeABI: TypeAlias = Mapping[str, "torch.dtype"]
+BufferDTypeABI: TypeAlias = Mapping[str, "torch.dtype | None"]
 _LAUNCH_BACKENDS = frozenset({"cuda", "triton", "metal"})
 
 
-@dataclass(frozen=True, slots=True)
-class ModuleEnabled:
+class ModuleEnabled(HydroForgeModel):
     module: str
 
-    def __post_init__(self) -> None:
+    @model_validator(mode="after")
+    def _validate_module(self) -> Self:
         if not isinstance(self.module, str) or not self.module.isidentifier():
             raise ValueError(
                 "module_enabled() requires a valid module identifier"
             )
+        return self
 
 
-@dataclass(frozen=True, slots=True)
-class ModuleFlag:
+class ModuleFlag(HydroForgeModel):
     module: str
     field: str
 
-    def __post_init__(self) -> None:
+    @model_validator(mode="after")
+    def _validate_flag(self) -> Self:
         if not isinstance(self.module, str) or not self.module.isidentifier():
             raise ValueError("module_flag() requires a valid module identifier")
         if not isinstance(self.field, str) or not self.field.isidentifier():
             raise ValueError("module_flag() requires a valid field identifier")
+        return self
 
 
 FeatureSource: TypeAlias = ModuleEnabled | ModuleFlag
 
 
 def module_enabled(module: str) -> ModuleEnabled:
-    return ModuleEnabled(module)
+    return ModuleEnabled(module=module)
 
 
 def module_flag(module: str, field: str) -> ModuleFlag:
-    return ModuleFlag(module, field)
+    return ModuleFlag(module=module, field=field)
 
 
-@dataclass(frozen=True, slots=True)
-class BufferAccessSemantics:
+class BufferAccessSemantics(HydroForgeModel):
     """Canonical dependency and native-storage meaning of one access mode."""
 
     reads: bool
@@ -74,13 +79,27 @@ class BufferAccessSemantics:
 
 
 _BUFFER_ACCESS_SEMANTICS = MappingProxyType({
-    "read": BufferAccessSemantics(True, False, False, "read"),
-    "write": BufferAccessSemantics(False, True, False, "write"),
-    "read_write": BufferAccessSemantics(True, True, False, "read_write"),
-    "atomic_write": BufferAccessSemantics(False, True, True, "write"),
-    "atomic_add": BufferAccessSemantics(True, True, True, "read_write"),
-    "atomic_min": BufferAccessSemantics(True, True, True, "read_write"),
-    "atomic_max": BufferAccessSemantics(True, True, True, "read_write"),
+    "read": BufferAccessSemantics(
+        reads=True, writes=False, atomic=False, dependency="read",
+    ),
+    "write": BufferAccessSemantics(
+        reads=False, writes=True, atomic=False, dependency="write",
+    ),
+    "read_write": BufferAccessSemantics(
+        reads=True, writes=True, atomic=False, dependency="read_write",
+    ),
+    "atomic_write": BufferAccessSemantics(
+        reads=False, writes=True, atomic=True, dependency="write",
+    ),
+    "atomic_add": BufferAccessSemantics(
+        reads=True, writes=True, atomic=True, dependency="read_write",
+    ),
+    "atomic_min": BufferAccessSemantics(
+        reads=True, writes=True, atomic=True, dependency="read_write",
+    ),
+    "atomic_max": BufferAccessSemantics(
+        reads=True, writes=True, atomic=True, dependency="read_write",
+    ),
 })
 BUFFER_ACCESS_MODES = tuple(_BUFFER_ACCESS_SEMANTICS)
 
@@ -107,7 +126,7 @@ def _validate_buffer_accesses(name: str, buffers: Mapping[str, Any]) -> None:
 
 
 def _frozen_mapping(values: Mapping[str, Any] | None) -> Mapping[str, Any]:
-    return MappingProxyType(dict(values or {}))
+    return _immutable_dict(values or {})
 
 
 def _host_scalar_is_valid(value: Any, kind: RuntimeScalarKind) -> bool:
@@ -122,11 +141,14 @@ def _host_scalar_is_valid(value: Any, kind: RuntimeScalarKind) -> bool:
     if kind == "index":
         return type(value) is int and -(2 ** 63) <= value < 2 ** 63
     if kind == "float32":
-        return bool(
-            type(value) is float
-            and math.isfinite(value)
-            and abs(value) <= 3.4028234663852886e38
-        )
+        if (
+            type(value) is not float
+            or not math.isfinite(value)
+            or abs(value) > 3.4028234663852886e38
+        ):
+            return False
+        encoded = struct.unpack("=f", struct.pack("=f", value))[0]
+        return value == 0.0 or encoded != 0.0
     if kind in {"float64", "precision"}:
         return type(value) is float and math.isfinite(value)
     raise RuntimeError(f"unknown canonical host scalar kind {kind!r}")
@@ -138,7 +160,7 @@ def _optional_value_declaration(
     """Validate one optional-value declaration before interpreting it."""
 
     if type(declaration) is not tuple or len(declaration) != 2:
-        raise TypeError(
+        raise ValueError(
             f"{kernel}: optional value {argument!r} must be declared as the "
             "exact tuple (feature, disabled_sentinel)"
         )
@@ -179,8 +201,7 @@ def validate_launch_extent(
     return extent
 
 
-@dataclass(frozen=True)
-class KernelMetadata:
+class KernelMetadata(HydroForgeModel):
     """Concrete metadata exposed by one specialized backend implementation."""
 
     name: str
@@ -189,34 +210,55 @@ class KernelMetadata:
     buffers: Mapping[str, AccessMode]
     optional_buffers: Mapping[str, str | None]
     compile_time: Mapping[str, ScalarKind]
-    runtime_scalars: Mapping[str, RuntimeScalarKind] = field(default_factory=dict)
-    optional_values: Mapping[str, tuple[str, Any]] = field(default_factory=dict)
-    block_sizes: Mapping[str, int] = field(default_factory=dict)
+    runtime_scalars: Mapping[str, RuntimeScalarKind] = Field(default_factory=dict)
+    optional_values: Mapping[str, tuple[str, Any]] = Field(default_factory=dict)
+    block_sizes: Mapping[str, int] = Field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "parameters", tuple(self.parameters))
+    @model_validator(mode="after")
+    def _validate_metadata(self) -> Self:
         for name in (
             "buffers", "optional_buffers", "compile_time",
             "runtime_scalars", "optional_values", "block_sizes",
         ):
             value = getattr(self, name)
             if not isinstance(value, Mapping):
-                raise TypeError(f"KernelMetadata.{name} must be a mapping")
+                raise ValueError(f"KernelMetadata.{name} must be a mapping")
             object.__setattr__(self, name, _frozen_mapping(value))
         _validate_buffer_accesses(self.name, self.buffers)
+        return self
+
+    @classmethod
+    def _from_validated_spec(
+        cls,
+        spec: "KernelSpec",
+        compile_time: Mapping[str, ScalarKind],
+    ) -> "KernelMetadata":
+        """Project metadata from a validated spec without revalidating it."""
+
+        return cls.model_construct(
+            name=spec.name,
+            parameters=spec.parameters,
+            size_key=spec.size_key,
+            buffers=spec.buffers,
+            optional_buffers=spec.optional_buffers,
+            compile_time=_immutable_dict(compile_time),
+            runtime_scalars=spec.runtime_scalars,
+            optional_values=spec.optional_values,
+            block_sizes=spec.block_sizes,
+        )
 
 
-@dataclass(frozen=True, slots=True)
-class BackendLoweringSpec:
+class BackendLoweringSpec(HydroForgeModel):
     """Explicit representation of canonical constants in a native adapter."""
 
     mode: LoweringMode
-    native_constants: Mapping[str, ScalarKind] = field(default_factory=dict)
+    native_constants: Mapping[str, ScalarKind] = Field(default_factory=dict)
     parameter_order: ParameterOrder = "native"
     buffer_access: BufferAccessLowering = "exact"
-    buffer_elements: BufferElementLowering = field(kw_only=True)
+    buffer_elements: BufferElementLowering
 
-    def __post_init__(self) -> None:
+    @model_validator(mode="after")
+    def _validate_lowering(self) -> Self:
         if (
             not isinstance(self.mode, str)
             or self.mode not in {"canonical", "plan", "declared"}
@@ -244,7 +286,7 @@ class BackendLoweringSpec:
                 f"invalid backend buffer elements {self.buffer_elements!r}"
             )
         if not isinstance(self.native_constants, Mapping):
-            raise TypeError("backend native_constants must be a mapping")
+            raise ValueError("backend native_constants must be a mapping")
         invalid_names = [
             name for name in self.native_constants
             if not isinstance(name, str) or not name.isidentifier()
@@ -270,6 +312,7 @@ class BackendLoweringSpec:
         object.__setattr__(
             self, "native_constants", _frozen_mapping(self.native_constants),
         )
+        return self
 
     def compile_time_for(self, spec: KernelSpec) -> Mapping[str, ScalarKind]:
         """Derive the native constexpr ABI from one canonical KernelSpec."""
@@ -296,7 +339,7 @@ class BackendLoweringSpec:
         cls, *, buffer_elements: BufferElementLowering,
     ) -> "BackendLoweringSpec":
         return cls(
-            "canonical", parameter_order="canonical",
+            mode="canonical", parameter_order="canonical",
             buffer_elements=buffer_elements,
         )
 
@@ -305,7 +348,7 @@ class BackendLoweringSpec:
         cls, *, buffer_elements: BufferElementLowering,
     ) -> "BackendLoweringSpec":
         return cls(
-            "plan", parameter_order="canonical", buffer_access="exact",
+            mode="plan", parameter_order="canonical", buffer_access="exact",
             buffer_elements=buffer_elements,
         )
 
@@ -315,12 +358,12 @@ class BackendLoweringSpec:
         buffer_elements: BufferElementLowering,
     ) -> "BackendLoweringSpec":
         return cls(
-            "declared", constants, buffer_elements=buffer_elements,
+            mode="declared", native_constants=constants,
+            buffer_elements=buffer_elements,
         )
 
 
-@dataclass(frozen=True)
-class KernelSpec:
+class KernelSpec(HydroForgeModel):
     """The single backend-neutral ABI for one logical kernel.
 
     A spec is declared beside the logical :class:`BackendRegistry`; backend
@@ -332,18 +375,17 @@ class KernelSpec:
     parameters: tuple[str, ...]
     size_key: str | tuple[str, ...]
     buffers: Mapping[str, AccessMode]
-    optional_buffers: Mapping[str, str | None] = field(default_factory=dict)
-    compile_time: Mapping[str, ScalarKind] = field(default_factory=dict)
-    feature_sources: Mapping[str, FeatureSource] = field(default_factory=dict)
-    runtime_scalars: Mapping[str, RuntimeScalarKind] = field(default_factory=dict)
-    optional_values: Mapping[str, tuple[str, Any]] = field(default_factory=dict)
-    block_sizes: Mapping[str, int] = field(default_factory=dict)
-    _precision_parameters: frozenset[str] = field(
-        default_factory=frozenset, init=False, repr=False, compare=False,
-    )
+    optional_buffers: Mapping[str, str | None] = Field(default_factory=dict)
+    compile_time: Mapping[str, ScalarKind] = Field(default_factory=dict)
+    feature_sources: Mapping[str, FeatureSource] = Field(default_factory=dict)
+    runtime_scalars: Mapping[str, RuntimeScalarKind] = Field(default_factory=dict)
+    optional_values: Mapping[str, tuple[str, Any]] = Field(default_factory=dict)
+    block_sizes: Mapping[str, int] = Field(default_factory=dict)
+    _precision_parameters: frozenset[str] = PrivateAttr(default_factory=frozenset)
 
-    def __post_init__(self) -> None:
-        parameters = tuple(self.parameters)
+    @model_validator(mode="after")
+    def _validate_spec(self) -> Self:
+        parameters = self.parameters
         if not isinstance(self.name, str) or not self.name.isidentifier():
             raise ValueError("KernelSpec.name must be a valid Python identifier")
         for field_name in (
@@ -351,7 +393,7 @@ class KernelSpec:
             "runtime_scalars", "optional_values", "block_sizes",
         ):
             if not isinstance(getattr(self, field_name), Mapping):
-                raise TypeError(
+                raise ValueError(
                     f"{self.name}: {field_name} must be a mapping"
                 )
         invalid_parameters = [
@@ -371,7 +413,7 @@ class KernelSpec:
         elif isinstance(self.size_key, tuple):
             size_keys = self.size_key
         else:
-            raise TypeError(
+            raise ValueError(
                 f"{self.name}: size_key must be a string or tuple of strings"
             )
         if (
@@ -450,7 +492,7 @@ class KernelSpec:
             if not isinstance(source, (ModuleEnabled, ModuleFlag))
         }
         if invalid_feature_sources:
-            raise TypeError(
+            raise ValueError(
                 f"{self.name}: feature_sources must contain module_enabled() "
                 f"or module_flag() declarations: {invalid_feature_sources}"
             )
@@ -521,12 +563,15 @@ class KernelSpec:
             )
         invalid_extents = {
             name for name in size_keys
-            if self.runtime_scalars.get(name) != "index"
+            if self.runtime_scalars.get(name) not in {
+                "int32", "uint32", "index",
+            }
         }
         if invalid_extents:
             raise ValueError(
-                f"{self.name}: launch extent scalar(s) must have runtime kind "
-                f"'index': {sorted(invalid_extents)}"
+                f"{self.name}: launch extent scalar(s) must have an integer "
+                "runtime kind ('int32', 'uint32', or 'index'): "
+                f"{sorted(invalid_extents)}"
             )
         duplicate_optional = set(self.optional_buffers).intersection(
             self.optional_values,
@@ -582,13 +627,13 @@ class KernelSpec:
                 argument, self.compile_time.get(argument),
             )
             if not _host_scalar_is_valid(disabled, kind):
-                raise TypeError(
+                raise ValueError(
                     f"{self.name}: optional value {argument!r} disabled "
                     f"sentinel must be an exact finite {kind} host scalar, "
                     f"got {disabled!r} ({type(disabled).__name__})"
                 )
         if not isinstance(self.block_sizes, Mapping):
-            raise TypeError(f"{self.name}: block_sizes must be a mapping")
+            raise ValueError(f"{self.name}: block_sizes must be a mapping")
         unknown_launch_backends = set(self.block_sizes).difference(
             _LAUNCH_BACKENDS,
         )
@@ -607,7 +652,6 @@ class KernelSpec:
                 f"{self.name}: backend block sizes must be exact ints in "
                 f"[1, 1024]: {invalid_block_sizes}"
             )
-        object.__setattr__(self, "parameters", parameters)
         object.__setattr__(self, "buffers", _frozen_mapping(self.buffers))
         object.__setattr__(
             self, "optional_buffers", _frozen_mapping(self.optional_buffers),
@@ -625,19 +669,20 @@ class KernelSpec:
         object.__setattr__(
             self, "block_sizes", _frozen_mapping(self.block_sizes),
         )
+        return self
 
     @cached_property
-    def uses_precision(self) -> bool:
+    def _uses_precision(self) -> bool:
         return "precision" in self.compile_time.values() or (
             "precision" in self.runtime_scalars.values()
         )
 
     @property
-    def precision_parameters(self) -> frozenset[str]:
+    def _precision_parameter_names(self) -> frozenset[str]:
         return self._precision_parameters
 
-    def resolve_precision(self, precision: Precision | None) -> "KernelSpec":
-        if not self.uses_precision:
+    def _resolve_precision(self, precision: Precision | None) -> "KernelSpec":
+        if not self._uses_precision:
             return self
         if precision not in {"float32", "float64"}:
             raise ValueError(
@@ -650,45 +695,48 @@ class KernelSpec:
             )
             if kind == "precision"
         )
-        resolved = KernelSpec(
-            name=self.name,
-            parameters=self.parameters,
-            size_key=self.size_key,
-            buffers=self.buffers,
-            optional_buffers=self.optional_buffers,
-            compile_time={
+        resolved = self._derive_trusted(
+            compile_time=_immutable_dict({
                 name: precision if kind == "precision" else kind
                 for name, kind in self.compile_time.items()
-            },
-            feature_sources=self.feature_sources,
-            runtime_scalars={
+            }),
+            runtime_scalars=_immutable_dict({
                 name: precision if kind == "precision" else kind
                 for name, kind in self.runtime_scalars.items()
-            },
-            optional_values=self.optional_values,
-            block_sizes=self.block_sizes,
+            }),
         )
         object.__setattr__(
             resolved, "_precision_parameters", precision_parameters,
         )
         return resolved
 
+    def _derive_trusted(self, **changes: Any) -> "KernelSpec":
+        """Build a spec solely from validated fields and checked derivations."""
+
+        values = {
+            "name": self.name,
+            "parameters": self.parameters,
+            "size_key": self.size_key,
+            "buffers": self.buffers,
+            "optional_buffers": self.optional_buffers,
+            "compile_time": self.compile_time,
+            "feature_sources": self.feature_sources,
+            "runtime_scalars": self.runtime_scalars,
+            "optional_values": self.optional_values,
+            "block_sizes": self.block_sizes,
+        }
+        values.update(changes)
+        return KernelSpec.model_construct(**values)
+
     def _metadata(
         self, compile_time: Mapping[str, ScalarKind],
     ) -> KernelMetadata:
-        return KernelMetadata(
-            name=self.name,
-            parameters=self.parameters,
-            size_key=self.size_key,
-            buffers=self.buffers,
-            optional_buffers=self.optional_buffers,
-            compile_time=compile_time,
-            runtime_scalars=self.runtime_scalars,
-            optional_values=self.optional_values,
-            block_sizes=self.block_sizes,
+        return KernelMetadata._from_validated_spec(
+            self,
+            compile_time,
         )
 
-    def metadata_for_lowering(
+    def _metadata_for_lowering(
         self, lowering: BackendLoweringSpec,
     ) -> KernelMetadata:
         """Project native metadata entirely from this Spec and its lowering."""
@@ -698,10 +746,10 @@ class KernelSpec:
         return self._metadata(lowering.compile_time_for(self))
 
     @cached_property
-    def metadata(self) -> KernelMetadata:
+    def _canonical_metadata(self) -> KernelMetadata:
         return self._metadata(self.compile_time)
 
-    def launch_extent(self, arguments: Mapping[str, Any]) -> int:
+    def _launch_extent(self, arguments: Mapping[str, Any]) -> int:
         """Return the exact flattened launch extent for this ABI.
 
         Launch geometry is part of the logical kernel contract, not a backend
@@ -712,7 +760,7 @@ class KernelSpec:
 
         return validate_launch_extent(self.name, self.size_key, arguments)
 
-    def execution_size_key(
+    def _execution_size_key(
         self, additional_axes: tuple[str, ...] = (),
     ) -> str | tuple[str, ...]:
         """Return a validated backend execution layout over canonical axes."""
@@ -746,7 +794,7 @@ class KernelSpec:
             )
         return (*base, *additional_axes) if additional_axes else self.size_key
 
-    def validate_runtime_scalars(self, arguments: Mapping[str, Any]) -> None:
+    def _validate_runtime_scalars(self, arguments: Mapping[str, Any]) -> None:
         """Validate semantic host values before any backend representation."""
 
         for name, kind in self.runtime_scalars.items():
@@ -757,7 +805,7 @@ class KernelSpec:
                     f"scalar, got {value!r} ({type(value).__name__})"
                 )
 
-    def validate_compile_time(self, arguments: Mapping[str, Any]) -> None:
+    def _validate_compile_time(self, arguments: Mapping[str, Any]) -> None:
         """Validate canonical specialization values without backend coercion."""
 
         for name, kind in self.compile_time.items():
@@ -768,15 +816,15 @@ class KernelSpec:
                     f"host scalar, got {value!r} ({type(value).__name__})"
                 )
 
-    def validate_host_arguments(self, arguments: Mapping[str, Any]) -> None:
+    def _validate_host_arguments(self, arguments: Mapping[str, Any]) -> None:
         """Apply every backend-independent host-side ABI invariant."""
 
-        self.validate_compile_time(arguments)
-        self.launch_extent(arguments)
-        self.validate_runtime_scalars(arguments)
-        self.validate_optional(arguments)
+        self._validate_compile_time(arguments)
+        self._launch_extent(arguments)
+        self._validate_runtime_scalars(arguments)
+        self._validate_optional(arguments)
 
-    def validate_optional(self, arguments: Mapping[str, Any]) -> None:
+    def _validate_optional(self, arguments: Mapping[str, Any]) -> None:
         """Require one exact representation for every disabled feature."""
 
         for buffer, feature in self.optional_buffers.items():
@@ -798,40 +846,25 @@ class KernelSpec:
         self, *, omit: tuple[str, ...] = (), name: str | None = None,
         size_key: str | tuple[str, ...] | None = None,
     ) -> "KernelSpec":
-        """Declare the exact private ABI consumed by one native variant."""
-        omitted = frozenset(omit)
-        unknown = omitted.difference(self.parameters)
-        if unknown:
-            raise ValueError(
-                f"{self.name}: projection omits unknown parameters "
-                f"{sorted(unknown)}"
-            )
-        projected_size = self.size_key if size_key is None else size_key
-        size_names = (
-            (projected_size,) if isinstance(projected_size, str)
-            else projected_size
+        """Return one validated semantic projection of this kernel ABI."""
+
+        request = _KernelProjectionRequest(
+            spec=self,
+            omit=omit,
+            name=name,
+            size_key=size_key,
         )
-        if omitted.intersection(size_names):
-            raise ValueError(
-                f"{self.name}: projection cannot omit size key(s) "
-                f"{sorted(omitted.intersection(size_names))}"
-            )
-        orphaned = {
-            parameter for parameter, feature in (
-                *self.optional_buffers.items(), *self.optional_values.items(),
-            )
-            if feature is not None and (
-                (feature[0] if isinstance(feature, tuple) else feature)
-                in omitted and parameter not in omitted
-            )
-        }
-        if orphaned:
-            raise ValueError(
-                f"{self.name}: projection omits feature while retaining "
-                f"optional argument(s) {sorted(orphaned)}"
-            )
-        projected = KernelSpec(
-            name=self.name if name is None else name,
+        return self._project(request)
+
+    def _project(self, request: "_KernelProjectionRequest") -> "KernelSpec":
+        """Compile a validated projection request into a new KernelSpec."""
+
+        omitted = frozenset(request.omit)
+        projected_size = (
+            self.size_key if request.size_key is None else request.size_key
+        )
+        projected = self._derive_trusted(
+            name=self.name if request.name is None else request.name,
             parameters=tuple(
                 parameter for parameter in self.parameters
                 if parameter not in omitted
@@ -866,7 +899,6 @@ class KernelSpec:
                 for parameter, value in self.optional_values.items()
                 if parameter not in omitted and value[0] not in omitted
             },
-            block_sizes=self.block_sizes,
         )
         object.__setattr__(
             projected,
@@ -875,7 +907,7 @@ class KernelSpec:
         )
         return projected
 
-    def validate(self, backend: str, actual: KernelMetadata) -> None:
+    def _validate(self, backend: str, actual: KernelMetadata) -> None:
         """Fail if a public kernel ABI differs from this exact specification."""
 
         differences: list[str] = []
@@ -907,7 +939,7 @@ class KernelSpec:
                 f"{self.name}: {backend} implementation violates KernelSpec: {detail}"
             )
 
-    def validate_native(
+    def _validate_native(
         self, backend: str, actual: KernelMetadata,
         lowering: BackendLoweringSpec,
     ) -> None:
@@ -972,3 +1004,104 @@ class KernelSpec:
                 f"{self.name}: {backend} native launch violates KernelSpec: "
                 f"{'; '.join(differences)}"
             )
+
+
+class _KernelProjectionRequest(HydroForgeModel):
+    """Private validated input for ``KernelSpec.project``."""
+
+    spec: KernelSpec = Field(exclude=True, repr=False)
+    omit: tuple[str, ...] = ()
+    name: str | None = None
+    size_key: str | tuple[str, ...] | None = None
+
+    @model_validator(mode="after")
+    def _validate_projection(self) -> Self:
+        if len(self.omit) != len(set(self.omit)):
+            raise ValueError("KernelSpec projection omit names must be unique")
+        invalid_omit = [name for name in self.omit if not name.isidentifier()]
+        if invalid_omit:
+            raise ValueError(
+                "KernelSpec projection omit names must be valid Python "
+                f"identifiers: {invalid_omit!r}"
+            )
+        if self.name is not None and not self.name.isidentifier():
+            raise ValueError(
+                "KernelSpec projection name must be a valid Python identifier"
+            )
+
+        omitted = frozenset(self.omit)
+        unknown = omitted.difference(self.spec.parameters)
+        if unknown:
+            raise ValueError(
+                f"{self.spec.name}: projection omits unknown parameters "
+                f"{sorted(unknown)}"
+            )
+        projected_size = (
+            self.spec.size_key if self.size_key is None else self.size_key
+        )
+        size_names = (
+            (projected_size,) if isinstance(projected_size, str)
+            else projected_size
+        )
+        if not size_names or len(size_names) != len(set(size_names)):
+            raise ValueError(
+                "KernelSpec projection size_key must contain one or more "
+                "unique identifiers"
+            )
+        invalid_size = [name for name in size_names if not name.isidentifier()]
+        if invalid_size:
+            raise ValueError(
+                "KernelSpec projection size_key names must be valid Python "
+                f"identifiers: {invalid_size!r}"
+            )
+        omitted_size = omitted.intersection(size_names)
+        if omitted_size:
+            raise ValueError(
+                f"{self.spec.name}: projection cannot omit size key(s) "
+                f"{sorted(omitted_size)}"
+            )
+        projected_parameters = set(self.spec.parameters).difference(omitted)
+        missing_size = set(size_names).difference(projected_parameters)
+        if missing_size:
+            raise ValueError(
+                f"{self.spec.name}: projection size key(s) outside projected "
+                f"ABI: {sorted(missing_size)}"
+            )
+        buffer_extents = set(size_names).intersection(self.spec.buffers)
+        if buffer_extents:
+            raise ValueError(
+                f"{self.spec.name}: projection size key(s) must be host "
+                f"scalars, not buffers: {sorted(buffer_extents)}"
+            )
+        invalid_extents = {
+            name
+            for name in size_names
+            if self.spec.runtime_scalars.get(name) not in {
+                "int32", "uint32", "index",
+            }
+        }
+        if invalid_extents:
+            raise ValueError(
+                f"{self.spec.name}: projection launch extent scalar(s) must "
+                "have an integer runtime kind ('int32', 'uint32', or "
+                f"'index'): {sorted(invalid_extents)}"
+            )
+        orphaned = {
+            parameter
+            for parameter, feature in (
+                *self.spec.optional_buffers.items(),
+                *self.spec.optional_values.items(),
+            )
+            if feature is not None
+            and (
+                (feature[0] if isinstance(feature, tuple) else feature)
+                in omitted
+                and parameter not in omitted
+            )
+        }
+        if orphaned:
+            raise ValueError(
+                f"{self.spec.name}: projection omits feature while retaining "
+                f"optional argument(s) {sorted(orphaned)}"
+            )
+        return self

@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Mapping
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Mapping, cast
 
 import torch
 
-from hydroforge.statistics.runtime import StatisticsRuntime, StatisticsConfig
-from hydroforge.statistics.ir import (
-    ExpressionSource, ScatterSource, parse_value_source,
+from hydroforge.statistics.runtime import (
+    StatisticsInstallation,
+    StatisticsRuntime,
+    StatisticsStaticBinding,
 )
-from hydroforge.statistics.layout import compile_statistics
+from hydroforge.statistics.observer import StatisticsObserver
+from hydroforge.statistics.ir import (
+    _StatisticsDeclaration, ExpressionSource, ScatterSource,
+    StatisticsProgram, TensorSource,
+)
 from hydroforge.contracts.events import emit
 from hydroforge.contracts.fields import RuntimeTensorMetadata, TensorMetadata
 from hydroforge.contracts.runtime import DEFAULT_BLOCK_SIZE
@@ -19,34 +25,72 @@ if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
 
 
-class StatisticsBindingCompiler:
-    """Own aggregator construction, request normalization and result access."""
+class DisabledStatisticsBinding:
+    """Resource-free statistics binding for a model without a declaration."""
 
-    def __init__(self, model: AbstractModel) -> None:
+    def close(self) -> None:
+        pass
+
+    def memory_usage(self) -> int:
+        return 0
+
+    def time_index(self) -> int:
+        return 0
+
+    def reset_time_index(self) -> None:
+        pass
+
+
+class StatisticsBindingCompiler:
+    """Compile and own one complete statistics runtime."""
+
+    def __init__(
+        self,
+        model: AbstractModel,
+        declaration: _StatisticsDeclaration,
+    ) -> None:
         self.model = model
-        self._aggregator: StatisticsRuntime | None = None
+        adhoc = self.prepare_virtuals(declaration.program)
+        installation = self._compile_installation(
+            declaration.variable_ops,
+            declaration.program,
+            adhoc,
+            declaration.static_names,
+            declaration.netcdf_options,
+        )
+        self._aggregator = self._create(installation)
+        model._execution.statistics = StatisticsObserver(
+            model, self._aggregator,
+        )
 
     @property
     def variable_map(self):
         return self.model._namespace.build()
 
     @property
-    def aggregator(self) -> StatisticsRuntime | None:
+    def aggregator(self) -> StatisticsRuntime:
         return self._aggregator
 
-    def create(self) -> StatisticsRuntime:
+    def _create(
+        self, installation: StatisticsInstallation,
+    ) -> StatisticsRuntime:
         model = self.model
-        aggregator = StatisticsRuntime(StatisticsConfig(
+        aggregator = StatisticsRuntime(
             device=model.device,
             backend=model._execution.backend,
+            installation=installation,
+            execution=model._execution,
+            base_dtype=model.dtype,
+            mixed_precision=model.mixed_precision,
             output_dir=model.output_full_dir,
             rank=model.rank,
             world_size=model.world_size,
             num_workers=model.output_workers,
             output_split_by_year=model.output_split_by_year,
-            num_trials=model.num_trials or 1,
+            num_trials=(1 if model.num_trials is None else model.num_trials),
             save_kernels=model.save_kernels,
             max_pending_steps=model.max_pending_steps,
+            max_pending_output_bytes=model.max_pending_output_bytes,
             block_size=(
                 DEFAULT_BLOCK_SIZE
                 if model.BLOCK_SIZE is None else model.BLOCK_SIZE
@@ -57,137 +101,60 @@ class StatisticsBindingCompiler:
             save_precision=torch.float32,
             output_netcdf_options=model.output_netcdf_options,
             event_sink=model.event_sink,
-        ))
-        aggregator._execution = model._execution
-        self._aggregator = aggregator
-        model._execution.statistics.attach(aggregator)
+        )
         return aggregator
 
-    def initialize(self, requests: Mapping[str, Any]) -> None:
-        aggregator = self.create()
-        variable_ops, expressions = self.normalize_requests(requests)
-        if not variable_ops:
-            raise ValueError(
-                "variables_to_save must contain at least one dynamic output"
-            )
-        adhoc = self.prepare_virtuals(variable_ops, expressions)
-        self._register_dynamic(variable_ops, adhoc)
-        aggregator.initialize(compile_statistics(aggregator, variable_ops))
-
-    def normalize_requests(
-        self,
-        requests: Mapping[str, Any],
-    ) -> tuple[dict[str, list[str]], dict[str, str]]:
-        """Compile public output requests and materialize static selections."""
-        variable_ops: dict[str, list[str]] = {}
-        expressions: dict[str, str] = {}
-        for operation, items in requests.items():
-            if operation == "static":
-                self._register_static(items)
-                continue
-            for item in items:
-                if isinstance(item, str):
-                    name, expression = item, None
-                else:
-                    name, expression = next(iter(item.items()))
-                if expression is not None:
-                    previous = expressions.get(name)
-                    if previous is not None and previous != expression:
-                        raise ValueError(
-                            f"Conflicting expressions for alias {name!r}: "
-                            f"{previous!r} vs {expression!r}"
-                        )
-                    expressions[name] = expression
-                operations = variable_ops.setdefault(name, [])
-                if operation not in operations:
-                    operations.append(operation)
-        return variable_ops, expressions
-
-    def _register_static(self, values: Any) -> None:
+    def _compile_static(
+        self, values: tuple[str, ...],
+    ) -> tuple[StatisticsStaticBinding, ...]:
         model = self.model
-        aggregator = self.aggregator
-        if aggregator is None:
-            raise RuntimeError("statistics aggregator has not been created")
+        bindings: list[StatisticsStaticBinding] = []
         for name in values:
-            try:
-                entry = self.variable_map[name]
-            except KeyError as exc:
-                raise ValueError(
-                    f"Static variable {name!r} was not found in an opened module"
-                ) from exc
+            entry = self.variable_map[name]
             tensor = getattr(entry.module, entry.field_name)
-            if not isinstance(tensor, torch.Tensor) or tensor.ndim != 1:
-                raise ValueError(
-                    f"Static variable {name!r} must be a one-dimensional tensor"
-                )
-            field = entry.module.get_tensor_schema(entry.field_name)
-            if field is None:
-                raise ValueError(f"Static variable {name!r} has no field metadata")
-            if field.tensor.output == "disabled":
-                raise ValueError(f"Variable {name!r} is disabled for output")
+            field = entry.module._get_tensor_schema(entry.field_name)
             bound, tensors = model._partition.bind_output(field)
             coordinate = bound.output_coord
-            if coordinate is None:
-                raise ValueError(
-                    f"Static variable {name!r} must declare dim_coords"
-                )
             if name == coordinate:
                 continue
             output_index = tensors.get(bound.output_index)
-            aggregator.register_static(
-                name, tensor, output_index=output_index, coordinate=coordinate,
-            )
+            bindings.append(StatisticsStaticBinding(
+                name=name,
+                tensor=tensor,
+                output_index=output_index,
+                coordinate=coordinate,
+            ))
+        return tuple(bindings)
 
     def prepare_virtuals(
         self,
-        variable_ops: Mapping[str, list[str]],
-        explicit_expressions: Mapping[str, str],
+        program: StatisticsProgram,
     ) -> dict[str, Any]:
-        """Validate declared virtuals and construct explicit ad-hoc fields."""
-        known = set(self.variable_map)
+        """Construct virtual metadata from the validated model declaration."""
         adhoc: dict[str, Any] = {}
-        for name in variable_ops:
+        for name, source in program.sources.items():
             if name in self.variable_map:
-                if name in explicit_expressions:
-                    raise ValueError(
-                        f"Explicit statistics alias {name!r} shadows an "
-                        "existing model field or declared virtual; choose a "
-                        "different alias"
-                    )
-                entry = self.variable_map[name]
-                field = entry.module.get_tensor_schema(entry.field_name)
-                metadata = field.tensor
-                expression = (
-                    metadata.expression
-                    if metadata.category == "virtual" else None
-                )
-                if expression:
-                    source = parse_value_source(expression, known)
-                    if isinstance(source, ExpressionSource):
-                        self._validate_coordinate_dependencies(
-                            name, source.expression.dependencies,
-                            metadata.dim_coords,
-                        )
                 continue
-
-            expression = explicit_expressions.get(name, name)
-            source = parse_value_source(expression, known)
-            if isinstance(source, ScatterSource):
-                raise ValueError(
-                    f"Scatter expression {expression!r} for ad-hoc variable "
-                    f"{name!r} must be declared as a module virtual field"
-                )
-            dependencies = source.expression.dependencies
-            if not dependencies:
-                raise ValueError(
-                    f"Ad-hoc output {name!r} has no registered field dependency"
-                )
-            output, coordinate = self._common_field_metadata(
-                name, expression, dependencies,
+            dependencies = (
+                source.expression.dependencies
+                if isinstance(source, ExpressionSource)
+                else source.value.dependencies
+                if isinstance(source, ScatterSource)
+                else (cast(TensorSource, source).name,)
             )
+            expression = (
+                source.expression.source
+                if isinstance(source, ExpressionSource)
+                else source.value.source
+                if isinstance(source, ScatterSource)
+                else source.name
+            )
+            tensor_shape, output, coordinate = self._field_metadata(
+                dependencies[0],
+            )[:3]
             adhoc[name] = RuntimeTensorMetadata(
                 tensor=TensorMetadata.compile({
-                    "tensor_shape": (), "category": "virtual",
+                    "tensor_shape": tensor_shape, "category": "virtual",
                     "expr": expression, "dim_coords": coordinate,
                     "output": output,
                 }),
@@ -197,28 +164,19 @@ class StatisticsBindingCompiler:
 
     def expand_dependencies(
         self,
-        variable_ops: Mapping[str, list[str]],
-        adhoc: Mapping[str, Any],
+        variable_ops: Mapping[str, tuple[str, ...]],
+        program: StatisticsProgram,
     ) -> list[str]:
         """Return selected fields and all typed virtual dependencies."""
-        known = set(self.variable_map) | set(adhoc)
         ordered = list(variable_ops)
         seen = set(ordered)
         cursor = 0
         while cursor < len(ordered):
             name = ordered[cursor]
             cursor += 1
-            info = adhoc.get(name)
-            if info is None and name in self.variable_map:
-                entry = self.variable_map[name]
-                info = entry.module.get_tensor_schema(entry.field_name)
-            metadata = info.tensor
-            expression = (
-                metadata.expression if metadata.category == "virtual" else None
-            )
-            if not expression:
+            source = program.sources.get(name, TensorSource(name))
+            if isinstance(source, TensorSource):
                 continue
-            source = parse_value_source(expression, known)
             dependencies = (
                 (*source.value.dependencies, source.index)
                 if isinstance(source, ScatterSource)
@@ -230,90 +188,79 @@ class StatisticsBindingCompiler:
                     ordered.append(dependency)
         return ordered
 
-    def _register_dynamic(
+    def _compile_installation(
         self,
-        variable_ops: Mapping[str, list[str]],
+        variable_ops: Mapping[str, tuple[str, ...]],
+        program: StatisticsProgram,
         adhoc: Mapping[str, Any],
-    ) -> None:
+        static_names: tuple[str, ...],
+        netcdf_options: Mapping[str, Mapping[str, Any]],
+    ) -> StatisticsInstallation:
         model = self.model
-        aggregator = self.aggregator
-        if aggregator is None:
-            raise RuntimeError("statistics aggregator has not been created")
         by_shape: dict[tuple[int, ...], list[str]] = {}
-        registered: set[str] = set()
+        tensors: dict[str, torch.Tensor] = {}
+        fields: dict[str, RuntimeTensorMetadata] = {}
+        pending_bindings: list[tuple[str, torch.Tensor, bool]] = []
 
-        def register_tensor(
+        def install_tensor(
             name: str,
             tensor: torch.Tensor,
-            info: Any,
+            info: RuntimeTensorMetadata | None,
             *,
             output_coordinate: bool = False,
+            output_index: bool = False,
         ) -> None:
             if output_coordinate:
-                aggregator.register_output_coordinate(name, tensor)
+                installed = tensor.detach().to(torch.int64).clone(
+                    memory_format=torch.contiguous_format,
+                )
+            elif output_index:
+                installed = tensor.detach().clone(
+                    memory_format=torch.contiguous_format,
+                )
             else:
-                aggregator.register_tensor(name, tensor, info)
-            registered.add(name)
-            by_shape.setdefault(tuple(tensor.shape), []).append(name)
+                installed = tensor
+            tensors[name] = installed
+            if info is not None:
+                fields[name] = info
+            by_shape.setdefault(tuple(installed.shape), []).append(name)
 
-        for name in self.expand_dependencies(variable_ops, adhoc):
-            if name in registered:
-                continue
+        for name in self.expand_dependencies(variable_ops, program):
             if name not in self.variable_map:
-                info = adhoc.get(name)
-                if info is None:
-                    raise ValueError(
-                        f"Output dependency {name!r} is not a registered model field"
-                    )
-                aggregator.register_virtual_tensor(name, info)
-                registered.add(name)
+                info = adhoc[name]
+                fields[name] = info
                 continue
 
             entry = self.variable_map[name]
-            if not hasattr(entry.module, entry.field_name):
-                raise ValueError(f"Output field {name!r} has no runtime value")
             tensor = getattr(entry.module, entry.field_name)
-            field = entry.module.get_tensor_schema(entry.field_name)
-            if field is None:
-                raise ValueError(f"Output field {name!r} has no tensor metadata")
-            if name in variable_ops and field.tensor.output == "disabled":
-                raise ValueError(f"Variable {name!r} is disabled for output")
+            field = entry.module._get_tensor_schema(entry.field_name)
             info, bindings = model._partition.bind_output(field)
             category = info.tensor.category
-            allowed = {"state", "shared_state", "init_state", "param", "virtual"}
-            dependency_only = name not in variable_ops
-            if category != "topology" or not dependency_only:
-                if category not in allowed:
-                    raise ValueError(
-                        f"Output variable {name!r} has unsupported category "
-                        f"{category!r}; allowed={sorted(allowed)}"
-                    )
             if category == "virtual" and info.tensor.expression:
-                aggregator.register_virtual_tensor(name, info)
-                registered.add(name)
-            elif isinstance(tensor, torch.Tensor):
-                register_tensor(
-                    name, tensor, info,
-                )
+                fields[name] = info
             else:
-                raise TypeError(
-                    f"Output field {name!r} is {type(tensor).__name__}, expected Tensor"
+                install_tensor(
+                    name, tensor, info,
                 )
 
             for binding_name in (info.output_index, info.output_coord):
-                if not binding_name or binding_name in registered:
+                if not binding_name:
                     continue
-                try:
-                    binding = bindings[binding_name]
-                except KeyError as exc:
-                    raise ValueError(
-                        f"Runtime output binding {binding_name!r} was not "
-                        f"resolved for {name!r}"
-                    ) from exc
-                register_tensor(
-                    binding_name, binding, {},
-                    output_coordinate=binding_name == info.output_coord,
-                )
+                binding = bindings[binding_name]
+                pending_bindings.append((
+                    binding_name, binding,
+                    binding_name == info.output_coord,
+                ))
+
+        for binding_name, binding, output_coordinate in pending_bindings:
+            existing = tensors.get(binding_name)
+            if existing is not None:
+                continue
+            install_tensor(
+                binding_name, binding, None,
+                output_coordinate=output_coordinate,
+                output_index=not output_coordinate,
+            )
 
         for shape, names in by_shape.items():
             emit(
@@ -322,123 +269,62 @@ class StatisticsBindingCompiler:
                 rank=model.rank, variables=tuple(names), shape=str(shape),
             )
 
-    def _field_metadata(self, name: str) -> tuple[str | None, str | None]:
+        return StatisticsInstallation(
+            variable_ops=MappingProxyType({
+                name: tuple(operations)
+                for name, operations in variable_ops.items()
+            }),
+            program=program,
+            tensors=MappingProxyType(tensors),
+            fields=MappingProxyType(fields),
+            statics=self._compile_static(static_names),
+            netcdf_options=netcdf_options,
+        )
+
+    def _field_metadata(
+        self, name: str,
+    ) -> tuple[tuple[str | int, ...], str, str | None]:
         entry = self.variable_map[name]
-        field = entry.module.get_tensor_schema(entry.field_name)
-        if field is None:
-            return None, None
+        field = entry.module._get_tensor_schema(entry.field_name)
         coordinate = field.tensor.dim_coords
         if coordinate:
             coordinate = coordinate.split(".")[-1]
-        return field.tensor.output, coordinate
-
-    def _validate_coordinate_dependencies(
-        self,
-        name: str,
-        dependencies: tuple[str, ...],
-        target_coordinate: str | None,
-    ) -> None:
-        coordinates = {
-            self._field_metadata(dependency)[1]
-            for dependency in dependencies
-            if self._field_metadata(dependency)[1] is not None
-        }
-        if len(coordinates) > 1:
-            raise ValueError(
-                f"Virtual field {name!r} mixes coordinate axes "
-                f"{sorted(coordinates)}"
-            )
-        target = target_coordinate.split(".")[-1] if target_coordinate else None
-        if coordinates and target not in coordinates:
-            raise ValueError(
-                f"Virtual field {name!r} declares dim_coords={target!r}, "
-                f"but its expression uses {next(iter(coordinates))!r}"
-            )
-
-    def _common_field_metadata(
-        self,
-        name: str,
-        expression: str,
-        dependencies: tuple[str, ...],
-    ) -> tuple[str | None, str | None]:
-        reference = self._field_metadata(dependencies[0])
-        for dependency in dependencies[1:]:
-            observed = self._field_metadata(dependency)
-            if observed != reference:
-                raise ValueError(
-                    f"Inconsistent metadata in virtual variable {name!r} "
-                    f"({expression!r}): {dependencies[0]!r} has {reference}, "
-                    f"but {dependency!r} has {observed}"
-                )
-        return reference
+        return field.tensor.shape, field.tensor.output, coordinate
 
     def close(self) -> None:
-        aggregator = self._aggregator
-        if aggregator is not None:
-            self._aggregator = None
-            failures: list[BaseException] = []
-            try:
-                self.model._execution.statistics.detach(aggregator)
-            except BaseException as error:
-                failures.append(error)
-            try:
-                aggregator._shutdown()
-            except BaseException as error:
-                failures.append(error)
-            if failures:
-                from hydroforge.contracts import ResourceCleanupError
+        self._aggregator._shutdown()
 
-                error = ResourceCleanupError("statistics resources", failures)
-                raise error from failures[0]
+    def memory_usage(self) -> int:
+        return self._aggregator.get_memory_usage()
 
     def results(self, *, stacked: bool) -> dict[str, torch.Tensor]:
-        if self.aggregator is None:
-            raise RuntimeError("Statistics aggregator is not initialized")
-        return self.aggregator.get_results(as_stacked=stacked)
+        return self._aggregator.get_results(as_stacked=stacked)
 
     def result(
         self, variable: str, operation: str, *, stacked: bool,
     ) -> torch.Tensor:
-        if self.aggregator is None:
-            raise RuntimeError("Statistics aggregator is not initialized")
-        return self.aggregator.get_result(variable, operation, as_stacked=stacked)
+        return self._aggregator.get_result(
+            variable, operation, as_stacked=stacked,
+        )
 
     def time_index(self) -> int:
-        if self.aggregator is None:
-            return 0
-        return self.aggregator.get_time_index()
+        return self._aggregator.get_time_index()
 
     def reset_time_index(self) -> None:
-        if self.aggregator is not None:
-            self.aggregator.reset_time_index()
+        self._aggregator.reset_time_index()
 
     def accumulator(self, variable: str, operation: str) -> torch.Tensor:
         """Return an ownership-isolated differentiable accumulator snapshot."""
 
-        if self.aggregator is None:
-            raise RuntimeError("Statistics aggregator is not initialized")
         key = f"{variable}_{operation}"
-        try:
-            accumulator = self.aggregator._storage[key]
-        except KeyError as exc:
-            raise KeyError(
-                f"No live accumulator {key!r}; available="
-                f"{sorted(self.aggregator._storage)}"
-            ) from exc
+        accumulator = self._aggregator._storage[key]
         return accumulator.clone(memory_format=torch.preserve_format)
 
-    def pop_result(self, variable: str, operation: str) -> torch.Tensor:
+    def pop_result(
+        self, variable: str, operation: str,
+    ) -> torch.Tensor | None:
         """Remove and return the newest finalized in-memory result."""
 
-        if self.aggregator is None:
-            raise RuntimeError("Statistics aggregator is not initialized")
         key = f"{variable}_{operation}"
-        values = self.aggregator._result_tensors.get(key)
-        if values is None:
-            raise KeyError(
-                f"No in-memory result {key!r}; available="
-                f"{sorted(self.aggregator._result_tensors)}"
-            )
-        if not values:
-            raise RuntimeError(f"No finalized result is available for {key!r}")
-        return values.pop()
+        values = self._aggregator._result_tensors[key]
+        return values.pop() if values else None

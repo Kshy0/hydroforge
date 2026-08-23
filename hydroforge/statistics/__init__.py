@@ -1,5 +1,3 @@
-"""Compiled streaming statistics and output."""
+"""Internal compiled streaming statistics implementation."""
 
-from hydroforge.statistics.runtime import StatisticsRuntime, StatisticsConfig
-
-__all__ = ["StatisticsRuntime", "StatisticsConfig"]
+__all__: list[str] = []

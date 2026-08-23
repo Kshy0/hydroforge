@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Literal
 
 import torch
+from pydantic import PrivateAttr, model_validator
 
-from hydroforge.contracts import (
+from hydroforge.contracts.kernels import (
     BackendLoweringSpec, BufferDTypeABI, KernelSpec,
     buffer_access_semantics,
 )
+from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.kernels.backends.metal.dispatcher import MetalDispatcher
 from hydroforge.kernels.backends.metal.types import (
     COMPILE_SCALAR_TYPES, RUNTIME_SCALAR_TYPES, tensor_type,
 )
-from hydroforge.kernels.context import active_kernel_spec, reject_direct_kernel_launch
+from hydroforge.kernels.context import active_kernel_spec
 
 
 METAL_KERNEL_BODY_MARKER = "// HYDROFORGE METAL KERNEL BODY"
@@ -95,11 +97,20 @@ class SpecMetalTemplateDispatcher:
         source: str,
         *,
         parallel_axes: tuple[str, ...] = (),
+        variant_role: Literal["standalone", "shared", "batched"] = "standalone",
+        batch_key: str | None = None,
     ) -> None:
         if not isinstance(spec, KernelSpec):
             raise TypeError("Metal template requires a KernelSpec")
         if type(source) is not str or not source.strip():
             raise ValueError("Metal template source must be a non-empty string")
+        canonical_spec = spec
+        if variant_role != "standalone" and batch_key is None:
+            raise ValueError("Metal template variant requires batch_key")
+        spec = (
+            canonical_spec.project(omit=(batch_key,))
+            if variant_role == "shared" else canonical_spec
+        )
         helpers, body = _split_template_source(spec, source)
         if not body.strip():
             raise ValueError("Metal template kernel body must be non-empty")
@@ -142,7 +153,15 @@ class SpecMetalTemplateDispatcher:
                 f"{spec.name}: Metal body references fields outside "
                 f"KernelSpec runtime ABI: {sorted(unknown)}"
             )
-        execution_size_key = spec.execution_size_key(parallel_axes)
+        if variant_role == "batched":
+            base_axes = (
+                (spec.size_key,) if isinstance(spec.size_key, str)
+                else tuple(spec.size_key)
+            )
+            effective_axes = () if batch_key in base_axes else (batch_key,)
+        else:
+            effective_axes = parallel_axes
+        execution_size_key = spec._execution_size_key(effective_axes)
         execution_axes = {
             execution_size_key
         } if isinstance(execution_size_key, str) else set(execution_size_key)
@@ -164,10 +183,13 @@ class SpecMetalTemplateDispatcher:
                 f"compile-time ABI fields: {sorted(unused_constants)}"
             )
         self.spec = spec
+        self.canonical_spec = canonical_spec
         self.source = source
         self.body = body
         self.helpers = helpers
         self.parallel_axes = parallel_axes
+        self.variant_role = variant_role
+        self.batch_key = batch_key
         self.fixed_group_size = (
             spec.block_sizes.get("metal") if "HF_BLOCK_SIZE" in body else None
         )
@@ -177,11 +199,19 @@ class SpecMetalTemplateDispatcher:
                 "does not define block_sizes['metal']"
             )
         self.kernel_name = spec.name
-        self.__hydroforge_kernel__ = spec.metadata
+        self.__hydroforge_kernel__ = spec._canonical_metadata
         self.__hydroforge_lowering__ = BackendLoweringSpec.canonical(
             buffer_elements="specialized",
         )
         self._dispatchers: dict[tuple[Any, ...], Any] = {}
+        self._validated_signatures: dict[
+            tuple[Any, ...], tuple[Any, ...]
+        ] = {}
+
+    def _signature_key(
+        self, buffer_dtypes: BufferDTypeABI,
+    ) -> tuple[Any, ...]:
+        return tuple(buffer_dtypes[name] for name in self.spec.buffers)
 
     def _type_signature(
         self, buffer_dtypes: BufferDTypeABI,
@@ -236,7 +266,7 @@ class SpecMetalTemplateDispatcher:
                 f"{self.spec.name}: missing Metal specialization values "
                 f"{sorted(missing)}"
             )
-        self.spec.validate_host_arguments(arguments)
+        self.spec._validate_host_arguments(arguments)
         signature = self._type_signature(buffer_dtypes)
         for name, dtype in buffer_dtypes.items():
             value = arguments[name]
@@ -246,6 +276,22 @@ class SpecMetalTemplateDispatcher:
                     f"but specialization declares {dtype}"
                 )
         return signature
+
+    def _validate_specialization_input(
+        self, arguments: dict[str, Any], *,
+        buffer_dtypes: BufferDTypeABI,
+    ) -> None:
+        """Build and validate the concrete Metal ABI inside Pydantic."""
+
+        self._validate_group_size(arguments)
+        signature = self._signature(arguments, buffer_dtypes)
+        self._validated_signatures[
+            self._signature_key(buffer_dtypes)
+        ] = signature
+        dispatcher = self._dispatcher_for_signature(signature)
+        dispatcher._validate_specialization_input(
+            arguments, buffer_dtypes=buffer_dtypes,
+        )
 
     def source_for_types(self, buffer_dtypes: BufferDTypeABI) -> str:
         """Render the ABI from declared buffer dtypes without runtime values."""
@@ -337,40 +383,74 @@ kernel void {self.spec.name}(
                 f"{self.fixed_group_size}, got {actual!r}"
             )
 
-    def _dispatcher(
-        self, arguments: dict[str, Any], buffer_dtypes: BufferDTypeABI,
-    ):
-        signature = self._signature(arguments, buffer_dtypes)
+    def _dispatcher_for_signature(self, signature: tuple[Any, ...]):
         dispatcher = self._dispatchers.get(signature)
         if dispatcher is None:
             dispatcher = MetalDispatcher(
-                self.source_for(arguments, buffer_dtypes=buffer_dtypes),
+                self._render_source(signature),
                 self.spec.name,
-                spec=self.spec,
+                spec=self.canonical_spec,
+                parallel_axes=self.parallel_axes,
+                variant_role=self.variant_role,
+                batch_key=self.batch_key,
             )
-            dispatcher.bind_parallel_axes(self.parallel_axes)
             self._dispatchers[signature] = dispatcher
         return dispatcher
 
     def specialize(
-        self, arguments: dict[str, Any], dynamic: frozenset[str], *,
+        self, arguments: dict[str, Any], *,
         buffer_dtypes: BufferDTypeABI,
     ):
-        self._validate_group_size(arguments)
-        dispatcher = self._dispatcher(arguments, buffer_dtypes)
+        signature = self._validated_signatures[
+            self._signature_key(buffer_dtypes)
+        ]
+        dispatcher = self._dispatchers[signature]
         return dispatcher.specialize(
-            arguments, dynamic, buffer_dtypes=buffer_dtypes,
+            arguments, buffer_dtypes=buffer_dtypes,
         )
 
-    def __call__(self, **arguments) -> None:
-        reject_direct_kernel_launch(self.spec.name)
-        self._validate_group_size(arguments)
-        buffer_dtypes = {
-            name: value.dtype
-            for name, value in arguments.items()
-            if name in self.spec.buffers and isinstance(value, torch.Tensor)
-        }
-        return self._dispatcher(arguments, buffer_dtypes)(**arguments)
+
+class _SpecMetalDispatcherDeclaration(HydroForgeModel):
+    spec: KernelSpec | None = None
+    source: str
+    parallel_axes: tuple[str, ...] = ()
+    variant_role: Literal["standalone", "shared", "batched"] = "standalone"
+    batch_key: str | None = None
+
+    _dispatcher: SpecMetalTemplateDispatcher = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _build(self):
+        active = active_kernel_spec()
+        if active is not None:
+            if self.spec is not None:
+                raise ValueError(
+                    "Metal template factory may not repeat active KernelSpec "
+                    "metadata"
+                )
+            spec = active
+        elif self.spec is None:
+            raise ValueError(
+                "make_spec_metal_dispatcher requires a KernelSpec outside a "
+                "BackendRegistry factory"
+            )
+        else:
+            spec = self.spec
+        try:
+            self._dispatcher = SpecMetalTemplateDispatcher(
+                spec,
+                self.source,
+                parallel_axes=self.parallel_axes,
+                variant_role=self.variant_role,
+                batch_key=self.batch_key,
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(str(error)) from error
+        return self
+
+    @property
+    def dispatcher(self) -> SpecMetalTemplateDispatcher:
+        return self._dispatcher
 
 
 def make_spec_metal_dispatcher(
@@ -378,28 +458,20 @@ def make_spec_metal_dispatcher(
     *,
     source: str,
     parallel_axes: tuple[str, ...] = (),
+    variant_role: Literal["standalone", "shared", "batched"] = "standalone",
+    batch_key: str | None = None,
 ) -> SpecMetalTemplateDispatcher:
     """Create a lazy Metal implementation from the active canonical Spec."""
 
-    active = active_kernel_spec()
-    if active is not None:
-        if spec is not None:
-            raise TypeError(
-                "Metal template factory may not repeat active KernelSpec metadata"
-            )
-        spec = active
-    elif spec is None:
-        raise TypeError(
-            "make_spec_metal_dispatcher requires a KernelSpec outside a "
-            "BackendRegistry factory"
-        )
-
-    return SpecMetalTemplateDispatcher(
-        spec, source, parallel_axes=parallel_axes,
-    )
+    return _SpecMetalDispatcherDeclaration(
+        spec=spec,
+        source=source,
+        parallel_axes=parallel_axes,
+        variant_role=variant_role,
+        batch_key=batch_key,
+    ).dispatcher
 
 
 __all__ = [
-    "METAL_KERNEL_BODY_MARKER", "SpecMetalTemplateDispatcher",
-    "make_spec_metal_dispatcher",
+    "METAL_KERNEL_BODY_MARKER", "make_spec_metal_dispatcher",
 ]

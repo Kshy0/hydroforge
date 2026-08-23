@@ -7,40 +7,49 @@
 from __future__ import annotations
 
 import atexit
+from dataclasses import dataclass, field
 import hashlib
 import linecache
+import math
 import random
 import sys
 import weakref
 from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Literal, Set
 
 import numpy as np
 import torch
-
 from hydroforge.contracts.runtime import DEFAULT_BLOCK_SIZE
-from hydroforge.contracts.events import emit
+from hydroforge.contracts.events import ConsoleEventSink, emit
 
 from hydroforge.data.distributed import torch_to_numpy_dtype
-from hydroforge.contracts import ResourceCleanupError
+from hydroforge.contracts.errors import ResourceCleanupError
 from hydroforge.statistics.ir import (
     ExpressionSource, Reduction, ScatterSource, StorageDType,
-    StorageInitialization, TensorSource, build_variable_storage_plan,
+    StatisticsProgram, StorageInitialization, TensorSource,
+    build_variable_storage_plan,
 )
 from hydroforge.statistics.compiler import StatisticsCompiler
-from hydroforge.statistics.layout import StatisticsCompilation
-from hydroforge.output.netcdf.writer import NetCDFWriter, _NetCDFOutputStream
+from hydroforge.statistics.layout import StatisticsCompilation, compile_statistics
+from hydroforge.output.netcdf.writer import (
+    _NetCDFOutputStream,
+    _NetCDFWriteBuffer,
+    _NetCDFWriter,
+    _close_worker_netcdf_files,
+    _initialize_netcdf_worker,
+    compute_write_batch_size,
+    constrain_write_batch_sizes,
+)
 from hydroforge.serialization.netcdf import (
-    default_netcdf_options, normalize_netcdf_variable_options,
+    default_netcdf_options,
 )
 from hydroforge.serialization.files import atomic_write_text
 from hydroforge.contracts.fields import RuntimeTensorMetadata
-from hydroforge.contracts.naming import RESERVED_CONTROL_STATE, sanitize_symbol
+from hydroforge.contracts.naming import sanitize_symbol
 
 
 def _weak_shutdown_callback(runtime: Any):
@@ -57,11 +66,38 @@ def _weak_shutdown_callback(runtime: Any):
 
 
 @dataclass(frozen=True, slots=True)
-class StatisticsConfig:
-    """Complete immutable configuration for one statistics output sink."""
+class StatisticsStaticBinding:
+    """One compiler-resolved static output owned by an installation."""
+
+    name: str
+    tensor: torch.Tensor
+    output_index: torch.Tensor | None
+    coordinate: str
+    dim: str = "saved_points"
+
+
+@dataclass(frozen=True, slots=True)
+class StatisticsInstallation:
+    """Complete trusted compiler output installed into a runtime once."""
+
+    variable_ops: Mapping[str, tuple[str, ...]]
+    program: StatisticsProgram
+    tensors: Mapping[str, torch.Tensor]
+    fields: Mapping[str, RuntimeTensorMetadata]
+    statics: tuple[StatisticsStaticBinding, ...]
+    netcdf_options: Mapping[str, Mapping[str, Any]]
+
+
+@dataclass
+class StatisticsRuntime:
+    """Trusted execution state built from a validated model declaration."""
 
     device: torch.device
-    backend: str
+    backend: Literal["torch", "cuda", "triton", "metal"]
+    installation: StatisticsInstallation = field(repr=False)
+    execution: Any = field(repr=False)
+    base_dtype: torch.dtype = torch.float32
+    mixed_precision: bool = False
     output_dir: Path | None = None
     rank: int = 0
     world_size: int = 1
@@ -70,137 +106,50 @@ class StatisticsConfig:
     output_split_by_year: bool = False
     num_trials: int = 1
     max_pending_steps: int = 200
+    max_pending_output_bytes: int = 512 * 1024 * 1024
     block_size: int = DEFAULT_BLOCK_SIZE
     calendar: str = "standard"
     time_unit: str = "days since 1900-01-01 00:00:00"
     in_memory: bool = False
-    result_device: torch.device | None = None
+    result_device: torch.device = field(
+        default_factory=lambda: torch.device("cpu"),
+    )
     save_precision: torch.dtype | None = None
     output_netcdf_options: Mapping[str, Any] = field(
         default_factory=default_netcdf_options,
     )
-    event_sink: Any = None
+    event_sink: Any = field(default_factory=ConsoleEventSink)
     run_id: str | None = None
 
+    _kernels_dir: Path | None = field(init=False, default=None, repr=False)
+    _static_vars: Dict[str, Dict[str, Any]] = field(
+        init=False, default_factory=dict, repr=False,
+    )
+
+    @property
+    def in_memory_mode(self) -> bool:
+        return self.in_memory
+
+    @property
+    def kernels_dir(self) -> Path | None:
+        return self._kernels_dir
+
+    @property
+    def static_vars(self) -> Dict[str, Dict[str, Any]]:
+        return self._static_vars
+
     def __post_init__(self) -> None:
-        if not isinstance(self.device, torch.device):
-            raise TypeError("statistics device must be a torch.device")
-        if self.backend not in {"torch", "cuda", "triton", "metal"}:
-            raise ValueError(f"unsupported statistics backend {self.backend!r}")
-        for name in (
-            "rank", "world_size", "num_workers", "num_trials",
-            "max_pending_steps", "block_size",
-        ):
-            value = getattr(self, name)
-            minimum = 0 if name == "rank" else 1
-            if type(value) is not int or value < minimum:
-                raise ValueError(
-                    f"statistics {name} must be an exact int >= {minimum}"
-                )
-        if self.rank >= self.world_size:
-            raise ValueError("statistics rank must be smaller than world_size")
-        if self.block_size > 1024:
-            raise ValueError("statistics block_size must be <= 1024")
-        if self.backend == "triton" and self.block_size & (self.block_size - 1):
-            raise ValueError("Triton statistics block_size must be a power of two")
-        for name in ("save_kernels", "output_split_by_year", "in_memory"):
-            if type(getattr(self, name)) is not bool:
-                raise TypeError(f"statistics {name} must be an exact bool")
-        if self.output_dir is not None and not isinstance(self.output_dir, Path):
-            raise TypeError("statistics output_dir must be a pathlib.Path or None")
-        if not self.in_memory and self.output_dir is None:
-            raise ValueError("statistics output_dir is required in streaming mode")
-        if self.save_kernels and self.output_dir is None:
-            raise ValueError("output_dir is required when save_kernels=True")
-        if self.result_device is not None and not isinstance(
-            self.result_device, torch.device,
-        ):
-            raise TypeError("statistics result_device must be a torch.device or None")
-        if self.save_precision is not None and not isinstance(
-            self.save_precision, torch.dtype,
-        ):
-            raise TypeError("statistics save_precision must be a torch.dtype or None")
-        normalize_netcdf_variable_options(self.output_netcdf_options)
-        if not isinstance(self.calendar, str) or not self.calendar:
-            raise ValueError("statistics calendar must be a non-empty string")
-        if not isinstance(self.time_unit, str) or not self.time_unit:
-            raise ValueError("statistics time_unit must be a non-empty string")
-        if self.run_id is not None and (
-            not isinstance(self.run_id, str) or not self.run_id.strip()
-        ):
-            raise ValueError(
-                "statistics run_id must be a non-empty string or None"
-            )
-
-
-class StatisticsRuntime:
-    """
-    Handles statistics aggregation with streaming NetCDF output to minimize memory usage.
-    Each time step is immediately written to disk after accumulation.
-
-    Supports two modes:
-    1. Streaming mode (default): Write each time step to NetCDF files incrementally.
-    2. In-memory mode: Store all time steps in memory (CPU by default) for small-scale analysis.
-       Results are dynamically appended, no need to pre-specify total time steps.
-    """
-
-    def __init__(self, config: StatisticsConfig):
-        """Initialize one statistics sink from its validated configuration.
-
-        Per-saved-point static metadata (e.g. basin_id, per-catchment
-        ``shift_days``) is registered after construction via
-        :meth:`register_static`, mirroring the ``register_tensor`` /
-        ``register_virtual_tensor`` pattern used for dynamic outputs.
-        """
-        self.device = config.device
-        self.backend = config.backend
-        from hydroforge.contracts.events import ConsoleEventSink
-
-        self.event_sink = (
-            ConsoleEventSink() if config.event_sink is None else config.event_sink
-        )
-        self.output_dir = config.output_dir
-        self.rank = config.rank
-        self.world_size = config.world_size
-        self.num_workers = config.num_workers
-        self.save_kernels = config.save_kernels
-        self.output_split_by_year = config.output_split_by_year
-        self.output_netcdf_options = normalize_netcdf_variable_options(
-            config.output_netcdf_options,
-        )
-        self.num_trials = config.num_trials
         self._closed = False
-        self.max_pending_steps = config.max_pending_steps
-        self.block_size = config.block_size
-        self.calendar = config.calendar
-        self.time_unit = config.time_unit
-        self.run_id = config.run_id
         self._current_year = None
-
-        # In-memory mode settings
-        self.in_memory_mode = config.in_memory
-        self.result_device = (
-            config.result_device
-            if config.result_device is not None else torch.device("cpu")
-        )
-        self.save_precision = config.save_precision
-
-        # Generated-kernel state (populated lazily by the codegen mixins).
-        self._static_gather_function = None
-        self.kernels_dir: Path | None = None
 
         # Create kernels directory if saving is enabled (must precede any
         # codegen step so the generated .py files have a destination).
         if self.save_kernels:
-            self.kernels_dir = self.output_dir / "generated_kernels"
-            self.kernels_dir.mkdir(parents=True, exist_ok=True)
-
-        # Normalize static_vars.  Populated by :meth:`register_static`
-        # on demand; the NetCDF writer consumes this dict at file
-        # creation time.
-        self.static_vars: Dict[str, Dict[str, Any]] = {}
+            self._kernels_dir = self.output_dir / "generated_kernels"
+            self._kernels_dir.mkdir(parents=True, exist_ok=True)
 
         self._macro_step_index = 0  # Current macro step index (outer loop counter)
+        self._macro_mean_count_limit: int | None = None
 
         # Internal state
         # Generic stats state (for all ops)
@@ -213,6 +162,9 @@ class StatisticsRuntime:
 
         self._tensor_registry: Dict[str, torch.Tensor] = {}
         self._field_registry: Dict[str, RuntimeTensorMetadata] = {}
+        self._structural_tensor_versions: dict[
+            str, tuple[torch.Tensor, int]
+        ] = {}
 
         # Cache for sanitized names
         self._safe_name_cache: Dict[str, str] = {}
@@ -230,31 +182,27 @@ class StatisticsRuntime:
         # Thread pool for background writing
         self._write_executors: List[ProcessPoolExecutor] = []
         self._pending_writes: List = []
-        self._write_buffers: Dict[str, Dict[str, Any]] = {}
+        self._write_buffers: Dict[str, _NetCDFWriteBuffer] = {}
 
         # Kernel state (mean fast-path)
-        self._aggregator_function = None
-        self._aggregator_generated = False
-        self._kernel_states: Optional[Dict[str, torch.Tensor]] = None
-
         self._kernel_module = None
         self._generated_modules: list[tuple[str, str]] = []
         self._saved_kernel_file = None
         self._dirty_outputs: Set[str] = set()
         self._compiler = StatisticsCompiler(self)
-        self._output = NetCDFWriter(self)
+        self._output = _NetCDFWriter(self)
 
         # In-memory result tensors: out_name -> list of tensors (one per time step)
         # Only used when in_memory_mode=True
         self._result_tensors: Dict[str, List[torch.Tensor]] = {}
-        self._current_time_index: int = 0  # Current time index for in-memory writing
+        self._current_time_index: int = 0
 
         emit(
             self, "info", "statistics.initialized",
             "Initialized streaming statistics",
             rank=self.rank, workers=self.num_workers,
         )
-        if config.in_memory:
+        if self.in_memory:
             emit(
                 self, "info", "statistics.memory_mode",
                 "Statistics results will be retained in memory",
@@ -268,10 +216,7 @@ class StatisticsRuntime:
             )
         self._atexit_callback = _weak_shutdown_callback(self)
         atexit.register(self._atexit_callback)
-
-    def _require_open(self) -> None:
-        if self._closed:
-            raise RuntimeError("statistics runtime is closed")
+        self._materialize_installation(self.installation)
 
     def _prepare_kernel_states(self) -> None:
         """Pre-compute and cache all tensors required for kernel execution."""
@@ -281,17 +226,14 @@ class StatisticsRuntime:
         def tensor_dependencies(name: str) -> Set[str]:
             source = ir.sources.get(name, TensorSource(name))
             if isinstance(source, TensorSource):
-                return {source.name} if source.name in self._tensor_registry else set()
+                return {source.name}
             dependencies = (
                 source.expression.dependencies
                 if isinstance(source, ExpressionSource)
                 else source.value.dependencies
             )
             result: Set[str] = set()
-            if (
-                isinstance(source, ScatterSource)
-                and source.index in self._tensor_registry
-            ):
+            if isinstance(source, ScatterSource):
                 result.add(source.index)
             for dependency in dependencies:
                 result.update(tensor_dependencies(dependency))
@@ -311,8 +253,16 @@ class StatisticsRuntime:
                 # For explicit argmax/argmin operations, add their auxiliary storage
                 if operation.stores_index:
                     aux_name = f"{var_name}_{operation.spelling}_aux"
-                    if aux_name in self._storage:
-                        required_tensors[aux_name] = self._storage[aux_name]
+                    required_tensors[aux_name] = self._storage[aux_name]
+
+                if (
+                    operation.inner is None
+                    and operation.outer is Reduction.MEAN
+                ):
+                    weight_name = (
+                        f"{var_name}_mean_sample_weight_state"
+                    )
+                    required_tensors[weight_name] = self._storage[weight_name]
 
                 # Add inner states for compound ops
                 if operation.inner is not None:
@@ -320,12 +270,10 @@ class StatisticsRuntime:
                     # 'last' inner op doesn't need cross-step state
                     if inner != 'last':
                         inner_name = f"{var_name}_{inner}_inner_state"
-                        if inner_name in self._storage:
-                            required_tensors[inner_name] = self._storage[inner_name]
+                        required_tensors[inner_name] = self._storage[inner_name]
                         if inner == 'mean':
                             w_name = f"{var_name}_{inner}_weight_state"
-                            if w_name in self._storage:
-                                required_tensors[w_name] = self._storage[w_name]
+                            required_tensors[w_name] = self._storage[w_name]
 
         # Collect required dimensions and output indices.
         required_dims: Set[str] = set()
@@ -342,56 +290,36 @@ class StatisticsRuntime:
             scatter = variable.source
             var_name = variable.name
             buf_key = f"__scatter_buf_{var_name}"
-            if buf_key in self._storage:
-                required_tensors[buf_key] = self._storage[buf_key]
+            required_tensors[buf_key] = self._storage[buf_key]
             if scatter.reduction.value == 'mean':
                 cnt_key = f"__scatter_cnt_{var_name}"
-                if cnt_key in self._storage:
-                    required_tensors[cnt_key] = self._storage[cnt_key]
+                required_tensors[cnt_key] = self._storage[cnt_key]
             # Ensure all scatter source tensors and index are in required_tensors
-            if scatter.index in self._tensor_registry:
-                required_tensors[scatter.index] = self._tensor_registry[scatter.index]
+            required_tensors[scatter.index] = self._tensor_registry[scatter.index]
             for dependency in tensor_dependencies(var_name):
                 required_tensors[dependency] = self._tensor_registry[dependency]
 
         # Add output_index tensors
         for output_index in required_output_indices:
-            if output_index in self._tensor_registry:
-                required_tensors[output_index] = self._tensor_registry[output_index]
-            else:
-                raise RuntimeError(f"Output index tensor '{output_index}' not registered")
+            required_tensors[output_index] = self._tensor_registry[output_index]
 
         # Add dimension tensors/scalars
         for dim_name in required_dims:
             if dim_name in self._tensor_registry:
-                tensor = self._tensor_registry[dim_name]
-                if isinstance(tensor, (int, float)):
-                    required_tensors[dim_name] = torch.tensor(tensor, device=self.device)
-                else:
-                    required_tensors[dim_name] = tensor
-
-        from hydroforge.kernels.registry import devices_match
-        mismatched = {
-            name: str(tensor.device)
-            for name, tensor in required_tensors.items()
-            if not devices_match(tensor.device, self.device)
-        }
-        if mismatched:
-            raise ValueError(
-                f"Statistics kernel tensors must be on {self.device}: {mismatched}"
-            )
+                required_tensors[dim_name] = self._tensor_registry[dim_name]
 
         # Scalar parameters as 1-element device tensors for CUDA Graph compatibility.
         # Kernel code loads these via tl.load (Triton) or reads from states dict,
         # so CUDA Graphs can replay without recapture when values change.
+        control_dtype = self._statistics_control_dtype()
         required_tensors['__weight'] = torch.zeros(
-            1, device=self.device, dtype=torch.float32,
+            1, device=self.device, dtype=control_dtype,
         )
         required_tensors['__total_weight'] = torch.zeros(
-            1, device=self.device, dtype=torch.float32,
+            1, device=self.device, dtype=control_dtype,
         )
         required_tensors['__num_macro_steps'] = torch.zeros(
-            1, device=self.device, dtype=torch.float32,
+            1, device=self.device, dtype=torch.int64,
         )
         required_tensors['__sub_step'] = torch.zeros(
             1, device=self.device, dtype=torch.int32,
@@ -403,70 +331,56 @@ class StatisticsRuntime:
             1, device=self.device, dtype=torch.int32,
         )
         required_tensors['__macro_step_index'] = torch.zeros(
-            1, device=self.device, dtype=torch.int32,
+            1, device=self.device, dtype=torch.int64,
         )
         # Publish only after dependency resolution, device checks, and every
         # allocation succeeded.  Rebinding may never expose partial states.
         self._kernel_states = required_tensors
 
-    def initialize_statistics(self, compilation: StatisticsCompilation) -> None:
-        """Initialize aggregation tensors and metadata for provided variables and ops."""
-        self._require_open()
-        if not isinstance(compilation, StatisticsCompilation):
-            raise TypeError(
-                "statistics runtime requires a StatisticsCompilation; "
-                "raw variable mappings must be compiled first"
-            )
-        reserved_output_group = "__full__"
-        reserved_users = sorted(
-            name for name in compilation.variable_ops
-            if self._field_registry[name].output_index == reserved_output_group
-        )
-        if reserved_users:
-            raise ValueError(
-                f"Statistics output index {reserved_output_group!r} is "
-                "reserved for the internal full-output group and cannot be "
-                f"used by variables {reserved_users}; choose a different "
-                "output-index tensor name"
-            )
-        execution = getattr(self, "_execution", None)
-        if execution is not None:
-            execution.invalidate_statistics(self)
-        # Reset generic state
-        self._variables = set()
+    def _statistics_control_dtype(self) -> torch.dtype:
+        """Return the precision shared by aggregation control scalars."""
+
+        if self.device.type == "mps":
+            return torch.float32
+        if any(
+            tensor.dtype == torch.float64
+            for tensor in self._storage.values()
+        ):
+            return torch.float64
+        return torch.float32
+
+    def _materialize_compilation(
+        self, compilation: StatisticsCompilation,
+    ) -> None:
+        """Materialize one trusted compiler-owned statistics program."""
         self._variable_ops = {
             name: list(operations)
             for name, operations in compilation.variable_ops.items()
         }
         self._statistics_program = compilation.program
         self._statistics_layouts = compilation.layouts
-        self._storage.clear()
-        self._output_keys = []
-        self._metadata.clear()
         self._output_is_outer: Dict[str, bool] = {}
 
-        self._aggregator_function = None
-        self._aggregator_generated = False
-        self._kernel_states = None
-        self._current_macro_step_count = 0.0
+        self._structural_tensor_versions = {}
+        self._current_macro_step_count = 0
         self._macro_step_index = 0
-        self._outer_flags_ever_seen = False
-
-        # Release a previous generated specialization before rebuilding.
-        self._cleanup_generated_modules()
+        mean_count_limits: set[int] = set()
+        for name, operations in compilation.program.operations.items():
+            if not any(
+                operation.compound and operation.outer is Reduction.MEAN
+                for operation in operations
+            ):
+                continue
+            dtype = compilation.layouts[name].dtype
+            if dtype == torch.float32:
+                mean_count_limits.add(2**24)
+            elif dtype == torch.float64:
+                mean_count_limits.add(2**53)
+        self._macro_mean_count_limit = (
+            min(mean_count_limits) if mean_count_limits else None
+        )
 
         for var_name, source in self._statistics_program.sources.items():
-            if isinstance(source, ScatterSource):
-                scatter_layout = self._statistics_layouts[var_name]
-                if (
-                    self.backend == "metal"
-                    and scatter_layout.dtype != torch.float32
-                ):
-                    raise TypeError(
-                        f"Metal scatter statistics for {var_name!r} require "
-                        "float32 materialization; atomic_float buffers cannot "
-                        f"alias {scatter_layout.dtype} storage"
-                    )
             if (
                 not isinstance(source, ScatterSource)
                 or var_name in self._variable_ops
@@ -474,10 +388,6 @@ class StatisticsRuntime:
                 continue
             layout = self._statistics_layouts[var_name]
             full_target_size = layout.scatter_extent
-            if full_target_size is None:
-                raise RuntimeError(
-                    f"Scatter layout for {var_name!r} has no target extent"
-                )
             shape = (
                 (self.num_trials, full_target_size)
                 if self.num_trials > 1 else (full_target_size,)
@@ -487,11 +397,10 @@ class StatisticsRuntime:
             )
             if source.reduction is Reduction.MEAN:
                 self._storage[f"__scatter_cnt_{var_name}"] = torch.zeros(
-                    shape, dtype=layout.dtype, device=self.device,
+                    shape, dtype=torch.int32, device=self.device,
                 )
 
-        # Validate and setup each variable
-        for var_name, ops in self._variable_ops.items():
+        for var_name in self._variable_ops:
             operation_nodes = self._statistics_program.operations[var_name]
             source = self._statistics_program.sources.get(
                 var_name, TensorSource(var_name),
@@ -510,45 +419,12 @@ class StatisticsRuntime:
             actual_shape = layout.actual_shape
             actual_ndim = layout.actual_ndim
 
-            if not target_dtype.is_floating_point:
-                unsupported = next((
-                    operation for operation in operation_nodes
-                    if (
-                        (
-                            operation.inner is None
-                            and operation.outer in {Reduction.MEAN, Reduction.SUM}
-                        )
-                        or (
-                            operation.inner is not None
-                            and (
-                                operation.inner in {
-                                    Reduction.MEAN, Reduction.SUM,
-                                    Reduction.MAX, Reduction.MIN,
-                                }
-                                or operation.outer is Reduction.MEAN
-                                or operation.k > 1
-                            )
-                        )
-                    )
-                ), None)
-                if unsupported is not None:
-                    raise TypeError(
-                        f"Statistics operation {unsupported.spelling!r} for "
-                        f"non-floating field {var_name!r} with dtype "
-                        f"{target_dtype} requires floating-point accumulator "
-                        "semantics"
-                    )
-
             # Track
             self._variables.add(var_name)
 
             # Detect scatter virtual and allocate materialized buffer
             if isinstance(source, ScatterSource):
                 full_target_size = layout.scatter_extent
-                if full_target_size is None:
-                    raise RuntimeError(
-                        f"Scatter layout for {var_name!r} has no target extent"
-                    )
                 scatter_buf_key = f"__scatter_buf_{var_name}"
                 buf_shape = (
                     (self.num_trials, full_target_size)
@@ -560,7 +436,7 @@ class StatisticsRuntime:
                 if source.reduction.value == 'mean':
                     scatter_cnt_key = f"__scatter_cnt_{var_name}"
                     self._storage[scatter_cnt_key] = torch.zeros(
-                        buf_shape, dtype=target_dtype, device=self.device
+                        buf_shape, dtype=torch.int32, device=self.device
                     )
 
             storage_plan = build_variable_storage_plan(
@@ -568,7 +444,7 @@ class StatisticsRuntime:
             )
             for slot in storage_plan.slots:
                 dtype = (
-                    torch.int32 if slot.dtype is StorageDType.INDEX
+                    torch.int64 if slot.dtype is StorageDType.INDEX
                     else target_dtype
                 )
                 if slot.initialization is StorageInitialization.NEGATIVE_INFINITY:
@@ -603,7 +479,14 @@ class StatisticsRuntime:
 
                 if output_coord and output_coord not in self._coord_cache:
                     coord_tensor = self._tensor_registry[output_coord]
-                    self._coord_cache[output_coord] = coord_tensor.detach().cpu().numpy()
+                    coordinate = np.array(
+                        coord_tensor.detach().cpu().numpy(),
+                        dtype=np.int64,
+                        order="C",
+                        copy=True,
+                    )
+                    coordinate.setflags(write=False)
+                    self._coord_cache[output_coord] = coordinate
 
                 # Downcast to save_precision if specified (e.g. float64 -> float32)
                 save_dtype = target_dtype
@@ -635,15 +518,15 @@ class StatisticsRuntime:
                     'output_index': output_index,
                     'full_output': full_output,
                     'tensor_shape': tensor_shape,
-                    'dtype': 'i4' if is_arg_op else out_dtype,  # int32 for arg ops
+                    'dtype': 'i8' if is_arg_op else out_dtype,
                     'actual_shape': actual_shape,
                     'actual_ndim': actual_ndim,
+                    'batched': layout.batched,
                     'output_coord': output_coord,
                     'nc_coord_name': dim_coords.split('.')[-1] if dim_coords else None,
                     'description': f"{description} ({op})",
                     'stride_input': stride_input,
                     'k': operation.k,
-                    'is_time_index': is_arg_op,  # argmax/argmin store integer indices
                     'scatter': scatter_info,  # None for non-scatter, dict for scatter virtuals
                 }
                 self._metadata[out_name] = meta
@@ -651,60 +534,43 @@ class StatisticsRuntime:
                 # Classify as outer if it is a compound op (e.g. max_mean)
                 self._output_is_outer[out_name] = operation.compound
 
-        self._has_compound_ops = any(self._output_is_outer.values())
+        from hydroforge.output.netcdf.schema import NetCDFSchema
 
-        from hydroforge.contracts.naming import sanitize_symbol
-        safe_outputs: Dict[str, str] = {}
-        for out_name in self._output_keys:
-            safe_name = sanitize_symbol(out_name)
-            if not safe_name:
-                raise ValueError(
-                    f"Output name '{out_name}' has no valid NetCDF characters."
-                )
-            previous = safe_outputs.get(safe_name)
-            if previous is not None and previous != out_name:
-                raise ValueError(
-                    f"Output names '{previous}' and '{out_name}' both map to "
-                    f"NetCDF variable '{safe_name}'."
-                )
-            safe_outputs[safe_name] = out_name
-
-        kernel_inputs: Set[str] = set()
-        for var_name in self._variables:
-            kernel_inputs.update(
-                self._statistics_program.leaf_tensors(var_name)
+        desired_batches: dict[str, int] = {}
+        row_bytes: dict[str, int] = {}
+        stream_counts: dict[str, int] = {}
+        for name, metadata in self._metadata.items():
+            order = metadata["k"]
+            row_shape = (
+                metadata["actual_shape"][:-1]
+                if order > 1 else metadata["actual_shape"]
             )
-            output_index = self._field_registry[var_name].output_index
-            if output_index is not None:
-                kernel_inputs.add(output_index)
-
-        reserved_collision = kernel_inputs.intersection(RESERVED_CONTROL_STATE)
-        if reserved_collision:
-            raise ValueError(
-                "Statistics input names collide with reserved control state: "
-                f"{sorted(reserved_collision)}"
+            storage_dtype = np.dtype(metadata["dtype"])
+            row_bytes[name] = max(
+                1, math.prod(row_shape) * storage_dtype.itemsize,
             )
-
-        storage_collision = kernel_inputs.intersection(self._storage)
-        if storage_collision:
-            raise ValueError(
-                "Statistics inputs collide with generated accumulator state: "
-                f"{sorted(storage_collision)}"
+            stream_counts[name] = order
+            desired_batches[name] = compute_write_batch_size(
+                max(1, math.prod(row_shape)),
+                storage_dtype.itemsize,
+                max_batch=min(30, self.max_pending_steps),
             )
-
-        symbol_names = (
-            kernel_inputs | set(self._storage) | set(self._variables)
+        write_batches = constrain_write_batch_sizes(
+            desired_batches,
+            row_bytes=row_bytes,
+            stream_counts=stream_counts,
+            max_pending_bytes=self.max_pending_output_bytes,
         )
-        symbols: Dict[str, str] = {}
-        for name in sorted(symbol_names):
-            symbol = sanitize_symbol(name)
-            previous = symbols.get(symbol)
-            if previous is not None and previous != name:
-                raise ValueError(
-                    f"Statistics names {previous!r} and {name!r} both map "
-                    f"to generated symbol {symbol!r}"
-                )
-            symbols[symbol] = name
+        self._netcdf_schemas = {
+            name: NetCDFSchema.compile(
+                metadata,
+                variable=name,
+                num_trials=self.num_trials,
+                netcdf_options=self.installation.netcdf_options[name],
+                write_batch_size=write_batches[name],
+            )
+            for name, metadata in self._metadata.items()
+        }
 
         # Generate kernels and prepare states for all requested variables/ops
         self._compiler.compile()
@@ -715,11 +581,31 @@ class StatisticsRuntime:
         is_inner_last: bool,
         is_outer_first: bool,
         is_outer_last: bool,
-    ) -> tuple[float, int]:
+    ) -> tuple[int, int]:
+        macro_step_index = 0 if is_outer_first else self._macro_step_index
+        macro_step_count = (
+            0 if is_outer_first else self._current_macro_step_count
+        )
+        next_count = macro_step_count + int(is_inner_last)
+        limit = torch.iinfo(torch.int64).max
+        if (
+            macro_step_index > limit
+            or next_count > limit
+            or (is_inner_last and macro_step_index == limit)
+        ):
+            raise OverflowError(
+                "statistics macro-step accounting exceeds int64 range"
+            )
+        mean_limit = self._macro_mean_count_limit
+        if is_inner_last and mean_limit is not None and next_count > mean_limit:
+            raise OverflowError(
+                "statistics compound mean macro-step count exceeds the "
+                f"largest consecutive integer exactly representable by its "
+                f"accumulator dtype ({mean_limit})"
+            )
         if is_outer_first:
             self._macro_step_index = 0
-            self._current_macro_step_count = 0.0
-            self._outer_flags_ever_seen = True
+            self._current_macro_step_count = 0
         if is_inner_last:
             self._dirty_outputs.update(
                 name for name, outer in self._output_is_outer.items()
@@ -730,17 +616,39 @@ class StatisticsRuntime:
                 name for name, outer in self._output_is_outer.items()
                 if outer
             )
-        macro_step_index = self._macro_step_index
         if is_inner_last:
-            self._current_macro_step_count += 1.0
-            self._macro_step_index += 1
+            self._current_macro_step_count = next_count
+            self._macro_step_index = macro_step_index + 1
         return self._current_macro_step_count, macro_step_index
 
-    def update_statistics(self, sub_step: int, num_sub_steps: int, flags: int,
-                          weight: float, total_weight: float = 0.0) -> None:
-        self._require_open()
-        if not self._aggregator_generated:
-            raise RuntimeError("Statistics aggregation has not been initialized")
+    def _convert_control_float(self, name: str, value: float) -> float:
+        """Convert a trusted schedule weight while preserving overflow errors."""
+
+        states = self._kernel_states
+        dtype = states[f"__{name}"].dtype
+        converted = float(torch.tensor(value, dtype=dtype).item())
+        if not math.isfinite(converted):
+            raise OverflowError(
+                f"statistics {name} {value!r} exceeds {dtype} range"
+            )
+        if converted == 0.0:
+            raise OverflowError(
+                f"statistics {name} {value!r} underflows {dtype}"
+            )
+        return converted
+
+    def update_statistics(
+        self,
+        sub_step: int,
+        num_sub_steps: int,
+        flags: int,
+        weight: float,
+        total_weight: float,
+    ) -> None:
+        converted_weight = self._convert_control_float("weight", weight)
+        converted_total = self._convert_control_float(
+            "total_weight", total_weight,
+        )
 
         is_inner_last = bool(flags & 2) and (sub_step == num_sub_steps - 1)
         is_outer_first = bool(flags & 4) and is_inner_last
@@ -753,8 +661,8 @@ class StatisticsRuntime:
 
         # Fill scalar tensors so kernels read updated values from fixed addresses
         states = self._kernel_states
-        states['__weight'].fill_(weight)
-        states['__total_weight'].fill_(total_weight)
+        states['__weight'].fill_(converted_weight)
+        states['__total_weight'].fill_(converted_total)
         states['__num_macro_steps'].fill_(num_macro_steps)
         states['__sub_step'].fill_(sub_step)
         states['__num_sub_steps'].fill_(num_sub_steps)
@@ -765,16 +673,9 @@ class StatisticsRuntime:
 
     def _execute_statistics_kernel(self) -> None:
         """Run the generated aggregator through its cached backend executor."""
-        if self._execution is None:
-            raise RuntimeError(
-                "statistics execution runtime is not attached to a model"
-            )
-        self._execution.run_statistics(self, self.block_size)
+        self.execution.run_statistics(self, self.block_size)
 
     def _init_result_storage(self) -> None:
-        if not self.in_memory_mode:
-            return
-        self._result_tensors.clear()
         self._current_time_index = 0
         for out_name in self._output_keys:
             self._result_tensors[out_name] = []
@@ -782,10 +683,7 @@ class StatisticsRuntime:
     def _result_dtype(self, out_name: str) -> torch.dtype:
         """Return the exact retained-output dtype for one storage slot."""
 
-        try:
-            dtype = self._storage[out_name].dtype
-        except KeyError as exc:
-            raise KeyError(f"No statistics storage exists for {out_name!r}") from exc
+        dtype = self._storage[out_name].dtype
         if self.save_precision is not None and dtype.is_floating_point:
             return self.save_precision
         return dtype
@@ -799,9 +697,6 @@ class StatisticsRuntime:
         )
 
     def get_results(self, as_stacked: bool = True):
-        self._require_open()
-        if not self.in_memory_mode:
-            raise RuntimeError("get_results() is only available in in_memory_mode")
         if not as_stacked:
             return {
                 name: [value.clone(memory_format=torch.preserve_format) for value in values]
@@ -818,15 +713,7 @@ class StatisticsRuntime:
     def get_result(
         self, variable_name: str, op: str = "mean", as_stacked: bool = True,
     ):
-        self._require_open()
-        if not self.in_memory_mode:
-            raise RuntimeError("get_result() is only available in in_memory_mode")
         out_name = f"{variable_name}_{op}"
-        if out_name not in self._result_tensors:
-            raise KeyError(
-                f"No result found for {out_name}. Available: "
-                f"{list(self._result_tensors)}"
-            )
         values = self._result_tensors[out_name]
         if not as_stacked:
             return [
@@ -839,36 +726,22 @@ class StatisticsRuntime:
         )
 
     def get_time_index(self) -> int:
-        self._require_open()
         return self._current_time_index
 
     def reset_time_index(self) -> None:
-        self._require_open()
-        if not self.in_memory_mode:
-            raise RuntimeError(
-                "reset_time_index() is only available in in_memory_mode"
-            )
         self._current_time_index = 0
+        self._output.reset_timeline()
         for out_name in self._result_tensors:
             self._result_tensors[out_name] = []
 
-    def finalize_time_step(self, dt) -> None:
-        self._require_open()
+    def finalize_time_step(self, dt: Any) -> None:
         self._output.finalize_time_step(dt)
 
-    def check_background_failures(self, current_time=None) -> None:
+    def check_background_failures(self, current_time: Any = None) -> None:
         """Raise completed asynchronous output failures without waiting."""
 
-        self._require_open()
         if not self.in_memory_mode:
             self._output.check_completed_writes(dt=current_time)
-
-    def ensure_output_durable(self, current_time=None) -> None:
-        """Flush and wait for every streaming row at a checkpoint boundary."""
-
-        self._require_open()
-        if not self.in_memory_mode:
-            self._output.flush_and_wait(dt=current_time)
 
     def _cleanup_generated_modules(self) -> None:
         for module_name, filename in reversed(self._generated_modules):
@@ -897,6 +770,10 @@ class StatisticsRuntime:
         executors, self._write_executors = self._write_executors, []
         for executor in executors:
             try:
+                executor.submit(_close_worker_netcdf_files).result()
+            except BaseException as error:
+                failures.append(error)
+            try:
                 executor.shutdown(wait=True)
             except BaseException as error:
                 failures.append(error)
@@ -910,13 +787,12 @@ class StatisticsRuntime:
     def _start_write_executors(self) -> None:
         """Create the background output process pools."""
 
-        if self._write_executors:
-            raise RuntimeError("statistics output workers are already started")
         created = []
         try:
             for _ in range(self.num_workers):
                 executor = ProcessPoolExecutor(
                     max_workers=1, mp_context=get_context("spawn"),
+                    initializer=_initialize_netcdf_worker,
                 )
                 created.append(executor)
         except BaseException as primary:
@@ -964,7 +840,7 @@ class StatisticsRuntime:
         seen: set[int] = set()
         total = 0
         for tensor in self._storage.values():
-            if isinstance(tensor, torch.Tensor) and tensor.data_ptr() not in seen:
+            if tensor.data_ptr() not in seen:
                 seen.add(tensor.data_ptr())
                 total += tensor.element_size() * tensor.numel()
         return total
@@ -980,192 +856,60 @@ class StatisticsRuntime:
         digest = hashlib.md5(seed.encode()).hexdigest()[:6]
         return f"{timestamp}_r{self.rank}_{digest}"
 
-    def _generate_static_gather_function(self) -> None:
-        """Bind the one-shot static gather used only during initialization."""
-        def gather_static_var(
-            tensor: torch.Tensor,
-            output_index: torch.Tensor | None,
-        ) -> torch.Tensor:
-            return tensor if output_index is None else tensor[output_index]
-
-        self._static_gather_function = gather_static_var
-        if self.save_kernels:
-            path = self.kernels_dir / f"kern_static_{self._generate_unique_name()}.py"
-            atomic_write_text(
-                path,
-                "def gather_static_var(tensor, output_index):\n"
-                "    return tensor if output_index is None else tensor[output_index]\n",
-            )
-
     def __del__(self) -> None:
         try:
             self._shutdown()
         except Exception:
             pass
 
-    def register_tensor(
-        self, name: str, tensor: torch.Tensor,
-        field_info: RuntimeTensorMetadata,
-    ) -> None:
-        """
-        Register a tensor with its metadata for potential aggregation.
-
-        Args:
-            name: Variable name
-            tensor: PyTorch tensor (actual sampled data)
-            field_info: Pydantic field information
-        """
-        self._register_tensor(
-            name, tensor, field_info, require_execution_device=True,
+    def _materialize_static(self, binding: StatisticsStaticBinding) -> None:
+        tensor = (
+            binding.tensor
+            if binding.output_index is None
+            else binding.tensor[binding.output_index]
         )
-
-    def register_output_coordinate(
-        self, name: str, tensor: torch.Tensor,
-    ) -> None:
-        """Register an output-axis value tensor outside the execution ABI.
-
-        Coordinate and selection fields intentionally remain on the CPU. They
-        are copied once into the NetCDF schema and never passed to a statistics
-        kernel; requiring the model execution device would contradict their
-        field contract.
-        """
-
-        self._register_tensor(
-            name, tensor, {}, require_execution_device=False,
-        )
-
-    def _register_tensor(
-        self, name: str, tensor: torch.Tensor,
-        field_info: RuntimeTensorMetadata | dict[str, Any], *,
-        require_execution_device: bool,
-    ) -> None:
-        self._require_open()
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"Expected torch.Tensor for {name}, got {type(tensor)}")
-        from hydroforge.kernels.registry import devices_match
-
-        if (
-            require_execution_device
-            and not devices_match(tensor.device, self.device)
-        ):
-            raise ValueError(
-                f"Statistics tensor {name!r} is on {tensor.device}, "
-                f"expected {self.device}"
-            )
-        if tensor.layout is not torch.strided:
-            raise ValueError(
-                f"Statistics tensor {name!r} must use torch.strided layout, "
-                f"got {tensor.layout}"
-            )
-        if not tensor.is_contiguous():
-            raise ValueError(
-                f"Statistics tensor {name!r} must be contiguous; generated "
-                "backends use one canonical linear buffer ABI"
-            )
-
-        self._tensor_registry[name] = tensor
-        self._field_registry[name] = field_info
-
-        # Pre-cache safe name
-        self._get_safe_name(name)
-
-        # Invalidate pre-computed states when new tensors are registered
-        self._kernel_states = None
-
-
-    def register_virtual_tensor(
-        self, name: str, field_info: RuntimeTensorMetadata,
-    ) -> None:
-        """
-        Register a virtual tensor (no data, just metadata).
-
-        Args:
-            name: Variable name
-            field_info: Pydantic field information (must contain expr)
-        """
-        self._require_open()
-        self._field_registry[name] = field_info
-        self._get_safe_name(name)
-        # Do NOT add to _tensor_registry since it has no storage
-        self._kernel_states = None
-
-
-    def register_static(self, name: str, tensor: torch.Tensor,
-                        output_index: Optional[torch.Tensor] = None,
-                        dim: str = "saved_points",
-                        coordinate: Optional[str] = None,
-                        dtype: Optional[str] = None,
-                        attrs: Optional[Dict[str, Any]] = None) -> None:
-        """Register a per-saved-point static variable.
-
-        The raw ``tensor`` (optionally gathered by ``output_index``) is
-        materialised once via the generated gather kernel and stashed
-        for the NetCDF writer, which emits it along ``dim`` at file
-        creation time.  Mirrors :meth:`register_tensor` /
-        :meth:`register_virtual_tensor` so all aggregator inputs flow
-        through the same register_* surface.
-        """
-        self._require_open()
-        if not isinstance(name, str) or not name:
-            raise ValueError("static variable name must be a non-empty string")
-        if name in self.static_vars:
-            raise ValueError(f"static variable {name!r} is already registered")
-        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 1:
-            raise TypeError("static variable tensor must be a one-dimensional tensor")
-        if not isinstance(dim, str) or not dim:
-            raise ValueError("static variable dim must be a non-empty string")
-        if not isinstance(coordinate, str) or not coordinate:
-            raise ValueError(
-                "static variable coordinate must be a non-empty string"
-            )
-        if attrs is not None and not isinstance(attrs, Mapping):
-            raise TypeError("static variable attrs must be a mapping or None")
-        if dtype is not None:
-            try:
-                normalized_dtype = np.dtype(dtype).str.lstrip("<>|")
-            except TypeError as error:
-                raise TypeError(
-                    f"static variable dtype {dtype!r} is not a NumPy dtype"
-                ) from error
-        else:
-            normalized_dtype = None
-        if self._static_gather_function is None:
-            self._generate_static_gather_function()
-        if output_index is not None:
-            if not isinstance(output_index, torch.Tensor):
-                raise TypeError("static output_index must be a tensor or None")
-            if output_index.device != tensor.device:
-                raise ValueError(
-                    "static output_index and tensor must be on the same device"
-                )
-            if output_index.ndim != 1 or output_index.dtype not in {
-                torch.int32, torch.int64,
-            }:
-                raise TypeError(
-                    "static output_index must be a one-dimensional int32/int64 tensor"
-                )
-            if output_index.numel() and bool((
-                (output_index < 0) | (output_index >= tensor.numel())
-            ).any()):
-                raise IndexError("static output_index is outside the tensor extent")
-        values = (
-            self._static_gather_function(tensor, output_index)
-            .detach().cpu().numpy()
-        )
-        self.static_vars[name] = {
+        values = tensor.detach().cpu().numpy()
+        values = np.array(values, order="C", copy=True)
+        values.setflags(write=False)
+        self.static_vars[binding.name] = {
             "values": values,
-            "dim": dim,
-            "coordinate": coordinate,
-            "dtype": (
-                normalized_dtype
-                if normalized_dtype is not None
-                else values.dtype.str.lstrip("<>|")
-            ),
-            "attrs": dict(attrs or {}),
+            "dim": binding.dim,
+            "coordinate": binding.coordinate,
+            "dtype": values.dtype.str.lstrip("<>|"),
+            "attrs": {},
         }
 
+    def _materialize_installation(
+        self, installation: StatisticsInstallation,
+    ) -> None:
+        """Materialize the complete compiler-owned registry during construction."""
 
-    def initialize(self, compilation: StatisticsCompilation) -> None:
+        self._tensor_registry = dict(installation.tensors)
+        self._field_registry = dict(installation.fields)
+        if self.save_kernels and installation.statics:
+            path = self.kernels_dir / (
+                f"kern_static_{self._generate_unique_name()}.py"
+            )
+            atomic_write_text(
+                path,
+                "def gather_static_var(tensor, output_index):\n"
+                "    return tensor if output_index is None else "
+                "tensor[output_index]\n",
+            )
+        for name in self._tensor_registry.keys() | self._field_registry.keys():
+            self._get_safe_name(name)
+        for binding in installation.statics:
+            self._materialize_static(binding)
+        compilation = compile_statistics(
+            self,
+            installation.variable_ops,
+            installation.program,
+        )
+        self._activate_compilation(compilation)
+
+    def _activate_compilation(
+        self, compilation: StatisticsCompilation,
+    ) -> None:
         """
         Initialize streaming aggregation for specified variables.
         Creates NetCDF file structure but writes time steps incrementally.
@@ -1173,12 +917,6 @@ class StatisticsRuntime:
         Args:
             compilation: Compiler-owned operations, expressions and layouts.
         """
-        self._require_open()
-        if not isinstance(compilation, StatisticsCompilation):
-            raise TypeError(
-                "statistics runtime requires a StatisticsCompilation; "
-                "raw variable mappings must be compiled first"
-            )
         from hydroforge.contracts.events import emit
 
         emit(
@@ -1189,9 +927,11 @@ class StatisticsRuntime:
 
         # Enable streaming mode
         self._files_created = False
+        self._current_year = None
+        self._output.reset_timeline()
 
         # Initialize single time step aggregation (generic)
-        self.initialize_statistics(compilation)
+        self._materialize_compilation(compilation)
 
         # If in-memory mode, initialize result storage lists instead of starting file writers
         if self.in_memory_mode:

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Self
+
+from pydantic import model_validator
+
+from hydroforge.contracts.validation import HydroForgeModel
 
 
 _PRECISIONS = frozenset({"float32", "float64"})
@@ -33,8 +37,7 @@ def validate_runtime_block_size(value: int, *, backend: str) -> None:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class BackendRequirement:
+class BackendRequirement(HydroForgeModel):
     """Model-wide restrictions not already defined by the backend runtime."""
 
     precision: frozenset[str] | None = None
@@ -44,10 +47,11 @@ class BackendRequirement:
     max_block_size: int | None = None
     block_size: int | None = None
 
-    def __post_init__(self) -> None:
+    @model_validator(mode="after")
+    def _validate_requirement(self) -> Self:
         if self.precision is not None:
             if type(self.precision) is not frozenset or not self.precision:
-                raise TypeError(
+                raise ValueError(
                     "backend precision must be a non-empty exact frozenset"
                 )
             unknown = self.precision.difference(_PRECISIONS)
@@ -57,7 +61,7 @@ class BackendRequirement:
                 )
         for name in ("mixed_precision", "trials"):
             if type(getattr(self, name)) is not bool:
-                raise TypeError(f"backend requirement {name} must be bool")
+                raise ValueError(f"backend requirement {name} must be bool")
         for name in ("min_block_size", "max_block_size", "block_size"):
             value = getattr(self, name)
             if value is not None and (type(value) is not int or value < 1):
@@ -77,8 +81,9 @@ class BackendRequirement:
             and self.block_size > self.max_block_size
         ):
             raise ValueError("fixed backend block size is outside its range")
+        return self
 
-    def validate_block_size(self, value: int, *, backend: str) -> None:
+    def _validate_block_size(self, value: int, *, backend: str) -> None:
         """Validate one resolved model or per-kernel launch width."""
 
         validate_runtime_block_size(value, backend=backend)
@@ -98,7 +103,7 @@ class BackendRequirement:
                 f"got {value}"
             )
 
-    def validate_precision(
+    def _validate_precision(
         self, precision: str, mixed_precision: bool, *, backend: str,
     ) -> None:
         """Validate model precision against one runtime or model restriction."""
@@ -114,15 +119,16 @@ class BackendRequirement:
             )
 
 
-@dataclass(frozen=True, slots=True)
-class ModuleRequirement:
+class ModuleRequirement(HydroForgeModel):
     """Restrictions introduced only when one optional module is open."""
 
     trials: bool = True
 
-    def __post_init__(self) -> None:
+    @model_validator(mode="after")
+    def _validate_requirement(self) -> Self:
         if type(self.trials) is not bool:
-            raise TypeError("module requirement trials must be bool")
+            raise ValueError("module requirement trials must be bool")
+        return self
 
 
 DEFAULT_BACKEND_REQUIREMENT = BackendRequirement()

@@ -2,54 +2,147 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from numba import njit
+from pydantic import Field, PrivateAttr, model_validator
 
-from hydroforge.data.distributed import find_indices_in, find_indices_in_torch
-from hydroforge.contracts.fields import (
-    PartitionSchema, RuntimeTensorMetadata, tensor_is_active,
+from hydroforge.data.distributed import (
+    _find_indices_in_trusted,
+    _find_indices_in_torch_trusted,
 )
+from hydroforge.compiler.model import _ReferenceTargetPlan
+from hydroforge.contracts.fields import (
+    ModuleFieldSchema, PartitionSchema, RuntimeTensorMetadata,
+    tensor_is_active,
+)
+from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.data.numeric import immutable_array
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
 
 
-@dataclass(frozen=True)
-class GroupRankLookup:
+class _GroupRankQuery(HydroForgeModel):
+    """One strict public lookup against a compiled group/rank identity."""
+
+    values: Any
+    group_ids: np.ndarray = Field(exclude=True)
+    ranks: np.ndarray = Field(exclude=True)
+
+    _result: int | np.ndarray = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _resolve(self):
+        values = self.values
+        if type(values) is int:
+            if not -(1 << 63) <= values < (1 << 63):
+                raise ValueError("group ID is outside the int64 range")
+            array = np.asarray(values, dtype=np.int64)
+        elif isinstance(values, np.integer) and not isinstance(values, np.bool_):
+            integer = int(values)
+            if not -(1 << 63) <= integer < (1 << 63):
+                raise ValueError("group ID is outside the int64 range")
+            array = np.asarray(integer, dtype=np.int64)
+        elif isinstance(values, np.ndarray):
+            if values.dtype != np.dtype(np.int64):
+                raise ValueError(
+                    "group ID arrays must use exact int64 dtype"
+                )
+            array = values
+        else:
+            raise ValueError(
+                "group IDs must be an exact int, NumPy integer, or int64 array"
+            )
+
+        flat = array.reshape(-1)
+        positions = np.searchsorted(self.group_ids, flat)
+        matched = positions < self.group_ids.size
+        if np.any(matched):
+            matched[matched] &= (
+                self.group_ids[positions[matched]] == flat[matched]
+            )
+        if not np.all(matched):
+            missing = flat[~matched][:5].tolist()
+            raise ValueError(
+                f"group IDs are absent from the model partition: {missing}"
+            )
+        result = self.ranks[positions].reshape(array.shape)
+        self._result = result.item() if array.ndim == 0 else result
+        return self
+
+    @property
+    def result(self) -> int | np.ndarray:
+        return self._result
+
+
+class GroupRankLookup(HydroForgeModel):
     """Sparse group-ID to rank mapping with NumPy-style lookup."""
 
     group_ids: np.ndarray
     ranks: np.ndarray
 
-    def __getitem__(self, values):
-        array = np.asarray(values)
-        flat = array.reshape(-1)
-        positions = np.searchsorted(self.group_ids, flat)
-        valid = positions < len(self.group_ids)
-        matched = np.zeros(flat.shape, dtype=np.bool_)
-        matched[valid] = self.group_ids[positions[valid]] == flat[valid]
-        if not np.all(matched):
-            raise KeyError(f"Unknown group ID(s): {flat[~matched][:5].tolist()}")
-        result = self.ranks[positions].reshape(array.shape)
-        return result.item() if array.ndim == 0 else result
+    @model_validator(mode="after")
+    def _canonicalize(self):
+        if (
+            self.group_ids.ndim != 1
+            or self.ranks.ndim != 1
+            or self.group_ids.dtype != np.dtype(np.int64)
+            or self.ranks.dtype != np.dtype(np.int64)
+        ):
+            raise ValueError(
+                "group IDs and ranks must be one-dimensional int64 arrays"
+            )
+        if self.group_ids.shape != self.ranks.shape:
+            raise ValueError("group IDs and ranks must have identical shape")
+        if self.group_ids.size > 1 and np.any(
+            self.group_ids[1:] <= self.group_ids[:-1]
+        ):
+            raise ValueError("group IDs must be strictly increasing")
+        if np.any(self.ranks < 0):
+            raise ValueError("partition ranks must be non-negative")
+        object.__setattr__(
+            self,
+            "group_ids",
+            immutable_array(self.group_ids, dtype=np.int64, order="C"),
+        )
+        object.__setattr__(
+            self,
+            "ranks",
+            immutable_array(self.ranks, dtype=np.int64, order="C"),
+        )
+        return self
+
+    def __getitem__(
+        self, values: int | np.integer | np.ndarray,
+    ) -> int | np.ndarray:
+        return _GroupRankQuery(
+            values=values,
+            group_ids=self.group_ids,
+            ranks=self.ranks,
+        ).result
+
+    def _lookup_trusted(self, values: np.ndarray) -> np.ndarray:
+        """Resolve compiled group IDs known to belong to this lookup."""
+
+        positions = np.searchsorted(self.group_ids, values)
+        return self.ranks[positions]
 
     def __len__(self) -> int:
         return len(self.group_ids)
 
 
 @njit
-def compute_group_to_rank(
+def _compute_group_to_rank(
     world_size: int, group_assignments: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Greedily balance original group IDs over ranks."""
     if world_size <= 0 or group_assignments.size == 0:
         return np.empty(0, np.int64), np.empty(0, np.int64)
-    unique_ids = np.unique(group_assignments).astype(np.int64)
+    unique_ids = np.unique(group_assignments)
     inverse = np.searchsorted(unique_ids, group_assignments)
     sizes = np.bincount(inverse, minlength=unique_ids.size).astype(np.int64)
     order = np.argsort(sizes)
@@ -63,13 +156,28 @@ def compute_group_to_rank(
     return unique_ids, ranks
 
 
-class PartitionCompiler:
-    """Own the immutable partition graph and every derived rank-local index."""
+def compute_group_to_rank(
+    world_size: int, group_assignments: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Greedily balance already validated group IDs over validated ranks."""
 
-    def __init__(self, model: AbstractModel) -> None:
+    canonical = np.asarray(group_assignments, dtype=np.int64)
+    return _compute_group_to_rank(world_size, canonical)
+
+
+class _PartitionSemanticCompiler:
+    """Validate and compile the immutable model partition declaration."""
+
+    def __init__(
+        self,
+        model: AbstractModel,
+        *,
+        schema: PartitionSchema | None = None,
+        variable_groups: MappingProxyType | None = None,
+    ) -> None:
         self.model = model
-        self._schema: PartitionSchema | None = None
-        self._variable_groups: MappingProxyType | None = None
+        self._schema = schema
+        self._variable_groups = variable_groups
         self._coordinate_groups: dict[str, np.ndarray] = {}
         self._reference_indices: dict[str, np.ndarray] = {}
         self._group_ranks: GroupRankLookup | None = None
@@ -83,7 +191,7 @@ class PartitionCompiler:
         fields = {
             field.name: field.tensor
             for module_name in model.opened_modules
-            for field in model.compiled_schema().fields(module_name)
+            for field in model._compiled_schema().fields(module_name)
             if (
                 not field.computed
                 and field.tensor is not None
@@ -112,11 +220,6 @@ class PartitionCompiler:
             raise ValueError(
                 f"partition_key '{model.partition_key}' must be a CoordinateField."
             )
-        if model.partition_group not in fields:
-            raise ValueError(
-                f"partition_group '{model.partition_group}' is not declared."
-            )
-
         for name, metadata in fields.items():
             coordinate = self._bare(metadata.dim_coords)
             if coordinate and coordinate not in coordinates:
@@ -173,11 +276,6 @@ class PartitionCompiler:
                     raise ValueError(
                         f"partition_by is only valid on CoordinateField, got '{name}'."
                     )
-                if partition_by not in fields:
-                    raise ValueError(
-                        f"Coordinate '{name}' partitions by undeclared field "
-                        f"'{partition_by}'."
-                    )
                 via = fields[partition_by]
                 if self._bare(via.dim_coords) != name:
                     raise ValueError(
@@ -188,6 +286,30 @@ class PartitionCompiler:
                     raise ValueError(
                         f"Partition field '{partition_by}' must declare references."
                     )
+
+        lineage: dict[str, str] = {}
+        for coordinate in coordinates:
+            if coordinate == model.partition_key:
+                continue
+            metadata = fields[coordinate]
+            via = self._bare(metadata.partition_by)
+            target = (
+                self._bare(fields[via].references)
+                if via else self._bare(metadata.references)
+            )
+            if target is not None:
+                lineage[coordinate] = target
+        for origin in lineage:
+            seen: set[str] = set()
+            coordinate = origin
+            while coordinate in lineage:
+                if coordinate in seen:
+                    raise ValueError(
+                        "partition coordinate lineage must be acyclic; "
+                        f"cycle includes {coordinate!r}"
+                    )
+                seen.add(coordinate)
+                coordinate = lineage[coordinate]
 
         cached = PartitionSchema(
             fields=MappingProxyType(fields),
@@ -230,7 +352,7 @@ class PartitionCompiler:
         self._variable_groups = cached
         return cached
 
-    def field_coordinate(self, field: Any) -> str | None:
+    def field_coordinate(self, field: ModuleFieldSchema) -> str | None:
         if field.tensor is None:
             return None
         coordinate = self._bare(field.tensor.dim_coords)
@@ -241,7 +363,10 @@ class PartitionCompiler:
         )
 
     def logical_axis(
-        self, field_name: str, field: Any, shape: tuple[int, ...],
+        self,
+        field_name: str,
+        field: ModuleFieldSchema,
+        shape: tuple[int, ...],
     ) -> int:
         if field.tensor is None:
             raise ValueError(f"Field {field_name!r} is not a tensor field")
@@ -261,18 +386,23 @@ class PartitionCompiler:
             f"{logical_ndim} logical dimension(s)."
         )
 
-    def validate_input_axes(self, fields: dict[str, Any]) -> None:
-        proxy = self.model.input_proxy
+    def compile_input_axes(
+        self, fields: dict[str, Any],
+    ) -> MappingProxyType:
+        proxy = self.model._input
+        axes: dict[str, int] = {}
         for name, field in fields.items():
             if name not in proxy or field.tensor is None:
                 continue
             coordinate = self._bare(field.tensor.dim_coords)
+            if (
+                coordinate is None
+                and name in self.schema.coordinates
+                and self.coordinate_is_partitioned(name)
+            ):
+                coordinate = name
             if not coordinate:
                 continue
-            if coordinate not in proxy:
-                raise ValueError(
-                    f"Field '{name}' requires missing dim_coords '{coordinate}'."
-                )
             shape = proxy.get_var_shape(name)
             coordinate_shape = proxy.get_var_shape(coordinate)
             if len(coordinate_shape) != 1:
@@ -285,73 +415,196 @@ class PartitionCompiler:
                     f"Field '{name}' logical axis length {shape[axis]} does not match "
                     f"dim_coords '{coordinate}' length {coordinate_shape[0]}."
                 )
+            axes[name] = axis
+        return MappingProxyType(axes)
+
+    def validate_global_reference_integrity(self) -> None:
+        """Validate external reference values before runtime slicing."""
+
+        proxy = self.model._input.proxy
+        for name, metadata in self.schema.fields.items():
+            target = self._bare(metadata.references)
+            if not target or name not in proxy or target not in proxy:
+                continue
+            values = self._numpy(
+                proxy._get_value_trusted(name),
+                label=f"reference field {name!r}",
+            ).reshape(-1)
+            target_values = self._numpy(
+                proxy._get_value_trusted(target),
+                label=f"reference coordinate {target!r}",
+            ).reshape(-1)
+            if np.unique(target_values).size != target_values.size:
+                raise ValueError(
+                    f"Reference target coordinate '{target}' must contain "
+                    "unique values."
+                )
+            index = _find_indices_in_trusted(values, target_values)
+            missing = index < 0
+            if np.any(missing):
+                raise ValueError(
+                    f"Reference field '{name}' has {int(missing.sum())} "
+                    f"value(s) absent from global coordinate '{target}'; "
+                    f"examples: {values[missing][:5].tolist()}."
+                )
+
+    def compile_reference_targets(
+        self,
+    ) -> tuple[
+        MappingProxyType,
+        frozenset[str],
+    ]:
+        """Resolve every derived reference-index target before runtime."""
+
+        model = self.model
+        module_types = model._module_types()
+        opened = frozenset(model.opened_modules)
+        compiled: dict[str, MappingProxyType] = {}
+        inverse_sources: set[str] = set()
+
+        for module_name in model.opened_modules:
+            module_type = module_types[module_name]
+            module_references = module_type._module_reference_fields()
+            plans: dict[str, _ReferenceTargetPlan] = {}
+            for descriptor in module_type._reference_index_fields().values():
+                source = module_type._tensor_schema_map().get(
+                    descriptor.reference,
+                )
+                if source is None or source.tensor is None:
+                    raise ValueError(
+                        f"ReferenceIndexField {descriptor.reference!r} in "
+                        f"module {module_name!r} does not name a tensor field"
+                    )
+                if not tensor_is_active(source.tensor, opened):
+                    continue
+                target_name = source.tensor.references
+                if not target_name:
+                    raise ValueError(
+                        f"ReferenceIndexField {descriptor.reference!r} in "
+                        f"module {module_name!r} refers to a field without "
+                        "reference metadata"
+                    )
+
+                parts = target_name.split(".")
+                target_field = parts[-1]
+                candidates: list[tuple[str, str]] = []
+                if len(parts) > 1:
+                    owner_name = parts[-2]
+                    if owner_name == module_name:
+                        owner_type = module_type
+                    else:
+                        reference = module_references.get(owner_name)
+                        owner_type = (
+                            None
+                            if reference is None
+                            or reference.module_name not in opened
+                            else reference.module_type
+                        )
+                    if owner_type is not None:
+                        target = owner_type._tensor_schema_map().get(
+                            target_field,
+                        )
+                        if (
+                            target is not None
+                            and target.tensor is not None
+                            and tensor_is_active(target.tensor, opened)
+                        ):
+                            candidates.append((
+                                owner_type.module_name,
+                                target_field,
+                            ))
+                else:
+                    local = module_type._tensor_schema_map().get(target_field)
+                    if (
+                        local is not None
+                        and local.tensor is not None
+                        and tensor_is_active(local.tensor, opened)
+                    ):
+                        candidates.append((module_name, target_field))
+                    for reference in module_references.values():
+                        if reference.module_name not in opened:
+                            continue
+                        target = reference.module_type._tensor_schema_map().get(
+                            target_field,
+                        )
+                        if (
+                            target is not None
+                            and target.tensor is not None
+                            and tensor_is_active(target.tensor, opened)
+                        ):
+                            candidates.append((
+                                reference.module_name,
+                                target_field,
+                            ))
+
+                if len(candidates) != 1:
+                    raise ValueError(
+                        f"Reference target {target_name!r} for "
+                        f"{module_name}.{descriptor.reference} resolves to "
+                        f"{len(candidates)} opened tensor fields; qualify the "
+                        "target with its module name"
+                    )
+                target_module, resolved_field = candidates[0]
+                plans[descriptor.reference] = _ReferenceTargetPlan(
+                    target_module=target_module,
+                    target_field=resolved_field,
+                    qualified_name=f"{target_module}.{resolved_field}",
+                )
+                if descriptor.inverse:
+                    inverse_sources.add(descriptor.reference)
+            compiled[module_name] = MappingProxyType(plans)
+
+        return MappingProxyType(compiled), frozenset(inverse_sources)
+
+    def validate_inverse_reference_integrity(
+        self, inverse_sources: frozenset[str],
+    ) -> None:
+        """Prove every inverse reference is a one-to-one global relation."""
+
+        proxy = self.model._input.proxy
+        for name in inverse_sources:
+            if name not in proxy:
+                continue
+            values = self._numpy(
+                proxy._get_value_trusted(name),
+                label=f"inverse reference field {name!r}",
+            ).reshape(-1)
+            if np.unique(values).size != values.size:
+                raise ValueError(
+                    f"Inverse reference field {name!r} must contain unique "
+                    "target references"
+                )
 
     def reference_index(self, name: str) -> np.ndarray:
         cached = self._reference_indices.get(name)
         if cached is not None:
             return cached
         target = self._bare(self.schema.fields[name].references)
-        if not target:
-            raise ValueError(f"Field '{name}' is not a reference field.")
-        proxy = self.model.input_proxy
-        if name not in proxy or target not in proxy:
-            raise ValueError(
-                f"Reference field '{name}' requires loaded coordinate '{target}'."
-            )
-        values = np.asarray(proxy[name])
-        target_values = np.asarray(proxy[target])
-        if values.ndim != 1 or target_values.ndim != 1:
-            raise ValueError(
-                f"Reference field '{name}' and coordinate '{target}' must be 1-D."
-            )
-        index = find_indices_in(values, target_values)
-        missing = index < 0
-        if np.any(missing):
-            raise ValueError(
-                f"Reference field '{name}' has {int(missing.sum())} value(s) "
-                f"absent from coordinate '{target}'; examples: "
-                f"{values[missing][:5].tolist()}."
-            )
+        proxy = self.model._input
+        values = self._numpy(proxy[name])
+        target_values = self._numpy(proxy[target])
+        index = _find_indices_in_trusted(values, target_values)
         self._reference_indices[name] = index
         return index
 
-    def coordinate_group_values(
-        self, coordinate: str, resolving: set[str] | None = None,
-    ) -> np.ndarray:
+    def coordinate_group_values(self, coordinate: str) -> np.ndarray:
         cached = self._coordinate_groups.get(coordinate)
         if cached is not None:
             return cached
-        resolving = set() if resolving is None else resolving
-        if coordinate in resolving:
-            raise ValueError(f"Partition coordinate cycle detected at '{coordinate}'.")
-        resolving.add(coordinate)
         model = self.model
         metadata = self.schema.fields[coordinate]
-        keys = np.asarray(model.input_proxy[coordinate])
-        if keys.ndim != 1 or len(np.unique(keys)) != len(keys):
-            raise ValueError(f"Coordinate '{coordinate}' must contain unique 1-D values.")
         if coordinate == model.partition_key:
-            groups = np.asarray(model.input_proxy[model.partition_group])
-            if groups.ndim != 1 or len(groups) != len(keys):
-                raise ValueError(
-                    f"partition_group '{model.partition_group}' must align with "
-                    f"partition_key '{coordinate}'."
-                )
+            groups = self._numpy(model._input[model.partition_group])
         else:
             via = self._bare(metadata.partition_by)
             references = self._bare(metadata.references)
             if via:
                 target = self._bare(self.schema.fields[via].references)
                 index = self.reference_index(via)
-            elif references:
+            else:
                 target = references
                 index = self.reference_index(coordinate)
-            else:
-                raise ValueError(
-                    f"Coordinate '{coordinate}' has no partition lineage."
-                )
-            groups = self.coordinate_group_values(target, resolving)[index]
-        resolving.remove(coordinate)
+            groups = self.coordinate_group_values(target)[index]
         self._coordinate_groups[coordinate] = groups
         return groups
 
@@ -361,12 +614,9 @@ class PartitionCompiler:
         if cached is not None:
             return cached
         model = self.model
-        if model.partition_group not in model.input_proxy:
-            raise ValueError(
-                f"Missing partition_group '{model.partition_group}' in InputProxy."
-            )
         ids, ranks = compute_group_to_rank(
-            model.world_size, np.asarray(model.input_proxy[model.partition_group]),
+            model.world_size,
+            self._numpy(model._input[model.partition_group]),
         )
         cached = GroupRankLookup(group_ids=ids, ranks=ranks)
         self._group_ranks = cached
@@ -374,46 +624,19 @@ class PartitionCompiler:
 
     def rank_indices(self, coordinate: str) -> np.ndarray:
         groups = self.coordinate_group_values(coordinate)
-        if not np.issubdtype(groups.dtype, np.integer) or np.any(groups < 0):
-            raise ValueError(
-                f"Resolved groups for coordinate '{coordinate}' must be nonnegative integers."
-            )
-        try:
-            ranks = self.group_ranks[groups]
-        except KeyError as exc:
-            raise ValueError(
-                f"Resolved groups for coordinate '{coordinate}' are unknown."
-            ) from exc
+        ranks = self.group_ranks._lookup_trusted(groups)
         return np.nonzero(ranks == self.model.rank)[0]
 
-    def validate_reference_integrity(self, module_data: dict[str, Any]) -> None:
-        proxy = self.model.input_proxy
-        for name, metadata in self.schema.fields.items():
-            target = self._bare(metadata.references)
-            if not target or name not in module_data or target not in proxy:
-                continue
-            values = self._numpy(module_data[name])
-            target_values = np.asarray(proxy[target])
-            index = find_indices_in(values.reshape(-1), target_values.reshape(-1))
-            missing = index < 0
-            if np.any(missing):
-                raise ValueError(
-                    f"Reference field '{name}' has {int(missing.sum())} value(s) "
-                    f"absent from global coordinate '{target}'; examples: "
-                    f"{values.reshape(-1)[missing][:5].tolist()}."
-                )
-
     @staticmethod
-    def _numpy(value: Any) -> np.ndarray:
+    def _numpy(value: Any, *, label: str | None = None) -> np.ndarray:
+        del label
         if isinstance(value, torch.Tensor):
             return value.detach().cpu().numpy()
         return np.asarray(value)
 
     def bind_output(
-        self, field: Any,
+        self, field: ModuleFieldSchema,
     ) -> tuple[RuntimeTensorMetadata, dict[str, torch.Tensor]]:
-        if field.tensor is None:
-            raise TypeError(f"{field.module_name}.{field.name} is not a tensor")
         policy = field.tensor.output
         coordinate = (
             None if policy == "disabled" else self._bare(field.tensor.dim_coords)
@@ -423,10 +646,6 @@ class PartitionCompiler:
         coordinate_tensor = None
         variable_map = self.model._namespace.build()
         if policy != "disabled" and coordinate:
-            if coordinate not in variable_map:
-                raise ValueError(
-                    f"Output coordinate '{coordinate}' is not available in opened modules."
-                )
             coordinate_entry = variable_map[coordinate]
             coordinate_tensor = getattr(
                 coordinate_entry.module, coordinate_entry.field_name,
@@ -443,21 +662,17 @@ class PartitionCompiler:
                     indices = (
                         torch.empty(0, dtype=torch.int32, device=self.model.device)
                         if selected.numel() == 0
-                        else find_indices_in_torch(selected, coordinate_tensor)
-                    )
-                    if torch.any(indices < 0):
-                        missing = selected[indices < 0][:5].detach().cpu().tolist()
-                        raise ValueError(
-                            f"Selection '{selection}' contains values absent from "
-                            f"coordinate '{coordinate}'; examples: {missing}."
+                        else _find_indices_in_torch_trusted(
+                            selected, coordinate_tensor,
                         )
+                    )
                     indices = indices.to(self.model.device)
                     index_name = f"__selection_idx__{selection}"
                     coordinate = selection
                     coordinate_tensor = selected
         bound = RuntimeTensorMetadata(
             tensor=field.tensor,
-            description=field.description or f"Variable {field.name}",
+            description=field.description,
             output_index=index_name,
             output_coord=coordinate,
         )
@@ -467,3 +682,20 @@ class PartitionCompiler:
         if coordinate and coordinate_tensor is not None:
             tensors[coordinate] = coordinate_tensor
         return bound, tensors
+
+
+class PartitionCompiler(_PartitionSemanticCompiler):
+    """Trusted runtime partition service built from validated semantics."""
+
+    def __init__(
+        self,
+        model: AbstractModel,
+        *,
+        schema: PartitionSchema,
+        variable_groups: MappingProxyType,
+    ) -> None:
+        super().__init__(
+            model,
+            schema=schema,
+            variable_groups=variable_groups,
+        )

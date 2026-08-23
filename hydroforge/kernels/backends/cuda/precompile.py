@@ -14,10 +14,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
-from hydroforge.contracts import ResourceCleanupError
+from hydroforge.contracts.errors import ResourceCleanupError
 from hydroforge.data.distributed import get_local_process_rank
 from hydroforge.kernels.backends.cuda.build import _safe_path_component, load_inline_cu_module
-from hydroforge.kernels.backends.cuda.spec import CudaExtensionSpec, cuda_declarations
+from hydroforge.kernels.backends.cuda.spec import _CompiledCudaExtension
 
 
 _WORKER_STOP_TIMEOUT = 5.0
@@ -70,12 +70,11 @@ def _compile_extension_payload(payload_path: str) -> None:
         path.unlink(missing_ok=True)
     payload = json.loads(serialized)
     source = payload["materialized_source"]
-    declarations = payload["declarations"] or cuda_declarations(
-        source, payload["functions"],
-    )
     load_inline_cu_module(
         payload["name"],
-        cpp_sources="\n".join((*payload["cpp_headers"], *declarations)),
+        cpp_sources="\n".join((
+            *payload["cpp_headers"], *payload["declarations"],
+        )),
         cuda_sources=source,
         functions=payload["functions"],
         extra_cuda_cflags=payload["cflags"],
@@ -87,31 +86,12 @@ def _compile_extension_payload(payload_path: str) -> None:
 
 def precompile_extension_specs(
     binary_prefix: str,
-    specs: Mapping[str, CudaExtensionSpec],
+    specs: Mapping[str, _CompiledCudaExtension],
     *,
     env_prefix: str = "HYDROFORGE",
     default_jobs: int = 6,
-    materialized_sources: Mapping[str, str] | None = None,
 ) -> None:
-    """Precompile declarative specs without mutating their owner module."""
-    if type(default_jobs) is not int or default_jobs < 1:
-        raise ValueError("default_jobs must be an exact positive int")
-    if type(binary_prefix) is not str or not binary_prefix.isidentifier():
-        raise ValueError("CUDA precompile binary_prefix must be an identifier")
-    if type(env_prefix) is not str or not env_prefix.isidentifier():
-        raise ValueError("CUDA precompile env_prefix must be an identifier")
-    if not isinstance(specs, Mapping):
-        raise TypeError("CUDA precompile specs must be a mapping")
-    invalid_specs = {
-        name: type(spec).__name__
-        for name, spec in specs.items()
-        if type(name) is not str or not name.isidentifier()
-        or not isinstance(spec, CudaExtensionSpec)
-    }
-    if invalid_specs:
-        raise TypeError(
-            f"invalid CUDA precompile extension specs: {invalid_specs}"
-        )
+    """Precompile immutable construction-time CUDA extension plans."""
     if not specs:
         return
     configured_jobs = os.environ.get("HYDROFORGE_PRECOMPILE_JOBS")
@@ -131,38 +111,14 @@ def precompile_extension_specs(
                 f"got {configured_jobs!r}"
             )
     jobs = min(jobs, len(specs))
-    if materialized_sources is None:
-        sources = {
-            name: spec.materialize_source() for name, spec in specs.items()
-        }
-    else:
-        if set(materialized_sources) != set(specs):
-            raise ValueError(
-                "materialized CUDA sources must exactly match extension specs: "
-                f"missing={sorted(set(specs).difference(materialized_sources))}, "
-                f"extra={sorted(set(materialized_sources).difference(specs))}"
-            )
-        invalid = {
-            name: type(source).__name__
-            for name, source in materialized_sources.items()
-            if type(source) is not str or not source
-        }
-        if invalid:
-            raise TypeError(
-                "materialized CUDA sources must be non-empty strings: "
-                f"{invalid}"
-            )
-        sources = dict(materialized_sources)
     if jobs == 1:
         for name, spec in specs.items():
-            source = sources[name]
             load_inline_cu_module(
                 f"{binary_prefix}_{name}",
                 cpp_sources="\n".join((
-                    *spec.cpp_headers,
-                    *(spec.declarations or cuda_declarations(source, spec.functions)),
+                    *spec.cpp_headers, *spec.declarations,
                 )),
-                cuda_sources=source,
+                cuda_sources=spec.source,
                 functions=spec.functions,
                 extra_cuda_cflags=spec.cflags,
                 extra_include_paths=tuple(map(str, spec.include_paths)),
@@ -175,7 +131,7 @@ def precompile_extension_specs(
     for name, spec in specs.items():
         payload = {
             "name": f"{binary_prefix}_{name}",
-            "materialized_source": sources[name],
+            "materialized_source": spec.source,
             "functions": spec.functions,
             "declarations": spec.declarations,
             "cflags": spec.cflags,
@@ -317,12 +273,16 @@ def precompile_cuda_modules(
     results: Dict[str, Any] = {}
     for module_name in module_names:
         mod = importlib.import_module(module_name)
-        groups = tuple(dict.fromkeys(
-            value
-            for value in vars(mod).values()
-            if isinstance(value, CudaExtensionGroup)
-            and value.owner_module == module_name
-        ))
+        groups = []
+        seen_groups: set[int] = set()
+        for value in vars(mod).values():
+            if (
+                isinstance(value, CudaExtensionGroup)
+                and value.owner_module == module_name
+                and id(value) not in seen_groups
+            ):
+                groups.append(value)
+                seen_groups.add(id(value))
         if not groups:
             foreign = sorted({
                 value.owner_module
@@ -340,9 +300,9 @@ def precompile_cuda_modules(
             )
         results[module_name] = {
             group.binary_prefix: (
-                group.ensure_precompiled()
+                group._ensure_precompiled()
                 if opened_modules is None
-                else group.ensure_precompiled_for_modules(opened_modules)
+                else group._ensure_precompiled_for_modules(opened_modules)
             )
             for group in groups
         }

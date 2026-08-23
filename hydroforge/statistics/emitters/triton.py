@@ -33,10 +33,20 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         self._generate_triton_aggregator_function()
         return self.result()
 
-    def _generate_triton_aggregator_function(self) -> None:
-        if not self._variables:
-            raise ValueError("No variables initialized for statistics aggregation")
+    def _triton_expression(
+        self: StatisticsRuntime, name: str, expression, names: dict[str, str],
+    ) -> str:
+        dtype = self._statistics_layouts[name].dtype
+        value_type = {
+            "torch.float32": "float32",
+            "torch.float64": "float64",
+        }[str(dtype)]
+        return render_expression(
+            expression, ExpressionDialect.TRITON, names,
+            value_type=value_type,
+        )
 
+    def _generate_triton_aggregator_function(self) -> None:
         groups = self._statistics_lowering.groups
         lines = self._generate_kernel_header()
         self._generate_scatter_kernels(lines)
@@ -75,7 +85,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             '- Use idx to access original data: data[idx]',
             '- Store outputs using sequential indexing: out[offs]',
             '- explicit argmax/argmin ops store the macro-step index',
-            '- argmax/argmin store the macro-step index and are written as int32;',
+            '- argmax/argmin store the macro-step index as int64;',
             '  conversion to datetime (if any) happens at the consumer via the',
             '  recorded macro-step time mapping, not at NC file write time',
             '',
@@ -92,13 +102,18 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             "",
             "@triton.jit",
             "def hydroforge_maximum(left, right):",
-            "    # Match torch.fmax/CUDA fmax without depending on Triton's default.",
+            "    # Ignore one-sided NaN without prescribing signed-zero bits.",
             "    return tl.where(left != left, right, tl.where(right != right, left, tl.maximum(left, right)))",
             "",
             "@triton.jit",
             "def hydroforge_minimum(left, right):",
-            "    # Match torch.fmin/CUDA fmin without depending on Triton's default.",
+            "    # Ignore one-sided NaN without prescribing signed-zero bits.",
             "    return tl.where(left != left, right, tl.where(right != right, left, tl.minimum(left, right)))",
+            "",
+            "@triton.jit",
+            "def hydroforge_weighted_mean(old_value, old_weight, value, weight):",
+            "    new_weight = old_weight + weight",
+            "    return old_value * (old_weight / new_weight) + value * (weight / new_weight)",
             "",
             '# ============================================================================',
             f"# Generated Triton kernels for statistics aggregation - Rank {self.rank}",
@@ -118,7 +133,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         )
         self._kernel_module = module
         self._aggregator_function = getattr(module, 'internal_update_statistics')
-        self._aggregator_generated = True
 
 
     def _generate_scatter_kernels(
@@ -183,7 +197,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             ])
             if is_mean:
                 kernel_code_lines.append(
-                    f"        tl.store({cnt_safe}_ptr + t * N + offs, 0.0, mask=mask)"
+                    f"        tl.store({cnt_safe}_ptr + t * N + offs, 0, mask=mask)"
                 )
             kernel_code_lines.append("")
 
@@ -234,8 +248,8 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         dependency: emit_scatter_value(dependency)
                         for dependency in source.expression.dependencies
                     }
-                    expression = render_expression(
-                        source.expression, ExpressionDialect.TRITON, names,
+                    expression = self._triton_expression(
+                        name, source.expression, names,
                     )
                     kernel_code_lines.append(
                         f"        {value_name} = {expression}"
@@ -257,8 +271,8 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 dependency: emit_scatter_value(dependency)
                 for dependency in scatter.value.dependencies
             }
-            value_expression = render_expression(
-                scatter.value, ExpressionDialect.TRITON, value_names,
+            value_expression = self._triton_expression(
+                var_name, scatter.value, value_names,
             )
             kernel_code_lines.append(f"        _val = {value_expression}")
             kernel_code_lines.append(
@@ -266,7 +280,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             )
             if is_mean:
                 kernel_code_lines.append(
-                    f"        tl.atomic_add({cnt_safe}_ptr + t * N + idx, 1.0, mask=mask)"
+                    f"        tl.atomic_add({cnt_safe}_ptr + t * N + idx, 1, mask=mask)"
                 )
             kernel_code_lines.append("")
 
@@ -283,9 +297,9 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
                     "    mask = offs < N",
                     "    for t in tl.static_range(num_trials):",
-                    f"        _cnt = tl.load({cnt_safe}_ptr + t * N + offs, mask=mask, other=1.0)",
+                    f"        _cnt = tl.load({cnt_safe}_ptr + t * N + offs, mask=mask, other=1)",
                     f"        _val = tl.load({buf_safe}_ptr + t * N + offs, mask=mask, other=0.0)",
-                    "        _mean = tl.where(_cnt > 0.0, _val / _cnt, float('nan'))",
+                    "        _mean = tl.where(_cnt > 0, _val / _cnt, float('nan'))",
                     f"        tl.store({buf_safe}_ptr + t * N + offs, _mean, mask=mask)",
                 ])
                 kernel_code_lines.append("")
@@ -323,8 +337,8 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 dependency: self._get_safe_name(dependency)
                 for dependency in source.expression.dependencies
             }
-            expression = render_expression(
-                source.expression, ExpressionDialect.TRITON, names,
+            expression = self._triton_expression(
+                var_name, source.expression, names,
             )
             indent = "        " if is_2d else "    "
             code_lines.append(f"{indent}{safe_var_name} = {expression}")
@@ -414,8 +428,8 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     dependency: emit_val(dependency, to_lines, scope)
                     for dependency in source.expression.dependencies
                 }
-                expression = render_expression(
-                    source.expression, ExpressionDialect.TRITON, names,
+                expression = self._triton_expression(
+                    v_name, source.expression, names,
                 )
                 to_lines.append(f"{indent}{safe_v_name}_val = {expression}")
 
@@ -472,38 +486,43 @@ class TritonStatisticsEmitter(StatisticsEmitter):
 
                         if k_val == 1:
                             aux_ptr = f"{aux_ptr_base} + {out_offset}"
-                            sentinel = (
-                                "-float('inf')"
-                                if arg_type == 'max' else "float('inf')"
-                            )
-                            candidate = (
-                                f"tl.where({val_var} == {val_var}, "
-                                f"{val_var}, {sentinel})"
-                                if self._statistics_layouts[
-                                    var
-                                ].dtype.is_floating_point
-                                else val_var
-                            )
-                            if arg_type == 'max':
+                            if self._statistics_layouts[
+                                var
+                            ].dtype.is_floating_point:
+                                comparison = '>' if arg_type == 'max' else '<'
+                                ops_is_inner_last_is_outer_first.extend([
+                                    f"tl.store({out_ptr}, -1, mask=mask)",
+                                    f"tl.store({aux_ptr}, float('nan'), mask=mask)",
+                                ])
+                                update = [
+                                    f"{safe_var}_{op}_aux_old = tl.load({aux_ptr}, mask=mask, other=float('nan'))",
+                                    f"{safe_var}_{op}_valid = {val_var} == {val_var}",
+                                    f"{safe_var}_{op}_cond = {safe_var}_{op}_valid & (({safe_var}_{op}_aux_old != {safe_var}_{op}_aux_old) | ({val_var} {comparison} {safe_var}_{op}_aux_old))",
+                                    f"tl.store({aux_ptr}, tl.where({safe_var}_{op}_cond, {val_var}, {safe_var}_{op}_aux_old), mask=mask)",
+                                    f"tl.store({out_ptr}, macro_step_index, mask=mask & {safe_var}_{op}_cond)",
+                                ]
+                                ops_is_inner_last_is_outer_first.extend(update)
+                                ops_is_inner_last_not_is_outer_first.extend(update)
+                            elif arg_type == 'max':
                                 ops_is_inner_last_is_outer_first.extend([
                                     f"tl.store({out_ptr}, macro_step_index, mask=mask)",
-                                    f"tl.store({aux_ptr}, {candidate}, mask=mask)",
+                                    f"tl.store({aux_ptr}, {val_var}, mask=mask)",
                                 ])
                                 ops_is_inner_last_not_is_outer_first.extend([
-                                    f"{safe_var}_{op}_aux_old = tl.load({aux_ptr}, mask=mask, other={candidate})",
-                                    f"{safe_var}_{op}_cond = {candidate} > {safe_var}_{op}_aux_old",
-                                    f"tl.store({aux_ptr}, tl.where({safe_var}_{op}_cond, {candidate}, {safe_var}_{op}_aux_old), mask=mask)",
+                                    f"{safe_var}_{op}_aux_old = tl.load({aux_ptr}, mask=mask, other={val_var})",
+                                    f"{safe_var}_{op}_cond = {val_var} > {safe_var}_{op}_aux_old",
+                                    f"tl.store({aux_ptr}, tl.where({safe_var}_{op}_cond, {val_var}, {safe_var}_{op}_aux_old), mask=mask)",
                                     f"tl.store({out_ptr}, macro_step_index, mask=mask & {safe_var}_{op}_cond)",
                                 ])
-                            else:  # min
+                            else:
                                 ops_is_inner_last_is_outer_first.extend([
                                     f"tl.store({out_ptr}, macro_step_index, mask=mask)",
-                                    f"tl.store({aux_ptr}, {candidate}, mask=mask)",
+                                    f"tl.store({aux_ptr}, {val_var}, mask=mask)",
                                 ])
                                 ops_is_inner_last_not_is_outer_first.extend([
-                                    f"{safe_var}_{op}_aux_old = tl.load({aux_ptr}, mask=mask, other={candidate})",
-                                    f"{safe_var}_{op}_cond = {candidate} < {safe_var}_{op}_aux_old",
-                                    f"tl.store({aux_ptr}, tl.where({safe_var}_{op}_cond, {candidate}, {safe_var}_{op}_aux_old), mask=mask)",
+                                    f"{safe_var}_{op}_aux_old = tl.load({aux_ptr}, mask=mask, other={val_var})",
+                                    f"{safe_var}_{op}_cond = {val_var} < {safe_var}_{op}_aux_old",
+                                    f"tl.store({aux_ptr}, tl.where({safe_var}_{op}_cond, {val_var}, {safe_var}_{op}_aux_old), mask=mask)",
                                     f"tl.store({out_ptr}, macro_step_index, mask=mask & {safe_var}_{op}_cond)",
                                 ])
                         else:
@@ -547,13 +566,12 @@ class TritonStatisticsEmitter(StatisticsEmitter):
 
                     elif outer == 'mean':
                         ops_is_inner_last_is_outer_first.append(
-                            f"{safe_var}_{op}_accum = {val_var}")
-                        ops_is_inner_last_not_is_outer_first.append(
-                            f"{safe_var}_{op}_accum = tl.load({out_ptr}, mask=mask, other=0.0) + {val_var}")
-                        ops_is_inner_last_is_outer_last.append(
-                            f"tl.store({out_ptr}, {safe_var}_{op}_accum / num_macro_steps, mask=mask)")
-                        ops_is_inner_last_not_is_outer_last.append(
-                            f"tl.store({out_ptr}, {safe_var}_{op}_accum, mask=mask)")
+                            f"tl.store({out_ptr}, {val_var}, mask=mask)")
+                        ops_is_inner_last_not_is_outer_first.extend([
+                            f"{safe_var}_{op}_old = tl.load({out_ptr}, mask=mask, other=0.0)",
+                            f"{safe_var}_{op}_count = num_macro_steps.to({val_var}.dtype)",
+                            f"tl.store({out_ptr}, hydroforge_weighted_mean({safe_var}_{op}_old, {safe_var}_{op}_count - 1.0, {val_var}, 1.0), mask=mask)",
+                        ])
 
                     elif outer == 'sum':
                         ops_is_inner_last_is_outer_first.append(
@@ -583,11 +601,17 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         ops_is_inner_last.append(f"tl.store({out_ptr}, val_for_{safe_var}_mean, mask=mask)")
                     else:
                         # Standalone mean - needs state (use variable-specific val)
+                        weight_ptr = (
+                            f"{safe_var}_mean_sample_weight_state_ptr + "
+                            f"{out_offset}"
+                        )
                         ops_unconditional.extend([
                             f"# Standalone mean for {safe_var}",
                             f"{safe_var}_mean_old = tl.where(is_inner_first, tl.zeros_like({safe_var}_val), tl.load({out_ptr}, mask=mask, other=0.0))",
-                            f"{safe_var}_mean_new = {safe_var}_mean_old + {safe_var}_val * weight",
-                            f"{safe_var}_mean_out = tl.where(is_inner_last, {safe_var}_mean_new / total_weight, {safe_var}_mean_new)",
+                            f"{safe_var}_mean_weight_old = tl.where(is_inner_first, 0.0, tl.load({weight_ptr}, mask=mask, other=0.0))",
+                            f"{safe_var}_mean_weight_new = {safe_var}_mean_weight_old + weight",
+                            f"{safe_var}_mean_out = hydroforge_weighted_mean({safe_var}_mean_old, {safe_var}_mean_weight_old, {safe_var}_val, weight)",
+                            f"tl.store({weight_ptr}, tl.where(is_inner_last, 0.0, {safe_var}_mean_weight_new), mask=mask)",
                         ])
                         ops_unconditional.append(f"tl.store({out_ptr}, {safe_var}_mean_out, mask=mask)")
 
@@ -687,14 +711,14 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     kernel_code_lines.extend([
                         f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
                         f"{indent}{safe_var}_weight_{inner_type}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
-                        f"{indent}{safe_var}_inner_{inner_type}_new = {safe_var}_inner_{inner_type}_old + {var_val} * weight",
                         f"{indent}{safe_var}_weight_{inner_type}_new = {safe_var}_weight_{inner_type}_old + weight",
+                        f"{indent}{safe_var}_inner_{inner_type}_new = hydroforge_weighted_mean({safe_var}_inner_{inner_type}_old, {safe_var}_weight_{inner_type}_old, {var_val}, weight)",
                     ])
                     # Store based on condition - use tl.where for efficiency
                     kernel_code_lines.extend([
                         f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, 0.0, {safe_var}_inner_{inner_type}_new), mask=mask)",
                         f"{indent}tl.store({weight_ptr}, tl.where(is_inner_last, 0.0, {safe_var}_weight_{inner_type}_new), mask=mask)",
-                        f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new / {safe_var}_weight_{inner_type}_new, {val_for_var_inner})",
+                        f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new, {val_for_var_inner})",
                     ])
                 elif inner_type == 'sum':
                     inner_ptr = f"{safe_var}_{inner_type}_inner_state_ptr + {out_offset}"
@@ -710,7 +734,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
                     kernel_code_lines.extend([
                         f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other={var_val})",
-                        f"{indent}{safe_var}_inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), {var_val}, hydroforge_maximum({safe_var}_inner_{inner_type}_old, {var_val}))",
+                        f"{indent}{safe_var}_inner_{inner_type}_new = tl.where(is_inner_first, {var_val}, hydroforge_maximum({safe_var}_inner_{inner_type}_old, {var_val}))",
                         f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, -float('inf'), {safe_var}_inner_{inner_type}_new), mask=mask)",
                         f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new, {val_for_var_inner})",
                     ])
@@ -719,7 +743,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     kernel_code_lines.append(f"{indent}{val_for_var_inner} = tl.zeros_like({var_val})")
                     kernel_code_lines.extend([
                         f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other={var_val})",
-                        f"{indent}{safe_var}_inner_{inner_type}_new = tl.where(is_inner_first & (macro_step_index==0), {var_val}, hydroforge_minimum({safe_var}_inner_{inner_type}_old, {var_val}))",
+                        f"{indent}{safe_var}_inner_{inner_type}_new = tl.where(is_inner_first, {var_val}, hydroforge_minimum({safe_var}_inner_{inner_type}_old, {var_val}))",
                         f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, float('inf'), {safe_var}_inner_{inner_type}_new), mask=mask)",
                         f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new, {val_for_var_inner})",
                     ])
@@ -855,22 +879,22 @@ class TritonStatisticsEmitter(StatisticsEmitter):
 
                 # Initialize new values for bubble insert (using correct val_var for each op type)
                 if has_max:
-                    kernel_code_lines.append(f"{indent2}new_val_max_{safe_var} = tl.where({max_val_var} == {max_val_var}, {max_val_var}, -float('inf'))")
+                    kernel_code_lines.append(f"{indent2}new_val_max_{safe_var} = {max_val_var}")
                 if has_min:
-                    kernel_code_lines.append(f"{indent2}new_val_min_{safe_var} = tl.where({min_val_var} == {min_val_var}, {min_val_var}, float('inf'))")
+                    kernel_code_lines.append(f"{indent2}new_val_min_{safe_var} = {min_val_var}")
                 if has_argmax:
-                    kernel_code_lines.append(f"{indent2}new_val_argmax_{safe_var} = tl.where({argmax_val_var} == {argmax_val_var}, {argmax_val_var}, -float('inf'))")
+                    kernel_code_lines.append(f"{indent2}new_val_argmax_{safe_var} = {argmax_val_var}")
                 if has_argmin:
-                    kernel_code_lines.append(f"{indent2}new_val_argmin_{safe_var} = tl.where({argmin_val_var} == {argmin_val_var}, {argmin_val_var}, float('inf'))")
+                    kernel_code_lines.append(f"{indent2}new_val_argmin_{safe_var} = {argmin_val_var}")
                 if has_argmax:
                     kernel_code_lines.append(
                         f"{indent2}new_idx_argmax_{safe_var} = "
-                        "tl.full([BLOCK_SIZE], macro_step_index, dtype=tl.int32)"
+                        "tl.full([BLOCK_SIZE], macro_step_index, dtype=tl.int64)"
                     )
                 if has_argmin:
                     kernel_code_lines.append(
                         f"{indent2}new_idx_argmin_{safe_var} = "
-                        "tl.full([BLOCK_SIZE], macro_step_index, dtype=tl.int32)"
+                        "tl.full([BLOCK_SIZE], macro_step_index, dtype=tl.int64)"
                     )
 
                 # is_outer_first branch: initialize all arrays
@@ -889,7 +913,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         f"{safe_var}_{argmax_op['op']}_aux_ptr"
                     )
                     argmax_idx_ptr = f"{safe_var}_{argmax_op['op']}_ptr"
-                    kernel_code_lines.append(f"{indent3}tl.store({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs, new_idx_argmax_{safe_var}, mask=mask)")
+                    kernel_code_lines.append(f"{indent3}tl.store({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs, tl.where(new_val_argmax_{safe_var} == new_val_argmax_{safe_var}, new_idx_argmax_{safe_var}, -1), mask=mask)")
                     kernel_code_lines.append(f"{indent3}tl.store({argmax_aux_ptr} + {safe_var}_k{k_val}_base_offs, new_val_argmax_{safe_var}, mask=mask)")
                     if argmax_op.get('has_val_output') and argmax_op.get('val_output_ptr'):
                         kernel_code_lines.append(f"{indent3}tl.store({argmax_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs, new_val_argmax_{safe_var}, mask=mask)")
@@ -899,7 +923,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         f"{safe_var}_{argmin_op['op']}_aux_ptr"
                     )
                     argmin_idx_ptr = f"{safe_var}_{argmin_op['op']}_ptr"
-                    kernel_code_lines.append(f"{indent3}tl.store({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs, new_idx_argmin_{safe_var}, mask=mask)")
+                    kernel_code_lines.append(f"{indent3}tl.store({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs, tl.where(new_val_argmin_{safe_var} == new_val_argmin_{safe_var}, new_idx_argmin_{safe_var}, -1), mask=mask)")
                     kernel_code_lines.append(f"{indent3}tl.store({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs, new_val_argmin_{safe_var}, mask=mask)")
                     if argmin_op.get('has_val_output') and argmin_op.get('val_output_ptr'):
                         kernel_code_lines.append(f"{indent3}tl.store({argmin_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs, new_val_argmin_{safe_var}, mask=mask)")
@@ -907,19 +931,19 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 # Initialize remaining positions with inf/-inf
                 kernel_code_lines.append(f"{indent3}for k in tl.static_range(1, {k_val}):")
                 if has_max:
-                    kernel_code_lines.append(f"{indent4}tl.store({max_ptr} + {safe_var}_k{k_val}_base_offs + k, -float('inf'), mask=mask)")
+                    kernel_code_lines.append(f"{indent4}tl.store({max_ptr} + {safe_var}_k{k_val}_base_offs + k, float('nan'), mask=mask)")
                 if has_min:
-                    kernel_code_lines.append(f"{indent4}tl.store({min_ptr} + {safe_var}_k{k_val}_base_offs + k, float('inf'), mask=mask)")
+                    kernel_code_lines.append(f"{indent4}tl.store({min_ptr} + {safe_var}_k{k_val}_base_offs + k, float('nan'), mask=mask)")
                 if has_argmax:
-                    kernel_code_lines.append(f"{indent4}tl.store({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, 0, mask=mask)")
-                    kernel_code_lines.append(f"{indent4}tl.store({argmax_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, -float('inf'), mask=mask)")
+                    kernel_code_lines.append(f"{indent4}tl.store({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, -1, mask=mask)")
+                    kernel_code_lines.append(f"{indent4}tl.store({argmax_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, float('nan'), mask=mask)")
                     if argmax_op.get('has_val_output') and argmax_op.get('val_output_ptr'):
-                        kernel_code_lines.append(f"{indent4}tl.store({argmax_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs + k, -float('inf'), mask=mask)")
+                        kernel_code_lines.append(f"{indent4}tl.store({argmax_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs + k, float('nan'), mask=mask)")
                 if has_argmin:
-                    kernel_code_lines.append(f"{indent4}tl.store({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, 0, mask=mask)")
-                    kernel_code_lines.append(f"{indent4}tl.store({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, float('inf'), mask=mask)")
+                    kernel_code_lines.append(f"{indent4}tl.store({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, -1, mask=mask)")
+                    kernel_code_lines.append(f"{indent4}tl.store({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, float('nan'), mask=mask)")
                     if argmin_op.get('has_val_output') and argmin_op.get('val_output_ptr'):
-                        kernel_code_lines.append(f"{indent4}tl.store({argmin_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs + k, float('inf'), mask=mask)")
+                        kernel_code_lines.append(f"{indent4}tl.store({argmin_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs + k, float('nan'), mask=mask)")
 
                 # else branch: bubble insert
                 kernel_code_lines.append(f"{indent2}else:")
@@ -928,25 +952,25 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                 # Load old values and compute swap masks
                 if has_max:
                     kernel_code_lines.extend([
-                        f"{indent4}old_max_k = tl.load({max_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=-float('inf'))",
-                        f"{indent4}swap_max = new_val_max_{safe_var} > old_max_k",
+                        f"{indent4}old_max_k = tl.load({max_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=float('nan'))",
+                        f"{indent4}swap_max = (new_val_max_{safe_var} == new_val_max_{safe_var}) & ((old_max_k != old_max_k) | (new_val_max_{safe_var} > old_max_k))",
                         f"{indent4}max_to_store = tl.where(swap_max, new_val_max_{safe_var}, old_max_k)",
                         f"{indent4}new_val_max_{safe_var} = tl.where(swap_max, old_max_k, new_val_max_{safe_var})",
                         f"{indent4}tl.store({max_ptr} + {safe_var}_k{k_val}_base_offs + k, max_to_store, mask=mask & swap_max)",
                     ])
                 if has_min:
                     kernel_code_lines.extend([
-                        f"{indent4}old_min_k = tl.load({min_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=float('inf'))",
-                        f"{indent4}swap_min = new_val_min_{safe_var} < old_min_k",
+                        f"{indent4}old_min_k = tl.load({min_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=float('nan'))",
+                        f"{indent4}swap_min = (new_val_min_{safe_var} == new_val_min_{safe_var}) & ((old_min_k != old_min_k) | (new_val_min_{safe_var} < old_min_k))",
                         f"{indent4}min_to_store = tl.where(swap_min, new_val_min_{safe_var}, old_min_k)",
                         f"{indent4}new_val_min_{safe_var} = tl.where(swap_min, old_min_k, new_val_min_{safe_var})",
                         f"{indent4}tl.store({min_ptr} + {safe_var}_k{k_val}_base_offs + k, min_to_store, mask=mask & swap_min)",
                     ])
                 if has_argmax:
                     kernel_code_lines.extend([
-                        f"{indent4}old_argmax_aux_k = tl.load({argmax_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=-float('inf'))",
-                        f"{indent4}old_argmax_idx_k = tl.load({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=0)",
-                        f"{indent4}swap_argmax = new_val_argmax_{safe_var} > old_argmax_aux_k",
+                        f"{indent4}old_argmax_aux_k = tl.load({argmax_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=float('nan'))",
+                        f"{indent4}old_argmax_idx_k = tl.load({argmax_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=-1)",
+                        f"{indent4}swap_argmax = (new_val_argmax_{safe_var} == new_val_argmax_{safe_var}) & ((old_argmax_aux_k != old_argmax_aux_k) | (new_val_argmax_{safe_var} > old_argmax_aux_k) | ((new_val_argmax_{safe_var} == old_argmax_aux_k) & (new_idx_argmax_{safe_var} < old_argmax_idx_k)))",
                         f"{indent4}argmax_aux_store = tl.where(swap_argmax, new_val_argmax_{safe_var}, old_argmax_aux_k)",
                         f"{indent4}argmax_idx_store = tl.where(swap_argmax, new_idx_argmax_{safe_var}, old_argmax_idx_k)",
                         f"{indent4}new_val_argmax_{safe_var} = tl.where(swap_argmax, old_argmax_aux_k, new_val_argmax_{safe_var})",
@@ -958,9 +982,9 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         kernel_code_lines.append(f"{indent4}tl.store({argmax_op['val_output_ptr']} + {safe_var}_k{k_val}_base_offs + k, argmax_aux_store, mask=mask & swap_argmax)")
                 if has_argmin:
                     kernel_code_lines.extend([
-                        f"{indent4}old_argmin_aux_k = tl.load({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=float('inf'))",
-                        f"{indent4}old_argmin_idx_k = tl.load({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=0)",
-                        f"{indent4}swap_argmin = new_val_argmin_{safe_var} < old_argmin_aux_k",
+                        f"{indent4}old_argmin_aux_k = tl.load({argmin_aux_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=float('nan'))",
+                        f"{indent4}old_argmin_idx_k = tl.load({argmin_idx_ptr} + {safe_var}_k{k_val}_base_offs + k, mask=mask, other=-1)",
+                        f"{indent4}swap_argmin = (new_val_argmin_{safe_var} == new_val_argmin_{safe_var}) & ((old_argmin_aux_k != old_argmin_aux_k) | (new_val_argmin_{safe_var} < old_argmin_aux_k) | ((new_val_argmin_{safe_var} == old_argmin_aux_k) & (new_idx_argmin_{safe_var} < old_argmin_idx_k)))",
                         f"{indent4}argmin_aux_store = tl.where(swap_argmin, new_val_argmin_{safe_var}, old_argmin_aux_k)",
                         f"{indent4}argmin_idx_store = tl.where(swap_argmin, new_idx_argmin_{safe_var}, old_argmin_idx_k)",
                         f"{indent4}new_val_argmin_{safe_var} = tl.where(swap_argmin, old_argmin_aux_k, new_val_argmin_{safe_var})",
@@ -1005,7 +1029,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         for var in sorted_inputs:
             safe_var = self._get_safe_name(var)
             # Avoid duplicate argument if output_index matches input var
-            if safe_var == output_index:
+            if var == output_index:
                 continue
             kernel_code_lines.append(f"    {safe_var}_ptr,")
 
@@ -1023,6 +1047,14 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     kernel_code_lines.append(
                         f"    {safe_var}_{op}_aux_ptr,"
                     )
+            if any(
+                operation.inner is None
+                and operation.outer.value == "mean"
+                for operation in variable.operations
+            ):
+                kernel_code_lines.append(
+                    f"    {safe_var}_mean_sample_weight_state_ptr,"
+                )
 
             # Inner state pointers (only for ops that need cross-step state)
             added_inner = set()
@@ -1062,7 +1094,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             "    sub_step = tl.load(__hf_sub_step_ptr).to(tl.int32)",
             "    num_sub_steps = tl.load(__hf_num_sub_steps_ptr).to(tl.int32)",
             "    flags = tl.load(__hf_flags_ptr).to(tl.int32)",
-            "    macro_step_index = tl.load(__hf_macro_step_index_ptr).to(tl.int32)",
+            "    macro_step_index = tl.load(__hf_macro_step_index_ptr).to(tl.int64)",
             "",
         ])
 
@@ -1091,7 +1123,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         indent2 = indent + "    "
         indent3 = indent2 + "    "
         indent4 = indent3 + "    "
-        indent5 = indent4 + "    "
 
         # 1D processing - use grouped generation for all vars
         if dims_1d:
@@ -1100,23 +1131,10 @@ class TritonStatisticsEmitter(StatisticsEmitter):
 
         # 2D processing
         if dims_2d:
-            unsupported = [
-                operation.spelling
-                for variable in dims_2d
-                for operation in self._statistics_lowering.operations(variable)
-                if operation.compound or operation.k > 1 or operation.stores_index
-            ]
-            if unsupported:
-                raise RuntimeError(
-                    "statistics lowering admitted unsupported indexed-level "
-                    f"operations into Triton code generation: {unsupported}"
-                )
-
             def is_last_only(name: str) -> bool:
                 operations = self._statistics_lowering.operations(name)
                 return (
                     len(operations) == 1
-                    and not operations[0].compound
                     and operations[0].outer.value == "last"
                 )
 
@@ -1146,9 +1164,8 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                 dependency: emit_val_2d(dependency)
                                 for dependency in source.expression.dependencies
                             }
-                            expression = render_expression(
-                                source.expression, ExpressionDialect.TRITON,
-                                names,
+                            expression = self._triton_expression(
+                                v_name, source.expression, names,
                             )
                             kernel_code_lines.append(
                                 f"{indent2}{safe_v_name}_val = {expression}"
@@ -1180,245 +1197,27 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     val_name = emit_val_2d(var)
                     kernel_code_lines.append(f"{indent2}val = {val_name}")
 
-                    # Inner states update
-                    inner_ops = (
-                        reduction.value
-                        for reduction in self._statistics_lowering.inner_reductions(var)
-                    )
-                    for inner in inner_ops:
-                        # Initialize val_for_inner to avoid UnboundLocalError/NameError in generated code
-                        # This value is used if is_update_outer is True, where it gets overwritten.
-                        kernel_code_lines.append(f"{indent2}val_for_{inner} = tl.zeros_like(val)")
-
-                        inner_ptr = f"{safe_var}_{inner}_inner_state_ptr + {out_offset}"
-                        if inner == 'mean':
-                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
-                             kernel_code_lines.extend([
-                                 f"{indent2}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
-                                 f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
-                                 f"{indent2}inner_{inner}_new = inner_{inner}_old + val * weight",
-                                 f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent2}if is_inner_last:",
-                                 f"{indent3}tl.store({inner_ptr}, 0.0, mask=mask)",
-                                 f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
-                                 f"{indent3}val_for_{inner} = inner_{inner}_new / (weight_{inner}_new)",
-                                 f"{indent2}else:",
-                                 f"{indent3}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
-                                 f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
-                             ])
-                        elif inner == 'sum':
-                             kernel_code_lines.extend([
-                                 f"{indent2}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
-                                 f"{indent2}inner_{inner}_new = inner_{inner}_old + val * weight",
-                                 f"{indent2}if is_inner_last:",
-                                 f"{indent3}tl.store({inner_ptr}, 0.0, mask=mask)",
-                                 f"{indent3}val_for_{inner} = inner_{inner}_new",
-                                 f"{indent2}else:",
-                                 f"{indent3}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
-                             ])
-                        elif inner == 'max':
-                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
-                             kernel_code_lines.extend([
-                                 f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
-                                 f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent2}if is_inner_first and macro_step_index==0:",
-                                 f"{indent3}inner_{inner}_new = val",
-                                 f"{indent2}else:",
-                                 f"{indent3}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
-                                 f"{indent3}inner_{inner}_new = hydroforge_maximum(inner_{inner}_old, val)",
-                                 f"{indent2}if is_inner_last:",
-                                 f"{indent3}tl.store({inner_ptr}, -float('inf'), mask=mask)",
-                                 f"{indent3}val_for_{inner} = inner_{inner}_new",
-                                 f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
-                                 f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
-                                 f"{indent2}else:",
-                                 f"{indent3}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
-                                 f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
-                             ])
-                        elif inner == 'min':
-                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
-                             kernel_code_lines.extend([
-                                 f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
-                                 f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent2}if is_inner_first and macro_step_index==0:",
-                                 f"{indent3}inner_{inner}_new = val",
-                                 f"{indent2}else:",
-                                 f"{indent3}inner_{inner}_old = tl.load({inner_ptr}, mask=mask, other=val)",
-                                 f"{indent3}inner_{inner}_new = hydroforge_minimum(inner_{inner}_old, val)",
-                                 f"{indent2}if is_inner_last:",
-                                 f"{indent3}tl.store({inner_ptr}, float('inf'), mask=mask)",
-                                 f"{indent3}val_for_{inner} = inner_{inner}_new",
-                                 f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
-                                 f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
-                                 f"{indent2}else:",
-                                 f"{indent3}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
-                                 f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
-                             ])
-                        elif inner == 'first':
-                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
-                             kernel_code_lines.extend([
-                                 f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
-                                 f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent2}val_stored = tl.load({inner_ptr}, mask=mask, other=0.0)",
-                                 f"{indent2}if weight_{inner}_old == 0.0:",
-                                 f"{indent3}inner_{inner}_new = val",
-                                 f"{indent2}else:",
-                                 f"{indent3}inner_{inner}_new = val_stored",
-                                 f"{indent2}if is_inner_last:",
-                                 f"{indent3}val_for_{inner} = inner_{inner}_new",
-                                 f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
-                                 f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
-                                 f"{indent3}tl.store({inner_ptr}, 0.0, mask=mask)",
-                                 f"{indent2}else:",
-                                 f"{indent3}tl.store({inner_ptr}, inner_{inner}_new, mask=mask)",
-                                 f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
-                             ])
-                        elif inner == 'last':
-                             weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + {out_offset}"
-                             kernel_code_lines.extend([
-                                 f"{indent2}weight_{inner}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
-                                 f"{indent2}weight_{inner}_new = weight_{inner}_old + weight",
-                                 f"{indent2}if is_inner_last:",
-                                 f"{indent3}val_for_{inner} = val",
-                                 f"{indent3}val_weight_for_{inner} = weight_{inner}_new",
-                                 f"{indent3}tl.store({weight_ptr}, 0.0, mask=mask)",
-                                 f"{indent2}else:",
-                                 f"{indent3}tl.store({weight_ptr}, weight_{inner}_new, mask=mask)",
-                             ])
                     for operation in self._statistics_lowering.operations(var):
                         op = operation.spelling
                         out_ptr = f"{safe_var}_{op}_ptr + {out_offset}"
-                        if operation.compound:
-                            outer = operation.outer.value
-                            inner = operation.inner.value
-                            k_val = operation.k
-
-                            val_var = f"val_for_{inner}"
-                            kernel_code_lines.append(f"{indent2}if is_inner_last:")
-
-                            if outer == 'max':
-                                # argmax pointer (automatically created alongside max)
-                                argmax_ptr = f"{safe_var}_arg{op}_ptr + {out_offset}"
-                                if k_val == 1:
-                                    kernel_code_lines.extend([
-                                        f"{indent3}if is_outer_first and macro_step_index==0:",
-                                        f"{indent4}tl.store({out_ptr}, {val_var}, mask=mask)",
-                                        f"{indent4}tl.store({argmax_ptr}, macro_step_index, mask=mask)",
-                                        f"{indent3}else:",
-                                        f"{indent4}old = tl.load({out_ptr}, mask=mask, other={val_var})",
-                                        f"{indent4}cond_mask = {val_var} > old",
-                                        f"{indent4}new = hydroforge_maximum(old, {val_var})",
-                                        f"{indent4}tl.store({out_ptr}, new, mask=mask)",
-                                        f"{indent4}tl.store({argmax_ptr}, macro_step_index, mask=mask & cond_mask)",
-                                    ])
-                                else:
-                                    # Bubble Insert Max K with ArgMax
-                                    argmax_op = f"arg{op}"
-                                    kernel_code_lines.extend([
-                                        f"{indent3}# Bubble Insert Max K={k_val} with ArgMax (static_range optimized)",
-                                        f"{indent3}new_val = {val_var}",
-                                        f"{indent3}new_idx = tl.full([BLOCK_SIZE], macro_step_index, tl.int32)",
-                                        f"{indent3}k_offset = ({out_offset}) * {k_val}",
-                                        f"{indent3}base_ptr = {safe_var}_{op}_ptr + k_offset",
-                                        f"{indent3}idx_base_ptr = {safe_var}_{argmax_op}_ptr + k_offset",
-
-                                        f"{indent3}if is_outer_first and macro_step_index==0:",
-                                        f"{indent4}tl.store(base_ptr, new_val, mask=mask)",
-                                        f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
-                                        f"{indent4}for k in tl.static_range(1, {k_val}):",
-                                        f"{indent5}tl.store(base_ptr + k, -float('inf'), mask=mask)",
-                                        f"{indent5}tl.store(idx_base_ptr + k, 0, mask=mask)",
-                                        f"{indent3}else:",
-                                        f"{indent4}for k in tl.static_range({k_val}):",
-                                        f"{indent5}old_k = tl.load(base_ptr + k, mask=mask, other=-float('inf'))",
-                                        f"{indent5}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)",
-                                        f"{indent5}swap_mask = new_val > old_k",
-                                        f"{indent5}val_to_store = tl.where(swap_mask, new_val, old_k)",
-                                        f"{indent5}idx_to_store = tl.where(swap_mask, new_idx, old_idx_k)",
-                                        f"{indent5}new_val = tl.where(swap_mask, old_k, new_val)",
-                                        f"{indent5}new_idx = tl.where(swap_mask, old_idx_k, new_idx)",
-                                        f"{indent5}tl.store(base_ptr + k, val_to_store, mask=mask)",
-                                        f"{indent5}tl.store(idx_base_ptr + k, idx_to_store, mask=mask)",
-                                    ])
-
-                            elif outer == 'min':
-                                # argmin pointer (automatically created alongside min)
-                                argmin_ptr = f"{safe_var}_arg{op}_ptr + {out_offset}"
-                                if k_val == 1:
-                                    kernel_code_lines.extend([
-                                        f"{indent3}if is_outer_first and macro_step_index==0:",
-                                        f"{indent4}tl.store({out_ptr}, {val_var}, mask=mask)",
-                                        f"{indent4}tl.store({argmin_ptr}, macro_step_index, mask=mask)",
-                                        f"{indent3}else:",
-                                        f"{indent4}old = tl.load({out_ptr}, mask=mask, other={val_var})",
-                                        f"{indent4}cond_mask = {val_var} < old",
-                                        f"{indent4}new = hydroforge_minimum(old, {val_var})",
-                                        f"{indent4}tl.store({out_ptr}, new, mask=mask)",
-                                        f"{indent4}tl.store({argmin_ptr}, macro_step_index, mask=mask & cond_mask)",
-                                    ])
-                                else:
-                                    # Min K with ArgMin
-                                    argmin_op = f"arg{op}"
-                                    kernel_code_lines.extend([
-                                        f"{indent3}# Bubble Insert Min K={k_val} with ArgMin (static_range optimized)",
-                                        f"{indent3}new_val = {val_var}",
-                                        f"{indent3}new_idx = tl.full([BLOCK_SIZE], macro_step_index, tl.int32)",
-                                        f"{indent3}k_offset = ({out_offset}) * {k_val}",
-                                        f"{indent3}base_ptr = {safe_var}_{op}_ptr + k_offset",
-                                        f"{indent3}idx_base_ptr = {safe_var}_{argmin_op}_ptr + k_offset",
-
-                                        f"{indent3}if is_outer_first and macro_step_index==0:",
-                                        f"{indent4}tl.store(base_ptr, new_val, mask=mask)",
-                                        f"{indent4}tl.store(idx_base_ptr, new_idx, mask=mask)",
-                                        f"{indent4}for k in tl.static_range(1, {k_val}):",
-                                        f"{indent5}tl.store(base_ptr + k, float('inf'), mask=mask)",
-                                        f"{indent5}tl.store(idx_base_ptr + k, 0, mask=mask)",
-                                        f"{indent3}else:",
-                                        f"{indent4}for k in tl.static_range({k_val}):",
-                                        f"{indent5}old_k = tl.load(base_ptr + k, mask=mask, other=float('inf'))",
-                                        f"{indent5}old_idx_k = tl.load(idx_base_ptr + k, mask=mask, other=0)",
-                                        f"{indent5}swap_mask = new_val < old_k",
-                                        f"{indent5}val_to_store = tl.where(swap_mask, new_val, old_k)",
-                                        f"{indent5}idx_to_store = tl.where(swap_mask, new_idx, old_idx_k)",
-                                        f"{indent5}new_val = tl.where(swap_mask, old_k, new_val)",
-                                        f"{indent5}new_idx = tl.where(swap_mask, old_idx_k, new_idx)",
-                                        f"{indent5}tl.store(base_ptr + k, val_to_store, mask=mask)",
-                                        f"{indent5}tl.store(idx_base_ptr + k, idx_to_store, mask=mask)",
-                                    ])
-                            elif outer == 'sum':
-                                kernel_code_lines.extend([
-                                    f"{indent3}if is_outer_first and macro_step_index==0:",
-                                    f"{indent4}tl.store({out_ptr}, {val_var}, mask=mask)",
-                                    f"{indent3}else:",
-                                    f"{indent4}old = tl.load({out_ptr}, mask=mask, other=0.0)",
-                                    f"{indent4}tl.store({out_ptr}, old + {val_var}, mask=mask)",
-                                ])
-                            elif outer == 'mean':
-                                term = f"{val_var}"
-                                kernel_code_lines.extend([
-                                    f"{indent3}if is_outer_first and macro_step_index==0:",
-                                    f"{indent4}tl.store({out_ptr}, {term}, mask=mask)",
-                                    f"{indent3}else:",
-                                    f"{indent4}old = tl.load({out_ptr}, mask=mask, other=0.0)",
-                                    f"{indent4}tl.store({out_ptr}, old + {term}, mask=mask)",
-                                    f"{indent3}if is_outer_last:",
-                                    f"{indent4}chk = tl.load({out_ptr}, mask=mask)",
-                                    f"{indent4}tl.store({out_ptr}, chk / num_macro_steps, mask=mask)",
-                                ])
-                            continue
-
-                        if op == 'mean':
+                        if operation.output is Reduction.MEAN:
+                            weight_ptr = (
+                                f"{safe_var}_mean_sample_weight_state_ptr + "
+                                f"{out_offset}"
+                            )
                             kernel_code_lines.extend([
                                 f"{indent2}if is_inner_first:",
                                 f"{indent3}old = tl.zeros_like(val)",
+                                f"{indent3}old_weight = tl.zeros_like(val)",
                                 f"{indent2}else:",
                                 f"{indent3}old = tl.load({out_ptr}, mask=mask, other=0.0)",
-                                f"{indent2}new = old + val * weight",
-                                f"{indent2}if is_inner_last:",
-                                f"{indent3}new = new / total_weight",
+                                f"{indent3}old_weight = tl.load({weight_ptr}, mask=mask, other=0.0)",
+                                f"{indent2}new_weight = old_weight + weight",
+                                f"{indent2}new = hydroforge_weighted_mean(old, old_weight, val, weight)",
                                 f"{indent2}tl.store({out_ptr}, new, mask=mask)",
+                                f"{indent2}tl.store({weight_ptr}, tl.where(is_inner_last, 0.0, new_weight), mask=mask)",
                             ])
-                        elif op == 'sum':
+                        elif operation.output is Reduction.SUM:
                             kernel_code_lines.extend([
                                 f"{indent2}if is_inner_first:",
                                 f"{indent3}old = tl.zeros_like(val)",
@@ -1427,7 +1226,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                 f"{indent2}new = old + val * weight",
                                 f"{indent2}tl.store({out_ptr}, new, mask=mask)",
                             ])
-                        elif op == 'max':
+                        elif operation.output is Reduction.MAX:
                             kernel_code_lines.extend([
                                 f"{indent2}if is_inner_first:",
                                 f"{indent3}tl.store({out_ptr}, val, mask=mask)",
@@ -1436,7 +1235,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                 f"{indent3}new = hydroforge_maximum(old, val)",
                                 f"{indent3}tl.store({out_ptr}, new, mask=mask)",
                             ])
-                        elif op == 'min':
+                        elif operation.output is Reduction.MIN:
                             kernel_code_lines.extend([
                                 f"{indent2}if is_inner_first:",
                                 f"{indent3}tl.store({out_ptr}, val, mask=mask)",
@@ -1445,33 +1244,12 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                 f"{indent3}new = hydroforge_minimum(old, val)",
                                 f"{indent3}tl.store({out_ptr}, new, mask=mask)",
                             ])
-                        elif op == 'argmax':
-                            # 2D argmax logic
-                            max_ptr = f"{safe_var}_max_ptr + {out_offset}"
-                            kernel_code_lines.extend([
-                                f"{indent2}if is_inner_first:",
-                                f"{indent3}tl.store({out_ptr}, macro_step_index, mask=mask)",
-                                f"{indent2}else:",
-                                f"{indent3}curr_max = tl.load({max_ptr}, mask=mask, other=val)",
-                                f"{indent3}cond_mask = val > curr_max",
-                                f"{indent3}tl.store({out_ptr}, macro_step_index, mask=mask & cond_mask)",
-                            ])
-                        elif op == 'argmin':
-                            min_ptr = f"{safe_var}_min_ptr + {out_offset}"
-                            kernel_code_lines.extend([
-                                f"{indent2}if is_inner_first:",
-                                f"{indent3}tl.store({out_ptr}, macro_step_index, mask=mask)",
-                                f"{indent2}else:",
-                                f"{indent3}curr_min = tl.load({min_ptr}, mask=mask, other=val)",
-                                f"{indent3}cond_mask = val < curr_min",
-                                f"{indent3}tl.store({out_ptr}, macro_step_index, mask=mask & cond_mask)",
-                            ])
-                        elif op == 'last':
+                        elif operation.output is Reduction.LAST:
                             kernel_code_lines.extend([
                                 f"{indent2}if is_inner_last:",
                                 f"{indent3}tl.store({out_ptr}, val, mask=mask)",
                             ])
-                        elif op == 'first':
+                        elif operation.output is Reduction.FIRST:
                             kernel_code_lines.extend([
                                 f"{indent2}if is_inner_first:",
                                 f"{indent3}tl.store({out_ptr}, val, mask=mask)",
@@ -1503,9 +1281,8 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                                 dependency: emit_last_value(dependency)
                                 for dependency in source.expression.dependencies
                             }
-                            expression = render_expression(
-                                source.expression, ExpressionDialect.TRITON,
-                                names,
+                            expression = self._triton_expression(
+                                v_name, source.expression, names,
                             )
                             kernel_code_lines.append(
                                 f"{indent3}{safe_name}_val = {expression}"
@@ -1568,6 +1345,14 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             operations = self._statistics_lowering.operations(var)
             for operation in operations:
                 kernel_code_lines.append(f"    {safe_var}_{operation.spelling}_ptr,")
+            if any(
+                operation.inner is None
+                and operation.outer.value == "mean"
+                for operation in operations
+            ):
+                kernel_code_lines.append(
+                    f"    {safe_var}_mean_sample_weight_state_ptr,"
+                )
             added_inner = set()
             for operation in operations:
                 if operation.inner is None:
@@ -1601,7 +1386,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             "    sub_step = tl.load(__hf_sub_step_ptr).to(tl.int32)",
             "    num_sub_steps = tl.load(__hf_num_sub_steps_ptr).to(tl.int32)",
             "    flags = tl.load(__hf_flags_ptr).to(tl.int32)",
-            "    macro_step_index = tl.load(__hf_macro_step_index_ptr).to(tl.int32)",
+            "    macro_step_index = tl.load(__hf_macro_step_index_ptr).to(tl.int64)",
             "    is_inner_first = ((flags & 1) != 0) & (sub_step == 0)",
             "    is_inner_last = (((flags >> 1) & 1) != 0) & (sub_step == num_sub_steps - 1)",
             "    is_outer_first = (((flags >> 2) & 1) != 0) & is_inner_last",
@@ -1646,8 +1431,8 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         dependency: emit_full_value(dependency)
                         for dependency in source.expression.dependencies
                     }
-                    expression = render_expression(
-                        source.expression, ExpressionDialect.TRITON, names,
+                    expression = self._triton_expression(
+                        name, source.expression, names,
                     )
                     kernel_code_lines.append(
                         f"{indent}{safe_name}_val = {expression}"
@@ -1670,9 +1455,9 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     kernel_code_lines.extend([
                         f"{indent}inner_{inner}_old = tl.load({inner_ptr}, mask=var_mask, other=0.0)",
                         f"{indent}weight_{inner}_old = tl.load({weight_ptr}, mask=var_mask, other=0.0)",
-                        f"{indent}inner_{inner}_new = inner_{inner}_old + {safe_var}_val * weight",
                         f"{indent}weight_{inner}_new = weight_{inner}_old + weight",
-                        f"{indent}{val_for} = inner_{inner}_new / weight_{inner}_new",
+                        f"{indent}inner_{inner}_new = hydroforge_weighted_mean(inner_{inner}_old, weight_{inner}_old, {safe_var}_val, weight)",
+                        f"{indent}{val_for} = inner_{inner}_new",
                         f"{indent}if is_inner_last:",
                         f"{indent2}tl.store({inner_ptr}, 0.0, mask=var_mask)",
                         f"{indent2}tl.store({weight_ptr}, 0.0, mask=var_mask)",
@@ -1711,10 +1496,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         f"{indent2}tl.store({inner_ptr}, {safe_var}_val, mask=var_mask)",
                         f"{indent}{val_for} = tl.load({inner_ptr}, mask=var_mask, other=0.0)",
                     ])
-                else:
-                    raise ValueError(
-                        f"Unsupported full-output inner op '{inner}'."
-                    )
 
             for operation in self._statistics_lowering.operations(var):
                 op = operation.spelling
@@ -1750,25 +1531,30 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     elif outer == "mean":
                         kernel_code_lines.extend([
                             f"{indent2}old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
-                            f"{indent2}accum = tl.where(is_outer_first, {val_for}, old + {val_for})",
-                            f"{indent2}new = tl.where(is_outer_last, accum / num_macro_steps, accum)",
+                            f"{indent2}count = num_macro_steps.to({val_for}.dtype)",
+                            f"{indent2}new = tl.where(is_outer_first, {val_for}, hydroforge_weighted_mean(old, count - 1.0, {val_for}, 1.0))",
                             f"{indent2}tl.store({out_ptr}, new, mask=var_mask)",
                         ])
                     elif outer == "last":
                         kernel_code_lines.append(f"{indent2}tl.store({out_ptr}, {val_for}, mask=var_mask)")
                     elif outer == "first":
                         kernel_code_lines.append(f"{indent2}tl.store({out_ptr}, {val_for}, mask=var_mask & is_outer_first)")
-                    else:
-                        raise ValueError(f"Unsupported full-output outer op '{outer}'.")
                     kernel_code_lines.append("")
                     continue
 
                 if op == "mean":
+                    weight_ptr = (
+                        f"{safe_var}_mean_sample_weight_state_ptr + offs"
+                    )
                     kernel_code_lines.extend([
                         f"{indent}old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
-                        f"{indent}accum = tl.where(is_inner_first, 0.0, old) + {safe_var}_val * weight",
-                        f"{indent}new = tl.where(is_inner_last, accum / total_weight, accum)",
+                        f"{indent}old_weight = tl.load({weight_ptr}, mask=var_mask, other=0.0)",
+                        f"{indent}old = tl.where(is_inner_first, 0.0, old)",
+                        f"{indent}old_weight = tl.where(is_inner_first, 0.0, old_weight)",
+                        f"{indent}new_weight = old_weight + weight",
+                        f"{indent}new = hydroforge_weighted_mean(old, old_weight, {safe_var}_val, weight)",
                         f"{indent}tl.store({out_ptr}, new, mask=var_mask)",
+                        f"{indent}tl.store({weight_ptr}, tl.where(is_inner_last, 0.0, new_weight), mask=var_mask)",
                     ])
                 elif op == "sum":
                     kernel_code_lines.extend([
@@ -1792,8 +1578,6 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     kernel_code_lines.append(f"{indent}tl.store({out_ptr}, {safe_var}_val, mask=var_mask & is_inner_last)")
                 elif op == "first":
                     kernel_code_lines.append(f"{indent}tl.store({out_ptr}, {safe_var}_val, mask=var_mask & is_inner_first)")
-                else:
-                    raise ValueError(f"Unsupported full-output op '{op}'.")
                 kernel_code_lines.append("")
         kernel_code_lines.append("")
 
@@ -1911,6 +1695,15 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     for operation in operations:
                         op = operation.spelling
                         kernel_code_lines.append(f"        {safe_var}_{op}_ptr=states['{var}_{op}'],")
+                    if any(
+                        operation.inner is None
+                        and operation.outer.value == "mean"
+                        for operation in operations
+                    ):
+                        kernel_code_lines.append(
+                            f"        {safe_var}_mean_sample_weight_state_ptr="
+                            f"states['{var}_mean_sample_weight_state'],"
+                        )
                     added_inner = set()
                     for operation in operations:
                         if operation.inner is None:
@@ -1966,7 +1759,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             for var in sorted_inputs:
                  safe_var = self._get_safe_name(var)
                  # Avoid duplicate argument if output_index matches input var
-                 if safe_var == output_index:
+                 if var == output_index:
                      continue
                  kernel_code_lines.append(f"        {safe_var}_ptr=states['{var}'],")
 
@@ -1986,6 +1779,16 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                             f"        {safe_var}_{op}_aux_ptr="
                             f"states['{aux_storage_key}'],"
                         )
+
+                if any(
+                    operation.inner is None
+                    and operation.outer.value == "mean"
+                    for operation in operations
+                ):
+                    kernel_code_lines.append(
+                        f"        {safe_var}_mean_sample_weight_state_ptr="
+                        f"states['{var}_mean_sample_weight_state'],"
+                    )
 
                 # Inner state pointers (only for ops that need cross-step state)
                 added_inner = set()

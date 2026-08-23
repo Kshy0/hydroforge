@@ -4,11 +4,32 @@ from __future__ import annotations
 import sys
 from typing import TYPE_CHECKING, Any, Iterator
 
+from pydantic import PrivateAttr, model_validator
+
+from hydroforge.contracts.validation import HydroForgeModel
+
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
 
 
 _MISSING = object()
+
+
+class _OuterScopeRequest(HydroForgeModel):
+    specialization: Any = None
+
+    _key: Any = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _validate_specialization(self):
+        from hydroforge.execution.substeps import _specialization_key
+
+        self._key = _specialization_key(self.specialization)
+        return self
+
+    @property
+    def specialization_key(self) -> Any:
+        return self._key
 
 
 class _OuterProgram:
@@ -23,7 +44,6 @@ class _OuterProgram:
             self.operators.prepare_metal(self.capture)
 
     def launch(self) -> None:
-        self.operators.require_stable_bindings()
         if (
             self.capture_mode == "cuda_graph"
             and self.operators.cuda_graph_capture_safe
@@ -57,7 +77,10 @@ class _OnceScope:
     def __iter__(self) -> Iterator[None]:
         from hydroforge.execution.operators import record_operator_scope
 
-        programs = self.runtime.model._execution.programs
+        execution = self.runtime.model._execution
+        step = self.runtime.step
+        step.begin_outer_scope_execution()
+        programs = execution.programs
         program = programs.get(self.key, _MISSING)
         if program is _MISSING:
             with record_operator_scope(
@@ -66,48 +89,23 @@ class _OnceScope:
                 yield None
             program = _OuterProgram(self.runtime.model, recording.program)
             programs[self.key] = program
-        elif not isinstance(program, _OuterProgram):
-            raise RuntimeError("cached outer operator program has the wrong kind")
         program.launch()
+        step.complete_outer_scope_execution()
 
 
 class OuterRuntime:
     """Declare cached once-per-outer-step operator sequences."""
 
-    def __init__(self, model: AbstractModel) -> None:
+    def __init__(self, model: Any, step: Any) -> None:
         self.model = model
+        self.step = step
 
     def once(self, *, specialization: Any = None) -> _OnceScope:
-        from hydroforge.execution.substeps import _specialization_key
-
-        step = self.model._execution.active_step
-        if step is None:
-            raise RuntimeError("outer operator scopes require @managed_step")
+        request = _OuterScopeRequest(specialization=specialization)
         caller = sys._getframe(1)
         lexical_site = (caller.f_code, caller.f_lasti)
-        key = step.claim_outer_scope(
+        key = self.step.claim_outer_scope(
             site=lexical_site,
-            specialization=_specialization_key(specialization),
-        )
-        return _OnceScope(self, key=key)
-
-    def cached(self, *, name: str, specialization: Any = None) -> _OnceScope:
-        """Return a named program that may be replayed repeatedly in one step.
-
-        This is intended for transactional algorithms that inspect a device
-        result on the host, restore state, and replay the same compiled pass
-        with another explicit specialization.
-        """
-
-        from hydroforge.execution.substeps import _specialization_key
-
-        if not isinstance(name, str) or not name:
-            raise ValueError("cached outer program name must be a non-empty string")
-        step = self.model._execution.active_step
-        if step is None:
-            raise RuntimeError("cached outer programs require @managed_step")
-        key = (
-            step.program_owner, "outer_cached", name,
-            _specialization_key(specialization),
+            specialization=request.specialization_key,
         )
         return _OnceScope(self, key=key)

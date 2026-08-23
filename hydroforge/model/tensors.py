@@ -2,14 +2,74 @@
 
 from __future__ import annotations
 
+import inspect
 from numbers import Integral
 from typing import Any, get_args
 
 import torch
+from pydantic_core import PydanticUndefined
 
 from hydroforge.contracts.fields import (
-    cast_declared_tensor, concrete_tensor_dtype, tensor_is_active,
+    concrete_tensor_dtype, tensor_is_active,
 )
+
+
+class _ModulePayload:
+    """Attribute view used only while a Pydantic before-validator completes input.
+
+    This is deliberately not a partially constructed ``AbstractModule``.  It
+    exposes the raw field mapping, already validated sibling modules and class
+    descriptors needed to evaluate declared symbolic dimensions.  The
+    completed mapping is then passed to Pydantic for the one real module
+    construction.
+    """
+
+    def __init__(
+        self,
+        module_type: type,
+        payload: dict[str, Any],
+        module_references: dict[str, Any],
+    ) -> None:
+        object.__setattr__(self, "_module_type", module_type)
+        object.__setattr__(self, "_model_fields_set", frozenset(payload))
+        object.__setattr__(self, "_reference_values", {
+            name: module_references.get(descriptor.module_name)
+            for name, descriptor in
+            module_type._module_reference_fields().items()
+        })
+        for name, field in module_type.model_fields.items():
+            if name in payload:
+                value = payload[name]
+            else:
+                value = field.get_default(call_default_factory=True)
+                if value is PydanticUndefined:
+                    continue
+            object.__setattr__(self, name, value)
+
+    @property
+    def model_fields_set(self) -> frozenset[str]:
+        return self._model_fields_set
+
+    def __getattr__(self, name: str) -> Any:
+        references = self._reference_values
+        if name in references:
+            return references[name]
+        module_type = self._module_type
+        try:
+            descriptor = inspect.getattr_static(module_type, name)
+        except AttributeError as error:
+            raise AttributeError(name) from error
+        if hasattr(descriptor, "__get__"):
+            return descriptor.__get__(self, module_type)
+        return descriptor
+
+    def completed(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name)
+            for name in self._module_type.model_fields
+            if hasattr(self, name)
+        }
+
 
 class ModuleTensors:
     """Materialize and validate a module's declared tensor schema once."""
@@ -18,12 +78,26 @@ class ModuleTensors:
         self.module = module
         self.expanded_parameters: set[str] = set()
 
-    def initialize_declared(self) -> None:
-        """Normalize only supplied/default fields during module construction."""
+    @classmethod
+    def prepare_payload(
+        cls,
+        module_type: type,
+        payload: dict[str, Any],
+        *,
+        module_references: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Complete scalar tensor defaults inside Pydantic validation."""
 
-        self._deactivate_declared()
-        self._normalize_declared()
-        self._initialize_optional()
+        view = _ModulePayload(module_type, payload, module_references)
+        tensors = cls(view)
+        tensors._deactivate_declared()
+        tensors._initialize_optional()
+        return view.completed()
+
+    def initialize_declared(self) -> None:
+        """Validate the complete tensor payload supplied to Pydantic."""
+
+        self._validate_declared()
 
     def materialize_computed(self) -> None:
         """Materialize non-virtual computed tensors after module linking."""
@@ -33,7 +107,7 @@ class ModuleTensors:
             if (
                 not field.computed
                 or field.tensor.category == "virtual"
-                or not module.is_tensor_field_active(field)
+                or not module._is_tensor_field_active(field)
             ):
                 continue
             self._validate_computed_field(
@@ -41,13 +115,13 @@ class ModuleTensors:
             )
         # Derived reference indices are descriptors rather than Pydantic
         # computed fields, but belong to the same stable cold-start phase.
-        for name in module.get_reference_index_fields():
+        for name in module._reference_index_fields():
             getattr(module, name)
 
     def _deactivate_declared(self) -> None:
         module = self.module
         for field in module.tensor_schema():
-            if field.computed or module.is_tensor_field_active(field):
+            if field.computed or module._is_tensor_field_active(field):
                 continue
             if field.name in module.model_fields_set:
                 required = ", ".join(field.tensor.depends_on)
@@ -62,11 +136,11 @@ class ModuleTensors:
                     f"Inactive field {module.module_name}.{field.name} was "
                     f"supplied explicitly; open its dependencies: {dependencies}"
                 )
-            setattr(module, field.name, None)
+            object.__setattr__(module, field.name, None)
 
     def expected_shape(self, field_name: str) -> tuple[int, ...] | None:
         module = self.module
-        schema = module.tensor_schema_map().get(field_name)
+        schema = module._tensor_schema_map().get(field_name)
         if schema is None:
             raise ValueError(f"Field {field_name} is not a tensor field")
         if not tensor_is_active(schema.tensor, module.opened_modules):
@@ -95,7 +169,7 @@ class ModuleTensors:
         shape = tuple(values[dimension] for dimension in schema.tensor.shape)
         for dimension, size in zip(schema.tensor.shape, shape, strict=True):
             if isinstance(size, bool) or not isinstance(size, Integral):
-                raise TypeError(
+                raise ValueError(
                     f"Dimension '{dimension}' used by field '{field_name}' must "
                     f"be an integer, got {type(size).__name__}"
                 )
@@ -119,7 +193,7 @@ class ModuleTensors:
 
     def expected_dtype(self, field_name: str) -> torch.dtype:
         module = self.module
-        schema = module.get_tensor_schema(field_name)
+        schema = module._get_tensor_schema(field_name)
         if schema is None:
             raise ValueError(f"Field {field_name} is not a tensor field")
         return concrete_tensor_dtype(
@@ -132,7 +206,7 @@ class ModuleTensors:
             if (
                 schema.computed
                 or schema.name in module.model_fields_set
-                or not module.is_tensor_field_active(schema)
+                or not module._is_tensor_field_active(schema)
             ):
                 continue
             shape = self.expected_shape(schema.name)
@@ -147,25 +221,19 @@ class ModuleTensors:
                     device=module.device,
                 )
             else:
-                raise TypeError(
+                raise ValueError(
                     f"Unsupported default type for {schema.name}: {type(value)}"
                 )
-            setattr(module, schema.name, tensor)
+            object.__setattr__(module, schema.name, tensor)
 
-    def _normalize_declared(self) -> None:
+    def _validate_declared(self) -> None:
+        """Assert the input-boundary contract without repairing tensors."""
+
         module = self.module
-        conversions: dict[str, list[str]] = {}
         fields = tuple(
             field for field in module.tensor_schema()
-            if not field.computed and module.is_tensor_field_active(field)
+            if not field.computed and module._is_tensor_field_active(field)
         )
-        # Shape expressions can depend on topology tensors, so place every
-        # supplied tensor before evaluating any expected shape.
-        for field in fields:
-            tensor = getattr(module, field.name, None)
-            if isinstance(tensor, torch.Tensor) and not self._on_device(tensor):
-                setattr(module, field.name, tensor.to(module.device))
-
         for field in fields:
             name = field.name
             tensor = getattr(module, name, None)
@@ -175,19 +243,22 @@ class ModuleTensors:
             if expected is not None and tuple(tensor.shape) != expected:
                 tensor = self._resolve_batch_shape(field, tensor, expected)
             if not tensor.is_contiguous():
-                tensor = tensor.contiguous()
+                raise ValueError(
+                    f"Input field {module.module_name}.{name} must be "
+                    "contiguous before module construction"
+                )
             if not self._on_device(tensor):
-                tensor = tensor.to(module.device)
+                raise ValueError(
+                    f"Input field {module.module_name}.{name} must already be "
+                    f"on device {module.device}, got {tensor.device}"
+                )
             dtype = self.expected_dtype(name)
             if tensor.dtype != dtype:
-                conversion = f"{tensor.dtype} -> {dtype}"
-                conversions.setdefault(conversion, []).append(name)
-                tensor = cast_declared_tensor(
-                    tensor, dtype, name=f"{module.module_name}.{name}",
+                raise ValueError(
+                    f"Input field {module.module_name}.{name} must already use "
+                    f"dtype {dtype}, got {tensor.dtype}"
                 )
             self._validate_key(field, tensor)
-            setattr(module, name, tensor)
-        self._emit_conversions("module.dtype_fixed", conversions)
 
     def _resolve_batch_shape(
         self, field: Any, tensor: torch.Tensor, expected: tuple[int, ...],
@@ -195,12 +266,6 @@ class ModuleTensors:
         module = self.module
         name = field.name
         category = field.tensor.category
-        if (
-            category in {"state", "init_state"}
-            and module.num_trials is not None
-            and tuple(tensor.shape) == expected[1:]
-        ):
-            return tensor.unsqueeze(0).expand(expected).clone()
         if (
             category in {"param", "derived_param"}
             and module.num_trials is not None
@@ -239,16 +304,12 @@ class ModuleTensors:
         self, field_name: str, value: Any,
     ) -> None:
         module = self.module
-        field = module.tensor_schema_map().get(field_name)
-        if field is None or not field.computed:
-            raise RuntimeError(
-                f"{module.module_name}.{field_name} is not a computed tensor field"
-            )
+        field = module._tensor_schema_map()[field_name]
         return_type = type(module).model_computed_fields[field_name].return_type
         if value is None and type(None) in get_args(return_type):
             return
         if not isinstance(value, torch.Tensor):
-            raise TypeError(
+            raise ValueError(
                 f"Computed field {field.name} must be a torch.Tensor, got "
                 f"{type(value).__name__}"
             )
@@ -259,7 +320,10 @@ class ModuleTensors:
                 f"{module.device}, but is on {tensor.device}"
             )
         if not tensor.is_contiguous():
-            tensor = tensor.contiguous()
+            raise ValueError(
+                f"Computed field {field.name} must be contiguous; computed "
+                "fields are never repaired implicitly"
+            )
         expected = self.expected_shape(field.name)
         if expected is not None and tuple(tensor.shape) != expected:
             if (
@@ -275,16 +339,10 @@ class ModuleTensors:
                 )
         dtype = self.expected_dtype(field.name)
         if tensor.dtype != dtype:
-            conversion = f"{tensor.dtype} -> {dtype}"
-            tensor = cast_declared_tensor(
-                tensor, dtype,
-                name=f"{module.module_name}.{field.name}",
+            raise ValueError(
+                f"Computed field {module.module_name}.{field.name} must use "
+                f"dtype {dtype}, got {tensor.dtype}"
             )
-            self._emit_conversions(
-                "module.computed_dtype_fixed",
-                {conversion: [field.name]},
-            )
-        setattr(module, field.name, tensor)
 
     def _on_device(self, tensor: torch.Tensor) -> bool:
         expected = self.module.device
@@ -297,22 +355,12 @@ class ModuleTensors:
             )
         )
 
-    def _emit_conversions(
-        self, event: str, conversions: dict[str, list[str]],
-    ) -> None:
-        for conversion, fields in conversions.items():
-            self.module._emit(
-                "info", event, "Normalized module field dtypes",
-                module=self.module.module_name, fields=fields,
-                conversion=conversion,
-            )
-
     def apply_modes(self) -> None:
         module = self.module
         for field in module.tensor_schema():
             if (
                 field.computed
-                or not module.is_tensor_field_active(field)
+                or not module._is_tensor_field_active(field)
                 or field.tensor.mode == "device"
             ):
                 continue
@@ -320,6 +368,6 @@ class ModuleTensors:
             if not isinstance(value, torch.Tensor):
                 continue
             if field.tensor.mode == "cpu":
-                setattr(module, field.name, value.cpu())
+                object.__setattr__(module, field.name, value.cpu())
             elif field.tensor.mode == "discard":
-                setattr(module, field.name, None)
+                object.__setattr__(module, field.name, None)

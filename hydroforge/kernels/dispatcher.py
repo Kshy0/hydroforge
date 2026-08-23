@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
-from hydroforge.contracts import (
+from pydantic import PrivateAttr, model_validator
+
+from hydroforge.contracts.kernels import (
     BackendLoweringSpec, BufferDTypeABI, KernelMetadata, KernelSpec,
-    validate_runtime_block_size,
 )
+from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.kernels.context import (
-    active_kernel_spec, native_component_factory, reject_direct_kernel_launch,
+    active_kernel_spec, native_component_factory,
 )
-
-
-def _metadata(callable_: Callable) -> KernelMetadata | None:
-    return getattr(callable_, "__hydroforge_kernel__", None)
 
 
 def _reject_unproven_uint32_runtime_scalars(
@@ -68,25 +66,22 @@ def _validate_triton_float64_scalars(
         )
 
 
-def require_specializer(implementation: Any, *, label: str) -> Callable:
-    """Return one strict backend specializer or reject Python launch fallback."""
+class _SpecializedDispatcher:
+    """Non-callable backend declaration with one trusted specializer."""
 
-    specializer = getattr(implementation, "specialize", None)
-    if not callable(specializer):
-        raise TypeError(
-            f"{label} must implement specialize(); Python launch fallback "
-            "is forbidden"
-        )
-    parameter = inspect.signature(specializer).parameters.get("buffer_dtypes")
-    if (
-        parameter is None
-        or parameter.kind is not inspect.Parameter.KEYWORD_ONLY
-    ):
-        raise TypeError(
-            f"{label} specialize() must accept the keyword-only canonical "
-            "buffer_dtypes ABI"
-        )
-    return specializer
+    def __init__(
+        self, metadata: KernelMetadata, lowering: BackendLoweringSpec,
+        specializer: Callable,
+    ) -> None:
+        self.__hydroforge_kernel__ = metadata
+        self.__hydroforge_lowering__ = lowering
+        self._specializer = specializer
+
+    def specialize(
+        self, arguments: dict[str, Any], *,
+        buffer_dtypes: BufferDTypeABI,
+    ) -> Callable:
+        return self._specializer(arguments, buffer_dtypes=buffer_dtypes)
 
 
 def _torch_compile(fn: Callable) -> Callable:
@@ -124,62 +119,75 @@ class TorchDispatcher:
             )
         if any(
             parameter.kind in {
+                inspect.Parameter.POSITIONAL_ONLY,
                 inspect.Parameter.VAR_POSITIONAL,
                 inspect.Parameter.VAR_KEYWORD,
             }
             for parameter in signature.parameters.values()
         ):
-            raise TypeError(f"{spec.name}: torch kernels may not use *args/**kwargs")
+            raise TypeError(
+                f"{spec.name}: torch kernels must accept canonical arguments "
+                "by keyword and may not use positional-only, *args, or **kwargs"
+            )
         self._kernel = _torch_compile(kernel) if compile else kernel
         self.spec = spec
         self._parameters = frozenset(spec.parameters)
-        self.__hydroforge_kernel__ = spec.metadata
+        self.__hydroforge_kernel__ = spec._canonical_metadata
         self.__hydroforge_lowering__ = BackendLoweringSpec.canonical(
             buffer_elements="tensor",
         )
 
-    def __call__(self, **kwargs: Any):
-        reject_direct_kernel_launch(self.__hydroforge_kernel__.name)
-        supplied = set(kwargs).difference({"BLOCK_SIZE"})
-        if supplied != self._parameters:
-            raise TypeError(
-                "torch kernel ABI mismatch: "
-                f"missing={sorted(self._parameters - supplied)}, "
-                f"extra={sorted(supplied - self._parameters)}"
-            )
-        self.spec.validate_host_arguments(kwargs)
-        return self._kernel(**{
-            name: kwargs[name] for name in self.spec.parameters
-        })
-
     def specialize(
-        self, arguments: dict[str, Any], dynamic: frozenset[str], *,
+        self, arguments: dict[str, Any], *,
         buffer_dtypes: BufferDTypeABI,
     ) -> Callable:
-        """Validate once and return a canonical launch without hot-path ABI work."""
+        """Return a zero-argument launch for an already validated call."""
         del buffer_dtypes
-        supplied = set(arguments).difference({"BLOCK_SIZE"})
-        if supplied != self._parameters:
-            raise TypeError(
-                "torch kernel specialization ABI mismatch: "
-                f"missing={sorted(self._parameters - supplied)}, "
-                f"extra={sorted(supplied - self._parameters)}"
-            )
-        for buffer, feature in self.spec.optional_buffers.items():
-            if buffer in dynamic or (feature is not None and feature in dynamic):
-                raise TypeError(
-                    f"optional Torch ABI ({buffer}, {feature}) must be static"
-                )
-        self.spec.validate_host_arguments(arguments)
         static = {
             name: value for name, value in arguments.items()
-            if name in self._parameters and name not in dynamic
+            if name in self._parameters
         }
 
-        def launch(**values: Any):
-            return self._kernel(**static, **values)
+        def launch():
+            return self._kernel(**static)
 
         return launch
+
+
+class _TorchDispatcherDeclaration(HydroForgeModel):
+    kernel: Callable
+    spec: KernelSpec | None = None
+    compile: bool = True
+
+    _dispatcher: TorchDispatcher = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _build(self):
+        active = active_kernel_spec()
+        if active is not None:
+            if self.spec is not None:
+                raise ValueError(
+                    "Torch factory may not repeat active KernelSpec metadata"
+                )
+            spec = active
+        elif self.spec is None:
+            raise ValueError(
+                "make_torch_dispatcher requires a KernelSpec outside a "
+                "BackendRegistry factory"
+            )
+        else:
+            spec = self.spec
+        try:
+            self._dispatcher = TorchDispatcher(
+                self.kernel, spec, compile=self.compile,
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(str(error)) from error
+        return self
+
+    @property
+    def dispatcher(self) -> TorchDispatcher:
+        return self._dispatcher
 
 
 def make_torch_dispatcher(
@@ -190,150 +198,9 @@ def make_torch_dispatcher(
 ) -> TorchDispatcher:
     """Build a formal Torch backend from the active canonical Spec."""
 
-    active = active_kernel_spec()
-    if active is not None:
-        if spec is not None:
-            raise TypeError(
-                "Torch factory may not repeat active KernelSpec metadata"
-            )
-        spec = active
-    elif spec is None:
-        raise TypeError(
-            "make_torch_dispatcher requires a KernelSpec outside a "
-            "BackendRegistry factory"
-        )
-    return TorchDispatcher(kernel, spec, compile=compile)
-
-
-class VariantDispatcher:
-    """Initialization-specialized shared/batched implementation pair."""
-
-    def __init__(
-        self, shared: Callable, batched: Callable, *, batch_key: str,
-        spec: Any,
-    ) -> None:
-        self.shared = shared
-        self.batched = batched
-        self.batch_key = batch_key
-        shared_metadata = _metadata(shared)
-        batched_metadata = _metadata(batched)
-        if shared_metadata is None or batched_metadata is None:
-            raise TypeError("variant implementations require KernelMetadata")
-        shared_lowering = getattr(shared, "__hydroforge_lowering__", None)
-        batched_lowering = getattr(batched, "__hydroforge_lowering__", None)
-        if shared_lowering is None or batched_lowering is None:
-            raise TypeError("shared/batched variants require lowering strategies")
-        if batch_key not in spec.parameters:
-            raise TypeError(
-                f"variant batch key {batch_key!r} is absent from KernelSpec"
-            )
-        canonical_parameters = set(spec.parameters)
-        batched_parameters = set(batched_metadata.parameters)
-        if batched_parameters != canonical_parameters:
-            raise TypeError(
-                f"{spec.name}: batched variant must consume the complete "
-                "canonical ABI: "
-                f"missing={sorted(canonical_parameters - batched_parameters)}, "
-                f"extra={sorted(batched_parameters - canonical_parameters)}"
-            )
-        if batch_key in shared_metadata.parameters:
-            raise TypeError(
-                f"{spec.name}: shared variant may not consume selection key "
-                f"{batch_key!r}; that key belongs to the batched projection"
-            )
-        expected_shared = canonical_parameters.difference({batch_key})
-        shared_parameters = set(shared_metadata.parameters)
-        if shared_parameters != expected_shared:
-            raise TypeError(
-                f"{spec.name}: shared variant must consume exactly the "
-                "canonical ABI except for its selection key: "
-                f"missing={sorted(expected_shared - shared_parameters)}, "
-                f"extra={sorted(shared_parameters - expected_shared)}"
-            )
-        shared_spec = spec.project(omit=(batch_key,))
-        shared_spec.validate_native(
-            "shared variant", shared_metadata, shared_lowering,
-        )
-        spec.validate_native(
-            "batched variant", batched_metadata, batched_lowering,
-        )
-        self.__hydroforge_kernel__ = spec.metadata
-        if shared_lowering.buffer_elements != batched_lowering.buffer_elements:
-            raise TypeError(
-                "shared/batched variants require identical buffer-element lowering"
-            )
-        specializers = []
-        for label, implementation in (
-            ("shared", shared), ("batched", batched),
-        ):
-            specializers.append(require_specializer(
-                implementation, label=f"{spec.name}: {label} variant",
-            ))
-        self._specializers = tuple(specializers)
-        self.__hydroforge_lowering__ = BackendLoweringSpec.canonical(
-            buffer_elements=shared_lowering.buffer_elements,
-        )
-        for implementation, is_batched in ((shared, False), (batched, True)):
-            bind_role = getattr(implementation, "bind_variant_role", None)
-            if bind_role is not None:
-                bind_role(batch_key, batched=is_batched)
-
-    def specialize(
-        self, arguments: dict[str, Any], dynamic: frozenset[str], *,
-        buffer_dtypes: BufferDTypeABI,
-    ) -> Callable:
-        trials = arguments[self.batch_key]
-        selected = self.batched if trials is not None and trials > 1 else self.shared
-        metadata = _metadata(selected)
-        accepted = frozenset(metadata.parameters)
-        selected_arguments = {
-            name: value for name, value in arguments.items()
-            if name in accepted or name == "BLOCK_SIZE"
-        }
-        dynamic_accepted = accepted & dynamic
-        specializer = self._specializers[1 if selected is self.batched else 0]
-        return specializer(
-            selected_arguments, dynamic_accepted,
-            buffer_dtypes={
-                name: dtype for name, dtype in buffer_dtypes.items()
-                if name in accepted
-            },
-        )
-
-    def __call__(self, **kwargs: Any):
-        del kwargs
-        raise RuntimeError(
-            "shared/batched variants may run only inside an explicit compiled "
-            "substep; eager calls would reselect and filter the ABI every launch"
-        )
-
-
-def make_variant_dispatcher(
-    shared: Callable,
-    batched: Callable,
-    *,
-    batch_key: str = "num_trials",
-    spec: KernelSpec | None = None,
-) -> VariantDispatcher:
-    """Create a variant pair from the enclosing registry's canonical Spec.
-
-    Backend factories run under :func:`kernel_factory_contract`, so repeating
-    ``spec=`` there creates a second source of ABI truth.  An explicit Spec is
-    accepted only for standalone construction in tests or low-level tooling.
-    """
-    active = active_kernel_spec()
-    if active is not None:
-        if spec is not None:
-            raise TypeError(
-                "make_variant_dispatcher may not repeat active KernelSpec metadata"
-            )
-        spec = active
-    elif spec is None:
-        raise TypeError(
-            "make_variant_dispatcher requires a KernelSpec outside a "
-            "BackendRegistry factory"
-        )
-    return VariantDispatcher(shared, batched, batch_key=batch_key, spec=spec)
+    return _TorchDispatcherDeclaration(
+        kernel=kernel, spec=spec, compile=compile,
+    ).dispatcher
 
 
 # ── Triton dispatcher factory ─────────────────────────────────────────────
@@ -342,13 +209,13 @@ def _cdiv(n: int, d: int) -> int:
     return (n + d - 1) // d
 
 
-def make_triton_dispatcher(
-    kernel,
+def _make_triton_dispatcher_trusted(
+    kernel: Any,
     *,
     spec: KernelSpec | None = None,
-    batched_kernel=None,
+    batched_kernel: Any = None,
     batched_grid: str = "parallel",
-) -> Callable:
+) -> _SpecializedDispatcher:
     """Create a unified dispatch function for a Triton kernel pair.
 
     Shared/batched selection, accepted arguments and launch geometry are fixed
@@ -386,18 +253,11 @@ def make_triton_dispatcher(
         )
 
     def specialize(
-        arguments: dict[str, Any], dynamic: frozenset[str], *,
+        arguments: dict[str, Any], *,
         buffer_dtypes: BufferDTypeABI,
     ) -> Callable:
-        canonical.validate_host_arguments(arguments)
         del buffer_dtypes
-        try:
-            bs = arguments["BLOCK_SIZE"]
-        except KeyError as error:
-            raise TypeError(
-                f"{canonical.name}: compiler-owned BLOCK_SIZE was not bound"
-            ) from error
-        validate_runtime_block_size(bs, backend="triton")
+        bs = arguments["BLOCK_SIZE"]
         trials = arguments.get("num_trials")
         use_batched = (
             trials is not None and trials > 1 and batched_kernel is not None
@@ -409,43 +269,23 @@ def make_triton_dispatcher(
         )
         static = {
             name: value for name, value in arguments.items()
-            if name in accepted and name not in dynamic
+            if name in accepted
         }
         size_keys = (size_key,) if isinstance(size_key, str) else size_key
-        static_n = None
-        if not set(size_keys) & dynamic:
-            static_n = 1
-            for key in size_keys:
-                static_n *= arguments[key]
+        static_n = 1
+        for key in size_keys:
+            static_n *= arguments[key]
+        if use_batched and batched_grid == "parallel":
+            static_n *= trials
 
-        def launch(**values: Any):
-            n = static_n
-            if n is None:
-                n = 1
-                merged = static | values
-                for key in size_keys:
-                    n *= merged[key]
-            if use_batched and batched_grid == "parallel":
-                n *= trials
-            if n == 0:
+        def launch():
+            if static_n == 0:
                 return None
-            grid = (_cdiv(n, bs),)
-            selected[grid](BLOCK_SIZE=bs, **static, **values)
+            grid = (_cdiv(static_n, bs),)
+            selected[grid](BLOCK_SIZE=bs, **static)
 
         return launch
 
-    def dispatch(**kw):
-        """One-shot eager call through the same initialization specializer."""
-        reject_direct_kernel_launch(
-            getattr(kernel, "__name__", "triton_kernel"),
-        )
-        return specialize(
-            kw, frozenset(),
-            buffer_dtypes={
-                name: value.dtype for name, value in kw.items()
-                if name in canonical.buffers and hasattr(value, "dtype")
-            },
-        )()
     canonical_parameters = set(canonical.parameters)
 
     def validate_variant(candidate, label: str, *, complete: bool) -> None:
@@ -500,22 +340,64 @@ def make_triton_dispatcher(
     lowering = BackendLoweringSpec.plan_specialized(
         buffer_elements="tensor",
     )
-    dispatch.__hydroforge_kernel__ = canonical.metadata_for_lowering(lowering)
-    dispatch.__hydroforge_lowering__ = lowering
-    dispatch.specialize = specialize
-    return dispatch
+    return _SpecializedDispatcher(
+        canonical._metadata_for_lowering(lowering), lowering, specialize,
+    )
 
 
-def make_triton_sequence_dispatcher(
+class _TritonDispatcherDeclaration(HydroForgeModel):
+    kernel: Any
+    spec: KernelSpec | None = None
+    batched_kernel: Any = None
+    batched_grid: Literal["parallel", "loop"] = "parallel"
+
+    _dispatcher: _SpecializedDispatcher = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _build(self):
+        try:
+            self._dispatcher = _make_triton_dispatcher_trusted(
+                self.kernel,
+                spec=self.spec,
+                batched_kernel=self.batched_kernel,
+                batched_grid=self.batched_grid,
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(str(error)) from error
+        return self
+
+    @property
+    def dispatcher(self) -> _SpecializedDispatcher:
+        return self._dispatcher
+
+
+def make_triton_dispatcher(
+    kernel: Any,
+    *,
+    spec: KernelSpec | None = None,
+    batched_kernel: Any = None,
+    batched_grid: Literal["parallel", "loop"] = "parallel",
+) -> _SpecializedDispatcher:
+    """Validate and build a Triton dispatcher declaration."""
+
+    return _TritonDispatcherDeclaration(
+        kernel=kernel,
+        spec=spec,
+        batched_kernel=batched_kernel,
+        batched_grid=batched_grid,
+    ).dispatcher
+
+
+def _make_triton_sequence_dispatcher_trusted(
     *,
     kernels: tuple[tuple[Any, str | tuple[str, ...]], ...],
     spec: KernelSpec | None = None,
-) -> Callable:
+) -> _SpecializedDispatcher:
     """Compose ordered native launches under one canonical logical ABI.
 
-    Components consume exact-name subsets of the public ABI.  Their launch
-    geometry and accepted dynamic values are specialized once, so the hot path
-    is only the prebuilt sequence of native launches.
+    Components consume exact-name subsets of the public ABI. Their complete
+    arguments and launch geometry are specialized once, so the hot path is
+    only the prebuilt sequence of native launches.
     """
     active = active_kernel_spec()
     if active is not None:
@@ -547,7 +429,7 @@ def make_triton_sequence_dispatcher(
         ))
     with native_component_factory():
         components = tuple(
-            make_triton_dispatcher(kernel, spec=component_spec)
+            _make_triton_dispatcher_trusted(kernel, spec=component_spec)
             for (kernel, _component_size), component_spec
             in zip(kernels, component_specs, strict=True)
         )
@@ -565,7 +447,7 @@ def make_triton_sequence_dispatcher(
         )
 
     def specialize(
-        arguments: dict[str, Any], dynamic: frozenset[str], *,
+        arguments: dict[str, Any], *,
         buffer_dtypes: BufferDTypeABI,
     ) -> Callable:
         launches = []
@@ -576,53 +458,71 @@ def make_triton_sequence_dispatcher(
                 key: value for key, value in arguments.items()
                 if key in accepted or key == "BLOCK_SIZE"
             }
-            dynamic_selected = dynamic & accepted
             launch = component.specialize(
-                selected, dynamic_selected,
+                selected,
                 buffer_dtypes={
                     name: dtype for name, dtype in buffer_dtypes.items()
                     if name in accepted
                 },
             )
-            launches.append((launch, dynamic_selected))
+            launches.append(launch)
 
-        def run(**values: Any) -> None:
-            for launch, accepted_dynamic in launches:
-                launch(**{
-                    key: value for key, value in values.items()
-                    if key in accepted_dynamic
-                })
+        def run() -> None:
+            for launch in launches:
+                launch()
 
         return run
-
-    def dispatch(**values: Any) -> None:
-        reject_direct_kernel_launch(spec.name)
-        return specialize(
-            values, frozenset(),
-            buffer_dtypes={
-                name: value.dtype for name, value in values.items()
-                if name in spec.buffers and hasattr(value, "dtype")
-            },
-        )()
 
     lowering = BackendLoweringSpec.plan_specialized(
         buffer_elements="tensor",
     )
-    dispatch.__hydroforge_kernel__ = spec.metadata_for_lowering(lowering)
-    dispatch.__hydroforge_lowering__ = lowering
-    dispatch.specialize = specialize
-    return dispatch
+    return _SpecializedDispatcher(
+        spec._metadata_for_lowering(lowering), lowering, specialize,
+    )
 
 
-def make_triton_program_dispatcher(
+class _TritonSequenceDeclaration(HydroForgeModel):
+    kernels: tuple[tuple[Any, str | tuple[str, ...]], ...]
+    spec: KernelSpec | None = None
+
+    _dispatcher: _SpecializedDispatcher = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _build(self):
+        try:
+            self._dispatcher = _make_triton_sequence_dispatcher_trusted(
+                kernels=self.kernels, spec=self.spec,
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(str(error)) from error
+        return self
+
+    @property
+    def dispatcher(self) -> _SpecializedDispatcher:
+        return self._dispatcher
+
+
+def make_triton_sequence_dispatcher(
+    *,
+    kernels: tuple[tuple[Any, str | tuple[str, ...]], ...],
+    spec: KernelSpec | None = None,
+) -> _SpecializedDispatcher:
+    """Validate and build an ordered Triton sequence."""
+
+    return _TritonSequenceDeclaration(
+        kernels=kernels, spec=spec,
+    ).dispatcher
+
+
+def _make_triton_program_dispatcher_trusted(
     prepare: Callable[..., Callable[..., None]],
     spec: KernelSpec | None = None,
-) -> Callable:
+) -> _SpecializedDispatcher:
     """Build one cached, ordered Triton program behind a canonical ABI.
 
     ``prepare`` is initialization/specialization work: it receives the stable
-    argument mapping, the dynamic-name set, and the concrete buffer dtype ABI,
-    and returns the hot-path launch callable.  This adapter is for physical
+    argument mapping and concrete buffer dtype ABI, then returns the hot-path
+    launch callable. This adapter is for physical
     operators made of several dependent native launches and device tensor
     expressions which cannot be represented as an independent-kernel sequence.
     It does not permit a Python launch fallback: preparation happens once per
@@ -643,47 +543,54 @@ def make_triton_program_dispatcher(
         )
     _reject_unproven_uint32_runtime_scalars(spec, "Triton")
     signature = inspect.signature(prepare)
-    if tuple(signature.parameters) != (
-        "arguments", "dynamic", "buffer_dtypes",
-    ):
+    if tuple(signature.parameters) != ("arguments", "buffer_dtypes"):
         raise TypeError(
             f"{spec.name}: Triton program prepare signature must be exactly "
-            "(arguments, dynamic, buffer_dtypes)"
+            "(arguments, buffer_dtypes)"
         )
 
     def specialize(
-        arguments: dict[str, Any], dynamic: frozenset[str], *,
+        arguments: dict[str, Any], *,
         buffer_dtypes: BufferDTypeABI,
     ) -> Callable:
-        try:
-            block_size = arguments["BLOCK_SIZE"]
-        except KeyError as error:
-            raise TypeError(
-                f"{spec.name}: compiler-owned BLOCK_SIZE was not bound"
-            ) from error
-        validate_runtime_block_size(block_size, backend="triton")
-        launch = prepare(arguments, dynamic, buffer_dtypes)
-        if not callable(launch):
-            raise TypeError(
-                f"{spec.name}: Triton program prepare must return a callable"
-            )
-        return launch
-
-    def dispatch(**values: Any) -> None:
-        reject_direct_kernel_launch(spec.name)
-        return specialize(
-            values, frozenset(),
-            buffer_dtypes={
-                name: value.dtype for name, value in values.items()
-                if name in spec.buffers and hasattr(value, "dtype")
-            },
-        )()
+        return prepare(arguments, buffer_dtypes)
 
     lowering = BackendLoweringSpec.plan_specialized(buffer_elements="tensor")
-    dispatch.__hydroforge_kernel__ = spec.metadata_for_lowering(lowering)
-    dispatch.__hydroforge_lowering__ = lowering
-    dispatch.specialize = specialize
-    return dispatch
+    return _SpecializedDispatcher(
+        spec._metadata_for_lowering(lowering), lowering, specialize,
+    )
+
+
+class _TritonProgramDeclaration(HydroForgeModel):
+    prepare: Callable[..., Callable[..., None]]
+    spec: KernelSpec | None = None
+
+    _dispatcher: _SpecializedDispatcher = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _build(self):
+        try:
+            self._dispatcher = _make_triton_program_dispatcher_trusted(
+                self.prepare, self.spec,
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(str(error)) from error
+        return self
+
+    @property
+    def dispatcher(self) -> _SpecializedDispatcher:
+        return self._dispatcher
+
+
+def make_triton_program_dispatcher(
+    prepare: Callable[..., Callable[..., None]],
+    spec: KernelSpec | None = None,
+) -> _SpecializedDispatcher:
+    """Validate and build a specialized Triton program."""
+
+    return _TritonProgramDeclaration(
+        prepare=prepare, spec=spec,
+    ).dispatcher
 
 
 # Metal is a separate adapter; this import preserves the public factory.

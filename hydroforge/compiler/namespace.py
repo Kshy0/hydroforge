@@ -10,20 +10,19 @@ from hydroforge.contracts.fields import tensor_is_active
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
-    from hydroforge.model.module import AbstractModule
 
 
 @dataclass(frozen=True, slots=True)
 class NamespaceEntry:
     """Resolved owner and coordinate metadata for a model field."""
 
-    module: AbstractModule
+    module: object
     field_name: str
     coordinate: str | None
 
 
 class NamespaceCompiler:
-    """Build qualified mappings and reject ambiguous unqualified fields."""
+    """Build qualified mappings and resolve unqualified field ownership."""
 
     def __init__(self, model: AbstractModel) -> None:
         self.model = model
@@ -33,8 +32,29 @@ class NamespaceCompiler:
         if self._mapping is not None:
             return self._mapping
         mapping: dict[str, NamespaceEntry] = {}
-        virtual: dict[str, bool] = {}
+        virtual: set[str] = set()
         ambiguous: set[str] = set()
+
+        def install_bare(
+            field_name: str,
+            entry: NamespaceEntry,
+            *,
+            expression_virtual: bool,
+        ) -> None:
+            if expression_virtual:
+                if field_name not in virtual:
+                    mapping[field_name] = entry
+                    virtual.add(field_name)
+                ambiguous.discard(field_name)
+                return
+            if field_name in virtual or field_name in ambiguous:
+                return
+            if field_name in mapping:
+                mapping.pop(field_name)
+                ambiguous.add(field_name)
+                return
+            mapping[field_name] = entry
+
         for module_name in self.model.opened_modules:
             module = self.model._modules[module_name]
             for field in module.tensor_schema():
@@ -46,38 +66,28 @@ class NamespaceCompiler:
                     field_name=field_name,
                     coordinate=field.tensor.dim_coords,
                 )
-                is_virtual = (
-                    field.tensor.category == "virtual"
-                    and bool(field.tensor.expression)
-                )
-                if field_name in ambiguous:
-                    pass
-                elif field_name not in mapping:
-                    mapping[field_name] = entry
-                    virtual[field_name] = is_virtual
-                elif is_virtual and not virtual.get(field_name):
-                    mapping[field_name] = entry
-                    virtual[field_name] = True
-                elif not is_virtual and virtual.get(field_name):
-                    pass
-                else:
-                    mapping.pop(field_name, None)
-                    ambiguous.add(field_name)
                 mapping[f"{module_name}.{field_name}"] = entry
+                install_bare(
+                    field_name,
+                    entry,
+                    expression_virtual=(
+                        field.tensor.category == "virtual"
+                        and bool(field.tensor.expression)
+                    ),
+                )
 
-            for field_name in module.get_reference_index_fields():
-                metadata = module.get_reference_index_metadata(field_name)
+            for field_name in module._reference_index_fields():
+                metadata = module._reference_index_metadata(field_name)
                 entry = NamespaceEntry(
                     module=module,
                     field_name=field_name,
                     coordinate=metadata.dim_coords,
                 )
-                if field_name not in ambiguous:
-                    if field_name in mapping and mapping[field_name] != entry:
-                        mapping.pop(field_name)
-                        ambiguous.add(field_name)
-                    else:
-                        mapping.setdefault(field_name, entry)
                 mapping[f"{module_name}.{field_name}"] = entry
+                install_bare(
+                    field_name,
+                    entry,
+                    expression_virtual=False,
+                )
         self._mapping = MappingProxyType(mapping)
         return self._mapping

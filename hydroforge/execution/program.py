@@ -7,30 +7,25 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from hydroforge.contracts.errors import ResourceCleanupError
+
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
 
 
-class FixedSubstepProgram:
-    """Cached fixed-width loop whose control state is owned by HydroForge."""
+class _FixedSubstepDraft:
+    """Recording-only controls that never enter the runtime program cache."""
 
     def __init__(self, model: AbstractModel) -> None:
-        self.execution = model._execution
-        self.capture = self.execution.capture
-        self.statistics = self.execution.statistics
         dtype = model.dtype
-        if dtype not in {torch.float32, torch.float64}:
-            raise TypeError(
-                "fixed substep control requires model.dtype to be float32 or float64"
-            )
         with torch.inference_mode(False):
             self.count = torch.ones(
-                1, device=self.execution.device, dtype=torch.int32,
+                1, device=model._execution.device, dtype=torch.int32,
             )
             self.counter = torch.zeros_like(self.count)
             self.continue_flag = torch.zeros_like(self.count)
             self.duration = torch.zeros(
-                1, device=self.execution.device, dtype=dtype,
+                1, device=model._execution.device, dtype=dtype,
             )
             self.weight = torch.zeros_like(self.duration)
             self.one_count = torch.ones_like(self.count)
@@ -39,8 +34,37 @@ class FixedSubstepProgram:
         self.frame = SubstepFrame(
             index=self.counter, dt=self.weight,
         )
-        self.operators = None
-        self.final_operators = None
+
+
+class FixedSubstepProgram:
+    """Complete cached fixed-width loop compiled from one recording draft."""
+
+    def __init__(
+        self,
+        model: AbstractModel,
+        draft: _FixedSubstepDraft,
+        operators: Any,
+        final_operators: Any | None = None,
+    ) -> None:
+        if not operators.operators:
+            from hydroforge.execution.operators import SubstepCompileError
+
+            raise SubstepCompileError(
+                "fixed substep produced an empty operator IR; backend kernels "
+                "must be registered through BackendRegistry + KernelSpec"
+            )
+        self.execution = model._execution
+        self.capture = self.execution.capture
+        self.statistics = self.execution.statistics
+        self.count = draft.count
+        self.counter = draft.counter
+        self.continue_flag = draft.continue_flag
+        self.duration = draft.duration
+        self.weight = draft.weight
+        self.one_count = draft.one_count
+        self.frame = draft.frame
+        self.operators = operators
+        self.final_operators = final_operators
         self.metal_iteration = None
         self.metal_final_iteration = None
         self.metal_fold_iteration = None
@@ -53,29 +77,16 @@ class FixedSubstepProgram:
         self.mode = self.execution.loop_mode(
             world_size=model.world_size, allow_distributed=False,
         )
-
-    def install(self, operators: Any, final_operators: Any | None = None) -> None:
-        """Atomically install one recorded fixed-step program."""
-        if self.operators is not None:
-            raise RuntimeError("fixed substep program is already installed")
-        if not operators.operators:
-            from hydroforge.execution.operators import SubstepCompileError
-
-            raise SubstepCompileError(
-                "fixed substep produced an empty operator IR; backend kernels "
-                "must be registered through BackendRegistry + KernelSpec"
-            )
         metal_iterations = (
             self._build_metal_iterations(operators, final_operators)
             if self.execution.capture_mode == "metal_icb" else None
         )
-        # Commit only after every backend compilation/capture step succeeds.
-        # A failed Metal build must remain an uninstalled program, never a
-        # partially initialized object that later executes operator-by-operator.
-        self.operators = operators
-        self.final_operators = final_operators
         if metal_iterations is not None:
             self.metal_iteration, self.metal_final_iteration = metal_iterations
+
+    @staticmethod
+    def recording_draft(model: AbstractModel) -> _FixedSubstepDraft:
+        return _FixedSubstepDraft(model)
 
     def _build_metal_iterations(
         self, operators: Any, final_operators: Any | None,
@@ -108,8 +119,6 @@ class FixedSubstepProgram:
             try:
                 self.capture.release(iteration.icb)
             except BaseException as cleanup_error:
-                from hydroforge.contracts import ResourceCleanupError
-
                 error = ResourceCleanupError(
                     "fixed Metal final capture", (primary, cleanup_error),
                 )
@@ -235,8 +244,6 @@ class FixedSubstepProgram:
             try:
                 self.capture.release(replacement.icb)
             except BaseException as cleanup_error:
-                from hydroforge.contracts import ResourceCleanupError
-
                 error = ResourceCleanupError(
                     "fixed Metal statistics final capture",
                     (primary, cleanup_error),
@@ -385,19 +392,11 @@ class FixedSubstepProgram:
             regular.replay()
         final.replay()
 
-    def execute(self, count: int, duration: float) -> int:
-        if self.operators is None:
-            raise RuntimeError("fixed substep scope has not been recorded")
-        self.operators.require_stable_bindings()
-        if self.final_operators is not None:
-            self.final_operators.require_stable_bindings()
+    def execute(self, count: int, duration: float, step: Any) -> int:
         if self.execution.capture_mode == "metal_icb":
             self.operators.reset_metal_errors()
             if self.final_operators is not None:
                 self.final_operators.reset_metal_errors()
-        step = self.execution.active_step
-        if step is None:
-            raise RuntimeError("fixed substeps require @managed_step")
         capture_safe = self.operators.cuda_graph_capture_safe and (
             self.final_operators is None
             or self.final_operators.cuda_graph_capture_safe
@@ -410,10 +409,6 @@ class FixedSubstepProgram:
             self.count.fill_(count)
             self.duration.fill_(duration)
             self.weight.fill_(duration / count)
-            if step.run_statistics and not self.statistics.device_compatible():
-                raise RuntimeError(
-                    "fixed device execution requires device-compatible statistics"
-                )
             controlled = self._references_counter()
             if controlled:
                 self._reset()
@@ -456,10 +451,6 @@ class FixedSubstepProgram:
         self.weight.fill_(duration / count)
         fold = False
         if self.metal_iteration is not None:
-            if step.run_statistics and not self.statistics.device_compatible():
-                raise RuntimeError(
-                    "fixed Metal execution requires device-compatible statistics"
-                )
             fold = step.run_statistics and self.statistics.should_fold()
         if self.metal_iteration is not None and fold:
             self.statistics.prelaunch(step.flags, step.total_weight)
@@ -512,10 +503,6 @@ class FixedSubstepProgram:
             if self.final_operators is not None:
                 self.final_operators.check_metal_errors()
             return count
-        if step.run_statistics and not self.statistics.device_compatible():
-            raise RuntimeError(
-                "fixed device execution requires device-compatible statistics"
-            )
         fold = step.run_statistics and self.statistics.should_fold()
         if fold:
             self.statistics.prelaunch(step.flags, step.total_weight)
@@ -545,29 +532,14 @@ class FixedSubstepProgram:
         return count
 
 
-class PredicateLoopProgram:
-    """Nested loop controlled by a body-authored device predicate.
-
-    The loop is deliberately independent of physical time and statistics.  It
-    is suitable for nonlinear closure iterations whose body updates a scalar
-    ``predicate`` and whose enclosing fixed/adaptive scope owns time advance.
-    """
+class _PredicateLoopDraft:
+    """Recording-only predicate controls."""
 
     def __init__(self, model: AbstractModel, *, maximum_steps: int) -> None:
-        if type(maximum_steps) is not int:
-            raise TypeError("predicate loop maximum_steps must be an exact int")
-        if maximum_steps < 1:
-            raise ValueError("predicate loop maximum_steps must be positive")
-        self.execution = model._execution
-        self.capture = self.execution.capture
-        self.maximum_steps = maximum_steps
         from torch.utils._python_dispatch import _disable_current_modes
 
-        # Predicate programs are constructed while their parent operator
-        # recorder is active; runtime-owned control allocation is compiler
-        # setup, not part of the parent's physics IR.
         with _disable_current_modes(), torch.inference_mode(False):
-            options = {"device": self.execution.device, "dtype": torch.int32}
+            options = {"device": model._execution.device, "dtype": torch.int32}
             self.predicate = torch.zeros(1, **options)
             self.counter = torch.zeros(1, **options)
             self.continue_flag = torch.zeros(1, **options)
@@ -575,24 +547,49 @@ class PredicateLoopProgram:
             self.zero_count = torch.zeros(1, **options)
             self.one_count = torch.ones(1, **options)
             self.has_more = torch.zeros(
-                1, device=self.execution.device, dtype=torch.bool,
+                1, device=model._execution.device, dtype=torch.bool,
             )
             self.under_limit = torch.zeros_like(self.has_more)
-        self.body_operators = None
+
+
+class PredicateLoopProgram:
+    """Complete nested loop controlled by a body-authored device predicate."""
+
+    def __init__(
+        self,
+        model: AbstractModel,
+        *,
+        maximum_steps: int,
+        draft: _PredicateLoopDraft,
+        body: Any,
+    ) -> None:
+        if not body.operators:
+            from hydroforge.execution.operators import SubstepCompileError
+
+            raise SubstepCompileError("predicate loop produced an empty operator IR")
+        self.execution = model._execution
+        self.capture = self.execution.capture
+        self.maximum_steps = maximum_steps
+        self.predicate = draft.predicate
+        self.counter = draft.counter
+        self.continue_flag = draft.continue_flag
+        self.maximum_count = draft.maximum_count
+        self.zero_count = draft.zero_count
+        self.one_count = draft.one_count
+        self.has_more = draft.has_more
+        self.under_limit = draft.under_limit
+        self.body_operators = body
         self.graph = None
         self.mode = self.execution.loop_mode(
             world_size=model.world_size,
             allow_distributed=False,
         )
 
-    def install(self, body: Any) -> None:
-        if self.body_operators is not None:
-            raise RuntimeError("predicate loop body is already installed")
-        if not body.operators:
-            from hydroforge.execution.operators import SubstepCompileError
-
-            raise SubstepCompileError("predicate loop produced an empty operator IR")
-        self.body_operators = body
+    @staticmethod
+    def recording_draft(
+        model: AbstractModel, *, maximum_steps: int,
+    ) -> _PredicateLoopDraft:
+        return _PredicateLoopDraft(model, maximum_steps=maximum_steps)
 
     def _reset(self) -> None:
         self.predicate.zero_()
@@ -635,9 +632,6 @@ class PredicateLoopProgram:
         return self.graph
 
     def execute(self) -> None:
-        if self.body_operators is None:
-            raise RuntimeError("predicate loop body has not been recorded")
-        self.body_operators.require_stable_bindings()
         self._reset()
         if self.mode == "eager":
             while True:
@@ -656,51 +650,20 @@ class PredicateLoopProgram:
             body.close(self.capture)
 
 
-class AdaptiveSubstepProgram:
-    """Cached adaptive loop whose control state is owned by HydroForge."""
+class _AdaptiveSubstepDraft:
+    """Recording-only adaptive controls."""
 
     def __init__(
-        self, model: AbstractModel, *, candidate_dt: torch.Tensor, dt: torch.Tensor,
-        maximum_dt: float, maximum_steps: int,
+        self,
+        *,
+        candidate_dt: torch.Tensor,
+        dt: torch.Tensor,
+        maximum_dt: float,
+        maximum_steps: int,
     ) -> None:
-        self.execution = model._execution
-        self.capture = self.execution.capture
-        self.statistics = self.execution.statistics
-        if not isinstance(candidate_dt, torch.Tensor) or candidate_dt.numel() != 1:
-            raise TypeError("adaptive candidate_dt must be a one-element tensor")
-        if not isinstance(dt, torch.Tensor) or dt.numel() != 1:
-            raise TypeError("adaptive dt must be a one-element tensor")
-        if (
-            candidate_dt.layout is not torch.strided
-            or not candidate_dt.is_contiguous()
-        ):
-            raise ValueError(
-                "adaptive candidate_dt must be a contiguous strided tensor"
-            )
-        if dt.layout is not torch.strided or not dt.is_contiguous():
-            raise ValueError("adaptive dt must be a contiguous strided tensor")
-        if candidate_dt.dtype != model.dtype:
-            raise TypeError(
-                "adaptive candidate_dt dtype must match model.dtype; "
-                f"got {candidate_dt.dtype} and {model.dtype}"
-            )
-        if dt.dtype != candidate_dt.dtype:
-            raise TypeError(
-                "adaptive dt and candidate_dt must have identical dtype"
-            )
-        if dt.device != candidate_dt.device:
-            raise ValueError("adaptive dt and candidate_dt must share one device")
-        if type(maximum_dt) not in {int, float}:
-            raise TypeError("adaptive maximum_dt must be an exact int or float")
-        if not math.isfinite(maximum_dt) or maximum_dt <= 0:
-            raise ValueError("adaptive maximum_dt must be finite and positive")
-        if type(maximum_steps) is not int:
-            raise TypeError("adaptive maximum_steps must be an exact int")
-        if maximum_steps < 1:
-            raise ValueError("adaptive maximum_steps must be positive")
         self.candidate = candidate_dt
         self.time_step = dt
-        self.maximum = float(maximum_dt)
+        self.maximum = maximum_dt
         self.maximum_steps = maximum_steps
         # The first program build may happen under ``torch.inference_mode``.
         # Runtime-owned controls must remain ordinary tensors because they are
@@ -738,40 +701,19 @@ class AdaptiveSubstepProgram:
         self.frame = SubstepFrame(
             index=self.counter, dt=self.time_step,
         )
-        self.graphs: dict[bool, Any] = {}
-        self.proposal_operators = None
-        self.body_operators = None
-        self.metal_iteration = None
-        self.mode = self.execution.loop_mode(
-            world_size=model.world_size, allow_distributed=False,
-        )
 
-    def require_binding(
-        self, *, candidate_dt: torch.Tensor, dt: torch.Tensor,
-        maximum_dt: float, maximum_steps: int,
+
+class AdaptiveSubstepProgram:
+    """Complete cached adaptive loop compiled from one recording draft."""
+
+    def __init__(
+        self,
+        model: AbstractModel,
+        *,
+        draft: _AdaptiveSubstepDraft,
+        proposal: Any,
+        body: Any,
     ) -> None:
-        """Reject address or control drift at a cached lexical scope."""
-
-        if candidate_dt is not self.candidate or dt is not self.time_step:
-            raise RuntimeError(
-                "adaptive substep tensors changed at a cached lexical scope; "
-                "bind stable model tensors or select a distinct specialization"
-            )
-        if (
-            type(maximum_dt) not in {int, float}
-            or float(maximum_dt) != self.maximum
-            or type(maximum_steps) is not int
-            or maximum_steps != self.maximum_steps
-        ):
-            raise RuntimeError(
-                "adaptive substep controls changed at a cached lexical scope; "
-                "include changing host controls in specialization"
-            )
-
-    def install(self, proposal: Any, body: Any) -> None:
-        """Atomically install the proposal and physics operator regions."""
-        if self.proposal_operators is not None or self.body_operators is not None:
-            raise RuntimeError("adaptive substep program is already installed")
         if not proposal.operators:
             from hydroforge.execution.operators import SubstepCompileError
 
@@ -784,13 +726,55 @@ class AdaptiveSubstepProgram:
             raise SubstepCompileError(
                 "adaptive physics body produced an empty operator IR"
             )
+        self.execution = model._execution
+        self.capture = self.execution.capture
+        self.statistics = self.execution.statistics
+        self.candidate = draft.candidate
+        self.time_step = draft.time_step
+        self.maximum = draft.maximum
+        self.maximum_steps = draft.maximum_steps
+        self.duration = draft.duration
+        self.elapsed = draft.elapsed
+        self.counter = draft.counter
+        self.continue_flag = draft.continue_flag
+        self.error_flag = draft.error_flag
+        self.remaining = draft.remaining
+        self.accepted = draft.accepted
+        self.predicate_a = draft.predicate_a
+        self.predicate_b = draft.predicate_b
+        self.predicate_c = draft.predicate_c
+        self.maximum_value = draft.maximum_value
+        self.zero_value = draft.zero_value
+        self.maximum_count = draft.maximum_count
+        self.one_count = draft.one_count
+        self.frame = draft.frame
+        self.graphs: dict[bool, Any] = {}
+        self.proposal_operators = proposal
+        self.body_operators = body
+        self.metal_iteration = None
+        self.mode = self.execution.loop_mode(
+            world_size=model.world_size, allow_distributed=False,
+        )
         metal_iteration = (
             self._build_metal_iteration(proposal, body)
             if self.execution.capture_mode == "metal_icb" else None
         )
-        self.proposal_operators = proposal
-        self.body_operators = body
         self.metal_iteration = metal_iteration
+
+    @staticmethod
+    def recording_draft(
+        *,
+        candidate_dt: torch.Tensor,
+        dt: torch.Tensor,
+        maximum_dt: float,
+        maximum_steps: int,
+    ) -> _AdaptiveSubstepDraft:
+        return _AdaptiveSubstepDraft(
+            candidate_dt=candidate_dt,
+            dt=dt,
+            maximum_dt=maximum_dt,
+            maximum_steps=maximum_steps,
+        )
 
     def _build_metal_iteration(self, proposal: Any, body: Any) -> Any:
         from hydroforge.execution.metal_control import adaptive_control_commands
@@ -920,22 +904,11 @@ class AdaptiveSubstepProgram:
         self.graphs[fold] = graph
         return graph
 
-    def execute(self, duration: float) -> int:
-        if type(duration) not in {int, float}:
-            raise TypeError("adaptive duration must be an int or float")
-        if not math.isfinite(duration) or duration <= 0:
-            raise ValueError("adaptive duration must be finite and positive")
+    def execute(self, duration: float, step: Any) -> int:
         self.duration.fill_(duration)
-        if self.proposal_operators is None or self.body_operators is None:
-            raise RuntimeError("adaptive substep scope has not been recorded")
-        self.proposal_operators.require_stable_bindings()
-        self.body_operators.require_stable_bindings()
         if self.execution.capture_mode == "metal_icb":
             self.proposal_operators.reset_metal_errors()
             self.body_operators.reset_metal_errors()
-        step = self.execution.active_step
-        if step is None:
-            raise RuntimeError("adaptive substeps require @managed_step")
         if self.mode == "eager":
             self._reset()
             count = 0
@@ -962,10 +935,6 @@ class AdaptiveSubstepProgram:
             self.proposal_operators.check_metal_errors()
             self.body_operators.check_metal_errors()
             return count
-        if step.run_statistics and not self.statistics.device_compatible():
-            raise RuntimeError(
-                "adaptive device execution requires device-compatible statistics"
-            )
         fold = step.run_statistics and self.statistics.should_fold()
         if fold:
             self.statistics.prelaunch(step.flags, step.total_weight)

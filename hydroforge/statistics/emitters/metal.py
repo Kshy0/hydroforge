@@ -32,8 +32,7 @@ def _emit_argument_kernel_start(
     """Emit an argument-buffer struct and kernel entry point directly."""
     lines.append(f"struct {kernel_name}_args {{")
     for index, (type_decl, name, scalar) in enumerate(fields):
-        native_type = "long" if scalar and type_decl == "int" else type_decl
-        field_type = f"constant {native_type}*" if scalar else type_decl
+        field_type = f"constant {type_decl}*" if scalar else type_decl
         lines.append(f"    {field_type} arg_{index} [[id({index})]];")
     lines.append(
         f"    constant long* _grid_size [[id({len(fields)})]];"
@@ -45,9 +44,8 @@ def _emit_argument_kernel_start(
     ])
     for index, (type_decl, name, scalar) in enumerate(fields):
         if scalar:
-            native_type = "long" if type_decl == "int" else type_decl
             lines.append(
-                f"    const {native_type} {name} = *args.arg_{index};"
+                f"    const {type_decl} {name} = *args.arg_{index};"
             )
         else:
             lines.append(f"    {type_decl} {name} = args.arg_{index};")
@@ -77,10 +75,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
         else:
             stored = self._storage.get(var_name)
             dt = stored.dtype if stored is not None else torch.float32
-        try:
-            return tensor_type(dt)
-        except TypeError as exc:
-            raise TypeError(f"Metal statistics does not support dtype {dt}") from exc
+        return tensor_type(dt)
 
     def _metal_emit_val_load(self: StatisticsRuntime, var_name: str,
                               lines: list, emitted: set, indent: str,
@@ -111,6 +106,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             }
             expression = render_expression(
                 source.expression, ExpressionDialect.METAL, names,
+                value_type="float32",
             )
             lines.append(f'{indent}{ctype} {val_name} = ({ctype})({expression});')
 
@@ -137,15 +133,21 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             operations = self._statistics_lowering.operations(var)
             for operation in operations:
                 op = operation.spelling
-                if operation.stores_index or operation.k > 1:
-                    raise ValueError(f"Full-output Metal aggregation does not support op '{op}'")
-
                 out_key = f'{var}_{op}'
                 if out_key not in seen_out:
                     out_tensors.append((out_key, ctype, f"p_{safe_var}_{op}"))
                     seen_out.add(out_key)
 
                 if operation.inner is None:
+                    if operation.outer.value == "mean":
+                        weight_key = f"{var}_mean_sample_weight_state"
+                        if weight_key not in seen_out:
+                            out_tensors.append((
+                                weight_key,
+                                ctype,
+                                f"p_{safe_var}_mean_sample_weight_state",
+                            ))
+                            seen_out.add(weight_key)
                     continue
                 inner = operation.inner.value
                 if inner == 'last':
@@ -182,29 +184,29 @@ class MetalStatisticsEmitter(StatisticsEmitter):
         varying_scalar_params = [
             ('__hf_weight', 'float', '__weight'),
             ('__hf_total_weight', 'float', '__total_weight'),
-            ('__hf_num_macro_steps', 'float', '__num_macro_steps'),
+            ('__hf_num_macro_steps', 'long', '__num_macro_steps'),
             ('__hf_sub_step', 'int', '__sub_step'),
             ('__hf_num_sub_steps', 'int', '__num_sub_steps'),
             ('__hf_flags', 'int', '__flags'),
-            ('__hf_macro_step_index', 'int', '__macro_step_index'),
+            ('__hf_macro_step_index', 'long', '__macro_step_index'),
         ]
         for sname, stype, state_key in varying_scalar_params:
             abi_fields.append((f'device const {stype}*', f'p_{sname}_ptr', False))
             arg_order.append(('tensor', state_key, 'read'))
 
-        abi_fields.append(('int', 'n_elements', True))
-        arg_order.append(('scalar', 'n_elements', 'int'))
+        abi_fields.append(('long', 'n_elements', True))
+        arg_order.append(('scalar', 'n_elements', 'long'))
         _emit_argument_kernel_start(msl_lines, kernel_name, abi_fields)
-        msl_lines.append(f'{indent}if ((int)tid >= n_elements) return;')
-        msl_lines.append(f'{indent}int out_idx = (int)tid;')
+        msl_lines.append(f'{indent}if ((long)tid >= n_elements) return;')
+        msl_lines.append(f'{indent}long out_idx = (long)tid;')
         msl_lines.append('')
         msl_lines.append(f'{indent}float weight = *p___hf_weight_ptr;')
         msl_lines.append(f'{indent}float total_weight = *p___hf_total_weight_ptr;')
-        msl_lines.append(f'{indent}float num_macro_steps = *p___hf_num_macro_steps_ptr;')
+        msl_lines.append(f'{indent}long num_macro_steps = *p___hf_num_macro_steps_ptr;')
         msl_lines.append(f'{indent}int sub_step = *p___hf_sub_step_ptr;')
         msl_lines.append(f'{indent}int num_sub_steps = *p___hf_num_sub_steps_ptr;')
         msl_lines.append(f'{indent}int flags = *p___hf_flags_ptr;')
-        msl_lines.append(f'{indent}int macro_step_index = *p___hf_macro_step_index_ptr;')
+        msl_lines.append(f'{indent}long macro_step_index = *p___hf_macro_step_index_ptr;')
         msl_lines.append('')
 
         needed_bools = self._statistics_lowering.required_flags
@@ -225,7 +227,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             operations = self._statistics_lowering.operations(var)
             var_numel = prod(self._statistics_layouts[var].actual_shape)
             indent2 = indent + "    "
-            msl_lines.append(f'{indent}if ((int)tid < {var_numel}) {{')
+            msl_lines.append(f'{indent}if ((long)tid < {var_numel}) {{')
             var_val = self._metal_emit_val_load(
                 var, msl_lines, set(), indent2, idx_expr="out_idx",
             )
@@ -244,12 +246,12 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                         f'{indent2}{{',
                         f'{indent2}    {ctype} inner_old = p_{safe_var}_mean_inner_state[out_idx];',
                         f'{indent2}    {ctype} w_old = p_{safe_var}_mean_weight_state[out_idx];',
-                        f'{indent2}    {ctype} inner_new = inner_old + {var_val} * ({ctype})weight;',
                         f'{indent2}    {ctype} w_new = w_old + ({ctype})weight;',
+                        f'{indent2}    {ctype} inner_new = hydroforge_weighted_mean(inner_old, w_old, {var_val}, ({ctype})weight);',
                         f'{indent2}    if (is_inner_last) {{',
                         f'{indent2}        p_{safe_var}_mean_inner_state[out_idx] = ({ctype})0;',
                         f'{indent2}        p_{safe_var}_mean_weight_state[out_idx] = ({ctype})0;',
-                        f'{indent2}        {val_for} = inner_new / w_new;',
+                        f'{indent2}        {val_for} = inner_new;',
                         f'{indent2}    }} else {{',
                         f'{indent2}        p_{safe_var}_mean_inner_state[out_idx] = inner_new;',
                         f'{indent2}        p_{safe_var}_mean_weight_state[out_idx] = w_new;',
@@ -299,8 +301,6 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                         f'{indent2}if (is_inner_first) p_{safe_var}_first_inner_state[out_idx] = {var_val};',
                         f'{indent2}if (is_inner_last) {val_for} = p_{safe_var}_first_inner_state[out_idx];',
                     ])
-                else:
-                    raise ValueError(f"Unsupported full-output inner op '{inner_type}'")
 
             for operation in operations:
                 op = operation.spelling
@@ -333,25 +333,25 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     elif outer == 'mean':
                         msl_lines.extend([
                             f'{indent2}if (is_inner_last) {{',
-                            f'{indent2}    if (is_outer_first) {{ {out_ptr}[out_idx] = {val_var}; }}',
-                            f'{indent2}    else {{ {out_ptr}[out_idx] += {val_var}; }}',
-                            f'{indent2}    if (is_outer_last) {{ {out_ptr}[out_idx] /= ({ctype})num_macro_steps; }}',
+                            f'{indent2}    {ctype} count = ({ctype})num_macro_steps;',
+                            f'{indent2}    {out_ptr}[out_idx] = is_outer_first ? {val_var} : hydroforge_weighted_mean({out_ptr}[out_idx], count - ({ctype})1, {val_var}, ({ctype})1);',
                             f'{indent2}}}',
                         ])
                     elif outer == 'last':
                         msl_lines.append(f'{indent2}if (is_inner_last) {{ {out_ptr}[out_idx] = {val_var}; }}')
                     elif outer == 'first':
                         msl_lines.append(f'{indent2}if (is_inner_last && is_outer_first) {{ {out_ptr}[out_idx] = {val_var}; }}')
-                    else:
-                        raise ValueError(f"Unsupported full-output outer op '{outer}'")
                     continue
 
                 if op == 'mean':
+                    weight_ptr = f"p_{safe_var}_mean_sample_weight_state"
                     msl_lines.extend([
                         f'{indent2}{{',
                         f'{indent2}    {ctype} old_val = is_inner_first ? ({ctype})0 : {out_ptr}[out_idx];',
-                        f'{indent2}    {ctype} new_val = old_val + {var_val} * ({ctype})weight;',
-                        f'{indent2}    {out_ptr}[out_idx] = is_inner_last ? new_val / ({ctype})total_weight : new_val;',
+                        f'{indent2}    {ctype} old_weight = is_inner_first ? ({ctype})0 : {weight_ptr}[out_idx];',
+                        f'{indent2}    {ctype} new_weight = old_weight + ({ctype})weight;',
+                        f'{indent2}    {out_ptr}[out_idx] = hydroforge_weighted_mean(old_val, old_weight, {var_val}, ({ctype})weight);',
+                        f'{indent2}    {weight_ptr}[out_idx] = is_inner_last ? ({ctype})0 : new_weight;',
                         f'{indent2}}}',
                     ])
                 elif op == 'sum':
@@ -375,9 +375,6 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     msl_lines.append(f'{indent2}if (is_inner_last) {{ {out_ptr}[out_idx] = {var_val}; }}')
                 elif op == 'first':
                     msl_lines.append(f'{indent2}if (is_inner_first) {{ {out_ptr}[out_idx] = {var_val}; }}')
-                else:
-                    raise ValueError(f"Unsupported full-output op '{op}'")
-
             msl_lines.append(f'{indent}}}')
             msl_lines.append('')
 
@@ -426,12 +423,21 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 op = operation.spelling
                 out_key = f'{var}_{op}'
                 if operation.stores_index:
-                    out_tensors.append((out_key, "int", f"p_{safe_var}_{op}"))
+                    out_tensors.append((out_key, "long", f"p_{safe_var}_{op}"))
                     aux_name = f"{var}_{op}_aux"
                     safe_aux = f"p_{safe_var}_{op}_aux"
                     out_tensors.append((aux_name, ctype, safe_aux))
                 else:
                     out_tensors.append((out_key, ctype, f"p_{safe_var}_{op}"))
+
+                if (
+                    operation.inner is None
+                    and operation.outer.value == "mean"
+                ):
+                    weight_key = f"{var}_mean_sample_weight_state"
+                    safe_weight = f"p_{safe_var}_mean_sample_weight_state"
+                    if not any(t[0] == weight_key for t in out_tensors):
+                        out_tensors.append((weight_key, ctype, safe_weight))
 
                 # Inner state for compound ops
                 if operation.inner is not None:
@@ -485,18 +491,18 @@ class MetalStatisticsEmitter(StatisticsEmitter):
         varying_scalar_params = [
             ('__hf_weight', 'float', '__weight'),
             ('__hf_total_weight', 'float', '__total_weight'),
-            ('__hf_num_macro_steps', 'float', '__num_macro_steps'),
+            ('__hf_num_macro_steps', 'long', '__num_macro_steps'),
             ('__hf_sub_step', 'int', '__sub_step'),
             ('__hf_num_sub_steps', 'int', '__num_sub_steps'),
             ('__hf_flags', 'int', '__flags'),
-            ('__hf_macro_step_index', 'int', '__macro_step_index'),
+            ('__hf_macro_step_index', 'long', '__macro_step_index'),
         ]
         for sname, stype, state_key in varying_scalar_params:
             abi_fields.append((f'device const {stype}*', f'p_{sname}_ptr', False))
             arg_order.append(('tensor', state_key, 'read'))
 
         # fixed scalar params (truly constant per-capture)
-        fixed_scalar_params = [('n_saved_points', 'int')]
+        fixed_scalar_params = [('n_saved_points', 'long')]
 
         for sname, stype in fixed_scalar_params:
             abi_fields.append((stype, sname, True))
@@ -505,17 +511,17 @@ class MetalStatisticsEmitter(StatisticsEmitter):
         _emit_argument_kernel_start(msl_lines, kernel_name, abi_fields)
 
         # Bounds check
-        msl_lines.append(f'{indent}if ((int)tid >= n_saved_points) return;')
-        msl_lines.append(f'{indent}int idx = p_{safe_save}[tid];')
+        msl_lines.append(f'{indent}if ((long)tid >= n_saved_points) return;')
+        msl_lines.append(f'{indent}long idx = (long)p_{safe_save}[tid];')
         msl_lines.append('')
         # Dereference varying scalar device pointers
         msl_lines.append(f'{indent}float weight = *p___hf_weight_ptr;')
         msl_lines.append(f'{indent}float total_weight = *p___hf_total_weight_ptr;')
-        msl_lines.append(f'{indent}float num_macro_steps = *p___hf_num_macro_steps_ptr;')
+        msl_lines.append(f'{indent}long num_macro_steps = *p___hf_num_macro_steps_ptr;')
         msl_lines.append(f'{indent}int sub_step = *p___hf_sub_step_ptr;')
         msl_lines.append(f'{indent}int num_sub_steps = *p___hf_num_sub_steps_ptr;')
         msl_lines.append(f'{indent}int flags = *p___hf_flags_ptr;')
-        msl_lines.append(f'{indent}int macro_step_index = *p___hf_macro_step_index_ptr;')
+        msl_lines.append(f'{indent}long macro_step_index = *p___hf_macro_step_index_ptr;')
         msl_lines.append('')
         needed_bools = self._statistics_lowering.required_flags
         if needed_bools:
@@ -532,10 +538,10 @@ class MetalStatisticsEmitter(StatisticsEmitter):
 
         # Trial loop
         if num_trials > 1:
-            msl_lines.append(f'{indent}for (int t = 0; t < {num_trials}; t++) {{')
+            msl_lines.append(f'{indent}for (long t = 0; t < {num_trials}; t++) {{')
             indent2 = indent + "    "
         else:
-            msl_lines.append(f'{indent}const int t = 0;')
+            msl_lines.append(f'{indent}const long t = 0;')
             indent2 = indent
 
         # -- 1D variables --
@@ -571,12 +577,12 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}{{',
                             f'{indent2}    {ctype} inner_old = p_{safe_var}_mean_inner_state[{out_idx}];',
                             f'{indent2}    {ctype} w_old = p_{safe_var}_mean_weight_state[{out_idx}];',
-                            f'{indent2}    {ctype} inner_new = inner_old + {var_val} * ({ctype})weight;',
                             f'{indent2}    {ctype} w_new = w_old + ({ctype})weight;',
+                            f'{indent2}    {ctype} inner_new = hydroforge_weighted_mean(inner_old, w_old, {var_val}, ({ctype})weight);',
                             f'{indent2}    if (is_inner_last) {{',
                             f'{indent2}        p_{safe_var}_mean_inner_state[{out_idx}] = ({ctype})0;',
                             f'{indent2}        p_{safe_var}_mean_weight_state[{out_idx}] = ({ctype})0;',
-                            f'{indent2}        {val_for} = inner_new / w_new;',
+                            f'{indent2}        {val_for} = inner_new;',
                             f'{indent2}    }} else {{',
                             f'{indent2}        p_{safe_var}_mean_inner_state[{out_idx}] = inner_new;',
                             f'{indent2}        p_{safe_var}_mean_weight_state[{out_idx}] = w_new;',
@@ -602,7 +608,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}{ctype} {val_for} = ({ctype})0;',
                             f'{indent2}{{',
                             f'{indent2}    {ctype} inner_old = p_{safe_var}_max_inner_state[{out_idx}];',
-                            f'{indent2}    {ctype} inner_new = (is_inner_first && macro_step_index == 0) ? {var_val} : hydroforge_maximum(inner_old, {var_val});',
+                            f'{indent2}    {ctype} inner_new = is_inner_first ? {var_val} : hydroforge_maximum(inner_old, {var_val});',
                             f'{indent2}    if (is_inner_last) {{',
                             f'{indent2}        p_{safe_var}_max_inner_state[{out_idx}] = ({ctype})(-INFINITY);',
                             f'{indent2}        {val_for} = inner_new;',
@@ -616,7 +622,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             f'{indent2}{ctype} {val_for} = ({ctype})0;',
                             f'{indent2}{{',
                             f'{indent2}    {ctype} inner_old = p_{safe_var}_min_inner_state[{out_idx}];',
-                            f'{indent2}    {ctype} inner_new = (is_inner_first && macro_step_index == 0) ? {var_val} : hydroforge_minimum(inner_old, {var_val});',
+                            f'{indent2}    {ctype} inner_new = is_inner_first ? {var_val} : hydroforge_minimum(inner_old, {var_val});',
                             f'{indent2}    if (is_inner_last) {{',
                             f'{indent2}        p_{safe_var}_min_inner_state[{out_idx}] = ({ctype})(INFINITY);',
                             f'{indent2}        {val_for} = inner_new;',
@@ -661,58 +667,58 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             aux_ptr = f"p_{safe_var}_{op}_aux"
                             out_ptr = f"p_{safe_var}_{op}"
                             if operation.k == 1:
-                                sentinel = (
-                                    f'({ctype})(-INFINITY)'
-                                    if arg_type == 'max'
-                                    else f'({ctype})(INFINITY)'
-                                )
-                                candidate = (
-                                    f'(hydroforge_isnan({val_var}) ? {sentinel} : {val_var})'
-                                    if self._statistics_layouts[var].dtype.is_floating_point
-                                    else val_var
-                                )
-                                msl_lines.extend([
-                                    f'{indent2}if (is_inner_last) {{',
-                                    f'{indent2}    if (is_outer_first) {{',
-                                    f'{indent2}        {out_ptr}[{out_idx}] = macro_step_index;',
-                                    f'{indent2}        {aux_ptr}[{out_idx}] = {candidate};',
-                                    f'{indent2}    }} else {{',
-                                    f'{indent2}        {ctype} old_aux = {aux_ptr}[{out_idx}];',
-                                    f'{indent2}        if ({candidate} {cmp_op} old_aux) {{',
-                                    f'{indent2}            {aux_ptr}[{out_idx}] = {candidate};',
-                                    f'{indent2}            {out_ptr}[{out_idx}] = macro_step_index;',
-                                    f'{indent2}        }}',
-                                    f'{indent2}    }}',
-                                    f'{indent2}}}',
-                                ])
+                                if self._statistics_layouts[
+                                    var
+                                ].dtype.is_floating_point:
+                                    msl_lines.extend([
+                                        f'{indent2}if (is_inner_last) {{',
+                                        f'{indent2}    {ctype} candidate = {val_var};',
+                                        f'{indent2}    if (is_outer_first) {{',
+                                        f'{indent2}        {out_ptr}[{out_idx}] = -1;',
+                                        f'{indent2}        {aux_ptr}[{out_idx}] = hydroforge_nan();',
+                                        f'{indent2}    }}',
+                                        f'{indent2}    {ctype} old_aux = {aux_ptr}[{out_idx}];',
+                                        f'{indent2}    if (!hydroforge_isnan(candidate) && (hydroforge_isnan(old_aux) || candidate {cmp_op} old_aux)) {{',
+                                        f'{indent2}        {aux_ptr}[{out_idx}] = candidate;',
+                                        f'{indent2}        {out_ptr}[{out_idx}] = macro_step_index;',
+                                        f'{indent2}    }}',
+                                        f'{indent2}}}',
+                                    ])
+                                else:
+                                    msl_lines.extend([
+                                        f'{indent2}if (is_inner_last) {{',
+                                        f'{indent2}    if (is_outer_first) {{',
+                                        f'{indent2}        {out_ptr}[{out_idx}] = macro_step_index;',
+                                        f'{indent2}        {aux_ptr}[{out_idx}] = {val_var};',
+                                        f'{indent2}    }} else {{',
+                                        f'{indent2}        {ctype} old_aux = {aux_ptr}[{out_idx}];',
+                                        f'{indent2}        if ({val_var} {cmp_op} old_aux) {{',
+                                        f'{indent2}            {aux_ptr}[{out_idx}] = {val_var};',
+                                        f'{indent2}            {out_ptr}[{out_idx}] = macro_step_index;',
+                                        f'{indent2}        }}',
+                                        f'{indent2}    }}',
+                                        f'{indent2}}}',
+                                    ])
                             else:
-                                sentinel = (
-                                    f'({ctype})(-INFINITY)'
-                                    if arg_type == 'max'
-                                    else f'({ctype})(INFINITY)'
-                                )
                                 msl_lines.extend([
                                     f'{indent2}if (is_inner_last) {{',
                                     f'{indent2}    long k_base = ({out_idx}) * {operation.k};',
-                                    f'{indent2}    {ctype} new_value = hydroforge_isnan({val_var}) ? {sentinel} : {val_var};',
-                                    f'{indent2}    int new_index = macro_step_index;',
+                                    f'{indent2}    {ctype} new_value = {val_var};',
+                                    f'{indent2}    long new_index = macro_step_index;',
                                     f'{indent2}    if (is_outer_first) {{',
-                                    f'{indent2}        {aux_ptr}[k_base] = new_value;',
-                                    f'{indent2}        {out_ptr}[k_base] = new_index;',
-                                    f'{indent2}        for (int rank = 1; rank < {operation.k}; ++rank) {{',
-                                    f'{indent2}            {aux_ptr}[k_base + rank] = {sentinel};',
-                                    f'{indent2}            {out_ptr}[k_base + rank] = 0;',
-                                    f'{indent2}        }}',
-                                    f'{indent2}    }} else {{',
                                     f'{indent2}        for (int rank = 0; rank < {operation.k}; ++rank) {{',
-                                    f'{indent2}            {ctype} old_value = {aux_ptr}[k_base + rank];',
-                                    f'{indent2}            int old_index = {out_ptr}[k_base + rank];',
-                                    f'{indent2}            if (new_value {cmp_op} old_value) {{',
-                                    f'{indent2}                {aux_ptr}[k_base + rank] = new_value;',
-                                    f'{indent2}                {out_ptr}[k_base + rank] = new_index;',
-                                    f'{indent2}                new_value = old_value;',
-                                    f'{indent2}                new_index = old_index;',
-                                    f'{indent2}            }}',
+                                    f'{indent2}            {aux_ptr}[k_base + rank] = hydroforge_nan();',
+                                    f'{indent2}            {out_ptr}[k_base + rank] = -1;',
+                                    f'{indent2}        }}',
+                                    f'{indent2}    }}',
+                                    f'{indent2}    for (int rank = 0; rank < {operation.k}; ++rank) {{',
+                                    f'{indent2}        {ctype} old_value = {aux_ptr}[k_base + rank];',
+                                    f'{indent2}        long old_index = {out_ptr}[k_base + rank];',
+                                    f'{indent2}        if (!hydroforge_isnan(new_value) && (hydroforge_isnan(old_value) || new_value {cmp_op} old_value || (new_value == old_value && new_index < old_index))) {{',
+                                    f'{indent2}            {aux_ptr}[k_base + rank] = new_value;',
+                                    f'{indent2}            {out_ptr}[k_base + rank] = new_index;',
+                                    f'{indent2}            new_value = old_value;',
+                                    f'{indent2}            new_index = old_index;',
                                     f'{indent2}        }}',
                                     f'{indent2}    }}',
                                     f'{indent2}}}',
@@ -735,27 +741,20 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                                 ])
                             else:
                                 cmp_op = '>' if outer_base == 'max' else '<'
-                                sentinel = (
-                                    f'({ctype})(-INFINITY)'
-                                    if outer_base == 'max'
-                                    else f'({ctype})(INFINITY)'
-                                )
                                 msl_lines.extend([
                                     f'{indent2}if (is_inner_last) {{',
                                     f'{indent2}    long k_base = ({out_idx}) * {operation.k};',
-                                    f'{indent2}    {ctype} new_value = hydroforge_isnan({val_var}) ? {sentinel} : {val_var};',
+                                    f'{indent2}    {ctype} new_value = {val_var};',
                                     f'{indent2}    if (is_outer_first) {{',
-                                    f'{indent2}        {out_ptr}[k_base] = new_value;',
-                                    f'{indent2}        for (int rank = 1; rank < {operation.k}; ++rank) {{',
-                                    f'{indent2}            {out_ptr}[k_base + rank] = {sentinel};',
-                                    f'{indent2}        }}',
-                                    f'{indent2}    }} else {{',
                                     f'{indent2}        for (int rank = 0; rank < {operation.k}; ++rank) {{',
-                                    f'{indent2}            {ctype} old_value = {out_ptr}[k_base + rank];',
-                                    f'{indent2}            if (new_value {cmp_op} old_value) {{',
-                                    f'{indent2}                {out_ptr}[k_base + rank] = new_value;',
-                                    f'{indent2}                new_value = old_value;',
-                                    f'{indent2}            }}',
+                                    f'{indent2}            {out_ptr}[k_base + rank] = hydroforge_nan();',
+                                    f'{indent2}        }}',
+                                    f'{indent2}    }}',
+                                    f'{indent2}    for (int rank = 0; rank < {operation.k}; ++rank) {{',
+                                    f'{indent2}        {ctype} old_value = {out_ptr}[k_base + rank];',
+                                    f'{indent2}        if (!hydroforge_isnan(new_value) && (hydroforge_isnan(old_value) || new_value {cmp_op} old_value)) {{',
+                                    f'{indent2}            {out_ptr}[k_base + rank] = new_value;',
+                                    f'{indent2}            new_value = old_value;',
                                     f'{indent2}        }}',
                                     f'{indent2}    }}',
                                     f'{indent2}}}',
@@ -764,14 +763,8 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             out_ptr = f"p_{safe_var}_{op}"
                             msl_lines.extend([
                                 f'{indent2}if (is_inner_last) {{',
-                                f'{indent2}    if (is_outer_first) {{',
-                                f'{indent2}        {out_ptr}[{out_idx}] = {val_var};',
-                                f'{indent2}    }} else {{',
-                                f'{indent2}        {out_ptr}[{out_idx}] += {val_var};',
-                                f'{indent2}    }}',
-                                f'{indent2}    if (is_outer_last) {{',
-                                f'{indent2}        {out_ptr}[{out_idx}] /= num_macro_steps;',
-                                f'{indent2}    }}',
+                                f'{indent2}    {ctype} count = ({ctype})num_macro_steps;',
+                                f'{indent2}    {out_ptr}[{out_idx}] = is_outer_first ? {val_var} : hydroforge_weighted_mean({out_ptr}[{out_idx}], count - ({ctype})1, {val_var}, ({ctype})1);',
                                 f'{indent2}}}',
                             ])
                         elif outer == 'sum':
@@ -799,11 +792,14 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     msl_lines.append(f'{indent2}// {op} for {safe_var}')
 
                     if op == 'mean':
+                        weight_ptr = f"p_{safe_var}_mean_sample_weight_state"
                         msl_lines.extend([
                             f'{indent2}{{',
                             f'{indent2}    {ctype} old_val = is_inner_first ? ({ctype})0 : {out_ptr}[{out_idx}];',
-                            f'{indent2}    {ctype} new_val = old_val + {var_val} * ({ctype})weight;',
-                            f'{indent2}    {out_ptr}[{out_idx}] = is_inner_last ? new_val / ({ctype})total_weight : new_val;',
+                            f'{indent2}    {ctype} old_weight = is_inner_first ? ({ctype})0 : {weight_ptr}[{out_idx}];',
+                            f'{indent2}    {ctype} new_weight = old_weight + ({ctype})weight;',
+                            f'{indent2}    {out_ptr}[{out_idx}] = hydroforge_weighted_mean(old_val, old_weight, {var_val}, ({ctype})weight);',
+                            f'{indent2}    {weight_ptr}[{out_idx}] = is_inner_last ? ({ctype})0 : new_weight;',
                             f'{indent2}}}',
                         ])
                     elif op == 'sum':
@@ -854,10 +850,13 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                         idx_expr=idx_2d,
                     )
                     if op == 'mean':
+                        weight_ptr = f"p_{safe_var}_mean_sample_weight_state"
                         msl_lines.extend([
                             f'{indent2}    {ctype} old_2d = is_inner_first ? ({ctype})0 : {out_ptr}[{out_2d}];',
-                            f'{indent2}    {ctype} new_2d = old_2d + {val_2d} * ({ctype})weight;',
-                            f'{indent2}    {out_ptr}[{out_2d}] = is_inner_last ? new_2d / ({ctype})total_weight : new_2d;',
+                            f'{indent2}    {ctype} old_weight_2d = is_inner_first ? ({ctype})0 : {weight_ptr}[{out_2d}];',
+                            f'{indent2}    {ctype} new_weight_2d = old_weight_2d + ({ctype})weight;',
+                            f'{indent2}    {out_ptr}[{out_2d}] = hydroforge_weighted_mean(old_2d, old_weight_2d, {val_2d}, ({ctype})weight);',
+                            f'{indent2}    {weight_ptr}[{out_2d}] = is_inner_last ? ({ctype})0 : new_weight_2d;',
                         ])
                     elif op == 'sum':
                         msl_lines.extend([
@@ -921,17 +920,17 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             zero_fields = [("device float*", "p_buf", False)]
             zero_order = [("tensor", buf_key, "write")]
             if cnt_key is not None:
-                zero_fields.append(("device float*", "p_cnt", False))
+                zero_fields.append(("device int*", "p_cnt", False))
                 zero_order.append(("tensor", cnt_key, "write"))
-            zero_fields.append(("int", "total", True))
+            zero_fields.append(("long", "total", True))
             zero_order.append(("scalar", "total", total_target))
             _emit_argument_kernel_start(msl_lines, zero_name, zero_fields)
             msl_lines.extend([
-                "    if ((int)tid >= total) return;",
+                "    if ((long)tid >= total) return;",
                 "    p_buf[tid] = 0.0f;",
             ])
             if cnt_key is not None:
-                msl_lines.append("    p_cnt[tid] = 0.0f;")
+                msl_lines.append("    p_cnt[tid] = 0;")
             msl_lines.extend(["}", ""])
             metas.append({
                 "kernel_name": zero_name, "arg_order": zero_order,
@@ -942,7 +941,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             add_fields = [("device atomic_float*", "p_buf", False)]
             add_order = [("tensor", buf_key, "atomic_add")]
             if cnt_key is not None:
-                add_fields.append(("device atomic_float*", "p_cnt", False))
+                add_fields.append(("device atomic_int*", "p_cnt", False))
                 add_order.append(("tensor", cnt_key, "atomic_add"))
             index_ctype = self._metal_dtype_str(source.index)
             index_safe = self._get_safe_name(source.index)
@@ -972,14 +971,14 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 ("source_size", source_size), ("target_size", target_size),
                 ("total", total_source),
             ):
-                add_fields.append(("int", scalar, True))
+                add_fields.append(("long", scalar, True))
                 add_order.append(("scalar", scalar, value))
             _emit_argument_kernel_start(msl_lines, add_name, add_fields)
             msl_lines.extend([
-                "    if ((int)tid >= total) return;",
-                "    int t = (int)tid / source_size;",
-                "    int src = (int)tid - t * source_size;",
-                f"    int dst = (int)p_{index_safe}[src];",
+                "    if ((long)tid >= total) return;",
+                "    long t = (long)tid / source_size;",
+                "    long src = (long)tid - t * source_size;",
+                f"    long dst = (long)p_{index_safe}[src];",
             ])
 
             emitted: dict[str, str] = {}
@@ -996,6 +995,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     }
                     expression = render_expression(
                         field_source.expression, ExpressionDialect.METAL, names,
+                        value_type="float32",
                     )
                     msl_lines.append(f"    float {value_name} = (float)({expression});")
                 else:
@@ -1018,6 +1018,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             }
             expression = render_expression(
                 source.value, ExpressionDialect.METAL, names,
+                value_type="float32",
             )
             msl_lines.append(f"    float value = (float)({expression});")
             msl_lines.append(
@@ -1027,7 +1028,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             if cnt_key is not None:
                 msl_lines.append(
                     "    atomic_fetch_add_explicit(p_cnt + t * target_size + dst, "
-                    "1.0f, memory_order_relaxed);"
+                    "1, memory_order_relaxed);"
                 )
             msl_lines.extend(["}", ""])
             metas.append({
@@ -1039,8 +1040,8 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 divide_name = f"aggr_scatter_divide_{safe}"
                 divide_fields = [
                     ("device float*", "p_buf", False),
-                    ("device const float*", "p_cnt", False),
-                    ("int", "total", True),
+                    ("device const int*", "p_cnt", False),
+                    ("long", "total", True),
                 ]
                 divide_order = [
                     ("tensor", buf_key, "read_write"),
@@ -1049,8 +1050,8 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 ]
                 _emit_argument_kernel_start(msl_lines, divide_name, divide_fields)
                 msl_lines.extend([
-                    "    if ((int)tid >= total) return;",
-                    "    float count = p_cnt[tid];",
+                    "    if ((long)tid >= total) return;",
+                    "    float count = float(p_cnt[tid]);",
                     "    p_buf[tid] = count > 0.0f ? p_buf[tid] / count : hydroforge_nan();",
                     "}", "",
                 ])
@@ -1069,9 +1070,6 @@ class MetalStatisticsEmitter(StatisticsEmitter):
         native Metal pipeline bridge.
         """
 
-        if not self._variables:
-            raise ValueError("No variables initialized for statistics aggregation")
-
         grouped_by_output_index = self._statistics_lowering.groups
 
         msl_lines = [
@@ -1088,10 +1086,18 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             '    return as_type<float>(0x7fc00000u);',
             '}',
             'inline float hydroforge_maximum(float left, float right) {',
-            '    return hydroforge_isnan(left) ? right : (hydroforge_isnan(right) ? left : max(left, right));',
+            '    if (hydroforge_isnan(left)) return right;',
+            '    if (hydroforge_isnan(right)) return left;',
+            '    return max(left, right);',
             '}',
             'inline float hydroforge_minimum(float left, float right) {',
-            '    return hydroforge_isnan(left) ? right : (hydroforge_isnan(right) ? left : min(left, right));',
+            '    if (hydroforge_isnan(left)) return right;',
+            '    if (hydroforge_isnan(right)) return left;',
+            '    return min(left, right);',
+            '}',
+            'inline float hydroforge_weighted_mean(float old_value, float old_weight, float value, float weight) {',
+            '    float new_weight = old_weight + weight;',
+            '    return old_value * (old_weight / new_weight) + value * (weight / new_weight);',
             '}',
             'inline int hydroforge_maximum(int left, int right) { return max(left, right); }',
             'inline int hydroforge_minimum(int left, int right) { return min(left, right); }',
@@ -1194,7 +1200,6 @@ class MetalStatisticsEmitter(StatisticsEmitter):
         self._aggregator_function = _make_wrapper(
             dispatchers, scatter_metas, group_metas,
         )
-        self._aggregator_generated = True
 
         # Save for debugging
         if self.save_kernels:
