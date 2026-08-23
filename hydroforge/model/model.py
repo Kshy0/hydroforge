@@ -37,7 +37,6 @@ from pydantic import (
     Field,
     PrivateAttr,
     ValidationInfo,
-    InstanceOf,
     field_validator,
     model_validator,
 )
@@ -425,10 +424,6 @@ class _SaveStateRequest(HydroForgeModel):
         return self
 
 
-class _LoadStateRequest(HydroForgeModel):
-    proxy: InstanceOf[InputProxy]
-
-
 class AbstractModel(HydroForgeModel, ABC):
     """
     Generic master controller for hydroforge models using the AbstractModule hierarchy.
@@ -479,6 +474,13 @@ class AbstractModel(HydroForgeModel, ABC):
     precision: Literal["float32", "float64"] = Field(
         default="float32",
         description="Base precision of the model",
+    )
+    statistics_save_precision: Optional[Literal["float32", "float64"]] = Field(
+        default="float32",
+        description=(
+            "Floating-point precision used for persisted statistics; None "
+            "preserves each statistics tensor's resolved precision."
+        ),
     )
     mixed_precision: Optional[bool] = Field(
         default=None,
@@ -534,6 +536,13 @@ class AbstractModel(HydroForgeModel, ABC):
         ge=2,
         strict=True,
         description="Number of parallel simulations (ensemble members)",
+    )
+    trial_forcing_fields: Mapping[str, tuple[str, ...]] = Field(
+        default_factory=dict,
+        description=(
+            "Construction-time trial-batched forcing fields grouped by module; "
+            "unlisted forcing fields remain shared"
+        ),
     )
     save_kernels: bool = Field(
         default=False,
@@ -811,6 +820,72 @@ class AbstractModel(HydroForgeModel, ABC):
                 compiled_items.append(_immutable_dict(item))
             normalized[canonical] = tuple(compiled_items)
         return _immutable_dict(normalized)
+
+    @field_validator("trial_forcing_fields", mode="before")
+    @classmethod
+    def _validate_trial_forcing_declaration(cls, value: Any):
+        if type(value) is not dict:
+            raise ValueError("trial_forcing_fields must be an exact dict")
+        normalized: dict[str, tuple[str, ...]] = {}
+        for module_name, field_names in value.items():
+            if type(module_name) is not str or not module_name:
+                raise ValueError(
+                    "trial_forcing_fields module names must be non-empty strings"
+                )
+            if type(field_names) is not tuple:
+                raise ValueError(
+                    f"trial_forcing_fields[{module_name!r}] must be an exact tuple"
+                )
+            if any(
+                type(field_name) is not str or not field_name
+                for field_name in field_names
+            ):
+                raise ValueError(
+                    f"trial_forcing_fields[{module_name!r}] must contain "
+                    "non-empty strings"
+                )
+            if len(field_names) != len(set(field_names)):
+                raise ValueError(
+                    f"trial_forcing_fields[{module_name!r}] contains duplicates"
+                )
+            normalized[module_name] = field_names
+        return _immutable_dict(normalized)
+
+    @model_validator(mode="after")
+    def _validate_trial_forcing_fields(self) -> Self:
+        declaration = self.trial_forcing_fields
+        if declaration and self.num_trials is None:
+            raise ValueError("trial_forcing_fields require num_trials")
+        module_types = self._module_types()
+        opened = frozenset(self.opened_modules)
+        for module_name, field_names in declaration.items():
+            if module_name not in opened:
+                raise ValueError(
+                    f"trial forcing module {module_name!r} is not open"
+                )
+            module_type = module_types[module_name]
+            for field_name in field_names:
+                schema = module_type._get_tensor_schema(field_name)
+                if schema is None or schema.tensor is None:
+                    raise ValueError(
+                        f"unknown trial forcing field "
+                        f"{module_name}.{field_name}"
+                    )
+                if schema.tensor.category != "forcing":
+                    raise ValueError(
+                        f"trial forcing field {module_name}.{field_name} has "
+                        f"category {schema.tensor.category!r}, expected 'forcing'"
+                    )
+                if not tensor_is_active(schema.tensor, self.opened_modules):
+                    raise ValueError(
+                        f"trial forcing field {module_name}.{field_name} is inactive"
+                    )
+        object.__setattr__(
+            self,
+            "trial_forcing_fields",
+            _immutable_dict(declaration),
+        )
+        return self
 
     @model_validator(mode="after")
     def _validate_module_requirements(self) -> Self:
@@ -1228,7 +1303,11 @@ class AbstractModel(HydroForgeModel, ABC):
             ("device_type", self.device.type),
             ("precision", self.precision, self.mixed_precision),
             ("execution", self.execution_mode, self.BLOCK_SIZE),
-            ("trials", self.num_trials),
+            (
+                "trials",
+                self.num_trials,
+                _distributed_value_signature(self.trial_forcing_fields),
+            ),
             (
                 "output",
                 self.experiment_name,
@@ -1251,6 +1330,7 @@ class AbstractModel(HydroForgeModel, ABC):
                 "statistics",
                 _distributed_value_signature(self.variables_to_save),
                 _distributed_value_signature(self._statistics_plan),
+                self.statistics_save_precision,
             ),
             (
                 "netcdf",
@@ -1295,13 +1375,10 @@ class AbstractModel(HydroForgeModel, ABC):
     def _distributed_compiled_runtime_signature(self) -> tuple[Any, ...]:
         """Describe rank-invariant services produced by initialization."""
 
-        checkpoint_schema = self._checkpoint.plan.schema_attrs[
-            "hydroforge_checkpoint_schema"
-        ]
         return (
             self._execution.backend,
             self._execution.capture_mode,
-            checkpoint_schema,
+            self._checkpoint.plan.layout_signature,
             tuple(sorted(
                 descriptor.protocol_name
                 for descriptor in self._execution.step_policies
@@ -1591,14 +1668,33 @@ class AbstractModel(HydroForgeModel, ABC):
         model authors explicitly call any module helpers here in physical order.
         """
 
-    def checkpoint_state_restored(self) -> None:
-        """Refresh transient state after checkpoint tensors are restored.
+    def _update_module_structures(self):
+        """Call every module in declared order and commit one staged update."""
 
-        Implementations must preserve tensor identities used by compiled
-        kernels and may only derive transient state from already restored
-        model fields. HydroForge invokes this hook inside the checkpoint load
-        transaction and invokes it again after rollback if the commit fails.
+        from hydroforge.model.structure import StructuralUpdateContext
+
+        context = StructuralUpdateContext(self)
+        for module_name in self.opened_modules:
+            self._modules[module_name].update_structure(context)
+        return context.commit()
+
+    def update_structure(self):
+        """Run the ordered module structure pass between managed steps."""
+
+        self._ensure_healthy_runtime()
+        return self._update_module_structures()
+
+    def commit_structural_update(self, replacements: Any):
+        """Commit staged tensor storage and rebuild dimension consumers.
+
+        The update is restricted to between-step cold paths. Symbolic
+        dimension changes are inferred from declared tensor shapes, while
+        tensor identities remain stable for model namespaces and observers.
         """
+
+        from hydroforge.model.structure import commit_structural_update
+
+        return commit_structural_update(self, replacements)
 
     def print_memory_summary(self) -> None:
         """
@@ -1827,7 +1923,7 @@ class AbstractModel(HydroForgeModel, ABC):
         return self._data.shard()
 
     def save_state(self) -> InputProxy:
-        """Persist physical state at the committed runtime clock."""
+        """Persist a complete construction input at the committed clock."""
         validation_error: BaseException | None = None
         try:
             _SaveStateRequest.model_validate(
@@ -1852,31 +1948,6 @@ class AbstractModel(HydroForgeModel, ABC):
             raise validation_error
         self._ensure_healthy_runtime()
         return self._checkpoint.save()
-
-    def load_state(self, proxy: InputProxy) -> None:
-        """Restore physical model state without changing runtime cursors."""
-        request: _LoadStateRequest | None = None
-        validation_error: BaseException | None = None
-        try:
-            request = _LoadStateRequest(proxy=proxy)
-        except BaseException as error:
-            validation_error = error
-        if self.world_size > 1:
-            failures = self._gather_distributed_failures(
-                validation_error,
-                phase="checkpoint.load.api-validation",
-            )
-            if any(failure is not None for failure in failures):
-                if validation_error is not None:
-                    raise validation_error
-                raise distributed_failure_error(
-                    "distributed checkpoint load entry validation",
-                    failures,
-                )
-        elif validation_error is not None:
-            raise validation_error
-        self._ensure_healthy_runtime()
-        self._checkpoint.load(cast(_LoadStateRequest, request).proxy)
 
     @field_validator("opened_modules", mode="before")
     @classmethod
@@ -2089,6 +2160,17 @@ class AbstractModel(HydroForgeModel, ABC):
             if not names:
                 raise ValueError(
                     f"statistics expression {name!r} has no field dependency"
+                )
+            forcing_dependencies = tuple(
+                dependency
+                for dependency in names
+                if metadata(dependency)[4] == "forcing"
+            )
+            if forcing_dependencies:
+                raise ValueError(
+                    f"statistics expression {name!r} depends on forcing fields "
+                    f"{forcing_dependencies}; forcing layout is run-specific "
+                    "and cannot define persistent output storage"
                 )
             reference_name = next(
                 (
@@ -2324,9 +2406,12 @@ class AbstractModel(HydroForgeModel, ABC):
                 self.dtype,
                 self.mixed_precision,
             )
-            saved_dtype = (
-                torch.float32 if tensor_dtype.is_floating_point else tensor_dtype
-            )
+            saved_dtype = tensor_dtype
+            if tensor_dtype.is_floating_point and self.statistics_save_precision:
+                saved_dtype = {
+                    "float32": torch.float32,
+                    "float64": torch.float64,
+                }[self.statistics_save_precision]
             storage_dtype, logical_dtype = netcdf_dtype_encoding(
                 torch_to_numpy_dtype(saved_dtype),
             )
@@ -2719,6 +2804,7 @@ class AbstractModel(HydroForgeModel, ABC):
             variable_groups=variable_groups,
             input_axes=input_axes,
             reference_targets=reference_targets,
+            trial_forcing_fields=self.trial_forcing_fields,
             statistics=self._statistics_declaration,
             parameter_changes=parameter_changes,
         )

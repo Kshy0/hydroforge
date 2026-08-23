@@ -901,8 +901,14 @@ class _CompiledStepPolicy:
         scheduled_step = invocation.scheduled_step
         request = invocation.request
         entered_user_step = False
+        preparation_failed = False
         try:
             self.execution.statistics.check_background_failures(current_time)
+            try:
+                model.update_structure()
+            except BaseException:
+                preparation_failed = True
+                raise
             context.begin(
                 current_time=current_time,
                 time_step=request.time_step,
@@ -986,7 +992,11 @@ class _CompiledStepPolicy:
                 context,
                 snapshot,
                 error,
-                poison=entered_user_step or context.world_size > 1,
+                poison=(
+                    preparation_failed
+                    or entered_user_step
+                    or context.world_size > 1
+                ),
             )
             if resolved is error:
                 raise

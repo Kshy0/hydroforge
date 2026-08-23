@@ -99,6 +99,11 @@ class NetCDFDataset(GriddedDataset):
     ) -> str | Mapping[str, str] | None:
         return cls._normalize_time_aggregation(value)
 
+    def _planned_storage_chunk_len(self, path: Path) -> int:
+        """Return this dataset type's automatic logical read length."""
+
+        return _planned_netcdf_chunk_len(path, self.var_name)
+
     @model_validator(mode="after")
     def _inspect_netcdf_storage(self):
         if self.chunk_len is None:
@@ -110,7 +115,7 @@ class NetCDFDataset(GriddedDataset):
             object.__setattr__(
                 self,
                 "chunk_len",
-                _planned_netcdf_chunk_len(path, self.var_name),
+                self._planned_storage_chunk_len(path),
             )
             self._install_temporal_domain(self._temporal_domain)
         self._timeline = DatasetTimeline(

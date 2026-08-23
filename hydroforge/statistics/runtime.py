@@ -743,6 +743,126 @@ class StatisticsRuntime:
         if not self.in_memory_mode:
             self._output.check_completed_writes(dt=current_time)
 
+    def require_output_coordinate_resize_safe(
+        self,
+        coordinate: str,
+        *,
+        old_extent: int,
+        new_extent: int,
+        stable_scatter_index: str | None = None,
+        stable_output_coordinate: str | None = None,
+    ) -> None:
+        """Reject a resize unless affected outputs keep a stable domain."""
+
+        if old_extent == new_extent:
+            return
+        unsafe: list[str] = []
+        program = self.installation.program
+        for variable in self._variable_ops:
+            touches_coordinate = any(
+                (
+                    field := self._field_registry.get(leaf)
+                ) is not None
+                and field.tensor.dim_coords is not None
+                and field.tensor.dim_coords.split(".")[-1] == coordinate
+                for leaf in program.leaf_tensors(variable)
+            )
+            if not touches_coordinate:
+                continue
+            source = program.sources.get(variable, TensorSource(variable))
+            scatter_is_stable = (
+                stable_scatter_index is not None
+                and stable_output_coordinate is not None
+                and isinstance(source, ScatterSource)
+                and source.index == stable_scatter_index
+                and (
+                    output_field := self._field_registry.get(variable)
+                ) is not None
+                and output_field.tensor.dim_coords is not None
+                and output_field.tensor.dim_coords.split(".")[-1]
+                == stable_output_coordinate
+            )
+            if not scatter_is_stable:
+                unsafe.append(variable)
+
+        if unsafe:
+            raise RuntimeError(
+                f"cannot resize output coordinate {coordinate!r} from "
+                f"{old_extent} to {new_extent}; affected outputs do not preserve "
+                f"a supported stable aggregation domain: {sorted(unsafe)}. "
+                "Contributor growth is supported only through the declared "
+                f"{stable_scatter_index!r} aggregation onto "
+                f"{stable_output_coordinate!r}"
+            )
+
+    def recompile_resized_sources(self) -> None:
+        """Recompile source addressing after model tensor shapes change.
+
+        Output domains and accumulator layouts must remain unchanged.  This
+        cold path is intended for topology growth where contributor arrays
+        gain rows while the saved coordinate domain is stable.
+        """
+
+        compilation = compile_statistics(
+            self,
+            self.installation.variable_ops,
+            self.installation.program,
+        )
+        for name in self._variable_ops:
+            previous = self._statistics_layouts[name]
+            updated = compilation.layouts[name]
+            if (
+                previous.actual_shape != updated.actual_shape
+                or previous.dtype != updated.dtype
+                or previous.batched != updated.batched
+                or previous.scatter_extent != updated.scatter_extent
+            ):
+                raise RuntimeError(
+                    "statistics topology growth changed the saved layout for "
+                    f"{name!r}: {previous!r} -> {updated!r}"
+                )
+
+        self._cleanup_generated_modules()
+        self._statistics_layouts = compilation.layouts
+        for name, metadata in self._metadata.items():
+            scatter = metadata.get("scatter")
+            if scatter is None:
+                continue
+            variable = metadata["original_variable"]
+            scatter["source_size"] = compilation.layouts[
+                variable
+            ].scatter_source_size
+        self._compiler.compile()
+        self._prepare_kernel_states()
+        self._structural_tensor_versions = {}
+        self.execution.statistics.invalidate()
+
+    def refresh_address_stable_sources(self) -> None:
+        """Refresh compiler-owned index copies without replacing graph storage."""
+
+        variable_map = self.execution.model._namespace.build()
+        with torch.inference_mode():
+            for name, installed in self._tensor_registry.items():
+                entry = variable_map.get(name)
+                if entry is None:
+                    continue
+                live = getattr(entry.module, entry.field_name)
+                if not isinstance(live, torch.Tensor) or installed is live:
+                    continue
+                schema = entry.module._get_tensor_schema(entry.field_name)
+                if schema.tensor.is_coordinate:
+                    continue
+                if (
+                    installed.shape != live.shape
+                    or installed.dtype != live.dtype
+                    or installed.device != live.device
+                ):
+                    raise RuntimeError(
+                        f"address-stable statistics source {name!r} changed "
+                        "shape, dtype, or device"
+                    )
+                installed.copy_(live)
+
     def _cleanup_generated_modules(self) -> None:
         for module_name, filename in reversed(self._generated_modules):
             sys.modules.pop(module_name, None)

@@ -49,6 +49,7 @@ class _ModelSemanticPlan:
     reference_targets: Mapping[
         str, Mapping[str, _ReferenceTargetPlan]
     ]
+    trial_forcing_fields: Mapping[str, tuple[str, ...]]
     statistics: _StatisticsDeclaration | None
     parameter_changes: tuple[_ParameterChangePlan, ...]
 

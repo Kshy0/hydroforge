@@ -141,8 +141,15 @@ def _planned_netcdf_chunk_len(
     max_steps: int = 256,
     max_bytes: int = _NETCDF_LOGICAL_CHUNK_BYTES,
     physical_chunk_max_bytes: int | None = None,
+    physical_chunk_multiplier: int = 1,
+    step_alignment: int = 1,
 ) -> int:
     """Choose a bounded logical batch from one variable's physical layout."""
+
+    if physical_chunk_multiplier < 1:
+        raise ValueError("physical_chunk_multiplier must be positive")
+    if step_alignment < 1:
+        raise ValueError("step_alignment must be positive")
 
     with Dataset(Path(path), "r") as dataset:
         variable = dataset.variables[var_name]
@@ -171,10 +178,21 @@ def _planned_netcdf_chunk_len(
             and physical_steps * bytes_per_step <= physical_chunk_max_bytes
         ):
             memory_steps = max(memory_steps, physical_steps)
-        return max(
-            1,
-            min(max(fallback, physical_steps), max_steps, memory_steps),
+        target_steps = max(
+            fallback,
+            physical_steps * physical_chunk_multiplier,
         )
+        capacity_steps = min(max_steps, memory_steps)
+        if step_alignment > 1:
+            target_steps = (
+                (target_steps + step_alignment - 1) // step_alignment
+            ) * step_alignment
+            aligned_capacity = (
+                capacity_steps // step_alignment
+            ) * step_alignment
+            if aligned_capacity >= step_alignment:
+                capacity_steps = aligned_capacity
+        return max(1, min(target_steps, capacity_steps))
 
 
 def _planned_exported_netcdf_chunk_len(

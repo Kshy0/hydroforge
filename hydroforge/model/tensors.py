@@ -74,9 +74,14 @@ class _ModulePayload:
 class ModuleTensors:
     """Materialize and validate a module's declared tensor schema once."""
 
-    def __init__(self, module: Any) -> None:
+    def __init__(
+        self,
+        module: Any,
+        *,
+        batched_fields: tuple[str, ...] = (),
+    ) -> None:
         self.module = module
-        self.expanded_parameters: set[str] = set()
+        self.batched_fields: set[str] = set(batched_fields)
 
     @classmethod
     def prepare_payload(
@@ -85,11 +90,12 @@ class ModuleTensors:
         payload: dict[str, Any],
         *,
         module_references: dict[str, Any],
+        batched_fields: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         """Complete scalar tensor defaults inside Pydantic validation."""
 
         view = _ModulePayload(module_type, payload, module_references)
-        tensors = cls(view)
+        tensors = cls(view, batched_fields=batched_fields)
         tensors._deactivate_declared()
         tensors._initialize_optional()
         return view.completed()
@@ -184,8 +190,8 @@ class ModuleTensors:
         if module.num_trials is not None:
             category = schema.tensor.category
             batched = category in {"state", "init_state"} or (
-                category in {"param", "derived_param"}
-                and field_name in self.expanded_parameters
+                category in {"param", "derived_param", "forcing"}
+                and field_name in self.batched_fields
             )
             if batched:
                 return (module.num_trials, *shape)
@@ -273,7 +279,7 @@ class ModuleTensors:
             and tensor.shape[0] == module.num_trials
             and tuple(tensor.shape[1:]) == expected
         ):
-            self.expanded_parameters.add(name)
+            self.batched_fields.add(name)
             if tuple(tensor.shape) == self.expected_shape(name):
                 return tensor
         raise ValueError(
@@ -331,7 +337,7 @@ class ModuleTensors:
                 and module.num_trials is not None
                 and tuple(tensor.shape) == (module.num_trials, *expected)
             ):
-                self.expanded_parameters.add(field.name)
+                self.batched_fields.add(field.name)
             else:
                 raise ValueError(
                     f"Computed field {field.name} has shape "

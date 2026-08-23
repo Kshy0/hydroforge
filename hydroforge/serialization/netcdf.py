@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from inspect import signature
 import math
 from pathlib import Path
 from types import MappingProxyType
@@ -52,24 +53,7 @@ _ZLIB_FALLBACK_OPTIONS: Mapping[str, Any] = MappingProxyType({
 DEFAULT_NETCDF_CHUNK_BYTES = 4 * 1024 * 1024
 MIN_BLOSC_CHUNK_BYTES = 128
 
-_NETCDF_VARIABLE_OPTION_NAMES = frozenset({
-    "compression",
-    "zlib",
-    "complevel",
-    "shuffle",
-    "szip_coding",
-    "szip_pixels_per_block",
-    "blosc_shuffle",
-    "fletcher32",
-    "contiguous",
-    "chunksizes",
-    "endian",
-    "least_significant_digit",
-    "significant_digits",
-    "quantize_mode",
-    "fill_value",
-    "chunk_cache",
-})
+_NETCDF_CREATE_VARIABLE_SIGNATURE = signature(Dataset.createVariable)
 
 _NETCDF_COMPRESSION_FILTERS = frozenset({
     "zlib",
@@ -147,19 +131,21 @@ def _blosc_chunk_is_too_small(
     dimensions: Sequence[str],
     options: Mapping[str, Any],
 ) -> bool:
-    """Detect Blosc chunks below the filter's 128-byte input minimum."""
+    """Detect Blosc chunks at or below the filter's unsafe boundary."""
 
     dims = tuple(dimensions)
     if not dims:
-        return False
+        # Scalar variables have no chunk extent to enlarge and cannot satisfy
+        # the Blosc filter's minimum input size.
+        return True
     chunks = options.get("chunksizes")
     if chunks is not None:
-        return math.prod(chunks) * np.dtype(dtype).itemsize < MIN_BLOSC_CHUNK_BYTES
+        return math.prod(chunks) * np.dtype(dtype).itemsize <= MIN_BLOSC_CHUNK_BYTES
     resolved = tuple(dataset.dimensions[name] for name in dims)
     if any(dimension.isunlimited() for dimension in resolved):
         return False
     elements = math.prod(len(dimension) for dimension in resolved)
-    return elements * np.dtype(dtype).itemsize < MIN_BLOSC_CHUNK_BYTES
+    return elements * np.dtype(dtype).itemsize <= MIN_BLOSC_CHUNK_BYTES
 
 
 def _resolve_netcdf_compression_options_trusted(
@@ -217,12 +203,18 @@ def normalize_netcdf_variable_options(options: Mapping[str, Any]) -> dict[str, A
     if not isinstance(options, Mapping):
         raise TypeError("NetCDF variable options must be a mapping")
     normalized = dict(options)
-    unknown = set(normalized).difference(_NETCDF_VARIABLE_OPTION_NAMES)
-    if unknown:
-        raise ValueError(
-            "unsupported NetCDF variable options: "
-            f"{sorted(unknown, key=repr)}"
+    try:
+        _NETCDF_CREATE_VARIABLE_SIGNATURE.bind(
+            None,
+            "__hydroforge_variable__",
+            "f4",
+            (),
+            **normalized,
         )
+    except TypeError as error:
+        raise ValueError(
+            f"unsupported NetCDF variable options: {error}"
+        ) from error
 
     for name in ("zlib", "shuffle", "fletcher32", "contiguous"):
         if name in normalized and type(normalized[name]) is not bool:

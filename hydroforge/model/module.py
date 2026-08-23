@@ -53,6 +53,7 @@ _MODULE_INITIALIZATION_CONTEXT = "hydroforge_model_initialization"
 _MODULE_REFERENCES_CONTEXT = "hydroforge_module_references"
 _MODULE_EVENT_SINK_CONTEXT = "hydroforge_module_event_sink"
 _MODULE_REFERENCE_TARGETS_CONTEXT = "hydroforge_module_reference_targets"
+_MODULE_TRIAL_FORCING_CONTEXT = "hydroforge_trial_forcing_fields"
 
 
 class _ModuleTensorQuery(HydroForgeModel):
@@ -160,7 +161,9 @@ class _TensorFieldDeclaration(HydroForgeModel):
     shape: tuple[str | int, ...]
     dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float"
     dim_coords: str | None = None
-    category: Literal["topology", "param", "init_state", "state"] = "param"
+    category: Literal[
+        "topology", "param", "forcing", "init_state", "state"
+    ] = "param"
     mode: Literal["device", "cpu", "discard"] = "device"
     is_key: bool = False
     is_coordinate: bool = False
@@ -172,6 +175,20 @@ class _TensorFieldDeclaration(HydroForgeModel):
     output: Literal["auto", "full", "disabled"] = "auto"
     depends_on: str | tuple[str, ...] | None = None
     required_by: str | tuple[str, ...] | None = None
+
+    @model_validator(mode="after")
+    def _validate_forcing_contract(self) -> Self:
+        if self.category != "forcing":
+            return self
+        if self.mode != "device":
+            raise ValueError("forcing fields must use mode='device'")
+        if self.output != "disabled":
+            raise ValueError("forcing fields must use output='disabled'")
+        if self.is_key or self.is_coordinate or self.references or self.selects:
+            raise ValueError(
+                "forcing fields cannot define topology/key relationships"
+            )
+        return self
 
 
 class _TensorFieldDefault(HydroForgeModel):
@@ -185,7 +202,9 @@ def TensorField(
     shape: Tuple[str | int, ...],
     dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
     dim_coords: Optional[str] = None,
-    category: Literal["topology", "param", "init_state", "state"] = "param",
+    category: Literal[
+        "topology", "param", "forcing", "init_state", "state"
+    ] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
     is_key: bool = False,
     is_coordinate: bool = False,
@@ -228,6 +247,8 @@ def TensorField(
         category: Category of the variable:
                   - 'topology': Static structure (NEVER batched)
                   - 'param': Input parameter (can be batched)
+                  - 'forcing': Transient per-step input; shared unless listed
+                    in the model's construction-time trial_forcing_fields
                   - 'init_state': Initializable restart state (persisted in model
                     checkpoints; ALWAYS batched if num_trials > 1)
         mode: Handling of variables after initialization:
@@ -654,7 +675,6 @@ class AbstractModule(HydroForgeModel, ABC):
     conflicts: ClassVar[Tuple[str, ...]] = ()
     nc_excluded_fields: ClassVar[Tuple[str, ...]] = MODEL_OWNED_MODULE_FIELDS
     """Fields owned by the model runtime rather than module input data."""
-
     opened_modules: tuple[str, ...] = Field(
         default_factory=tuple,
     )
@@ -758,6 +778,22 @@ class AbstractModule(HydroForgeModel, ABC):
             )
         )
 
+    def update_structure(self, context: Any) -> None:
+        """Stage rare between-step storage changes in module order.
+
+        Implementations call ``context.stage`` when their declared tensor
+        dimensions must change. The model commits every staged module
+        atomically after the ordered pass completes.
+        """
+
+        del context
+
+    @classmethod
+    def prepare_module_input(cls, values: dict[str, Any]) -> dict[str, Any]:
+        """Normalize one module payload before declared tensors materialize."""
+
+        return values
+
     @field_validator("num_trials")
     @classmethod
     def _validate_num_trials(cls, v: Optional[int]) -> Optional[int]:
@@ -795,11 +831,23 @@ class AbstractModule(HydroForgeModel, ABC):
             raise ValueError("model initialization must provide an EventSink")
         if not isinstance(values, Mapping):
             return values
+        trial_forcing_fields = context.get(_MODULE_TRIAL_FORCING_CONTEXT, ())
+        if type(trial_forcing_fields) is not tuple:
+            raise ValueError(
+                "model initialization must provide trial forcing fields as a tuple"
+            )
         try:
+            payload = cls.prepare_module_input(dict(values))
+            if not isinstance(payload, dict):
+                raise TypeError(
+                    f"module {cls.module_name!r} prepare_module_input must "
+                    "return a dict"
+                )
             return ModuleTensors.prepare_payload(
                 cls,
-                dict(values),
+                payload,
                 module_references=references,
+                batched_fields=trial_forcing_fields,
             )
         except (KeyError, TypeError, OverflowError) as error:
             raise ValueError(str(error)) from error
@@ -822,7 +870,15 @@ class AbstractModule(HydroForgeModel, ABC):
             }
             self._reference_targets = context[_MODULE_REFERENCE_TARGETS_CONTEXT]
             self._event_sink = context[_MODULE_EVENT_SINK_CONTEXT]
-            self._tensors = ModuleTensors(self)
+            trial_forcing_fields = context.get(_MODULE_TRIAL_FORCING_CONTEXT, ())
+            if type(trial_forcing_fields) is not tuple:
+                raise ValueError(
+                    "model initialization must provide trial forcing fields as a tuple"
+                )
+            self._tensors = ModuleTensors(
+                self,
+                batched_fields=trial_forcing_fields,
+            )
             if self.module_name not in self.opened_modules:
                 raise ValueError(
                     f"`{self.module_name}` is not listed in `opened_modules`. "
@@ -1038,11 +1094,34 @@ class AbstractModule(HydroForgeModel, ABC):
         tensor = query.tensor
         return tensor.ndim > 0 and tensor.shape[0] == self.num_trials
 
+    def forcing_layout(
+        self,
+        field_name: str,
+    ) -> Literal["shared", "batched"]:
+        """Return the construction-time layout of one forcing field."""
+
+        schema = type(self)._get_tensor_schema(field_name)
+        if schema is None or schema.tensor.category != "forcing":
+            raise ValueError(
+                f"{self.module_name}.{field_name} is not a forcing field"
+            )
+        if not self._is_tensor_field_active(schema):
+            raise ValueError(
+                f"forcing field {self.module_name}.{field_name} is inactive"
+            )
+        return (
+            "batched"
+            if field_name in self._tensors.batched_fields
+            else "shared"
+        )
+
     def _is_batched_trusted(self, field_name: str) -> bool:
         if self.num_trials is None:
             return False
         schema = type(self)._get_tensor_schema(field_name)
         if schema.tensor.category == "topology":
             return False
+        if schema.tensor.category == "forcing":
+            return field_name in self._tensors.batched_fields
         tensor = getattr(self, field_name)
         return tensor.ndim == len(schema.tensor.shape) + 1

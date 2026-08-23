@@ -2,6 +2,10 @@
 
 from hydroforge.contracts.events import NullEventSink
 from hydroforge.model.model import AbstractModel
+from hydroforge.model.structure import (
+    StructuralUpdateContext,
+    StructuralUpdateResult,
+)
 from hydroforge.contracts.kernel_field import kernel_field
 from hydroforge.model.module import (
     AbstractModule,
@@ -23,6 +27,8 @@ __all__ = [
     "ReferenceField",
     "ReferenceIndexField",
     "SelectionField",
+    "StructuralUpdateContext",
+    "StructuralUpdateResult",
     "TensorField",
     "computed_tensor_field",
     "kernel_field",
