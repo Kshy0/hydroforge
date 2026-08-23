@@ -37,6 +37,19 @@ def validate_runtime_block_size(value: int, *, backend: str) -> None:
         )
 
 
+def _effective_block_size(
+    configured: int | None,
+    *,
+    backend: str,
+    default: int = DEFAULT_BLOCK_SIZE,
+) -> int:
+    """Resolve the launch width actually used by one backend."""
+
+    if backend == "metal":
+        return DEFAULT_BLOCK_SIZE
+    return default if configured is None else configured
+
+
 class BackendRequirement(HydroForgeModel):
     """Model-wide restrictions not already defined by the backend runtime."""
 

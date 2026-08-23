@@ -193,13 +193,6 @@ class DatasetTimeline:
             self._storage_key(timestamp) for timestamp in required_times
         }
 
-        # Probe an existing shard before validating keys.  The public calendar
-        # is immutable: storage metadata may confirm it, never rewrite it.
-        probe = sorted(key for key in candidates if self._path(key).exists())
-        if probe:
-            source_calendar = self._file_calendar(probe[0])
-            owner._validate_source_calendar(source_calendar)
-
         if aggregate:
             # An output interval can span multiple file partitions. Deriving
             # keys only at output boundaries would skip every interior shard

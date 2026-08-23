@@ -10,6 +10,7 @@ import torch
 from pydantic import Field, PrivateAttr, model_validator
 
 from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.kernels.devices import devices_match
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -165,11 +166,11 @@ class _AdaptiveSubstepRequest(HydroForgeModel):
             raise ValueError(
                 "adaptive dt and candidate_dt must have identical dtype"
             )
-        if self.candidate_dt.device != self.model_device:
+        if not devices_match(self.candidate_dt.device, self.model_device):
             raise ValueError(
                 "adaptive candidate_dt must be on the model device"
             )
-        if self.dt.device != self.candidate_dt.device:
+        if not devices_match(self.dt.device, self.candidate_dt.device):
             raise ValueError(
                 "adaptive dt and candidate_dt must share one device"
             )

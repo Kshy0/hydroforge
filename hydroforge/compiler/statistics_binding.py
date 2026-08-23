@@ -19,7 +19,10 @@ from hydroforge.statistics.ir import (
 )
 from hydroforge.contracts.events import emit
 from hydroforge.contracts.fields import RuntimeTensorMetadata, TensorMetadata
-from hydroforge.contracts.runtime import DEFAULT_BLOCK_SIZE
+from hydroforge.contracts.runtime import (
+    DEFAULT_BLOCK_SIZE,
+    _effective_block_size,
+)
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -91,9 +94,10 @@ class StatisticsBindingCompiler:
             save_kernels=model.save_kernels,
             max_pending_steps=model.max_pending_steps,
             max_pending_output_bytes=model.max_pending_output_bytes,
-            block_size=(
-                DEFAULT_BLOCK_SIZE
-                if model.BLOCK_SIZE is None else model.BLOCK_SIZE
+            block_size=_effective_block_size(
+                model.BLOCK_SIZE,
+                backend=model._execution.backend,
+                default=DEFAULT_BLOCK_SIZE,
             ),
             calendar=model.calendar,
             in_memory=model.in_memory_output,

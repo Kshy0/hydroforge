@@ -208,6 +208,16 @@ class MultiVariableDataset(AbstractDataset):
                 chunk_plan=chunk_plan,
                 schedule=simulation_schedule,
             )
+        read_pools = [
+            dataset._read_handles
+            for dataset in self.datasets.values()
+            if hasattr(dataset, "_read_handles")
+        ]
+        if read_pools:
+            shared_pool = read_pools[0]
+            for dataset in self.datasets.values():
+                if hasattr(dataset, "_read_handles"):
+                    dataset._read_handles = shared_pool
         return self
 
     @property

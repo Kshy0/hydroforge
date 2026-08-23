@@ -25,6 +25,7 @@ from pydantic import (
 )
 
 from hydroforge.data.netcdf import (
+    _NetCDFReadHandlePool,
     _as_integer_array,
     _is_scalar_integer,
     _normalize_integer_slice,
@@ -825,6 +826,9 @@ class InputProxy(HydroForgeModel):
     sources: Mapping[str, NetCDFInputSource] = Field(default_factory=dict)
 
     _cache: dict[str, InputValue] = PrivateAttr(default_factory=dict)
+    _read_handles: _NetCDFReadHandlePool = PrivateAttr(
+        default_factory=_NetCDFReadHandlePool,
+    )
 
     @field_serializer("data")
     def _serialize_data(
@@ -1147,7 +1151,7 @@ class InputProxy(HydroForgeModel):
 
         try:
             source.file_identity._verify(target_path)
-            with Dataset(target_path, "r") as ds:
+            with self._read_handles.acquire(target_path) as ds:
                 final_indices = source.selectors(selector)
                 value = _NetCDFChunkRequest(
                     name=name,
@@ -1341,3 +1345,8 @@ class InputProxy(HydroForgeModel):
 
     def __contains__(self, key: str) -> bool:
         return key in self.visible_vars
+
+    def close(self) -> None:
+        """Close process-local handles used by lazy NetCDF reads."""
+
+        self._read_handles.close()

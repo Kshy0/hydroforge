@@ -38,9 +38,9 @@ from pydantic import (
 from hydroforge.contracts.temporal import DateLike
 from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.data.datasets.base import (
-    _SourceChunkPayload,
     _TrustedSourceChunk,
     SourceDataset,
+    _trusted_source_chunk_payload,
     _validated_dataset_index,
     _validated_forcing_shard,
     positive_finite_real,
@@ -48,6 +48,9 @@ from hydroforge.data.datasets.base import (
 from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.timeline import DatasetTimeline, ReadOp
 from hydroforge.data.netcdf import (
+    _NetCDFReadHandlePool,
+    _configure_netcdf_variable_cache,
+    _planned_exported_netcdf_chunk_len,
     _read_netcdf_var_sliced_trusted,
     single_file_key,
 )
@@ -373,6 +376,7 @@ class ExportedDataset(SourceDataset):
     base_dir: str | Path
     var_name: str
     prefix: str
+    chunk_len: int | None = Field(default=None, strict=True, ge=1)
     suffix: str = "rank0.nc"
     time_to_key: Callable[[DateLike], str] = single_file_key
     coord_name: str = "catchment_id"
@@ -415,6 +419,9 @@ class ExportedDataset(SourceDataset):
     )
     _timeline: DatasetTimeline = PrivateAttr()
     _global_times: list[DateLike] = PrivateAttr(default_factory=list)
+    _read_handles: _NetCDFReadHandlePool = PrivateAttr(
+        default_factory=_NetCDFReadHandlePool,
+    )
 
     @field_validator("unit_factor")
     @classmethod
@@ -484,6 +491,17 @@ class ExportedDataset(SourceDataset):
                 "window_starts and window_length extend beyond the main "
                 f"source axis of {self._temporal_domain.count} steps"
             )
+        if self.chunk_len is None:
+            key = self.time_to_key(self.start_date)
+            if type(key) is not str:
+                raise TypeError("time_to_key must return an exact string")
+            path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
+            object.__setattr__(
+                self,
+                "chunk_len",
+                _planned_exported_netcdf_chunk_len(path, self.var_name),
+            )
+            self._install_temporal_domain(self._temporal_domain)
         self._timeline = DatasetTimeline(
             self,
             base_dir=self.base_dir,
@@ -567,7 +585,20 @@ class ExportedDataset(SourceDataset):
         result._variable_axes_by_path = dict(self._variable_axes_by_path)
         result._timeline = self._timeline._rebind_trusted(result)
         result._global_times = list(self._global_times)
+        result._read_handles = self._read_handles
         result._compute_column_bbox_from_indices()
+        same_selection = (
+            self.local_indices is result.local_indices
+            or (
+                self.local_indices is not None
+                and result.local_indices is not None
+                and np.array_equal(self.local_indices, result.local_indices)
+            )
+        )
+        if same_selection:
+            result._memory_cache = self._memory_cache
+            result._spin_up_memory_cache = self._spin_up_memory_cache
+            result._memory_cache_file_indices = self._memory_cache_file_indices
         if result.time_shift_steps is not None:
             result._shift_day_groups = result._compile_groups(
                 result.time_shift_steps,
@@ -582,20 +613,8 @@ class ExportedDataset(SourceDataset):
             raise TypeError("time_to_key must return an exact string")
         path = Path(base_dir) / f"{prefix}{key}{suffix}"
         if not path.exists():
-            return None
-        with Dataset(path, "r") as ds:
-            var = ds.variables[var_name]
-            chunking = var.chunking()
-            if chunking == "contiguous" or not chunking:
-                return None
-            dimensions = tuple(var.dimensions)
-            if dimensions != ("time", "saved_points"):
-                raise ValueError(
-                    f"variable {var_name!r} in {path.name} must have "
-                    "dimensions ('time', 'saved_points'); got "
-                    f"{dimensions}"
-                )
-            return int(chunking[0])
+            return 24
+        return _planned_exported_netcdf_chunk_len(path, var_name)
 
     @staticmethod
     def _compile_groups(shift: np.ndarray) -> list:
@@ -791,7 +810,7 @@ class ExportedDataset(SourceDataset):
             path = self._checked_source_path(
                 Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
             )
-            with Dataset(path, "r") as ds:
+            with self._read_handles.acquire(path) as ds:
                 var = ds.variables[self.var_name]
                 t_idx, c_idx = self._variable_axes_by_path[path]
                 if not abs_indices:
@@ -802,22 +821,27 @@ class ExportedDataset(SourceDataset):
                 if use_column_bbox:
                     col_min, col_max = self._column_bbox
                     sel[c_idx] = slice(col_min, col_max + 1)
-                arr = _read_netcdf_var_sliced_trusted(var, tuple(sel))
+                selectors = tuple(sel)
+                _configure_netcdf_variable_cache(
+                    var, selectors, time_axis=t_idx,
+                )
+                arr = _read_netcdf_var_sliced_trusted(var, selectors)
                 arr = self._ensure_tc(arr, t_idx, c_idx)
-                arr = _SourceChunkPayload(
-                    data=arr,
-                    expected_rows=len(abs_indices),
-                    clip_negative=self.clip_negative,
-                ).data
 
-                # Reorder columns if indices are set
+                # Reorder before the ownership boundary so a sparse view does
+                # not copy the entire bounding range first.
                 if self.local_indices is not None:
                     if use_column_bbox:
                         arr = arr[:, self._column_bbox_local_indices]
                     else:
                         arr = arr[:, self.local_indices]
+                arr = _trusted_source_chunk_payload(
+                    arr,
+                    expected_rows=len(abs_indices),
+                    clip_negative=self.clip_negative,
+                )
 
-                chunks.append(arr)
+            chunks.append(arr)
             self._verify_source_path(path)
 
         return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
@@ -841,9 +865,12 @@ class ExportedDataset(SourceDataset):
         if self.unit_factor == 1.0:
             converted = data
         elif isinstance(data, dict):
-            converted = {name: block / self.unit_factor for name, block in data.items()}
+            for block in data.values():
+                np.divide(block, self.unit_factor, out=block)
+            converted = data
         else:
-            converted = data / self.unit_factor
+            np.divide(data, self.unit_factor, out=data)
+            converted = data
         return self._finalize_output_data(
             converted,
             label="exported dataset output",
@@ -897,7 +924,7 @@ class ExportedDataset(SourceDataset):
             path = self._checked_source_path(
                 Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
             )
-            with Dataset(path, "r") as dataset:
+            with self._read_handles.acquire(path) as dataset:
                 variable = dataset.variables[self.var_name]
                 read_dtype = np.dtype(variable.dtype)
                 # netCDF4 applies packing attributes while reading. Include
@@ -910,7 +937,6 @@ class ExportedDataset(SourceDataset):
                             np.asarray(getattr(variable, attribute)).dtype,
                         )
                 if not np.issubdtype(read_dtype, np.floating):
-                    # A masked integer source is promoted to float64 when its
                     # Missing integer values are promoted to float64 by the
                     # source payload boundary.
                     element_bytes = max(element_bytes, 8)
@@ -938,7 +964,9 @@ class ExportedDataset(SourceDataset):
         )
 
     def close(self) -> None:
-        """No persistent NetCDF handles are retained."""
+        """Close this process's persistent NetCDF read handles."""
+
+        self._read_handles.close()
 
     def selected(
         self,
@@ -1261,22 +1289,26 @@ class ExportedDataset(SourceDataset):
                         path = self._checked_source_path(
                             Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
                         )
-                        with Dataset(path, "r") as ds_in:
+                        with self._read_handles.acquire(path) as ds_in:
                             var_in = ds_in.variables[self.var_name]
                             t_idx, c_idx = self._variable_axes_by_path[path]
 
                             sel = [slice(None)] * var_in.ndim
                             sel[t_idx] = np.asarray(abs_indices, dtype=np.int64)
                             sel[c_idx] = file_col_indices
+                            selectors = tuple(sel)
+                            _configure_netcdf_variable_cache(
+                                var_in, selectors, time_axis=t_idx,
+                            )
                             arr = _read_netcdf_var_sliced_trusted(
-                                var_in, tuple(sel),
+                                var_in, selectors,
                             )
                             batch_data = self._ensure_tc(arr, t_idx, c_idx)
-                            batch_data = _SourceChunkPayload(
-                                data=batch_data,
+                            batch_data = _trusted_source_chunk_payload(
+                                batch_data,
                                 expected_rows=len(abs_indices),
                                 clip_negative=self.clip_negative,
-                            ).data
+                            )
                             file_chunks.append(batch_data)
                         self._verify_source_path(path)
 
@@ -1535,6 +1567,11 @@ class ExportedDataset(SourceDataset):
                 starts.size,
                 T,
             )
+        # Window reads are intentionally memory-backed.  Materialize once in
+        # the creating process so fork-based DataLoader workers inherit the
+        # cache copy-on-write instead of re-reading the full NetCDF source.
+        self.load_to_memory()
+        self.close()
         return self._rebuild(
             window_length=request.window,
             window_starts=starts,
@@ -1648,6 +1685,22 @@ def open_multivariable_exported(
         shared["time_to_key"] = request.time_to_key
     if request.chunk_len is not None:
         shared["chunk_len"] = request.chunk_len
+    else:
+        first_name, first_spec = request.compiled_specs[0]
+        first_prefix = first_spec.get("prefix", f"{first_name}_")
+        first_suffix = first_spec.get("suffix", "rank0.nc")
+        first_time_to_key = (
+            request.time_to_key
+            if request.time_to_key is not None else single_file_key
+        )
+        shared["chunk_len"] = ExportedDataset._detect_chunk_len(
+            request.base_dir,
+            first_prefix,
+            first_suffix,
+            first_name,
+            request.start_date,
+            first_time_to_key,
+        )
     datasets = {}
     for name, spec in request.compiled_specs:
         options = shared | spec

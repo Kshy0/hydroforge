@@ -14,8 +14,8 @@ import numpy as np
 from pydantic import PrivateAttr, field_validator, model_validator
 
 from hydroforge.data.datasets.base import (
-    _SourceChunkPayload,
     _TrustedSourceChunk,
+    _trusted_source_chunk_payload,
     positive_finite_real,
 )
 from hydroforge.data.datasets.chunking import SourceChunk
@@ -316,14 +316,15 @@ class DailyBinDataset(GriddedDataset):
             count=frame_size, offset=frame_idx * frame_size * element_size,
         )
         self._verify_source_path(file_path)
-        data = _SourceChunkPayload(
-            data=data.reshape(1, ny, nx),
+        data = _trusted_source_chunk_payload(
+            data.reshape(1, ny, nx),
             expected_rows=1,
             clip_negative=self.clip_negative,
-        ).data
+        )
         data = self._canonical_calculation_data(
             data, label="daily binary dataset input",
-        ) / self.unit_factor
+        )
+        np.divide(data, self.unit_factor, out=data)
         data = self._finalize_output_data(
             data, label="daily binary dataset output",
         )

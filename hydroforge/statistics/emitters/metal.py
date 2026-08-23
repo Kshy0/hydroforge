@@ -1154,6 +1154,10 @@ class MetalStatisticsEmitter(StatisticsEmitter):
 
         # Build the Python wrapper
         def _make_wrapper(compiled, scatters, metas):
+            from hydroforge.kernels.backends.metal.online import (
+                launch_metal_dispatcher,
+            )
+
             def internal_update_statistics(states, BLOCK_SIZE):
                 for meta in scatters:
                     dispatcher = compiled[meta['kernel_name']]
@@ -1161,7 +1165,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                         states[rest[0]] if kind == 'tensor' else rest[1]
                         for kind, *rest in meta['arg_order']
                     ]
-                    dispatcher(**{
+                    launch_metal_dispatcher(dispatcher, {
                         **{f'arg_{i}': value for i, value in enumerate(args)},
                         'BLOCK_SIZE': BLOCK_SIZE,
                         '_grid_size': meta['grid_size'],
@@ -1189,7 +1193,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             elif sname == 'n_elements':
                                 args.append(meta['n_elements_val'])
 
-                    dispatcher(**{
+                    launch_metal_dispatcher(dispatcher, {
                         **{f'arg_{i}': value for i, value in enumerate(args)},
                         'BLOCK_SIZE': BLOCK_SIZE,
                         '_grid_size': n_threads,

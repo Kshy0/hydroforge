@@ -8,7 +8,6 @@ import math
 from numbers import Integral, Real
 from typing import Any, List, Optional, Sequence, Tuple
 
-import netCDF4 as nc
 import numpy as np
 
 from hydroforge.serialization.netcdf import (
@@ -310,7 +309,7 @@ class MultiRankDataAccess:
         )
         local_time = orig_time - start
         fp = self.owner._checked_source_path(info["paths"][file_index])
-        with nc.Dataset(fp, "r") as ds:
+        with self.owner._read_handles.acquire(fp) as ds:
             var = ds.variables[self.owner.var_name]
             indices = [local_time]
             if info["has_trials"]:
@@ -458,13 +457,12 @@ class MultiRankDataAccess:
             local_stop = requested_stop - file_start
             output_start = requested_start - global_start
             checked_path = self.owner._checked_source_path(fp)
-            with nc.Dataset(checked_path, "r") as ds:
+            with self.owner._read_handles.acquire(checked_path) as ds:
                 var = ds.variables[self.owner.var_name]
                 if self.owner.row_chunk_size is None:
-                    # Bound the unfiltered NetCDF read even when the caller asks
-                    # for only one gauge column. Selection happens after the
-                    # block is decoded, so the full saved-point row controls
-                    # peak memory.
+                    # Bound the unfiltered NetCDF read even when the caller
+                    # asks for one gauge column. The full saved-point row
+                    # controls peak memory before selection.
                     bytes_per_row = max(
                         1,
                         int(np.prod(var.shape[1:], dtype=np.int64))

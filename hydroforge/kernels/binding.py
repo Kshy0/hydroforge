@@ -14,6 +14,7 @@ from hydroforge.contracts.fields import concrete_tensor_dtype
 from hydroforge.contracts.kernels import ModuleEnabled, ModuleFlag
 from hydroforge.contracts.runtime import (
     DEFAULT_BLOCK_SIZE,
+    _effective_block_size,
 )
 from hydroforge.contracts.validation import HydroForgeModel
 
@@ -254,13 +255,13 @@ class KernelBinder:
 
         model = self.model
         backend = model._execution.backend
-        value = model.BLOCK_SIZE
-        if value is None:
-            value = kernel.metadata.block_sizes.get(
+        return _effective_block_size(
+            model.BLOCK_SIZE,
+            backend=backend,
+            default=kernel.metadata.block_sizes.get(
                 backend, DEFAULT_BLOCK_SIZE,
-            )
-
-        return value
+            ),
+        )
 
     def resolve(
         self,
