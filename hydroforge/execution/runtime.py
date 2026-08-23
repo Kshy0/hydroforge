@@ -37,6 +37,7 @@ class ModelExecution:
         self.programs: dict[Any, Any] = {}
         self._model_tensor_ids: frozenset[int] = frozenset()
         self._tensor_index_valid = False
+        self.structural_revision = 0
         self.step: Any = None
         self._failure: tuple[str, str, str] | None = None
         self.closed = False

@@ -135,6 +135,9 @@ class ModelInitializer:
                     "hydroforge_model_simulation_schedule": (
                         model.simulation_schedule
                     ),
+                    "hydroforge_trial_forcing_fields": (
+                        model._semantic_plan.trial_forcing_fields.get(name, ())
+                    ),
                 },
             )
             model._modules[name] = module

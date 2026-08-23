@@ -18,7 +18,14 @@ from hydroforge.contracts.temporal import _timedelta_quotient_trusted
 from hydroforge.data.datasets.base import _TrustedSourceChunk
 from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.netcdf import NetCDFDataset
-from hydroforge.data.netcdf import monthly_time_to_key
+from hydroforge.data.netcdf import (
+    _planned_netcdf_chunk_len,
+    monthly_time_to_key,
+)
+
+
+_ERA5_LOGICAL_CHUNK_BYTES = 4 * 1024**3
+_ERA5_PHYSICAL_CHUNK_MULTIPLIER = 2
 
 
 class ERA5LandAccumDataset(NetCDFDataset):
@@ -76,13 +83,31 @@ class ERA5LandAccumDataset(NetCDFDataset):
     supports_time_aggregation: ClassVar[bool] = False
 
     base_dir: str | Path
-    chunk_len: int = Field(default=24, strict=True, ge=1)
+    chunk_len: int | None = Field(default=None, strict=True, ge=1)
     var_name: str = "ro"
     prefix: str = "runoff_"
     suffix: str = ".nc"
     time_to_key: Callable[[datetime], str] = monthly_time_to_key
     clip_incremental_negative: bool = True
     time_aggregation: str | Mapping[str, str] | None = None
+
+    def _planned_storage_chunk_len(self, path: Path) -> int:
+        """Batch physical slabs while retaining midnight chunk boundaries."""
+
+        daily_steps = _timedelta_quotient_trusted(
+            timedelta(days=1),
+            self.time_interval,
+            duration_label="one day",
+            interval_label="ERA5 time_interval",
+        )
+        return _planned_netcdf_chunk_len(
+            path,
+            self.var_name,
+            fallback=daily_steps,
+            max_bytes=_ERA5_LOGICAL_CHUNK_BYTES,
+            physical_chunk_multiplier=_ERA5_PHYSICAL_CHUNK_MULTIPLIER,
+            step_alignment=daily_steps,
+        )
 
     @model_validator(mode="after")
     def _validate_era5_domain(self) -> Self:

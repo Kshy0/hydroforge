@@ -102,7 +102,14 @@ class StatisticsBindingCompiler:
             calendar=model.calendar,
             in_memory=model.in_memory_output,
             result_device=model.result_device,
-            save_precision=torch.float32,
+            save_precision=(
+                None
+                if model.statistics_save_precision is None
+                else {
+                    "float32": torch.float32,
+                    "float64": torch.float64,
+                }[model.statistics_save_precision]
+            ),
             output_netcdf_options=model.output_netcdf_options,
             event_sink=model.event_sink,
         )

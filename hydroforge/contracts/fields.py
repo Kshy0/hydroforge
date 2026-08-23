@@ -242,7 +242,7 @@ class TensorMetadata(HydroForgeModel):
             category=enum_value(
                 "category", "param",
                 frozenset({
-                    "topology", "param", "init_state", "state",
+                    "topology", "param", "forcing", "init_state", "state",
                     "derived_param", "shared_state", "virtual",
                 }),
             ),

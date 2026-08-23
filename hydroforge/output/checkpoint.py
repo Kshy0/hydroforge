@@ -2,25 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from datetime import datetime
+from collections.abc import Mapping
 from dataclasses import dataclass
-import hashlib
-import json
 from pathlib import Path
-from types import MappingProxyType
-from typing import Any, Iterator, cast
+from typing import Any, cast
 from uuid import uuid4
 
 import numpy as np
 import numpy.ma as ma
 import torch
 from netCDF4 import Dataset
-from pydantic import InstanceOf, PrivateAttr, ValidationInfo, model_validator
+from pydantic import model_validator
 
-from hydroforge.data.distributed import _find_indices_in_trusted
 from hydroforge.contracts.events import emit
-from hydroforge.contracts.fields import tensor_is_active
 from hydroforge.contracts.errors import (
     ResourceCleanupError,
     distributed_failure_error,
@@ -40,18 +34,14 @@ from hydroforge.serialization.netcdf import (
 )
 
 
-_CHECKPOINT_FORMAT = "hydroforge.model-state"
-_CHECKPOINT_VERSION = 6
-_CHECKPOINT_LOAD_CONTEXT = "hydroforge_checkpoint_runtime"
-
-
 @dataclass(frozen=True, slots=True)
-class _StateField:
+class _InputField:
+    """One live field required to reconstruct the initialized model."""
+
     name: str
     module_name: str
     module: Any
     info: Any
-    tensor: torch.Tensor
     shape: tuple[int, ...]
     numpy_dtype: np.dtype
     coordinate: str | None
@@ -59,57 +49,11 @@ class _StateField:
 
 
 @dataclass(frozen=True, slots=True)
-class _CheckpointCoordinate:
-    """Trusted local coordinate identity compiled with the runtime."""
-
-    values: np.ndarray
-
-
-@dataclass(frozen=True, slots=True)
-class _TensorRestore:
-    field: _StateField
-    array: np.ndarray
-
-
-@dataclass(frozen=True, slots=True)
 class _CheckpointPlan:
-    """Complete trusted checkpoint schema compiled after module construction."""
+    """Trusted construction-input layout compiled for the save service."""
 
-    fields: tuple[_StateField, ...]
-    coordinates: Mapping[str, _CheckpointCoordinate]
-    manifest: dict[str, Any]
-    schema_attrs: dict[str, Any]
-
-
-@dataclass(frozen=True, slots=True)
-class _ValidatedCheckpointPayload:
-    """Fully validated external checkpoint content ready for commit."""
-
-    restores: tuple[_TensorRestore, ...]
-    checkpoint_id: str
-
-
-class _CheckpointLoadRequest(HydroForgeModel):
-    """One public load request with completely staged external content."""
-
-    proxy: InstanceOf[InputProxy]
-
-    _payload: _ValidatedCheckpointPayload = PrivateAttr()
-
-    @model_validator(mode="after")
-    def _validate_checkpoint(self, info: ValidationInfo):
-        runtime = (
-            info.context.get(_CHECKPOINT_LOAD_CONTEXT)
-            if isinstance(info.context, Mapping) else None
-        )
-        if runtime is None:
-            raise ValueError("checkpoint load requires runtime context")
-        self._payload = runtime._validate_load_payload(self.proxy)
-        return self
-
-    @property
-    def payload(self) -> _ValidatedCheckpointPayload:
-        return self._payload
+    fields: tuple[_InputField, ...]
+    layout_signature: tuple[Any, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,7 +64,6 @@ class _CheckpointSaveStage:
     distributed: tuple[str, ...]
     global_fields: tuple[str, ...]
     groups: dict[str, str]
-    attrs: dict[str, Any]
 
 
 class _CheckpointMergeDeclaration(HydroForgeModel):
@@ -167,10 +110,8 @@ def _merge_rank_checkpoints(
 ) -> None:
     """Merge one exact set of rank-local checkpoint files.
 
-    Every mapped variable must occur on every rank.  HydroForge contract
-    attributes must agree exactly; rank zero's complete attributes are
-    retained in the merged file.  A malformed rank set is rejected before
-    it can masquerade as a resumable checkpoint.
+    Every mapped variable must occur on every rank. Rank-local files must not
+    carry global attributes, so the merged parameter file has none either.
     """
     declaration = _CheckpointMergeDeclaration(
         output_path=output_path,
@@ -184,7 +125,6 @@ def _merge_rank_checkpoints(
     create_options = declaration.netcdf_options
     distributed_names = set(variable_group_mapping)
     offsets: dict[str, int] = {}
-    contract_attrs: dict[str, Any] | None = None
     coordinate_groups = set(variable_group_mapping.values())
     coordinate_parts: dict[str, list[np.ndarray]] = {
         name: [] for name in coordinate_groups
@@ -198,17 +138,10 @@ def _merge_rank_checkpoints(
                 attrs = {
                     name: rank_ds.getncattr(name) for name in rank_ds.ncattrs()
                 }
-                rank_contract = {
-                    name: value for name, value in attrs.items()
-                    if name.startswith("hydroforge_")
-                }
-                if contract_attrs is None:
-                    contract_attrs = rank_contract
-                    merged_ds.setncatts(attrs)
-                elif rank_contract != contract_attrs:
+                if attrs:
                     raise ValueError(
-                        f"Rank checkpoint {rank_path!s} has incompatible "
-                        "HydroForge contract attributes"
+                        f"Rank checkpoint {rank_path!s} must not contain "
+                        f"global attributes: {sorted(attrs)}"
                     )
                 rank_variables = set(rank_ds.variables)
                 missing_distributed = distributed_names.difference(
@@ -372,26 +305,24 @@ def _merge_rank_checkpoints(
 
 
 class CheckpointRuntime:
-    """Save and restore model state without adding downstream model surface."""
+    """Persist complete inputs for constructing a fresh model."""
 
     def __init__(self, model: Any) -> None:
         self.model = model
-        fields = self._compile_fields()
-        coordinates = self._compile_coordinates(fields)
-        manifest = self._manifest(fields)
-        encoded = self._canonical_json(manifest)
+        fields = self._compile_input_fields()
         self.plan = _CheckpointPlan(
             fields=fields,
-            coordinates=coordinates,
-            manifest=manifest,
-            schema_attrs={
-                "hydroforge_checkpoint_format": _CHECKPOINT_FORMAT,
-                "hydroforge_checkpoint_version": _CHECKPOINT_VERSION,
-                "hydroforge_checkpoint_manifest": encoded,
-                "hydroforge_checkpoint_schema": hashlib.sha256(
-                    encoded.encode("utf-8")
-                ).hexdigest(),
-            },
+            layout_signature=tuple(
+                (
+                    field.name,
+                    field.module_name,
+                    field.shape,
+                    str(field.numpy_dtype),
+                    field.coordinate,
+                    field.partition_axis,
+                )
+                for field in fields
+            ),
         )
 
     def _coordinate_phase(
@@ -426,7 +357,7 @@ class CheckpointRuntime:
             None
             if stage is None else (
                 stage.timestamp,
-                self.plan.schema_attrs["hydroforge_checkpoint_schema"],
+                self.plan.layout_signature,
                 stage.distributed,
                 tuple(sorted(stage.groups.items())),
             )
@@ -457,278 +388,76 @@ class CheckpointRuntime:
         return failures, checkpoint_id
 
     @staticmethod
-    def _state_fields(module: Any) -> Iterator[tuple[str, Any]]:
-        for field in module.tensor_schema():
-            if not tensor_is_active(
-                field.tensor, getattr(module, "opened_modules", ()),
-            ):
-                continue
-            if not field.computed and field.tensor.category == "init_state":
-                yield field.name, field
+    def _numpy_dtype(value: Any) -> np.dtype:
+        if isinstance(value, torch.Tensor):
+            return np.asarray(value.detach().cpu().numpy()).dtype
+        return np.asarray(value).dtype
 
-    def _compile_fields(self) -> tuple[_StateField, ...]:
-        """Compile the exact checkpoint field set from declared model state."""
+    def _local_input_value(self, name: str) -> Any:
+        """Reload one rank-local input whose runtime storage was discarded."""
+
+        source = self.model._input
+        group = self.model._partition.variable_groups.get(name)
+        if group is None:
+            return source[name]
+        indices = self.model._partition.rank_indices(group)
+        axis = self.model._semantic_plan.input_axes[name]
+        selector = (slice(None), indices) if axis == 1 else indices
+        return source.get_subset(name, selector)
+
+    def _field_value(self, field: _InputField) -> Any:
+        value = getattr(field.module, field.name)
+        if value is None:
+            value = self._local_input_value(field.name)
+        return value
+
+    def _compile_input_fields(self) -> tuple[_InputField, ...]:
+        """Compile every current value needed by a fresh model construction."""
 
         model = self.model
         partition = model._partition
-        numpy_dtypes = {
-            torch.bool: np.dtype("bool"),
-            torch.float32: np.dtype("float32"),
-            torch.float64: np.dtype("float64"),
-            torch.int32: np.dtype("int32"),
-            torch.int64: np.dtype("int64"),
-        }
-        fields: dict[str, _StateField] = {}
-        for module_name in model.opened_modules:
-            module = model._modules[module_name]
-            for field_name, info in self._state_fields(module):
-                if field_name in module.nc_excluded_fields or info.excluded:
+        fields: dict[str, _InputField] = {}
+        for name, info in model._input.fields.items():
+            tensor = info.tensor
+            if tensor is not None:
+                if tensor.category not in {"param", "topology", "init_state"}:
                     continue
-                value = getattr(module, field_name)
-                coordinate = partition.field_coordinate(info)
-                candidate = _StateField(
-                    name=field_name,
-                    module_name=module_name,
-                    module=module,
-                    info=info,
-                    tensor=value,
-                    shape=tuple(value.shape),
-                    numpy_dtype=numpy_dtypes[value.dtype],
-                    coordinate=coordinate,
-                    partition_axis=(
-                        partition.logical_axis(
-                            field_name, info, tuple(value.shape),
-                        )
-                        if coordinate is not None else None
-                    ),
-                )
-                fields[field_name] = candidate
+            elif not info.required and name not in model._input:
+                # An absent optional scalar is reconstructed from its declared
+                # default and need not be encoded as a NetCDF variable.
+                continue
+            module = model._modules[info.module_name]
+            if name in module.nc_excluded_fields or info.excluded:
+                continue
+            value = getattr(module, name)
+            if value is None:
+                if name not in model._input:
+                    # A discarded optional tensor that originated from its
+                    # declared default is reconstructed from that same default.
+                    continue
+                value = self._local_input_value(name)
+            shape = tuple(np.shape(
+                value.detach().cpu().numpy()
+                if isinstance(value, torch.Tensor) else value
+            ))
+            coordinate = partition.field_coordinate(info)
+            fields[name] = _InputField(
+                name=name,
+                module_name=info.module_name,
+                module=module,
+                info=info,
+                shape=shape,
+                numpy_dtype=self._numpy_dtype(value),
+                coordinate=coordinate,
+                partition_axis=(
+                    partition.logical_axis(name, info, shape)
+                    if coordinate is not None else None
+                ),
+            )
         return tuple(fields[name] for name in sorted(fields))
 
-    def _compile_coordinates(
-        self, fields: tuple[_StateField, ...],
-    ) -> Mapping[str, _CheckpointCoordinate]:
-        """Capture trusted local coordinate identities exactly once."""
-
-        variable_map = self.model._namespace.build()
-        coordinates: dict[str, _CheckpointCoordinate] = {}
-        for name in sorted({
-            field.coordinate for field in fields
-            if field.coordinate is not None
-        }):
-            entry = variable_map[name]
-            value = getattr(entry.module, entry.field_name)
-            if isinstance(value, torch.Tensor):
-                value = value.detach().cpu().numpy()
-            frozen = np.array(value, copy=True, subok=False)
-            frozen.setflags(write=False)
-            coordinates[name] = _CheckpointCoordinate(values=frozen)
-        return MappingProxyType(coordinates)
-
-    def _manifest(self, fields: tuple[_StateField, ...]) -> dict[str, Any]:
-        model = self.model
-        entries = []
-        for field in fields:
-            metadata = field.info.tensor
-            entries.append({
-                "name": field.name,
-                "module": field.module_name,
-                "category": metadata.category,
-                "computed": bool(field.info.computed),
-                "declared_shape": list(metadata.shape),
-                "declared_dtype": metadata.dtype,
-                "runtime_dtype": str(field.tensor.dtype).removeprefix("torch."),
-                "coordinate": field.coordinate,
-            })
-        return {
-            "model": f"{type(model).__module__}.{type(model).__qualname__}",
-            "modules": list(model.opened_modules),
-            "fields": entries,
-        }
-
-    @staticmethod
-    def _canonical_json(value: Any) -> str:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"))
-
-    @staticmethod
-    def _integer_attr(attrs: dict[str, Any], name: str) -> int:
-        """Decode one explicitly integral NetCDF attribute at the I/O edge."""
-
-        value = attrs[name]
-        if isinstance(value, (bool, np.bool_)) or not isinstance(
-            value, (int, np.integer),
-        ):
-            raise TypeError(f"checkpoint attribute {name!r} must be an integer")
-        return int(value)
-
-    def _validate_schema(
-        self, proxy: InputProxy,
-    ) -> dict[str, Any]:
-        attrs = proxy.attrs
-        if attrs["hydroforge_checkpoint_format"] != _CHECKPOINT_FORMAT:
-            raise ValueError(
-                "input is not a versioned HydroForge model-state checkpoint"
-            )
-        version = self._integer_attr(attrs, "hydroforge_checkpoint_version")
-        if version != _CHECKPOINT_VERSION:
-            raise ValueError(
-                f"unsupported checkpoint version {version}; expected "
-                f"{_CHECKPOINT_VERSION}"
-            )
-        encoded = attrs["hydroforge_checkpoint_manifest"]
-        digest = attrs["hydroforge_checkpoint_schema"]
-        if not isinstance(encoded, str) or not isinstance(digest, str):
-            raise ValueError("checkpoint schema manifest must be text")
-        actual_digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-        if digest != actual_digest:
-            raise ValueError("checkpoint schema manifest digest is invalid")
-        manifest = json.loads(encoded)
-        expected = self.plan.manifest
-        if manifest != expected:
-            raise ValueError(
-                "checkpoint state schema does not match the initialized model"
-            )
-        expected_data = {field.name for field in self.plan.fields}
-        expected_data.update(
-            field.coordinate
-            for field in self.plan.fields
-            if field.coordinate is not None
-        )
-        available = set(proxy.keys())
-        missing = expected_data.difference(available)
-        extra = available.difference(expected_data)
-        if missing or extra:
-            raise ValueError(
-                "checkpoint variables do not match its model-state schema: "
-                f"missing={sorted(missing)}, extra={sorted(extra)}"
-            )
-        return manifest
-
-    @staticmethod
-    def _validate_array_dtype(
-        field: _StateField, array: np.ndarray,
-    ) -> np.ndarray:
-        expected = field.numpy_dtype
-        if expected == np.dtype("bool") and array.dtype == np.dtype("uint8"):
-            if np.any((array != 0) & (array != 1)):
-                raise ValueError(
-                    f"Boolean checkpoint field {field.name!r} contains values "
-                    "other than 0 and 1"
-                )
-            return array.astype(np.bool_, copy=False)
-        if array.dtype != expected:
-            raise TypeError(
-                f"Dtype mismatch for checkpoint state {field.name!r}: "
-                f"expected {expected}, got {array.dtype}"
-            )
-        return array
-
-    @staticmethod
-    def _copy_state(target: torch.Tensor, array: np.ndarray) -> None:
-        target.copy_(torch.tensor(array, device=target.device))
-
-    @staticmethod
-    def _validate_external_coordinate(
-        coordinate: str, value: Any, *, source: str,
-    ) -> np.ndarray:
-        if np.ma.isMaskedArray(value) and np.any(np.ma.getmaskarray(value)):
-            raise ValueError(
-                f"Checkpoint coordinate {coordinate!r} contains missing "
-                f"IDs in {source}"
-            )
-        array = np.asarray(value)
-        if array.ndim != 1:
-            raise ValueError(
-                f"Checkpoint coordinate {coordinate!r} in {source} must be "
-                "one-dimensional"
-            )
-        if array.dtype.kind not in "iu":
-            raise TypeError(
-                f"Checkpoint coordinate {coordinate!r} in {source} must use "
-                "an integer dtype"
-            )
-        if np.unique(array).size != array.size:
-            raise ValueError(
-                f"Checkpoint coordinate {coordinate!r} in {source} contains "
-                "duplicate IDs"
-            )
-        return array
-
-    def _commit_restores(
-        self, restores: Sequence[_TensorRestore],
-    ) -> list[_TensorRestore]:
-        """Commit tensors transactionally and return their prior values."""
-
-        originals = [
-            restore.field.tensor.detach().cpu().numpy().copy()
-            for restore in restores
-        ]
-        touched = 0
-        try:
-            for restore in restores:
-                # Include the currently attempted tensor in rollback: a failed
-                # asynchronous/device copy is not guaranteed to be untouched.
-                touched += 1
-                self._copy_state(restore.field.tensor, restore.array)
-        except BaseException as commit_error:
-            rollback_errors: list[BaseException] = []
-            for restore, original in reversed(tuple(zip(
-                restores[:touched], originals[:touched], strict=True,
-            ))):
-                try:
-                    self._copy_state(restore.field.tensor, original)
-                except BaseException as rollback_error:
-                    rollback_errors.append(rollback_error)
-            if rollback_errors:
-                error = ResourceCleanupError(
-                    "checkpoint restore rollback",
-                    (commit_error, *rollback_errors),
-                )
-                # ``load`` cannot receive the original snapshots when this
-                # method raises. Preserve that loss-of-proof on the original
-                # aggregate without replacing its public error type or causes.
-                error._checkpoint_restore_incomplete = True
-                raise error from commit_error
-            raise
-        return [
-            _TensorRestore(restore.field, original)
-            for restore, original in zip(restores, originals, strict=True)
-        ]
-
-    def _rollback_load(
-        self,
-        originals: list[_TensorRestore] | None,
-        commit_error: BaseException | None,
-    ) -> BaseException | None:
-        """Restore local pre-load state and report any loss of proof."""
-
-        model = self.model
-        rollback_errors: list[BaseException] = []
-        if originals is not None:
-            try:
-                self._commit_restores(originals)
-            except BaseException as rollback_error:
-                rollback_errors.append(rollback_error)
-        try:
-            model.checkpoint_state_restored()
-        except BaseException as rollback_error:
-            rollback_errors.append(rollback_error)
-        restore_incomplete = bool(
-            commit_error is not None
-            and getattr(
-                commit_error, "_checkpoint_restore_incomplete", False,
-            )
-        )
-        if not rollback_errors:
-            return commit_error if restore_incomplete else None
-        failures = (
-            (commit_error, *rollback_errors)
-            if restore_incomplete else tuple(rollback_errors)
-        )
-        return ResourceCleanupError("checkpoint load rollback", failures)
-
     def _stage_save(self) -> _CheckpointSaveStage:
-        """Snapshot and validate checkpoint state without publishing a file."""
+        """Snapshot complete current construction input without publishing."""
 
         model = self.model
         variable_map = model._namespace.build()
@@ -753,7 +482,19 @@ class CheckpointRuntime:
                 groups[field.name] = field.coordinate
             elif model.rank != 0:
                 continue
-            data[field.name] = field.tensor.detach().cpu().numpy().copy()
+            value = self._field_value(field)
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().numpy().copy()
+            elif isinstance(value, np.ndarray):
+                value = np.array(value, order="K", copy=True, subok=False)
+            elif isinstance(value, np.generic):
+                value = value.copy()
+            elif type(value) not in {bool, int, float}:
+                raise TypeError(
+                    f"checkpoint construction input {field.name!r} has "
+                    f"unsupported value type {type(value).__name__!r}"
+                )
+            data[field.name] = value
             (distributed if field.coordinate is not None else global_fields).append(
                 field.name
             )
@@ -769,12 +510,6 @@ class CheckpointRuntime:
             groups[coordinate] = coordinate
             distributed.append(coordinate)
 
-        attrs = {
-            "title": "hydroforge Model State",
-            "history": f"Created by hydroforge at {datetime.now().isoformat()}",
-            "source": "hydroforge.output.checkpoint.CheckpointRuntime.save",
-            **self.plan.schema_attrs,
-        }
         return _CheckpointSaveStage(
             timestamp=timestamp,
             path=path,
@@ -782,7 +517,6 @@ class CheckpointRuntime:
             distributed=tuple(distributed),
             global_fields=tuple(global_fields),
             groups=groups,
-            attrs=attrs,
         )
 
     def _abort_save(
@@ -988,10 +722,8 @@ class CheckpointRuntime:
         distributed = stage.distributed
         global_fields = stage.global_fields
         groups = stage.groups
-        attrs = stage.attrs
-        attrs["hydroforge_checkpoint_id"] = checkpoint_id
         execution = model._execution
-        proxy = InputProxy(data=data, attrs=attrs)
+        proxy = InputProxy(data=data)
         if model.world_size == 1:
             return self._save_single_rank(
                 stage, proxy, checkpoint_id=checkpoint_id,
@@ -1172,12 +904,9 @@ class CheckpointRuntime:
                 )
                 execution.poison(error, phase="checkpoint post-commit event")
                 raise error
-            # Return the committed, globally merged artifact on every rank.
-            # A rank-local staging proxy omits global fields away from rank 0
-            # and therefore cannot satisfy this service's own load contract.
-            # Once rank 0 broadcasts merge success, absence of the commit
-            # point is an I/O failure; silently returning the staging proxy
-            # would turn a failed save into a value that cannot be loaded.
+            # Return the committed, globally merged construction input on
+            # every rank. A rank-local staging proxy omits global fields away
+            # from rank zero and is therefore not a complete model input.
             reopen_error: BaseException | None = None
             reopened_proxy: InputProxy | None = None
             try:
@@ -1202,270 +931,3 @@ class CheckpointRuntime:
                 raise failure
             committed_proxy = cast(InputProxy, reopened_proxy)
         return committed_proxy
-
-    def _validate_load_payload(
-        self, proxy: InputProxy,
-    ) -> _ValidatedCheckpointPayload:
-        """Validate a checkpoint completely without mutating live state."""
-
-        fields = self.plan.fields
-        self._validate_schema(proxy)
-        checkpoint_id = proxy.attrs["hydroforge_checkpoint_id"]
-        if not isinstance(checkpoint_id, str) or not checkpoint_id:
-            raise ValueError("checkpoint ID must be a non-empty string")
-        restores: list[_TensorRestore] = []
-        coordinate_indices: dict[str, np.ndarray] = {}
-        for field in fields:
-            field_name = field.name
-            incoming = proxy._get_value_trusted(field_name)
-            if isinstance(incoming, torch.Tensor):
-                incoming = incoming.detach().cpu().numpy()
-            if np.ma.isMaskedArray(incoming) and np.any(
-                np.ma.getmaskarray(incoming)
-            ):
-                raise ValueError(
-                    f"Checkpoint state {field_name!r} contains missing values"
-                )
-            array = np.asarray(incoming)
-            coordinate = field.coordinate
-            if coordinate is not None:
-                indices = coordinate_indices.get(coordinate)
-                if indices is None:
-                    checkpoint = proxy._get_value_trusted(coordinate)
-                    if isinstance(checkpoint, torch.Tensor):
-                        checkpoint = checkpoint.detach().cpu().numpy()
-                    local = self.plan.coordinates[coordinate].values
-                    checkpoint = self._validate_external_coordinate(
-                        coordinate, checkpoint, source="checkpoint",
-                    )
-                    if local.dtype != checkpoint.dtype:
-                        raise TypeError(
-                            f"Checkpoint coordinate {coordinate!r} dtype "
-                            f"{checkpoint.dtype} differs from initialized "
-                            f"model dtype {local.dtype}"
-                        )
-                    indices = _find_indices_in_trusted(
-                        local, checkpoint,
-                    )
-                    if np.any(indices < 0):
-                        missing = np.asarray(local)[indices < 0][:5].tolist()
-                        raise ValueError(
-                            f"Checkpoint coordinate {coordinate!r} is missing "
-                            f"local IDs; examples: {missing}"
-                        )
-                    coordinate_indices[coordinate] = indices
-                array = self._slice(
-                    field, array, indices,
-                )
-            elif array.shape != field.shape:
-                raise ValueError(
-                    f"Shape mismatch for global state {field_name!r}: "
-                    f"expected {field.shape}, got {array.shape}"
-                )
-            if array.shape != field.shape:
-                raise ValueError(
-                    f"Shape mismatch for {field_name!r} after restore: "
-                    f"expected {field.shape}, got {array.shape}"
-                )
-            array = self._validate_array_dtype(field, array)
-            restores.append(_TensorRestore(field, array))
-
-        return _ValidatedCheckpointPayload(tuple(restores), checkpoint_id)
-
-    def load(self, proxy: InputProxy) -> None:
-        """Restore one checkpoint as a rank-synchronous transaction."""
-
-        model = self.model
-        execution = model._execution
-        staged: _ValidatedCheckpointPayload | None = None
-        checkpoint_id = None
-        validation_error: BaseException | None = None
-        try:
-            staged = _CheckpointLoadRequest.model_validate(
-                {"proxy": proxy},
-                context={_CHECKPOINT_LOAD_CONTEXT: self},
-            ).payload
-            checkpoint_id = staged.checkpoint_id
-        except BaseException as error:
-            validation_error = error
-        validation_failures = self._coordinate_phase(
-            validation_error,
-            phase="checkpoint.load.entry",
-            signature=(checkpoint_id,) if checkpoint_id is not None else None,
-        )
-        if any(failure is not None for failure in validation_failures):
-            if validation_error is not None:
-                raise validation_error
-            raise distributed_failure_error(
-                "distributed checkpoint load validation",
-                validation_failures,
-            )
-        restores = cast(_ValidatedCheckpointPayload, staged).restores
-        event_error: BaseException | None = None
-        try:
-            emit(
-                model, "info", "checkpoint.loading", "Loading model state",
-                rank=model.rank,
-            )
-        except BaseException as error:
-            event_error = error
-        event_failures = self._coordinate_phase(
-            event_error,
-            phase="checkpoint.load.events.precommit",
-            signature=(checkpoint_id,),
-        )
-        if any(failure is not None for failure in event_failures):
-            if event_error is not None:
-                raise event_error
-            raise distributed_failure_error(
-                "distributed checkpoint pre-load event",
-                event_failures,
-            )
-
-        # Commit only after every rank validated every field, coordinate and
-        # tensor. Copies preserve tensor identities, so existing compiled
-        # bindings remain valid. Retain old state until every rank reports a
-        # successful commit.
-        original_tensors: list[_TensorRestore] | None = None
-        commit_error: BaseException | None = None
-        try:
-            original_tensors = self._commit_restores(restores)
-            model.checkpoint_state_restored()
-        except BaseException as error:
-            commit_error = error
-
-        try:
-            commit_failures = self._coordinate_phase(
-                commit_error,
-                phase="checkpoint.load.commit",
-                signature=(checkpoint_id,),
-            )
-        except BaseException as coordination_error:
-            rollback_error = self._rollback_load(
-                original_tensors, commit_error,
-            )
-            failures: list[BaseException] = []
-            if commit_error is not None:
-                failures.append(commit_error)
-            failures.append(coordination_error)
-            if (
-                rollback_error is not None
-                and rollback_error is not commit_error
-            ):
-                failures.append(rollback_error)
-            failure = (
-                coordination_error
-                if len(failures) == 1 else ResourceCleanupError(
-                    "checkpoint load commit coordination", failures,
-                )
-            )
-            phase = (
-                "checkpoint load commit coordination"
-                if rollback_error is None else "checkpoint load rollback"
-            )
-            execution.poison(failure, phase=phase)
-            if failure is coordination_error:
-                raise
-            raise failure from coordination_error
-        if any(failure is not None for failure in commit_failures):
-            rollback_error = self._rollback_load(
-                original_tensors, commit_error,
-            )
-            try:
-                rollback_failures = self._coordinate_phase(
-                    rollback_error,
-                    phase="checkpoint.load.rollback",
-                    signature=(checkpoint_id,),
-                )
-            except BaseException as coordination_error:
-                failures = []
-                if commit_error is not None:
-                    failures.append(commit_error)
-                else:
-                    failures.append(distributed_failure_error(
-                        "distributed checkpoint load commit",
-                        commit_failures,
-                    ))
-                if rollback_error is not None:
-                    failures.append(rollback_error)
-                failures.append(coordination_error)
-                failure = ResourceCleanupError(
-                    "checkpoint load rollback coordination", failures,
-                )
-                execution.poison(
-                    failure, phase="checkpoint load rollback coordination",
-                )
-                raise failure from coordination_error
-            if any(failure is not None for failure in rollback_failures):
-                if rollback_error is None:
-                    rollback_error = distributed_failure_error(
-                        "distributed checkpoint rollback",
-                        rollback_failures,
-                    )
-                execution.poison(
-                    rollback_error, phase="checkpoint load rollback",
-                )
-                if rollback_error is commit_error:
-                    raise rollback_error
-                raise rollback_error from commit_error
-            if commit_error is not None:
-                raise commit_error
-            raise distributed_failure_error(
-                "distributed checkpoint load commit",
-                commit_failures,
-            )
-        event_error = None
-        try:
-            emit(
-                model, "info", "checkpoint.loaded", "Loaded model state",
-                rank=model.rank, variables=len(restores),
-            )
-        except BaseException as error:
-            event_error = error
-        try:
-            event_failures = self._coordinate_phase(
-                event_error,
-                phase="checkpoint.load.events.postcommit",
-                signature=(checkpoint_id,),
-            )
-        except BaseException as coordination_error:
-            failure = (
-                coordination_error
-                if event_error is None else ResourceCleanupError(
-                    "checkpoint post-load event coordination",
-                    (event_error, coordination_error),
-                )
-            )
-            execution.poison(
-                failure, phase="checkpoint post-load event coordination",
-            )
-            if failure is coordination_error:
-                raise
-            raise failure from coordination_error
-        if any(failure is not None for failure in event_failures):
-            if event_error is None:
-                event_error = distributed_failure_error(
-                    "distributed checkpoint post-load event",
-                    event_failures,
-                )
-            if event_error is None:
-                raise RuntimeError("checkpoint post-load event failed")
-            execution.poison(event_error, phase="checkpoint post-load event")
-            raise event_error
-
-    def _slice(
-        self,
-        field: _StateField,
-        array: np.ndarray,
-        indices: np.ndarray,
-    ) -> np.ndarray:
-        axis = cast(int, field.partition_axis)
-        slicer = [slice(None)] * array.ndim
-        slicer[axis] = indices
-        try:
-            return array[tuple(slicer)]
-        except IndexError as exc:
-            raise ValueError(
-                f"Cannot shard checkpoint field {field.name!r} with shape "
-                f"{array.shape} on logical axis {axis}"
-            ) from exc

@@ -107,9 +107,15 @@ class _ModelTensorPayload(HydroForgeModel):
                 source, contract.dtype, name=f"input.{name}",
             )
         tensor = source.to(device=self.model.device)
-        tensor = tensor.detach().clone(
-            memory_format=torch.contiguous_format,
+        trials = getattr(self.model, "num_trials", None)
+        shared_trial_state = (
+            trials is not None
+            and contract.category in {"state", "init_state"}
+            and tensor.ndim == contract.logical_rank
         )
+        if shared_trial_state:
+            tensor = tensor.unsqueeze(0).expand(trials, *tensor.shape)
+        tensor = tensor.detach().clone(memory_format=torch.contiguous_format)
 
         if (
             original_dtype != tensor.dtype
@@ -165,6 +171,10 @@ class ModelInput:
                     field.computed
                     or field.excluded
                     or field.name in MODEL_OWNED_MODULE_FIELDS
+                    or (
+                        field.tensor is not None
+                        and field.tensor.category == "forcing"
+                    )
                     or not tensor_is_active(field.tensor, model.opened_modules)
                 ):
                     continue
@@ -235,9 +245,7 @@ class ModelInput:
         trials = self.model.num_trials
         if trials is None:
             allowed_ranks = (logical_rank,)
-        elif contract.category in {"state", "init_state"}:
-            allowed_ranks = (logical_rank + 1,)
-        elif contract.category == "param":
+        elif contract.category in {"state", "init_state", "param", "forcing"}:
             allowed_ranks = (logical_rank, logical_rank + 1)
         else:
             allowed_ranks = (logical_rank,)
