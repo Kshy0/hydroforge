@@ -138,6 +138,9 @@ class ModelInitializer:
                     "hydroforge_trial_forcing_fields": (
                         model._semantic_plan.trial_forcing_fields.get(name, ())
                     ),
+                    "hydroforge_field_demand_plan": (
+                        model._semantic_plan.field_demand
+                    ),
                 },
             )
             model._modules[name] = module
@@ -151,7 +154,7 @@ class ModelInitializer:
     def _apply_tensor_modes(self) -> None:
         model = self.model
         for name in model.opened_modules:
-            model._modules[name]._tensors.apply_modes()
+            model._modules[name]._tensors._apply_modes()
 
     def _precompile_backend(self) -> None:
         """Materialize only backend extensions reachable by opened modules."""

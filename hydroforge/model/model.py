@@ -59,7 +59,7 @@ from hydroforge.data.distributed import ProcessTopology
 from hydroforge.data.input import InputProxy
 from hydroforge.contracts.kernel_field import _KernelField
 from hydroforge.contracts.validation import HydroForgeModel, _immutable_dict
-from hydroforge.contracts.fields import tensor_is_active
+from hydroforge.contracts.fields import FieldDemandPlan, tensor_is_active
 from hydroforge.contracts.temporal import (
     EveryStep,
     SimulationSchedule,
@@ -471,6 +471,13 @@ class AbstractModel(HydroForgeModel, ABC):
             "Statistics outputs as {operation: [field or {alias: expression}]}."
         ),
     )
+    materialized_outputs: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Output-capable fields to keep resident for direct consumers "
+            "without registering a statistics writer"
+        ),
+    )
     precision: Literal["float32", "float64"] = Field(
         default="float32",
         description="Base precision of the model",
@@ -646,6 +653,9 @@ class AbstractModel(HydroForgeModel, ABC):
     _statistics_plan: StatisticsPlan | None = PrivateAttr(default=None)
     _statistics_outputs: tuple[_StatisticsOutput, ...] = PrivateAttr(
         default=(),
+    )
+    _field_demand: FieldDemandPlan = PrivateAttr(
+        default_factory=FieldDemandPlan.empty,
     )
     _semantic_plan: _ModelSemanticPlan = PrivateAttr()
 
@@ -1085,6 +1095,183 @@ class AbstractModel(HydroForgeModel, ABC):
                 f"graph: {error.args[1]}"
             ) from error
 
+    @model_validator(mode="after")
+    def _compile_output_tensor_activation(self) -> Self:
+        """Resolve output requests to their concrete field dependencies."""
+
+        if self._statistics_plan is None and not self.materialized_outputs:
+            self._field_demand = FieldDemandPlan.empty()
+            return self
+
+        opened = frozenset(self.opened_modules)
+        schema = type(self)._compiled_schema()
+        module_types = self._module_types()
+        qualified: dict[str, Any] = {}
+        bare: dict[str, Any] = {}
+        virtual: set[str] = set()
+        ambiguous: set[str] = set()
+
+        def install_bare(field: Any) -> None:
+            name = field.name
+            expression_virtual = bool(
+                field.tensor.category == "virtual"
+                and field.tensor.expression
+            )
+            if expression_virtual:
+                if name not in virtual:
+                    bare[name] = field
+                    virtual.add(name)
+                ambiguous.discard(name)
+                return
+            if name in virtual or name in ambiguous:
+                return
+            if name in bare:
+                bare.pop(name)
+                ambiguous.add(name)
+                return
+            bare[name] = field
+
+        for module_name in self.opened_modules:
+            excluded = set(module_types[module_name].nc_excluded_fields)
+            for field in schema.fields(module_name):
+                tensor = field.tensor
+                if (
+                    tensor is None
+                    or field.excluded
+                    or field.name in excluded
+                    or not all(
+                        dependency in opened
+                        for dependency in tensor.depends_on
+                    )
+                ):
+                    continue
+                qualified[f"{module_name}.{field.name}"] = field
+                install_bare(field)
+            # Reference indices may appear in virtual expressions but not schema.fields.
+            for field_name in module_types[module_name]._reference_index_fields():
+                field = module_types[module_name]._get_tensor_schema(field_name)
+                if field is None:
+                    raise ValueError(
+                        f"ReferenceIndexField {module_name}.{field_name} "
+                        "has no tensor schema"
+                    )
+                qualified[f"{module_name}.{field.name}"] = field
+                install_bare(field)
+
+        # Propagate virtual-output demand before module construction.
+        required: dict[str, set[str]] = {}
+        observed: dict[str, set[str]] = {}
+        known = set(qualified) | set(bare)
+        visited: set[str] = set()
+
+        def field_key(field: Any) -> str:
+            return f"{field.module_name}.{field.name}"
+
+        def source_dependencies(source: Any) -> tuple[str, ...]:
+            if isinstance(source, TensorSource):
+                return (source.name,)
+            if isinstance(source, ExpressionSource):
+                return source.expression.dependencies
+            return (*source.value.dependencies, source.index)
+
+        def resolve_field(name: str) -> Any | None:
+            # Statistics use bare names; aliases may use qualified names.
+            return bare.get(name) or qualified.get(name)
+
+        def visit_field(field: Any) -> None:
+            key = field_key(field)
+            if key in visited:
+                return
+            visited.add(key)
+            observed.setdefault(field.module_name, set()).add(field.name)
+            required.setdefault(field.module_name, set()).add(field.name)
+            tensor = field.tensor
+            if (
+                tensor is None
+                or tensor.category != "virtual"
+                or not tensor.expression
+            ):
+                return
+            source = parse_value_source(tensor.expression, known)
+            for dependency in source_dependencies(source):
+                dependency_field = resolve_field(dependency)
+                if dependency_field is not None:
+                    visit_field(dependency_field)
+
+        for name in self.materialized_outputs:
+            field = qualified.get(name) if "." in name else bare.get(name)
+            if field is None:
+                raise ValueError(
+                    f"materialized output {name!r} is unknown, ambiguous, "
+                    "or inactive"
+                )
+            if field.tensor.output == "disabled":
+                raise ValueError(
+                    f"materialized output {name!r} is disabled for output"
+                )
+            visit_field(field)
+
+        for items in self.variables_to_save.values():
+            for item in items:
+                direct = isinstance(item, str)
+                name = item if direct else next(iter(item))
+                field = qualified.get(name) if "." in name else bare.get(name)
+                if direct:
+                    if field is None:
+                        continue
+                    tensor = field.tensor
+                    if tensor.output == "disabled":
+                        raise ValueError(
+                            f"statistics field {name!r} is disabled for output"
+                        )
+                    visit_field(field)
+                    continue
+
+                # Activate every concrete dependency of an alias expression.
+                expression = next(iter(item.values()))
+                if field is not None:
+                    tensor = field.tensor
+                    if (
+                        tensor.depends_on
+                        or tensor.required_by
+                        or tensor.output_only
+                    ):
+                        observed.setdefault(field.module_name, set()).add(
+                            field.name,
+                        )
+                        # Active conditional fields take precedence over aliases.
+                        if tensor_is_active(
+                            tensor,
+                            self.opened_modules,
+                            output_required=False,
+                        ):
+                            continue
+                source = parse_value_source(expression, known)
+                for dependency in source_dependencies(source):
+                    dependency_field = resolve_field(dependency)
+                    if dependency_field is not None:
+                        visit_field(dependency_field)
+
+        self._field_demand = FieldDemandPlan.from_sets(required, observed)
+        return self
+
+    def _is_tensor_field_active(
+        self,
+        module_name: str,
+        field: Any,
+    ) -> bool:
+        """Resolve one field against the frozen model output specialization."""
+
+        output_required = self._field_demand.is_required(
+            module_name, field.name,
+        )
+        tensor = field.tensor
+        return tensor_is_active(
+            tensor,
+            self.opened_modules,
+            output_required=output_required,
+        )
+
     @cached_property
     def dtype(self) -> torch.dtype:
         _dtype_map = {
@@ -1132,9 +1319,8 @@ class AbstractModel(HydroForgeModel, ABC):
                         )
                 if field.excluded or field.name in excluded:
                     continue
-                if field.tensor is not None and not tensor_is_active(
-                    field.tensor,
-                    self.opened_modules,
+                if field.tensor is not None and not self._is_tensor_field_active(
+                    module_name, field,
                 ):
                     continue
                 previous = field_definitions.get(field.name)
@@ -2089,9 +2275,12 @@ class AbstractModel(HydroForgeModel, ABC):
         for module_name in opened_modules:
             for field in schema.fields(module_name):
                 tensor = field.tensor
-                if tensor is None or not tensor_is_active(
-                    tensor,
-                    opened_modules,
+                if tensor is None:
+                    continue
+                # Keep inactive output-only metadata visible to expressions.
+                if (
+                    not self._is_tensor_field_active(module_name, field)
+                    and not tensor.output_only
                 ):
                     continue
                 install_field(module_name, field)
@@ -2105,6 +2294,12 @@ class AbstractModel(HydroForgeModel, ABC):
                     )
                 install_field(module_name, field)
         known = set(fields)
+        def active_declared_field(name: str) -> bool:
+            field = fields.get(name)
+            if field is None or field.tensor is None:
+                return False
+            return self._is_tensor_field_active(field.module_name, field)
+
         selection_targets = {
             field.tensor.selects.split(".")[-1]
             for field in fields.values()
@@ -2432,12 +2627,9 @@ class AbstractModel(HydroForgeModel, ABC):
                 operation = None
             else:
                 operation = output.operation
-            if output.expression is not None:
-                if output.name in known:
-                    raise ValueError(
-                        f"statistics alias {output.name!r} shadows a declared "
-                        "model field"
-                    )
+            if output.expression is not None and not active_declared_field(
+                output.name,
+            ):
                 expression_metadata = validate_expression(
                     name=output.name,
                     expression=output.expression,
@@ -2459,7 +2651,16 @@ class AbstractModel(HydroForgeModel, ABC):
                 continue
             field = fields[output.name]
             tensor = field.tensor
-            if tensor.output == "disabled":
+            if output.expression is not None and not (
+                tensor.depends_on
+                or tensor.required_by
+                or tensor.output_only
+            ):
+                raise ValueError(
+                    f"statistics alias {output.name!r} shadows an "
+                    "unconditional model field"
+                )
+            if tensor.output == "disabled" and output.expression is None:
                 raise ValueError(
                     f"statistics field {output.name!r} is disabled for output"
                 )
@@ -2592,7 +2793,7 @@ class AbstractModel(HydroForgeModel, ABC):
             grouped_operations.setdefault(output.name, []).append(
                 compiled_operations[(output.name, output.operation)],
             )
-            if output.expression is None:
+            if output.expression is None or active_declared_field(output.name):
                 source = resolve_declared_source(output.name)
             else:
                 source = parse_value_source(output.expression, known)
@@ -2805,6 +3006,7 @@ class AbstractModel(HydroForgeModel, ABC):
             input_axes=input_axes,
             reference_targets=reference_targets,
             trial_forcing_fields=self.trial_forcing_fields,
+            field_demand=self._field_demand,
             statistics=self._statistics_declaration,
             parameter_changes=parameter_changes,
         )

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from functools import cache
-from typing import Any, Self, TypeAlias
+from types import MappingProxyType
+from typing import Any, Self, TypeAlias, get_args
 
 import torch
 from pydantic import PrivateAttr, model_validator
@@ -19,18 +21,139 @@ ModuleType: TypeAlias = type[Any]
 DimensionToken: TypeAlias = str | int
 
 
+@dataclass(frozen=True, slots=True)
+class FieldDemandPlan:
+    """Immutable output demand for one model specialization.
+
+    ``required_fields`` controls storage; ``observed_fields`` also tracks
+    alias and virtual-expression dependencies.
+    """
+
+    required_fields: Mapping[str, frozenset[str]]
+    observed_fields: Mapping[str, frozenset[str]]
+
+    def __post_init__(self) -> None:
+        def freeze(
+            values: Mapping[str, Iterable[str]],
+        ) -> Mapping[str, frozenset[str]]:
+            if not isinstance(values, Mapping):
+                raise TypeError("field demand maps must be mappings")
+            normalized: dict[str, frozenset[str]] = {}
+            for module, fields in values.items():
+                if type(module) is not str or not module:
+                    raise TypeError(
+                        "field demand module names must be non-empty strings"
+                    )
+                if isinstance(fields, str):
+                    raise TypeError(
+                        f"field demand for module {module!r} must be an "
+                        "iterable of field names, not a string"
+                    )
+                try:
+                    normalized[module] = frozenset(fields)
+                except TypeError as error:
+                    raise TypeError(
+                        f"field demand for module {module!r} must be iterable"
+                    ) from error
+                if any(
+                    type(field) is not str or not field
+                    for field in normalized[module]
+                ):
+                    raise TypeError(
+                        f"field demand for module {module!r} must contain "
+                        "non-empty strings"
+                    )
+            return MappingProxyType(normalized)
+
+        object.__setattr__(self, "required_fields", freeze(self.required_fields))
+        object.__setattr__(self, "observed_fields", freeze(self.observed_fields))
+
+    @classmethod
+    def empty(cls) -> Self:
+        """Return a plan with no output-driven field demand."""
+
+        return cls({}, {})
+
+    @classmethod
+    def from_sets(
+        cls,
+        required_fields: Mapping[str, Iterable[str]],
+        observed_fields: Mapping[str, Iterable[str]],
+    ) -> Self:
+        """Build a canonical plan from compiler-owned mutable sets."""
+
+        return cls(required_fields, observed_fields)
+
+    def required_for(self, module_name: str) -> frozenset[str]:
+        """Return direct output requests belonging to one module."""
+
+        return self.required_fields.get(module_name, frozenset())
+
+    def observed_for(self, module_name: str) -> frozenset[str]:
+        """Return all output observations belonging to one module."""
+
+        return self.observed_fields.get(module_name, frozenset())
+
+    @property
+    def specialization_key(
+        self,
+    ) -> tuple[
+        tuple[tuple[str, tuple[str, ...]], ...],
+        tuple[tuple[str, tuple[str, ...]], ...],
+    ]:
+        """Return an order-independent cache key."""
+
+        def canonical(
+            values: Mapping[str, frozenset[str]],
+        ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+            return tuple(
+                (module, tuple(sorted(fields)))
+                for module, fields in sorted(values.items())
+            )
+
+        return canonical(self.required_fields), canonical(self.observed_fields)
+
+    def __hash__(self) -> int:
+        """Make the immutable plan safe to use as a specialization key."""
+
+        return hash(self.specialization_key)
+
+    def is_required(self, module_name: str, field_name: str) -> bool:
+        """Return whether one field is directly requested as output."""
+
+        return field_name in self.required_for(module_name)
+
+    def is_observed(self, module_name: str, field_name: str) -> bool:
+        """Return whether one field participates in output observation."""
+
+        return field_name in self.observed_for(module_name)
+
+
 def tensor_is_active(
     metadata: TensorMetadata | RuntimeTensorMetadata | None,
     opened_modules: Iterable[str],
+    *,
+    output_required: bool = False,
 ) -> bool:
-    """Return whether field dependencies and consumer requirements hold."""
+    """Evaluate conditional tensor residency for one specialization.
+
+    Output demand activates ``output_only`` and ``required_by`` storage but
+    never bypasses ``depends_on``.
+    """
     opened = set(opened_modules)
     required = getattr(metadata, "depends_on", ())
     consumers = getattr(metadata, "required_by", ())
+    output_only = getattr(metadata, "output_only", False)
     return all(
         dependency in opened
         for dependency in required
-    ) and (not consumers or any(item in opened for item in consumers))
+    ) and (
+        not output_only or output_required
+    ) and (
+        not consumers
+        or output_required
+        or any(item in opened for item in consumers)
+    )
 
 
 def concrete_tensor_dtype(
@@ -155,11 +278,11 @@ class TensorMetadata(HydroForgeModel):
     references: str | None
     selects: str | None
     replicated: bool
-    allow_empty: bool
     output: str
     depends_on: tuple[str, ...]
     required_by: tuple[str, ...]
     expression: str
+    output_only: bool = False
 
     @classmethod
     def compile(cls, raw: Mapping[str, Any]) -> Self:
@@ -256,13 +379,13 @@ class TensorMetadata(HydroForgeModel):
             references=optional_name("references"),
             selects=optional_name("selects"),
             replicated=exact_bool("replicated"),
-            allow_empty=exact_bool("allow_empty"),
             output=enum_value(
                 "output", "auto", frozenset({"auto", "full", "disabled"}),
             ),
             depends_on=depends_on,
             required_by=required_by,
             expression=expression,
+            output_only=exact_bool("output_only"),
         )
 
 
@@ -359,6 +482,27 @@ def _field_schema(
         if "tensor_shape" in metadata
         else None
     )
+    annotation = getattr(
+        field, "annotation", getattr(field, "return_type", None),
+    )
+    if tensor is not None and tensor.category != "virtual":
+        may_be_inactive = bool(
+            tensor.depends_on
+            or tensor.required_by
+            or tensor.output_only
+            or tensor.mode == "discard"
+        )
+        if (
+            may_be_inactive
+            and annotation is not Any
+            and annotation is not None
+            and annotation is not type(None)
+            and type(None) not in get_args(annotation)
+        ):
+            raise ValueError(
+                f"{module_name}.{name} may be None because of its tensor "
+                "lifecycle metadata; annotate it as torch.Tensor | None"
+            )
     excluded = getattr(field, "exclude", None)
     if excluded is None:
         excluded = False
@@ -382,7 +526,7 @@ def _field_schema(
         computed=computed,
         tensor=tensor,
         excluded=excluded,
-        annotation=getattr(field, "annotation", getattr(field, "return_type", None)),
+        annotation=annotation,
         description=description,
     )
 

@@ -58,6 +58,25 @@ diagnostic: torch.Tensor | None = TensorField(
 Use a tuple for multiple required modules. `required_by` declares storage used
 when any listed consumer is open. Only `init_state` tensors are checkpointed.
 
+Conditional tensor storage follows three rules:
+
+- `depends_on`: every named module must be open.
+- `required_by`: at least one named consumer must be open or request output.
+- `output_only`: storage exists only when the field is requested directly.
+
+Inactive computed tensors are exposed as `None`. Virtual expression fields are
+symbolic and do not allocate storage.
+
+`variables_to_save` directly requests its declared fields. Alias expressions
+observe their source fields without activating storage. For a conditional field
+with a same-named alias, the tensor is used when active and the alias expression
+is used when inactive. Use `materialized_outputs=("module.field", ...)` when a
+field must be resident without being written by the statistics system.
+
+Kernels can bind output-dependent features with
+`output_requested(module, field)`. The feature is fixed for the compiled model
+specialization across all backends.
+
 A model defines forcing staging and physical execution directly:
 
 ```python
@@ -149,6 +168,11 @@ model = Model(
 
 Models select variables and aggregation operations with `variables_to_save`.
 Supported reductions are `mean`, `sum`, `max`, `min`, `first`, and `last`.
+For a declared tensor, `output="auto"` applies the matching `SelectionField`
+when one exists and otherwise saves the full logical domain; `output="full"`
+always saves the full domain, while `output="disabled"` rejects direct output.
+Output policy controls serialization; field dependencies and output demand
+control storage allocation.
 
 The default NetCDF profile is lossless Blosc-Zstd level 5 with byte shuffle:
 

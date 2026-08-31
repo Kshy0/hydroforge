@@ -11,7 +11,11 @@ import torch
 from pydantic import Field, PrivateAttr, model_validator
 
 from hydroforge.contracts.fields import concrete_tensor_dtype
-from hydroforge.contracts.kernels import ModuleEnabled, ModuleFlag
+from hydroforge.contracts.kernels import (
+    ModuleEnabled,
+    ModuleFlag,
+    OutputRequested,
+)
 from hydroforge.contracts.runtime import (
     DEFAULT_BLOCK_SIZE,
     _effective_block_size,
@@ -196,6 +200,26 @@ class KernelBinder:
         feature_sources: Mapping[str, Any], *, optional: bool,
     ) -> torch.dtype | None:
         field = parameter[:-4] if parameter.endswith("_ptr") else parameter
+
+        def globally_declared_dtype() -> torch.dtype | None:
+            declared = []
+            for module_name, module_type in self.model._module_types().items():
+                schema = module_type._get_tensor_schema(field)
+                if (
+                    schema is not None
+                    and schema.tensor is not None
+                    and not schema.tensor.expression
+                ):
+                    declared.append((module_name, schema.tensor.dtype))
+            if len(declared) == 1:
+                return self._concrete_dtype(declared[0][1])
+            if len(declared) > 1:
+                raise ValueError(
+                    f"optional buffer {parameter!r} has ambiguous declarations "
+                    f"in {[name for name, _kind in declared]}"
+                )
+            return None
+
         matches = self._field_index.get(field, ())
         typed = []
         for match in matches:
@@ -214,35 +238,19 @@ class KernelBinder:
             )
 
         if feature is None and optional:
-            declared = []
-            for module_name, module_type in self.model._module_types().items():
-                schema = module_type._get_tensor_schema(field)
-                if (
-                    schema is not None
-                    and schema.tensor is not None
-                    and not schema.tensor.expression
-                ):
-                    declared.append((module_name, schema.tensor.dtype))
-            if len(declared) == 1:
-                return self._concrete_dtype(declared[0][1])
-            if len(declared) > 1:
-                raise ValueError(
-                    f"optional buffer {parameter!r} has ambiguous declarations "
-                    f"in {[name for name, _kind in declared]}"
-                )
-            return None
+            return globally_declared_dtype()
         if feature is None:
             return None
         source = feature_sources.get(feature)
-        if not isinstance(source, (ModuleEnabled, ModuleFlag)):
+        if not isinstance(source, (ModuleEnabled, ModuleFlag, OutputRequested)):
             return None
         module_name = source.module
         module_type = self.model._module_types().get(module_name)
         if module_type is None:
-            return None
+            return globally_declared_dtype() if optional else None
         schema = module_type._get_tensor_schema(field)
         if schema is None or schema.tensor is None:
-            return None
+            return globally_declared_dtype() if optional else None
         return self._concrete_dtype(schema.tensor.dtype)
 
     def _concrete_dtype(self, kind: str) -> torch.dtype:
@@ -385,8 +393,11 @@ class KernelBinder:
                 )
             module = model._modules.get(source.module)
             if module is None:
+                # Closed optional modules resolve field features to false.
+                if source.module not in model.opened_modules:
+                    return False
                 raise KeyError(
-                    f"kernel feature {parameter!r} requires closed module "
+                    f"kernel feature {parameter!r} requires materialized module "
                     f"{source.module!r}"
                 )
             if source.field not in module_type.model_fields and not hasattr(
@@ -404,8 +415,38 @@ class KernelBinder:
                     f"got {type(value).__name__}"
                 )
             return value
+        if isinstance(source, OutputRequested):
+            module_type = model._module_types().get(source.module)
+            if module_type is None:
+                raise KeyError(
+                    f"kernel feature {parameter!r} references unknown "
+                    f"model module {source.module!r}"
+                )
+            schema = module_type._get_tensor_schema(source.field)
+            if (
+                schema is None
+                or schema.tensor is None
+                or schema.tensor.expression
+            ):
+                raise KeyError(
+                    f"kernel feature {parameter!r} references unknown "
+                    f"materialized tensor field "
+                    f"{source.module}.{source.field}"
+                )
+            module = model._modules.get(source.module)
+            if module is None:
+                if source.module not in model.opened_modules:
+                    return False
+                raise KeyError(
+                    f"kernel feature {parameter!r} requires materialized module "
+                    f"{source.module!r}"
+                )
+            return (
+                module._is_tensor_field_active(schema)
+                and module._is_field_requested_for_output(source.field)
+            )
         raise TypeError(
-            f"kernel feature {parameter!r} has invalid source "
+            f"kernel feature {parameter!r} has unsupported source "
             f"{type(source).__name__}"
         )
 

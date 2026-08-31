@@ -17,7 +17,6 @@ from hydroforge.data.distributed import (
 from hydroforge.compiler.model import _ReferenceTargetPlan
 from hydroforge.contracts.fields import (
     ModuleFieldSchema, PartitionSchema, RuntimeTensorMetadata,
-    tensor_is_active,
 )
 from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.data.numeric import immutable_array
@@ -195,7 +194,7 @@ class _PartitionSemanticCompiler:
             if (
                 not field.computed
                 and field.tensor is not None
-                and tensor_is_active(field.tensor, model.opened_modules)
+                and model._is_tensor_field_active(module_name, field)
             )
         }
         coordinates = {
@@ -475,7 +474,7 @@ class _PartitionSemanticCompiler:
                         f"ReferenceIndexField {descriptor.reference!r} in "
                         f"module {module_name!r} does not name a tensor field"
                     )
-                if not tensor_is_active(source.tensor, opened):
+                if not model._is_tensor_field_active(module_name, source):
                     continue
                 target_name = source.tensor.references
                 if not target_name:
@@ -507,7 +506,9 @@ class _PartitionSemanticCompiler:
                         if (
                             target is not None
                             and target.tensor is not None
-                            and tensor_is_active(target.tensor, opened)
+                            and model._is_tensor_field_active(
+                                owner_type.module_name, target,
+                            )
                         ):
                             candidates.append((
                                 owner_type.module_name,
@@ -518,7 +519,7 @@ class _PartitionSemanticCompiler:
                     if (
                         local is not None
                         and local.tensor is not None
-                        and tensor_is_active(local.tensor, opened)
+                        and model._is_tensor_field_active(module_name, local)
                     ):
                         candidates.append((module_name, target_field))
                     for reference in module_references.values():
@@ -530,7 +531,9 @@ class _PartitionSemanticCompiler:
                         if (
                             target is not None
                             and target.tensor is not None
-                            and tensor_is_active(target.tensor, opened)
+                            and model._is_tensor_field_active(
+                                reference.module_name, target,
+                            )
                         ):
                             candidates.append((
                                 reference.module_name,

@@ -127,7 +127,7 @@ class NetCDFSchema:
             for axis, (chunk, (_name, extent)) in enumerate(
                 zip(chunks[1:], dimensions, strict=True), start=1,
             ):
-                if chunk > extent:
+                if extent > 0 and chunk > extent:
                     raise ValueError(
                         f"NetCDF chunksizes for {variable!r} axis {axis} "
                         f"exceed dimension extent {extent}: {chunk}"

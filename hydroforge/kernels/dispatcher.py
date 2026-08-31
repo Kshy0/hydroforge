@@ -9,6 +9,7 @@ from pydantic import PrivateAttr, model_validator
 
 from hydroforge.contracts.kernels import (
     BackendLoweringSpec, BufferDTypeABI, KernelMetadata, KernelSpec,
+    validate_launch_extent,
 )
 from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.kernels.context import (
@@ -143,6 +144,14 @@ class TorchDispatcher:
     ) -> Callable:
         """Return a zero-argument launch for an already validated call."""
         del buffer_dtypes
+        extent = validate_launch_extent(
+            self.spec.name, self.spec.size_key, arguments,
+        )
+        if extent == 0:
+            def no_op() -> None:
+                return None
+
+            return no_op
         static = {
             name: value for name, value in arguments.items()
             if name in self._parameters
@@ -553,6 +562,13 @@ def _make_triton_program_dispatcher_trusted(
         arguments: dict[str, Any], *,
         buffer_dtypes: BufferDTypeABI,
     ) -> Callable:
+        if validate_launch_extent(
+            spec.name, spec.size_key, arguments,
+        ) == 0:
+            def no_op() -> None:
+                return None
+
+            return no_op
         return prepare(arguments, buffer_dtypes)
 
     lowering = BackendLoweringSpec.plan_specialized(buffer_elements="tensor")

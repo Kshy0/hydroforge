@@ -40,6 +40,8 @@ def _constant_literal(kind: str, value: Any) -> str:
         return "true" if value else "false"
     if kind == "int32":
         return str(value)
+    if kind == "uint32":
+        return f"{value}u"
     if kind == "float32":
         return f"{repr(value)}f"
     if kind == "float64":
@@ -102,6 +104,14 @@ class _TemplateCudaGroup:
             )
         return self._module
 
+    def _load_variant(
+        self, extension: str, masks: tuple[tuple[str, int], ...],
+    ):
+        """Return the module whose masks are already rendered in source."""
+
+        del masks
+        return self._load(extension)
+
     def ensure_precompiled(self):
         return {"template": self._load("template")}
 
@@ -157,6 +167,13 @@ class SpecCudaTemplateDispatcher:
                 f"KernelSpec: {sorted(unknown_ptrs)}"
             )
         unused = set(spec.parameters).difference(identifiers)
+        grouped_members = {
+            member
+            for mask, members in spec.compile_time_masks.items()
+            if mask in identifiers
+            for member in members
+        }
+        unused.difference_update(grouped_members)
         if unused:
             raise ValueError(
                 f"{spec.name}: CUDA body does not consume declared ABI "
@@ -195,6 +212,11 @@ class SpecCudaTemplateDispatcher:
             f"{_constant_literal(kind, constants[name])};"
             for name, kind in self.spec.compile_time.items()
         )
+        mask_source = "\n".join(
+            f"static constexpr uint32_t {name} = "
+            f"{self.spec.compile_time_mask(name, constants)}u;"
+            for name in self.spec.compile_time_masks
+        )
         return f"""
 #include <cuda_runtime.h>
 #include <torch/extension.h>
@@ -203,6 +225,7 @@ class SpecCudaTemplateDispatcher:
 #include <cstdint>
 #include <optional>
 {constant_source}
+{mask_source}
 {self.prelude}
 void {self.launch}(
     {parameters},
