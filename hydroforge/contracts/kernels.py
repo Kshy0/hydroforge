@@ -6,7 +6,15 @@ from functools import cached_property
 import math
 import struct
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, Mapping, Self, TypeAlias
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    Mapping,
+    Self,
+    TypeAlias,
+)
 
 from pydantic import Field, PrivateAttr, model_validator
 
@@ -34,6 +42,7 @@ _LAUNCH_BACKENDS = frozenset({"cuda", "triton", "metal"})
 
 
 class ModuleEnabled(HydroForgeModel):
+    kind: Literal["module_enabled"] = "module_enabled"
     module: str
 
     @model_validator(mode="after")
@@ -46,6 +55,7 @@ class ModuleEnabled(HydroForgeModel):
 
 
 class ModuleFlag(HydroForgeModel):
+    kind: Literal["module_flag"] = "module_flag"
     module: str
     field: str
 
@@ -58,7 +68,30 @@ class ModuleFlag(HydroForgeModel):
         return self
 
 
-FeatureSource: TypeAlias = ModuleEnabled | ModuleFlag
+class OutputRequested(HydroForgeModel):
+    """A compile-time feature derived from one declared statistics field."""
+
+    kind: Literal["output_requested"] = "output_requested"
+    module: str
+    field: str
+
+    @model_validator(mode="after")
+    def _validate_field(self) -> Self:
+        if not isinstance(self.module, str) or not self.module.isidentifier():
+            raise ValueError(
+                "output_requested() requires a valid module identifier"
+            )
+        if not isinstance(self.field, str) or not self.field.isidentifier():
+            raise ValueError(
+                "output_requested() requires a valid field identifier"
+            )
+        return self
+
+
+FeatureSource: TypeAlias = Annotated[
+    ModuleEnabled | ModuleFlag | OutputRequested,
+    Field(discriminator="kind"),
+]
 
 
 def module_enabled(module: str) -> ModuleEnabled:
@@ -67,6 +100,12 @@ def module_enabled(module: str) -> ModuleEnabled:
 
 def module_flag(module: str, field: str) -> ModuleFlag:
     return ModuleFlag(module=module, field=field)
+
+
+def output_requested(module: str, field: str) -> OutputRequested:
+    """Bind a kernel feature to the model's frozen statistics output plan."""
+
+    return OutputRequested(module=module, field=field)
 
 
 class BufferAccessSemantics(HydroForgeModel):
@@ -377,6 +416,10 @@ class KernelSpec(HydroForgeModel):
     buffers: Mapping[str, AccessMode]
     optional_buffers: Mapping[str, str | None] = Field(default_factory=dict)
     compile_time: Mapping[str, ScalarKind] = Field(default_factory=dict)
+    # Source-first backends may pack canonical boolean features into masks.
+    compile_time_masks: Mapping[str, tuple[str, ...]] = Field(
+        default_factory=dict,
+    )
     feature_sources: Mapping[str, FeatureSource] = Field(default_factory=dict)
     runtime_scalars: Mapping[str, RuntimeScalarKind] = Field(default_factory=dict)
     optional_values: Mapping[str, tuple[str, Any]] = Field(default_factory=dict)
@@ -389,7 +432,8 @@ class KernelSpec(HydroForgeModel):
         if not isinstance(self.name, str) or not self.name.isidentifier():
             raise ValueError("KernelSpec.name must be a valid Python identifier")
         for field_name in (
-            "buffers", "optional_buffers", "compile_time", "feature_sources",
+            "buffers", "optional_buffers", "compile_time",
+            "compile_time_masks", "feature_sources",
             "runtime_scalars", "optional_values", "block_sizes",
         ):
             if not isinstance(getattr(self, field_name), Mapping):
@@ -469,6 +513,50 @@ class KernelSpec(HydroForgeModel):
                 f"{self.name}: invalid compile-time scalar kind(s): "
                 f"{sorted(invalid_constant_kinds)}"
             )
+        invalid_masks = {
+            name: members
+            for name, members in self.compile_time_masks.items()
+            if (
+                type(name) is not str
+                or not name.isidentifier()
+                or type(members) is not tuple
+                or not members
+                or len(members) != len(set(members))
+                or any(
+                    type(member) is not str
+                    or member not in self.compile_time
+                    or self.compile_time[member] != "bool"
+                    for member in members
+                )
+            )
+        }
+        if invalid_masks:
+            raise ValueError(
+                f"{self.name}: compile-time masks must map identifiers to "
+                "unique tuples of boolean compile-time parameters: "
+                f"{sorted(invalid_masks)}"
+            )
+        mask_names = set(self.compile_time_masks)
+        mask_collisions = mask_names.intersection(parameter_set)
+        if mask_collisions:
+            raise ValueError(
+                f"{self.name}: compile-time mask names cannot be canonical "
+                f"parameters: {sorted(mask_collisions)}"
+            )
+        mask_memberships: dict[str, str] = {}
+        for mask, members in self.compile_time_masks.items():
+            if len(members) > 32:
+                raise ValueError(
+                    f"{self.name}: compile-time mask {mask!r} supports at most "
+                    "32 boolean members"
+                )
+            for member in members:
+                previous = mask_memberships.setdefault(member, mask)
+                if previous != mask:
+                    raise ValueError(
+                        f"{self.name}: compile-time feature {member!r} belongs "
+                        f"to masks {previous!r} and {mask!r}"
+                    )
         noncanonical_features = sorted(
             name for name, kind in self.compile_time.items()
             if kind == "bool" and name.isupper() and not name.startswith("HAS_")
@@ -489,12 +577,13 @@ class KernelSpec(HydroForgeModel):
         invalid_feature_sources = {
             name: type(source).__name__
             for name, source in self.feature_sources.items()
-            if not isinstance(source, (ModuleEnabled, ModuleFlag))
+            if not isinstance(source, (ModuleEnabled, ModuleFlag, OutputRequested))
         }
         if invalid_feature_sources:
             raise ValueError(
-                f"{self.name}: feature_sources must contain module_enabled() "
-                f"or module_flag() declarations: {invalid_feature_sources}"
+                f"{self.name}: feature_sources must contain module_enabled(), "
+                f"module_flag(), or output_requested() declarations: "
+                f"{invalid_feature_sources}"
             )
         non_boolean_feature_sources = {
             name: self.compile_time[name]
@@ -658,6 +747,14 @@ class KernelSpec(HydroForgeModel):
         )
         object.__setattr__(self, "compile_time", _frozen_mapping(self.compile_time))
         object.__setattr__(
+            self,
+            "compile_time_masks",
+            _frozen_mapping({
+                name: tuple(members)
+                for name, members in self.compile_time_masks.items()
+            }),
+        )
+        object.__setattr__(
             self, "feature_sources", _frozen_mapping(self.feature_sources),
         )
         object.__setattr__(
@@ -720,6 +817,7 @@ class KernelSpec(HydroForgeModel):
             "buffers": self.buffers,
             "optional_buffers": self.optional_buffers,
             "compile_time": self.compile_time,
+            "compile_time_masks": self.compile_time_masks,
             "feature_sources": self.feature_sources,
             "runtime_scalars": self.runtime_scalars,
             "optional_values": self.optional_values,
@@ -727,6 +825,29 @@ class KernelSpec(HydroForgeModel):
         }
         values.update(changes)
         return KernelSpec.model_construct(**values)
+
+    def compile_time_mask(
+        self, name: str, arguments: Mapping[str, Any],
+    ) -> int:
+        """Pack one declared boolean feature group into a constexpr mask."""
+
+        try:
+            members = self.compile_time_masks[name]
+        except KeyError as error:
+            raise KeyError(
+                f"{self.name}: unknown compile-time mask {name!r}"
+            ) from error
+        mask = 0
+        for bit, member in enumerate(members):
+            value = arguments[member]
+            if type(value) is not bool:
+                raise TypeError(
+                    f"{self.name}.{member} must be an exact bool to build "
+                    f"compile-time mask {name!r}"
+                )
+            if value:
+                mask |= 1 << bit
+        return mask
 
     def _metadata(
         self, compile_time: Mapping[str, ScalarKind],
@@ -883,6 +1004,14 @@ class KernelSpec(HydroForgeModel):
                 parameter: kind
                 for parameter, kind in self.compile_time.items()
                 if parameter not in omitted
+            },
+            compile_time_masks={
+                name: tuple(
+                    member for member in members if member not in omitted
+                )
+                for name, members in self.compile_time_masks.items()
+                if name not in omitted
+                and any(member not in omitted for member in members)
             },
             feature_sources={
                 parameter: source

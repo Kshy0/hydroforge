@@ -324,11 +324,18 @@ def _largest_divisor_not_exceeding(value: int, limit: int) -> int:
 def _fit_spatial_chunks(
     shape: Sequence[int], *, max_elements: int,
 ) -> tuple[int, ...]:
-    """Tile a row deterministically without exceeding an element budget."""
+    """Tile a row deterministically without exceeding an element budget.
 
-    chunks = [int(extent) for extent in shape]
-    if any(extent <= 0 for extent in chunks):
-        raise ValueError("NetCDF output dimensions must be positive")
+    NetCDF represents a zero-sized dimension as an unlimited dimension.  Its
+    chunk extent must still be positive, so an empty logical axis uses a
+    physical chunk extent of one while retaining a current dimension length
+    of zero.
+    """
+
+    extents = [int(extent) for extent in shape]
+    if any(extent < 0 for extent in extents):
+        raise ValueError("NetCDF output dimensions must be non-negative")
+    chunks = [max(1, extent) for extent in extents]
     while math.prod(chunks) > max_elements:
         axis = max(range(len(chunks)), key=chunks.__getitem__)
         other = math.prod(chunks[:axis] + chunks[axis + 1:])

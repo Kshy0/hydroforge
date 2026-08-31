@@ -761,9 +761,14 @@ class MetalDispatcher:
         """Own packed tensors in the model-local specialized launch."""
 
         values = dict(arguments)
+        threads, group_size = self._trusted_launch_geometry(values)
+        if threads == 0:
+            def no_op() -> None:
+                return None
+
+            return no_op
         packed = self._packed_values(values)
         static = values | packed
-        threads, group_size = self._trusted_launch_geometry(static)
 
         def launch() -> None:
             prepared = self._prepare_values(

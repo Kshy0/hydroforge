@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Mapping
 
-from hydroforge.contracts.fields import tensor_is_active
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -58,7 +57,7 @@ class NamespaceCompiler:
         for module_name in self.model.opened_modules:
             module = self.model._modules[module_name]
             for field in module.tensor_schema():
-                if not tensor_is_active(field.tensor, self.model.opened_modules):
+                if not module._is_tensor_field_active(field):
                     continue
                 field_name = field.name
                 entry = NamespaceEntry(

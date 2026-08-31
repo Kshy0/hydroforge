@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 from pydantic import BaseModel
 
+from hydroforge.contracts.fields import FieldDemandPlan
 from hydroforge.contracts.kernel_field import _KernelField
-from hydroforge.contracts.fields import tensor_is_active
 
 if TYPE_CHECKING:
     from hydroforge.contracts.fields import PartitionSchema
@@ -50,6 +50,7 @@ class _ModelSemanticPlan:
         str, Mapping[str, _ReferenceTargetPlan]
     ]
     trial_forcing_fields: Mapping[str, tuple[str, ...]]
+    field_demand: FieldDemandPlan
     statistics: _StatisticsDeclaration | None
     parameter_changes: tuple[_ParameterChangePlan, ...]
 
@@ -74,9 +75,7 @@ class FieldNamespaceCompiler:
                     schema.tensor is None
                     or (
                         not schema.tensor.expression
-                        and tensor_is_active(
-                            schema.tensor, model.opened_modules,
-                        )
+                        and module._is_tensor_field_active(schema)
                         and (
                             schema.tensor.category != "virtual"
                             or name in module.__dict__

@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 
 import torch
 
-from hydroforge.contracts.fields import tensor_is_active
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -303,7 +302,7 @@ def _validate_dependent_shapes(
         module = model._modules[module_name]
         for field in module.tensor_schema():
             tensor_schema = field.tensor
-            if not tensor_is_active(tensor_schema, model.opened_modules):
+            if not module._is_tensor_field_active(field):
                 continue
             if (
                 tensor_schema.category == "virtual"

@@ -41,7 +41,7 @@ from pydantic import (
 
 from hydroforge.data.distributed import _find_indices_in_torch_trusted
 from hydroforge.contracts.events import EventSink, ModelEvent, NullEventSink
-from hydroforge.contracts.fields import tensor_is_active
+from hydroforge.contracts.fields import FieldDemandPlan, tensor_is_active
 from hydroforge.contracts.kernel_field import _KernelField
 from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.contracts.runtime import MODEL_OWNED_MODULE_FIELDS
@@ -54,6 +54,7 @@ _MODULE_REFERENCES_CONTEXT = "hydroforge_module_references"
 _MODULE_EVENT_SINK_CONTEXT = "hydroforge_module_event_sink"
 _MODULE_REFERENCE_TARGETS_CONTEXT = "hydroforge_module_reference_targets"
 _MODULE_TRIAL_FORCING_CONTEXT = "hydroforge_trial_forcing_fields"
+_MODULE_FIELD_DEMAND_CONTEXT = "hydroforge_field_demand_plan"
 
 
 class _ModuleTensorQuery(HydroForgeModel):
@@ -171,13 +172,22 @@ class _TensorFieldDeclaration(HydroForgeModel):
     references: str | None = None
     selects: str | None = None
     replicated: bool = False
-    allow_empty: bool = False
     output: Literal["auto", "full", "disabled"] = "auto"
     depends_on: str | tuple[str, ...] | None = None
     required_by: str | tuple[str, ...] | None = None
 
     @model_validator(mode="after")
-    def _validate_forcing_contract(self) -> Self:
+    def _validate_field_contract(self) -> Self:
+        if self.mode == "discard":
+            if self.category not in {"topology", "param"}:
+                raise ValueError(
+                    "mode='discard' is only valid for construction-time "
+                    "topology or parameter fields"
+                )
+            if self.output != "disabled":
+                raise ValueError(
+                    "mode='discard' fields must use output='disabled'"
+                )
         if self.category != "forcing":
             return self
         if self.mode != "device":
@@ -212,7 +222,6 @@ def TensorField(
     references: Optional[str] = None,
     selects: Optional[str] = None,
     replicated: bool = False,
-    allow_empty: bool = False,
     output: Literal["auto", "full", "disabled"] = "auto",
     depends_on: str | Tuple[str, ...] | None = None,
     required_by: str | Tuple[str, ...] | None = None,
@@ -235,8 +244,6 @@ def TensorField(
         replicated: Coordinate ownership exception.  ``True`` means every rank
                     receives the complete coordinate and its aligned fields.
                     Valid only for CoordinateField declarations.
-        allow_empty: Whether a tensor may contain a zero-length declared axis.
-                     Ordinary model dimensions are non-empty by default.
         output: Output policy. ``auto`` inherits the default SelectionField for
                 ``dim_coords``; ``full`` writes the full local axis; ``disabled``
                 rejects explicit output requests.
@@ -270,7 +277,6 @@ def TensorField(
         references=references,
         selects=selects,
         replicated=replicated,
-        allow_empty=allow_empty,
         output=output,
         depends_on=depends_on,
         required_by=required_by,
@@ -295,7 +301,6 @@ def TensorField(
             "references": declaration.references,
             "selects": declaration.selects,
             "replicated": declaration.replicated,
-            "allow_empty": declaration.allow_empty,
             "output": declaration.output,
             "depends_on": declaration.depends_on,
             "required_by": declaration.required_by,
@@ -310,7 +315,6 @@ def CoordinateField(
     partition_by: Optional[str] = None,
     references: Optional[str] = None,
     replicated: bool = False,
-    allow_empty: bool = False,
     default: Any = _NO_FIELD_DEFAULT,
 ):
     """Declare an axis coordinate; ownership is inferred from its relations."""
@@ -326,7 +330,6 @@ def CoordinateField(
         partition_by=partition_by,
         references=references,
         replicated=replicated,
-        allow_empty=allow_empty,
         default=default,
     )
 
@@ -336,7 +339,6 @@ def SelectionField(
     shape: Tuple[str | int, ...],
     selects: str,
     dtype: Literal["int", "idx"] = "int",
-    allow_empty: bool = True,
     default: Any = _NO_FIELD_DEFAULT,
 ):
     """Declare a unique coordinate subset used as the default output view."""
@@ -351,7 +353,6 @@ def SelectionField(
         is_coordinate=True,
         references=selects,
         selects=selects,
-        allow_empty=allow_empty,
         output="disabled",
         default=default,
     )
@@ -364,7 +365,6 @@ def ReferenceField(
     dim_coords: str,
     dtype: Literal["int", "idx"] = "int",
     is_key: bool = False,
-    allow_empty: bool = False,
     default: Any = _NO_FIELD_DEFAULT,
 ):
     """Declare a globally valid foreign key to another coordinate."""
@@ -377,7 +377,6 @@ def ReferenceField(
         mode="cpu",
         is_key=is_key,
         references=references,
-        allow_empty=allow_empty,
         default=default,
     )
 
@@ -561,12 +560,18 @@ class _ComputedTensorFieldDeclaration(HydroForgeModel):
     depends_on: str | tuple[str, ...] | None = None
     required_by: str | tuple[str, ...] | None = None
     output: Literal["auto", "full", "disabled"] = "auto"
-    allow_empty: bool = False
+    output_only: bool = False
 
     @model_validator(mode="after")
     def _validate_expression(self) -> Self:
         if self.expr is not None and self.category != "virtual":
             raise ValueError("expr can only be provided when category is 'virtual'")
+        if self.output_only and self.category == "virtual":
+            raise ValueError("output_only is invalid for virtual fields")
+        if self.output_only and self.output == "disabled":
+            raise ValueError(
+                "output_only fields must permit explicit statistics output"
+            )
         return self
 
 
@@ -582,7 +587,7 @@ def computed_tensor_field(
     depends_on: str | Tuple[str, ...] | None = None,
     required_by: str | Tuple[str, ...] | None = None,
     output: Literal["auto", "full", "disabled"] = "auto",
-    allow_empty: bool = False,
+    output_only: bool = False,
 ):
     """
     Create a computed tensor field with shape information for AbstractModule.
@@ -606,7 +611,12 @@ def computed_tensor_field(
             computed tensor is evaluated or validated.
         required_by: Consumer module names. At least one must be active before
             this computed tensor is evaluated or validated.
-        allow_empty: Whether a symbolic tensor dimension may resolve to zero.
+        output_only: Keep this computed tensor unmaterialized unless it is
+            directly requested by statistics. This is an output-storage
+            policy; it does not introduce a new checkpoint/state lifecycle
+            category. HydroForge exposes an inactive computed tensor as
+            ``None`` after specialization, so field implementations do not
+            need an activation guard.
     """
     declaration = _ComputedTensorFieldDeclaration(
         description=description,
@@ -618,7 +628,7 @@ def computed_tensor_field(
         depends_on=depends_on,
         required_by=required_by,
         output=output,
-        allow_empty=allow_empty,
+        output_only=output_only,
     )
 
     return computed_field(
@@ -631,8 +641,8 @@ def computed_tensor_field(
             "expr": declaration.expr,
             "depends_on": declaration.depends_on,
             "required_by": declaration.required_by,
-            "allow_empty": declaration.allow_empty,
             "output": declaration.output,
+            "output_only": declaration.output_only,
         },
     )
 
@@ -713,6 +723,8 @@ class AbstractModule(HydroForgeModel, ABC):
         default_factory=dict,
     )
     _reference_targets: Mapping[str, Any] = PrivateAttr(default_factory=dict)
+    _output_required_fields: frozenset[str] = PrivateAttr(default_factory=frozenset)
+    _observed_output_fields: frozenset[str] = PrivateAttr(default_factory=frozenset)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -766,7 +778,17 @@ class AbstractModule(HydroForgeModel, ABC):
         )
         if schema is None or schema.tensor is None:
             raise KeyError(f"Unknown tensor field: {field}")
-        return tensor_is_active(schema.tensor, self.opened_modules)
+        output_required = schema.name in self._output_required_fields
+        return tensor_is_active(
+            schema.tensor,
+            self.opened_modules,
+            output_required=output_required,
+        )
+
+    def _is_field_requested_for_output(self, field: str) -> bool:
+        """Return whether statistics observes this declared field directly."""
+
+        return field in self._observed_output_fields
 
     def _emit(self, level: str, name: str, message: str, **fields: Any) -> None:
         self._event_sink.emit(
@@ -836,6 +858,12 @@ class AbstractModule(HydroForgeModel, ABC):
             raise ValueError(
                 "model initialization must provide trial forcing fields as a tuple"
             )
+        demand_plan = context.get(_MODULE_FIELD_DEMAND_CONTEXT)
+        if not isinstance(demand_plan, FieldDemandPlan):
+            raise ValueError(
+                "model initialization must provide a FieldDemandPlan"
+            )
+        output_required_fields = demand_plan.required_for(cls.module_name)
         try:
             payload = cls.prepare_module_input(dict(values))
             if not isinstance(payload, dict):
@@ -843,11 +871,12 @@ class AbstractModule(HydroForgeModel, ABC):
                     f"module {cls.module_name!r} prepare_module_input must "
                     "return a dict"
                 )
-            return ModuleTensors.prepare_payload(
+            return ModuleTensors._prepare_payload(
                 cls,
                 payload,
                 module_references=references,
                 batched_fields=trial_forcing_fields,
+                output_required_fields=output_required_fields,
             )
         except (KeyError, TypeError, OverflowError) as error:
             raise ValueError(str(error)) from error
@@ -870,6 +899,19 @@ class AbstractModule(HydroForgeModel, ABC):
             }
             self._reference_targets = context[_MODULE_REFERENCE_TARGETS_CONTEXT]
             self._event_sink = context[_MODULE_EVENT_SINK_CONTEXT]
+            demand_plan = context.get(_MODULE_FIELD_DEMAND_CONTEXT)
+            if not isinstance(demand_plan, FieldDemandPlan):
+                raise ValueError(
+                    "model initialization must provide a FieldDemandPlan"
+                )
+            output_required_fields = demand_plan.required_for(
+                self.module_name,
+            )
+            observed_output_fields = demand_plan.observed_for(
+                self.module_name,
+            )
+            self._output_required_fields = output_required_fields
+            self._observed_output_fields = observed_output_fields
             trial_forcing_fields = context.get(_MODULE_TRIAL_FORCING_CONTEXT, ())
             if type(trial_forcing_fields) is not tuple:
                 raise ValueError(
@@ -884,8 +926,8 @@ class AbstractModule(HydroForgeModel, ABC):
                     f"`{self.module_name}` is not listed in `opened_modules`. "
                     "All active modules must include themselves in that list."
                 )
-            self._tensors.initialize_declared()
-            self._tensors.materialize_computed()
+            self._tensors._initialize_declared()
+            self._tensors._finalize_computed()
         except (KeyError, TypeError, OverflowError) as error:
             raise ValueError(str(error)) from error
         return self
@@ -943,7 +985,6 @@ class AbstractModule(HydroForgeModel, ABC):
                 "category": "topology",
                 "mode": "device" if descriptor.device else "cpu",
                 "output": "disabled",
-                "allow_empty": source.tensor.allow_empty,
             }
         )
 
@@ -1035,7 +1076,7 @@ class AbstractModule(HydroForgeModel, ABC):
         return self._get_expected_dtype(query.field_name)
 
     def _get_expected_dtype(self, field_name: str) -> torch.dtype:
-        return self._tensors.expected_dtype(field_name)
+        return self._tensors._expected_dtype(field_name)
 
     @model_validator(mode="after")
     def _validate_opened_modules(self) -> Self:

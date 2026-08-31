@@ -24,7 +24,6 @@ from hydroforge.contracts.fields import (
     ModuleFieldSchema,
     cast_declared_tensor,
     concrete_tensor_dtype,
-    tensor_is_active,
 )
 from hydroforge.contracts.runtime import MODEL_OWNED_MODULE_FIELDS
 from hydroforge.contracts.validation import HydroForgeModel
@@ -175,7 +174,7 @@ class ModelInput:
                         field.tensor is not None
                         and field.tensor.category == "forcing"
                     )
-                    or not tensor_is_active(field.tensor, model.opened_modules)
+                    or not model._is_tensor_field_active(module_name, field)
                 ):
                     continue
                 fields.setdefault(field.name, field)

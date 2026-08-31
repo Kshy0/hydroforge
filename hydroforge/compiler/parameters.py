@@ -14,7 +14,6 @@ import torch
 from hydroforge.contracts.fields import (
     ModuleFieldSchema,
     concrete_tensor_dtype,
-    tensor_is_active,
 )
 from hydroforge.contracts.parameters import ParameterChange, ParameterValue
 from hydroforge.data.distributed import _find_indices_in_trusted
@@ -86,8 +85,8 @@ class ParameterSemanticCompiler:
         for module_name in self.model.opened_modules:
             for field in schema.fields(module_name):
                 tensor = field.tensor
-                if tensor is None or not tensor_is_active(
-                    tensor, self.model.opened_modules,
+                if tensor is None or not self.model._is_tensor_field_active(
+                    module_name, field,
                 ):
                     continue
                 resolved = _ResolvedParameterField(module_name, field)

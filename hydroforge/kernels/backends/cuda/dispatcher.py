@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
+import hashlib
 import math
 from typing import Any, Callable, Dict, Mapping, Self
 
@@ -278,7 +279,16 @@ def _compile_cuda_route(
             "consumed by the launcher/derived ABI or absent from KernelSpec: "
             f"{sorted(unknown_fixed)}"
         )
-    missing_fixed = omitted_canonical.difference(projection.fixed)
+    # Mask members are supplied by source specialization, not launcher inputs.
+    grouped_features = (
+        set().union(*spec.compile_time_masks.values())
+        if spec.compile_time_masks
+        else set()
+    )
+    missing_fixed = omitted_canonical.difference(
+        projection.fixed,
+        grouped_features,
+    )
     if missing_fixed:
         raise ValueError(
             f"{spec.name}: CUDA launcher omits canonical inputs "
@@ -286,7 +296,11 @@ def _compile_cuda_route(
             "CudaNativeProjection.fixed instead of inferring semantics from "
             "an absent native parameter"
         )
-    _validate_projection_values(spec, projection, omitted_canonical)
+    _validate_projection_values(
+        spec,
+        projection,
+        omitted_canonical.difference(grouped_features),
+    )
     if "BLOCK_SIZE" not in native_names:
         raise ValueError(
             f"{spec.name}: CUDA launcher must expose compiler-owned "
@@ -434,6 +448,9 @@ class CudaExtensionGroup(HydroForgeModel):
         default_factory=dict,
     )
     _loaded: Dict[str, Any] = PrivateAttr(default_factory=dict)
+    _variant_loaded: Dict[tuple[str, tuple[tuple[str, int], ...]], Any] = (
+        PrivateAttr(default_factory=dict)
+    )
     _precompiled: set[str] = PrivateAttr(default_factory=set)
 
     @model_validator(mode="after")
@@ -593,6 +610,41 @@ class CudaExtensionGroup(HydroForgeModel):
         self._loaded[name] = module
         return module
 
+    def _load_variant(
+        self, name: str, masks: tuple[tuple[str, int], ...],
+    ) -> Any:
+        """Compile a CUDA source variant for one grouped-mask tuple."""
+
+        key = (name, masks)
+        cached = self._variant_loaded.get(key)
+        if cached is not None:
+            return cached
+        if not masks:
+            return self._load(name)
+        spec = self._compiled_specs[name]
+        prefix = "".join(
+            f"#define HYDROFORGE_{mask} {value}u\n"
+            for mask, value in masks
+        )
+        source = prefix + spec.source
+        digest = hashlib.sha256(source.encode()).hexdigest()[:16]
+        from hydroforge.kernels.backends.cuda.build import load_inline_cu_module
+
+        module = load_inline_cu_module(
+            f"{self.binary_prefix}_{name}_mask_{digest}",
+            cpp_sources="\n".join((*spec.cpp_headers, *cuda_declarations(
+                source, spec.functions,
+            ))),
+            cuda_sources=source,
+            functions=spec.functions,
+            extra_cuda_cflags=spec.cflags,
+            extra_include_paths=tuple(map(str, spec.include_paths)),
+            extra_ldflags=spec.ldflags,
+            env_prefix=self.env_prefix,
+        )
+        self._variant_loaded[key] = module
+        return module
+
     def _ensure_precompiled(
         self, extensions: Any = None,
     ) -> Dict[str, Any]:
@@ -701,7 +753,19 @@ class CudaDispatcher:
                 return None
 
             return no_op
-        launcher = self._launcher
+        if self.spec.compile_time_masks:
+            masks = tuple(
+                (
+                    name,
+                    self.spec.compile_time_mask(name, values),
+                )
+                for name in self.spec.compile_time_masks
+            )
+            launcher = getattr(
+                self.group._load_variant(self.extension, masks), self.launch,
+            )
+        else:
+            launcher = self._launcher
         static_launch = tuple(values[name] for name in self.launch_args)
 
         def launch():

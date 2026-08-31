@@ -10,7 +10,7 @@ import torch
 from pydantic_core import PydanticUndefined
 
 from hydroforge.contracts.fields import (
-    concrete_tensor_dtype, tensor_is_active,
+    concrete_tensor_dtype,
 )
 
 
@@ -29,9 +29,13 @@ class _ModulePayload:
         module_type: type,
         payload: dict[str, Any],
         module_references: dict[str, Any],
+        output_required_fields: frozenset[str],
     ) -> None:
         object.__setattr__(self, "_module_type", module_type)
         object.__setattr__(self, "_model_fields_set", frozenset(payload))
+        object.__setattr__(
+            self, "_output_required_fields", output_required_fields,
+        )
         object.__setattr__(self, "_reference_values", {
             name: module_references.get(descriptor.module_name)
             for name, descriptor in
@@ -63,7 +67,7 @@ class _ModulePayload:
             return descriptor.__get__(self, module_type)
         return descriptor
 
-    def completed(self) -> dict[str, Any]:
+    def _completed(self) -> dict[str, Any]:
         return {
             name: getattr(self, name)
             for name in self._module_type.model_fields
@@ -84,41 +88,46 @@ class ModuleTensors:
         self.batched_fields: set[str] = set(batched_fields)
 
     @classmethod
-    def prepare_payload(
+    def _prepare_payload(
         cls,
         module_type: type,
         payload: dict[str, Any],
         *,
         module_references: dict[str, Any],
         batched_fields: tuple[str, ...] = (),
+        output_required_fields: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         """Complete scalar tensor defaults inside Pydantic validation."""
 
-        view = _ModulePayload(module_type, payload, module_references)
+        view = _ModulePayload(
+            module_type, payload, module_references, output_required_fields,
+        )
         tensors = cls(view, batched_fields=batched_fields)
         tensors._deactivate_declared()
         tensors._initialize_optional()
-        return view.completed()
+        return view._completed()
 
-    def initialize_declared(self) -> None:
+    def _initialize_declared(self) -> None:
         """Validate the complete tensor payload supplied to Pydantic."""
 
         self._validate_declared()
 
-    def materialize_computed(self) -> None:
-        """Materialize non-virtual computed tensors after module linking."""
+    def _finalize_computed(self) -> None:
+        """Resolve computed tensor residency and validate active values."""
 
         module = self.module
-        for field in module.tensor_schema():
-            if (
-                not field.computed
-                or field.tensor.category == "virtual"
-                or not module._is_tensor_field_active(field)
-            ):
-                continue
-            self._validate_computed_field(
-                field.name, getattr(module, field.name),
-            )
+        computed_fields = tuple(
+            field for field in module.tensor_schema()
+            if field.computed and field.tensor.category != "virtual"
+        )
+        for field in computed_fields:
+            if not module._is_tensor_field_active(field):
+                object.__setattr__(module, field.name, None)
+        for field in computed_fields:
+            if module._is_tensor_field_active(field):
+                self._validate_computed_field(
+                    field.name, getattr(module, field.name),
+                )
         # Derived reference indices are descriptors rather than Pydantic
         # computed fields, but belong to the same stable cold-start phase.
         for name in module._reference_index_fields():
@@ -144,12 +153,12 @@ class ModuleTensors:
                 )
             object.__setattr__(module, field.name, None)
 
-    def expected_shape(self, field_name: str) -> tuple[int, ...] | None:
+    def _expected_shape(self, field_name: str) -> tuple[int, ...] | None:
         module = self.module
         schema = module._tensor_schema_map().get(field_name)
         if schema is None:
             raise ValueError(f"Field {field_name} is not a tensor field")
-        if not tensor_is_active(schema.tensor, module.opened_modules):
+        if not module._is_tensor_field_active(schema):
             return None
         values: dict[Any, Any] = {}
         for dimension in schema.tensor.shape:
@@ -179,13 +188,10 @@ class ModuleTensors:
                     f"Dimension '{dimension}' used by field '{field_name}' must "
                     f"be an integer, got {type(size).__name__}"
                 )
-            if size < 0 or (size == 0 and not schema.tensor.allow_empty):
-                requirement = (
-                    "non-negative" if schema.tensor.allow_empty else "positive"
-                )
+            if size < 0:
                 raise ValueError(
                     f"Dimension '{dimension}' used by field '{field_name}' must "
-                    f"be {requirement}, got {size}"
+                    f"be non-negative, got {size}"
                 )
         if module.num_trials is not None:
             category = schema.tensor.category
@@ -197,7 +203,7 @@ class ModuleTensors:
                 return (module.num_trials, *shape)
         return shape
 
-    def expected_dtype(self, field_name: str) -> torch.dtype:
+    def _expected_dtype(self, field_name: str) -> torch.dtype:
         module = self.module
         schema = module._get_tensor_schema(field_name)
         if schema is None:
@@ -215,7 +221,7 @@ class ModuleTensors:
                 or not module._is_tensor_field_active(schema)
             ):
                 continue
-            shape = self.expected_shape(schema.name)
+            shape = self._expected_shape(schema.name)
             if shape is None:
                 continue
             value = getattr(module, schema.name, None)
@@ -223,7 +229,7 @@ class ModuleTensors:
                 tensor = None
             elif isinstance(value, (int, float, bool)):
                 tensor = torch.full(
-                    shape, value, dtype=self.expected_dtype(schema.name),
+                    shape, value, dtype=self._expected_dtype(schema.name),
                     device=module.device,
                 )
             else:
@@ -245,7 +251,7 @@ class ModuleTensors:
             tensor = getattr(module, name, None)
             if not isinstance(tensor, torch.Tensor):
                 continue
-            expected = self.expected_shape(name)
+            expected = self._expected_shape(name)
             if expected is not None and tuple(tensor.shape) != expected:
                 tensor = self._resolve_batch_shape(field, tensor, expected)
             if not tensor.is_contiguous():
@@ -258,7 +264,7 @@ class ModuleTensors:
                     f"Input field {module.module_name}.{name} must already be "
                     f"on device {module.device}, got {tensor.device}"
                 )
-            dtype = self.expected_dtype(name)
+            dtype = self._expected_dtype(name)
             if tensor.dtype != dtype:
                 raise ValueError(
                     f"Input field {module.module_name}.{name} must already use "
@@ -280,7 +286,7 @@ class ModuleTensors:
             and tuple(tensor.shape[1:]) == expected
         ):
             self.batched_fields.add(name)
-            if tuple(tensor.shape) == self.expected_shape(name):
+            if tuple(tensor.shape) == self._expected_shape(name):
                 return tensor
         raise ValueError(
             f"Shape mismatch for {name}: expected {expected}, "
@@ -330,7 +336,7 @@ class ModuleTensors:
                 f"Computed field {field.name} must be contiguous; computed "
                 "fields are never repaired implicitly"
             )
-        expected = self.expected_shape(field.name)
+        expected = self._expected_shape(field.name)
         if expected is not None and tuple(tensor.shape) != expected:
             if (
                 field.tensor.category == "derived_param"
@@ -343,7 +349,7 @@ class ModuleTensors:
                     f"Computed field {field.name} has shape "
                     f"{tuple(tensor.shape)}, expected {expected}"
                 )
-        dtype = self.expected_dtype(field.name)
+        dtype = self._expected_dtype(field.name)
         if tensor.dtype != dtype:
             raise ValueError(
                 f"Computed field {module.module_name}.{field.name} must use "
@@ -361,7 +367,7 @@ class ModuleTensors:
             )
         )
 
-    def apply_modes(self) -> None:
+    def _apply_modes(self) -> None:
         module = self.module
         for field in module.tensor_schema():
             if (
