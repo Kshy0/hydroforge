@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import json
-from pathlib import Path
 from collections.abc import Mapping
+from copy import deepcopy
+from pathlib import Path
 from typing import Any, Literal, Self
 
 import numpy as np
@@ -21,6 +21,7 @@ from pydantic import (
 from scipy.sparse import csr_matrix
 
 from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.data.distributed import _find_indices_in_trusted
 from hydroforge.data.numeric import (
     canonical_floating_array,
     canonical_ids,
@@ -28,7 +29,6 @@ from hydroforge.data.numeric import (
     immutable_metadata,
 )
 from hydroforge.serialization.files import atomic_output_path
-
 
 _MAPPING_SCHEMA = "hydroforge.spatial_mapping.v2"
 _MAPPING_ARCHIVE_KEYS = frozenset(
@@ -45,6 +45,34 @@ _MAPPING_ARCHIVE_KEYS = frozenset(
     }
 )
 _MAPPING_APPLY_CONTEXT = "hydroforge_mapping_apply"
+
+
+def _validate_csr_components(
+    data: np.ndarray,
+    indices: np.ndarray,
+    indptr: np.ndarray,
+    shape: tuple[int, int],
+) -> None:
+    for name, component in (
+        ("sparse_data", data),
+        ("sparse_indices", indices),
+        ("sparse_indptr", indptr),
+    ):
+        if not isinstance(component, np.ndarray) or component.ndim != 1:
+            raise ValueError(f"{name} must be a one-dimensional array")
+        if np.ma.isMaskedArray(component) and np.any(np.ma.getmaskarray(component)):
+            raise ValueError(f"{name} contains missing values")
+    for name, component in (("sparse_indices", indices), ("sparse_indptr", indptr)):
+        if component.dtype not in {np.dtype(np.int32), np.dtype(np.int64)}:
+            raise ValueError(f"{name} must use signed int32 or int64 storage")
+    if indices.size != data.size:
+        raise ValueError("sparse_indices must match sparse_data size")
+    if indptr.shape != (shape[0] + 1,):
+        raise ValueError(f"sparse_indptr must have shape ({shape[0] + 1},)")
+    if indptr[0] != 0 or indptr[-1] != data.size or np.any(indptr[1:] < indptr[:-1]):
+        raise ValueError("sparse_indptr is not a valid CSR row pointer")
+    if indices.size and (indices.min() < 0 or indices.max() >= shape[1]):
+        raise ValueError("sparse_indices fall outside matrix_shape")
 
 
 class _ImmutableCSR(csr_matrix):
@@ -96,7 +124,9 @@ class _ImmutableCSR(csr_matrix):
 def _freeze_csr_storage(matrix: csr_matrix) -> csr_matrix:
     """Replace CSR component arrays with immutable-buffer-backed arrays."""
 
-    frozen = _ImmutableCSR(matrix, copy=True)
+    # The new CSR shell may share inputs until each component is replaced by
+    # immutable_array's independently owned byte storage below.
+    frozen = _ImmutableCSR(matrix, copy=False)
     frozen.data = immutable_array(frozen.data, order="C")
     frozen.indices = immutable_array(frozen.indices, order="C")
     frozen.indptr = immutable_array(frozen.indptr, order="C")
@@ -120,9 +150,7 @@ def _canonical_metadata_value(value: Any, *, path: str) -> Any:
         )
     if type(value) is dict:
         if any(type(name) is not str or not name for name in value):
-            raise ValueError(
-                f"{path} keys must be non-empty exact strings"
-            )
+            raise ValueError(f"{path} keys must be non-empty exact strings")
         return {
             name: _canonical_metadata_value(
                 item,
@@ -157,8 +185,6 @@ class _MappingApplyRequest(HydroForgeModel):
         arr = np.asarray(self.data)
         if arr.ndim == 0:
             raise ValueError("mapping input must have at least one dimension")
-        if arr.dtype.kind not in {"f", "i", "u"}:
-            raise ValueError("mapping input must contain real numbers")
         arr = canonical_floating_array(
             arr,
             dtype="float64",
@@ -200,8 +226,12 @@ class LocalMapping(HydroForgeModel):
             raise ValueError("source_indices must be unique")
         if source_indices.size and np.any(source_indices < 0):
             raise ValueError("source_indices must be nonnegative")
-        if not isinstance(self.source_to_target, csr_matrix):
-            raise ValueError("source_to_target must be a scipy CSR matrix")
+        _validate_csr_components(
+            self.source_to_target.data,
+            self.source_to_target.indices,
+            self.source_to_target.indptr,
+            self.source_to_target.shape,
+        )
         matrix = self.source_to_target.copy()
         if matrix.dtype != np.dtype(np.float32):
             raise ValueError("source_to_target must use float32 storage")
@@ -219,7 +249,9 @@ class LocalMapping(HydroForgeModel):
         if np.any(matrix.data < 0):
             raise ValueError("source_to_target weights must be nonnegative")
         object.__setattr__(
-            self, "target_ids", immutable_array(target_ids, order="C"),
+            self,
+            "target_ids",
+            immutable_array(target_ids, order="C"),
         )
         object.__setattr__(
             self,
@@ -227,7 +259,9 @@ class LocalMapping(HydroForgeModel):
             immutable_array(source_indices, order="C"),
         )
         object.__setattr__(
-            self, "source_to_target", _freeze_csr_storage(matrix),
+            self,
+            "source_to_target",
+            _freeze_csr_storage(matrix),
         )
         return self
 
@@ -238,23 +272,19 @@ class LocalMapping(HydroForgeModel):
         target_ids: np.ndarray,
         source_indices: np.ndarray,
         source_to_target: csr_matrix,
-    ) -> "LocalMapping":
+    ) -> LocalMapping:
         """Own a local projection derived solely from a validated mapping."""
 
-        owned_target_ids = np.array(
-            target_ids, dtype=np.int64, order="C", copy=True,
-        )
-        owned_source_indices = np.array(
-            source_indices, dtype=np.int64, order="C", copy=True,
-        )
-        matrix = source_to_target.copy().astype(np.float32)
+        matrix = source_to_target.astype(np.float32, copy=True)
         matrix.sum_duplicates()
         matrix.eliminate_zeros()
         matrix.sort_indices()
         return cls.model_construct(
-            target_ids=immutable_array(owned_target_ids, order="C"),
+            target_ids=immutable_array(target_ids, dtype=np.int64, order="C"),
             source_indices=immutable_array(
-                owned_source_indices, order="C",
+                source_indices,
+                dtype=np.int64,
+                order="C",
             ),
             source_to_target=_freeze_csr_storage(matrix),
         )
@@ -297,25 +327,16 @@ class _LocalMappingRequest(HydroForgeModel):
     def _compile(self):
         mapping = self.mapping
         selected_ids = (
-            mapping.target_ids.copy() if self.target_ids is None else self.target_ids
+            mapping.target_ids if self.target_ids is None else self.target_ids
         )
-        row_by_id = {
-            int(target_id): row for row, target_id in enumerate(mapping.target_ids)
-        }
-        missing = tuple(
-            int(target_id)
-            for target_id in selected_ids
-            if int(target_id) not in row_by_id
-        )
-        if missing:
+        rows = _find_indices_in_trusted(selected_ids, mapping.target_ids)
+        missing = rows < 0
+        missing_count = np.count_nonzero(missing)
+        if missing_count:
             raise ValueError(
-                f"{len(missing)} requested target id(s) are absent from the "
-                f"mapping; examples={list(missing[:5])}"
+                f"{missing_count} requested target id(s) are absent from the "
+                f"mapping; examples={selected_ids[missing][:5].tolist()}"
             )
-        rows = np.asarray(
-            [row_by_id[int(target_id)] for target_id in selected_ids],
-            dtype=np.int64,
-        )
         selected = mapping.matrix[rows, :].tocsr()
         active = np.flatnonzero(
             np.asarray(selected.sum(axis=0)).ravel() != 0,
@@ -323,7 +344,7 @@ class _LocalMappingRequest(HydroForgeModel):
         self._local_mapping = LocalMapping._from_trusted(
             target_ids=selected_ids,
             source_indices=active,
-            source_to_target=(selected[:, active].T.tocsr().astype(np.float32)),
+            source_to_target=selected[:, active].T.tocsr(),
         )
         return self
 
@@ -358,17 +379,26 @@ class MappingTable(HydroForgeModel):
 
     @model_validator(mode="after")
     def _validate_mapping(self) -> Self:
+        for name in ("target_ids", "source_x", "source_y", "coverage"):
+            value = getattr(self, name)
+            if np.ma.isMaskedArray(value) and np.any(np.ma.getmaskarray(value)):
+                raise ValueError(f"mapping {name} contains missing values")
         if self.target_ids.ndim != 1:
             raise ValueError("mapping target_ids must be one-dimensional")
         if self.target_ids.dtype != np.dtype(np.int64):
             raise ValueError("mapping target_ids must use exact int64 dtype")
         if np.unique(self.target_ids).size != self.target_ids.size:
             raise ValueError("mapping target_ids must be unique")
-        if not isinstance(self.matrix, csr_matrix):
-            raise ValueError("mapping matrix must be a scipy CSR matrix")
+        _validate_csr_components(
+            self.matrix.data,
+            self.matrix.indices,
+            self.matrix.indptr,
+            self.matrix.shape,
+        )
         if self.matrix.dtype != np.dtype(np.float32):
             raise ValueError("mapping matrix must use exact float32 dtype")
-        if not self.matrix.has_canonical_format:
+        matrix = self.matrix.copy()
+        if not matrix.has_canonical_format:
             raise ValueError("mapping matrix must use canonical CSR storage")
         if not np.isfinite(self.matrix.data).all():
             raise ValueError("mapping matrix values must be finite")
@@ -412,33 +442,14 @@ class MappingTable(HydroForgeModel):
             raise ValueError("mapping coverage size must match target_ids")
         if not np.isfinite(self.coverage).all() or np.any(self.coverage < 0):
             raise ValueError("mapping coverage must be finite and nonnegative")
-        target_ids = np.array(
-            self.target_ids, dtype=np.int64, order="C", copy=True,
-        )
-        matrix = self.matrix.copy()
-        source_x = np.array(
-            self.source_x, dtype=np.float64, order="C", copy=True,
-        )
-        source_y = np.array(
-            self.source_y, dtype=np.float64, order="C", copy=True,
-        )
-        coverage = np.array(
-            self.coverage, dtype=np.float32, order="C", copy=True,
-        )
+        for name in ("target_ids", "source_x", "source_y", "coverage"):
+            object.__setattr__(
+                self, name, immutable_array(getattr(self, name), order="C")
+            )
         object.__setattr__(
-            self, "target_ids", immutable_array(target_ids, order="C"),
-        )
-        object.__setattr__(
-            self, "matrix", _freeze_csr_storage(matrix),
-        )
-        object.__setattr__(
-            self, "source_x", immutable_array(source_x, order="C"),
-        )
-        object.__setattr__(
-            self, "source_y", immutable_array(source_y, order="C"),
-        )
-        object.__setattr__(
-            self, "coverage", immutable_array(coverage, order="C"),
+            self,
+            "matrix",
+            _freeze_csr_storage(matrix),
         )
         return self
 
@@ -452,33 +463,27 @@ class MappingTable(HydroForgeModel):
         source_y: np.ndarray,
         coverage: np.ndarray,
         metadata: Mapping[str, Any],
-    ) -> "MappingTable":
+    ) -> MappingTable:
         """Own a table produced by a transformation of validated storage."""
 
-        owned_target_ids = np.array(
-            target_ids, dtype=np.int64, order="C", copy=True,
-        )
-        owned_matrix = matrix.copy().astype(np.float32)
+        owned_matrix = matrix.copy()
         owned_matrix.sum_duplicates()
+        owned_matrix.data = canonical_floating_array(
+            owned_matrix.data,
+            dtype="float32",
+            label="transformed mapping weights",
+        )
         owned_matrix.eliminate_zeros()
         owned_matrix.sort_indices()
-        owned_source_x = np.array(
-            source_x, dtype=np.float64, order="C", copy=True,
-        )
-        owned_source_y = np.array(
-            source_y, dtype=np.float64, order="C", copy=True,
-        )
-        owned_coverage = np.array(
-            coverage, dtype=np.float32, order="C", copy=True,
-        )
         return cls.model_construct(
-            target_ids=immutable_array(owned_target_ids, order="C"),
+            target_ids=immutable_array(target_ids, dtype=np.int64, order="C"),
             matrix=_freeze_csr_storage(owned_matrix),
-            source_x=immutable_array(owned_source_x, order="C"),
-            source_y=immutable_array(owned_source_y, order="C"),
-            coverage=immutable_array(owned_coverage, order="C"),
+            source_x=immutable_array(source_x, dtype=np.float64, order="C"),
+            source_y=immutable_array(source_y, dtype=np.float64, order="C"),
+            coverage=immutable_array(coverage, dtype=np.float32, order="C"),
             metadata=immutable_metadata(
-                dict(metadata), label="mapping metadata",
+                dict(metadata),
+                label="mapping metadata",
             ),
         )
 
@@ -486,16 +491,14 @@ class MappingTable(HydroForgeModel):
     def _source_shape(self) -> tuple[int, int]:
         return (self.source_y.size, self.source_x.size)
 
-    def _row_normalized(self) -> "MappingTable":
+    def _row_normalized(self) -> MappingTable:
         """Return a copy with each row scaled to sum 1 (empty rows stay zero)."""
-        matrix = self.matrix.tocsr(copy=True).astype(np.float64)
+        matrix = self.matrix.astype(np.float64, copy=True)
         row_sums = np.asarray(matrix.sum(axis=1), dtype=np.float64).ravel()
         scale = np.zeros_like(row_sums)
         nz = row_sums > 0
         scale[nz] = 1.0 / row_sums[nz]
-        matrix = matrix.multiply(scale[:, None]).tocsr().astype(np.float32)
-        matrix.eliminate_zeros()
-        matrix.sort_indices()
+        matrix = matrix.multiply(scale[:, None]).tocsr()
         return MappingTable._from_trusted(
             target_ids=self.target_ids,
             matrix=matrix,
@@ -528,6 +531,8 @@ class MappingTable(HydroForgeModel):
         if not np.any(valid_grid):
             return None
 
+        best_col = None
+        best_distance = None
         max_radius = max(ny, nx)
         for radius in range(1, max_radius + 1):
             cand_y: list[np.ndarray] = []
@@ -566,9 +571,15 @@ class MappingTable(HydroForgeModel):
                 dx = np.abs(xs - start_x)
                 if periodic_x:
                     dx = np.minimum(dx, nx - dx)
-                best = int(np.argmin(dy * dy + dx * dx))
-                return int(ys[best] * nx + xs[best])
-        return None
+                distances = dy * dy + dx * dx
+                best = int(np.argmin(distances))
+                distance = int(distances[best])
+                if best_distance is None or distance < best_distance:
+                    best_distance = distance
+                    best_col = int(ys[best] * nx + xs[best])
+            if best_distance is not None and best_distance <= (radius + 1) ** 2:
+                return best_col
+        return best_col
 
     @staticmethod
     def _weighted_center_index(
@@ -603,7 +614,7 @@ class MappingTable(HydroForgeModel):
         *,
         empty_row_policy: Literal["zero", "nearest"] = "zero",
         preserve_row_sum: bool = True,
-    ) -> "MappingTable":
+    ) -> MappingTable:
         """Return a mapping with invalid source cells removed.
 
         ``empty_row_policy="nearest"`` repairs rows that originally had source
@@ -612,7 +623,7 @@ class MappingTable(HydroForgeModel):
         """
         valid = valid_source_mask.reshape(-1)
 
-        original = self.matrix.tocsr(copy=True).astype(np.float64)
+        original = self.matrix.astype(np.float64, copy=True)
         original_row_sums = np.asarray(
             original.sum(axis=1),
             dtype=np.float64,
@@ -706,7 +717,6 @@ class MappingTable(HydroForgeModel):
                 masked = (masked + repair).tocsr()
                 repaired_rows = len(repair_row)
 
-        masked.eliminate_zeros()
         metadata = {
             **self.metadata,
             "source_mask_valid_cells": int(valid.sum()),
@@ -717,9 +727,6 @@ class MappingTable(HydroForgeModel):
             "source_mask_repaired_rows": repaired_rows,
             "source_mask_scaled_rows": scaled_rows,
         }
-        masked = masked.astype(np.float32)
-        masked.eliminate_zeros()
-        masked.sort_indices()
         return MappingTable._from_trusted(
             target_ids=self.target_ids,
             matrix=masked,
@@ -738,14 +745,14 @@ class MappingTable(HydroForgeModel):
             with temporary.open("wb") as stream:
                 np.savez_compressed(
                     stream,
-                    target_ids=self.target_ids.astype(np.int64),
-                    sparse_data=self.matrix.data.astype(np.float32),
-                    sparse_indices=self.matrix.indices.astype(np.int64),
-                    sparse_indptr=self.matrix.indptr.astype(np.int64),
+                    target_ids=self.target_ids,
+                    sparse_data=self.matrix.data,
+                    sparse_indices=self.matrix.indices.astype(np.int64, copy=False),
+                    sparse_indptr=self.matrix.indptr.astype(np.int64, copy=False),
                     matrix_shape=np.asarray(self.matrix.shape, dtype=np.int64),
-                    coord_lon=self.source_x.astype(np.float64),
-                    coord_lat=self.source_y.astype(np.float64),
-                    coverage=self.coverage.astype(np.float32),
+                    coord_lon=self.source_x,
+                    coord_lat=self.source_y,
+                    coverage=self.coverage,
                     metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
                 )
         return out_path
@@ -767,44 +774,19 @@ class MappingTable(HydroForgeModel):
                 )
 
             raw_shape = np.asarray(data["matrix_shape"])
-            if raw_shape.ndim != 1:
-                raise ValueError("matrix_shape must be one-dimensional")
             shape = canonical_ids(raw_shape, label="matrix_shape")
-            if (
-                shape.shape != (2,)
-                or shape[0] < 0
-                or shape[1] < 1
-            ):
+            if shape.shape != (2,) or shape[0] < 0 or shape[1] < 1:
                 raise ValueError(
                     "matrix_shape must contain a nonnegative row count and "
                     "a positive column count"
                 )
             n_rows, n_cols = map(int, shape)
             sparse_data = np.asarray(data["sparse_data"])
-            if sparse_data.ndim != 1:
-                raise ValueError("sparse_data must be one-dimensional")
             raw_indices = np.asarray(data["sparse_indices"])
             raw_indptr = np.asarray(data["sparse_indptr"])
-            if raw_indices.ndim != 1:
-                raise ValueError("sparse_indices must be one-dimensional")
-            if raw_indptr.ndim != 1:
-                raise ValueError("sparse_indptr must be one-dimensional")
             indices = canonical_ids(raw_indices, label="sparse_indices")
             indptr = canonical_ids(raw_indptr, label="sparse_indptr")
-            if indices.size != sparse_data.size:
-                raise ValueError(
-                    "sparse_indices must be one-dimensional and match sparse_data"
-                )
-            if indptr.shape != (n_rows + 1,):
-                raise ValueError(f"sparse_indptr must have shape ({n_rows + 1},)")
-            if (
-                indptr[0] != 0
-                or indptr[-1] != sparse_data.size
-                or np.any(np.diff(indptr) < 0)
-            ):
-                raise ValueError("sparse_indptr is not a valid CSR row pointer")
-            if indices.size and (indices.min() < 0 or indices.max() >= n_cols):
-                raise ValueError("sparse_indices fall outside matrix_shape")
+            _validate_csr_components(sparse_data, indices, indptr, (n_rows, n_cols))
 
             target_ids = canonical_ids(
                 np.asarray(data["target_ids"]),

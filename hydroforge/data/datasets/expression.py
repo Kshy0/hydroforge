@@ -4,33 +4,32 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from operator import add, mul, sub, truediv
 from typing import Any, Literal
 
 import numpy as np
-from pydantic import PrivateAttr, field_validator, model_validator
+from pydantic import PrivateAttr, model_validator
 
 from hydroforge.contracts.temporal import _combine_temporal_domains_trusted
 from hydroforge.data.datasets.base import (
     AbstractDataset,
     _close_dataset_tree,
-    _validated_dataset_index,
+    _spatial_selection_refs,
 )
 from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.gridded import GriddedDataset
 from hydroforge.data.numeric import (
     canonical_floating_array,
     exact_numeric_array_equal,
+    immutable_array,
 )
 
-
 _OPERATIONS: dict[str, Callable[[Any, Any], Any]] = {
-    "add": lambda left, right: left + right,
-    "sub": lambda left, right: left - right,
-    "mul": lambda left, right: left * right,
-    "div": lambda left, right: left / right,
+    "add": add,
+    "sub": sub,
+    "mul": mul,
+    "div": truediv,
 }
-
-_DatasetOperand = Any
 
 
 def _is_scalar(value: Any) -> bool:
@@ -38,19 +37,6 @@ def _is_scalar(value: Any) -> bool:
         isinstance(value, (int, float, np.integer, np.floating))
         and not isinstance(value, (bool, np.bool_))
         and bool(np.isfinite(value))
-    )
-
-
-def _finalize_expression_array(
-    value: Any,
-    *,
-    out_dtype: str,
-    label: str,
-) -> np.ndarray:
-    return canonical_floating_array(
-        value,
-        dtype=out_dtype,
-        label=label,
     )
 
 
@@ -146,14 +132,14 @@ def _evaluate_expression(
     # first would inherit an accidental integer or lower-precision operand
     # dtype, so overflow/underflow could occur before the result validator ever
     # sees the intended value.
-    left_array = _finalize_expression_array(
+    left_array = canonical_floating_array(
         left_array,
-        out_dtype=out_dtype,
+        dtype=out_dtype,
         label="left dataset expression operand",
     )
-    right_array = _finalize_expression_array(
+    right_array = canonical_floating_array(
         right_array,
-        out_dtype=out_dtype,
+        dtype=out_dtype,
         label="right dataset expression operand",
     )
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
@@ -164,9 +150,9 @@ def _evaluate_expression(
                 "dataset expression result contains values outside float32 range"
             )
         raise OverflowError("dataset expression result overflowed float64")
-    return _finalize_expression_array(
+    return canonical_floating_array(
         result,
-        out_dtype=out_dtype,
+        dtype=out_dtype,
         label="dataset expression result",
     )
 
@@ -178,6 +164,7 @@ class _SpatialIdentity:
 
 
 def _spatial_identity(dataset: Any, *, position: int) -> _SpatialIdentity | None:
+    dataset._refresh_spatial_selection()
     if isinstance(dataset, DatasetExpression):
         return dataset._expression_spatial_identity
     coordinate_reader = getattr(dataset, "get_coordinates", None)
@@ -266,9 +253,7 @@ def _spatial_identity(dataset: Any, *, position: int) -> _SpatialIdentity | None
                 arrays[0],
                 np.arange(arrays[0].size, dtype=np.int64),
             )
-    frozen = tuple(np.array(axis, order="C", copy=True) for axis in arrays)
-    for axis in frozen:
-        axis.setflags(write=False)
+    frozen = tuple(immutable_array(axis, order="C") for axis in arrays)
     return _SpatialIdentity(
         kind=kind,
         coordinates=frozen,
@@ -305,6 +290,7 @@ class DatasetExpression(AbstractDataset):
     _left_operand: Any = PrivateAttr()
     _right_operand: Any = PrivateAttr()
     _expression_spatial_identity: _SpatialIdentity | None = PrivateAttr()
+    _selection_refs: tuple[object, ...] = PrivateAttr(default=())
     _supports_time_aggregation: bool = PrivateAttr(default=False)
 
     @model_validator(mode="before")
@@ -323,20 +309,16 @@ class DatasetExpression(AbstractDataset):
         )
         if reference is None:
             return value
+        reference._refresh_spatial_selection()
         payload = dict(value)
         derived = reference._dataset_identity_arguments()
         for name, expected in derived.items():
             if name in payload and payload[name] != expected:
                 raise ValueError(f"dataset expression {name} must match its operands")
             payload[name] = expected
+        for name in ("local_indices", "desired_catchment_ids"):
+            payload.setdefault(name, getattr(reference, name))
         return payload
-
-    @field_validator("operation")
-    @classmethod
-    def _validate_operation(cls, operation: str) -> str:
-        if type(operation) is not str or operation not in _OPERATIONS:
-            raise ValueError(f"unknown dataset operation {operation!r}")
-        return operation
 
     @model_validator(mode="after")
     def _validate_expression(self):
@@ -377,17 +359,7 @@ class DatasetExpression(AbstractDataset):
             raise ValueError(
                 "reference dataset out_dtype must be 'float32' or 'float64'"
             )
-        _canonical_expression_scalar(
-            left,
-            out_dtype=out_dtype,
-            label="left dataset expression scalar",
-        ) if left_is_scalar else left
-        _canonical_expression_scalar(
-            right,
-            out_dtype=out_dtype,
-            label="right dataset expression scalar",
-        ) if right_is_scalar else right
-        _combine_temporal_domains_trusted(
+        temporal_domain = _combine_temporal_domains_trusted(
             {
                 f"operand_{index}": dataset._temporal_domain
                 for index, dataset in enumerate(datasets)
@@ -413,22 +385,8 @@ class DatasetExpression(AbstractDataset):
                 chunk_plan=reference.chunk_plan,
                 reference_identity=reference_identity,
             )
-        return self
-
-    @model_validator(mode="after")
-    def _compile_expression(self):
-        left_is_scalar = _is_scalar(self.left)
-        right_is_scalar = _is_scalar(self.right)
-        datasets = tuple(
-            value
-            for value, is_scalar in (
-                (self.left, left_is_scalar),
-                (self.right, right_is_scalar),
-            )
-            if not is_scalar
-        )
-        reference = datasets[0]
-        out_dtype = reference.out_dtype
+        if temporal_domain != self._temporal_domain:
+            raise ValueError("dataset expression timeline must match its operands")
         self._reference = reference
         self._out_dtype = out_dtype
         self._left_operand = (
@@ -449,20 +407,35 @@ class DatasetExpression(AbstractDataset):
             if right_is_scalar
             else self.right
         )
-        temporal_domain = _combine_temporal_domains_trusted(
-            {
-                f"operand_{index}": dataset._temporal_domain
-                for index, dataset in enumerate(datasets)
-            }
-        )
-        if temporal_domain != self._temporal_domain:
-            raise ValueError("dataset expression timeline must match its operands")
-        self._expression_spatial_identity = _spatial_identity(
-            reference,
-            position=0,
-        )
-        self._supports_time_aggregation = reference.supports_time_aggregation
+        self._expression_spatial_identity = reference_identity
+        self._inherit_spatial_selection(reference, validate=True)
+        self._selection_refs = _spatial_selection_refs(datasets)
+        self._supports_time_aggregation = supports_time_aggregation
         return self
+
+    def _refresh_spatial_selection(self) -> None:
+        datasets = self._close_children()
+        references = _spatial_selection_refs(datasets)
+        if len(references) == len(self._selection_refs) and all(
+            current is previous
+            for current, previous in zip(references, self._selection_refs, strict=True)
+        ):
+            return
+        reference = self._reference
+        identity = _spatial_identity(reference, position=0)
+        for position, dataset in enumerate(datasets[1:], start=1):
+            self._validate_compatible(
+                dataset,
+                position,
+                reference=reference,
+                out_dtype=self._out_dtype,
+                schedule=reference.simulation_schedule,
+                chunk_plan=reference.chunk_plan,
+                reference_identity=identity,
+            )
+        self._inherit_spatial_selection(reference, validate=False)
+        self._expression_spatial_identity = identity
+        self._selection_refs = references
 
     @property
     def reference(self) -> AbstractDataset | DatasetExpression:
@@ -534,25 +507,38 @@ class DatasetExpression(AbstractDataset):
         raise ValueError(f"dataset operand {position} uses a different spatial domain")
 
     @staticmethod
-    def _value(operand: Any, chunk: SourceChunk) -> Any:
+    def _value(operand: Any, chunk: SourceChunk, cache: dict, *, raw: bool) -> Any:
         if _is_scalar(operand):
             return operand
         operand_chunk = operand.chunk_plan._at_trusted(chunk.index)
-        return operand._get_chunk_trusted(operand_chunk)
-
-    def __getitem__(self, index: int):
-        chunk = self._chunk_plan._at_trusted(
-            _validated_dataset_index(self, index),
+        if type(operand) is DatasetExpression:
+            return operand._evaluate_chunk(operand_chunk, cache, raw=raw)
+        reusable = (
+            type(operand).__dict__.get("reusable_expression_reads", False) is True
         )
-        return self._get_chunk_trusted(chunk)
+        key = (id(operand), operand_chunk.index)
+        if reusable and key in cache:
+            return cache[key]
+        value = (
+            operand._read_chunk_trusted(operand_chunk)
+            if raw
+            else operand._get_chunk_trusted(operand_chunk)
+        )
+        if reusable:
+            cache[key] = value
+        return value
 
     def _get_chunk_trusted(self, chunk: SourceChunk):
         """Evaluate one framework-produced consumer request."""
 
+        return self._evaluate_chunk(chunk, {}, raw=False)
+
+    def _evaluate_chunk(self, chunk: SourceChunk, cache: dict, *, raw: bool):
+        self._refresh_spatial_selection()
         return _evaluate_expression(
             self.operation,
-            self._value(self._left_operand, chunk),
-            self._value(self._right_operand, chunk),
+            self._value(self._left_operand, chunk, cache, raw=raw),
+            self._value(self._right_operand, chunk, cache, raw=raw),
             left_is_scalar=_is_scalar(self._left_operand),
             right_is_scalar=_is_scalar(self._right_operand),
             out_dtype=self._out_dtype,
@@ -564,29 +550,15 @@ class DatasetExpression(AbstractDataset):
     def _read_chunk(self, chunk: SourceChunk):
         """Evaluate one framework-produced raw source request."""
 
-        def read(operand: Any):
-            return (
-                operand
-                if _is_scalar(operand)
-                else operand._read_chunk_trusted(
-                    operand.chunk_plan._at_trusted(chunk.index)
-                )
-            )
-
-        return _evaluate_expression(
-            self.operation,
-            read(self._left_operand),
-            read(self._right_operand),
-            left_is_scalar=_is_scalar(self._left_operand),
-            right_is_scalar=_is_scalar(self._right_operand),
-            out_dtype=self._out_dtype,
-        )
+        return self._evaluate_chunk(chunk, {}, raw=True)
 
     def get_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
+        self._refresh_spatial_selection()
         return self.reference.get_coordinates()
 
     @property
     def data_size(self) -> int:
+        self._refresh_spatial_selection()
         return self.reference.data_size
 
     @property
@@ -610,27 +582,3 @@ class DatasetExpression(AbstractDataset):
             operation=operation,
             right=right,
         )
-
-    def __add__(self, other: _DatasetOperand):
-        return self._combine(other, "add")
-
-    def __radd__(self, other: _DatasetOperand):
-        return self._combine(other, "add", reverse=True)
-
-    def __sub__(self, other: _DatasetOperand):
-        return self._combine(other, "sub")
-
-    def __rsub__(self, other: _DatasetOperand):
-        return self._combine(other, "sub", reverse=True)
-
-    def __mul__(self, other: _DatasetOperand):
-        return self._combine(other, "mul")
-
-    def __rmul__(self, other: _DatasetOperand):
-        return self._combine(other, "mul", reverse=True)
-
-    def __truediv__(self, other: _DatasetOperand):
-        return self._combine(other, "div")
-
-    def __rtruediv__(self, other: _DatasetOperand):
-        return self._combine(other, "div", reverse=True)

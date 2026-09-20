@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
+
 from hydroforge.serialization.netcdf import (
     COMMITTED_STEPS_ATTR as COMMITTED_STEPS_ATTR,
+)
+from hydroforge.serialization.netcdf import (
     OUTPUT_FORMAT as OUTPUT_FORMAT,
+)
+from hydroforge.serialization.netcdf import (
     OUTPUT_VERSION as OUTPUT_VERSION,
+)
+from hydroforge.serialization.netcdf import (
     RUN_ID_ATTR as RUN_ID_ATTR,
 )
 
@@ -43,6 +51,7 @@ class NetCDFCreateRequest:
     time_unit: str
     static_variables: Mapping[str, Mapping[str, Any]]
     run_id: str | None = None
+    ensemble_member_ids: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)

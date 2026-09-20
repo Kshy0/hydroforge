@@ -7,27 +7,24 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import (
+    Annotated,
     Any,
-    Callable,
     ClassVar,
-    Dict,
-    List,
     Literal,
-    Optional,
-    Sequence,
-    Tuple,
     cast,
-    Union,
 )
 
+import numba as _numba
 import numpy as np
 import torch
 from netCDF4 import Dataset
 from pydantic import (
+    BeforeValidator,
     Field,
     PrivateAttr,
     ValidationInfo,
@@ -36,20 +33,21 @@ from pydantic import (
 )
 
 from hydroforge.contracts.temporal import DateLike
-from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.contracts.validation import FrozenMapping, HydroForgeModel
 from hydroforge.data.datasets.base import (
-    _TrustedSourceChunk,
     SourceDataset,
     _trusted_source_chunk_payload,
+    _TrustedSourceChunk,
     _validated_dataset_index,
     _validated_forcing_shard,
     positive_finite_real,
 )
 from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.timeline import DatasetTimeline, ReadOp
+from hydroforge.data.distributed import _find_indices_in_trusted, is_rank_zero
 from hydroforge.data.netcdf import (
-    _NetCDFReadHandlePool,
     _configure_netcdf_variable_cache,
+    _NetCDFReadHandlePool,
     _planned_exported_netcdf_chunk_len,
     _read_netcdf_var_sliced_trusted,
     single_file_key,
@@ -60,16 +58,14 @@ from hydroforge.data.numeric import (
     canonical_ids,
     immutable_array,
 )
-from hydroforge.data.distributed import _find_indices_in_trusted, is_rank_zero
 from hydroforge.serialization.netcdf import (
     DEFAULT_NETCDF_OPTIONS,
     _atomic_netcdf_dataset_trusted,
     _create_netcdf_variable_trusted,
-    prepare_netcdf_variable_options,
+    _prepare_netcdf_variable_options_trusted,
+    default_netcdf_options,
+    normalize_netcdf_variable_options,
 )
-
-import numba as _numba
-
 
 logger = logging.getLogger(__name__)
 
@@ -83,26 +79,30 @@ class _ExportedSelectionRequest(HydroForgeModel):
     @field_validator("desired_catchment_ids")
     @classmethod
     def _validate_ids(cls, value: np.ndarray) -> np.ndarray:
-        result = _id_vector(value, label="desired_catchment_ids")
+        result = canonical_ids(value, label="desired_catchment_ids")
         if np.unique(result).size != result.size:
             raise ValueError("desired_catchment_ids must be unique")
         return immutable_array(result, order="C")
 
     @field_validator("time_shift_steps")
     @classmethod
-    def _validate_shift(
-        cls,
-        value: np.ndarray | None,
-        info: ValidationInfo,
-    ) -> np.ndarray | None:
+    def _validate_shift(cls, value: np.ndarray | None) -> np.ndarray | None:
         if value is None:
             return None
-        result = _int64_vector(
-            value,
-            label="time_shift_steps",
-            expected_shape=(len(info.data["desired_catchment_ids"]),),
+        return _int64_vector(
+            value, label="time_shift_steps", expected_shape=(value.size,)
         )
-        return immutable_array(result, order="C")
+
+    @model_validator(mode="after")
+    def _validate_shape(self):
+        if (
+            self.time_shift_steps is not None
+            and self.time_shift_steps.shape != self.desired_catchment_ids.shape
+        ):
+            raise ValueError(
+                f"time_shift_steps must have shape {self.desired_catchment_ids.shape}"
+            )
+        return self
 
 
 class _ExportedSelectionBinding(HydroForgeModel):
@@ -126,13 +126,7 @@ class _ExportedSelectionBinding(HydroForgeModel):
                 f"{missing} desired catchments were not found in exported "
                 f"file {self.source_name}"
             )
-        self._positions = np.array(
-            positions,
-            dtype=np.int64,
-            order="C",
-            copy=True,
-        )
-        self._positions = immutable_array(self._positions, order="C")
+        self._positions = immutable_array(positions, dtype=np.int64, order="C")
         return self
 
     @property
@@ -199,17 +193,7 @@ class _ExportedFilterRequest(HydroForgeModel):
                 "window filter must be a boolean array with shape "
                 f"{expected_shape}; got {mask.shape}"
             )
-        result = np.array(mask, dtype=np.bool_, order="C", copy=True)
-        return immutable_array(result, order="C")
-
-
-def _id_vector(value: Any, *, label: str) -> np.ndarray:
-    if np.ma.isMaskedArray(value) and np.any(np.ma.getmaskarray(value)):
-        raise ValueError(f"{label} contains missing IDs")
-    array = np.asarray(value)
-    if array.ndim != 1:
-        raise ValueError(f"{label} must be one-dimensional")
-    return canonical_ids(array, label=label)
+        return immutable_array(mask, dtype=np.bool_, order="C")
 
 
 def _int64_vector(
@@ -231,37 +215,7 @@ def _int64_vector(
         and np.any(array > np.iinfo(np.int64).max)
     ):
         raise ValueError(f"{label} contains a value outside int64 range")
-    return np.array(array, dtype=np.int64, order="C", copy=True)
-
-
-def _overlay_data(value: Any, *, label: str) -> np.ndarray:
-    if np.ma.isMaskedArray(value):
-        raise TypeError(f"{label} must use NaN rather than a masked array")
-    array = np.asarray(value)
-    if array.ndim != 2:
-        raise ValueError(f"{label} must be 2-D; got {array.shape}")
-    return canonical_floating_array(
-        array,
-        dtype="float32",
-        label=label,
-        allow_nan=True,
-    )
-
-
-def _overlay_source_data(value: Any, *, label: str) -> np.ndarray:
-    """Validate overlay contributions without narrowing before reduction."""
-
-    if np.ma.isMaskedArray(value):
-        raise TypeError(f"{label} must use NaN rather than a masked array")
-    array = np.asarray(value)
-    if array.ndim != 2:
-        raise ValueError(f"{label} must be 2-D; got {array.shape}")
-    return canonical_floating_array(
-        array,
-        dtype="float64",
-        label=label,
-        allow_nan=True,
-    )
+    return immutable_array(array, dtype=np.int64, order="C")
 
 
 def _quantile_levels(value: Any) -> np.ndarray:
@@ -284,29 +238,33 @@ def _quantile_levels(value: Any) -> np.ndarray:
     return result
 
 
-def _quantile_output(
-    value: Any,
-    *,
-    dtype: str,
-    expected_shape: tuple[int, int],
-) -> np.ndarray:
-    del expected_shape
-    if np.ma.isMaskedArray(value):
-        raise TypeError("quantile result must not be a masked array")
-    array = np.asarray(value)
-    if not np.isfinite(array).all():
-        raise ValueError("quantile result contains non-finite values")
-    target = np.float32 if dtype == "float32" else np.float64
-    if dtype == "float32" and np.any(np.abs(array) > np.finfo(np.float32).max):
-        raise OverflowError("quantile result contains values outside float32 range")
-    result = np.asarray(array, dtype=target)
-    if not np.isfinite(result).all():
-        raise OverflowError(f"quantile result overflowed {dtype}")
-    if target == np.float32 and np.any((array != 0) & (result == 0)):
-        raise OverflowError(
-            "quantile result contains nonzero values that underflow in float32"
+class _QuantileExportRequest(HydroForgeModel):
+    out_path: Annotated[Path, BeforeValidator(lambda value: Path(value))]
+    quantiles: Annotated[np.ndarray, BeforeValidator(_quantile_levels)]
+    var_name: str = Field(min_length=1)
+    dtype: Literal["float32", "float64"] = "float32"
+    netcdf_options: Annotated[
+        FrozenMapping[str, Any], BeforeValidator(normalize_netcdf_variable_options)
+    ] = Field(default_factory=default_netcdf_options)
+    max_buffer_mb: Annotated[
+        float, BeforeValidator(partial(positive_finite_real, label="max_buffer_mb"))
+    ] = 4096.0
+
+    _create_options: Mapping[str, Any] = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _compile_options(self):
+        self._create_options = _prepare_netcdf_variable_options_trusted(
+            self.netcdf_options,
+            dtype="f4" if self.dtype == "float32" else "f8",
+            dimensions=("quantile", "saved_points"),
+            name=self.var_name,
         )
-    return result
+        return self
+
+    @property
+    def create_options(self) -> Mapping[str, Any]:
+        return self._create_options
 
 
 @_numba.njit(cache=True, parallel=True)
@@ -331,7 +289,7 @@ _EXPORTED_READ_LENGTH_CONTEXT = "hydroforge_exported_read_length"
 class _ExportedReadWindowQuery(HydroForgeModel):
     """One bounded main-axis read from an exported Dataset identity."""
 
-    base_step: int
+    base_step: int = Field(ge=0)
     length: int = Field(ge=1, strict=True)
 
     @model_validator(mode="after")
@@ -343,7 +301,7 @@ class _ExportedReadWindowQuery(HydroForgeModel):
         )
         if type(total) is not int or total < 1:
             raise ValueError("exported read query requires dataset context")
-        if self.base_step < 0 or self.base_step + self.length > total:
+        if self.base_step + self.length > total:
             raise ValueError(
                 "exported read window must satisfy "
                 f"0 <= base_step < base_step + length <= {total}"
@@ -371,6 +329,7 @@ class ExportedDataset(SourceDataset):
     """
 
     supports_time_aggregation: ClassVar[bool] = True
+    reusable_expression_reads: ClassVar[bool] = True
     _POINT_DIM: ClassVar[str] = "saved_points"
 
     base_dir: str | Path
@@ -414,9 +373,6 @@ class ExportedDataset(SourceDataset):
         default=None,
     )
     _source_dtype: np.dtype | None = PrivateAttr(default=None)
-    _variable_axes_by_path: Mapping[Path, tuple[int, int]] = PrivateAttr(
-        default_factory=dict
-    )
     _timeline: DatasetTimeline = PrivateAttr()
     _global_times: list[DateLike] = PrivateAttr(default_factory=list)
     _read_handles: _NetCDFReadHandlePool = PrivateAttr(
@@ -455,7 +411,7 @@ class ExportedDataset(SourceDataset):
         )
         if not np.any(shift):
             return None
-        return immutable_array(shift, order="C")
+        return shift
 
     @field_validator("window_starts")
     @classmethod
@@ -471,14 +427,16 @@ class ExportedDataset(SourceDataset):
             )
         if value is None:
             return None
-        starts = _int64_vector(value, label="window_starts")
+        starts = _int64_vector(
+            value, label="window_starts", expected_shape=(value.size,)
+        )
         if starts.size == 0:
             raise ValueError("window_starts must contain at least one window")
         if np.any(starts < 0) or np.any(np.diff(starts) <= 0):
             raise ValueError(
                 "window_starts must be nonnegative and strictly increasing"
             )
-        return immutable_array(starts, order="C")
+        return starts
 
     @model_validator(mode="after")
     def _inspect_exported_storage(self):
@@ -496,11 +454,12 @@ class ExportedDataset(SourceDataset):
             if type(key) is not str:
                 raise TypeError("time_to_key must return an exact string")
             path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
-            object.__setattr__(
-                self,
-                "chunk_len",
-                _planned_exported_netcdf_chunk_len(path, self.var_name),
-            )
+            with self._inspect_source_file(path):
+                object.__setattr__(
+                    self,
+                    "chunk_len",
+                    _planned_exported_netcdf_chunk_len(path, self.var_name),
+                )
             self._install_temporal_domain(self._temporal_domain)
         self._timeline = DatasetTimeline(
             self,
@@ -515,23 +474,14 @@ class ExportedDataset(SourceDataset):
             Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
             for key in sorted(self._timeline.file_times)
         )
-        axes_by_path: dict[Path, tuple[int, int]] = {}
         for path in source_paths:
-            with Dataset(path, "r") as dataset:
+            with self._inspect_source_file(path), Dataset(path, "r") as dataset:
                 point_dim = self._infer_point_dim(dataset, path)
                 self._validate_shard_coordinates(
                     dataset,
                     path,
                     point_dim,
                 )
-                axes_by_path[self._canonical_source_path(path)] = (
-                    self._variable_axes(
-                        dataset,
-                        dataset.variables[self.var_name],
-                        path,
-                    )
-                )
-        self._variable_axes_by_path = axes_by_path
         self._validate_local_index_extent(
             len(cast(tuple[np.ndarray, np.ndarray], self._coordinates_cache)[0]),
             label="exported catchment axis",
@@ -544,8 +494,7 @@ class ExportedDataset(SourceDataset):
         # replayed spin-up rows.
         contract = self._temporal_domain
         self._global_times = [
-            contract._support_trusted(index)[0]
-            for index in range(contract.count)
+            contract._support_trusted(index)[0] for index in range(contract.count)
         ]
 
         if self.time_shift_steps is not None:
@@ -558,9 +507,7 @@ class ExportedDataset(SourceDataset):
     def _rebuild(self, **updates: Any) -> ExportedDataset:
         """Derive a view from the already validated storage identity."""
 
-        payload = {
-            name: getattr(self, name) for name in type(self).model_fields
-        }
+        payload = {name: getattr(self, name) for name in type(self).model_fields}
         payload.update(updates)
         for name in (
             "local_indices",
@@ -572,7 +519,9 @@ class ExportedDataset(SourceDataset):
             if value is None:
                 continue
             payload[name] = immutable_array(
-                value, dtype=np.int64, order="C",
+                value,
+                dtype=np.int64,
+                order="C",
             )
 
         result = type(self).model_construct(**payload)
@@ -582,18 +531,14 @@ class ExportedDataset(SourceDataset):
         result._source_file_identities = dict(self._source_file_identities)
         result._coordinates_cache = self._coordinates_cache
         result._source_dtype = self._source_dtype
-        result._variable_axes_by_path = dict(self._variable_axes_by_path)
         result._timeline = self._timeline._rebind_trusted(result)
         result._global_times = list(self._global_times)
         result._read_handles = self._read_handles
         result._compute_column_bbox_from_indices()
-        same_selection = (
-            self.local_indices is result.local_indices
-            or (
-                self.local_indices is not None
-                and result.local_indices is not None
-                and np.array_equal(self.local_indices, result.local_indices)
-            )
+        same_selection = self.local_indices is result.local_indices or (
+            self.local_indices is not None
+            and result.local_indices is not None
+            and np.array_equal(self.local_indices, result.local_indices)
         )
         if same_selection:
             result._memory_cache = self._memory_cache
@@ -619,8 +564,14 @@ class ExportedDataset(SourceDataset):
     @staticmethod
     def _compile_groups(shift: np.ndarray) -> list:
         """Precompute [(shift_val, col_indices), ...] for fast _gather dispatch."""
-        unique_shifts, inv = np.unique(shift, return_inverse=True)
-        return [(int(s), np.where(inv == i)[0]) for i, s in enumerate(unique_shifts)]
+        if shift.size == 0:
+            return []
+        order = np.argsort(shift, kind="stable")
+        sorted_shift = shift[order]
+        boundaries = np.flatnonzero(sorted_shift[1:] != sorted_shift[:-1]) + 1
+        return [
+            (int(shift[columns[0]]), columns) for columns in np.split(order, boundaries)
+        ]
 
     # -------------------------
     # Coordinates (1D catchment IDs)
@@ -631,31 +582,14 @@ class ExportedDataset(SourceDataset):
         *,
         path: Path,
     ) -> np.ndarray:
-        if np.ma.isMaskedArray(value) and np.any(np.ma.getmaskarray(value)):
-            raise ValueError(
-                f"Coordinate variable {self.coord_name!r} in {path.name} "
-                "contains missing IDs"
-            )
-        array = np.asarray(value)
-        if array.ndim != 1:
-            raise ValueError(
-                f"Coordinate variable {self.coord_name!r} in {path.name} "
-                "must be one-dimensional"
-            )
-        if array.dtype.kind not in "iu":
-            raise TypeError(
-                f"Coordinate variable {self.coord_name!r} in {path.name} "
-                "must use an integer dtype"
-            )
+        array = canonical_ids(
+            value, label=f"Coordinate variable {self.coord_name!r} in {path.name}"
+        )
         if np.unique(array).size != array.size:
             raise ValueError(
-                f"Coordinate variable {self.coord_name!r} in {path.name} "
-                "contains duplicate IDs"
+                f"Coordinate variable {self.coord_name!r} in {path.name} contains duplicate IDs"
             )
-        return canonical_ids(
-            array,
-            label=f"Coordinate variable {self.coord_name!r}",
-        )
+        return array
 
     def _validate_shard_coordinates(
         self,
@@ -696,7 +630,7 @@ class ExportedDataset(SourceDataset):
                 )
         return values
 
-    def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
+    def get_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
         """Return catchment coordinate arrays.
 
         Returns (output_coord, index) where:
@@ -716,16 +650,6 @@ class ExportedDataset(SourceDataset):
     # -------------------------
     # Reading helpers (T, C)
     # -------------------------
-    @staticmethod
-    def _ensure_tc(
-        data: np.ndarray, t_idx: Optional[int], c_idx: Optional[int]
-    ) -> np.ndarray:
-        """Transpose data to (T, C) format."""
-        axes = list(range(data.ndim))
-        front = [cast(int, t_idx), cast(int, c_idx)]
-        back = [a for a in axes if a not in front]
-        return np.transpose(data, axes=front + back)
-
     def _infer_point_dim(self, dataset: Dataset, path: Path) -> str:
         """Validate the canonical exported variable dimensions."""
 
@@ -752,23 +676,6 @@ class ExportedDataset(SourceDataset):
             )
         return self._POINT_DIM
 
-    def _variable_axes(
-        self,
-        dataset: Dataset,
-        variable: Any,
-        path: Path,
-    ) -> tuple[int, int]:
-        """Return the time and sparse-point axes of one source variable."""
-
-        point_dim = self._infer_point_dim(dataset, path)
-        dimensions = tuple(variable.dimensions)
-        if dimensions != ("time", point_dim):
-            raise ValueError(
-                f"Variable {variable.name!r} in {path.name} must have "
-                f"dimensions ('time', {point_dim!r}); got {dimensions}"
-            )
-        return 0, 1
-
     def _compute_column_bbox_from_indices(self) -> None:
         """Compute the minimal saved_points slice for mapped catchments."""
         if self.local_indices is None:
@@ -787,63 +694,39 @@ class ExportedDataset(SourceDataset):
             np.int64, copy=False
         )
 
-    def _read_ops(self, ops: Sequence[ReadOp]) -> np.ndarray:
-        """Read time steps and reorder columns if local_indices is set."""
-        # Determine output size
-        if self.local_indices is not None:
-            out_cols = len(self.local_indices)
-        else:
-            sc, _ = self.get_coordinates()
-            out_cols = len(sc)
-
-        use_column_bbox = (
-            self.local_indices is not None
-            and self._column_bbox is not None
-            and self._column_bbox_local_indices is not None
+    def _read_source_columns(self, key, rows, columns, *, reorder=None) -> np.ndarray:
+        """Read one canonical (time, point) block and verify its source identity."""
+        path = self._checked_source_path(
+            Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
         )
-
-        if not ops:
-            return np.empty((0, out_cols), dtype=self.out_dtype)
-
-        chunks: List[np.ndarray] = []
-        for key, abs_indices in ops:
-            path = self._checked_source_path(
-                Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
+        with self._read_handles.acquire(path) as dataset:
+            variable = dataset.variables[self.var_name]
+            selectors = (np.asarray(rows, dtype=np.int64), columns)
+            _configure_netcdf_variable_cache(variable, selectors, time_axis=0)
+            array = _read_netcdf_var_sliced_trusted(variable, selectors)
+            if reorder is not None:
+                array = array[:, reorder]
+            result = _trusted_source_chunk_payload(
+                array, expected_rows=len(rows), clip_negative=self.clip_negative
             )
-            with self._read_handles.acquire(path) as ds:
-                var = ds.variables[self.var_name]
-                t_idx, c_idx = self._variable_axes_by_path[path]
-                if not abs_indices:
-                    continue
-                abs_idx = np.asarray(abs_indices, dtype=np.int64)
-                sel = [slice(None)] * var.ndim
-                sel[t_idx] = abs_idx
-                if use_column_bbox:
-                    col_min, col_max = self._column_bbox
-                    sel[c_idx] = slice(col_min, col_max + 1)
-                selectors = tuple(sel)
-                _configure_netcdf_variable_cache(
-                    var, selectors, time_axis=t_idx,
-                )
-                arr = _read_netcdf_var_sliced_trusted(var, selectors)
-                arr = self._ensure_tc(arr, t_idx, c_idx)
+        self._verify_source_path(path)
+        return result
 
-                # Reorder before the ownership boundary so a sparse view does
-                # not copy the entire bounding range first.
-                if self.local_indices is not None:
-                    if use_column_bbox:
-                        arr = arr[:, self._column_bbox_local_indices]
-                    else:
-                        arr = arr[:, self.local_indices]
-                arr = _trusted_source_chunk_payload(
-                    arr,
-                    expected_rows=len(abs_indices),
-                    clip_negative=self.clip_negative,
-                )
-
-            chunks.append(arr)
-            self._verify_source_path(path)
-
+    def _read_ops(self, ops: Sequence[ReadOp]) -> np.ndarray:
+        """Read time steps and reorder columns in the dataset's selected order."""
+        if not ops:
+            return np.empty((0, self.data_size), dtype=self.out_dtype)
+        columns = slice(None)
+        if self._column_bbox is not None:
+            start, end = self._column_bbox
+            columns = slice(start, end + 1)
+        chunks = [
+            self._read_source_columns(
+                key, rows, columns, reorder=self._column_bbox_local_indices
+            )
+            for key, rows in ops
+            if rows
+        ]
         return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
 
     def _finish_read(self, data: np.ndarray):
@@ -862,24 +745,15 @@ class ExportedDataset(SourceDataset):
                 self._timeline.source_time_interval,
                 self.time_aggregation,
             )
-        if self.unit_factor == 1.0:
-            converted = data
-        elif isinstance(data, dict):
-            for block in data.values():
+        if self.unit_factor != 1.0:
+            for block in data.values() if isinstance(data, dict) else (data,):
                 np.divide(block, self.unit_factor, out=block)
-            converted = data
-        else:
-            np.divide(data, self.unit_factor, out=data)
-            converted = data
-        return self._finalize_output_data(
-            converted,
-            label="exported dataset output",
-        )
+        return self._finalize_output_data(data, label="exported dataset output")
 
     def _as_cache_data(
         self,
-        data: Union[np.ndarray, Dict[str, np.ndarray]],
-    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        data: np.ndarray | dict[str, np.ndarray],
+    ) -> np.ndarray | dict[str, np.ndarray]:
         """Normalize one processed cache while preserving aggregation maps."""
         if isinstance(data, dict):
             return {
@@ -890,7 +764,7 @@ class ExportedDataset(SourceDataset):
 
     @staticmethod
     def _cache_column_count(
-        cache: Union[np.ndarray, Dict[str, np.ndarray]],
+        cache: np.ndarray | dict[str, np.ndarray],
     ) -> int:
         if isinstance(cache, dict):
             first = next(iter(cache.values()))
@@ -898,13 +772,13 @@ class ExportedDataset(SourceDataset):
         return int(cache.shape[1])
 
     @staticmethod
-    def _cache_shape(cache: Union[np.ndarray, Dict[str, np.ndarray]]):
+    def _cache_shape(cache: np.ndarray | dict[str, np.ndarray]):
         if isinstance(cache, dict):
             return {name: block.shape for name, block in cache.items()}
         return cache.shape
 
     @staticmethod
-    def _cache_nbytes(cache: Union[np.ndarray, Dict[str, np.ndarray]]) -> int:
+    def _cache_nbytes(cache: np.ndarray | dict[str, np.ndarray]) -> int:
         if isinstance(cache, dict):
             return sum(block.nbytes for block in cache.values())
         return cache.nbytes
@@ -916,11 +790,7 @@ class ExportedDataset(SourceDataset):
         """Return a conservative element width for NetCDF source reads."""
 
         element_bytes = np.dtype(self.out_dtype).itemsize
-        visited: set[str] = set()
-        for key, _ in ops:
-            if key in visited:
-                continue
-            visited.add(key)
+        for key in dict.fromkeys(key for key, _ in ops):
             path = self._checked_source_path(
                 Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
             )
@@ -944,18 +814,6 @@ class ExportedDataset(SourceDataset):
             self._verify_source_path(path)
         return element_bytes
 
-    @staticmethod
-    def _select_cache_columns(
-        cache: Union[np.ndarray, Dict[str, np.ndarray]],
-        positions: np.ndarray,
-    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
-        if isinstance(cache, dict):
-            return {
-                name: np.ascontiguousarray(block[:, positions])
-                for name, block in cache.items()
-            }
-        return np.ascontiguousarray(cache[:, positions])
-
     def _read_chunk(self, chunk: SourceChunk) -> _TrustedSourceChunk:
         return _TrustedSourceChunk(
             self._finish_read(
@@ -972,7 +830,7 @@ class ExportedDataset(SourceDataset):
         self,
         desired_catchment_ids: np.ndarray,
         *,
-        time_shift_steps: Optional[np.ndarray] = None,
+        time_shift_steps: np.ndarray | None = None,
     ) -> ExportedDataset:
         """Return a validated immutable column/temporal selection.
 
@@ -1013,7 +871,6 @@ class ExportedDataset(SourceDataset):
             source_name=path.name,
         )
         local_indices = binding.positions
-        selected_ids = desired_catchment_ids.copy()
         if is_rank_zero():
             logger.info(
                 "Mapped %d catchments from %d in exported file",
@@ -1023,7 +880,7 @@ class ExportedDataset(SourceDataset):
 
         return self._rebuild(
             local_indices=local_indices,
-            desired_catchment_ids=selected_ids,
+            desired_catchment_ids=desired_catchment_ids,
             time_shift_steps=time_shift_steps,
             window_length=None,
             window_starts=None,
@@ -1069,16 +926,20 @@ class ExportedDataset(SourceDataset):
             spin_data = self._finish_read(self._read_ops(spin_ops))
 
         # Store in cache with correct dtype and C-contiguous layout.
-        self._memory_cache = self._as_cache_data(all_data)
-        self._spin_up_memory_cache = (
+        memory_cache = self._as_cache_data(all_data)
+        spin_up_memory_cache = (
             None if spin_data is None else self._as_cache_data(spin_data)
         )
         if self.local_indices is None:
-            self._memory_cache_file_indices = np.arange(
-                self._cache_column_count(self._memory_cache), dtype=np.int64
+            memory_cache_file_indices = np.arange(
+                self._cache_column_count(memory_cache), dtype=np.int64
             )
         else:
-            self._memory_cache_file_indices = self.local_indices.copy()
+            memory_cache_file_indices = self.local_indices.copy()
+
+        self._spin_up_memory_cache = spin_up_memory_cache
+        self._memory_cache_file_indices = memory_cache_file_indices
+        self._memory_cache = memory_cache
 
         if is_rank_zero():
             n_files = len(main_ops)
@@ -1098,9 +959,9 @@ class ExportedDataset(SourceDataset):
 
     def _export_quantiles(
         self,
-        out_path: Union[str, Path],
+        out_path: str | Path,
         quantiles: Sequence[float] = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0),
-        var_name: Optional[str] = None,
+        var_name: str | None = None,
         dtype: Literal["float32", "float64"] = "float32",
         netcdf_options: Mapping[str, Any] = DEFAULT_NETCDF_OPTIONS,
         max_buffer_mb: float = 4096.0,
@@ -1121,9 +982,13 @@ class ExportedDataset(SourceDataset):
         Dataset writes the file's native order.
 
         Exact quantile computation requires the full time series per catchment.
-        When the full (T, C) array exceeds ``max_buffer_mb``, catchments are
-        processed in column-batches whose size is automatically computed so that
-        each batch (T × batch_catchments) fits within the buffer limit.
+        When the estimated source working set exceeds ``max_buffer_mb``,
+        catchments are processed in column-batches. The estimate reserves three
+        arrays on the expanded source time axis using the widest source/output
+        element width. A budget smaller than one estimated column is rejected
+        before reading data or creating output. Already-resident data is reused
+        without new source reads. This is a source-buffer planning limit, not a
+        bound on library caches, quantile-result arrays, or total process memory.
 
         Args:
             out_path: Output NetCDF file path.
@@ -1131,9 +996,9 @@ class ExportedDataset(SourceDataset):
             var_name: Variable name in output file (default: ``self.var_name``).
             dtype: Output data type.
             netcdf_options: Validated NetCDF variable-creation options.
-            max_buffer_mb: Maximum memory buffer in MB for reading data.
-                When the full dataset exceeds this limit, catchments are
-                processed in column-batches automatically. Default 4096 (4 GB).
+            max_buffer_mb: Source working-set planning budget in MiB.
+                Column batching must fit at least one estimated source column.
+                Default 4096 (4 GiB).
 
         Returns:
             Path to the created NetCDF file.
@@ -1143,21 +1008,20 @@ class ExportedDataset(SourceDataset):
                 "export_quantiles requires one time-aggregation result; "
                 "create a single-result ExportedDataset first"
             )
-        if type(dtype) is not str or dtype not in {"float32", "float64"}:
-            raise ValueError("dtype must be 'float32' or 'float64'")
-        if var_name is None:
-            resolved_var_name = self.var_name
-        elif not isinstance(var_name, str) or not var_name:
-            raise ValueError("var_name must be a non-empty string when provided")
-        else:
-            resolved_var_name = var_name
-        if not isinstance(resolved_var_name, str) or not resolved_var_name:
-            raise ValueError("output variable name must be a non-empty string")
-        max_buffer_mb = positive_finite_real(
-            max_buffer_mb,
-            label="max_buffer_mb",
+        request = _QuantileExportRequest(
+            out_path=out_path,
+            quantiles=quantiles,
+            dtype=dtype,
+            var_name=self.var_name if var_name is None else var_name,
+            netcdf_options=netcdf_options,
+            max_buffer_mb=max_buffer_mb,
         )
-        quantiles_arr = _quantile_levels(quantiles)
+        out_path, dtype, resolved_var_name = (
+            request.out_path,
+            request.dtype,
+            request.var_name,
+        )
+        max_buffer_mb, quantiles_arr = request.max_buffer_mb, request.quantiles
         Q = len(quantiles_arr)
 
         # ---- catchment IDs (respecting column reorder) ----
@@ -1168,8 +1032,6 @@ class ExportedDataset(SourceDataset):
             catchment_ids = file_catchment_ids
         C_total = len(catchment_ids)
         T_total = self.num_main_source_steps
-        if T_total < 1:
-            raise ValueError("export_quantiles requires at least one time step")
         # ---- determine whether full (T, C) fits in buffer ----
         max_buffer_bytes = max_buffer_mb * 1024 * 1024
         main_ops = None
@@ -1202,10 +1064,14 @@ class ExportedDataset(SourceDataset):
             # from the expanded source axis, since aggregation may require
             # several source rows for every output row.
             rows_per_batch = max(1, source_rows)
-            batch_size = max(
-                1,
-                int(max_buffer_bytes / (rows_per_batch * working_elem_bytes)),
-            )
+            minimum_column_bytes = rows_per_batch * working_elem_bytes
+            if max_buffer_bytes < minimum_column_bytes:
+                raise ValueError(
+                    "max_buffer_mb is too small for one quantile source column; "
+                    f"requires at least {minimum_column_bytes} bytes "
+                    f"({minimum_column_bytes / 1024**2:g} MiB)"
+                )
+            batch_size = int(max_buffer_bytes / minimum_column_bytes)
             n_batches = (C_total + batch_size - 1) // batch_size
             if is_rank_zero():
                 logger.info(
@@ -1221,19 +1087,14 @@ class ExportedDataset(SourceDataset):
         # All arguments and the read plan are valid before touching the output
         # directory. Atomic NetCDF creation then protects against read or
         # numerical failures while computing individual batches.
-        out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         # ---- create output NetCDF ----
         dtype_nc = "f4" if dtype == "float32" else "f8"
-        create_options = prepare_netcdf_variable_options(
-            netcdf_options,
-            dtype=dtype_nc,
-            dimensions=("quantile", "saved_points"),
-            name=resolved_var_name,
-        )
+        create_options = request.create_options
         with _atomic_netcdf_dataset_trusted(
-            out_path, format="NETCDF4",
+            out_path,
+            format="NETCDF4",
         ) as out_ds:
             out_ds.createDimension("quantile", Q)
             out_ds.createDimension("saved_points", C_total)
@@ -1264,10 +1125,10 @@ class ExportedDataset(SourceDataset):
                         "resident quantile source contains non-finite values"
                     )
                 q_values = np.quantile(all_data, quantiles_arr, axis=0)  # (Q, C)
-                data_var[:] = _quantile_output(
+                data_var[:] = canonical_floating_array(
                     q_values,
                     dtype=dtype,
-                    expected_shape=(Q, C_total),
+                    label="quantile result",
                 )
             else:
                 # ---- too large: batch by catchments (columns) ----
@@ -1284,45 +1145,16 @@ class ExportedDataset(SourceDataset):
                     else:
                         file_col_indices = np.arange(c_start, c_end, dtype=np.int64)
 
-                    file_chunks: List[np.ndarray] = []
-                    for key, abs_indices in main_ops:
-                        path = self._checked_source_path(
-                            Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
-                        )
-                        with self._read_handles.acquire(path) as ds_in:
-                            var_in = ds_in.variables[self.var_name]
-                            t_idx, c_idx = self._variable_axes_by_path[path]
-
-                            sel = [slice(None)] * var_in.ndim
-                            sel[t_idx] = np.asarray(abs_indices, dtype=np.int64)
-                            sel[c_idx] = file_col_indices
-                            selectors = tuple(sel)
-                            _configure_netcdf_variable_cache(
-                                var_in, selectors, time_axis=t_idx,
-                            )
-                            arr = _read_netcdf_var_sliced_trusted(
-                                var_in, selectors,
-                            )
-                            batch_data = self._ensure_tc(arr, t_idx, c_idx)
-                            batch_data = _trusted_source_chunk_payload(
-                                batch_data,
-                                expected_rows=len(abs_indices),
-                                clip_negative=self.clip_negative,
-                            )
-                            file_chunks.append(batch_data)
-                        self._verify_source_path(path)
-
+                    file_chunks = [
+                        self._read_source_columns(key, rows, file_col_indices)
+                        for key, rows in main_ops
+                    ]
                     all_batch = (
                         np.concatenate(file_chunks, axis=0)
                         if len(file_chunks) > 1
                         else file_chunks[0]
                     )
-                    if len(file_chunks) > 1:
-                        # Drop references to the component reads before the
-                        # aggregation/conversion allocation below.
-                        file_chunks.clear()
-                    else:
-                        file_chunks.pop()
+                    file_chunks.clear()
                     processed_batch = self._finish_read(all_batch)
                     if not np.isfinite(processed_batch).all():
                         raise ValueError(
@@ -1334,16 +1166,16 @@ class ExportedDataset(SourceDataset):
                         axis=0,
                         overwrite_input=True,
                     )
-                    data_var[:, batch_cols] = _quantile_output(
+                    data_var[:, batch_cols] = canonical_floating_array(
                         q_batch,
                         dtype=dtype,
-                        expected_shape=(Q, c_end - c_start),
+                        label="quantile result",
                     )
                     # Python loop locals retain the previous batch unless
                     # explicitly released. Drop every large array before the
                     # next read so the three-array working-set estimate above
                     # remains conservative across batch boundaries.
-                    del q_batch, processed_batch, all_batch, batch_data, arr
+                    del q_batch, processed_batch, all_batch
 
         if is_rank_zero():
             logger.info(
@@ -1392,13 +1224,13 @@ class ExportedDataset(SourceDataset):
     # -------------------------
     def _gather_cache(
         self,
-        cache: Union[np.ndarray, Dict[str, np.ndarray]],
-        shift: Optional[np.ndarray],
+        cache: np.ndarray | dict[str, np.ndarray],
+        shift: np.ndarray | None,
         base_t: int,
         length: int,
         *,
-        groups: Optional[list],
-    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        groups: list | None,
+    ) -> np.ndarray | dict[str, np.ndarray]:
         if isinstance(cache, dict):
             return {
                 name: self._gather(
@@ -1415,7 +1247,7 @@ class ExportedDataset(SourceDataset):
     def _cached_or_disk_chunk(
         self,
         chunk: SourceChunk,
-    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    ) -> np.ndarray | dict[str, np.ndarray]:
         """Interpret one planned request through cache or NetCDF storage."""
 
         if self._memory_cache is None and (
@@ -1481,12 +1313,12 @@ class ExportedDataset(SourceDataset):
     @staticmethod
     def _gather(
         data: np.ndarray,
-        shift: Optional[np.ndarray],
+        shift: np.ndarray | None,
         base_t: int,
         length: int,
         oob_fill: float = 0.0,
         *,
-        groups: Optional[list] = None,
+        groups: list | None = None,
     ) -> np.ndarray:
         """Gather a ``(length, C)`` window from in-memory ``data``.
 
@@ -1513,10 +1345,7 @@ class ExportedDataset(SourceDataset):
             return _gather_nb_kernel(data, shift, base_t, length, float(oob_fill))
         out = np.full((length, C), oob_fill, dtype=data.dtype)
         if groups is None:
-            unique_shifts, inv = np.unique(shift, return_inverse=True)
-            groups = [
-                (int(s), np.where(inv == i)[0]) for i, s in enumerate(unique_shifts)
-            ]
+            groups = ExportedDataset._compile_groups(shift)
         for s, cols in groups:
             src_lo = base_t + s
             clip_lo = max(src_lo, 0)
@@ -1535,7 +1364,7 @@ class ExportedDataset(SourceDataset):
     def windowed(
         self,
         window: int,
-        stride: Optional[int] = None,
+        stride: int | None = None,
     ) -> ExportedDataset:
         """Return an immutable shifted-window Dataset identity.
 
@@ -1642,8 +1471,8 @@ def open_multivariable_exported(
     spin_up_cycles: int = 0,
     spin_up_start_date: DateLike | None = None,
     spin_up_end_date: DateLike | None = None,
-    chunk_len: Optional[int] = None,
-    time_to_key: Optional[Callable[[datetime], str]] = None,
+    chunk_len: int | None = None,
+    time_to_key: Callable[[datetime], str] | None = None,
     coord_name: str = "catchment_id",
     in_memory: bool = False,
 ):
@@ -1690,8 +1519,7 @@ def open_multivariable_exported(
         first_prefix = first_spec.get("prefix", f"{first_name}_")
         first_suffix = first_spec.get("suffix", "rank0.nc")
         first_time_to_key = (
-            request.time_to_key
-            if request.time_to_key is not None else single_file_key
+            request.time_to_key if request.time_to_key is not None else single_file_key
         )
         shared["chunk_len"] = ExportedDataset._detect_chunk_len(
             request.base_dir,

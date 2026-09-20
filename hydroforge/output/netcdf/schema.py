@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from collections.abc import Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Mapping, Self
+from typing import Any, Self
 
+from hydroforge.contracts.naming import sanitize_symbol
 from hydroforge.serialization.netcdf import (
-    _prepare_netcdf_variable_options_trusted,
     MIN_BLOSC_CHUNK_BYTES,
+    _prepare_netcdf_variable_options_trusted,
     netcdf_dtype_encoding,
     plan_streaming_netcdf_chunks,
 )
-from hydroforge.contracts.naming import sanitize_symbol
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +43,7 @@ class NetCDFSchema:
         metadata: Mapping[str, Any],
         *,
         variable: str,
-        num_trials: int,
+        ensemble_size: int,
         netcdf_options: Mapping[str, Any],
         write_batch_size: int = 1,
     ) -> Self:
@@ -53,12 +54,8 @@ class NetCDFSchema:
         order = metadata["k"]
         batched = metadata["batched"]
         full_output = metadata["full_output"]
-        file_actual_shape = (
-            actual_shape[:-1] if order > 1 else actual_shape
-        )
-        logical_actual_shape = (
-            file_actual_shape[1:] if batched else file_actual_shape
-        )
+        file_actual_shape = actual_shape[:-1] if order > 1 else actual_shape
+        logical_actual_shape = file_actual_shape[1:] if batched else file_actual_shape
         data_dimensions = ["time"]
         used_dimensions = {"time"}
         dimensions: list[tuple[str, int]] = []
@@ -78,24 +75,24 @@ class NetCDFSchema:
             data_dimensions.append(candidate)
             dimensions.append((candidate, extent))
 
+        if batched:
+            data_dimensions.append("ensemble")
+            used_dimensions.add("ensemble")
+            dimensions.append(("ensemble", ensemble_size))
         if full_output:
-            if batched:
-                data_dimensions.append("trial")
-                used_dimensions.add("trial")
-                dimensions.append(("trial", num_trials))
             logical_dimensions = list(tensor_shape)
             if coordinate_name and logical_actual_shape:
                 logical_dimensions[0] = "saved_points"
-            for axis, (name, extent) in enumerate(zip(
-                logical_dimensions, logical_actual_shape, strict=True,
-            )):
+            for axis, (name, extent) in enumerate(
+                zip(
+                    logical_dimensions,
+                    logical_actual_shape,
+                    strict=True,
+                )
+            ):
                 logical_name = f"dim_{axis}" if type(name) is int else name
                 add_dimension(logical_name, extent, axis=axis)
         else:
-            if batched:
-                data_dimensions.append("trial")
-                used_dimensions.add("trial")
-                dimensions.append(("trial", num_trials))
             data_dimensions.append("saved_points")
             used_dimensions.add("saved_points")
             dimensions.append(("saved_points", logical_actual_shape[0]))
@@ -125,7 +122,8 @@ class NetCDFSchema:
         chunks = create_options.get("chunksizes")
         if chunks is not None:
             for axis, (chunk, (_name, extent)) in enumerate(
-                zip(chunks[1:], dimensions, strict=True), start=1,
+                zip(chunks[1:], dimensions, strict=True),
+                start=1,
             ):
                 if extent > 0 and chunk > extent:
                     raise ValueError(
@@ -136,8 +134,7 @@ class NetCDFSchema:
             if (
                 type(compression) is str
                 and compression.startswith("blosc_")
-                and math.prod(chunks) * storage_dtype.itemsize
-                < MIN_BLOSC_CHUNK_BYTES
+                and math.prod(chunks) * storage_dtype.itemsize < MIN_BLOSC_CHUNK_BYTES
             ):
                 raise ValueError(
                     f"Blosc chunksizes for {variable!r} must encode at least "
@@ -159,6 +156,6 @@ class NetCDFSchema:
             logical_actual_shape=logical_actual_shape,
             dimensions=tuple(dimensions),
             data_dimensions=tuple(data_dimensions),
-            create_options=MappingProxyType(dict(create_options)),
+            create_options=MappingProxyType(create_options),
             metadata=MappingProxyType(dict(metadata)),
         )

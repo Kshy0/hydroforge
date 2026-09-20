@@ -3,22 +3,20 @@
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from hydroforge.output.checkpoint import CheckpointRuntime
-from hydroforge.compiler.data import ModelDataCompiler
-from hydroforge.contracts.events import emit
+from hydroforge.compiler.model import FieldNamespaceCompiler
 from hydroforge.compiler.namespace import NamespaceCompiler
-from hydroforge.compiler.partition import PartitionCompiler
 from hydroforge.compiler.statistics_binding import (
     DisabledStatisticsBinding,
     StatisticsBindingCompiler,
 )
-from hydroforge.compiler.model import FieldNamespaceCompiler
+from hydroforge.contracts.errors import ResourceCleanupError
+from hydroforge.contracts.events import emit
 from hydroforge.execution.parameters import ParameterPlanRuntime
 from hydroforge.execution.progress import ProgressRuntime
 from hydroforge.execution.runtime import ModelExecution
-from hydroforge.contracts.errors import ResourceCleanupError
+from hydroforge.output.checkpoint import CheckpointRuntime
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -37,9 +35,12 @@ class ModelInitializer:
     def run(self) -> None:
         model = self.model
         try:
+            if model._data.consumed:
+                from hydroforge.compiler.declarations import validate_input_contract
+
+                validate_input_contract(model)
             self._runtime_services()
-            module_data = model.shard_param()
-            self._construct_modules(module_data)
+            self._construct_modules()
             self._precompile_backend()
             self._apply_tensor_modes()
             model.initialize_model_state()
@@ -52,16 +53,12 @@ class ModelInitializer:
             emit(model, "info", "model.initialized", "Model initialized")
         except BaseException as initialization_error:
             cleanup_failures: list[BaseException] = []
-            if self._statistics is not None:
-                try:
-                    self._statistics.close()
-                except BaseException as cleanup_error:
-                    cleanup_failures.append(cleanup_error)
-            if self._execution is not None:
-                try:
-                    self._execution.close()
-                except BaseException as cleanup_error:
-                    cleanup_failures.append(cleanup_error)
+            for resource in (self._statistics, self._execution):
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except BaseException as cleanup_error:
+                        cleanup_failures.append(cleanup_error)
             if cleanup_failures:
                 error = ResourceCleanupError(
                     "model after initialization failure",
@@ -76,14 +73,10 @@ class ModelInitializer:
         self._execution = execution
         model._execution = execution
         model._namespace = NamespaceCompiler(model)
-        semantic_plan = model._semantic_plan
-        model._partition = PartitionCompiler(
-            model,
-            schema=semantic_plan.partition_schema,
-            variable_groups=semantic_plan.variable_groups,
-        )
-        model._data = ModelDataCompiler(model)
         model._progress_service = ProgressRuntime(model)
+        from hydroforge.serialization.manifest import write_model_manifest
+
+        write_model_manifest(model, backend=execution.backend)
         emit(
             model,
             "info",
@@ -101,49 +94,34 @@ class ModelInitializer:
             group=model.partition_group,
         )
 
-    def _construct_modules(self, module_data: dict[str, Any]) -> None:
+    def _construct_modules(self) -> None:
         model = self.model
         module_types = model._module_types()
+        prepared = model._data.prepare_modules()
         for name in model._module_order:
             module_class = module_types[name]
-            declared = module_class.model_fields
-            payload = {
-                field_name: value
-                for field_name, value in module_data.items()
-                if field_name in declared
-            }
-            payload.update(
-                {
-                    "opened_modules": model.opened_modules,
-                    "rank": model.rank,
-                    "device": model.device,
-                    "precision": model.dtype,
-                    "mixed_precision": model.mixed_precision,
-                    "num_trials": model.num_trials,
-                }
-            )
+            view = prepared[name]
             module = module_class.model_validate(
-                payload,
+                view._input_values,
                 context={
                     "hydroforge_model_initialization": True,
+                    "hydroforge_module_input_prepared": True,
                     "hydroforge_module_references": model._modules,
                     "hydroforge_module_event_sink": model.event_sink,
                     "hydroforge_module_reference_targets": (
                         model._semantic_plan.reference_targets[name]
                     ),
                     "hydroforge_model_initial_time": model.initial_time,
-                    "hydroforge_model_simulation_schedule": (
-                        model.simulation_schedule
+                    "hydroforge_model_simulation_schedule": (model.simulation_schedule),
+                    "hydroforge_ensemble_forcing_fields": (
+                        model._semantic_plan.ensemble_forcing_fields.get(name, ())
                     ),
-                    "hydroforge_trial_forcing_fields": (
-                        model._semantic_plan.trial_forcing_fields.get(name, ())
-                    ),
-                    "hydroforge_field_demand_plan": (
-                        model._semantic_plan.field_demand
-                    ),
+                    "hydroforge_field_demand_plan": (model._semantic_plan.field_demand),
+                    "hydroforge_module_defaults": (view._default_values),
                 },
             )
             model._modules[name] = module
+        model._data.release()
         model._module_links = MappingProxyType(
             {
                 name: model._modules.get(reference.module_name)

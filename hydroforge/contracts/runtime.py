@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import Self
+from typing import Literal, Self
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from hydroforge.contracts.validation import HydroForgeModel
 
-
-_PRECISIONS = frozenset({"float32", "float64"})
 DEFAULT_BLOCK_SIZE = 256
 MODEL_OWNED_MODULE_FIELDS = (
     "opened_modules",
@@ -18,7 +16,7 @@ MODEL_OWNED_MODULE_FIELDS = (
     "device",
     "precision",
     "mixed_precision",
-    "num_trials",
+    "ensemble_size",
 )
 
 
@@ -32,8 +30,7 @@ def validate_runtime_block_size(value: int, *, backend: str) -> None:
         )
     if backend == "triton" and value & (value - 1):
         raise ValueError(
-            "backend 'triton' BLOCK_SIZE must be a power of two, "
-            f"got {value}"
+            f"backend 'triton' BLOCK_SIZE must be a power of two, got {value}"
         )
 
 
@@ -53,34 +50,17 @@ def _effective_block_size(
 class BackendRequirement(HydroForgeModel):
     """Model-wide restrictions not already defined by the backend runtime."""
 
-    precision: frozenset[str] | None = None
+    precision: frozenset[Literal["float32", "float64"]] | None = Field(
+        default=None, min_length=1
+    )
     mixed_precision: bool = True
-    trials: bool = True
-    min_block_size: int | None = None
-    max_block_size: int | None = None
-    block_size: int | None = None
+    ensemble: bool = True
+    min_block_size: int | None = Field(default=None, ge=1)
+    max_block_size: int | None = Field(default=None, ge=1)
+    block_size: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def _validate_requirement(self) -> Self:
-        if self.precision is not None:
-            if type(self.precision) is not frozenset or not self.precision:
-                raise ValueError(
-                    "backend precision must be a non-empty exact frozenset"
-                )
-            unknown = self.precision.difference(_PRECISIONS)
-            if unknown:
-                raise ValueError(
-                    f"backend precision contains unknown values: {sorted(unknown)}"
-                )
-        for name in ("mixed_precision", "trials"):
-            if type(getattr(self, name)) is not bool:
-                raise ValueError(f"backend requirement {name} must be bool")
-        for name in ("min_block_size", "max_block_size", "block_size"):
-            value = getattr(self, name)
-            if value is not None and (type(value) is not int or value < 1):
-                raise ValueError(
-                    f"backend requirement {name} must be a positive exact int"
-                )
         if (
             self.min_block_size is not None
             and self.max_block_size is not None
@@ -117,7 +97,11 @@ class BackendRequirement(HydroForgeModel):
             )
 
     def _validate_precision(
-        self, precision: str, mixed_precision: bool, *, backend: str,
+        self,
+        precision: str,
+        mixed_precision: bool,
+        *,
+        backend: str,
     ) -> None:
         """Validate model precision against one runtime or model restriction."""
 
@@ -127,21 +111,13 @@ class BackendRequirement(HydroForgeModel):
                 f"got {precision!r}"
             )
         if not self.mixed_precision and mixed_precision:
-            raise ValueError(
-                f"backend {backend!r} does not support mixed precision"
-            )
+            raise ValueError(f"backend {backend!r} does not support mixed precision")
 
 
 class ModuleRequirement(HydroForgeModel):
     """Restrictions introduced only when one optional module is open."""
 
-    trials: bool = True
-
-    @model_validator(mode="after")
-    def _validate_requirement(self) -> Self:
-        if type(self.trials) is not bool:
-            raise ValueError("module requirement trials must be bool")
-        return self
+    ensemble: bool = True
 
 
 DEFAULT_BACKEND_REQUIREMENT = BackendRequirement()
@@ -151,8 +127,11 @@ DEFAULT_MODULE_REQUIREMENT = ModuleRequirement()
 # model. Launch-width rules are enforced by ``validate_runtime_block_size``;
 # these declarative requirements capture the remaining backend capabilities.
 # Model ``backend_requirements`` may only add stricter constraints.
-RUNTIME_BACKEND_REQUIREMENTS = MappingProxyType({
-    "metal": BackendRequirement(
-        precision=frozenset({"float32"}), mixed_precision=False,
-    ),
-})
+RUNTIME_BACKEND_REQUIREMENTS = MappingProxyType(
+    {
+        "metal": BackendRequirement(
+            precision=frozenset({"float32"}),
+            mixed_precision=False,
+        ),
+    }
+)

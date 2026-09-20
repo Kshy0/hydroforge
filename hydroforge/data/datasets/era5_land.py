@@ -4,10 +4,10 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
-from collections.abc import Mapping
-from typing import Callable, ClassVar, Optional, Self, Union
+from typing import ClassVar, Self
 
 import cftime
 import numpy as np
@@ -22,7 +22,6 @@ from hydroforge.data.netcdf import (
     _planned_netcdf_chunk_len,
     monthly_time_to_key,
 )
-
 
 _ERA5_LOGICAL_CHUNK_BYTES = 4 * 1024**3
 _ERA5_PHYSICAL_CHUNK_MULTIPLIER = 2
@@ -80,10 +79,12 @@ class ERA5LandAccumDataset(NetCDFDataset):
     This keeps the output aligned with the physical interval [t, t+Δt) and avoids
     off-by-one mistakes caused by end-of-period time stamps and the 00:00 daily total.
     """
+
     supports_time_aggregation: ClassVar[bool] = False
+    reusable_expression_reads: ClassVar[bool] = True
 
     base_dir: str | Path
-    chunk_len: int | None = Field(default=None, strict=True, ge=1)
+    chunk_len: int | None = Field(default=None, ge=1)
     var_name: str = "ro"
     prefix: str = "runoff_"
     suffix: str = ".nc"
@@ -126,7 +127,9 @@ class ERA5LandAccumDataset(NetCDFDataset):
             interval_label="ERA5 time_interval",
         )
         self._validate_daily_grid_alignment(
-            self.start_date, self.time_interval, "start_date",
+            self.start_date,
+            self.time_interval,
+            "start_date",
         )
         if self.spin_up_start_date is not None:
             self._validate_daily_grid_alignment(
@@ -141,8 +144,7 @@ class ERA5LandAccumDataset(NetCDFDataset):
         """Freeze every predecessor required by non-midnight chunk reads."""
 
         for chunk in self.chunk_plan:
-            physical_times = tuple(chunk._source_times())
-            if self._is_day_start(physical_times[0]):
+            if self._is_day_start(chunk.source_start):
                 continue
             source_times = self._timeline.storage_times_for_chunk(chunk)
             predecessor = source_times[0] - self.time_interval
@@ -163,24 +165,25 @@ class ERA5LandAccumDataset(NetCDFDataset):
         )
         axes_by_path: dict[Path, tuple[int, int, int]] = {}
         for path in source_paths:
-            with Dataset(path, "r") as dataset:
-                axes_by_path[
-                    self._canonical_source_path(path)
-                ] = self._validate_shard_coordinates(dataset, path)
+            with self._inspect_source_file(path), Dataset(path, "r") as dataset:
+                axes_by_path[self._canonical_source_path(path)] = (
+                    self._validate_shard_coordinates(dataset, path)
+                )
         self._variable_axes_by_path = axes_by_path
         self._record_source_files(source_paths)
         return self
 
     def _storage_time(
-        self, logical_time: Union[datetime, cftime.datetime],
-    ) -> Union[datetime, cftime.datetime]:
+        self,
+        logical_time: datetime | cftime.datetime,
+    ) -> datetime | cftime.datetime:
         """Map interval-start time to ERA5's interval-end timestamp."""
 
         return logical_time + self.time_interval
 
     @staticmethod
     def _validate_daily_grid_alignment(
-        dt: Union[datetime, cftime.datetime],
+        dt: datetime | cftime.datetime,
         interval: timedelta,
         label: str,
     ) -> None:
@@ -205,19 +208,16 @@ class ERA5LandAccumDataset(NetCDFDataset):
             ) from error
 
     @staticmethod
-    def _is_day_start(dt: Union[datetime, cftime.datetime]) -> bool:
+    def _is_day_start(dt: datetime | cftime.datetime) -> bool:
         return (
-            dt.hour == 0
-            and dt.minute == 0
-            and dt.second == 0
-            and dt.microsecond == 0
+            dt.hour == 0 and dt.minute == 0 and dt.second == 0 and dt.microsecond == 0
         )
 
     def _transform_cumulative_to_incremental(
         self,
         arr: np.ndarray,
-        physical_times: list[Union[datetime, cftime.datetime]],
-        previous: Optional[np.ndarray] = None,
+        physical_times: list[datetime | cftime.datetime],
+        previous: np.ndarray | None = None,
     ) -> np.ndarray:
         """Convert daily cumulative records using their physical interval times."""
         reset = np.fromiter(
@@ -250,15 +250,24 @@ class ERA5LandAccumDataset(NetCDFDataset):
             read_times = [predecessor, *source_times]
 
         ops = self._timeline.operations_for_times(read_times)
-        data = self._canonical_calculation_data(
-            self._read_ops(ops), label="ERA5 cumulative input",
-        ) / self.unit_factor
+        data = (
+            self._canonical_calculation_data(
+                self._read_ops(ops),
+                label="ERA5 cumulative input",
+            )
+            / self.unit_factor
+        )
 
         previous = data[0] if needs_previous else None
         arr = data[1:] if needs_previous else data
         increments = self._transform_cumulative_to_incremental(
-            arr, physical_times, previous,
+            arr,
+            physical_times,
+            previous,
         )
-        return _TrustedSourceChunk(self._finalize_output_data(
-            increments, label="ERA5 cumulative increment output",
-        ))
+        return _TrustedSourceChunk(
+            self._finalize_output_data(
+                increments,
+                label="ERA5 cumulative increment output",
+            )
+        )

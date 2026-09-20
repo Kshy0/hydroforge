@@ -1,12 +1,8 @@
 """Public declarative physical-model API."""
 
 from hydroforge.contracts.events import NullEventSink
-from hydroforge.model.model import AbstractModel
-from hydroforge.model.structure import (
-    StructuralUpdateContext,
-    StructuralUpdateResult,
-)
 from hydroforge.contracts.kernel_field import kernel_field
+from hydroforge.model.model import AbstractModel
 from hydroforge.model.module import (
     AbstractModule,
     CoordinateField,
@@ -18,6 +14,11 @@ from hydroforge.model.module import (
     module_ref,
     optional_module_ref,
 )
+from hydroforge.model.structure import (
+    StructuralUpdateContext,
+    StructuralUpdateResult,
+)
+from hydroforge.model.tensors import copy_tensor_inputs
 
 __all__ = [
     "AbstractModel",
@@ -31,6 +32,7 @@ __all__ = [
     "StructuralUpdateResult",
     "TensorField",
     "computed_tensor_field",
+    "copy_tensor_inputs",
     "kernel_field",
     "module_ref",
     "optional_module_ref",

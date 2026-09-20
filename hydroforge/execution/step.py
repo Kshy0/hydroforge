@@ -3,36 +3,35 @@
 from __future__ import annotations
 
 import inspect
-from hashlib import sha256
+import sys
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import IntEnum
 from functools import wraps
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast
+from hashlib import sha256
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import torch
 import torch.distributed as dist
 from pydantic import Field, PrivateAttr, ValidationInfo, model_validator
 
+from hydroforge.contracts.errors import ResourceCleanupError
 from hydroforge.contracts.events import emit
-from hydroforge.contracts.errors import (
-    ResourceCleanupError,
-    distributed_failure_error,
-)
-from hydroforge.contracts.validation import HydroForgeModel
-from hydroforge.kernels.devices import devices_match
 from hydroforge.contracts.temporal import (
     DateLike,
     SimulationStep,
     date_calendar,
     timedelta_microseconds,
 )
+from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.execution.boundaries import coordinate_preflight
 from hydroforge.execution.windows import (
     StatisticsWindowController,
     WindowDecision,
 )
+from hydroforge.kernels.devices import devices_match
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -45,6 +44,12 @@ _ACTIVE_MANAGED_STEP: ContextVar[_StepRuntime | None] = ContextVar(
     "hydroforge_active_managed_step",
     default=None,
 )
+_ENSEMBLE_COLLECTIVE_FLAG = 1 << 60
+
+
+def _collective_mesh():
+    step = _ACTIVE_MANAGED_STEP.get()
+    return None if step is None else getattr(step.model, "parallel", None)
 
 
 def _managed_step_active() -> bool:
@@ -136,9 +141,7 @@ class _StepRuntime:
         backend = str(dist.get_backend()).lower()
         accelerator_collective = "nccl" in backend or "xccl" in backend
         sync_device = (
-            self.execution.device
-            if accelerator_collective
-            else torch.device("cpu")
+            self.execution.device if accelerator_collective else torch.device("cpu")
         )
         if (
             self._distributed_input is None
@@ -164,17 +167,24 @@ class _StepRuntime:
             return
         source = self._distributed_input
         wire = event.wire(self._distributed_sequence)
-        for index, value in enumerate(wire):
-            source[index] = value
+        source.copy_(torch.tensor(wire, dtype=torch.int64, device="cpu"))
         dist.all_gather(list(self._distributed_outputs), source)
         observed = tuple(
-            tuple(map(int, value.tolist())) for value in self._distributed_outputs
+            map(tuple, torch.stack(self._distributed_outputs).cpu().tolist())
         )
         self._distributed_sequence += 1
         failed_ranks = tuple(
             rank for rank, value in enumerate(observed) if value[1] < 0
         )
-        if failed_ranks or len(set(observed)) != 1:
+        matching = len(set(observed)) == 1
+        mesh = getattr(self.model, "parallel", None)
+        if mesh is not None and event.kind >= 10 and not failed_ranks:
+            scope = "ensemble" if event.kind & _ENSEMBLE_COLLECTIVE_FLAG else "spatial"
+            matching = len({value[:2] for value in observed}) == 1 and all(
+                len({observed[rank][2:] for rank in ranks}) == 1
+                for ranks in mesh.rank_groups(scope)
+            )
+        if failed_ranks or not matching:
             self._distributed_terminal = True
             if event.failed:
                 return
@@ -205,6 +215,7 @@ class _StepRuntime:
             state.elapsed,
             state.start_time,
             state.pending_outer_first,
+            self.model._current_time,
         )
         controller = (
             None if self.controller is None else self.controller.snapshot_state()
@@ -220,6 +231,7 @@ class _StepRuntime:
             self.state.elapsed,
             self.state.start_time,
             self.state.pending_outer_first,
+            self.model._current_time,
         ) = local
         if self.controller is not None and controller is not None:
             self.controller.restore_snapshot_state(controller)
@@ -325,6 +337,7 @@ class _StepRuntime:
         return self.time_step, (
             self._substep_program_owner,
             kind,
+            self.model.options.specialization_key(),
             specialization,
         )
 
@@ -343,6 +356,7 @@ class _StepRuntime:
             self._substep_program_owner,
             "outer",
             site,
+            self.model.options.specialization_key(),
             specialization,
         )
 
@@ -514,9 +528,9 @@ class ManagedStep(HydroForgeModel):
                 else runtime.requested_sub_steps
             ),
             is_spin_up=runtime.spinup,
+            _substeps=SubstepRuntime(model, runtime),
+            _outer=OuterRuntime(model, runtime),
         )
-        result._substeps = SubstepRuntime(model, runtime)
-        result._outer = OuterRuntime(model, runtime)
         return result
 
     def fixed(
@@ -563,7 +577,11 @@ class ManagedStep(HydroForgeModel):
     def outer(self, *, specialization: Any = None):
         """Declare one cached once-per-outer-step operator scope."""
 
-        return self._outer.once(specialization=specialization)
+        caller = sys._getframe(1)
+        return self._outer.once(
+            site=(caller.f_code, caller.f_lasti),
+            specialization=specialization,
+        )
 
 
 class _ManagedStepEntryRequest(HydroForgeModel):
@@ -607,11 +625,19 @@ class _ManagedScheduleRequest(HydroForgeModel):
         return self._step
 
 
+@dataclass(frozen=True, slots=True)
+class _ManagedStepConditions:
+    time_step_supplied: bool
+    schedule_configured: bool
+    spinup: bool
+    statistics_configured: bool
+    current_time_available: bool
+
+
 class _ManagedStepRequest(HydroForgeModel):
     """The complete driver-owned input to one managed-step invocation."""
 
     time_step: timedelta | None = None
-    time_step_supplied: bool = Field(strict=True, exclude=True)
     num_sub_steps: int | None = Field(
         default=None,
         strict=True,
@@ -619,18 +645,18 @@ class _ManagedStepRequest(HydroForgeModel):
         lt=(1 << 31) - 1,
     )
     output_enabled: bool | None = Field(default=None, strict=True)
-    schedule_configured: bool = Field(strict=True, exclude=True)
-    spinup: bool = Field(strict=True, exclude=True)
-    statistics_configured: bool = Field(strict=True, exclude=True)
-    current_time_available: bool = Field(strict=True, exclude=True)
+    _conditions: _ManagedStepConditions = PrivateAttr()
 
     @model_validator(mode="after")
-    def _validate_schedule_ownership(self) -> _ManagedStepRequest:
-        if self.schedule_configured and self.time_step_supplied:
+    def _validate_schedule_ownership(self, info: ValidationInfo) -> _ManagedStepRequest:
+        conditions = info.context
+        if not isinstance(conditions, _ManagedStepConditions):
+            raise ValueError("managed-step validation requires framework context")
+        if conditions.schedule_configured and conditions.time_step_supplied:
             raise ValueError(
                 "time_step is derived from simulation_schedule and must not be provided"
             )
-        if not self.schedule_configured and self.time_step is None:
+        if not conditions.schedule_configured and self.time_step is None:
             raise ValueError(
                 "time_step is required when simulation_schedule is not configured"
             )
@@ -643,19 +669,22 @@ class _ManagedStepRequest(HydroForgeModel):
             <= 0
         ):
             raise ValueError("time_step must be positive")
-        if self.spinup and self.output_enabled is True:
+        if conditions.spinup and self.output_enabled is True:
             raise ValueError("spin-up requires output_enabled=False")
         effective_output = (
-            not self.spinup if self.output_enabled is None else self.output_enabled
+            not conditions.spinup
+            if self.output_enabled is None
+            else self.output_enabled
         )
         if (
-            self.statistics_configured
+            conditions.statistics_configured
             and effective_output
-            and not self.current_time_available
+            and not conditions.current_time_available
         ):
             raise ValueError(
                 "current_time must be provided when statistics output is enabled"
             )
+        self._conditions = conditions
         return self
 
 
@@ -666,10 +695,14 @@ class _ManagedStepDeclaration(HydroForgeModel):
 
     @model_validator(mode="after")
     def _validate_signature(self) -> _ManagedStepDeclaration:
-        from hydroforge.execution.boundaries import is_between_steps_api
+        from hydroforge.execution.boundaries import (
+            _validate_synchronous_function,
+            is_between_steps_api,
+        )
 
         if is_between_steps_api(self.function):
             raise ValueError("@managed_step cannot decorate a @between_steps method")
+        _validate_synchronous_function(self.function, decorator="@managed_step")
         parameters = tuple(inspect.signature(self.function).parameters.values())
         positional = tuple(
             parameter
@@ -704,9 +737,8 @@ class _ManagedStepDeclaration(HydroForgeModel):
 class _ManagedStepDescriptor:
     def __init__(self, declaration: _ManagedStepDeclaration) -> None:
         self.function = declaration.function
-        self.protocol_name = (
-            f"{self.function.__module__}.{self.function.__qualname__}"
-        )
+        self._request_cache: tuple[tuple[Any, ...], _ManagedStepRequest] | None = None
+        self.protocol_name = f"{self.function.__module__}.{self.function.__qualname__}"
         self.protocol_code = int.from_bytes(
             sha256(self.protocol_name.encode("utf-8")).digest()[:8],
             byteorder="big",
@@ -724,11 +756,11 @@ class _ManagedStepDescriptor:
     ) -> _ValidatedStepInvocation:
         """Validate driver input before model runtime materialization."""
 
-        _ManagedStepEntryRequest(
-            available=_ACTIVE_MANAGED_STEP.get() is None,
-        )
-        framework_values = dict(kwargs)
+        if _ACTIVE_MANAGED_STEP.get() is not None:
+            _ManagedStepEntryRequest(available=False)
+        framework_values = kwargs
         if len(args) != 1:
+            framework_values = dict(kwargs)
             framework_values["unexpected_positional_arguments"] = args[1:]
         schedule = model.simulation_schedule
         current_time = (
@@ -738,20 +770,40 @@ class _ManagedStepDescriptor:
             if schedule is not None
             else model.initial_time
         )
-        scheduled_step = _ManagedScheduleRequest(
-            schedule=schedule,
-            current_time=current_time,
-        ).step
-        request = _ManagedStepRequest.model_validate(
-            {
-                **framework_values,
-                "time_step_supplied": "time_step" in framework_values,
-                "schedule_configured": schedule is not None,
-                "spinup": (scheduled_step is not None and scheduled_step.is_spin_up),
-                "statistics_configured": model._statistics_plan is not None,
-                "current_time_available": current_time is not None,
-            }
+        scheduled_step = (
+            None
+            if schedule is None
+            else _ManagedScheduleRequest(
+                schedule=schedule,
+                current_time=current_time,
+            ).step
         )
+        conditions = _ManagedStepConditions(
+            time_step_supplied="time_step" in framework_values,
+            schedule_configured=schedule is not None,
+            spinup=scheduled_step is not None and scheduled_step.is_spin_up,
+            statistics_configured=model._statistics_plan is not None,
+            current_time_available=current_time is not None,
+        )
+        duration = framework_values.get("time_step")
+        count = framework_values.get("num_sub_steps")
+        output = framework_values.get("output_enabled")
+        cacheable = (
+            framework_values.keys() <= _FRAMEWORK_STEP_PARAMETERS
+            and (duration is None or type(duration) is timedelta)
+            and (count is None or type(count) is int)
+            and (output is None or type(output) is bool)
+        )
+        key = (duration, count, output, conditions)
+        cached = self._request_cache
+        if cacheable and cached is not None and cached[0] == key:
+            request = cached[1]
+        else:
+            request = _ManagedStepRequest.model_validate(
+                framework_values, context=conditions
+            )
+            if cacheable:
+                self._request_cache = (key, request)
         return _ValidatedStepInvocation(
             current_time=current_time,
             scheduled_step=scheduled_step,
@@ -771,6 +823,7 @@ class _ValidatedStepInvocation:
         """Return the exact driver and schedule identity shared by all ranks."""
 
         request = self.request
+        conditions = request._conditions
         time_step_us = (
             None
             if request.time_step is None
@@ -780,13 +833,13 @@ class _ValidatedStepInvocation:
             _distributed_date_identity(self.current_time),
             _distributed_step_identity(self.scheduled_step),
             time_step_us,
-            request.time_step_supplied,
+            conditions.time_step_supplied,
             request.num_sub_steps,
             request.output_enabled,
-            request.schedule_configured,
-            request.spinup,
-            request.statistics_configured,
-            request.current_time_available,
+            conditions.schedule_configured,
+            conditions.spinup,
+            conditions.statistics_configured,
+            conditions.current_time_available,
         )
 
 
@@ -859,7 +912,6 @@ class _CompiledStepPolicy:
     ) -> BaseException:
         """Publish failure, restore temporal state, and return its full cause."""
 
-        primary_error = error
         try:
             context.abort_distributed()
         except BaseException as coordination_error:
@@ -867,8 +919,6 @@ class _CompiledStepPolicy:
                 "managed-step distributed failure propagation",
                 (error, coordination_error),
             )
-        if poison:
-            self.execution.poison(error, phase="managed-step execution")
         try:
             context.restore_snapshot_state(snapshot)
         except BaseException as rollback_error:
@@ -876,8 +926,8 @@ class _CompiledStepPolicy:
                 "managed-step temporal rollback",
                 (error, rollback_error),
             )
-        if error is primary_error:
-            return primary_error
+        if poison or isinstance(error, ResourceCleanupError):
+            self.execution.poison(error, phase="managed-step execution")
         return error
 
     def execute(self, invocation: _ValidatedStepInvocation) -> Any:
@@ -923,11 +973,7 @@ class _CompiledStepPolicy:
                     _DistributedStepKind.BEGIN,
                     (
                         self.descriptor.protocol_code,
-                        (
-                            -1
-                            if scheduled_step is None
-                            else scheduled_step.index
-                        ),
+                        (-1 if scheduled_step is None else scheduled_step.index),
                         (
                             0
                             if context.requested_sub_steps is None
@@ -958,34 +1004,37 @@ class _CompiledStepPolicy:
                         # There is no affordable generic rollback proof for an
                         # arbitrary failure, so the instance must fail closed.
                         entered_user_step = True
+                        self.execution.step_fields.prepare(
+                            current_time, context.time_step
+                        )
                         result = self.descriptor.function(model, managed)
                 finally:
                     _ACTIVE_MANAGED_STEP.reset(token)
-            context.synchronize_distributed(
-                _DistributedStepEvent(
-                    _DistributedStepKind.USER_STEP_COMPLETE,
-                )
-            )
-            context.finish()
-            self.execution.statistics.check_background_failures(current_time)
-            if self._rank == 0:
-                if self._progress_tick():
-                    progress = self._format_progress()
-                    emit(
-                        model,
-                        "progress",
-                        "step.completed",
-                        "Processed step",
-                        current_time=current_time,
-                        adaptive_time_step=context.completed_substeps,
-                        progress=progress,
+                context.synchronize_distributed(
+                    _DistributedStepEvent(
+                        _DistributedStepKind.USER_STEP_COMPLETE,
                     )
-            context.synchronize_distributed(
-                _DistributedStepEvent(
-                    _DistributedStepKind.STEP_FINALIZED,
                 )
-            )
-            context.commit_clock()
+                context.finish()
+                self.execution.statistics.check_background_failures(current_time)
+                if self._rank == 0:
+                    if self._progress_tick():
+                        progress = self._format_progress()
+                        emit(
+                            model,
+                            "progress",
+                            "step.completed",
+                            "Processed step",
+                            current_time=current_time,
+                            adaptive_time_step=context.completed_substeps,
+                            progress=progress,
+                        )
+                context.synchronize_distributed(
+                    _DistributedStepEvent(
+                        _DistributedStepKind.STEP_FINALIZED,
+                    )
+                )
+                context.commit_clock()
             return result
         except BaseException as error:
             resolved = self._coordinate_failure(
@@ -993,9 +1042,7 @@ class _CompiledStepPolicy:
                 snapshot,
                 error,
                 poison=(
-                    preparation_failed
-                    or entered_user_step
-                    or context.world_size > 1
+                    preparation_failed or entered_user_step or context.world_size > 1
                 ),
             )
             if resolved is error:
@@ -1032,33 +1079,20 @@ def managed_step(function: _F) -> _F:
             invocation = descriptor.validate_invocation(model, args, kwargs)
         except BaseException as error:
             validation_error = error
-        if model.world_size > 1:
-            validation_failures = model._gather_distributed_failures(
-                validation_error,
-                phase=(
-                    "managed-step.invocation:"
-                    f"{descriptor.protocol_name}"
-                ),
-                signature=(
-                    None
-                    if invocation is None
-                    else (
-                        model._runtime_materialized,
-                        *invocation.distributed_signature(),
-                    )
-                ),
-            )
-            if any(
-                failure is not None for failure in validation_failures
-            ):
-                if validation_error is not None:
-                    raise validation_error
-                raise distributed_failure_error(
-                    "distributed managed-step invocation validation",
-                    validation_failures,
+        coordinate_preflight(
+            model,
+            validation_error,
+            phase=f"managed-step.invocation:{descriptor.protocol_name}",
+            scope="distributed managed-step invocation validation",
+            signature=(
+                None
+                if invocation is None or model.world_size == 1
+                else (
+                    model._runtime_materialized,
+                    *invocation.distributed_signature(),
                 )
-        elif validation_error is not None:
-            raise validation_error
+            ),
+        )
         model._ensure_runtime_materialized()
         return model._execution.step_policies[descriptor].execute(
             cast(_ValidatedStepInvocation, invocation),

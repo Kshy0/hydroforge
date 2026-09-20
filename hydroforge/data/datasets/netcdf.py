@@ -4,19 +4,13 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import (
     Any,
-    Callable,
     ClassVar,
-    Dict,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-    Union,
     cast,
 )
 
@@ -25,24 +19,25 @@ import numpy as np
 from netCDF4 import Dataset
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 
-from hydroforge.data.datasets.chunking import SourceChunk
+from hydroforge.contracts.temporal import DateLike
+from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.data.datasets.base import (
-    _TrustedSourceChunk,
+    _as_nan_array,
     _trusted_source_chunk_payload,
+    _TrustedSourceChunk,
     positive_finite_real,
 )
+from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.gridded import GriddedDataset
 from hydroforge.data.datasets.timeline import DatasetTimeline, ReadOp
 from hydroforge.data.netcdf import (
-    _NetCDFReadHandlePool,
     _configure_netcdf_variable_cache,
+    _NetCDFReadHandlePool,
     _planned_netcdf_chunk_len,
     _read_netcdf_var_sliced_trusted,
     yearly_time_to_key,
 )
 from hydroforge.data.numeric import canonical_float64, immutable_array
-from hydroforge.contracts.temporal import DateLike
-from hydroforge.contracts.validation import HydroForgeModel
 
 
 class NetCDFDataset(GriddedDataset):
@@ -58,11 +53,12 @@ class NetCDFDataset(GriddedDataset):
     """
 
     supports_time_aggregation: ClassVar[bool] = True
+    reusable_expression_reads: ClassVar[bool] = True
 
     base_dir: str | Path
     var_name: str
     prefix: str
-    chunk_len: int | None = Field(default=None, strict=True, ge=1)
+    chunk_len: int | None = Field(default=None, ge=1)
     unit_factor: float = 1.0
     suffix: str = ".nc"
     time_to_key: Callable[[DateLike], str] = yearly_time_to_key
@@ -70,6 +66,7 @@ class NetCDFDataset(GriddedDataset):
 
     _bbox: tuple[int, int, int, int] | None = PrivateAttr(default=None)
     _bbox_local_indices: np.ndarray | None = PrivateAttr(default=None)
+    _spatial_read_plans: dict = PrivateAttr(default_factory=dict)
     _coordinates_cache: tuple[np.ndarray, np.ndarray] | None = PrivateAttr(
         default=None,
     )
@@ -112,11 +109,12 @@ class NetCDFDataset(GriddedDataset):
             if type(key) is not str:
                 raise TypeError("time_to_key must return an exact string")
             path = Path(self.base_dir, f"{self.prefix}{key}{self.suffix}")
-            object.__setattr__(
-                self,
-                "chunk_len",
-                self._planned_storage_chunk_len(path),
-            )
+            with self._inspect_source_file(path):
+                object.__setattr__(
+                    self,
+                    "chunk_len",
+                    self._planned_storage_chunk_len(path),
+                )
             self._install_temporal_domain(self._temporal_domain)
         self._timeline = DatasetTimeline(
             self,
@@ -133,7 +131,7 @@ class NetCDFDataset(GriddedDataset):
                 self.base_dir,
                 f"{self.prefix}{key}{self.suffix}",
             )
-            with Dataset(path, "r") as dataset:
+            with self._inspect_source_file(path), Dataset(path, "r") as dataset:
                 axes_by_path[self._canonical_source_path(path)] = (
                     self._validate_shard_coordinates(dataset, path)
                 )
@@ -151,8 +149,8 @@ class NetCDFDataset(GriddedDataset):
 
     @staticmethod
     def _storage_time(
-        logical_time: Union[datetime, cftime.datetime],
-    ) -> Union[datetime, cftime.datetime]:
+        logical_time: datetime | cftime.datetime,
+    ) -> datetime | cftime.datetime:
         """Map public logical time to the timestamp stored on disk."""
 
         return logical_time
@@ -161,7 +159,7 @@ class NetCDFDataset(GriddedDataset):
     # Variable shape helpers
     # -------------------------
     @staticmethod
-    def _pick_dim(dim_names: Tuple[str, ...], *candidates: str) -> Optional[int]:
+    def _pick_dim(dim_names: tuple[str, ...], *candidates: str) -> int | None:
         m = {name: index for index, name in enumerate(dim_names)}
         matches = [(name, m[name]) for name in candidates if name in m]
         if len(matches) > 1:
@@ -171,7 +169,7 @@ class NetCDFDataset(GriddedDataset):
         return None if not matches else matches[0][1]
 
     @classmethod
-    def _tyx_axes(cls, dim_names: Tuple[str, ...]) -> tuple[int, int, int]:
+    def _tyx_axes(cls, dim_names: tuple[str, ...]) -> tuple[int, int, int]:
         t_idx = cls._pick_dim(dim_names, "time", "valid_time")
         y_idx = cls._pick_dim(dim_names, "lat", "latitude", "y")
         x_idx = cls._pick_dim(dim_names, "lon", "longitude", "long", "x")
@@ -183,11 +181,9 @@ class NetCDFDataset(GriddedDataset):
         return t_idx, y_idx, x_idx
 
     @staticmethod
-    def _ensure_tyx(
-        data: np.ndarray, t_idx: Optional[int], y_idx: int, x_idx: int
-    ) -> np.ndarray:
+    def _ensure_tyx(data: np.ndarray, t_idx: int, y_idx: int, x_idx: int) -> np.ndarray:
         """Transpose one exact rank-three variable to ``(T, Y, X)``."""
-        return np.transpose(data, axes=(cast(int, t_idx), y_idx, x_idx))
+        return np.transpose(data, axes=(t_idx, y_idx, x_idx))
 
     @staticmethod
     def _coordinate_axis(
@@ -320,10 +316,27 @@ class NetCDFDataset(GriddedDataset):
         return _t_idx, y_idx, x_idx
 
     @property
-    def _grid_shape(self) -> Tuple[int, int]:
+    def _grid_shape(self) -> tuple[int, int]:
         """Return the spatial shape validated for every source shard."""
 
         return cast(tuple[int, int], self._grid_shape_cache)
+
+    @contextmanager
+    def _mapping_transaction(self) -> Iterator[None]:
+        """Keep bounding boxes and cached read plans in the selection transaction."""
+
+        previous_bbox = self._bbox
+        previous_indices = self._bbox_local_indices
+        previous_plans = self._spatial_read_plans.copy()
+        with super()._mapping_transaction():
+            try:
+                yield
+            except BaseException:
+                self._bbox = previous_bbox
+                self._bbox_local_indices = previous_indices
+                self._spatial_read_plans.clear()
+                self._spatial_read_plans.update(previous_plans)
+                raise
 
     def _compute_bbox_from_indices(self) -> None:
         """Compute 2D bounding box from local_indices for optimized reading.
@@ -336,11 +349,8 @@ class NetCDFDataset(GriddedDataset):
         - self._bbox: (y_min, y_max, x_min, x_max) - inclusive bounds
         - self._bbox_local_indices: indices relative to the bounding box flatten
         """
-        if self.local_indices is None:
-            self._bbox = None
-            self._bbox_local_indices = None
-            return
-        if self.local_indices.size == 0:
+        self._spatial_read_plans.clear()
+        if self.local_indices is None or self.local_indices.size == 0:
             self._bbox = None
             self._bbox_local_indices = None
             return
@@ -366,6 +376,88 @@ class NetCDFDataset(GriddedDataset):
         local_y = y_coords - y_min
         local_x = x_coords - x_min
         self._bbox_local_indices = (local_y * bbox_nx + local_x).astype(np.int64)
+
+    def _spatial_tiles(self, variable, y_axis: int, x_axis: int):
+        """Choose bounded tile reads only when they reduce spatial coverage."""
+
+        if self._bbox is None or self.local_indices is None:
+            return None
+        _grid_height, grid_width = self._grid_shape
+        chunking = variable.chunking()
+        chunked = chunking != "contiguous" and bool(chunking)
+        tile_height = int(chunking[y_axis]) if chunked else 1
+        tile_width = int(chunking[x_axis]) if chunked else grid_width
+        key = (tile_height, tile_width, chunked)
+        if key in self._spatial_read_plans:
+            return self._spatial_read_plans[key]
+        rows, columns = np.divmod(self.local_indices, grid_width)
+        minimum_y, maximum_y, minimum_x, maximum_x = self._bbox
+        bbox_area = (maximum_y - minimum_y + 1) * (maximum_x - minimum_x + 1)
+        plan = None
+        if self.local_indices.size * 4 < bbox_area:
+            tile_ids = (rows // tile_height) * (
+                (grid_width + tile_width - 1) // tile_width
+            ) + columns // tile_width
+            order = np.argsort(tile_ids, kind="stable")
+            boundaries = np.flatnonzero(np.diff(tile_ids[order]) != 0) + 1
+            if boundaries.size < 128:
+                parts = np.split(order, boundaries)
+                tiles = []
+                covered = 0
+                for positions in parts:
+                    start_y, stop_y = (
+                        int(rows[positions].min()),
+                        int(rows[positions].max()) + 1,
+                    )
+                    start_x, stop_x = (
+                        int(columns[positions].min()),
+                        int(columns[positions].max()) + 1,
+                    )
+                    local = (
+                        (rows[positions] - start_y) * (stop_x - start_x)
+                        + columns[positions]
+                        - start_x
+                    )
+                    tiles.append(
+                        (
+                            slice(start_y, stop_y),
+                            slice(start_x, stop_x),
+                            positions,
+                            local,
+                        )
+                    )
+                    covered += (stop_y - start_y) * (stop_x - start_x)
+                physical_bbox = (
+                    maximum_y // tile_height - minimum_y // tile_height + 1
+                ) * (maximum_x // tile_width - minimum_x // tile_width + 1)
+                if covered * 2 < bbox_area and (
+                    not chunked or len(tiles) * 2 < physical_bbox
+                ):
+                    plan = tuple(tiles)
+        if len(self._spatial_read_plans) >= 8:
+            self._spatial_read_plans.clear()
+        self._spatial_read_plans[key] = plan
+        return plan
+
+    def _read_spatial_tiles(self, variable, selectors, axes, tiles):
+        time_axis, y_axis, x_axis = axes
+        result = None
+        for y_slice, x_slice, positions, local in tiles:
+            tile_selectors = list(selectors)
+            tile_selectors[y_axis], tile_selectors[x_axis] = y_slice, x_slice
+            _configure_netcdf_variable_cache(
+                variable, tuple(tile_selectors), time_axis=time_axis
+            )
+            tile = _read_netcdf_var_sliced_trusted(variable, tuple(tile_selectors))
+            tile = _as_nan_array(self._ensure_tyx(tile, time_axis, y_axis, x_axis))
+            if result is None:
+                result = np.empty(
+                    (tile.shape[0], self.local_indices.size), dtype=tile.dtype
+                )
+            elif result.dtype != np.result_type(result.dtype, tile.dtype):
+                result = result.astype(np.result_type(result.dtype, tile.dtype))
+            result[:, positions] = tile.reshape(tile.shape[0], -1)[:, local]
+        return result
 
     def _read_ops(self, ops: Sequence[ReadOp]) -> np.ndarray:
         """Execute per-file reads using absolute time indices.
@@ -402,7 +494,7 @@ class NetCDFDataset(GriddedDataset):
             else:
                 return np.empty((0, ny, nx), dtype=self.out_dtype)
 
-        chunks: List[np.ndarray] = []
+        chunks: list[np.ndarray] = []
 
         for key, abs_indices in ops:
             path = self._checked_source_path(
@@ -426,23 +518,21 @@ class NetCDFDataset(GriddedDataset):
                     sel[x_idx] = slice(x_min, x_max + 1)
 
                 selectors = tuple(sel)
-                _configure_netcdf_variable_cache(
-                    var, selectors, time_axis=t_idx,
-                )
-                arr = _read_netcdf_var_sliced_trusted(var, selectors)
-
-                # Normalize to (T, Y, X); Y/X may describe only the bbox.
-                arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
-
-                if compressed:
-                    # Flatten and extract active columns: (T, Y, X) -> (T, N)
-                    T, Y, X = arr.shape
-                    flat = arr.reshape(T, Y * X)
-                    out = flat[:, self._bbox_local_indices]
+                tiles = self._spatial_tiles(var, y_idx, x_idx) if use_bbox else None
+                if tiles is not None:
+                    out = self._read_spatial_tiles(
+                        var, selectors, (t_idx, y_idx, x_idx), tiles
+                    )
                 else:
-                    out = arr
+                    _configure_netcdf_variable_cache(var, selectors, time_axis=t_idx)
+                    arr = _read_netcdf_var_sliced_trusted(var, selectors)
+                    arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
+                    if compressed:
+                        out = arr.reshape(arr.shape[0], -1)[:, self._bbox_local_indices]
+                    else:
+                        out = arr
 
-                out = self._as_nan_array(out)
+                out = _as_nan_array(out)
                 if np.issubdtype(out.dtype, np.floating):
                     missing = np.isnan(out)
                     if np.any(missing):
@@ -459,7 +549,7 @@ class NetCDFDataset(GriddedDataset):
 
         return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
 
-    def _get_first_frame_nan_mask(self) -> Optional[np.ndarray]:
+    def _get_first_frame_nan_mask(self) -> np.ndarray | None:
         """Read the first planned source frame and return a flat NaN/mask bitmap."""
         if not self._timeline.plan:
             return None
@@ -489,7 +579,7 @@ class NetCDFDataset(GriddedDataset):
             selectors = tuple(sel)
             _configure_netcdf_variable_cache(var, selectors, time_axis=t_idx)
             arr = _read_netcdf_var_sliced_trusted(var, selectors)
-            arr = self._as_nan_array(arr)
+            arr = _as_nan_array(arr)
             arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
         self._verify_source_path(path)
 
@@ -497,29 +587,23 @@ class NetCDFDataset(GriddedDataset):
             return np.zeros(arr.shape[1:], dtype=bool)
         return np.isnan(arr[0])
 
-    def _finish_read(
-        self, data: np.ndarray
-    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    def _finish_read(self, data: np.ndarray) -> np.ndarray | dict[str, np.ndarray]:
         calculation = self._canonical_calculation_data(
             data,
             label="NetCDF dataset input",
         )
-        if self.time_aggregation is None:
-            np.divide(calculation, self.unit_factor, out=calculation)
-            converted = calculation
-        else:
-            aggregated = self._apply_time_aggregation(
+        converted = (
+            calculation
+            if self.time_aggregation is None
+            else self._apply_time_aggregation(
                 calculation,
                 self._timeline.source_time_interval,
                 self.time_aggregation,
             )
-            if isinstance(aggregated, dict):
-                for block in aggregated.values():
-                    np.divide(block, self.unit_factor, out=block)
-                converted = aggregated
-            else:
-                np.divide(aggregated, self.unit_factor, out=aggregated)
-                converted = aggregated
+        )
+        blocks = converted.values() if isinstance(converted, dict) else (converted,)
+        for block in blocks:
+            np.divide(block, self.unit_factor, out=block)
         return self._finalize_output_data(
             converted,
             label="NetCDF dataset output",
@@ -543,7 +627,7 @@ class NetCDFDataset(GriddedDataset):
     # -------------------------
     # Public API
     # -------------------------
-    def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
+    def get_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
         """Return the canonical grid validated at Dataset construction."""
 
         return cast(tuple[np.ndarray, np.ndarray], self._coordinates_cache)
@@ -557,13 +641,13 @@ class _OpenMultivariableNetCDFRequest(HydroForgeModel):
     model_step: timedelta
     time_interval: timedelta = timedelta(days=1)
     calendar: str | None = None
-    spin_up_cycles: int = Field(default=0, strict=True, ge=0)
+    spin_up_cycles: int = Field(default=0, ge=0)
     spin_up_start_date: DateLike | None = None
     spin_up_end_date: DateLike | None = None
-    chunk_len: int | None = Field(default=None, ge=1, strict=True)
+    chunk_len: int | None = Field(default=None, ge=1)
     unit_factor: float = 1.0
     suffix: str = ".nc"
-    clip_negative: bool = Field(default=False, strict=True)
+    clip_negative: bool = False
     time_to_key: Callable[[DateLike], str] = yearly_time_to_key
 
     _compiled_specs: tuple[tuple[str, dict[str, Any]], ...] = PrivateAttr()
@@ -598,7 +682,7 @@ def open_multivariable_netcdf(
     unit_factor: float = 1.0,
     suffix: str = ".nc",
     clip_negative: bool = False,
-    time_to_key: Callable[[Union[datetime, cftime.datetime]], str] = yearly_time_to_key,
+    time_to_key: Callable[[datetime | cftime.datetime], str] = yearly_time_to_key,
 ):
     """Open aligned gridded variables as one generic composite."""
     from hydroforge.data.datasets.multivariable import (

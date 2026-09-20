@@ -36,7 +36,9 @@ class StatisticsWindowController:
     """O(1) regular/calendar cursor with explicit-window lookup support."""
 
     def __init__(
-        self, plan: StatisticsPlan, schedule: SimulationSchedule | None,
+        self,
+        plan: StatisticsPlan,
+        schedule: SimulationSchedule | None,
     ) -> None:
         self.plan = plan
         self.schedule = schedule
@@ -58,11 +60,13 @@ class StatisticsWindowController:
             if isinstance(rule, ExplicitWindows):
                 for window in rule.windows:
                     require_calendar(
-                        window.start, schedule.calendar,
+                        window.start,
+                        schedule.calendar,
                         label=f"explicit window {window.name!r} start",
                     )
                     require_calendar(
-                        window.end, schedule.calendar,
+                        window.end,
+                        schedule.calendar,
                         label=f"explicit window {window.name!r} end",
                     )
                     if type(window.start) is not type(schedule._start):
@@ -73,7 +77,9 @@ class StatisticsWindowController:
             if isinstance(rule, CalendarWindow) and rule.period == "year":
                 try:
                     cftime.datetime(
-                        2001, rule.start_month, rule.start_day,
+                        2001,
+                        rule.start_month,
+                        rule.start_day,
                         calendar=schedule.calendar,
                     )
                 except ValueError as exc:
@@ -105,11 +111,14 @@ class StatisticsWindowController:
         if rule.period == "month":
             return value.day == 1
         return (value.month, value.day) == (
-            rule.start_month, rule.start_day,
+            rule.start_month,
+            rule.start_day,
         )
 
     def _locate(
-        self, rule: WindowRule, value: Any,
+        self,
+        rule: WindowRule,
+        value: Any,
     ) -> tuple[Any, Any] | None:
         if isinstance(rule, EveryStep):
             return value, None
@@ -134,7 +143,7 @@ class StatisticsWindowController:
         located = self._locate(rule, value)
         return located is not None and value == located[1].start
 
-    def _validated_rule_position(
+    def _rule_position(
         self,
         rule: WindowRule,
         *,
@@ -142,10 +151,11 @@ class StatisticsWindowController:
         end: Any,
         previous_key: Any,
         final_step: bool,
+        validate: bool = False,
     ) -> tuple[Any, bool, bool] | None:
         located = self._locate(rule, start)
         if located is None:
-            if isinstance(rule, ExplicitWindows):
+            if validate and isinstance(rule, ExplicitWindows):
                 starts = self._explicit_starts[id(rule)]
                 next_index = bisect_right(starts, start)
                 if (
@@ -164,7 +174,7 @@ class StatisticsWindowController:
         if isinstance(rule, CalendarWindow):
             end_key = self._calendar_key(rule, end)
             changed = end_key != key
-            if changed:
+            if validate and changed:
                 if not self._is_calendar_boundary(rule, end):
                     raise ValueError(
                         f"model step [{start!r}, {end!r}) crosses a "
@@ -175,31 +185,32 @@ class StatisticsWindowController:
                 # sufficient for unequal month/year lengths (Jan 1 -> Mar 1
                 # has a midpoint that is still in January).
                 preceding_key = self._calendar_key(
-                    rule, end - timedelta(microseconds=1),
+                    rule,
+                    end - timedelta(microseconds=1),
                 )
                 if preceding_key != key:
                     raise ValueError("model step crosses multiple statistics windows")
-            last = changed or (
-                final_step and self.plan.partial_period == "close"
-            )
+            last = changed or (final_step and self.plan.partial_period == "close")
             return key, previous_key != key, last
-        if end > window.end:
+        if validate and end > window.end:
             raise ValueError(
                 f"model step [{start!r}, {end!r}) crosses explicit window "
                 f"{window.name!r} boundary"
             )
-        return key, previous_key != key, (
-            end == window.end
-            or final_step and self.plan.partial_period == "close"
+        return (
+            key,
+            previous_key != key,
+            (end == window.end or final_step and self.plan.partial_period == "close"),
         )
 
-    def _resolve_validating(
+    def resolve(
         self,
         *,
         step: SimulationStep,
         output_enabled: bool,
+        _validate: bool = False,
     ) -> WindowDecision:
-        """Advance windows from the managed step's validated schedule record."""
+        """Advance the cursor; model construction alone enables schedule checks."""
 
         if not output_enabled:
             self._last_inner_key = None
@@ -207,21 +218,23 @@ class StatisticsWindowController:
             return WindowDecision(False, False, False, False, False)
         final_step = step.index == len(self.schedule) - 1
         outer_rule = self.plan._effective_outer
-        inner_position = self._validated_rule_position(
+        inner_position = self._rule_position(
             self.plan.inner,
             start=step.start,
             end=step.end,
             previous_key=self._last_inner_key,
             final_step=final_step,
+            validate=_validate,
         )
-        outer_position = self._validated_rule_position(
+        outer_position = self._rule_position(
             outer_rule,
             start=step.start,
             end=step.end,
             previous_key=self._last_outer_key,
             final_step=final_step,
+            validate=_validate,
         )
-        if (inner_position is None) != (outer_position is None):
+        if _validate and (inner_position is None) != (outer_position is None):
             raise ValueError(
                 "inner and outer statistics windows must cover the same "
                 f"model steps; coverage differs for [{step.start!r}, "
@@ -242,13 +255,13 @@ class StatisticsWindowController:
             return WindowDecision(False, False, False, False, False)
         inner_key, inner_first, inner_last = inner_position
         outer_key, outer_first, outer_last = outer_position
-        if outer_first and not inner_first:
+        if _validate and outer_first and not inner_first:
             raise ValueError(
                 "outer statistics windows must start on an inner window "
                 f"boundary; [{step.start!r}, {step.end!r}) starts only the "
                 "outer window"
             )
-        if outer_last and not inner_last:
+        if _validate and outer_last and not inner_last:
             raise ValueError(
                 "outer statistics windows must end on an inner window "
                 f"boundary; [{step.start!r}, {step.end!r}) ends only the "
@@ -261,89 +274,21 @@ class StatisticsWindowController:
         self._last_outer_key = outer_key
         return WindowDecision(
             True,
-            inner_first, inner_last, outer_first, outer_last,
+            inner_first,
+            inner_last,
+            outer_first,
+            outer_last,
         )
 
-    def _rule_position(
-        self,
-        rule: WindowRule,
-        *,
-        start: Any,
-        end: Any,
-        previous_key: Any,
-        final_step: bool,
-    ) -> tuple[Any, bool, bool] | None:
-        """Resolve one rule after schedule compatibility was validated."""
-
-        located = self._locate(rule, start)
-        if located is None:
-            return None
-        key, window = located
-        if isinstance(rule, EveryStep):
-            return key, True, True
-        if isinstance(rule, CalendarWindow):
-            changed = self._calendar_key(rule, end) != key
-            return key, previous_key != key, (
-                changed
-                or final_step and self.plan.partial_period == "close"
-            )
-        return key, previous_key != key, (
-            end == window.end
-            or final_step and self.plan.partial_period == "close"
-        )
-
-    def resolve(
+    def _resolve_validating(
         self,
         *,
         step: SimulationStep,
         output_enabled: bool,
     ) -> WindowDecision:
-        """Advance a schedule already proven compatible by model validation."""
+        """Validate schedule compatibility with the same cursor transitions."""
 
-        if not output_enabled:
-            self._last_inner_key = None
-            self._last_outer_key = None
-            return WindowDecision(False, False, False, False, False)
-        final_step = step.index == len(self.schedule) - 1
-        outer_rule = self.plan._effective_outer
-        inner_position = self._rule_position(
-            self.plan.inner,
-            start=step.start,
-            end=step.end,
-            previous_key=self._last_inner_key,
-            final_step=final_step,
-        )
-        outer_position = self._rule_position(
-            outer_rule,
-            start=step.start,
-            end=step.end,
-            previous_key=self._last_outer_key,
-            final_step=final_step,
-        )
-        if inner_position is None:
-            self._last_inner_key = None
-            self._last_outer_key = None
-            return WindowDecision(False, False, False, False, False)
-        if (
-            self.plan.partial_period == "drop"
-            and self._last_inner_key is None
-            and (
-                not self._starts_complete_period(self.plan.inner, step.start)
-                or not self._starts_complete_period(outer_rule, step.start)
-            )
-        ):
-            return WindowDecision(False, False, False, False, False)
-        inner_key, inner_first, inner_last = inner_position
-        outer_key, outer_first, outer_last = outer_position
-        if self._last_inner_key is None:
-            inner_first = True
-            outer_first = True
-        self._last_inner_key = inner_key
-        self._last_outer_key = outer_key
-        return WindowDecision(
-            True,
-            inner_first, inner_last, outer_first, outer_last,
-        )
+        return self.resolve(step=step, output_enabled=output_enabled, _validate=True)
 
     def snapshot_state(self) -> tuple[Any, Any]:
         """Capture only mutable window state for transactional rollback."""
@@ -374,14 +319,16 @@ def bind_statistics_plan_schedule(
             values,
             calendar=schedule.calendar,
         )
-        return ExplicitWindows(windows=tuple(
-            ExplicitWindow(
-                name=window.name,
-                start=normalized[f"explicit window {index} start"],
-                end=normalized[f"explicit window {index} end"],
+        return ExplicitWindows(
+            windows=tuple(
+                ExplicitWindow(
+                    name=window.name,
+                    start=normalized[f"explicit window {index} start"],
+                    end=normalized[f"explicit window {index} end"],
+                )
+                for index, window in enumerate(rule.windows)
             )
-            for index, window in enumerate(rule.windows)
-        ))
+        )
 
     return StatisticsPlan(
         inner=bind(plan.inner),
@@ -398,6 +345,11 @@ def validate_statistics_window_schedule(
 
     controller = StatisticsWindowController(plan, schedule)
     controller._validate_schedule_contract()
+    if isinstance(plan.inner, EveryStep) and isinstance(
+        plan._effective_outer,
+        EveryStep,
+    ):
+        return
     for step in schedule:
         if step.is_spin_up:
             continue

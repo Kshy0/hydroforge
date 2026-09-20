@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, Mapping
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from pydantic import Field, PrivateAttr, model_validator
 
 from hydroforge.contracts.fields import concrete_tensor_dtype
 from hydroforge.contracts.kernels import (
+    ConfigValue,
+    LiteralValue,
     ModuleEnabled,
     ModuleFlag,
+    OptionCode,
     OutputRequested,
 )
 from hydroforge.contracts.runtime import (
@@ -35,7 +39,14 @@ class BindingResolution:
     """One initialization-time canonical parameter resolution."""
 
     value: Any
-    source: Literal["field", "feature", "optional", "model_config", "batched"]
+    source: Literal[
+        "field",
+        "compile_time",
+        "optional",
+        "model_config",
+        "batched",
+        "step_field",
+    ]
     owner: str | None = None
 
 
@@ -53,10 +64,12 @@ class _KernelBindingRequest(HydroForgeModel):
     def _bind(self):
         try:
             arguments = self.binder._complete_trusted(
-                self.kernel, dict(self.supplied),
+                self.kernel,
+                self.supplied,
             )
             buffer_dtypes = self.binder._buffer_dtypes_trusted(
-                self.kernel, arguments,
+                self.kernel,
+                arguments,
             )
         except (KeyError, TypeError, ValueError, OverflowError) as error:
             raise ValueError(str(error)) from error
@@ -94,16 +107,24 @@ class KernelBinder:
         return self.model._field_namespace
 
     def bind(
-        self, kernel: Any, supplied: dict[str, Any],
+        self,
+        kernel: Any,
+        supplied: dict[str, Any],
     ) -> _KernelBindingRequest:
         return _KernelBindingRequest(
-            binder=self, kernel=kernel, supplied=supplied,
+            binder=self,
+            kernel=kernel,
+            supplied=supplied,
         )
 
     def _complete_trusted(
-        self, kernel: Any, supplied: dict[str, Any],
+        self,
+        kernel: Any,
+        supplied: Mapping[str, Any],
     ) -> dict[str, Any]:
         spec = kernel._spec
+        if spec.step_fields:
+            self.model._execution.step_fields.bind_many(spec.step_fields.values())
         if not supplied:
             cached = self._complete_cache.get(kernel)
             if cached is None:
@@ -113,7 +134,8 @@ class KernelBinder:
                         parameter,
                         metadata.optional_buffers,
                         metadata.optional_values,
-                        spec.feature_sources,
+                        spec.compile_time_sources,
+                        spec.step_fields,
                     ).value
                     for parameter in metadata.parameters
                     if parameter != "BLOCK_SIZE"
@@ -134,7 +156,8 @@ class KernelBinder:
                     parameter,
                     metadata.optional_buffers,
                     metadata.optional_values,
-                    spec.feature_sources,
+                    spec.compile_time_sources,
+                    spec.step_fields,
                 ).value
         arguments["BLOCK_SIZE"] = self._block_size(kernel)
         return arguments
@@ -147,7 +170,8 @@ class KernelBinder:
                 parameter,
                 spec.optional_buffers,
                 spec.optional_values,
-                spec.feature_sources,
+                spec.compile_time_sources,
+                spec.step_fields,
             )
         except UnboundKernelArgument:
             if parameter.startswith(("HAS_", "batched_")):
@@ -160,19 +184,26 @@ class KernelBinder:
         )
 
     def _buffer_dtypes_trusted(
-        self, kernel: Any, arguments: dict[str, Any],
+        self,
+        kernel: Any,
+        arguments: dict[str, Any],
     ) -> Mapping[str, torch.dtype]:
         """Compile buffer dtypes from declared model fields."""
 
         metadata = kernel.metadata
-        feature_sources = kernel._spec.feature_sources
+        compile_time_sources = kernel._spec.compile_time_sources
         result: dict[str, torch.dtype] = {}
         for parameter in metadata.buffers:
             value = arguments[parameter]
+            if parameter in kernel._spec.step_fields:
+                result[parameter] = self.model._execution.step_fields.concrete_dtype(
+                    kernel._spec.step_fields[parameter]
+                )
+                continue
             declared = self._declared_buffer_dtype(
                 parameter,
                 metadata.optional_buffers.get(parameter),
-                feature_sources,
+                compile_time_sources,
                 optional=parameter in metadata.optional_buffers,
             )
             if isinstance(value, torch.Tensor):
@@ -196,14 +227,21 @@ class KernelBinder:
         return MappingProxyType(result)
 
     def _declared_buffer_dtype(
-        self, parameter: str, feature: str | None,
-        feature_sources: Mapping[str, Any], *, optional: bool,
+        self,
+        parameter: str,
+        feature: str | None,
+        compile_time_sources: Mapping[str, Any],
+        *,
+        optional: bool,
     ) -> torch.dtype | None:
-        field = parameter[:-4] if parameter.endswith("_ptr") else parameter
+        field = parameter.removesuffix("_ptr")
 
         def globally_declared_dtype() -> torch.dtype | None:
             declared = []
             for module_name, module_type in self.model._module_types().items():
+                if field in module_type._reference_index_fields():
+                    declared.append((module_name, "idx"))
+                    continue
                 schema = module_type._get_tensor_schema(field)
                 if (
                     schema is not None
@@ -224,7 +262,15 @@ class KernelBinder:
         typed = []
         for match in matches:
             schema_getter = getattr(match.owner, "_get_tensor_schema", None)
-            if schema_getter is not None and schema_getter(field) is None:
+            if (
+                schema_getter is not None
+                and schema_getter(
+                    field,
+                    opened_modules=self.model.opened_modules,
+                    field_demand=self.model._field_demand,
+                )
+                is None
+            ):
                 continue
             getter = getattr(match.owner, "_get_expected_dtype", None)
             if getter is not None:
@@ -241,13 +287,15 @@ class KernelBinder:
             return globally_declared_dtype()
         if feature is None:
             return None
-        source = feature_sources.get(feature)
+        source = compile_time_sources.get(feature)
         if not isinstance(source, (ModuleEnabled, ModuleFlag, OutputRequested)):
             return None
         module_name = source.module
         module_type = self.model._module_types().get(module_name)
         if module_type is None:
             return globally_declared_dtype() if optional else None
+        if field in module_type._reference_index_fields():
+            return self._concrete_dtype("idx")
         schema = module_type._get_tensor_schema(field)
         if schema is None or schema.tensor is None:
             return globally_declared_dtype() if optional else None
@@ -255,7 +303,9 @@ class KernelBinder:
 
     def _concrete_dtype(self, kind: str) -> torch.dtype:
         return concrete_tensor_dtype(
-            kind, self.model.dtype, self.model.mixed_precision,
+            kind,
+            self.model.dtype,
+            self.model.mixed_precision,
         )
 
     def _block_size(self, kernel: Any) -> int:
@@ -267,7 +317,8 @@ class KernelBinder:
             model.BLOCK_SIZE,
             backend=backend,
             default=kernel.metadata.block_sizes.get(
-                backend, DEFAULT_BLOCK_SIZE,
+                backend,
+                DEFAULT_BLOCK_SIZE,
             ),
         )
 
@@ -276,12 +327,18 @@ class KernelBinder:
         parameter: str,
         optional_buffers: Any,
         optional_values: Any,
-        feature_sources: Mapping[str, Any],
+        compile_time_sources: Mapping[str, Any],
+        step_fields: Mapping[str, Any] | None = None,
     ) -> BindingResolution:
         model = self.model
+        if step_fields and parameter in step_fields:
+            field = step_fields[parameter]
+            return BindingResolution(
+                model._execution.step_fields.bind(field), "step_field", field.source
+            )
         if parameter in optional_values:
             flag, disabled = optional_values[parameter]
-            if not self._feature(flag, feature_sources):
+            if not self._compile_time_value(flag, compile_time_sources):
                 return BindingResolution(disabled, "optional", flag)
         if parameter in optional_buffers:
             feature = optional_buffers[parameter]
@@ -292,11 +349,19 @@ class KernelBinder:
                     return BindingResolution(None, "optional", None)
                 if len(matches) != 1:
                     self._raise_resolution(
-                        parameter, [match.module_name for match in matches],
+                        parameter,
+                        [match.module_name for match in matches],
                     )
                 match = matches[0]
                 schema_getter = getattr(match.owner, "get_tensor_schema", None)
-                schema = None if schema_getter is None else schema_getter(field)
+                schema = (
+                    None
+                    if schema_getter is None
+                    else schema_getter(
+                        field,
+                        opened_modules=self.model.opened_modules,
+                    )
+                )
                 if (
                     schema is not None
                     and schema.tensor is not None
@@ -309,21 +374,26 @@ class KernelBinder:
                     "optional",
                     f"{match.module_name}.{field}",
                 )
-            if not self._feature(feature, feature_sources):
+            if not self._compile_time_value(feature, compile_time_sources):
                 return BindingResolution(
-                    None, "optional", feature,
+                    None,
+                    "optional",
+                    feature,
                 )
-        if parameter == "num_trials":
+        if parameter == "ensemble_size":
             return BindingResolution(
-                1 if model.num_trials is None else model.num_trials,
-                "model_config", "model",
+                1 if model.local_ensemble_size is None else model.local_ensemble_size,
+                "model_config",
+                "model",
             )
-        if parameter in feature_sources:
+        if parameter in compile_time_sources:
             return BindingResolution(
-                self._feature(parameter, feature_sources), "feature", parameter,
+                self._compile_time_value(parameter, compile_time_sources),
+                "compile_time",
+                parameter,
             )
 
-        field = parameter[:-4] if parameter.endswith("_ptr") else parameter
+        field = parameter.removesuffix("_ptr")
         if field.startswith("batched_"):
             source = field.removeprefix("batched_")
             matches = self._field_index.get(source, ())
@@ -336,16 +406,16 @@ class KernelBinder:
                         for item in self.model._compiled_schema().fields(module_name)
                     )
                 ]
-                if (
-                    len(declared) == 1
-                    and declared[0] not in self.model.opened_modules
-                ):
+                if len(declared) == 1 and declared[0] not in self.model.opened_modules:
                     return BindingResolution(
-                        False, "batched", declared[0],
+                        False,
+                        "batched",
+                        declared[0],
                     )
             if len(matches) != 1:
                 self._raise_resolution(
-                    parameter, [match.module_name for match in matches],
+                    parameter,
+                    [match.module_name for match in matches],
                 )
             return BindingResolution(
                 matches[0].owner._is_batched_trusted(source),
@@ -356,7 +426,8 @@ class KernelBinder:
         matches = self._field_index.get(field, ())
         if len(matches) != 1:
             self._raise_resolution(
-                parameter, [match.module_name for match in matches],
+                parameter,
+                [match.module_name for match in matches],
             )
         match = matches[0]
         value = getattr(match.owner, field)
@@ -368,14 +439,17 @@ class KernelBinder:
             f"{match.module_name}.{field}",
         )
 
-    def _feature(
-        self, parameter: str, feature_sources: Mapping[str, Any],
-    ) -> bool:
+    def _compile_time_value(
+        self,
+        parameter: str,
+        compile_time_sources: Mapping[str, Any],
+    ) -> Any:
         model = self.model
-        source = feature_sources.get(parameter)
+        source = compile_time_sources.get(parameter)
         if source is None:
             raise KeyError(
-                f"kernel feature {parameter!r} has no explicit feature_source"
+                f"kernel compile-time parameter {parameter!r} has no "
+                "explicit compile_time_source"
             )
         if isinstance(source, ModuleEnabled):
             if source.module not in model._module_types():
@@ -401,7 +475,8 @@ class KernelBinder:
                     f"{source.module!r}"
                 )
             if source.field not in module_type.model_fields and not hasattr(
-                module_type, source.field,
+                module_type,
+                source.field,
             ):
                 raise KeyError(
                     f"kernel feature {parameter!r} references unknown field "
@@ -422,12 +497,21 @@ class KernelBinder:
                     f"kernel feature {parameter!r} references unknown "
                     f"model module {source.module!r}"
                 )
-            schema = module_type._get_tensor_schema(source.field)
-            if (
-                schema is None
-                or schema.tensor is None
-                or schema.tensor.expression
+            if source.field in module_type._reference_index_fields() and (
+                source.module not in model.opened_modules
+                or source.field
+                not in module_type._reference_index_fields(
+                    opened_modules=model.opened_modules,
+                    field_demand=model._field_demand,
+                )
             ):
+                return False
+            schema = module_type._get_tensor_schema(
+                source.field,
+                opened_modules=model.opened_modules,
+                field_demand=model._field_demand,
+            )
+            if schema is None or schema.tensor is None or schema.tensor.expression:
                 raise KeyError(
                     f"kernel feature {parameter!r} references unknown "
                     f"materialized tensor field "
@@ -441,12 +525,17 @@ class KernelBinder:
                     f"kernel feature {parameter!r} requires materialized module "
                     f"{source.module!r}"
                 )
-            return (
-                module._is_tensor_field_active(schema)
-                and module._is_field_requested_for_output(source.field)
-            )
+            return module._is_tensor_field_active(
+                schema
+            ) and module._is_field_requested_for_output(source.field)
+        if isinstance(source, ConfigValue):
+            return model.options.value(source.path)
+        if isinstance(source, OptionCode):
+            return model.options.option_code(source.path)
+        if isinstance(source, LiteralValue):
+            return source.value
         raise TypeError(
-            f"kernel feature {parameter!r} has unsupported source "
+            f"kernel compile-time parameter {parameter!r} has unsupported source "
             f"{type(source).__name__}"
         )
 

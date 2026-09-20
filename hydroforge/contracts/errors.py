@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from collections.abc import Callable, Iterable
+from contextlib import contextmanager
+from typing import Any
+
+
+def _exception_message(error: BaseException) -> str:
+    try:
+        return str(error)
+    except BaseException:
+        return "<exception message unavailable>"
 
 
 def failure_description(error: BaseException) -> dict[str, str]:
@@ -10,7 +19,7 @@ def failure_description(error: BaseException) -> dict[str, str]:
 
     return {
         "type": f"{type(error).__module__}.{type(error).__qualname__}",
-        "message": str(error),
+        "message": _exception_message(error),
     }
 
 
@@ -21,8 +30,7 @@ def distributed_failure_error(
     """Build one deterministic summary of failures observed across ranks."""
 
     failed = [
-        (rank, failure) for rank, failure in enumerate(failures)
-        if failure is not None
+        (rank, failure) for rank, failure in enumerate(failures) if failure is not None
     ]
     details = "; ".join(
         f"rank {rank}: {failure['type']}: {failure['message']}"
@@ -39,8 +47,28 @@ class ResourceCleanupError(RuntimeError):
         if not self.failures:
             raise ValueError("ResourceCleanupError requires at least one failure")
         detail = ", ".join(
-            f"{type(error).__name__}: {error}" for error in self.failures
+            f"{type(error).__name__}: {_exception_message(error)}"
+            for error in self.failures
         )
         super().__init__(
             f"failed to close {scope} ({len(self.failures)} error(s)): {detail}"
         )
+
+
+@contextmanager
+def cleanup_on_exit(scope: str, actions: Iterable[Callable[[], None]]):
+    """Attempt every release and retain any operation failure alongside them."""
+    failures = []
+    try:
+        yield
+    except BaseException as error:
+        failures.append(error)
+    for action in actions:
+        try:
+            action()
+        except BaseException as error:
+            failures.append(error)
+    if len(failures) > 1:
+        raise ResourceCleanupError(scope, failures) from failures[0]
+    if failures:
+        raise failures[0]

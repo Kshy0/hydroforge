@@ -27,6 +27,41 @@ import torch
 _MUTABLE_CATEGORIES = frozenset({"init_state", "state", "shared_state"})
 
 
+def _cuda_version_tuple(version: object) -> tuple[int, int] | None:
+    """Parse the CUDA toolkit version exposed by the active Torch build."""
+
+    if not isinstance(version, str):
+        return None
+    parts = version.split(".", 2)
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def supports_conditional_cuda_graph(
+    device: torch.device | str | None = None,
+) -> bool:
+    """Return whether HydroForge's CUDA conditional-WHILE ABI is available.
+
+    PyTorch exposes AMD/ROCm devices through the ``cuda`` device type, but
+    HIP does not provide the CUDA conditional-graph node API used by
+    :data:`_COND_CUDA`.  The CUDA API is available from CUDA 12.4 onward.
+    This check deliberately happens before the inline extension is compiled,
+    so an unsupported HIP compiler never sees CUDA-only graph declarations.
+    """
+
+    target = torch.device("cuda" if device is None else device)
+    if target.type != "cuda":
+        return False
+    if getattr(torch.version, "hip", None) is not None:
+        return False
+    cuda_version = _cuda_version_tuple(getattr(torch.version, "cuda", None))
+    return cuda_version is not None and cuda_version >= (12, 4)
+
+
 # ====================================================================== #
 # Device-side conditional-graph (WHILE node) support
 # ====================================================================== #
@@ -58,6 +93,7 @@ _COND_CUDA = r"""
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <memory>
 
 #define CWG_CK(x) do { cudaError_t e=(x); if(e!=cudaSuccess){ \
   TORCH_CHECK(false, "CUDA ", #x, " -> ", cudaGetErrorString(e)); }}while(0)
@@ -67,12 +103,26 @@ struct CondWhileGraph {
     cudaGraph_t body = nullptr;
     cudaGraphConditionalHandle handle = 0;
     cudaGraphExec_t exec = nullptr;
+
+    ~CondWhileGraph() {
+        if (exec) cudaGraphExecDestroy(exec);
+        if (graph) cudaGraphDestroy(graph);
+    }
+};
+
+struct CapturedGraph {
+    cudaGraph_t graph = nullptr;
+
+    ~CapturedGraph() {
+        if (graph) cudaGraphDestroy(graph);
+    }
 };
 
 // Outer graph holding one WHILE conditional node.  Handle default value 1 makes
 // the body run at least once per launch (the first sub-step always executes).
 int64_t cwg_create() {
-    auto* g = new CondWhileGraph();
+    auto graph_owner = std::make_unique<CondWhileGraph>();
+    auto* g = graph_owner.get();
     CWG_CK(cudaGraphCreate(&g->graph, 0));
     CWG_CK(cudaGraphConditionalHandleCreate(&g->handle, g->graph, 1, cudaGraphCondAssignDefault));
     cudaGraphNodeParams cp = {};
@@ -89,19 +139,22 @@ int64_t cwg_create() {
         &cnode, g->graph, nullptr, nullptr, 0, &cp));
 #endif
     g->body = cp.conditional.phGraph_out[0];
-    return reinterpret_cast<int64_t>(g);
+    return reinterpret_cast<int64_t>(graph_owner.release());
 }
 
 void cwg_begin_capture(int64_t h, int64_t stream) {
-    auto* g = reinterpret_cast<CondWhileGraph*>(h);
-    CWG_CK(cudaStreamBeginCaptureToGraph((cudaStream_t)stream, g->body, nullptr,
-                                         nullptr, 0, cudaStreamCaptureModeThreadLocal));
+    (void)h;
+    CWG_CK(cudaStreamBeginCapture((cudaStream_t)stream, cudaStreamCaptureModeThreadLocal));
 }
 
 void cwg_end_capture(int64_t h, int64_t stream) {
-    (void)h;
-    cudaGraph_t out;
-    CWG_CK(cudaStreamEndCapture((cudaStream_t)stream, &out));
+    auto* graph_owner = reinterpret_cast<CondWhileGraph*>(h);
+    CapturedGraph captured;
+    cudaError_t status = cudaStreamEndCapture((cudaStream_t)stream, &captured.graph);
+    if (status != cudaSuccess) cudaGetLastError();
+    CWG_CK(status);
+    cudaGraphNode_t body_node;
+    CWG_CK(cudaGraphAddChildGraphNode(&body_node, graph_owner->body, nullptr, 0, captured.graph));
 }
 
 // Generic continuation predicate: read the model's (1,) int "continue?" flag and
@@ -132,6 +185,20 @@ void cwg_fixed_end(at::Tensor count, at::Tensor counter,
 }
 
 template <typename SourceT, typename DestinationT>
+__device__ void write_statistics_control(bool first, bool last,
+        const SourceT* weight_src, DestinationT* weight,
+        int* sub_step, int* num_sub_steps) {
+    int ss, n;
+    if (first && last) { ss = 0; n = 1; }
+    else if (first)    { ss = 0; n = 2; }
+    else if (last)     { ss = 1; n = 2; }
+    else               { ss = 1; n = 3; }
+    *weight = static_cast<DestinationT>(*weight_src);
+    *sub_step = ss;
+    *num_sub_steps = n;
+}
+
+template <typename SourceT, typename DestinationT>
 __global__ void k_fixed_stats_end(const int* __restrict__ count,
         int* __restrict__ counter, int* __restrict__ cont,
         const SourceT* __restrict__ weight_src,
@@ -142,14 +209,7 @@ __global__ void k_fixed_stats_end(const int* __restrict__ count,
     bool last = next == *count;
     *counter = next;
     *cont = !last;
-    int ss, n;
-    if (first && last) { ss = 0; n = 1; }
-    else if (first)    { ss = 0; n = 2; }
-    else if (last)     { ss = 1; n = 2; }
-    else               { ss = 1; n = 3; }
-    *weight = static_cast<DestinationT>(*weight_src);
-    *sub_step = ss;
-    *num_sub_steps = n;
+    write_statistics_control(first, last, weight_src, weight, sub_step, num_sub_steps);
 }
 
 void cwg_fixed_stats_end(at::Tensor count, at::Tensor counter,
@@ -181,16 +241,8 @@ __global__ void k_stats_control(const SourceT* __restrict__ weight_src,
         const int* __restrict__ cont, const int* __restrict__ counter,
         DestinationT* __restrict__ weight, int* __restrict__ sub_step,
         int* __restrict__ num_sub_steps) {
-    bool first = (*counter == 1);
-    bool last = (*cont == 0);
-    int ss, n;
-    if (first && last) { ss = 0; n = 1; }
-    else if (first)    { ss = 0; n = 2; }
-    else if (last)     { ss = 1; n = 2; }
-    else               { ss = 1; n = 3; }
-    *weight = static_cast<DestinationT>(*weight_src);
-    *sub_step = ss;
-    *num_sub_steps = n;
+    write_statistics_control(*counter == 1, *cont == 0,
+                             weight_src, weight, sub_step, num_sub_steps);
 }
 
 void cwg_stats_control(at::Tensor weight_src, at::Tensor cont, at::Tensor counter,
@@ -220,8 +272,6 @@ void cwg_launch(int64_t h, int64_t stream) {
 
 void cwg_destroy(int64_t h) {
     auto* g = reinterpret_cast<CondWhileGraph*>(h);
-    if (g->exec) cudaGraphExecDestroy(g->exec);
-    if (g->graph) cudaGraphDestroy(g->graph);
     delete g;
 }
 """
@@ -230,45 +280,77 @@ void cwg_destroy(int64_t h) {
 @functools.lru_cache(maxsize=1)
 def _cond_ext():
     from hydroforge.kernels.backends.cuda.build import load_inline_cu_module
+
     return load_inline_cu_module(
         name="hydroforge_conditional_while_graph",
         cpp_sources=_COND_CPP,
         cuda_sources=_COND_CUDA,
-        functions=["cwg_create", "cwg_begin_capture", "cwg_end_capture",
-                   "cwg_set_conditional", "cwg_fixed_end",
-                   "cwg_fixed_stats_end", "cwg_stats_control",
-                   "cwg_instantiate", "cwg_launch", "cwg_destroy"],
+        functions=[
+            "cwg_create",
+            "cwg_begin_capture",
+            "cwg_end_capture",
+            "cwg_set_conditional",
+            "cwg_fixed_end",
+            "cwg_fixed_stats_end",
+            "cwg_stats_control",
+            "cwg_instantiate",
+            "cwg_launch",
+            "cwg_destroy",
+        ],
         extra_cuda_cflags=("-O3",),
     )
 
 
 def fixed_control_end(
-    count: torch.Tensor, counter: torch.Tensor, continue_flag: torch.Tensor,
+    count: torch.Tensor,
+    counter: torch.Tensor,
+    continue_flag: torch.Tensor,
     stream_ptr: int,
 ) -> None:
     _cond_ext().cwg_fixed_end(count, counter, continue_flag, stream_ptr)
 
 
 def statistics_control(
-    *, weight_src: torch.Tensor, continue_flag: torch.Tensor,
-    counter: torch.Tensor, weight: torch.Tensor, sub_step: torch.Tensor,
-    num_sub_steps: torch.Tensor, stream_ptr: int,
+    *,
+    weight_src: torch.Tensor,
+    continue_flag: torch.Tensor,
+    counter: torch.Tensor,
+    weight: torch.Tensor,
+    sub_step: torch.Tensor,
+    num_sub_steps: torch.Tensor,
+    stream_ptr: int,
 ) -> None:
     _cond_ext().cwg_stats_control(
-        weight_src, continue_flag, counter, weight, sub_step,
-        num_sub_steps, stream_ptr,
+        weight_src,
+        continue_flag,
+        counter,
+        weight,
+        sub_step,
+        num_sub_steps,
+        stream_ptr,
     )
 
 
 def fixed_statistics_end(
-    *, count: torch.Tensor, counter: torch.Tensor,
-    continue_flag: torch.Tensor, weight_src: torch.Tensor,
-    weight: torch.Tensor, sub_step: torch.Tensor,
-    num_sub_steps: torch.Tensor, stream_ptr: int,
+    *,
+    count: torch.Tensor,
+    counter: torch.Tensor,
+    continue_flag: torch.Tensor,
+    weight_src: torch.Tensor,
+    weight: torch.Tensor,
+    sub_step: torch.Tensor,
+    num_sub_steps: torch.Tensor,
+    stream_ptr: int,
 ) -> None:
     _cond_ext().cwg_fixed_stats_end(
-        count, counter, continue_flag, weight_src, weight, sub_step,
-        num_sub_steps, stream_ptr,
+        count,
+        counter,
+        continue_flag,
+        weight_src,
+        weight,
+        sub_step,
+        num_sub_steps,
+        stream_ptr,
     )
 
 
@@ -282,44 +364,68 @@ class ConditionalWhileGraph:
     """
 
     def __init__(self) -> None:
+        self._device = torch.cuda.current_device()
         self._ext = _cond_ext()
         self._h = self._ext.cwg_create()
 
     def begin_capture(self, stream_ptr: int) -> None:
-        self._ext.cwg_begin_capture(self._h, stream_ptr)
+        with torch.cuda.device(self._device):
+            self._ext.cwg_begin_capture(self._h, stream_ptr)
 
     def end_capture(self, stream_ptr: int) -> None:
-        self._ext.cwg_end_capture(self._h, stream_ptr)
+        with torch.cuda.device(self._device):
+            self._ext.cwg_end_capture(self._h, stream_ptr)
 
-    def set_conditional(self, continue_flag: torch.Tensor, set_cond: bool, stream_ptr: int) -> None:
+    def set_conditional(
+        self, continue_flag: torch.Tensor, set_cond: bool, stream_ptr: int
+    ) -> None:
         """Append the predicate kernel reading ``continue_flag`` (``(1,)`` int32).
 
         ``set_cond`` must be ``False`` during warmup (outside graph capture, where
         ``cudaGraphSetConditional`` is invalid) and ``True`` when capturing the body.
         """
-        self._ext.cwg_set_conditional(self._h, continue_flag, 1 if set_cond else 0, stream_ptr)
+        with torch.cuda.device(self._device):
+            self._ext.cwg_set_conditional(
+                self._h, continue_flag, 1 if set_cond else 0, stream_ptr
+            )
 
-    def stats_control(self, *, weight_src: torch.Tensor, continue_flag: torch.Tensor,
-                      counter: torch.Tensor, weight: torch.Tensor, sub_step: torch.Tensor,
-                      num_sub_steps: torch.Tensor, stream_ptr: int) -> None:
+    def stats_control(
+        self,
+        *,
+        weight_src: torch.Tensor,
+        continue_flag: torch.Tensor,
+        counter: torch.Tensor,
+        weight: torch.Tensor,
+        sub_step: torch.Tensor,
+        num_sub_steps: torch.Tensor,
+        stream_ptr: int,
+    ) -> None:
         """Write the aggregator control scalars from the loop state (folded path)."""
-        statistics_control(
-            weight_src=weight_src, continue_flag=continue_flag,
-            counter=counter, weight=weight, sub_step=sub_step,
-            num_sub_steps=num_sub_steps, stream_ptr=stream_ptr,
-        )
+        with torch.cuda.device(self._device):
+            statistics_control(
+                weight_src=weight_src,
+                continue_flag=continue_flag,
+                counter=counter,
+                weight=weight,
+                sub_step=sub_step,
+                num_sub_steps=num_sub_steps,
+                stream_ptr=stream_ptr,
+            )
 
     def instantiate(self) -> None:
-        self._ext.cwg_instantiate(self._h)
+        with torch.cuda.device(self._device):
+            self._ext.cwg_instantiate(self._h)
 
     def launch(self, stream_ptr: int) -> None:
-        self._ext.cwg_launch(self._h, stream_ptr)
+        with torch.cuda.device(self._device):
+            self._ext.cwg_launch(self._h, stream_ptr)
 
     def destroy(self) -> None:
         if getattr(self, "_h", None) is not None:
             handle = self._h
             self._h = None
-            self._ext.cwg_destroy(handle)
+            with torch.cuda.device(self._device):
+                self._ext.cwg_destroy(handle)
 
     def __del__(self) -> None:
         try:

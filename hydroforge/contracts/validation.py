@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from collections.abc import Mapping
-from typing import Any, NoReturn
+from copy import deepcopy
+from typing import Annotated, Any, NoReturn, TypeAlias, TypeVar
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import AfterValidator, BaseModel, ConfigDict
 
 _PUBLIC_MODEL_CONFIG = ConfigDict(
     arbitrary_types_allowed=True,
@@ -89,8 +89,7 @@ class _ImmutableDict(dict[Any, Any]):
 
     def __deepcopy__(self, memo: dict[int, Any]) -> _ImmutableDict:
         copied = type(self)(
-            (deepcopy(key, memo), deepcopy(value, memo))
-            for key, value in self.items()
+            (deepcopy(key, memo), deepcopy(value, memo)) for key, value in self.items()
         )
         memo[id(self)] = copied
         return copied
@@ -116,7 +115,14 @@ def _restore_immutable_dict(items: tuple[tuple[Any, Any], ...]) -> _ImmutableDic
 
 
 def _immutable_dict(values: Any) -> _ImmutableDict:
-    return _ImmutableDict(dict(values))
+    return _ImmutableDict(values)
+
+
+_Key = TypeVar("_Key")
+_Value = TypeVar("_Value")
+FrozenMapping: TypeAlias = Annotated[
+    Mapping[_Key, _Value], AfterValidator(_immutable_dict)
+]
 
 
 __all__ = ["HydroForgeModel"]

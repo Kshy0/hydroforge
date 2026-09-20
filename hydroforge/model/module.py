@@ -18,12 +18,9 @@ from types import MappingProxyType
 from typing import (
     Any,
     ClassVar,
-    Dict,
     Generic,
     Literal,
-    Optional,
     Self,
-    Tuple,
     TypeVar,
     overload,
 )
@@ -35,41 +32,54 @@ from pydantic import (
     PrivateAttr,
     ValidationInfo,
     computed_field,
-    field_validator,
     model_validator,
 )
 
-from hydroforge.data.distributed import _find_indices_in_torch_trusted
 from hydroforge.contracts.events import EventSink, ModelEvent, NullEventSink
-from hydroforge.contracts.fields import FieldDemandPlan, tensor_is_active
+from hydroforge.contracts.fields import (
+    FieldDemandPlan,
+    TensorDependencies,
+    TensorDType,
+    TensorName,
+    TensorOutput,
+    TensorShape,
+    tensor_is_active,
+)
 from hydroforge.contracts.kernel_field import _KernelField
-from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.contracts.naming import Identifier
 from hydroforge.contracts.runtime import MODEL_OWNED_MODULE_FIELDS
+from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.data.distributed import _find_indices_in_torch_trusted
 from hydroforge.model.tensors import ModuleTensors
-
 
 _NO_FIELD_DEFAULT = object()
 _MODULE_INITIALIZATION_CONTEXT = "hydroforge_model_initialization"
 _MODULE_REFERENCES_CONTEXT = "hydroforge_module_references"
 _MODULE_EVENT_SINK_CONTEXT = "hydroforge_module_event_sink"
 _MODULE_REFERENCE_TARGETS_CONTEXT = "hydroforge_module_reference_targets"
-_MODULE_TRIAL_FORCING_CONTEXT = "hydroforge_trial_forcing_fields"
+_MODULE_ENSEMBLE_FORCING_CONTEXT = "hydroforge_ensemble_forcing_fields"
 _MODULE_FIELD_DEMAND_CONTEXT = "hydroforge_field_demand_plan"
+_MODULE_DEFAULTS_CONTEXT = "hydroforge_module_defaults"
+_MODULE_PREPARED_CONTEXT = "hydroforge_module_input_prepared"
 
 
 class _ModuleTensorQuery(HydroForgeModel):
     """One validated public lookup into a module's compiled tensor schema."""
 
     module_type: Any = Field(exclude=True)
-    field_name: str
+    field_name: str = Field(min_length=1)
+    opened_modules: tuple[str, ...] | None = None
+    field_demand: FieldDemandPlan | None = None
 
     _schema: Any = PrivateAttr()
 
     @model_validator(mode="after")
     def _resolve(self) -> Self:
-        if not self.field_name:
-            raise ValueError("tensor field name must be non-empty")
-        schema = self.module_type._get_tensor_schema(self.field_name)
+        schema = self.module_type._get_tensor_schema(
+            self.field_name,
+            opened_modules=self.opened_modules,
+            field_demand=self.field_demand,
+        )
         if schema is None:
             raise ValueError(
                 f"unknown tensor field {self.module_type.module_name}.{self.field_name}"
@@ -97,6 +107,8 @@ class _ModuleBatchQuery(HydroForgeModel):
             query = _ModuleTensorQuery(
                 module_type=type(self.module),
                 field_name=self.field,
+                opened_modules=self.module.opened_modules,
+                field_demand=self.module._field_demand,
             )
             self._schema = query.schema
             self._tensor = getattr(self.module, query.field_name)
@@ -119,14 +131,14 @@ class _ModuleGatherRequest(HydroForgeModel):
     tensor: torch.Tensor
     indices: torch.Tensor
     batched: bool
-    num_trials: int | None = Field(exclude=True)
+    ensemble_size: int | None = Field(exclude=True)
 
     @model_validator(mode="after")
     def _validate_gather(self) -> Self:
         if self.batched and (
-            self.num_trials is None or self.tensor.shape[0] != self.num_trials
+            self.ensemble_size is None or self.tensor.shape[0] != self.ensemble_size
         ):
-            raise ValueError("batched gather requires the declared leading trial axis")
+            raise ValueError("batched gather requires the declared leading member axis")
         if self.indices.numel() and int(self.indices.min().item()) < 0:
             raise ValueError("gather indices must be non-negative")
         return self
@@ -135,21 +147,15 @@ class _ModuleGatherRequest(HydroForgeModel):
 class _ModuleClassDeclaration(HydroForgeModel):
     """Validated subclass-authoring declaration for ``AbstractModule``."""
 
-    module_name: str
-    description: str
-    conflicts: tuple[str, ...]
-    nc_excluded_fields: tuple[str, ...]
+    module_name: Identifier
+    description: str = Field(min_length=1)
+    conflicts: tuple[Identifier, ...]
+    nc_excluded_fields: tuple[Identifier, ...]
 
     @model_validator(mode="after")
     def _validate_declaration(self) -> Self:
-        if not self.module_name.isidentifier():
-            raise ValueError("module_name must be a Python identifier")
-        if not self.description:
-            raise ValueError("description must be a non-empty string")
         for label in ("conflicts", "nc_excluded_fields"):
             values = getattr(self, label)
-            if any(not value or not value.isidentifier() for value in values):
-                raise ValueError(f"{label} must contain Python identifiers")
             if len(values) != len(set(values)):
                 raise ValueError(f"{label} must not contain duplicates")
         return self
@@ -159,22 +165,20 @@ class _TensorFieldDeclaration(HydroForgeModel):
     """Validated public declaration consumed by the TensorField adapter."""
 
     description: str
-    shape: tuple[str | int, ...]
-    dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float"
-    dim_coords: str | None = None
-    category: Literal[
-        "topology", "param", "forcing", "init_state", "state"
-    ] = "param"
+    shape: TensorShape
+    dtype: TensorDType = "float"
+    dim_coords: TensorName | None = None
+    category: Literal["topology", "param", "forcing", "init_state", "state"] = "param"
     mode: Literal["device", "cpu", "discard"] = "device"
     is_key: bool = False
     is_coordinate: bool = False
-    partition_by: str | None = None
-    references: str | None = None
-    selects: str | None = None
+    partition_by: TensorName | None = None
+    references: TensorName | None = None
+    selects: TensorName | None = None
     replicated: bool = False
-    output: Literal["auto", "full", "disabled"] = "auto"
-    depends_on: str | tuple[str, ...] | None = None
-    required_by: str | tuple[str, ...] | None = None
+    output: TensorOutput = "auto"
+    depends_on: TensorDependencies = None
+    required_by: TensorDependencies = None
 
     @model_validator(mode="after")
     def _validate_field_contract(self) -> Self:
@@ -185,9 +189,7 @@ class _TensorFieldDeclaration(HydroForgeModel):
                     "topology or parameter fields"
                 )
             if self.output != "disabled":
-                raise ValueError(
-                    "mode='discard' fields must use output='disabled'"
-                )
+                raise ValueError("mode='discard' fields must use output='disabled'")
         if self.category != "forcing":
             return self
         if self.mode != "device":
@@ -195,9 +197,7 @@ class _TensorFieldDeclaration(HydroForgeModel):
         if self.output != "disabled":
             raise ValueError("forcing fields must use output='disabled'")
         if self.is_key or self.is_coordinate or self.references or self.selects:
-            raise ValueError(
-                "forcing fields cannot define topology/key relationships"
-            )
+            raise ValueError("forcing fields cannot define topology/key relationships")
         return self
 
 
@@ -209,22 +209,20 @@ class _TensorFieldDefault(HydroForgeModel):
 
 def TensorField(
     description: str,
-    shape: Tuple[str | int, ...],
+    shape: tuple[str | int, ...],
     dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
-    dim_coords: Optional[str] = None,
-    category: Literal[
-        "topology", "param", "forcing", "init_state", "state"
-    ] = "param",
+    dim_coords: str | None = None,
+    category: Literal["topology", "param", "forcing", "init_state", "state"] = "param",
     mode: Literal["device", "cpu", "discard"] = "device",
     is_key: bool = False,
     is_coordinate: bool = False,
-    partition_by: Optional[str] = None,
-    references: Optional[str] = None,
-    selects: Optional[str] = None,
+    partition_by: str | None = None,
+    references: str | None = None,
+    selects: str | None = None,
     replicated: bool = False,
     output: Literal["auto", "full", "disabled"] = "auto",
-    depends_on: str | Tuple[str, ...] | None = None,
-    required_by: str | Tuple[str, ...] | None = None,
+    depends_on: str | tuple[str, ...] | None = None,
+    required_by: str | tuple[str, ...] | None = None,
     default: Any = _NO_FIELD_DEFAULT,
 ):
     """
@@ -255,9 +253,9 @@ def TensorField(
                   - 'topology': Static structure (NEVER batched)
                   - 'param': Input parameter (can be batched)
                   - 'forcing': Transient per-step input; shared unless listed
-                    in the model's construction-time trial_forcing_fields
+                    in the model's construction-time ensemble_forcing_fields
                   - 'init_state': Initializable restart state (persisted in model
-                    checkpoints; ALWAYS batched if num_trials > 1)
+                    checkpoints; ALWAYS batched if ensemble_size > 1)
         mode: Handling of variables after initialization:
                   - 'device': Keep on current device (default)
                   - 'cpu': Move to CPU memory to save GPU memory
@@ -310,10 +308,10 @@ def TensorField(
 
 def CoordinateField(
     description: str,
-    shape: Tuple[str | int, ...],
+    shape: tuple[str | int, ...],
     dtype: Literal["int", "idx"] = "int",
-    partition_by: Optional[str] = None,
-    references: Optional[str] = None,
+    partition_by: str | None = None,
+    references: str | None = None,
     replicated: bool = False,
     default: Any = _NO_FIELD_DEFAULT,
 ):
@@ -336,7 +334,7 @@ def CoordinateField(
 
 def SelectionField(
     description: str,
-    shape: Tuple[str | int, ...],
+    shape: tuple[str | int, ...],
     selects: str,
     dtype: Literal["int", "idx"] = "int",
     default: Any = _NO_FIELD_DEFAULT,
@@ -360,7 +358,7 @@ def SelectionField(
 
 def ReferenceField(
     description: str,
-    shape: Tuple[str | int, ...],
+    shape: tuple[str | int, ...],
     references: str,
     dim_coords: str,
     dtype: Literal["int", "idx"] = "int",
@@ -399,6 +397,9 @@ class _ReferenceIndexDescriptor:
         cache_name = f"__derived_reference_index_{self.name}"
         cached = instance.__dict__.get(cache_name)
         if cached is None:
+            source = type(instance)._tensor_schema_map().get(self.reference)
+            if source is not None and not instance._is_tensor_field_active(source):
+                return None
             if self.inverse:
                 cached = instance._inverse_reference_index(self.reference)
             else:
@@ -449,14 +450,6 @@ class ModuleReference(HydroForgeModel, Generic[_TReference]):
     module_type: type[AbstractModule]
     optional: bool
 
-    @model_validator(mode="after")
-    def _validate_reference(self) -> Self:
-        if not isinstance(self.module_type, type) or not issubclass(
-            self.module_type, AbstractModule
-        ):
-            raise ValueError("module_ref requires an AbstractModule class")
-        return self
-
     @property
     def module_name(self) -> str:
         return self.module_type.module_name
@@ -470,16 +463,11 @@ class ModuleReference(HydroForgeModel, Generic[_TReference]):
             )
 
     @classmethod
+    @cache
     def collect(cls, owner: type) -> Mapping[str, ModuleReference]:
         """Collect active declarations using normal Python MRO lookup."""
 
-        return cls._collect(owner)
-
-    @classmethod
-    @cache
-    def _collect(cls, owner: type) -> Mapping[str, ModuleReference]:
-
-        fields: Dict[str, ModuleReference] = {}
+        fields: dict[str, ModuleReference] = {}
         seen: set[str] = set()
         for base in owner.mro():
             for name, value in vars(base).items():
@@ -504,12 +492,12 @@ class ModuleReference(HydroForgeModel, Generic[_TReference]):
         if instance is None:
             return self
         if isinstance(instance, AbstractModule):
-            links = instance._module_references
+            links = instance.__pydantic_private__["_module_references"]
         else:
-            links = instance._module_links
+            links = instance.__pydantic_private__["_module_links"]
             if links is None:
                 instance._ensure_runtime_materialized()
-                links = instance._module_links
+                links = instance.__pydantic_private__["_module_links"]
         return links.get(self.module_name)
 
     def __set__(self, instance: Any, value: Any) -> None:
@@ -550,16 +538,16 @@ def optional_module_ref(
 
 class _ComputedTensorFieldDeclaration(HydroForgeModel):
     description: str
-    shape: tuple[str | int, ...]
-    dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float"
-    dim_coords: str | None = None
+    shape: TensorShape
+    dtype: TensorDType = "float"
+    dim_coords: TensorName | None = None
     category: Literal[
         "topology", "derived_param", "state", "shared_state", "virtual"
     ] = "derived_param"
     expr: str | None = None
-    depends_on: str | tuple[str, ...] | None = None
-    required_by: str | tuple[str, ...] | None = None
-    output: Literal["auto", "full", "disabled"] = "auto"
+    depends_on: TensorDependencies = None
+    required_by: TensorDependencies = None
+    output: TensorOutput = "auto"
     output_only: bool = False
 
     @model_validator(mode="after")
@@ -577,15 +565,15 @@ class _ComputedTensorFieldDeclaration(HydroForgeModel):
 
 def computed_tensor_field(
     description: str,
-    shape: Tuple[str | int, ...],
+    shape: tuple[str | int, ...],
     dtype: Literal["float", "int", "idx", "bool", "hpfloat"] = "float",
-    dim_coords: Optional[str] = None,
+    dim_coords: str | None = None,
     category: Literal[
         "topology", "derived_param", "state", "shared_state", "virtual"
     ] = "derived_param",
-    expr: Optional[str] = None,
-    depends_on: str | Tuple[str, ...] | None = None,
-    required_by: str | Tuple[str, ...] | None = None,
+    expr: str | None = None,
+    depends_on: str | tuple[str, ...] | None = None,
+    required_by: str | tuple[str, ...] | None = None,
     output: Literal["auto", "full", "disabled"] = "auto",
     output_only: bool = False,
 ):
@@ -602,7 +590,7 @@ def computed_tensor_field(
                   - 'topology': Static structure (NEVER batched)
                   - 'derived_param': Computed parameter (can be batched)
                   - 'state': Reconstructed runtime state (ALWAYS batched if
-                    num_trials > 1; never checkpointed)
+                    ensemble_size > 1; never checkpointed)
                   - 'shared_state': Reconstructed runtime state (NEVER batched
                     or checkpointed)
                   - 'virtual': Computed on-demand during analysis/output (not stored in memory)
@@ -665,13 +653,6 @@ class AbstractModule(HydroForgeModel, ABC):
 
     # Pydantic configuration
     model_config = ConfigDict(
-        arbitrary_types_allowed=True,  # Allow torch.Tensor types
-        frozen=True,
-        # The model compiler materializes every TensorField declaration before
-        # Pydantic construction; ordinary scalar defaults are validated here.
-        validate_default=True,
-        extra="forbid",
-        strict=True,
         ignored_types=(
             _ReferenceIndexDescriptor,
             ModuleReference,
@@ -682,8 +663,8 @@ class AbstractModule(HydroForgeModel, ABC):
     # Module metadata - must be overridden in subclasses
     module_name: ClassVar[str] = "abstract"
     description: ClassVar[str] = "Abstract base module"
-    conflicts: ClassVar[Tuple[str, ...]] = ()
-    nc_excluded_fields: ClassVar[Tuple[str, ...]] = MODEL_OWNED_MODULE_FIELDS
+    conflicts: ClassVar[tuple[str, ...]] = ()
+    nc_excluded_fields: ClassVar[tuple[str, ...]] = MODEL_OWNED_MODULE_FIELDS
     """Fields owned by the model runtime rather than module input data."""
     opened_modules: tuple[str, ...] = Field(
         default_factory=tuple,
@@ -711,18 +692,20 @@ class AbstractModule(HydroForgeModel, ABC):
             "  float32 → float64, float64 → float64 (no promotion)."
         ),
     )
-    num_trials: Optional[int] = Field(
+    ensemble_size: int | None = Field(
         default=None,
+        ge=1,
         strict=True,
         description="Number of parallel simulations (ensemble members)",
     )
 
     _event_sink: EventSink = PrivateAttr(default_factory=NullEventSink)
     _tensors: ModuleTensors = PrivateAttr()
-    _module_references: Dict[str, Optional["AbstractModule"]] = PrivateAttr(
+    _module_references: dict[str, AbstractModule | None] = PrivateAttr(
         default_factory=dict,
     )
     _reference_targets: Mapping[str, Any] = PrivateAttr(default_factory=dict)
+    _field_demand: FieldDemandPlan = PrivateAttr(default_factory=FieldDemandPlan.empty)
     _output_required_fields: frozenset[str] = PrivateAttr(default_factory=frozenset)
     _observed_output_fields: frozenset[str] = PrivateAttr(default_factory=frozenset)
 
@@ -753,9 +736,7 @@ class AbstractModule(HydroForgeModel, ABC):
     @classmethod
     @cache
     def _field_schema_map(cls):
-        return MappingProxyType(
-            {field.name: field for field in cls._field_schema()}
-        )
+        return MappingProxyType({field.name: field for field in cls._field_schema()})
 
     @classmethod
     @cache
@@ -767,9 +748,7 @@ class AbstractModule(HydroForgeModel, ABC):
     @cache
     def _tensor_schema_map(cls):
         """Index the compiled schema without reparsing ``json_schema_extra``."""
-        return MappingProxyType(
-            {field.name: field for field in cls.tensor_schema()}
-        )
+        return MappingProxyType({field.name: field for field in cls.tensor_schema()})
 
     def _is_tensor_field_active(self, field: str | Any) -> bool:
         """Return whether a tensor field belongs to this module specialization."""
@@ -778,6 +757,10 @@ class AbstractModule(HydroForgeModel, ABC):
         )
         if schema is None or schema.tensor is None:
             raise KeyError(f"Unknown tensor field: {field}")
+        if schema.computed:
+            descriptor = type(self)._reference_index_fields().get(schema.name)
+            if descriptor is not None:
+                schema = self._tensor_schema_map()[descriptor.reference]
         output_required = schema.name in self._output_required_fields
         return tensor_is_active(
             schema.tensor,
@@ -816,15 +799,6 @@ class AbstractModule(HydroForgeModel, ABC):
 
         return values
 
-    @field_validator("num_trials")
-    @classmethod
-    def _validate_num_trials(cls, v: Optional[int]) -> Optional[int]:
-        if v is not None and v <= 1:
-            raise ValueError(
-                "num_trials must be greater than 1 if specified. For single trial, use None."
-            )
-        return v
-
     @model_validator(mode="before")
     @classmethod
     def _complete_module_input(
@@ -853,19 +827,21 @@ class AbstractModule(HydroForgeModel, ABC):
             raise ValueError("model initialization must provide an EventSink")
         if not isinstance(values, Mapping):
             return values
-        trial_forcing_fields = context.get(_MODULE_TRIAL_FORCING_CONTEXT, ())
-        if type(trial_forcing_fields) is not tuple:
+        ensemble_forcing_fields = context.get(_MODULE_ENSEMBLE_FORCING_CONTEXT, ())
+        if type(ensemble_forcing_fields) is not tuple:
             raise ValueError(
-                "model initialization must provide trial forcing fields as a tuple"
+                "model initialization must provide member forcing fields as a tuple"
             )
         demand_plan = context.get(_MODULE_FIELD_DEMAND_CONTEXT)
         if not isinstance(demand_plan, FieldDemandPlan):
-            raise ValueError(
-                "model initialization must provide a FieldDemandPlan"
-            )
+            raise ValueError("model initialization must provide a FieldDemandPlan")
         output_required_fields = demand_plan.required_for(cls.module_name)
         try:
-            payload = cls.prepare_module_input(dict(values))
+            payload = (
+                dict(values)
+                if context.get(_MODULE_PREPARED_CONTEXT) is True
+                else cls.prepare_module_input(dict(values))
+            )
             if not isinstance(payload, dict):
                 raise TypeError(
                     f"module {cls.module_name!r} prepare_module_input must "
@@ -875,8 +851,9 @@ class AbstractModule(HydroForgeModel, ABC):
                 cls,
                 payload,
                 module_references=references,
-                batched_fields=trial_forcing_fields,
+                batched_fields=ensemble_forcing_fields,
                 output_required_fields=output_required_fields,
+                default_values=context.get(_MODULE_DEFAULTS_CONTEXT),
             )
         except (KeyError, TypeError, OverflowError) as error:
             raise ValueError(str(error)) from error
@@ -901,9 +878,8 @@ class AbstractModule(HydroForgeModel, ABC):
             self._event_sink = context[_MODULE_EVENT_SINK_CONTEXT]
             demand_plan = context.get(_MODULE_FIELD_DEMAND_CONTEXT)
             if not isinstance(demand_plan, FieldDemandPlan):
-                raise ValueError(
-                    "model initialization must provide a FieldDemandPlan"
-                )
+                raise ValueError("model initialization must provide a FieldDemandPlan")
+            self._field_demand = demand_plan
             output_required_fields = demand_plan.required_for(
                 self.module_name,
             )
@@ -912,21 +888,21 @@ class AbstractModule(HydroForgeModel, ABC):
             )
             self._output_required_fields = output_required_fields
             self._observed_output_fields = observed_output_fields
-            trial_forcing_fields = context.get(_MODULE_TRIAL_FORCING_CONTEXT, ())
-            if type(trial_forcing_fields) is not tuple:
+            ensemble_forcing_fields = context.get(_MODULE_ENSEMBLE_FORCING_CONTEXT, ())
+            if type(ensemble_forcing_fields) is not tuple:
                 raise ValueError(
-                    "model initialization must provide trial forcing fields as a tuple"
+                    "model initialization must provide member forcing fields as a tuple"
                 )
             self._tensors = ModuleTensors(
                 self,
-                batched_fields=trial_forcing_fields,
+                batched_fields=ensemble_forcing_fields,
             )
             if self.module_name not in self.opened_modules:
                 raise ValueError(
                     f"`{self.module_name}` is not listed in `opened_modules`. "
                     "All active modules must include themselves in that list."
                 )
-            self._tensors._initialize_declared()
+            self._tensors._validate_declared()
             self._tensors._finalize_computed()
         except (KeyError, TypeError, OverflowError) as error:
             raise ValueError(str(error)) from error
@@ -939,7 +915,7 @@ class AbstractModule(HydroForgeModel, ABC):
         return ModuleReference.collect(cls)
 
     @classmethod
-    def _required_modules(cls) -> Tuple[str, ...]:
+    def _required_modules(cls) -> tuple[str, ...]:
         """Return sibling modules that must be open with this module."""
 
         return tuple(
@@ -949,26 +925,118 @@ class AbstractModule(HydroForgeModel, ABC):
         )
 
     @classmethod
-    def _reference_index_fields(cls) -> Dict[str, _ReferenceIndexDescriptor]:
-        fields: Dict[str, _ReferenceIndexDescriptor] = {}
-        for owner in reversed(cls.mro()):
+    def _reference_index_fields(
+        cls,
+        *,
+        opened_modules: tuple[str, ...] | None = None,
+        field_demand: FieldDemandPlan | None = None,
+    ) -> dict[str, _ReferenceIndexDescriptor]:
+        fields: dict[str, _ReferenceIndexDescriptor] = {}
+        seen: set[str] = set()
+        for owner in cls.mro():
             for name, value in vars(owner).items():
+                if name in seen:
+                    continue
+                seen.add(name)
                 if isinstance(value, _ReferenceIndexDescriptor):
+                    source = cls._tensor_schema_map().get(value.reference)
+                    if (
+                        opened_modules is not None
+                        and source is not None
+                        and not tensor_is_active(
+                            source.tensor,
+                            opened_modules,
+                            output_required=(
+                                field_demand is None
+                                or field_demand.is_required(
+                                    cls.module_name, source.name
+                                )
+                            ),
+                        )
+                    ):
+                        continue
                     fields[name] = value
         return fields
 
     @classmethod
-    def _reference_index_metadata(cls, name: str):
-        """Compile derived-index tensor metadata once per module class."""
-
-        return cls._get_reference_index_metadata(name)
+    def _reference_target_schema(
+        cls,
+        reference: str,
+        *,
+        opened_modules: tuple[str, ...] | None = None,
+        field_demand: FieldDemandPlan | None = None,
+    ):
+        """Resolve one declared target using the selected module configuration."""
+        source = cls._tensor_schema_map().get(reference)
+        if source is None or source.tensor is None:
+            raise ValueError(
+                f"ReferenceIndexField {reference!r} in module {cls.module_name!r} "
+                "does not name a tensor field"
+            )
+        target_name = source.tensor.references
+        if not target_name:
+            raise ValueError(
+                f"ReferenceIndexField {reference!r} in module {cls.module_name!r} "
+                "refers to a field without reference metadata"
+            )
+        owners = {cls.module_name: cls}
+        owners.update(
+            {
+                name: declaration.module_type
+                for name, declaration in cls._module_reference_fields().items()
+                if opened_modules is None or declaration.module_name in opened_modules
+            }
+        )
+        parts = target_name.split(".")
+        target_field = parts[-1]
+        if len(parts) > 1:
+            owner = owners.get(parts[-2])
+            owners = {} if owner is None else {owner.module_name: owner}
+        candidates = []
+        for owner in owners.values():
+            target = owner._tensor_schema_map().get(target_field)
+            if (
+                target is not None
+                and target.tensor is not None
+                and (
+                    opened_modules is None
+                    or tensor_is_active(
+                        target.tensor,
+                        opened_modules,
+                        output_required=(
+                            field_demand is None
+                            or field_demand.is_required(target.module_name, target.name)
+                        ),
+                    )
+                )
+            ):
+                candidates.append(target)
+        if len(candidates) != 1:
+            raise ValueError(
+                f"Reference target {target_name!r} for "
+                f"{cls.module_name}.{reference} resolves to "
+                f"{len(candidates)} opened tensor fields; qualify the "
+                "target with its module name or provide opened_modules"
+            )
+        return candidates[0]
 
     @classmethod
     @cache
-    def _get_reference_index_metadata(cls, name: str):
+    def _reference_index_metadata(
+        cls,
+        name: str,
+        *,
+        opened_modules: tuple[str, ...] | None = None,
+        field_demand: FieldDemandPlan | None = None,
+    ):
+        """Compile derived-index tensor metadata once per module class."""
+
         from hydroforge.contracts.fields import TensorMetadata
 
-        descriptor = cls._reference_index_fields().get(name)
+        descriptor = cls._reference_index_fields(
+            opened_modules=opened_modules,
+            field_demand=field_demand,
+        ).get(name)
         if descriptor is None:
             return None
         source = cls._tensor_schema_map().get(descriptor.reference)
@@ -977,33 +1045,77 @@ class AbstractModule(HydroForgeModel, ABC):
                 f"ReferenceIndexField {name!r} refers to non-tensor field "
                 f"{descriptor.reference!r}"
             )
+        axis = (
+            cls._reference_target_schema(
+                descriptor.reference,
+                opened_modules=opened_modules,
+                field_demand=field_demand,
+            )
+            if descriptor.inverse
+            else source
+        )
+        shape = axis.tensor.shape
+        coordinate = axis.name if axis.tensor.is_coordinate else axis.tensor.dim_coords
+        if axis.module_name != cls.module_name:
+            shape = tuple(
+                f"{axis.module_name}.{dimension}"
+                if isinstance(dimension, str) and "." not in dimension
+                else dimension
+                for dimension in shape
+            )
+            if coordinate is not None and "." not in coordinate:
+                coordinate = f"{axis.module_name}.{coordinate}"
         return TensorMetadata.compile(
             {
-                "tensor_shape": source.tensor.shape,
+                "tensor_shape": shape,
                 "tensor_dtype": "idx",
-                "dim_coords": source.tensor.dim_coords,
+                "dim_coords": coordinate,
                 "category": "topology",
                 "mode": "device" if descriptor.device else "cpu",
                 "output": "disabled",
+                "depends_on": source.tensor.depends_on,
+                "required_by": source.tensor.required_by,
             }
         )
 
     @classmethod
-    def get_tensor_schema(cls, name: str):
-        """Resolve a regular, computed, or derived-index typed schema."""
+    def get_tensor_schema(
+        cls,
+        name: str,
+        *,
+        opened_modules: tuple[str, ...] | None = None,
+        field_demand: FieldDemandPlan | None = None,
+    ):
+        """Resolve declared metadata, optionally restricted to a field demand plan.
+
+        Without a demand plan, output-activatable fields remain candidates;
+        module dependencies still restrict the selected configuration.
+        """
 
         return _ModuleTensorQuery(
             module_type=cls,
             field_name=name,
+            opened_modules=opened_modules,
+            field_demand=field_demand,
         ).schema
 
     @classmethod
     @cache
-    def _get_tensor_schema(cls, name: str):
+    def _get_tensor_schema(
+        cls,
+        name: str,
+        *,
+        opened_modules: tuple[str, ...] | None = None,
+        field_demand: FieldDemandPlan | None = None,
+    ):
         schema = cls._tensor_schema_map().get(name)
         if schema is not None:
             return schema
-        metadata = cls._reference_index_metadata(name)
+        metadata = cls._reference_index_metadata(
+            name,
+            opened_modules=opened_modules,
+            field_demand=field_demand,
+        )
         if metadata is None:
             return None
         from hydroforge.contracts.fields import ModuleFieldSchema
@@ -1021,7 +1133,7 @@ class AbstractModule(HydroForgeModel, ABC):
             description=f"Derived local index {name}",
         )
 
-    def _reference_target(self, field_name: str) -> Tuple[str, torch.Tensor]:
+    def _reference_target(self, field_name: str) -> tuple[str, torch.Tensor]:
         """Return the construction-time-resolved local target tensor."""
 
         plan = self._reference_targets[field_name]
@@ -1035,7 +1147,7 @@ class AbstractModule(HydroForgeModel, ABC):
     def _reference_index(
         self,
         field_name: str,
-        target: Optional[torch.Tensor] = None,
+        target: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Resolve a validated ReferenceField to rank-local indices."""
         values = getattr(self, field_name)
@@ -1047,7 +1159,7 @@ class AbstractModule(HydroForgeModel, ABC):
     def _inverse_reference_index(
         self,
         field_name: str,
-        target: Optional[torch.Tensor] = None,
+        target: torch.Tensor | None = None,
         *,
         fill_value: int = -1,
     ) -> torch.Tensor:
@@ -1072,6 +1184,7 @@ class AbstractModule(HydroForgeModel, ABC):
         query = _ModuleTensorQuery(
             module_type=type(self),
             field_name=field_name,
+            opened_modules=self.opened_modules,
         )
         return self._get_expected_dtype(query.field_name)
 
@@ -1107,33 +1220,33 @@ class AbstractModule(HydroForgeModel, ABC):
 
         ``batched`` must come from field metadata (for example
         ``module.is_batched("field")``). Shape-only inference is ambiguous
-        whenever a shared tensor's leading dimension equals ``num_trials``.
+        whenever a shared tensor's leading dimension equals ``ensemble_size``.
         """
         request = _ModuleGatherRequest(
             tensor=tensor,
             indices=indices,
             batched=batched,
-            num_trials=self.num_trials,
+            ensemble_size=self.ensemble_size,
         )
         if request.batched:
             return request.tensor[:, request.indices]
         return request.tensor[request.indices]
 
     def is_batched(self, field: str | torch.Tensor) -> bool:
-        """Return whether a tensor has HydroForge's leading trial axis.
+        """Return whether a tensor has HydroForge's leading member axis.
 
         Declared fields are decided from their schema rank, so a shared tensor
-        whose first dimension happens to equal ``num_trials`` is never
+        whose first dimension happens to equal ``ensemble_size`` is never
         misclassified. Passing a raw tensor retains the shape-only behavior for
         callers that do not have field metadata.
         """
         query = _ModuleBatchQuery(module=self, field=field)
         if query.schema is not None:
             return self._is_batched_trusted(query.schema.name)
-        if self.num_trials is None:
+        if self.ensemble_size is None:
             return False
         tensor = query.tensor
-        return tensor.ndim > 0 and tensor.shape[0] == self.num_trials
+        return tensor.ndim > 0 and tensor.shape[0] == self.ensemble_size
 
     def forcing_layout(
         self,
@@ -1141,25 +1254,56 @@ class AbstractModule(HydroForgeModel, ABC):
     ) -> Literal["shared", "batched"]:
         """Return the construction-time layout of one forcing field."""
 
-        schema = type(self)._get_tensor_schema(field_name)
+        schema = type(self)._get_tensor_schema(
+            field_name,
+            opened_modules=self.opened_modules,
+            field_demand=self._field_demand,
+        )
         if schema is None or schema.tensor.category != "forcing":
-            raise ValueError(
-                f"{self.module_name}.{field_name} is not a forcing field"
-            )
+            raise ValueError(f"{self.module_name}.{field_name} is not a forcing field")
         if not self._is_tensor_field_active(schema):
             raise ValueError(
                 f"forcing field {self.module_name}.{field_name} is inactive"
             )
-        return (
-            "batched"
-            if field_name in self._tensors.batched_fields
-            else "shared"
-        )
+        return "batched" if field_name in self._tensors.batched_fields else "shared"
+
+    def materialize_fields(self, *field_names: str) -> None:
+        """Materialize declared lazy fields needed by a module execution path.
+
+        Computed virtual fields intentionally remain lazy so output selection
+        does not allocate every diagnostic.  A model's
+        ``initialize_model_state`` method can request a module's internal
+        workspace through this small, schema-aware API instead of reaching
+        through the controller with private ``_ = module.field`` accesses.
+        Modules do not receive an implicit initialization callback.
+        """
+
+        for field_name in field_names:
+            schema = type(self)._get_tensor_schema(
+                field_name,
+                opened_modules=self.opened_modules,
+                field_demand=self._field_demand,
+            )
+            if schema is None:
+                raise KeyError(f"Unknown tensor field {self.module_name}.{field_name}")
+            if not self._is_tensor_field_active(schema):
+                raise ValueError(
+                    f"Cannot materialize inactive field {self.module_name}.{field_name}"
+                )
+            value = getattr(self, field_name)
+            if value is None:
+                raise ValueError(
+                    f"Active field {self.module_name}.{field_name} resolved to None"
+                )
 
     def _is_batched_trusted(self, field_name: str) -> bool:
-        if self.num_trials is None:
+        if self.ensemble_size is None:
             return False
-        schema = type(self)._get_tensor_schema(field_name)
+        schema = type(self)._get_tensor_schema(
+            field_name,
+            opened_modules=self.opened_modules,
+            field_demand=self._field_demand,
+        )
         if schema.tensor.category == "topology":
             return False
         if schema.tensor.category == "forcing":

@@ -3,24 +3,28 @@
 from __future__ import annotations
 
 import os
+import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
-import sys
-from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 
 from hydroforge.contracts.errors import ResourceCleanupError
+from hydroforge.kernels.backends.build_environment import (
+    serialized_compilation,
+    temporary_environment,
+)
 from hydroforge.kernels.backends.metal.limits import (
     validate_metal_launch_extent,
 )
 
-
 _recording_sequence: ContextVar[Any] = ContextVar(
-    "hydroforge_metal_recording_sequence", default=None,
+    "hydroforge_metal_recording_sequence",
+    default=None,
 )
 
 
@@ -33,7 +37,7 @@ def _raise_failures(scope: str, failures: list[BaseException]) -> None:
     raise error from failures[0]
 
 
-def metal_resource_identity(value: Any) -> Any:
+def metal_resource_identity(value: Any) -> tuple[Any, ...]:
     """Identify the underlying allocation so distinct tensor views alias."""
     if not isinstance(value, torch.Tensor):
         return type(value), id(value)
@@ -45,6 +49,7 @@ def metal_resource_identity(value: Any) -> Any:
 
 
 @cache
+@serialized_compilation()
 def load_metal_kernel():
     if sys.platform != "darwin":
         raise RuntimeError("Native Metal kernels are only available on macOS")
@@ -55,11 +60,9 @@ def load_metal_kernel():
     # environment discoverable without imposing a package-build dependency.
     old_path = os.environ.get("PATH")
     executable_dir = str(Path(sys.executable).parent)
-    os.environ["PATH"] = (
-        executable_dir if old_path is None else f"{executable_dir}:{old_path}"
-    )
+    build_path = executable_dir if old_path is None else f"{executable_dir}:{old_path}"
     source = Path(__file__).with_suffix(".mm")
-    try:
+    with temporary_environment({"PATH": build_path}):
         return load(
             name="hydroforge_metal_kernel",
             sources=[str(source)],
@@ -67,11 +70,6 @@ def load_metal_kernel():
             extra_ldflags=["-framework", "Metal", "-framework", "Foundation"],
             verbose=False,
         )
-    finally:
-        if old_path is None:
-            os.environ.pop("PATH", None)
-        else:
-            os.environ["PATH"] = old_path
 
 
 @dataclass
@@ -81,8 +79,8 @@ class MetalCommandSequence:
     prepared_commands: list[tuple[Any, int, int, int, int, bool]] = field(
         default_factory=list,
     )
-    _pending_reads: set[int] = field(default_factory=set, init=False)
-    _pending_writes: set[int] = field(default_factory=set, init=False)
+    _pending_reads: set[tuple[Any, ...]] = field(default_factory=set, init=False)
+    _pending_writes: set[tuple[Any, ...]] = field(default_factory=set, init=False)
 
     def add_prepared(
         self,
@@ -95,10 +93,9 @@ class MetalCommandSequence:
         """Record an already-specialized launch from the normal dispatcher."""
         read_ids = {metal_resource_identity(value) for value in reads}
         write_ids = {metal_resource_identity(value) for value in writes}
-        if (
-            self._pending_writes.intersection(read_ids | write_ids)
-            or self._pending_reads.intersection(write_ids)
-        ):
+        if self._pending_writes.intersection(
+            read_ids | write_ids
+        ) or self._pending_reads.intersection(write_ids):
             self.mark_barrier()
         self.prepared_commands.append((*prepared, barrier))
         if barrier:
@@ -110,7 +107,8 @@ class MetalCommandSequence:
 
     def mark_barrier(self) -> None:
         """Place a dependency barrier after the most recently recorded command."""
-        self.prepared_commands[-1] = (*self.prepared_commands[-1][:-1], True)
+        if self.prepared_commands:
+            self.prepared_commands[-1] = (*self.prepared_commands[-1][:-1], True)
         self._pending_reads.clear()
         self._pending_writes.clear()
 
@@ -120,7 +118,8 @@ class MetalCommandSequence:
         prepared = []
         for item in self.prepared_commands:
             threads = validate_metal_launch_extent(
-                "Metal command sequence", item[3],
+                "Metal command sequence",
+                item[3],
             )
             if threads == 0:
                 # A zero-width dispatch is a semantic no-op. Preserve an
@@ -165,7 +164,11 @@ class MetalCommandSequence:
             native, pipelines, bindings, threads, groups, barriers = self._prepare()
             if native is not None:
                 native.dispatch_sequence(
-                    pipelines, bindings, threads, groups, barriers,
+                    pipelines,
+                    bindings,
+                    threads,
+                    groups,
+                    barriers,
                 )
         except BaseException as error:
             failures.append(error)
@@ -175,7 +178,7 @@ class MetalCommandSequence:
             failures.append(error)
         _raise_failures("Metal command dispatch", failures)
 
-    def capture(self) -> "MetalICB | MetalNoOpICB":
+    def capture(self) -> MetalICB | MetalNoOpICB:
         failures: list[BaseException] = []
         native = None
         graph_id = None
@@ -186,7 +189,11 @@ class MetalCommandSequence:
                 empty = True
             else:
                 graph_id = native.create_icb(
-                    pipelines, bindings, threads, groups, barriers,
+                    pipelines,
+                    bindings,
+                    threads,
+                    groups,
+                    barriers,
                 )
         except BaseException as error:
             failures.append(error)
@@ -223,6 +230,8 @@ class MetalICB:
     _closed: bool = field(default=False, init=False)
 
     def replay(self, replays: int = 1) -> None:
+        if self._closed:
+            raise RuntimeError("Metal ICB is closed")
         self._native.replay_icb(self.graph_id, replays)
 
     def close(self) -> None:
@@ -249,7 +258,8 @@ def record_metal_commands(sequence: MetalCommandSequence):
             sequence.close()
         except BaseException as cleanup_error:
             error = ResourceCleanupError(
-                "Metal command recording", (primary, cleanup_error),
+                "Metal command recording",
+                (primary, cleanup_error),
             )
             raise error from primary
         raise

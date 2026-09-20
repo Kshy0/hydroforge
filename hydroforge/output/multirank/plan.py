@@ -121,5 +121,4 @@ class _ReaderStoragePlan:
         return canonical
 
     def verify_path(self, path: str | Path) -> None:
-        canonical = self.canonical_path(path)
-        self.file_identities[canonical].verify(canonical)
+        self.checked_path(path)

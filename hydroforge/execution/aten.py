@@ -2,22 +2,39 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
 import torch
 
-
-
-FORBIDDEN_SUBSTEP_CONVERSIONS = frozenset({
-    "bfloat16", "cpu", "cuda", "double", "float", "half", "mps",
-    "to", "type", "type_as", "xpu",
-})
-FORBIDDEN_SUBSTEP_CONSTRUCTORS = frozenset({
-    "arange", "as_tensor", "empty", "full", "ones", "tensor", "zeros",
-})
+FORBIDDEN_SUBSTEP_CONVERSIONS = frozenset(
+    {
+        "bfloat16",
+        "cpu",
+        "cuda",
+        "double",
+        "float",
+        "half",
+        "mps",
+        "to",
+        "type",
+        "type_as",
+        "xpu",
+    }
+)
+FORBIDDEN_SUBSTEP_CONSTRUCTORS = frozenset(
+    {
+        "arange",
+        "as_tensor",
+        "empty",
+        "full",
+        "ones",
+        "tensor",
+        "zeros",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,63 +52,101 @@ def _contract(
     preallocated: tuple[tuple[str, str], ...] = (),
 ) -> _CompiledAtenPlan:
     return _CompiledAtenPlan(
-        semantics, frozenset(overloads), preallocated,
+        semantics,
+        frozenset(overloads),
+        preallocated,
     )
 
 
 # This is the single support definition for Torch execution, CUDA graph capture
 # and online Metal lowering. Adding a name requires choosing explicit semantics;
 # there is no default validator category.
-COMPILED_ATEN_CONTRACTS = MappingProxyType({
-    "aten::add": _contract(
-        "binary", "Tensor", "Scalar", "out", "Scalar_out",
-        preallocated=(("Tensor", "out"), ("Scalar", "Scalar_out")),
-    ),
-    "aten::add_": _contract("binary", "Tensor", "Scalar"),
-    "aten::copy_": _contract("copy", ""),
-    "aten::div": _contract(
-        "binary", "Tensor", "Scalar", "out", "Scalar_out",
-        preallocated=(("Tensor", "out"), ("Scalar", "Scalar_out")),
-    ),
-    "aten::div_": _contract("binary", "Tensor", "Scalar"),
-    "aten::fill_": _contract("fill", "Scalar"),
-    "aten::index_add_": _contract("scatter", ""),
-    "aten::lerp": _contract(
-        "lerp", "Tensor", "Tensor_out",
-        preallocated=(("Tensor", "Tensor_out"),),
-    ),
-    "aten::lt": _contract(
-        "binary", "Tensor", "Scalar", "Tensor_out", "Scalar_out",
-        preallocated=(("Tensor", "Tensor_out"), ("Scalar", "Scalar_out")),
-    ),
-    "aten::minimum": _contract(
-        "binary", "", "out", preallocated=(("", "out"),),
-    ),
-    "aten::mul": _contract(
-        "binary", "Tensor", "Scalar", "out", "Scalar_out",
-        preallocated=(("Tensor", "out"), ("Scalar", "Scalar_out")),
-    ),
-    "aten::mul_": _contract("binary", "Tensor", "Scalar"),
-    "aten::scatter_add": _contract(
-        "scatter", "", "out", preallocated=(("", "out"),),
-    ),
-    "aten::scatter_add_": _contract("scatter", ""),
-    "aten::sub": _contract(
-        "binary", "Tensor", "Scalar", "out", "Scalar_out",
-        preallocated=(("Tensor", "out"), ("Scalar", "Scalar_out")),
-    ),
-    "aten::sub_": _contract("binary", "Tensor", "Scalar"),
-    "aten::zero_": _contract("zero", ""),
-})
+COMPILED_ATEN_CONTRACTS = MappingProxyType(
+    {
+        "aten::add": _contract(
+            "binary",
+            "Tensor",
+            "Scalar",
+            "out",
+            "Scalar_out",
+            preallocated=(("Tensor", "out"), ("Scalar", "Scalar_out")),
+        ),
+        "aten::add_": _contract("binary", "Tensor", "Scalar"),
+        "aten::copy_": _contract("copy", ""),
+        "aten::div": _contract(
+            "binary",
+            "Tensor",
+            "Scalar",
+            "out",
+            "Scalar_out",
+            preallocated=(("Tensor", "out"), ("Scalar", "Scalar_out")),
+        ),
+        "aten::div_": _contract("binary", "Tensor", "Scalar"),
+        "aten::fill_": _contract("fill", "Scalar"),
+        "aten::index_add_": _contract("scatter", ""),
+        "aten::lerp": _contract(
+            "lerp",
+            "Tensor",
+            "Tensor_out",
+            preallocated=(("Tensor", "Tensor_out"),),
+        ),
+        "aten::lt": _contract(
+            "binary",
+            "Tensor",
+            "Scalar",
+            "Tensor_out",
+            "Scalar_out",
+            preallocated=(("Tensor", "Tensor_out"), ("Scalar", "Scalar_out")),
+        ),
+        "aten::minimum": _contract(
+            "binary",
+            "",
+            "out",
+            preallocated=(("", "out"),),
+        ),
+        "aten::mul": _contract(
+            "binary",
+            "Tensor",
+            "Scalar",
+            "out",
+            "Scalar_out",
+            preallocated=(("Tensor", "out"), ("Scalar", "Scalar_out")),
+        ),
+        "aten::mul_": _contract("binary", "Tensor", "Scalar"),
+        "aten::scatter_add": _contract(
+            "scatter",
+            "",
+            "out",
+            preallocated=(("", "out"),),
+        ),
+        "aten::scatter_add_": _contract("scatter", ""),
+        "aten::sub": _contract(
+            "binary",
+            "Tensor",
+            "Scalar",
+            "out",
+            "Scalar_out",
+            preallocated=(("Tensor", "out"), ("Scalar", "Scalar_out")),
+        ),
+        "aten::sub_": _contract("binary", "Tensor", "Scalar"),
+        "aten::zero_": _contract("zero", ""),
+    }
+)
 COMPILED_ATEN = frozenset(
     (name, overload)
     for name, contract in COMPILED_ATEN_CONTRACTS.items()
     for overload in contract.overloads
 )
 
-COMPILED_ATEN_DTYPES = frozenset({
-    torch.bool, torch.float32, torch.float64, torch.int32, torch.int64,
-})
+COMPILED_ATEN_DTYPES = frozenset(
+    {
+        torch.bool,
+        torch.float32,
+        torch.float64,
+        torch.int32,
+        torch.int64,
+    }
+)
 
 
 def preallocated_replay_overload(function: Any) -> Any | None:
@@ -132,7 +187,9 @@ def _require_same_shape(name: str, *tensors: torch.Tensor) -> None:
 
 
 def _require_tensor_scalar_shape(
-    name: str, reference: torch.Tensor, scalar: torch.Tensor,
+    name: str,
+    reference: torch.Tensor,
+    scalar: torch.Tensor,
 ) -> None:
     """Reject singleton tensors whose broadcasting would increase rank."""
 
@@ -149,51 +206,38 @@ def _require_tensor_scalar_shape(
 
 def normalize_float32_scalar(name: str, value: Any) -> float:
     """Return the one canonical host representation used by all backends."""
-
-    if type(value) not in {int, float}:
-        _error(f"Compiled ATen {name} scalar must be an exact int or float")
-    try:
-        result = float(value)
-    except OverflowError:
-        _error(f"Compiled ATen {name} scalar is outside float32 range")
-    if not math.isfinite(result) or abs(result) > torch.finfo(torch.float32).max:
-        _error(
-            f"Compiled ATen {name} scalar must be finite and within float32 range"
-        )
-    encoded = torch.tensor(result, dtype=torch.float32).item()
-    if result != 0.0 and encoded == 0.0:
-        _error(f"Compiled ATen {name} scalar underflows float32 storage")
-    if type(value) is int and int(encoded) != value:
-        _error(
-            f"Compiled ATen {name} integer scalar cannot be represented "
-            "exactly in float32"
-        )
-    return result
+    return normalize_floating_scalar(name, value, torch.float32)
 
 
 def normalize_floating_scalar(
-    name: str, value: Any, dtype: torch.dtype,
+    name: str,
+    value: Any,
+    dtype: torch.dtype,
 ) -> float:
     """Normalize a scalar for a declared float32/float64 tensor contract."""
 
-    if dtype == torch.float32:
-        return normalize_float32_scalar(name, value)
-    if dtype != torch.float64:
+    if dtype not in {torch.float32, torch.float64}:
         _error(f"Compiled ATen {name} requires a floating tensor dtype")
+    precision = str(dtype).removeprefix("torch.")
     if type(value) not in {int, float}:
         _error(f"Compiled ATen {name} scalar must be an exact int or float")
     try:
         result = float(value)
     except OverflowError:
-        _error(f"Compiled ATen {name} scalar is outside float64 range")
-    if not math.isfinite(result) or abs(result) > torch.finfo(torch.float64).max:
+        _error(f"Compiled ATen {name} scalar is outside {precision} range")
+    if not math.isfinite(result) or abs(result) > torch.finfo(dtype).max:
         _error(
-            f"Compiled ATen {name} scalar must be finite and within float64 range"
+            f"Compiled ATen {name} scalar must be finite and within {precision} range"
         )
-    if type(value) is int and int(result) != value:
+    encoded = (
+        torch.tensor(result, dtype=dtype).item() if dtype == torch.float32 else result
+    )
+    if result != 0.0 and encoded == 0.0:
+        _error(f"Compiled ATen {name} scalar underflows {precision} storage")
+    if type(value) is int and int(encoded) != value:
         _error(
             f"Compiled ATen {name} integer scalar cannot be represented "
-            "exactly in float64"
+            f"exactly in {precision}"
         )
     return result
 
@@ -228,7 +272,9 @@ def _validate_copy(args: tuple[Any, ...]) -> None:
 
 
 def _validate_lerp(
-    args: tuple[Any, ...], kwargs: dict[str, Any], result: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
 ) -> None:
     start, end, weight = args[:3]
     destination = kwargs.get("out", result)
@@ -247,7 +293,10 @@ def _validate_lerp(
 
 
 def _validate_scatter(
-    name: str, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any,
+    name: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
 ) -> None:
     destination, dim, index, source = args[:4]
     if dim != 0 or any(value.ndim != 1 for value in (destination, index, source)):
@@ -268,8 +317,11 @@ def _validate_scatter(
 
 
 def _validate_binary(
-    name: str, schema_name: str, args: tuple[Any, ...],
-    kwargs: dict[str, Any], result: Any,
+    name: str,
+    schema_name: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
 ) -> None:
     left, right = args[:2]
     destination = left if schema_name.endswith("_") else result
@@ -294,14 +346,18 @@ def _validate_binary(
         normalize_floating_scalar(f"{name} alpha", alpha, left.dtype)
     if name == "div":
         rounding_mode = kwargs.get(
-            "rounding_mode", args[2] if len(args) > 2 else None,
+            "rounding_mode",
+            args[2] if len(args) > 2 else None,
         )
         if rounding_mode is not None:
             _error("Compiled ATen div does not support rounding_mode")
 
 
 def validate_compiled_aten(
-    function: Any, args: tuple[Any, ...], kwargs: dict[str, Any], result: Any,
+    function: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
 ) -> None:
     """Validate the backend-neutral value contract for one recorded node."""
 
@@ -317,7 +373,10 @@ def validate_compiled_aten(
         _validate_lerp(args, kwargs, result)
     elif contract.semantics == "scatter":
         _validate_scatter(
-            schema_name.removeprefix("aten::"), args, kwargs, result,
+            schema_name.removeprefix("aten::"),
+            args,
+            kwargs,
+            result,
         )
     elif contract.semantics == "zero":
         destination = args[0]
@@ -331,9 +390,7 @@ def validate_compiled_aten(
     elif contract.semantics == "binary":
         _validate_binary(name, schema_name, args, kwargs, result)
     else:
-        raise RuntimeError(
-            f"unhandled compiled ATen semantics {contract.semantics!r}"
-        )
+        raise RuntimeError(f"unhandled compiled ATen semantics {contract.semantics!r}")
 
 
 def supports_aten(execution: Any, name: str, overload: str) -> bool:

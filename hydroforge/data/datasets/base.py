@@ -5,11 +5,13 @@
 #
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from collections.abc import Iterable, Mapping
-from typing import Any, ClassVar, Dict, Iterator, Literal, Optional, Self, Union
+from typing import Any, ClassVar, Literal, Self
 
 import cftime
 import numpy as np
@@ -22,32 +24,76 @@ from pydantic import (
     model_validator,
 )
 
-from hydroforge.contracts.validation import HydroForgeModel, _immutable_dict
 from hydroforge.contracts.errors import ResourceCleanupError
-from hydroforge.data.numeric import (
-    canonical_ids,
-    canonical_floating_array,
-    immutable_array,
-    positive_finite_float64,
-)
 from hydroforge.contracts.temporal import (
-    UpsamplingMethod,
-    _DatasetTemporalDomain,
     DateLike,
     SimulationSchedule,
+    UpsamplingMethod,
+    _DatasetTemporalDomain,
     _require_date,
+    _timedelta_quotient_trusted,
     canonical_calendar,
     require_calendar,
     timedelta_microseconds,
-    _timedelta_quotient_trusted,
 )
+from hydroforge.contracts.validation import HydroForgeModel, _immutable_dict
 from hydroforge.data.datasets.chunking import SourceChunk, SourceChunkPlan
+from hydroforge.data.numeric import (
+    canonical_floating_array,
+    canonical_ids,
+    immutable_array,
+)
+from hydroforge.data.numeric import (
+    positive_finite_float64 as positive_finite_real,  # noqa: F401 - storage adapter scalar contract
+)
 from hydroforge.kernels.devices import devices_match
-
 
 _DatasetOperand = Any
 _DATASET_INDEX_LENGTH_CONTEXT = "hydroforge_dataset_index_length"
 _FORCING_SHARD_CONTEXT = "hydroforge_forcing_shard_context"
+_DEFERRED_FORCING_CHECKS: ContextVar[dict | None] = ContextVar(
+    "hydroforge_deferred_forcing_checks",
+    default=None,
+)
+
+
+def _spatial_selection_refs(datasets) -> tuple[object, ...]:
+    references = []
+    for dataset in datasets:
+        dataset._refresh_spatial_selection()
+        references.extend((dataset.local_indices, dataset.desired_catchment_ids))
+    return tuple(references)
+
+
+def _check_forcing_finite(checks_by_device) -> None:
+    for values in checks_by_device.values():
+        checks = [torch.isfinite(value).all() for _label, value in values]
+        flags = torch.stack(checks) if len(checks) > 1 else checks[0].reshape(1)
+        if not bool(flags.all().item()):
+            invalid = (~flags).nonzero().flatten().cpu().tolist()
+            label = values[invalid[0]][0]
+            raise ValueError(f"{label} contains non-finite values")
+
+
+@contextmanager
+def _batch_forcing_validation():
+    """Aggregate standard child validators for exactly one public request."""
+
+    if _DEFERRED_FORCING_CHECKS.get() is not None:
+        yield
+        return
+    checks: dict[torch.device, list[tuple[str, torch.Tensor]]] = {}
+    token = _DEFERRED_FORCING_CHECKS.set(checks)
+    try:
+        try:
+            yield
+        except Exception:
+            _check_forcing_finite(checks)
+            raise
+        else:
+            _check_forcing_finite(checks)
+    finally:
+        _DEFERRED_FORCING_CHECKS.reset(token)
 
 
 class _DatasetIndexQuery(HydroForgeModel):
@@ -118,7 +164,14 @@ class _ForcingShardRequest(HydroForgeModel):
         if device is not None and not isinstance(device, torch.device):
             raise ValueError("forcing shard device context is invalid")
 
-        def canonical(value: Any, *, label: str) -> Any:
+        finite_checks: dict[torch.device, list[tuple[str, torch.Tensor]]] = {}
+
+        def canonical(
+            value: Any,
+            checks_by_device: dict[torch.device, list[tuple[str, torch.Tensor]]],
+            *,
+            label: str,
+        ) -> Any:
             if isinstance(value, Mapping):
                 if not value:
                     raise ValueError(f"{label} mapping must not be empty")
@@ -127,7 +180,7 @@ class _ForcingShardRequest(HydroForgeModel):
                         f"{label} mapping keys must be non-empty exact strings"
                     )
                 return {
-                    name: canonical(block, label=f"{label}.{name}")
+                    name: canonical(block, checks_by_device, label=f"{label}.{name}")
                     for name, block in value.items()
                 }
             if isinstance(value, (tuple, list)):
@@ -136,7 +189,7 @@ class _ForcingShardRequest(HydroForgeModel):
                 if not value:
                     raise ValueError(f"{label} sequence must not be empty")
                 return tuple(
-                    canonical(block, label=f"{label}[{index}]")
+                    canonical(block, checks_by_device, label=f"{label}[{index}]")
                     for index, block in enumerate(value)
                 )
             if not isinstance(value, torch.Tensor):
@@ -152,21 +205,24 @@ class _ForcingShardRequest(HydroForgeModel):
                     f"{label} has {value.shape[-1]} columns; expected {columns}"
                 )
             if dtype is not None and value.dtype != dtype:
-                raise ValueError(
-                    f"{label} has dtype {value.dtype}; expected {dtype}"
-                )
+                raise ValueError(f"{label} has dtype {value.dtype}; expected {dtype}")
             if device is not None and not devices_match(value.device, device):
                 raise ValueError(
                     f"{label} is on device {value.device}; expected {device}"
                 )
-            if (
-                (value.is_floating_point() or value.is_complex())
-                and not bool(torch.isfinite(value).all().item())
-            ):
-                raise ValueError(f"{label} contains non-finite values")
+            if value.is_floating_point() or value.is_complex():
+                checks_by_device.setdefault(value.device, []).append((label, value))
             return value
 
-        object.__setattr__(self, "data", canonical(self.data, label="forcing"))
+        object.__setattr__(
+            self, "data", canonical(self.data, finite_checks, label="forcing")
+        )
+        deferred = _DEFERRED_FORCING_CHECKS.get()
+        if deferred is None:
+            _check_forcing_finite(finite_checks)
+        else:
+            for device, values in finite_checks.items():
+                deferred.setdefault(device, []).extend(values)
         return self
 
 
@@ -193,55 +249,36 @@ def _validated_forcing_shard(
     ).data
 
 
+def _as_nan_array(data: np.ndarray) -> np.ndarray:
+    """Convert NetCDF masked values to NaN while preserving normal values."""
+    if isinstance(data, np.ma.MaskedArray):
+        mask = np.ma.getmaskarray(data)
+        if np.any(mask):
+            if np.issubdtype(data.dtype, np.floating):
+                return np.asarray(data.filled(np.nan))
+            return np.asarray(data.astype(np.float64).filled(np.nan))
+        return np.asarray(data.data)
+    return np.asarray(data)
+
+
 class _SourceChunkPayload(HydroForgeModel):
     """Canonical external arrays returned by one storage read."""
 
     data: Any
-    expected_rows: int = Field(strict=True, ge=1, exclude=True)
-    clip_negative: bool = Field(strict=True, exclude=True)
+    expected_rows: int = Field(ge=1, exclude=True)
+    clip_negative: bool = Field(exclude=True)
 
     @model_validator(mode="after")
     def _canonicalize(self) -> Self:
-        def canonical(value: Any, *, label: str) -> Any:
-            if isinstance(value, Mapping):
-                if not value:
-                    raise ValueError(f"{label} mapping must not be empty")
-                if any(type(name) is not str or not name for name in value):
-                    raise ValueError(f"{label} keys must be non-empty exact strings")
-                return {
-                    name: canonical(block, label=f"{label}.{name}")
-                    for name, block in value.items()
-                }
-            if np.ma.isMaskedArray(value):
-                mask = np.ma.getmaskarray(value)
-                if np.any(mask):
-                    value = (
-                        value.filled(np.nan)
-                        if np.issubdtype(value.dtype, np.floating)
-                        else value.astype(np.float64).filled(np.nan)
-                    )
-                else:
-                    value = value.data
-            array = np.asarray(value)
-            if array.ndim < 1:
-                raise ValueError(f"{label} must include a time axis")
-            if array.shape[0] != self.expected_rows:
-                raise ValueError(
-                    f"{label} has {array.shape[0]} rows; expected {self.expected_rows}"
-                )
-            if array.dtype.kind not in {"f", "i", "u"}:
-                raise ValueError(f"{label} must contain real numeric values")
-            if np.issubdtype(array.dtype, np.inexact) and not np.isfinite(array).all():
-                raise ValueError(f"{label} contains missing or non-finite values")
-            owned = np.array(array, order="C", copy=True)
-            if self.clip_negative:
-                np.maximum(owned, 0, out=owned)
-            return owned
-
         object.__setattr__(
             self,
             "data",
-            canonical(self.data, label="source chunk"),
+            _trusted_source_chunk_payload(
+                self.data,
+                expected_rows=self.expected_rows,
+                clip_negative=self.clip_negative,
+                copy_storage=True,
+            ),
         )
         return self
 
@@ -251,35 +288,29 @@ def _trusted_source_chunk_payload(
     *,
     expected_rows: int,
     clip_negative: bool,
+    copy_storage: bool = False,
 ) -> Any:
-    """Validate one storage-owned result without an unconditional copy."""
+    """Normalize leaf arrays, copying storage returned by extension readers."""
 
     def canonical(value: Any, *, label: str) -> Any:
         if isinstance(value, Mapping):
+            if copy_storage:
+                if not value:
+                    raise ValueError(f"{label} mapping must not be empty")
+                if any(type(name) is not str or not name for name in value):
+                    raise ValueError(f"{label} keys must be non-empty exact strings")
             return {
                 name: canonical(block, label=f"{label}.{name}")
                 for name, block in value.items()
             }
-        if np.ma.isMaskedArray(value):
-            mask = np.ma.getmaskarray(value)
-            if np.any(mask):
-                value = (
-                    value.filled(np.nan)
-                    if np.issubdtype(value.dtype, np.floating)
-                    else value.astype(np.float64).filled(np.nan)
-                )
-            else:
-                value = value.data
-        array = np.asarray(value)
+        array = _as_nan_array(value)
         if array.ndim < 1 or array.shape[0] != expected_rows:
-            raise ValueError(
-                f"{label} must have {expected_rows} rows on its time axis"
-            )
+            raise ValueError(f"{label} must have {expected_rows} rows on its time axis")
         if array.dtype.kind not in {"f", "i", "u"}:
             raise ValueError(f"{label} must contain real numeric values")
         if np.issubdtype(array.dtype, np.inexact) and not np.isfinite(array).all():
             raise ValueError(f"{label} contains missing or non-finite values")
-        if not array.flags.c_contiguous or not array.flags.writeable:
+        if copy_storage or not array.flags.c_contiguous or not array.flags.writeable:
             array = np.array(array, order="C", copy=True)
         if clip_negative:
             np.maximum(array, 0, out=array)
@@ -299,18 +330,22 @@ class _SourceChunkReadRequest(HydroForgeModel):
     """Bind one public chunk identity to the Dataset that owns its plan."""
 
     chunk: SourceChunk
-    temporal_domain: _DatasetTemporalDomain = Field(exclude=True)
+    chunk_plan: SourceChunkPlan = Field(exclude=True)
 
     @model_validator(mode="after")
     def _validate_owner(self) -> Self:
-        if self.chunk.temporal_domain != self.temporal_domain:
+        if self.chunk.temporal_domain != self.chunk_plan.temporal_domain:
             raise ValueError("source chunk belongs to a different Dataset timeline")
+        if self.chunk.index >= len(
+            self.chunk_plan
+        ) or self.chunk != self.chunk_plan._at_trusted(self.chunk.index):
+            raise ValueError("source chunk does not match the Dataset chunk plan")
         return self
 
 
 @dataclass(frozen=True, slots=True)
 class _SourceFileIdentity:
-    """External file identity captured after Dataset schema validation."""
+    """External file identity captured before Dataset schema inspection."""
 
     device: int
     inode: int
@@ -338,16 +373,6 @@ class _SourceFileIdentity:
             raise RuntimeError(
                 f"Dataset source file {str(path)!r} changed after validation"
             )
-
-
-def positive_finite_real(
-    value: int | float | np.integer | np.floating,
-    *,
-    label: str,
-) -> float:
-    """Return the canonical positive float64 dataset scalar."""
-
-    return positive_finite_float64(value, label=label)
 
 
 def _close_dataset_tree(root: object, *, scope: str) -> None:
@@ -415,18 +440,19 @@ class AbstractDataset(HydroForgeModel, ABC):
 
     supports_time_aggregation: ClassVar[bool] = False
     precompressed_source: ClassVar[bool] = False
+    reusable_expression_reads: ClassVar[bool] = False
 
     start_date: DateLike
     end_date: DateLike
     time_interval: timedelta
     model_step: timedelta
     calendar: str | None = None
-    spin_up_cycles: int = Field(default=0, strict=True, ge=0)
+    spin_up_cycles: int = Field(default=0, ge=0)
     spin_up_start_date: DateLike | None = None
     spin_up_end_date: DateLike | None = None
     out_dtype: Literal["float32", "float64"] = "float32"
-    chunk_len: int = Field(default=1, strict=True, ge=1)
-    clip_negative: bool = Field(default=False, strict=True)
+    chunk_len: int = Field(default=1, ge=1)
+    clip_negative: bool = False
     upsampling: UpsamplingMethod | None = None
 
     local_indices: np.ndarray | None = Field(
@@ -459,9 +485,7 @@ class AbstractDataset(HydroForgeModel, ABC):
             spin_up_start_date=self.spin_up_start_date,
             spin_up_end_date=self.spin_up_end_date,
         )
-        self._calendar_from_storage_allowed = (
-            temporal_domain.calendar_defaulted
-        )
+        self._calendar_from_storage_allowed = temporal_domain.calendar_defaulted
         self._install_temporal_domain(temporal_domain)
         return self
 
@@ -574,9 +598,7 @@ class AbstractDataset(HydroForgeModel, ABC):
         if target_ids is None:
             return None
         if np.ma.isMaskedArray(target_ids):
-            raise ValueError(
-                "dataset desired_catchment_ids must not be a masked array"
-            )
+            raise ValueError("dataset desired_catchment_ids must not be a masked array")
         owned_ids = canonical_ids(
             target_ids,
             label="dataset desired_catchment_ids",
@@ -621,6 +643,30 @@ class AbstractDataset(HydroForgeModel, ABC):
             "upsampling": self.upsampling,
         }
 
+    def _refresh_spatial_selection(self) -> None:
+        """Validate mutable dependencies before consuming a composite selection."""
+
+    def _inherit_spatial_selection(self, reference, *, validate: bool) -> None:
+        selection = {
+            name: getattr(reference, name)
+            for name in ("local_indices", "desired_catchment_ids")
+        }
+        if validate:
+            for name, expected in selection.items():
+                current = getattr(self, name)
+                if current is expected:
+                    continue
+                if (
+                    current is None
+                    or expected is None
+                    or not np.array_equal(current, expected)
+                ):
+                    raise ValueError(
+                        f"composite spatial selection {name} must match its reference"
+                    )
+        for name, value in selection.items():
+            object.__setattr__(self, name, value)
+
     @property
     def _main_start_time(self):
         """Physical start of the main source support exposed to drivers."""
@@ -660,7 +706,7 @@ class AbstractDataset(HydroForgeModel, ABC):
         return self._simulation_schedule._reuse_count
 
     @staticmethod
-    def _validate_time_aggregation(method: Optional[str]) -> Optional[str]:
+    def _validate_time_aggregation(method: str | None) -> str | None:
         if method is None:
             return None
         if type(method) is not str:
@@ -692,10 +738,12 @@ class AbstractDataset(HydroForgeModel, ABC):
                     "time_aggregation names must be non-empty strings; "
                     f"got {invalid_names!r}"
                 )
-            return _immutable_dict({
-                name: cls._validate_time_aggregation(method)
-                for name, method in time_aggregation.items()
-            })
+            return _immutable_dict(
+                {
+                    name: cls._validate_time_aggregation(method)
+                    for name, method in time_aggregation.items()
+                }
+            )
         raise ValueError("time_aggregation must be None, a string, or a dict")
 
     def _get_time_aggregation_factor(self, source_time_interval: timedelta) -> int:
@@ -807,10 +855,10 @@ class AbstractDataset(HydroForgeModel, ABC):
 
     def _require_calendar_datetime(
         self,
-        value: Union[datetime, cftime.datetime],
+        value: datetime | cftime.datetime,
         *,
         label: str,
-    ) -> Union[datetime, cftime.datetime]:
+    ) -> datetime | cftime.datetime:
         """Validate one storage timestamp without changing its calendar."""
 
         _require_date(value, label=label)
@@ -821,18 +869,6 @@ class AbstractDataset(HydroForgeModel, ABC):
                 "dataset start_date"
             )
         return value
-
-    @staticmethod
-    def _as_nan_array(data: np.ndarray) -> np.ndarray:
-        """Convert NetCDF masked values to NaN while preserving normal values."""
-        if isinstance(data, np.ma.MaskedArray):
-            mask = np.ma.getmaskarray(data)
-            if np.any(mask):
-                if np.issubdtype(data.dtype, np.floating):
-                    return np.asarray(data.filled(np.nan))
-                return np.asarray(data.astype(np.float64).filled(np.nan))
-            return np.asarray(data.data)
-        return np.asarray(data)
 
     def _apply_upsampling_policy(self, data: Any) -> Any:
         if self.upsampling != "distribute":
@@ -880,19 +916,19 @@ class AbstractDataset(HydroForgeModel, ABC):
     def read_chunk(
         self,
         chunk: SourceChunk,
-    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    ) -> np.ndarray | dict[str, np.ndarray]:
         """Read exactly one immutable request from this dataset's source plan."""
 
         request = _SourceChunkReadRequest(
             chunk=chunk,
-            temporal_domain=self._temporal_domain,
+            chunk_plan=self._chunk_plan,
         )
         return self._read_chunk_trusted(request.chunk)
 
     def _read_chunk_trusted(
         self,
         chunk: SourceChunk,
-    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    ) -> np.ndarray | dict[str, np.ndarray]:
         """Read one framework-produced chunk without revalidating identity."""
 
         return self._accept_read_chunk(
@@ -909,25 +945,26 @@ class AbstractDataset(HydroForgeModel, ABC):
     def get_chunk(
         self,
         chunk: SourceChunk,
-    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    ) -> np.ndarray | dict[str, np.ndarray]:
         """Read and normalize one exact source request for consumption."""
 
         request = _SourceChunkReadRequest(
             chunk=chunk,
-            temporal_domain=self._temporal_domain,
+            chunk_plan=self._chunk_plan,
         )
         return self._get_chunk_trusted(request.chunk)
 
     def _get_chunk_trusted(
         self,
         chunk: SourceChunk,
-    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    ) -> np.ndarray | dict[str, np.ndarray]:
         """Prepare one framework-produced chunk without revalidation."""
 
-        compressed = self.local_indices is not None or self.precompressed_source
         data = self._read_chunk_trusted(chunk)
         integer_fields = getattr(
-            type(self), "integer_output_fields", frozenset(),
+            type(self),
+            "integer_output_fields",
+            frozenset(),
         )
         if isinstance(data, dict):
             missing_integer_fields = integer_fields.difference(data)
@@ -940,7 +977,7 @@ class AbstractDataset(HydroForgeModel, ABC):
                 name: (
                     self._prepare_integer_output_array(block, label=name)
                     if name in integer_fields
-                    else self._prepare_chunk_array(block, compressed)
+                    else self._prepare_chunk_array(block)
                 )
                 for name, block in data.items()
             }
@@ -948,7 +985,7 @@ class AbstractDataset(HydroForgeModel, ABC):
             raise ValueError(
                 "integer_output_fields require source chunks to be mappings"
             )
-        return self._prepare_chunk_array(data, compressed)
+        return self._prepare_chunk_array(data)
 
     @staticmethod
     def _prepare_integer_output_array(
@@ -965,13 +1002,11 @@ class AbstractDataset(HydroForgeModel, ABC):
         array = np.asarray(data)
         if array.ndim < 1:
             raise ValueError(
-                f"prepared integer forcing field {label!r} must include a "
-                "time axis"
+                f"prepared integer forcing field {label!r} must include a time axis"
             )
         if array.dtype.kind not in {"i", "u"}:
             raise ValueError(
-                f"prepared integer forcing field {label!r} must contain "
-                "integers"
+                f"prepared integer forcing field {label!r} must contain integers"
             )
         if (
             array.dtype.kind == "u"
@@ -988,7 +1023,7 @@ class AbstractDataset(HydroForgeModel, ABC):
     def _read_chunk(
         self,
         chunk: SourceChunk,
-    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    ) -> np.ndarray | dict[str, np.ndarray]:
         """Interpret one validated temporal request through source storage.
 
         Implementations interpret the same temporal request through their own
@@ -1037,7 +1072,7 @@ class AbstractDataset(HydroForgeModel, ABC):
             right=right,
         )
 
-    def __getitem__(self, idx: int) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    def __getitem__(self, idx: int) -> np.ndarray | dict[str, np.ndarray]:
         """
         Fetch one chunk (T <= chunk_len) starting at chunk index `idx`.
 
@@ -1051,9 +1086,7 @@ class AbstractDataset(HydroForgeModel, ABC):
     def _prepare_chunk_array(
         self,
         data: np.ndarray,
-        compressed: bool,
     ) -> np.ndarray:
-        del compressed
         data = self._apply_upsampling_policy(data)
         return self._finalize_output_data(
             data,
@@ -1104,7 +1137,7 @@ class SourceDataset(AbstractDataset, ABC):
         cls.precompressed_source = declaration.precompressed_source
         cls.integer_output_fields = declaration.integer_output_fields
 
-    _source_file_identities: Mapping[Path, _SourceFileIdentity] = PrivateAttr(
+    _source_file_identities: dict[Path, _SourceFileIdentity] = PrivateAttr(
         default_factory=dict,
     )
 
@@ -1142,15 +1175,26 @@ class SourceDataset(AbstractDataset, ABC):
     def _canonical_source_path(path: str | Path) -> Path:
         return Path(path).absolute()
 
-    def _record_source_files(self, paths: Iterable[str | Path]) -> None:
-        """Freeze every schema-inspected source file identity."""
+    @contextmanager
+    def _inspect_source_file(self, path: str | Path) -> Iterator[Path]:
+        """Bind schema reads to the same file identity used by runtime reads."""
 
-        canonical = tuple(
-            dict.fromkeys(self._canonical_source_path(path) for path in paths)
-        )
-        self._source_file_identities = {
-            path: _SourceFileIdentity.capture(path) for path in canonical
-        }
+        canonical = self._canonical_source_path(path)
+        identity = self._source_file_identities.get(canonical)
+        if identity is None:
+            identity = _SourceFileIdentity.capture(canonical)
+            self._source_file_identities[canonical] = identity
+        else:
+            identity.verify(canonical)
+        yield canonical
+        identity.verify(canonical)
+
+    def _record_source_files(self, paths: Iterable[str | Path]) -> None:
+        """Finalize inspected identities without recapturing validated files."""
+
+        for path in paths:
+            with self._inspect_source_file(path):
+                pass
 
     def _checked_source_path(self, path: str | Path) -> Path:
         """Verify external identity immediately before one runtime read."""

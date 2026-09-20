@@ -8,8 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-
-METAL_GRID_MAX_EXTENT = 2 ** 32 - 1
+METAL_GRID_MAX_EXTENT = 2**32 - 1
 
 
 def validate_metal_launch_extent(name: str, extent: Any) -> int:
@@ -23,9 +22,7 @@ def validate_metal_launch_extent(name: str, extent: Any) -> int:
     if extent < 0:
         raise ValueError(f"{name} Metal launch extent must be non-negative")
     if extent > METAL_GRID_MAX_EXTENT:
-        raise OverflowError(
-            f"{name} Metal launch extent exceeds the uint32 grid range"
-        )
+        raise OverflowError(f"{name} Metal launch extent exceeds the uint32 grid range")
     return extent
 
 

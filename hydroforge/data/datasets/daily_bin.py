@@ -4,34 +4,30 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
-from collections.abc import Mapping
-from typing import Callable, Literal, Optional, Self, Tuple
+from typing import ClassVar, Literal, Self
 
 import cftime
 import numpy as np
 from pydantic import PrivateAttr, field_validator, model_validator
 
+from hydroforge.contracts.temporal import (
+    DateLike,
+    _timedelta_quotient_trusted,
+)
+from hydroforge.contracts.validation import _immutable_dict
 from hydroforge.data.datasets.base import (
-    _TrustedSourceChunk,
     _trusted_source_chunk_payload,
+    _TrustedSourceChunk,
     positive_finite_real,
 )
 from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.gridded import GriddedDataset
 from hydroforge.data.netcdf import daily_time_to_key, single_file_key
-from hydroforge.contracts.temporal import (
-    DateLike, _timedelta_quotient_trusted,
-)
-from hydroforge.contracts.validation import _immutable_dict
 
-
-FileStartDate = (
-    DateLike
-    | Mapping[str, DateLike]
-    | Callable[[str], DateLike]
-)
+FileStartDate = DateLike | Mapping[str, DateLike] | Callable[[str], DateLike]
 
 
 class DailyBinDataset(GriddedDataset):
@@ -49,6 +45,8 @@ class DailyBinDataset(GriddedDataset):
     are mapped to their absolute offset from that origin; they are never
     renumbered from zero merely because a run requests a subset of dates.
     """
+
+    reusable_expression_reads: ClassVar[bool] = True
 
     base_dir: str | Path
     shape: tuple[int, int]
@@ -72,8 +70,6 @@ class DailyBinDataset(GriddedDataset):
     @field_validator("shape")
     @classmethod
     def _validate_shape(cls, shape: tuple[int, int]) -> tuple[int, int]:
-        if len(shape) != 2:
-            raise ValueError("shape must contain exactly two dimensions")
         if any(type(extent) is not int or extent < 1 for extent in shape):
             raise ValueError("shape values must be exact positive ints")
         return shape
@@ -103,13 +99,6 @@ class DailyBinDataset(GriddedDataset):
         if self.chunk_len != 1:
             raise ValueError("DailyBinDataset chunk_len must be 1")
         configured = self.file_start_date
-        if configured is not None and not (
-            isinstance(configured, (datetime, cftime.datetime, Mapping))
-            or callable(configured)
-        ):
-            raise ValueError(
-                "file_start_date must be a datetime, mapping, callable, or None"
-            )
         if isinstance(configured, Mapping):
             invalid = {
                 key: type(value).__name__
@@ -136,7 +125,8 @@ class DailyBinDataset(GriddedDataset):
     def _inspect_binary_storage(self):
         self._storage_dtype = np.dtype(self.bin_dtype)
         self._validate_local_index_extent(
-            self.shape[0] * self.shape[1], label="binary grid",
+            self.shape[0] * self.shape[1],
+            label="binary grid",
         )
         self._build_file_mapping()
         self._inspect_required_files()
@@ -153,13 +143,9 @@ class DailyBinDataset(GriddedDataset):
         by_key: dict[str, list] = {}
         for dt in dates:
             by_key.setdefault(self._storage_key(dt), []).append(dt)
-        daily_layout = (
-            all(
-                len(key_dates) == 1
-                and key == daily_time_to_key(key_dates[0])
-                for key, key_dates in by_key.items()
-            )
-            and len(by_key) == len(dates)
+        daily_layout = all(
+            len(key_dates) == 1 and key == daily_time_to_key(key_dates[0])
+            for key, key_dates in by_key.items()
         )
         self._daily_layout = daily_layout
         # Only the canonical one-file-per-day layout has an implicit frame
@@ -167,13 +153,11 @@ class DailyBinDataset(GriddedDataset):
         # constant file) needs an explicit origin.
         if daily_layout and self.file_start_date is not None:
             raise ValueError(
-                "file_start_date must be None for one-file-per-day binary "
-                "layouts"
+                "file_start_date must be None for one-file-per-day binary layouts"
             )
         if not daily_layout and self.file_start_date is None:
             raise ValueError(
-                "file_start_date is required for grouped or custom binary "
-                "file layouts"
+                "file_start_date is required for grouped or custom binary file layouts"
             )
 
         locations: dict[DateLike, tuple[str, int]] = {}
@@ -188,9 +172,7 @@ class DailyBinDataset(GriddedDataset):
                 frame_idx = _timedelta_quotient_trusted(
                     dt - origin,
                     self.time_interval,
-                    duration_label=(
-                        f"file frame offset for key {key!r}"
-                    ),
+                    duration_label=(f"file frame offset for key {key!r}"),
                     interval_label="daily binary time_interval",
                 )
                 if frame_idx < 0:
@@ -204,9 +186,7 @@ class DailyBinDataset(GriddedDataset):
     def _storage_key(self, timestamp: DateLike) -> str:
         key = self.time_to_key(timestamp)
         if type(key) is not str:
-            raise ValueError(
-                "DailyBinDataset time_to_key must return an exact string"
-            )
+            raise ValueError("DailyBinDataset time_to_key must return an exact string")
         previous = self._key_cache.setdefault(timestamp, key)
         if previous != key:
             raise ValueError(
@@ -240,32 +220,39 @@ class DailyBinDataset(GriddedDataset):
 
     def _inspect_required_files(self):
         """Validate that all required files exist and match expected size."""
-        required_paths = set()
-        for key, _frame_idx in self._dt_to_loc.values():
+        required_frames: dict[Path, int] = {}
+        for key, frame_idx in self._dt_to_loc.values():
             path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
-            required_paths.add(path)
+            required_frames[path] = max(required_frames.get(path, 0), frame_idx + 1)
         # Validate file sizes are consistent with shape
         ny, nx = self.shape
         frame_bytes = ny * nx * self._storage_dtype.itemsize
-        for fp in required_paths:
-            file_bytes = Path(fp).stat().st_size
-            if file_bytes % frame_bytes != 0:
-                raise ValueError(
-                    f"File size mismatch: {fp} is {file_bytes} bytes, "
-                    f"but shape={self.shape} dtype={self.bin_dtype} expects "
-                    f"multiples of {frame_bytes} bytes "
-                    f"(got {file_bytes / frame_bytes:.4f} frames). "
-                    f"Check the 'shape' parameter."
-                )
-            observed_frames = file_bytes // frame_bytes
-            if self._daily_layout and observed_frames != 1:
-                raise ValueError(
-                    f"Daily binary file {fp} must contain exactly one frame; "
-                    f"found {observed_frames}"
-                )
-        self._record_source_files(required_paths)
+        for path, minimum_frames in required_frames.items():
+            with self._inspect_source_file(path):
+                file_bytes = path.stat().st_size
+                if file_bytes % frame_bytes != 0:
+                    raise ValueError(
+                        f"File size mismatch: {path} is {file_bytes} bytes, "
+                        f"but shape={self.shape} dtype={self.bin_dtype} expects "
+                        f"multiples of {frame_bytes} bytes "
+                        f"(got {file_bytes / frame_bytes:.4f} frames). "
+                        f"Check the 'shape' parameter."
+                    )
+                observed_frames = file_bytes // frame_bytes
+                if self._daily_layout and observed_frames != 1:
+                    raise ValueError(
+                        f"Daily binary file {path} must contain exactly one frame; "
+                        f"found {observed_frames}"
+                    )
+                if observed_frames < minimum_frames:
+                    raise ValueError(
+                        f"Binary file {path} contains {observed_frames} frames, "
+                        f"but the requested absolute frame offsets require "
+                        f"at least {minimum_frames} frames"
+                    )
+        self._record_source_files(required_frames)
 
-    def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
+    def get_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
         """Return (lon, lat) coordinate arrays.
 
         Note: shape is (ny, nx) = (lat, lon), so shape[0] is lat size, shape[1] is lon size.
@@ -301,32 +288,22 @@ class DailyBinDataset(GriddedDataset):
 
         Spatial convention: (Y, X) = (lat, lon), C-order flatten (lon varies fastest)
         """
-        key, frame_idx = self._dt_to_loc[chunk.source_start]
-        filename = f"{self.prefix}{key}{self.suffix}"
-        file_path = self._checked_source_path(
-            Path(self.base_dir) / filename,
-        )
-
         ny, nx = self.shape
         frame_size = ny * nx
-        element_size = self._storage_dtype.itemsize
-
-        data = np.fromfile(
-            file_path, dtype=self._storage_dtype,
-            count=frame_size, offset=frame_idx * frame_size * element_size,
-        )
-        self._verify_source_path(file_path)
+        data = self._read_frame(chunk.source_start)
         data = _trusted_source_chunk_payload(
             data.reshape(1, ny, nx),
             expected_rows=1,
             clip_negative=self.clip_negative,
         )
         data = self._canonical_calculation_data(
-            data, label="daily binary dataset input",
+            data,
+            label="daily binary dataset input",
         )
         np.divide(data, self.unit_factor, out=data)
         data = self._finalize_output_data(
-            data, label="daily binary dataset output",
+            data,
+            label="daily binary dataset output",
         )
 
         if self.local_indices is not None:
@@ -335,8 +312,9 @@ class DailyBinDataset(GriddedDataset):
             result = data
         return _TrustedSourceChunk(result)
 
-    def _get_first_frame_nan_mask(self) -> Optional[np.ndarray]:
-        key, frame_idx = self._dt_to_loc[self.start_date]
+    def _read_frame(self, timestamp: DateLike) -> np.ndarray:
+        """Read one frame under the declared file identity."""
+        key, frame_idx = self._dt_to_loc[timestamp]
         file_path = self._checked_source_path(
             Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
         )
@@ -352,15 +330,11 @@ class DailyBinDataset(GriddedDataset):
         )
         self._verify_source_path(file_path)
         data = data.reshape(ny, nx)
-        if not np.issubdtype(data.dtype, np.floating):
-            return np.zeros((ny, nx), dtype=bool)
+        return data
+
+    def _get_first_frame_nan_mask(self) -> np.ndarray | None:
+        data = self._read_frame(self.start_date)
         return np.isnan(data)
 
     def close(self):
         pass
-
-    def __len__(self):
-        """
-        Returns the total number of samples in the dataset based on the time range.
-        """
-        return super().__len__()

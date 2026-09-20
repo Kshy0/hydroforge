@@ -2,23 +2,50 @@
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, TypeAlias
 
+from pydantic import AfterValidator
+
+
+def _validate_identifier(value: str) -> str:
+    if not value.isidentifier():
+        raise ValueError("must be a valid identifier")
+    return value
+
+
+def _validate_dotted_path(value: str) -> str:
+    if any(not name.isidentifier() for name in value.split(".")):
+        raise ValueError("must be a dotted attribute path")
+    return value
+
+
+Identifier: TypeAlias = Annotated[str, AfterValidator(_validate_identifier)]
+DottedPath: TypeAlias = Annotated[str, AfterValidator(_validate_dotted_path)]
 
 # Read-only launch controls excluded from accumulator snapshots.
-RESERVED_CONTROL_STATE = frozenset({
-    "__weight", "__total_weight", "__num_macro_steps",
-    "__sub_step", "__num_sub_steps", "__flags",
-    "__macro_step_index",
-})
+RESERVED_CONTROL_STATE = frozenset(
+    {
+        "__weight",
+        "__total_weight",
+        "__num_macro_steps",
+        "__sub_step",
+        "__num_sub_steps",
+        "__flags",
+        "__macro_step_index",
+    }
+)
 
 
 def sanitize_symbol(name: str) -> str:
     """Return a stable Python/C/filename-safe spelling."""
 
     for operator, spelling in (
-        ("**", "_pow_"), ("^", "_pow_"), ("+", "_plus_"),
-        ("-", "_minus_"), ("*", "_mul_"), ("/", "_div_"),
+        ("**", "_pow_"),
+        ("^", "_pow_"),
+        ("+", "_plus_"),
+        ("-", "_minus_"),
+        ("*", "_mul_"),
+        ("/", "_div_"),
         (".", "_dot_"),
     ):
         name = name.replace(operator, spelling)

@@ -5,7 +5,6 @@
 
 #import <Metal/Metal.h>
 
-#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <mutex>
@@ -68,6 +67,21 @@ constexpr uint64_t kMaxMetalGridExtent =
 void validate_grid_extent(uint64_t threads) {
   TORCH_CHECK(threads <= kMaxMetalGridExtent,
               "Metal launch extent exceeds the uint32 grid range: ", threads);
+}
+
+NSUInteger validate_group_size(const Pipeline& pipeline, uint64_t requested) {
+  TORCH_CHECK(
+      requested > 0 && requested <= pipeline.state.maxTotalThreadsPerThreadgroup,
+      "Requested Metal threadgroup width ", requested,
+      " exceeds pipeline limit ", pipeline.state.maxTotalThreadsPerThreadgroup);
+  return static_cast<NSUInteger>(requested);
+}
+
+template <typename Scalar>
+id<MTLBuffer> allocate_scalar_buffer(id<MTLDevice> device, pybind11::handle value) {
+  Scalar scalar = pybind11::cast<Scalar>(value);
+  return [device newBufferWithBytes:&scalar length:sizeof(scalar)
+                           options:MTLResourceStorageModeShared];
 }
 
 MTLLanguageVersion latest_stable_msl_version() {
@@ -241,29 +255,17 @@ int64_t create_argument_binding(
         binding->retained_tensors.push_back(tensor);
       }
     } else if (kind == Pipeline::ArgumentType::Float32) {
-      float scalar = pybind11::cast<float>(value);
-      buffer = [device newBufferWithBytes:&scalar length:sizeof(scalar)
-                                  options:MTLResourceStorageModeShared];
-      binding->owned_scalar_buffers.push_back(buffer);
+      buffer = allocate_scalar_buffer<float>(device, value);
     } else if (kind == Pipeline::ArgumentType::Int32) {
-      int32_t scalar = pybind11::cast<int32_t>(value);
-      buffer = [device newBufferWithBytes:&scalar length:sizeof(scalar)
-                                  options:MTLResourceStorageModeShared];
-      binding->owned_scalar_buffers.push_back(buffer);
+      buffer = allocate_scalar_buffer<int32_t>(device, value);
     } else if (kind == Pipeline::ArgumentType::UInt32) {
-      uint32_t scalar = pybind11::cast<uint32_t>(value);
-      buffer = [device newBufferWithBytes:&scalar length:sizeof(scalar)
-                                  options:MTLResourceStorageModeShared];
-      binding->owned_scalar_buffers.push_back(buffer);
+      buffer = allocate_scalar_buffer<uint32_t>(device, value);
     } else if (kind == Pipeline::ArgumentType::Int64) {
-      int64_t scalar = pybind11::cast<int64_t>(value);
-      buffer = [device newBufferWithBytes:&scalar length:sizeof(scalar)
-                                  options:MTLResourceStorageModeShared];
-      binding->owned_scalar_buffers.push_back(buffer);
+      buffer = allocate_scalar_buffer<int64_t>(device, value);
     } else {
-      bool scalar = pybind11::cast<bool>(value);
-      buffer = [device newBufferWithBytes:&scalar length:sizeof(scalar)
-                                  options:MTLResourceStorageModeShared];
+      buffer = allocate_scalar_buffer<bool>(device, value);
+    }
+    if (kind != Pipeline::ArgumentType::Buffer) {
       binding->owned_scalar_buffers.push_back(buffer);
     }
     TORCH_CHECK(buffer != nil || kind == Pipeline::ArgumentType::Buffer,
@@ -311,13 +313,7 @@ void dispatch(
     for (const auto& [resource, usage] : binding->resources) {
       [encoder useResource:resource usage:usage];
     }
-    TORCH_CHECK(
-        requested_group_size > 0 &&
-            requested_group_size <= pipeline->state.maxTotalThreadsPerThreadgroup,
-        "Requested Metal threadgroup width ", requested_group_size,
-        " exceeds pipeline limit ",
-        pipeline->state.maxTotalThreadsPerThreadgroup);
-    NSUInteger width = static_cast<NSUInteger>(requested_group_size);
+    NSUInteger width = validate_group_size(*pipeline, requested_group_size);
     [encoder dispatchThreads:MTLSizeMake(threads, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
   });
@@ -346,13 +342,7 @@ void dispatch_sequence(
       for (const auto& [resource, usage] : binding->resources) {
         [encoder useResource:resource usage:usage];
       }
-      TORCH_CHECK(
-          group_sizes[i] > 0 &&
-              group_sizes[i] <= pipeline->state.maxTotalThreadsPerThreadgroup,
-          "Requested Metal threadgroup width ", group_sizes[i],
-          " exceeds pipeline limit ",
-          pipeline->state.maxTotalThreadsPerThreadgroup);
-      NSUInteger width = static_cast<NSUInteger>(group_sizes[i]);
+      NSUInteger width = validate_group_size(*pipeline, group_sizes[i]);
       [encoder dispatchThreads:MTLSizeMake(threads[i], 1, 1)
           threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
       if (barriers[i]) {
@@ -376,17 +366,12 @@ int64_t create_icb(
   for (uint64_t extent : threads) validate_grid_extent(extent);
   auto* stream = at::mps::getCurrentMPSStream();
   id<MTLDevice> device = stream->device();
-  NSUInteger max_bindings = 0;
-  for (int64_t id : pipeline_ids) {
-    max_bindings = std::max<NSUInteger>(max_bindings, 1);
-  }
-
   MTLIndirectCommandBufferDescriptor* descriptor =
       [[MTLIndirectCommandBufferDescriptor alloc] init];
   descriptor.commandTypes = MTLIndirectCommandTypeConcurrentDispatchThreads;
   descriptor.inheritPipelineState = NO;
   descriptor.inheritBuffers = NO;
-  descriptor.maxKernelBufferBindCount = max_bindings;
+  descriptor.maxKernelBufferBindCount = 1;
   id<MTLIndirectCommandBuffer> commands =
       [device newIndirectCommandBufferWithDescriptor:descriptor
                                      maxCommandCount:count
@@ -423,15 +408,8 @@ int64_t create_icb(
     for (const auto& [resource, usage] : binding->resources) {
       add_resource(resource, usage);
     }
-    TORCH_CHECK(
-        group_sizes[command_index] > 0 &&
-            group_sizes[command_index] <=
-                pipeline->state.maxTotalThreadsPerThreadgroup,
-        "Requested Metal threadgroup width ", group_sizes[command_index],
-        " exceeds pipeline limit ",
-        pipeline->state.maxTotalThreadsPerThreadgroup);
-    NSUInteger width = static_cast<NSUInteger>(group_sizes[command_index]);
-    TORCH_CHECK(threads[command_index] > 0 && width > 0,
+    NSUInteger width = validate_group_size(*pipeline, group_sizes[command_index]);
+    TORCH_CHECK(threads[command_index] > 0,
                 "ICB dispatch dimensions must be positive");
     [command concurrentDispatchThreads:MTLSizeMake(threads[command_index], 1, 1)
                      threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];

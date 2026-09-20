@@ -18,7 +18,6 @@ import torch
 
 from hydroforge.contracts.validation import _ImmutableDict
 
-
 NumericScalar: TypeAlias = int | float | np.integer | np.floating
 NumericValue: TypeAlias = NumericScalar | np.ndarray
 
@@ -44,22 +43,22 @@ def immutable_array(
     target_dtype = source.dtype if dtype is None else np.dtype(dtype)
     if target_dtype.hasobject:
         raise ValueError("immutable arrays must not use object dtype")
-    owned = np.array(
+    canonical = np.asarray(
         source,
         dtype=target_dtype,
         order=order,
-        copy=True,
-        subok=False,
     )
+    if not canonical.flags.c_contiguous and not canonical.flags.f_contiguous:
+        canonical = np.array(canonical, order=order, copy=True)
     storage_order: Literal["C", "F"] = (
         "F"
-        if owned.flags.f_contiguous and not owned.flags.c_contiguous
+        if canonical.flags.f_contiguous and not canonical.flags.c_contiguous
         else "C"
     )
-    payload = owned.tobytes(order=storage_order)
+    payload = canonical.tobytes(order=storage_order)
     return np.ndarray(
-        owned.shape,
-        dtype=owned.dtype,
+        canonical.shape,
+        dtype=canonical.dtype,
         buffer=payload,
         order=storage_order,
     )
@@ -83,8 +82,7 @@ def immutable_metadata(value: Any, *, label: str) -> Any:
         )
     if isinstance(value, (set, frozenset)):
         return frozenset(
-            immutable_metadata(item, label=f"{label} item")
-            for item in value
+            immutable_metadata(item, label=f"{label} item") for item in value
         )
     if np.ma.isMaskedArray(value):
         raise ValueError(f"{label} must not contain masked arrays")
@@ -135,9 +133,7 @@ def finite_float64(value: NumericScalar, *, label: str) -> float:
     else:
         exact = bool(value == result)
     if not exact:
-        raise ValueError(
-            f"{label} is not exactly representable as float64"
-        )
+        raise ValueError(f"{label} is not exactly representable as float64")
     return result
 
 
@@ -149,9 +145,7 @@ def positive_finite_float64(value: NumericScalar, *, label: str) -> float:
     except ValueError as error:
         if "not exactly representable as float64" in str(error):
             raise
-        raise ValueError(
-            f"{label} must be a finite positive real number"
-        ) from error
+        raise ValueError(f"{label} must be a finite positive real number") from error
     if result <= 0.0:
         raise ValueError(f"{label} must be a finite positive real number")
     return result
@@ -182,26 +176,21 @@ def canonical_floating_array(
     target = np.dtype(dtype)
     if target == np.dtype(np.float32) and source.size:
         as_float64 = np.asarray(source[finite], dtype=np.float64)
-        if (
-            not np.isfinite(as_float64).all()
-            or np.any(np.abs(as_float64) > np.finfo(np.float32).max)
+        if not np.isfinite(as_float64).all() or np.any(
+            np.abs(as_float64) > np.finfo(np.float32).max
         ):
-            raise ValueError(
-                f"{label} contains values outside float32 range"
-            )
+            raise ValueError(f"{label} contains values outside float32 range")
     result = np.asarray(source, dtype=target)
     if np.isinf(result).any() or (not allow_nan and np.isnan(result).any()):
         raise ValueError(f"{label} overflowed {dtype}")
     if np.any(finite & (source != 0) & (result == 0)):
-        raise ValueError(
-            f"{label} contains nonzero values that underflow in {dtype}"
-        )
+        raise ValueError(f"{label} contains nonzero values that underflow in {dtype}")
     if source.dtype.kind in {"i", "u"} and not np.array_equal(
-        source.astype(object), result.astype(object),
+        source.astype(object),
+        result.astype(object),
     ):
         raise ValueError(
-            f"{label} contains integers that are not exactly representable "
-            f"as {dtype}"
+            f"{label} contains integers that are not exactly representable as {dtype}"
         )
     return result if result.ndim == 0 else np.ascontiguousarray(result)
 
@@ -232,14 +221,14 @@ def canonical_float64(value: NumericValue, *, label: str) -> np.ndarray:
             restored = result.astype(source.dtype)
         if not np.array_equal(restored, source):
             raise ValueError(
-                f"{label} contains values that cannot be represented exactly "
-                "as float64"
+                f"{label} contains values that cannot be represented exactly as float64"
             )
     return result
 
 
 def exact_numeric_array_equal(
-    left: NumericValue, right: NumericValue,
+    left: NumericValue,
+    right: NumericValue,
 ) -> bool:
     """Compare real numeric arrays without NumPy's lossy mixed promotion."""
 
@@ -253,13 +242,14 @@ def exact_numeric_array_equal(
         right_array.dtype.kind not in {"f", "i", "u"}
     ):
         return False
-    if left_array.dtype == right_array.dtype:
-        return bool(np.array_equal(left_array, right_array))
     if left_array.dtype.kind == right_array.dtype.kind:
         return bool(np.array_equal(left_array, right_array))
     # In particular, int64/uint64 mixed with float64 can otherwise promote to
     # float64 and make adjacent large integers compare equal.  Object arrays
     # use Python's exact integer/float comparison rules.
-    return bool(np.array_equal(
-        left_array.astype(object), right_array.astype(object),
-    ))
+    return bool(
+        np.array_equal(
+            left_array.astype(object),
+            right_array.astype(object),
+        )
+    )

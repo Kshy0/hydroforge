@@ -16,36 +16,38 @@ Public functions
 - :func:`build_point_mapping` — source grid -> a regular 1D cell list (e.g. VIC).
 - :func:`aggregate_field_to_nc` — apply a saved mapping to a static/climatology field.
 """
+
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Mapping
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal
 
 import netCDF4 as nc
 import numpy as np
 from pydantic import Field, PrivateAttr, model_validator
 
-from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.contracts.naming import validate_safe_path_component
+from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.data.distributed import _find_indices_in_trusted
 from hydroforge.data.mapping.build import (
     _build_regular_grid_mapping_trusted,
     build_hires_aggregate_mapping,
 )
 from hydroforge.data.mapping.cama import (
-    read_cama_catchments, read_cama_hires_pixels,
+    read_cama_catchments,
+    read_cama_hires_pixels,
 )
 from hydroforge.data.mapping.grid import RegularGrid
 from hydroforge.data.mapping.table import MappingTable
 from hydroforge.data.mapping.target import TargetSupport
 from hydroforge.data.numeric import (
-    canonical_ids,
     canonical_float64,
     canonical_floating_array,
+    canonical_ids,
     positive_finite_float64,
 )
-from hydroforge.data.distributed import _find_indices_in_trusted
 from hydroforge.serialization.netcdf import (
     DEFAULT_NETCDF_OPTIONS,
     _atomic_netcdf_dataset_trusted,
@@ -64,8 +66,8 @@ class _BuildCamaMappingRequest(HydroForgeModel):
     hires_idx_precision: str = "<i2"
     map_precision: str = "<f4"
     parameter_nc: str | Path | None = None
-    allow_oob_zero: bool = Field(default=False, strict=True)
-    producer: str = "build_cama_mapping"
+    allow_oob_zero: bool = False
+    producer: str = Field(default="build_cama_mapping", min_length=1)
 
     _source: RegularGrid = PrivateAttr()
     _target_ids: np.ndarray = PrivateAttr()
@@ -76,10 +78,9 @@ class _BuildCamaMappingRequest(HydroForgeModel):
 
     @model_validator(mode="after")
     def _validate_declaration(self):
-        if not self.producer:
-            raise ValueError("producer must be non-empty")
         self._source = RegularGrid.from_coordinates(
-            self.source_lon, self.source_lat,
+            self.source_lon,
+            self.source_lat,
         )
         catchment_id, nx, ny, nextxy_data = read_cama_catchments(
             self.map_dir,
@@ -89,18 +90,9 @@ class _BuildCamaMappingRequest(HydroForgeModel):
         if self.parameter_nc is not None:
             with nc.Dataset(Path(self.parameter_nc), "r") as dataset:
                 raw_ids = dataset.variables["catchment_id"][...]
-                if np.ma.isMaskedArray(raw_ids) and np.any(
-                    np.ma.getmaskarray(raw_ids)
-                ):
-                    raise ValueError(
-                        "parameter catchment_id contains missing IDs"
-                    )
-                if np.asarray(raw_ids).ndim != 1:
-                    raise ValueError(
-                        "parameter catchment_id must be one-dimensional"
-                    )
                 desired_ids = canonical_ids(
-                    raw_ids, label="parameter catchment_id",
+                    raw_ids,
+                    label="parameter catchment_id",
                 )
         (
             pixel_catchment_id,
@@ -119,12 +111,11 @@ class _BuildCamaMappingRequest(HydroForgeModel):
         )
         if desired_ids is None:
             target_ids = canonical_ids(
-                catchment_id, label="CaMa catchment IDs",
+                catchment_id,
+                label="CaMa catchment IDs",
             )
         else:
-            present = (
-                _find_indices_in_trusted(desired_ids, catchment_id) >= 0
-            )
+            present = _find_indices_in_trusted(desired_ids, catchment_id) >= 0
             if not np.all(present):
                 missing = desired_ids[~present]
                 raise ValueError(
@@ -165,7 +156,7 @@ class _BuildPointMappingRequest(HydroForgeModel):
     lat_name: str = "latitude"
     id_name: str = "catchment_id"
     gsize: Any = None
-    producer: str = "build_point_mapping"
+    producer: str = Field(default="build_point_mapping", min_length=1)
 
     _source: RegularGrid = PrivateAttr()
     _gsize: float | None = PrivateAttr(default=None)
@@ -173,15 +164,14 @@ class _BuildPointMappingRequest(HydroForgeModel):
 
     @model_validator(mode="after")
     def _validate_declaration(self):
-        if not self.producer:
-            raise ValueError("producer must be non-empty")
         self._gsize = (
             None
             if self.gsize is None
             else positive_finite_float64(self.gsize, label="gsize")
         )
         self._source = RegularGrid.from_coordinates(
-            self.source_lon, self.source_lat,
+            self.source_lon,
+            self.source_lat,
         )
         with nc.Dataset(Path(self.parameter_nc), "r") as dataset:
             lon = dataset.variables[self.lon_name][:]
@@ -190,24 +180,17 @@ class _BuildPointMappingRequest(HydroForgeModel):
             for label, value in (
                 (self.lon_name, lon),
                 (self.lat_name, lat),
-                (self.id_name, raw_ids),
             ):
-                if np.ma.isMaskedArray(value) and np.any(
-                    np.ma.getmaskarray(value)
-                ):
+                if np.ma.isMaskedArray(value) and np.any(np.ma.getmaskarray(value)):
                     raise ValueError(
-                        f"parameter variable {label!r} contains missing "
-                        "values"
+                        f"parameter variable {label!r} contains missing values"
                     )
-            if np.asarray(raw_ids).ndim != 1:
-                raise ValueError(
-                    f"parameter variable {self.id_name!r} must be 1-D"
-                )
             target_ids = canonical_ids(raw_ids, label=self.id_name)
             gsize = self._gsize
             if gsize is None and "gsize" in dataset.ncattrs():
                 gsize = positive_finite_float64(
-                    dataset.getncattr("gsize"), label="gsize",
+                    dataset.getncattr("gsize"),
+                    label="gsize",
                 )
         if self.method == "overlap" and gsize is None:
             raise ValueError(
@@ -229,10 +212,6 @@ class _BuildPointMappingRequest(HydroForgeModel):
         return self._source
 
     @property
-    def normalized_gsize(self) -> float | None:
-        return self._gsize
-
-    @property
     def target(self) -> TargetSupport:
         return self._target
 
@@ -245,16 +224,14 @@ class _AggregateFieldRequest(HydroForgeModel):
     out_name: str | None = None
     dtype: Literal["float32", "float64"] = "float32"
     netcdf_options: Mapping[str, Any] = DEFAULT_NETCDF_OPTIONS
-    units: str = "mm"
+    units: str = Field(default="mm", min_length=1)
     description: str | None = None
-    normalized: bool = Field(default=False, strict=True)
+    normalized: bool = False
 
     _plan: _AggregateFieldPlan = PrivateAttr()
 
     @model_validator(mode="after")
     def _validate_declaration(self):
-        if not self.units:
-            raise ValueError("units must be non-empty")
         if self.out_name is None:
             object.__setattr__(self, "out_name", self.var_name)
         object.__setattr__(
@@ -311,25 +288,21 @@ def _compile_aggregate_field_plan(
             coordinate = dataset.variables[dimension]
             if coordinate.dimensions != (dimension,):
                 raise ValueError(
-                    f"spatial coordinate {dimension!r} must be "
-                    "one-dimensional"
+                    f"spatial coordinate {dimension!r} must be one-dimensional"
                 )
             raw_coordinate = coordinate[:]
             if np.ma.isMaskedArray(raw_coordinate) and np.any(
                 np.ma.getmaskarray(raw_coordinate)
             ):
                 raise ValueError(
-                    f"spatial coordinate {dimension!r} contains missing "
-                    "values"
+                    f"spatial coordinate {dimension!r} contains missing values"
                 )
             observed = canonical_float64(
                 raw_coordinate,
                 label=f"spatial coordinate {dimension!r}",
             )
-            if (
-                observed.shape != expected.shape
-                or not np.isfinite(observed).all()
-                or not np.array_equal(observed, expected)
+            if observed.shape != expected.shape or not np.array_equal(
+                observed, expected
             ):
                 raise ValueError(
                     f"spatial coordinate {dimension!r} does not match the "
@@ -337,8 +310,7 @@ def _compile_aggregate_field_plan(
                 )
         if np.dtype(variable.dtype).kind not in {"f", "i", "u"}:
             raise ValueError(
-                f"field variable {request.var_name!r} must contain real "
-                "numeric values"
+                f"field variable {request.var_name!r} must contain real numeric values"
             )
         has_time = variable.ndim == 3
         ntime = int(variable.shape[0]) if has_time else 1
@@ -348,13 +320,10 @@ def _compile_aggregate_field_plan(
             time_variable = dataset.variables[time_dimension]
             if time_variable.dimensions != (time_dimension,):
                 raise ValueError(
-                    f"time coordinate {time_dimension!r} must be "
-                    "one-dimensional"
+                    f"time coordinate {time_dimension!r} must be one-dimensional"
                 )
             raw_time = time_variable[:]
-            if np.ma.isMaskedArray(raw_time) and np.any(
-                np.ma.getmaskarray(raw_time)
-            ):
+            if np.ma.isMaskedArray(raw_time) and np.any(np.ma.getmaskarray(raw_time)):
                 raise ValueError("time coordinate contains missing values")
             time_values = np.array(raw_time, order="C", copy=True)
             if (
@@ -406,14 +375,14 @@ def _compile_aggregate_field_plan(
 def build_cama_mapping(
     source_lon: np.ndarray,
     source_lat: np.ndarray,
-    map_dir: Union[str, Path],
+    map_dir: str | Path,
     *,
-    hires_tag: Optional[str] = "1min",
+    hires_tag: str | None = "1min",
     mapinfo_txt: str = "location.txt",
     lowres_idx_precision: str = "<i4",
     hires_idx_precision: str = "<i2",
     map_precision: str = "<f4",
-    parameter_nc: Union[str, Path, None] = None,
+    parameter_nc: str | Path | None = None,
     allow_oob_zero: bool = False,
     producer: str = "build_cama_mapping",
 ) -> MappingTable:
@@ -470,13 +439,13 @@ def build_cama_mapping(
 def build_point_mapping(
     source_lon: np.ndarray,
     source_lat: np.ndarray,
-    parameter_nc: Union[str, Path],
+    parameter_nc: str | Path,
     *,
     method: Literal["nearest", "overlap"] = "overlap",
     lon_name: str = "longitude",
     lat_name: str = "latitude",
     id_name: str = "catchment_id",
-    gsize: Optional[float] = None,
+    gsize: float | None = None,
     producer: str = "build_point_mapping",
 ) -> MappingTable:
     """Build a mapping from a source grid onto a regular 1D point-cell list.
@@ -511,16 +480,16 @@ def build_point_mapping(
 
 
 def aggregate_field_to_nc(
-    field_nc: Union[str, Path],
+    field_nc: str | Path,
     var_name: str,
-    mapping_npz: Union[str, Path],
-    out_dir: Union[str, Path],
+    mapping_npz: str | Path,
+    out_dir: str | Path,
     *,
-    out_name: Optional[str] = None,
+    out_name: str | None = None,
     dtype: Literal["float32", "float64"] = "float32",
     netcdf_options: Mapping[str, Any] = DEFAULT_NETCDF_OPTIONS,
     units: str = "mm",
-    description: Optional[str] = None,
+    description: str | None = None,
     normalized: bool = False,
 ) -> Path:
     """Apply a saved mapping to a static or climatology field, writing a NetCDF.
@@ -556,14 +525,8 @@ def aggregate_field_to_nc(
     time_values = plan.time_values
     time_attributes = plan.time_attributes
 
-    aggregated_float64 = canonical_floating_array(
-        mapping._apply_trusted(field, layout="grid"),
-        dtype="float64",
-        label="aggregated values",
-        allow_nan=True,
-    )
     aggregated = canonical_floating_array(
-        aggregated_float64,
+        mapping._apply_trusted(field, layout="grid"),
         dtype=dtype,
         label="aggregated values",
         allow_nan=True,
@@ -591,7 +554,10 @@ def aggregate_field_to_nc(
 
         dims = ("time", "saved_points") if has_time else ("saved_points",)
         create_options = prepare_netcdf_variable_options(
-            netcdf_options, dtype=dtype_nc, dimensions=dims, name=out_name,
+            netcdf_options,
+            dtype=dtype_nc,
+            dimensions=dims,
+            name=out_name,
         )
         out_var = _create_netcdf_variable_trusted(
             ds,
@@ -601,8 +567,7 @@ def aggregate_field_to_nc(
             options=create_options,
         )
         resolved_description = (
-            f"Catchment-aggregated {out_name}"
-            if description is None else description
+            f"Catchment-aggregated {out_name}" if description is None else description
         )
         out_var.setncattr("description", resolved_description)
         out_var.setncattr("units", units)

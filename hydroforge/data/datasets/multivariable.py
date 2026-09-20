@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from typing import Any, Literal
 
@@ -19,8 +20,9 @@ from hydroforge.contracts.temporal import _combine_temporal_domains_trusted
 from hydroforge.contracts.validation import HydroForgeModel, _immutable_dict
 from hydroforge.data.datasets.base import (
     AbstractDataset,
+    _batch_forcing_validation,
     _close_dataset_tree,
-    _validated_dataset_index,
+    _spatial_selection_refs,
 )
 from hydroforge.data.datasets.chunking import SourceChunk
 from hydroforge.data.datasets.gridded import GriddedDataset
@@ -29,9 +31,6 @@ from hydroforge.data.numeric import (
     exact_numeric_array_equal,
     immutable_array,
 )
-
-
-_NO_SPATIAL_SELECTION = object()
 
 
 class _MultiVariableSelectionRequest(HydroForgeModel):
@@ -47,6 +46,7 @@ class _MultiVariableSelectionRequest(HydroForgeModel):
             raise ValueError("desired_ids must be unique")
         return immutable_array(result, order="C")
 
+
 class _MultiVariableForcingRequest(HydroForgeModel):
     """One complete named forcing batch for a composite Dataset."""
 
@@ -57,6 +57,7 @@ class _MultiVariableForcingRequest(HydroForgeModel):
     def _canonicalize(self):
         if not isinstance(self.owner, MultiVariableDataset):
             raise ValueError("multi-variable forcing requires Dataset ownership")
+        self.owner._refresh_spatial_selection()
         if not isinstance(self.data, Mapping):
             raise ValueError("multi-variable forcing must be a mapping")
         expected = tuple(self.owner.datasets)
@@ -66,10 +67,21 @@ class _MultiVariableForcingRequest(HydroForgeModel):
                 "multi-variable forcing keys must exactly match "
                 f"{expected}; got {observed}"
             )
-        canonical = {
-            name: dataset._validate_forcing_shard(self.data[name])
-            for name, dataset in self.owner.datasets.items()
-        }
+        from hydroforge.data.datasets.exported import ExportedDataset
+
+        standard = all(
+            type(dataset)._validate_forcing_shard
+            in {
+                GriddedDataset._validate_forcing_shard,
+                ExportedDataset._validate_forcing_shard,
+            }
+            for dataset in self.owner.datasets.values()
+        )
+        with _batch_forcing_validation() if standard else nullcontext():
+            canonical = {
+                name: dataset._validate_forcing_shard(self.data[name])
+                for name, dataset in self.owner.datasets.items()
+            }
         object.__setattr__(self, "data", canonical)
         return self
 
@@ -123,10 +135,11 @@ class _VariableSpecsDeclaration(HydroForgeModel):
 class MultiVariableDataset(AbstractDataset):
     """One validated timeline composed from named single-variable sources."""
 
-    datasets: Mapping[str, AbstractDataset]
+    datasets: Mapping[str, AbstractDataset] = Field(min_length=1)
 
     _reference: AbstractDataset = PrivateAttr()
     _gridded: bool = PrivateAttr()
+    _selection_refs: tuple[object, ...] = PrivateAttr(default=())
 
     @model_validator(mode="before")
     @classmethod
@@ -139,12 +152,15 @@ class MultiVariableDataset(AbstractDataset):
         reference = next(iter(datasets.values()))
         if not isinstance(reference, AbstractDataset):
             return value
+        reference._refresh_spatial_selection()
         payload = dict(value)
         derived = reference._dataset_identity_arguments()
         for name, expected in derived.items():
             if name in payload and payload[name] != expected:
                 raise ValueError(f"multi-variable {name} must match its child datasets")
             payload[name] = expected
+        for name in ("local_indices", "desired_catchment_ids"):
+            payload.setdefault(name, getattr(reference, name))
         return payload
 
     @field_validator("datasets")
@@ -153,10 +169,6 @@ class MultiVariableDataset(AbstractDataset):
         cls,
         datasets: Mapping[str, AbstractDataset],
     ) -> Mapping[str, AbstractDataset]:
-        if not isinstance(datasets, Mapping):
-            raise ValueError("datasets must be a mapping")
-        if not datasets:
-            raise ValueError("datasets must contain at least one named source")
         items = tuple(datasets.items())
         invalid_names = [
             name for name, _dataset in items if type(name) is not str or not name
@@ -165,13 +177,6 @@ class MultiVariableDataset(AbstractDataset):
             raise ValueError(
                 "multi-variable source names must be non-empty exact strings"
             )
-        invalid = {
-            name: type(dataset).__name__
-            for name, dataset in items
-            if not isinstance(dataset, AbstractDataset)
-        }
-        if invalid:
-            raise ValueError(f"multi-variable sources must be datasets: {invalid}")
         return _immutable_dict(items)
 
     def _composition_parts(self):
@@ -190,6 +195,7 @@ class MultiVariableDataset(AbstractDataset):
 
     @model_validator(mode="after")
     def _compile_composition(self):
+        references = _spatial_selection_refs(self.datasets.values())
         (
             self._reference,
             self._gridded,
@@ -208,6 +214,8 @@ class MultiVariableDataset(AbstractDataset):
                 chunk_plan=chunk_plan,
                 schedule=simulation_schedule,
             )
+        self._inherit_spatial_selection(self._reference, validate=True)
+        self._selection_refs = references
         read_pools = [
             dataset._read_handles
             for dataset in self.datasets.values()
@@ -219,6 +227,26 @@ class MultiVariableDataset(AbstractDataset):
                 if hasattr(dataset, "_read_handles"):
                     dataset._read_handles = shared_pool
         return self
+
+    def _refresh_spatial_selection(self) -> None:
+        references = _spatial_selection_refs(self.datasets.values())
+        if len(references) == len(self._selection_refs) and all(
+            current is previous
+            for current, previous in zip(references, self._selection_refs, strict=True)
+        ):
+            return
+        reference = self._reference
+        for name, dataset in tuple(self.datasets.items())[1:]:
+            self._validate_child(
+                name,
+                dataset,
+                reference=reference,
+                gridded=self._gridded,
+                chunk_plan=reference.chunk_plan,
+                schedule=reference.simulation_schedule,
+            )
+        self._inherit_spatial_selection(reference, validate=False)
+        self._selection_refs = references
 
     @property
     def reference(self) -> AbstractDataset:
@@ -240,45 +268,23 @@ class MultiVariableDataset(AbstractDataset):
             raise ValueError(f"variable {name!r} has a different model cadence")
         if dataset.chunk_plan.chunk_len != chunk_plan.chunk_len:
             raise ValueError(f"variable {name!r} has a different chunk length")
-        if (
-            isinstance(dataset, GriddedDataset)
-            != gridded
-        ):
+        if isinstance(dataset, GriddedDataset) != gridded:
             raise ValueError(
                 "one multi-variable dataset cannot mix grid and point sources"
             )
-        reference_raw = reference.get_coordinates()[0]
-        coordinate_raw = dataset.get_coordinates()[0]
-        if np.ma.isMaskedArray(reference_raw) or np.ma.isMaskedArray(coordinate_raw):
+        reference_axes = reference.get_coordinates()
+        observed_axes = dataset.get_coordinates()
+        axes = tuple(zip(reference_axes, observed_axes, strict=True))
+        if not gridded:
+            axes = axes[:1]
+        if any(np.ma.isMaskedArray(axis) for pair in axes for axis in pair):
             raise ValueError("multi-variable spatial coordinates must not be masked")
-        reference_coordinates = np.asarray(reference_raw)
-        coordinates = np.asarray(coordinate_raw)
-        if gridded:
-            reference_y_raw = reference.get_coordinates()[1]
-            y_raw = dataset.get_coordinates()[1]
-            if np.ma.isMaskedArray(reference_y_raw) or np.ma.isMaskedArray(y_raw):
-                raise ValueError(
-                    "multi-variable spatial coordinates must not be masked"
-                )
-            reference_y = np.asarray(reference_y_raw)
-            y = np.asarray(y_raw)
-            same = exact_numeric_array_equal(
-                reference_coordinates,
-                coordinates,
-            ) and exact_numeric_array_equal(
-                reference_y,
-                y,
-            )
-        else:
-            # Point columns are consumed positionally by the composite read.
-            # Comparing only sets would accept ``[A, B]`` versus ``[B, A]``
-            # and silently attach the second variable's values to the wrong
-            # catchment.  Require the canonical order here, just as the
-            # arithmetic expression composite does.
-            same = exact_numeric_array_equal(
-                reference_coordinates,
-                coordinates,
-            )
+        reference_coordinates = np.asarray(reference_axes[0])
+        coordinates = np.asarray(observed_axes[0])
+        same = all(exact_numeric_array_equal(left, right) for left, right in axes)
+        if not gridded:
+            # Point columns are positional: equal sets in a different order
+            # must not attach another variable's values to the wrong catchment.
             if not same:
                 try:
                     same_members = (
@@ -296,23 +302,13 @@ class MultiVariableDataset(AbstractDataset):
                     )
         if not same:
             raise ValueError(f"variable {name!r} uses a different spatial domain")
-        reference_selection = getattr(
-            reference,
-            "local_indices",
-            _NO_SPATIAL_SELECTION,
+        reference_selection = reference.local_indices
+        selection = dataset.local_indices
+        aligned = (
+            reference_selection is selection
+            if reference_selection is None or selection is None
+            else exact_numeric_array_equal(reference_selection, selection)
         )
-        selection = getattr(dataset, "local_indices", _NO_SPATIAL_SELECTION)
-        if reference_selection is _NO_SPATIAL_SELECTION:
-            aligned = selection is _NO_SPATIAL_SELECTION
-        elif selection is _NO_SPATIAL_SELECTION:
-            aligned = False
-        elif reference_selection is None or selection is None:
-            aligned = reference_selection is selection
-        else:
-            aligned = exact_numeric_array_equal(
-                reference_selection,
-                selection,
-            )
         if not aligned:
             raise ValueError(f"variable {name!r} uses a different spatial selection")
 
@@ -321,13 +317,16 @@ class MultiVariableDataset(AbstractDataset):
         return tuple(self.datasets)
 
     def get_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
+        self._refresh_spatial_selection()
         return self.reference.get_coordinates()
 
     @property
     def data_size(self) -> int:
+        self._refresh_spatial_selection()
         return self.reference.data_size
 
     def _read_chunk(self, chunk: SourceChunk):
+        self._refresh_spatial_selection()
         return {
             name: dataset._read_chunk_trusted(
                 dataset.chunk_plan._at_trusted(chunk.index),
@@ -338,18 +337,13 @@ class MultiVariableDataset(AbstractDataset):
     def _get_chunk_trusted(self, chunk: SourceChunk):
         """Prepare one framework-produced request through every child."""
 
+        self._refresh_spatial_selection()
         return {
             name: dataset._get_chunk_trusted(
                 dataset.chunk_plan._at_trusted(chunk.index),
             )
             for name, dataset in self.datasets.items()
         }
-
-    def __getitem__(self, index: int):
-        chunk = self._chunk_plan._at_trusted(
-            _validated_dataset_index(self, index),
-        )
-        return self._get_chunk_trusted(chunk)
 
     def __len__(self) -> int:
         return len(self.reference)
@@ -366,13 +360,8 @@ class GriddedMultiVariableDataset(MultiVariableDataset):
 
     @model_validator(mode="after")
     def _require_gridded_sources(self):
-        if any(
-            not isinstance(dataset, GriddedDataset)
-            for dataset in self.datasets.values()
-        ):
-            raise ValueError(
-                "GriddedMultiVariableDataset requires grid sources"
-            )
+        if not self._gridded:
+            raise ValueError("GriddedMultiVariableDataset requires grid sources")
         return self
 
     def build_local_mapping(
@@ -383,25 +372,31 @@ class GriddedMultiVariableDataset(MultiVariableDataset):
         precision: Literal["float32", "float64"] = "float32",
     ) -> torch.Tensor:
         reference = self.reference
-        mapping = reference.build_local_mapping(
-            mapping_file=mapping_file,
-            desired_catchment_ids=desired_catchment_ids,
-            device=device,
-            precision=precision,
+        datasets = tuple(
+            {id(dataset): dataset for dataset in self.datasets.values()}.values()
         )
-        for dataset in tuple(self.datasets.values())[1:]:
-            dataset._install_local_selection(
-                source_indices=reference.local_indices,
-                target_ids=reference.desired_catchment_ids,
-                device=reference._mapping_device,
+        with ExitStack() as transactions:
+            for dataset in datasets:
+                transactions.enter_context(dataset._mapping_transaction())
+            mapping = reference.build_local_mapping(
+                mapping_file=mapping_file,
+                desired_catchment_ids=desired_catchment_ids,
+                device=device,
                 precision=precision,
             )
-        object.__setattr__(self, "local_indices", reference.local_indices)
-        object.__setattr__(
-            self,
-            "desired_catchment_ids",
-            reference.desired_catchment_ids,
-        )
+            for dataset in datasets[1:]:
+                dataset._install_local_selection(
+                    source_indices=reference.local_indices,
+                    target_ids=reference.desired_catchment_ids,
+                    device=reference._mapping_device,
+                    precision=precision,
+                )
+            object.__setattr__(self, "local_indices", reference.local_indices)
+            object.__setattr__(
+                self,
+                "desired_catchment_ids",
+                reference.desired_catchment_ids,
+            )
         return mapping
 
     def shard_forcing(

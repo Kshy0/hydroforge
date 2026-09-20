@@ -9,18 +9,21 @@ each catchment is composed of, returning plain numpy arrays:
 * :func:`read_cama_hires_pixels` -> per-pixel ``(catchment_id, area, lon, lat)``
   used to area-weight a runoff grid onto catchments.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
 
 import numpy as np
 
-
 from hydroforge.data.distributed import binread, read_map
 
 
 def _binary_precision(
-    value: str, *, label: str, kinds: frozenset[str],
+    value: str,
+    *,
+    label: str,
+    kinds: frozenset[str],
 ) -> np.dtype:
     if type(value) is not str:
         raise TypeError(f"{label} must be an exact dtype string")
@@ -100,9 +103,7 @@ def _grid_offset(delta: float, spacing: float, *, label: str) -> int:
         5.0e-7 * max(abs(quotient), 1.0),
     )
     if abs(quotient - nearest) > tolerance:
-        raise ValueError(
-            f"{label} is not aligned to grid spacing {spacing!r}"
-        )
+        raise ValueError(f"{label} is not aligned to grid spacing {spacing!r}")
     return int(nearest)
 
 
@@ -119,7 +120,9 @@ def _validate_grid_extent(
     if type(count) is not int or count < 1:
         raise ValueError(f"{label} cell count must be a positive integer")
     observed = _grid_offset(
-        upper - lower, spacing, label=f"{label} extent",
+        upper - lower,
+        spacing,
+        label=f"{label} extent",
     )
     if observed != count:
         raise ValueError(
@@ -129,9 +132,11 @@ def _validate_grid_extent(
 
 
 def _read_region_parameters(
-    map_dir: Path, nx: int, ny: int,
+    map_dir: Path,
+    nx: int,
+    ny: int,
 ) -> tuple[float, float, float, float, float]:
-    with open(map_dir / "params.txt", "r") as stream:
+    with open(map_dir / "params.txt") as stream:
         lines = stream.readlines()
     if len(lines) < 8:
         raise ValueError("params.txt must contain at least eight lines")
@@ -143,6 +148,32 @@ def _read_region_parameters(
     _validate_grid_extent(west, east, gsize, nx, label="CaMa longitude")
     _validate_grid_extent(south, north, gsize, ny, label="CaMa latitude")
     return gsize, west, east, south, north
+
+
+def _read_hires_tile(
+    directory: Path,
+    name: str,
+    nx: int,
+    ny: int,
+    *,
+    area_precision: str,
+    index_precision: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read one tile's areas in m² and validate its paired catchment indices."""
+    areas = (
+        np.asarray(
+            read_map(
+                directory / f"{name}.grdare.bin", (nx, ny), precision=area_precision
+            ),
+            dtype=np.float64,
+        )
+        * 1e6
+    )
+    catchments = read_map(
+        directory / f"{name}.catmxy.bin", (nx, ny, 2), precision=index_precision
+    )
+    _validate_catmxy(catchments, label=f"{name}.catmxy.bin")
+    return areas, catchments
 
 
 def read_cama_catchments(
@@ -162,7 +193,7 @@ def read_cama_catchments(
         kinds=frozenset({"i"}),
     )
     map_dir = Path(map_dir)
-    with open(map_dir / "mapdim.txt", "r") as f:
+    with open(map_dir / "mapdim.txt") as f:
         lines = f.readlines()
         nx = int(lines[0].split("!!")[0].strip())
         ny = int(lines[1].split("!!")[0].strip())
@@ -170,7 +201,8 @@ def read_cama_catchments(
         raise ValueError("mapdim.txt grid dimensions must be positive")
 
     nextxy_data = binread(
-        map_dir / "nextxy.bin", (nx, ny, 2),
+        map_dir / "nextxy.bin",
+        (nx, ny, 2),
         dtype_str=lowres_idx_precision,
     )
     _validate_nextxy(nextxy_data)
@@ -211,15 +243,12 @@ def read_cama_hires_pixels(
     )
     if type(nx) is not int or nx < 1 or type(ny) is not int or ny < 1:
         raise ValueError("CaMa grid dimensions must be positive exact integers")
-    if np.ma.isMaskedArray(nextxy_data) and np.any(
-        np.ma.getmaskarray(nextxy_data)
-    ):
+    if np.ma.isMaskedArray(nextxy_data) and np.any(np.ma.getmaskarray(nextxy_data)):
         raise ValueError("nextxy_data contains missing values")
     nextxy_data = np.asarray(nextxy_data)
     if nextxy_data.shape != (nx, ny, 2):
         raise ValueError(
-            f"nextxy_data must have shape ({nx}, {ny}, 2), "
-            f"got {nextxy_data.shape}"
+            f"nextxy_data must have shape ({nx}, {ny}, 2), got {nextxy_data.shape}"
         )
     _validate_nextxy(nextxy_data)
     map_dir = Path(map_dir)
@@ -227,7 +256,9 @@ def read_cama_hires_pixels(
     if hires_tag is None:
         # Use the actual regional CaMa grid as a uniform hires grid.
         csize, west, _east, _south, north = _read_region_parameters(
-            map_dir, nx, ny,
+            map_dir,
+            nx,
+            ny,
         )
         hires_lon = west + (np.arange(nx, dtype=np.float64) + 0.5) * csize
         hires_lat = north - (np.arange(ny, dtype=np.float64) + 0.5) * csize
@@ -237,7 +268,7 @@ def read_cama_hires_pixels(
         return catchment_id_hires, areas, hires_lon[x_idx], hires_lat[y_idx]
 
     hires_map_dir = map_dir / hires_tag
-    with open(hires_map_dir / mapinfo_txt, "r") as f:
+    with open(hires_map_dir / mapinfo_txt) as f:
         loc_lines = f.readlines()
     narea = int(loc_lines[0].split()[0])
     if narea < 1:
@@ -245,24 +276,25 @@ def read_cama_hires_pixels(
 
     if narea == 1:
         data = loc_lines[2].split()
-        Nx, Ny = int(data[6]), int(data[7])
-        West, East = float(data[2]), float(data[3])
-        South, North = float(data[4]), float(data[5])
+        tile_nx, tile_ny = int(data[6]), int(data[7])
+        west, east = float(data[2]), float(data[3])
+        south, north = float(data[4]), float(data[5])
         csize = float(data[8])
-        _validate_grid_extent(West, East, csize, Nx, label="hires longitude")
-        _validate_grid_extent(South, North, csize, Ny, label="hires latitude")
+        _validate_grid_extent(west, east, csize, tile_nx, label="hires longitude")
+        _validate_grid_extent(south, north, csize, tile_ny, label="hires latitude")
 
-        hires_lon = West + (np.arange(Nx, dtype=np.float64) + 0.5) * csize
-        hires_lat = North - (np.arange(Ny, dtype=np.float64) + 0.5) * csize
+        hires_lon = west + (np.arange(tile_nx, dtype=np.float64) + 0.5) * csize
+        hires_lat = north - (np.arange(tile_ny, dtype=np.float64) + 0.5) * csize
 
         tile_name = data[1]
-        grid_area = np.asarray(read_map(
-            hires_map_dir / f"{tile_name}.grdare.bin", (Nx, Ny), precision=map_precision
-        ), dtype=np.float64) * 1e6
-        catm = read_map(
-            hires_map_dir / f"{tile_name}.catmxy.bin", (Nx, Ny, 2), precision=hires_idx_precision
+        grid_area, catm = _read_hires_tile(
+            hires_map_dir,
+            tile_name,
+            tile_nx,
+            tile_ny,
+            area_precision=map_precision,
+            index_precision=hires_idx_precision,
         )
-        _validate_catmxy(catm, label=f"{tile_name}.catmxy.bin")
 
         valid = catm[:, :, 0] > 0
         x_idx, y_idx = np.where(valid)
@@ -279,23 +311,28 @@ def read_cama_hires_pixels(
             catm_y,
             label=f"{tile_name}.catmxy.bin",
         )
-        catchment_id_hires = np.ravel_multi_index(
-            (catm_x, catm_y), (nx, ny)
+        catchment_id_hires = np.ravel_multi_index((catm_x, catm_y), (nx, ny))
+        return (
+            catchment_id_hires,
+            grid_area[x_idx, y_idx],
+            hires_lon[x_idx],
+            hires_lat[y_idx],
         )
-        return catchment_id_hires, grid_area[x_idx, y_idx], hires_lon[x_idx], hires_lat[y_idx]
 
     # --- Multi-tile hires map (catmxy stores global indices) ---
-    gsize, reg_west, reg_east, reg_south, reg_north = (
-        _read_region_parameters(map_dir, nx, ny)
+    gsize, reg_west, reg_east, reg_south, reg_north = _read_region_parameters(
+        map_dir, nx, ny
     )
 
     # Regional map is a subset of the global grid starting at (-180, 90).
-    dXX = _grid_offset(
-        reg_west - (-180.0), gsize,
+    global_x_offset = _grid_offset(
+        reg_west - (-180.0),
+        gsize,
         label="CaMa western global offset",
     )
-    dYY = _grid_offset(
-        90.0 - reg_north, gsize,
+    global_y_offset = _grid_offset(
+        90.0 - reg_north,
+        gsize,
         label="CaMa northern global offset",
     )
     csize = float(loc_lines[2].split()[8])
@@ -323,22 +360,38 @@ def read_cama_hires_pixels(
         if te <= reg_west or tw >= reg_east or tn <= reg_south or ts >= reg_north:
             continue
 
-        ix_start = max(0, _grid_offset(
-            reg_west - tw, csize,
-            label=f"tile {tile_name} western crop",
-        ))
-        ix_end = min(tnx, _grid_offset(
-            reg_east - tw, csize,
-            label=f"tile {tile_name} eastern crop",
-        ))
-        iy_start = max(0, _grid_offset(
-            tn - reg_north, csize,
-            label=f"tile {tile_name} northern crop",
-        ))
-        iy_end = min(tny, _grid_offset(
-            tn - reg_south, csize,
-            label=f"tile {tile_name} southern crop",
-        ))
+        ix_start = max(
+            0,
+            _grid_offset(
+                reg_west - tw,
+                csize,
+                label=f"tile {tile_name} western crop",
+            ),
+        )
+        ix_end = min(
+            tnx,
+            _grid_offset(
+                reg_east - tw,
+                csize,
+                label=f"tile {tile_name} eastern crop",
+            ),
+        )
+        iy_start = max(
+            0,
+            _grid_offset(
+                tn - reg_north,
+                csize,
+                label=f"tile {tile_name} northern crop",
+            ),
+        )
+        iy_end = min(
+            tny,
+            _grid_offset(
+                tn - reg_south,
+                csize,
+                label=f"tile {tile_name} southern crop",
+            ),
+        )
         if ix_end <= ix_start or iy_end <= iy_start:
             continue
 
@@ -355,43 +408,45 @@ def read_cama_hires_pixels(
         region_x1 = region_x0 + (ix_end - ix_start)
         region_y1 = region_y0 + (iy_end - iy_start)
         for other_name, other_x0, other_x1, other_y0, other_y1 in occupied_tiles:
-            if (
-                max(region_x0, other_x0) < min(region_x1, other_x1)
-                and max(region_y0, other_y0) < min(region_y1, other_y1)
-            ):
+            if max(region_x0, other_x0) < min(region_x1, other_x1) and max(
+                region_y0, other_y0
+            ) < min(region_y1, other_y1):
                 raise ValueError(
                     f"hires tiles {other_name!r} and {tile_name!r} overlap "
                     "inside the regional CaMa grid"
                 )
-        occupied_tiles.append((
-            tile_name, region_x0, region_x1, region_y0, region_y1,
-        ))
-
-        tile_grdare = np.asarray(read_map(
-            hires_map_dir / f"{tile_name}.grdare.bin", (tnx, tny), precision=map_precision
-        ), dtype=np.float64) * 1e6
-        tile_catmxy = read_map(
-            hires_map_dir / f"{tile_name}.catmxy.bin", (tnx, tny, 2), precision=hires_idx_precision
+        occupied_tiles.append(
+            (
+                tile_name,
+                region_x0,
+                region_x1,
+                region_y0,
+                region_y1,
+            )
         )
-        _validate_catmxy(tile_catmxy, label=f"{tile_name}.catmxy.bin")
+
+        tile_grdare, tile_catmxy = _read_hires_tile(
+            hires_map_dir,
+            tile_name,
+            tnx,
+            tny,
+            area_precision=map_precision,
+            index_precision=hires_idx_precision,
+        )
 
         sub_catmxy = tile_catmxy[ix_start:ix_end, iy_start:iy_end, :]
         sub_grdare = tile_grdare[ix_start:ix_end, iy_start:iy_end]
 
-        sub_lon = tw + (
-            np.arange(ix_start, ix_end, dtype=np.float64) + 0.5
-        ) * csize
-        sub_lat = tn - (
-            np.arange(iy_start, iy_end, dtype=np.float64) + 0.5
-        ) * csize
+        sub_lon = tw + (np.arange(ix_start, ix_end, dtype=np.float64) + 0.5) * csize
+        sub_lat = tn - (np.arange(iy_start, iy_end, dtype=np.float64) + 0.5) * csize
 
         valid = sub_catmxy[:, :, 0] > 0
         xi, yi = np.where(valid)
         if len(xi) == 0:
             continue
 
-        vx = sub_catmxy[xi, yi, 0].astype(np.int64, copy=False) - 1 - dXX
-        vy = sub_catmxy[xi, yi, 1].astype(np.int64, copy=False) - 1 - dYY
+        vx = sub_catmxy[xi, yi, 0].astype(np.int64, copy=False) - 1 - global_x_offset
+        vy = sub_catmxy[xi, yi, 1].astype(np.int64, copy=False) - 1 - global_y_offset
         in_region = (vx >= 0) & (vx < nx) & (vy >= 0) & (vy < ny)
         xi_r, yi_r = xi[in_region], yi[in_region]
         vx_r, vy_r = vx[in_region], vy[in_region]

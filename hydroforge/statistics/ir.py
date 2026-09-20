@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 import math
 import re
-from enum import Enum
+from collections.abc import Mapping
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from enum import Enum, StrEnum
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 
-class Reduction(str, Enum):
+
+class Reduction(StrEnum):
+    __str__ = Enum.__str__
+    __format__ = Enum.__format__
+
     MEAN = "mean"
     SUM = "sum"
     MAX = "max"
@@ -22,22 +27,39 @@ class Reduction(str, Enum):
     LAST = "last"
 
 
-class ExpressionDialect(str, Enum):
+class ExpressionDialect(StrEnum):
+    __str__ = Enum.__str__
+    __format__ = Enum.__format__
+
     CUDA = "cuda"
     TRITON = "triton"
     METAL = "metal"
     TORCH = "torch"
 
 
-class StorageInitialization(str, Enum):
+class StorageInitialization(StrEnum):
+    __str__ = Enum.__str__
+    __format__ = Enum.__format__
+
     ZERO = "zero"
     NEGATIVE_INFINITY = "negative_infinity"
     POSITIVE_INFINITY = "positive_infinity"
 
 
-class StorageDType(str, Enum):
+class StorageDType(StrEnum):
+    __str__ = Enum.__str__
+    __format__ = Enum.__format__
+
     VALUE = "value"
     INDEX = "index"
+
+
+def storage_initialization(reduction: Reduction) -> StorageInitialization:
+    if reduction is Reduction.MAX:
+        return StorageInitialization.NEGATIVE_INFINITY
+    if reduction is Reduction.MIN:
+        return StorageInitialization.POSITIVE_INFINITY
+    return StorageInitialization.ZERO
 
 
 @dataclass(frozen=True)
@@ -82,14 +104,14 @@ class ScatterSource:
 
 
 def validate_expression_constants(
-    name: str, expression: Expression, dtype: torch.dtype,
+    name: str,
+    expression: Expression,
+    dtype: torch.dtype,
 ) -> None:
     """Validate literal meaning once at the public statistics boundary."""
 
     if not dtype.is_floating_point:
-        raise ValueError(
-            f"statistics expression {name!r} requires a floating dtype"
-        )
+        raise ValueError(f"statistics expression {name!r} requires a floating dtype")
     for node in ast.walk(expression.tree):
         if (
             not isinstance(node, ast.Constant)
@@ -113,8 +135,7 @@ def validate_expression_constants(
         converted = float(torch.tensor(value, dtype=dtype).item())
         if value != 0 and converted == 0.0:
             raise ValueError(
-                f"statistics expression {name!r} constant {value!r} "
-                f"underflows {dtype}"
+                f"statistics expression {name!r} constant {value!r} underflows {dtype}"
             )
         if not math.isfinite(converted):
             raise ValueError(
@@ -139,21 +160,24 @@ class StatisticsProgram:
     sources: Mapping[str, ValueSource]
 
     def dependencies(self, name: str) -> tuple[str, ...]:
-        source = self.sources.get(name, TensorSource(name))
+        source = self.sources.get(name) or TensorSource(name)
         if isinstance(source, TensorSource):
             return (source.name,)
         expression = (
-            source.expression if isinstance(source, ExpressionSource)
-            else source.value
+            source.expression if isinstance(source, ExpressionSource) else source.value
         )
         return expression.dependencies
 
     def leaf_tensors(self, name: str) -> tuple[str, ...]:
         """Return concrete model tensors required to evaluate ``name``."""
         leaves: set[str] = set()
+        visited: set[str] = set()
 
         def visit(field: str) -> None:
-            source = self.sources.get(field, TensorSource(field))
+            if field in visited:
+                return
+            visited.add(field)
+            source = self.sources.get(field) or TensorSource(field)
             if isinstance(source, TensorSource):
                 leaves.add(source.name)
                 return
@@ -179,10 +203,12 @@ class _StatisticsDeclaration:
 
     @property
     def variable_ops(self) -> Mapping[str, tuple[str, ...]]:
-        return MappingProxyType({
-            name: tuple(operation.spelling for operation in operations)
-            for name, operations in self.program.operations.items()
-        })
+        return MappingProxyType(
+            {
+                name: tuple(operation.spelling for operation in operations)
+                for name, operations in self.program.operations.items()
+            }
+        )
 
 
 @dataclass(frozen=True)
@@ -225,39 +251,44 @@ def build_variable_storage_plan(
         if name in internal_names:
             return
         internal_names.add(name)
-        slots.append(StorageSlot(
-            name, actual_shape, StorageDType.VALUE, initialization, False,
-        ))
+        slots.append(
+            StorageSlot(
+                name,
+                actual_shape,
+                StorageDType.VALUE,
+                initialization,
+                False,
+            )
+        )
 
     for operation in operations:
-        shape = (
-            actual_shape + (operation.k,)
-            if operation.k > 1 else actual_shape
+        shape = actual_shape + (operation.k,) if operation.k > 1 else actual_shape
+        initialization = storage_initialization(operation.outer)
+        dtype = StorageDType.INDEX if operation.stores_index else StorageDType.VALUE
+        slots.append(
+            StorageSlot(
+                f"{variable}_{operation.spelling}",
+                shape,
+                dtype,
+                StorageInitialization.ZERO
+                if operation.stores_index
+                else initialization,
+                True,
+            )
         )
-        initialization = (
-            StorageInitialization.NEGATIVE_INFINITY
-            if operation.outer is Reduction.MAX
-            else StorageInitialization.POSITIVE_INFINITY
-            if operation.outer is Reduction.MIN
-            else StorageInitialization.ZERO
-        )
-        dtype = (
-            StorageDType.INDEX if operation.stores_index
-            else StorageDType.VALUE
-        )
-        slots.append(StorageSlot(
-            f"{variable}_{operation.spelling}", shape, dtype,
-            StorageInitialization.ZERO if operation.stores_index
-            else initialization,
-            True,
-        ))
         if operation.stores_index:
             add_name = f"{variable}_{operation.spelling}_aux"
             if add_name not in internal_names:
                 internal_names.add(add_name)
-                slots.append(StorageSlot(
-                    add_name, shape, StorageDType.VALUE, initialization, False,
-                ))
+                slots.append(
+                    StorageSlot(
+                        add_name,
+                        shape,
+                        StorageDType.VALUE,
+                        initialization,
+                        False,
+                    )
+                )
         if operation.inner is None:
             if operation.outer is Reduction.MEAN:
                 add_internal(
@@ -267,16 +298,9 @@ def build_variable_storage_plan(
             continue
         if operation.inner is Reduction.LAST:
             continue
-        inner_initialization = (
-            StorageInitialization.NEGATIVE_INFINITY
-            if operation.inner is Reduction.MAX
-            else StorageInitialization.POSITIVE_INFINITY
-            if operation.inner is Reduction.MIN
-            else StorageInitialization.ZERO
-        )
         add_internal(
             f"{variable}_{operation.inner.value}_inner_state",
-            inner_initialization,
+            storage_initialization(operation.inner),
         )
         if operation.inner is Reduction.MEAN:
             add_internal(
@@ -309,16 +333,23 @@ class StatisticsIR:
 
     def materialized_inputs(self, name: str) -> tuple[str, ...]:
         """Return leaf buffers read by the main aggregation kernel."""
-        source = self.sources.get(name, TensorSource(name))
-        if isinstance(source, TensorSource):
-            return (source.name,)
-        if isinstance(source, ScatterSource):
-            return (f"__scatter_buf_{name}",)
-        inputs = {
-            leaf
-            for dependency in source.expression.dependencies
-            for leaf in self.materialized_inputs(dependency)
-        }
+        inputs: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(field: str) -> None:
+            if field in visited:
+                return
+            visited.add(field)
+            source = self.sources.get(field) or TensorSource(field)
+            if isinstance(source, TensorSource):
+                inputs.add(source.name)
+            elif isinstance(source, ScatterSource):
+                inputs.add(f"__scatter_buf_{field}")
+            else:
+                for dependency in source.expression.dependencies:
+                    visit(dependency)
+
+        visit(name)
         return tuple(sorted(inputs))
 
     def scatter_inputs(self, name: str) -> tuple[str, ...]:
@@ -337,7 +368,8 @@ class StatisticsIR:
         def visit(name: str) -> None:
             if name in visited:
                 return
-            source = self.sources.get(name, TensorSource(name))
+            visited.add(name)
+            source = self.sources.get(name) or TensorSource(name)
             if isinstance(source, TensorSource):
                 return
             dependencies = (
@@ -348,7 +380,6 @@ class StatisticsIR:
             for dependency in dependencies:
                 visit(dependency)
             if isinstance(source, ScatterSource):
-                visited.add(name)
                 result.append(MaterializedScatter(name, source))
 
         for variable in self.variables:
@@ -357,8 +388,6 @@ class StatisticsIR:
 
 
 _OP_RE = re.compile(r"^(arg)?(mean|sum|max|min|first|last)(\d*)$")
-_INNER = frozenset({Reduction.MEAN, Reduction.SUM, Reduction.MAX,
-                    Reduction.MIN, Reduction.FIRST, Reduction.LAST})
 
 _FUNCTION_ARITIES = {
     "abs": 1,
@@ -395,11 +424,7 @@ def parse_operation(spelling: str) -> StatisticOperation:
     try:
         inner = Reduction(parts[1]) if len(parts) == 2 else None
     except ValueError as error:
-        raise ValueError(
-            f"unsupported inner reduction in {spelling!r}"
-        ) from error
-    if inner is not None and inner not in _INNER:
-        raise ValueError(f"unsupported inner reduction in {spelling!r}")
+        raise ValueError(f"unsupported inner reduction in {spelling!r}") from error
     if inner is None and (stores_index or k > 1):
         raise ValueError(
             f"{spelling!r} requires an inner statistics window; "
@@ -408,37 +433,12 @@ def parse_operation(spelling: str) -> StatisticOperation:
     return StatisticOperation(spelling, outer, inner, k, stores_index)
 
 
-class _DependencyVisitor(ast.NodeVisitor):
-    def __init__(self) -> None:
-        self.dependencies: set[str] = set()
-
-    def visit_Call(self, node: ast.Call) -> None:
-        for arg in node.args:
-            self.visit(arg)
-        for keyword in node.keywords:
-            self.visit(keyword.value)
-
-    def visit_Name(self, node: ast.Name) -> None:
-        if node.id not in {"pi", "M_PI", "True", "False"}:
-            self.dependencies.add(node.id)
-
-    def visit_Attribute(self, node: ast.Attribute) -> None:
-        parts: list[str] = []
-        current: ast.AST = node
-        while isinstance(current, ast.Attribute):
-            parts.append(current.attr)
-            current = current.value
-        if not isinstance(current, ast.Name):
-            raise ValueError("statistics expressions only support dotted field names")
-        parts.append(current.id)
-        self.dependencies.add(".".join(reversed(parts)))
-
-
 class _ExpressionValidator(ast.NodeVisitor):
     """Reject semantics that cannot be rendered identically by every backend."""
 
     def __init__(self, source: str) -> None:
         self.source = source
+        self.dependencies: set[str] = set()
 
     def _unsupported(self, node: ast.AST) -> ValueError:
         return ValueError(
@@ -454,7 +454,8 @@ class _ExpressionValidator(ast.NodeVisitor):
 
     def visit_BinOp(self, node: ast.BinOp) -> None:
         if not isinstance(
-            node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow),
+            node.op,
+            (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow),
         ):
             raise self._unsupported(node.op)
         self.visit(node.left)
@@ -473,12 +474,9 @@ class _ExpressionValidator(ast.NodeVisitor):
 
     def visit_Compare(self, node: ast.Compare) -> None:
         supported = (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq)
-        if any(not isinstance(operator, supported) for operator in node.ops):
-            unsupported = next(
-                operator for operator in node.ops
-                if not isinstance(operator, supported)
-            )
-            raise self._unsupported(unsupported)
+        for operator in node.ops:
+            if not isinstance(operator, supported):
+                raise self._unsupported(operator)
         self.visit(node.left)
         for comparator in node.comparators:
             self.visit(comparator)
@@ -502,39 +500,31 @@ class _ExpressionValidator(ast.NodeVisitor):
                 f"statistics expression {self.source!r} contains a "
                 "non-finite numeric constant"
             )
-        if (
-            isinstance(node.value, int)
-            and int(float(node.value)) != node.value
-        ):
+        if isinstance(node.value, int) and int(float(node.value)) != node.value:
             raise ValueError(
                 f"statistics expression {self.source!r} contains an integer "
                 "constant that cannot be represented exactly"
             )
 
     def visit_Name(self, node: ast.Name) -> None:
-        del node
+        if node.id not in {"pi", "M_PI", "True", "False"}:
+            self.dependencies.add(node.id)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        current: ast.AST = node
-        while isinstance(current, ast.Attribute):
-            current = current.value
-        if not isinstance(current, ast.Name):
-            raise ValueError(
-                "statistics expressions only support dotted field names"
+        self.dependencies.add(
+            _field_reference(
+                node, message="statistics expressions only support dotted field names"
             )
+        )
 
     def visit_Call(self, node: ast.Call) -> None:
         if not isinstance(node.func, ast.Name):
-            raise ValueError(
-                "statistics expression functions must use bare names"
-            )
+            raise ValueError("statistics expression functions must use bare names")
         function = node.func.id
         try:
             arity = _FUNCTION_ARITIES[function]
         except KeyError as error:
-            raise ValueError(
-                f"unsupported expression function {function!r}"
-            ) from error
+            raise ValueError(f"unsupported expression function {function!r}") from error
         if node.keywords:
             raise ValueError(
                 f"statistics expression function {function!r} does not "
@@ -559,10 +549,11 @@ def _parse_expression(source: str) -> tuple[str, ast.Expression]:
 
 
 def _compile_expression(
-    source: str, tree: ast.Expression, known_fields: set[str],
+    source: str,
+    tree: ast.Expression,
+    known_fields: set[str],
 ) -> Expression:
-    _ExpressionValidator(source).visit(tree)
-    visitor = _DependencyVisitor()
+    visitor = _ExpressionValidator(source)
     visitor.visit(tree)
     unknown = visitor.dependencies.difference(known_fields)
     if unknown:
@@ -573,13 +564,15 @@ def _compile_expression(
     return Expression(source, tree, tuple(sorted(visitor.dependencies)))
 
 
-def _field_reference(node: ast.AST) -> str:
+def _field_reference(
+    node: ast.AST, *, message: str = "scatter index must be a field name"
+) -> str:
     parts: list[str] = []
     while isinstance(node, ast.Attribute):
         parts.append(node.attr)
         node = node.value
     if not isinstance(node, ast.Name):
-        raise ValueError("scatter index must be a field name")
+        raise ValueError(message)
     parts.append(node.id)
     return ".".join(reversed(parts))
 
@@ -607,47 +600,75 @@ def parse_value_source(source: str, known_fields: set[str]) -> ValueSource:
         )
     index = _field_reference(body.args[1])
     if index not in known_fields:
-        raise ValueError(
-            f"scatter index {index!r} is not a registered field"
-        )
-    value_tree = ast.Expression(body.args[0])
+        raise ValueError(f"scatter index {index!r} is not a registered field")
+    value_source = ast.get_source_segment(normalized, body.args[0])
+    if value_source is None:
+        raise ValueError("scatter value expression has no source location")
+    value_source, value_tree = _parse_expression(f"({value_source}\n)")
     return ScatterSource(
         Reduction(body.func.id.removeprefix("scatter_")),
-        _compile_expression(ast.unparse(body.args[0]), value_tree, known_fields),
+        _compile_expression(value_source, value_tree, known_fields),
         index,
     )
 
 
 _FUNCTIONS: dict[ExpressionDialect, dict[str, str]] = {
     ExpressionDialect.CUDA: {
-        "abs": "fabs", "sqrt": "sqrt", "exp": "exp",
-        "log": "log", "sin": "sin", "cos": "cos", "tan": "tan",
-        "pow": "pow", "maximum": "hf_max", "minimum": "hf_min",
+        "abs": "fabs",
+        "sqrt": "sqrt",
+        "exp": "exp",
+        "log": "log",
+        "sin": "sin",
+        "cos": "cos",
+        "tan": "tan",
+        "pow": "pow",
+        "maximum": "hf_max",
+        "minimum": "hf_min",
     },
     ExpressionDialect.TRITON: {
-        "abs": "tl.abs", "sqrt": "tl.sqrt",
-        "exp": "tl.exp", "log": "tl.log", "sin": "tl.sin",
-        "cos": "tl.cos", "tan": "libdevice.tan", "pow": "libdevice.pow",
-        "maximum": "hydroforge_maximum", "minimum": "hydroforge_minimum",
+        "abs": "tl.abs",
+        "sqrt": "tl.sqrt",
+        "exp": "tl.exp",
+        "log": "tl.log",
+        "sin": "tl.sin",
+        "cos": "tl.cos",
+        "tan": "libdevice.tan",
+        "pow": "libdevice.pow",
+        "maximum": "hydroforge_maximum",
+        "minimum": "hydroforge_minimum",
     },
     ExpressionDialect.METAL: {
-        "abs": "fabs", "sqrt": "sqrt", "exp": "exp",
-        "log": "log", "sin": "sin", "cos": "cos", "tan": "tan",
-        "pow": "pow", "maximum": "hydroforge_maximum",
+        "abs": "fabs",
+        "sqrt": "sqrt",
+        "exp": "exp",
+        "log": "log",
+        "sin": "sin",
+        "cos": "cos",
+        "tan": "tan",
+        "pow": "pow",
+        "maximum": "hydroforge_maximum",
         "minimum": "hydroforge_minimum",
     },
     ExpressionDialect.TORCH: {
-        "abs": "torch.abs", "sqrt": "torch.sqrt",
-        "exp": "torch.exp", "log": "torch.log", "sin": "torch.sin",
-        "cos": "torch.cos", "tan": "torch.tan", "pow": "torch.pow",
-        "maximum": "hydroforge_maximum", "minimum": "hydroforge_minimum",
+        "abs": "torch.abs",
+        "sqrt": "torch.sqrt",
+        "exp": "torch.exp",
+        "log": "torch.log",
+        "sin": "torch.sin",
+        "cos": "torch.cos",
+        "tan": "torch.tan",
+        "pow": "torch.pow",
+        "maximum": "hydroforge_maximum",
+        "minimum": "hydroforge_minimum",
     },
 }
 
 
 class _ExpressionRenderer:
     def __init__(
-        self, dialect: ExpressionDialect, names: Mapping[str, str],
+        self,
+        dialect: ExpressionDialect,
+        names: Mapping[str, str],
         value_type: str | None,
     ) -> None:
         self.dialect = dialect
@@ -656,7 +677,20 @@ class _ExpressionRenderer:
 
     def render(self, expression: Expression) -> str:
         rendered = self.visit(expression.tree.body)
+        if self.dialect is ExpressionDialect.TORCH:
+            return self._torch_tensor(rendered)
         return self._cast_tensor(rendered)
+
+    def _torch_tensor(self, value: str) -> str:
+        reference = next(iter(self.names.values()), None)
+        arguments = [value]
+        if self.value_type is not None:
+            arguments.append(f"dtype=torch.{self.value_type}")
+        elif reference is not None:
+            arguments.append(f"dtype=({reference}).dtype")
+        if reference is not None:
+            arguments.append(f"device=({reference}).device")
+        return f"torch.as_tensor({', '.join(arguments)})"
 
     def _cast_tensor(self, value: str) -> str:
         if self.value_type is None:
@@ -678,14 +712,21 @@ class _ExpressionRenderer:
             return f"static_cast<{native}>({value})"
         if self.dialect is ExpressionDialect.METAL:
             return f"{native}({value})"
+        if self.dialect is ExpressionDialect.TRITON:
+            return f"tl.cast({value}, {native})"
         return f"({value}).to({native})"
 
     def _numeric_constant(self, value: int | float) -> str:
         rendered = repr(float(value))
+        if self.dialect is ExpressionDialect.TORCH:
+            return self._torch_tensor(rendered)
         if self.value_type is None:
             return rendered
+        if self.dialect is ExpressionDialect.TRITON:
+            return f"tl.full((), {rendered}, tl.{self.value_type})"
         if self.dialect in {
-            ExpressionDialect.CUDA, ExpressionDialect.METAL,
+            ExpressionDialect.CUDA,
+            ExpressionDialect.METAL,
         }:
             return self._cast_tensor(rendered)
         return rendered
@@ -695,9 +736,25 @@ class _ExpressionRenderer:
 
         return f"(({self.visit(node)}) != 0.0)"
 
+    def _numeric_operand(self, node: ast.AST) -> str:
+        rendered = self.visit(node)
+        if self.dialect is ExpressionDialect.TORCH:
+            return self._torch_tensor(rendered)
+        return self._cast_tensor(rendered)
+
+    def _conditional(self, test: ast.AST, body: ast.AST, orelse: ast.AST) -> str:
+        condition = self._truth(test)
+        positive, negative = self.visit(body), self.visit(orelse)
+        if self.dialect is ExpressionDialect.TRITON:
+            return f"tl.where({condition}, {positive}, {negative})"
+        if self.dialect is ExpressionDialect.TORCH:
+            return f"hydroforge_where({condition}, {positive}, {negative})"
+        return f"(({condition}) ? ({positive}) : ({negative}))"
+
     def visit(self, node: ast.AST) -> str:
         if isinstance(node, ast.BinOp):
-            left, right = self.visit(node.left), self.visit(node.right)
+            left = self._numeric_operand(node.left)
+            right = self._numeric_operand(node.right)
             if isinstance(node.op, ast.Mod):
                 if self.dialect is ExpressionDialect.TORCH:
                     return f"hydroforge_remainder({left}, {right})"
@@ -708,23 +765,20 @@ class _ExpressionRenderer:
                         f"(({remainder} != 0.0) & "
                         f"(({remainder} < 0.0) != ({right} < 0.0)))"
                     )
-                    adjusted = (
-                        f"tl.where({adjust}, {remainder} + {right}, "
-                        f"{remainder})"
-                    )
+                    adjusted = f"tl.where({adjust}, {remainder} + {right}, {remainder})"
                     return adjusted
                 remainder = f"fmod({left}, {right})"
                 adjust = (
                     f"(({remainder} != 0.0) && "
                     f"(({remainder} < 0.0) != ({right} < 0.0)))"
                 )
-                adjusted = (
-                    f"(({adjust}) ? ({remainder} + {right}) : "
-                    f"({remainder}))"
-                )
+                adjusted = f"(({adjust}) ? ({remainder} + {right}) : ({remainder}))"
                 return adjusted
             operators = {
-                ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
+                ast.Add: "+",
+                ast.Sub: "-",
+                ast.Mult: "*",
+                ast.Div: "/",
             }
             symbol = operators.get(type(node.op))
             if symbol is not None:
@@ -735,25 +789,31 @@ class _ExpressionRenderer:
                     left, right = self._triton_promote_binary(left, right)
                 return f"{function}({left}, {right})"
         if isinstance(node, ast.UnaryOp):
-            value = self.visit(node.operand)
             if isinstance(node.op, ast.USub):
-                return f"(-{value})"
+                return f"(-{self._numeric_operand(node.operand)})"
             if isinstance(node.op, ast.UAdd):
-                return value
+                return self._numeric_operand(node.operand)
             if isinstance(node.op, ast.Not):
                 return f"({self._truth(node.operand)} == 0)"
         if isinstance(node, ast.BoolOp):
             if self.dialect in {
-                ExpressionDialect.TRITON, ExpressionDialect.TORCH,
+                ExpressionDialect.TRITON,
+                ExpressionDialect.TORCH,
             }:
                 symbol = "&" if isinstance(node.op, ast.And) else "|"
             else:
                 symbol = "&&" if isinstance(node.op, ast.And) else "||"
-            return f"({f' {symbol} '.join(self._truth(value) for value in node.values)})"
+            return (
+                f"({f' {symbol} '.join(self._truth(value) for value in node.values)})"
+            )
         if isinstance(node, ast.Compare):
             symbols = {
-                ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=",
-                ast.Eq: "==", ast.NotEq: "!=",
+                ast.Lt: "<",
+                ast.LtE: "<=",
+                ast.Gt: ">",
+                ast.GtE: ">=",
+                ast.Eq: "==",
+                ast.NotEq: "!=",
             }
             left = self.visit(node.left)
             pieces = []
@@ -762,28 +822,31 @@ class _ExpressionRenderer:
                 symbol = symbols[type(operator)]
                 pieces.append(f"({left} {symbol} {right})")
                 left = right
-            conjunction = " & " if self.dialect in {
-                ExpressionDialect.TRITON, ExpressionDialect.TORCH,
-            } else " && "
+            conjunction = (
+                " & "
+                if self.dialect
+                in {
+                    ExpressionDialect.TRITON,
+                    ExpressionDialect.TORCH,
+                }
+                else " && "
+            )
             return f"({conjunction.join(pieces)})"
         if isinstance(node, ast.IfExp):
-            condition = self._truth(node.test)
-            positive, negative = self.visit(node.body), self.visit(node.orelse)
-            if self.dialect is ExpressionDialect.TRITON:
-                return f"tl.where({condition}, {positive}, {negative})"
-            if self.dialect is ExpressionDialect.TORCH:
-                return f"hydroforge_where({condition}, {positive}, {negative})"
-            return f"(({condition}) ? ({positive}) : ({negative}))"
-        if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, float)):
+            return self._conditional(node.test, node.body, node.orelse)
+        if isinstance(node, ast.Constant) and isinstance(
+            node.value, (bool, int, float)
+        ):
             if isinstance(node.value, bool):
                 if self.dialect in {
-                    ExpressionDialect.TRITON, ExpressionDialect.TORCH,
+                    ExpressionDialect.TRITON,
+                    ExpressionDialect.TORCH,
                 }:
                     return "True" if node.value else "False"
                 return "true" if node.value else "false"
             return self._numeric_constant(node.value)
         if isinstance(node, (ast.Name, ast.Attribute)):
-            name = self._name(node)
+            name = _field_reference(node)
             if name in {"pi", "M_PI"}:
                 # Treat pi exactly like every other numeric literal.  Leaving
                 # M_PI as a double in CUDA/Metal promotes an otherwise float32
@@ -792,48 +855,27 @@ class _ExpressionRenderer:
                 return self._numeric_constant(math.pi)
             return self._cast_tensor(self.names[name])
         if isinstance(node, ast.Call):
-            function = self._name(node.func).split(".")[-1]
+            function = node.func.id
             if function == "where":
-                condition = self._truth(node.args[0])
-                positive = self.visit(node.args[1])
-                negative = self.visit(node.args[2])
-                if self.dialect is ExpressionDialect.TRITON:
-                    return f"tl.where({condition}, {positive}, {negative})"
-                if self.dialect is ExpressionDialect.TORCH:
-                    return f"hydroforge_where({condition}, {positive}, {negative})"
-                return f"(({condition}) ? ({positive}) : ({negative}))"
-            arguments = [self.visit(argument) for argument in node.args]
+                return self._conditional(*node.args)
+            arguments = [self._numeric_operand(argument) for argument in node.args]
             rendered = _FUNCTIONS[self.dialect][function]
-            if (
-                self.dialect is ExpressionDialect.TRITON
-                and function == "pow"
-            ):
+            if self.dialect is ExpressionDialect.TRITON and function == "pow":
                 arguments = list(self._triton_promote_binary(*arguments))
             return f"{rendered}({', '.join(arguments)})"
         return ""
 
-    @staticmethod
-    def _triton_promote_binary(left: str, right: str) -> tuple[str, str]:
-        """Give libdevice binary operands one common inferred tensor dtype."""
-        return (
-            f"(({left}) + ({right}) * 0.0)",
-            f"(({right}) + ({left}) * 0.0)",
+    def _triton_promote_binary(self, left: str, right: str) -> tuple[str, str]:
+        """Unify libdevice operand types without evaluating extra arithmetic."""
+        dtype = (
+            f"tl.{self.value_type}"
+            if self.value_type is not None
+            else f"(tl.where(True, {left}, {right})).dtype"
         )
-
-    @staticmethod
-    def _name(node: ast.AST) -> str:
-        if isinstance(node, ast.Name):
-            return node.id
-        if isinstance(node, ast.Attribute):
-            parts = []
-            current: ast.AST = node
-            while isinstance(current, ast.Attribute):
-                parts.append(current.attr)
-                current = current.value
-            if isinstance(current, ast.Name):
-                parts.append(current.id)
-                return ".".join(reversed(parts))
-        return ""
+        return (
+            f"tl.cast({left}, {dtype})",
+            f"tl.cast({right}, {dtype})",
+        )
 
 
 def render_expression(
@@ -845,7 +887,9 @@ def render_expression(
 ) -> str:
     """Lower one validated expression; only syntax varies by dialect."""
     return _ExpressionRenderer(
-        dialect, names, value_type,
+        dialect,
+        names,
+        value_type,
     ).render(expression)
 
 
@@ -862,7 +906,7 @@ def build_statistics_ir(aggregator: Any) -> StatisticsIR:
         variable = StatisticVariable(
             name=name,
             safe_name=aggregator._get_safe_name(name),
-            source=program.sources.get(name, TensorSource(name)),
+            source=program.sources.get(name) or TensorSource(name),
             operations=program.operations[name],
             tensor_shape=metadata.shape,
             actual_shape=layout.actual_shape,
@@ -875,5 +919,8 @@ def build_statistics_ir(aggregator: Any) -> StatisticsIR:
     by_name = MappingProxyType({variable.name: variable for variable in variables})
     grouped = MappingProxyType({key: tuple(value) for key, value in groups.items()})
     return StatisticsIR(
-        tuple(variables), by_name, grouped, program.sources,
+        tuple(variables),
+        by_name,
+        grouped,
+        program.sources,
     )

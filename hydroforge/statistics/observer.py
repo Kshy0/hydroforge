@@ -31,7 +31,8 @@ class _MetalStatisticsOperator(MetalCommandNode):
     def record(self) -> None:
         aggregator = self.observer.aggregator
         aggregator._aggregator_function(
-            aggregator._kernel_states, aggregator.block_size,
+            aggregator._kernel_states,
+            aggregator.block_size,
         )
 
 
@@ -41,7 +42,9 @@ class StatisticsObserver:
     _FOLD_INNER_OPS = frozenset({"last", "mean", "sum", "max", "min", "first"})
 
     def __init__(
-        self, model: AbstractModel, aggregator: StatisticsRuntime,
+        self,
+        model: AbstractModel,
+        aggregator: StatisticsRuntime,
     ) -> None:
         self.model = model
         self.aggregator = aggregator
@@ -64,14 +67,19 @@ class StatisticsObserver:
         total_weight: float,
     ) -> None:
         self.aggregator.update_statistics(
-            sub_step, num_sub_steps, flags, weight, total_weight,
+            sub_step,
+            num_sub_steps,
+            flags,
+            weight,
+            total_weight,
         )
 
     def finish(self, current_time: DateLike) -> None:
         self.aggregator.finalize_time_step(current_time)
 
     def check_background_failures(
-        self, current_time: DateLike,
+        self,
+        current_time: DateLike,
     ) -> None:
         self.aggregator.check_background_failures(current_time)
 
@@ -85,9 +93,7 @@ class StatisticsObserver:
             for variable in aggregator._statistics_ir.variables
             for operation in variable.operations
         )
-        compatible = all(
-            reduction in self._FOLD_INNER_OPS for reduction in reductions
-        )
+        compatible = all(reduction in self._FOLD_INNER_OPS for reduction in reductions)
         should_fold = any(
             reduction in self._FOLD_INNER_OPS and reduction != "last"
             for reduction in reductions
@@ -133,7 +139,8 @@ class StatisticsObserver:
     def prelaunch(self, flags: int, total_weight: float) -> None:
         aggregator = self.aggregator
         converted_total = aggregator._convert_control_float(
-            "total_weight", total_weight,
+            "total_weight",
+            total_weight,
         )
         states = aggregator._kernel_states
         is_inner_last = bool(flags & 2)

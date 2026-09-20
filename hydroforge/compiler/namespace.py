@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Mapping
-
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -20,6 +20,45 @@ class NamespaceEntry:
     coordinate: str | None
 
 
+_Entry = TypeVar("_Entry")
+
+
+class FieldNameResolver(Generic[_Entry]):
+    """One qualified/bare-name precedence rule for declarations and bindings."""
+
+    def __init__(self) -> None:
+        self.entries: dict[str, _Entry] = {}
+        self.virtual_names: set[str] = set()
+        self.ambiguous_names: set[str] = set()
+
+    def install(
+        self,
+        module_name: str,
+        field_name: str,
+        entry: _Entry,
+        *,
+        expression_virtual: bool,
+    ) -> None:
+        self.entries[f"{module_name}.{field_name}"] = entry
+        if expression_virtual:
+            if field_name in self.virtual_names:
+                self.entries.pop(field_name, None)
+                self.ambiguous_names.add(field_name)
+            else:
+                self.entries[field_name] = entry
+                self.virtual_names.add(field_name)
+                self.ambiguous_names.discard(field_name)
+        elif (
+            field_name not in self.virtual_names
+            and field_name not in self.ambiguous_names
+        ):
+            if field_name in self.entries:
+                self.entries.pop(field_name)
+                self.ambiguous_names.add(field_name)
+            else:
+                self.entries[field_name] = entry
+
+
 class NamespaceCompiler:
     """Build qualified mappings and resolve unqualified field ownership."""
 
@@ -30,29 +69,7 @@ class NamespaceCompiler:
     def build(self) -> Mapping[str, NamespaceEntry]:
         if self._mapping is not None:
             return self._mapping
-        mapping: dict[str, NamespaceEntry] = {}
-        virtual: set[str] = set()
-        ambiguous: set[str] = set()
-
-        def install_bare(
-            field_name: str,
-            entry: NamespaceEntry,
-            *,
-            expression_virtual: bool,
-        ) -> None:
-            if expression_virtual:
-                if field_name not in virtual:
-                    mapping[field_name] = entry
-                    virtual.add(field_name)
-                ambiguous.discard(field_name)
-                return
-            if field_name in virtual or field_name in ambiguous:
-                return
-            if field_name in mapping:
-                mapping.pop(field_name)
-                ambiguous.add(field_name)
-                return
-            mapping[field_name] = entry
+        resolver: FieldNameResolver[NamespaceEntry] = FieldNameResolver()
 
         for module_name in self.model.opened_modules:
             module = self.model._modules[module_name]
@@ -65,8 +82,8 @@ class NamespaceCompiler:
                     field_name=field_name,
                     coordinate=field.tensor.dim_coords,
                 )
-                mapping[f"{module_name}.{field_name}"] = entry
-                install_bare(
+                resolver.install(
+                    module_name,
                     field_name,
                     entry,
                     expression_virtual=(
@@ -75,18 +92,25 @@ class NamespaceCompiler:
                     ),
                 )
 
-            for field_name in module._reference_index_fields():
-                metadata = module._reference_index_metadata(field_name)
+            for field_name in module._reference_index_fields(
+                opened_modules=self.model.opened_modules,
+                field_demand=self.model._field_demand,
+            ):
+                metadata = module._reference_index_metadata(
+                    field_name,
+                    opened_modules=self.model.opened_modules,
+                    field_demand=self.model._field_demand,
+                )
                 entry = NamespaceEntry(
                     module=module,
                     field_name=field_name,
                     coordinate=metadata.dim_coords,
                 )
-                mapping[f"{module_name}.{field_name}"] = entry
-                install_bare(
+                resolver.install(
+                    module_name,
                     field_name,
                     entry,
                     expression_virtual=False,
                 )
-        self._mapping = MappingProxyType(mapping)
+        self._mapping = MappingProxyType(resolver.entries)
         return self._mapping

@@ -5,23 +5,23 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 from uuid import uuid4
 
 import numpy as np
 import numpy.ma as ma
 import torch
 from netCDF4 import Dataset
-from pydantic import model_validator
+from pydantic import BeforeValidator, Field, model_validator
 
-from hydroforge.contracts.events import emit
 from hydroforge.contracts.errors import (
     ResourceCleanupError,
     distributed_failure_error,
     failure_description,
 )
+from hydroforge.contracts.events import emit
+from hydroforge.contracts.validation import FrozenMapping, HydroForgeModel
 from hydroforge.data.input import InputProxy
-from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.serialization.files import atomic_output_path
 from hydroforge.serialization.netcdf import (
     LOGICAL_DTYPE_ATTR,
@@ -59,28 +59,29 @@ class _CheckpointPlan:
 @dataclass(frozen=True, slots=True)
 class _CheckpointSaveStage:
     timestamp: str
-    path: Any
+    path: Path
     data: dict[str, Any]
     distributed: tuple[str, ...]
     global_fields: tuple[str, ...]
     groups: dict[str, str]
 
 
+_CheckpointPath = Annotated[Path, BeforeValidator(lambda value: Path(value))]
+
+
 class _CheckpointMergeDeclaration(HydroForgeModel):
     """Complete validated input for one distributed checkpoint merge."""
 
-    output_path: str | Path
-    rank_paths: tuple[str | Path, ...]
-    variable_group_mapping: Mapping[str, str]
-    netcdf_options: Mapping[str, Any]
+    output_path: _CheckpointPath
+    rank_paths: tuple[_CheckpointPath, ...] = Field(min_length=1)
+    variable_group_mapping: FrozenMapping[str, str]
+    netcdf_options: Annotated[
+        FrozenMapping[str, Any], BeforeValidator(normalize_netcdf_variable_options)
+    ]
 
     @model_validator(mode="after")
     def _validate_merge(self):
-        if not self.rank_paths:
-            raise ValueError("checkpoint merge requires at least one rank file")
-        paths = tuple(Path(path) for path in self.rank_paths)
-        normalized = tuple(str(path) for path in paths)
-        if len(normalized) != len(set(normalized)):
+        if len(self.rank_paths) != len(set(self.rank_paths)):
             raise ValueError("checkpoint merge received duplicate rank files")
         distributed_names = set(self.variable_group_mapping)
         unknown_groups = set(self.variable_group_mapping.values()).difference(
@@ -91,13 +92,6 @@ class _CheckpointMergeDeclaration(HydroForgeModel):
                 "checkpoint variable groups must name mapped coordinate "
                 f"variables: {sorted(unknown_groups)}"
             )
-        object.__setattr__(self, "output_path", Path(self.output_path))
-        object.__setattr__(self, "rank_paths", paths)
-        object.__setattr__(
-            self,
-            "netcdf_options",
-            normalize_netcdf_variable_options(self.netcdf_options),
-        )
         return self
 
 
@@ -131,22 +125,19 @@ def _merge_rank_checkpoints(
     }
 
     with _atomic_netcdf_dataset_trusted(
-        output_path, format="NETCDF4",
+        output_path,
+        format="NETCDF4",
     ) as merged_ds:
         for r, rank_path in enumerate(rank_paths):
             with Dataset(rank_path, "r") as rank_ds:
-                attrs = {
-                    name: rank_ds.getncattr(name) for name in rank_ds.ncattrs()
-                }
+                attrs = rank_ds.ncattrs()
                 if attrs:
                     raise ValueError(
                         f"Rank checkpoint {rank_path!s} must not contain "
                         f"global attributes: {sorted(attrs)}"
                     )
                 rank_variables = set(rank_ds.variables)
-                missing_distributed = distributed_names.difference(
-                    rank_variables
-                )
+                missing_distributed = distributed_names.difference(rank_variables)
                 if missing_distributed:
                     raise ValueError(
                         f"Rank checkpoint {rank_path!s} is missing distributed "
@@ -197,38 +188,37 @@ def _merge_rank_checkpoints(
                 for var_name, var_in in rank_ds.variables.items():
                     is_distributed = var_name in variable_group_mapping
                     raw_data = var_in[:]
-                    if ma.isMaskedArray(raw_data) and np.any(
-                        ma.getmaskarray(raw_data)
-                    ):
+                    if ma.isMaskedArray(raw_data) and np.any(ma.getmaskarray(raw_data)):
                         raise ValueError(
                             f"Rank checkpoint {rank_path!s} variable "
                             f"{var_name!r} contains missing values"
                         )
-                    data = np.asarray(decode_netcdf_logical_array(
-                        var_in, raw_data, name=var_name,
-                    ))
+                    data = np.asarray(
+                        decode_netcdf_logical_array(
+                            var_in,
+                            raw_data,
+                            name=var_name,
+                        )
+                    )
                     storage_dtype, logical_dtype = netcdf_dtype_encoding(
                         data.dtype,
                     )
 
                     # Define/create dims and variable in merged file
                     if var_name not in merged_ds.variables:
-                        # Build dims
-                        if data.ndim == 0:
-                            dims = ()
-                        else:
-                            dims = []
-                            for ax, sz in enumerate(data.shape):
-                                if is_distributed and ax == 0:
-                                    dname = f"{var_name}_n"
-                                    # Ensure dim exists
-                                    if dname not in merged_ds.dimensions:
-                                        merged_ds.createDimension(dname, None) # Unlimited
-                                else:
-                                    dname = f"{var_name}_dim{ax}"
-                                    if dname not in merged_ds.dimensions:
-                                        merged_ds.createDimension(dname, sz)
-                                dims.append(dname)
+                        dims = []
+                        for axis, size in enumerate(data.shape):
+                            partitioned = is_distributed and axis == 0
+                            dimension = (
+                                f"{var_name}_n"
+                                if partitioned
+                                else f"{var_name}_dim{axis}"
+                            )
+                            if dimension not in merged_ds.dimensions:
+                                merged_ds.createDimension(
+                                    dimension, None if partitioned else size
+                                )
+                            dims.append(dimension)
 
                         variable_options = _prepare_netcdf_variable_options_trusted(
                             create_options,
@@ -246,12 +236,15 @@ def _merge_rank_checkpoints(
                         )
                         if logical_dtype is not None:
                             merged_var.setncattr(
-                                LOGICAL_DTYPE_ATTR, logical_dtype,
+                                LOGICAL_DTYPE_ATTR,
+                                logical_dtype,
                             )
                     else:
                         merged_var = merged_ds.variables[var_name]
                         merged_logical_dtype = getattr(
-                            merged_var, LOGICAL_DTYPE_ATTR, None,
+                            merged_var,
+                            LOGICAL_DTYPE_ATTR,
+                            None,
                         )
                         if logical_dtype != merged_logical_dtype:
                             raise TypeError(
@@ -274,27 +267,16 @@ def _merge_rank_checkpoints(
                                 f"{data.shape[1:]}"
                             )
 
-                    # Write/append
-                    if data.ndim == 0:
-                        # Only copy from rank 0 for non-distributed scalars
-                        if r == 0:
-                            merged_var.assignValue(
-                                data.astype(storage_dtype, copy=False),
-                            )
+                    stored = data.astype(storage_dtype, copy=False)
+                    if is_distributed:
+                        offset = offsets.get(var_name, 0)
+                        end = offset + data.shape[0]
+                        merged_var[offset:end, ...] = stored
+                        offsets[var_name] = end
+                    elif data.ndim == 0:
+                        merged_var.assignValue(stored)
                     else:
-                        if is_distributed:
-                            off = offsets.get(var_name, 0)
-                            n = data.shape[0]
-                            merged_var[off : off + n, ...] = data.astype(
-                                storage_dtype, copy=False,
-                            )
-                            offsets[var_name] = off + n
-                        else:
-                            # Only copy non-distributed arrays from rank 0
-                            if r == 0:
-                                merged_var[:] = data.astype(
-                                    storage_dtype, copy=False,
-                                )
+                        merged_var[:] = stored
         for coordinate, parts in coordinate_parts.items():
             combined = np.concatenate(parts)
             if np.unique(combined).size != combined.size:
@@ -316,7 +298,17 @@ class CheckpointRuntime:
                 (
                     field.name,
                     field.module_name,
-                    field.shape,
+                    tuple(
+                        None
+                        if axis == field.partition_axis
+                        or (
+                            axis == 0
+                            and field.info.tensor is not None
+                            and len(field.shape) == len(field.info.tensor.shape) + 1
+                        )
+                        else extent
+                        for axis, extent in enumerate(field.shape)
+                    ),
                     str(field.numpy_dtype),
                     field.coordinate,
                     field.partition_axis,
@@ -335,9 +327,7 @@ class CheckpointRuntime:
         """Route every checkpoint collective through the public protocol."""
 
         if self.model.world_size == 1:
-            return (
-                None if error is None else failure_description(error),
-            )
+            return (None if error is None else failure_description(error),)
         return self.model._gather_distributed_failures(
             error,
             phase=phase,
@@ -355,7 +345,8 @@ class CheckpointRuntime:
         candidate = uuid4().hex if model.rank == 0 else None
         signature = (
             None
-            if stage is None else (
+            if stage is None
+            else (
                 stage.timestamp,
                 self.plan.layout_signature,
                 stage.distributed,
@@ -363,9 +354,7 @@ class CheckpointRuntime:
             )
         )
         if model.world_size == 1:
-            failures = (
-                None if error is None else failure_description(error),
-            )
+            failures = (None if error is None else failure_description(error),)
             return failures, None if error is not None else candidate
         failures, payloads = model._exchange_distributed_public_transaction(
             error,
@@ -390,7 +379,7 @@ class CheckpointRuntime:
     @staticmethod
     def _numpy_dtype(value: Any) -> np.dtype:
         if isinstance(value, torch.Tensor):
-            return np.asarray(value.detach().cpu().numpy()).dtype
+            return torch.empty(0, dtype=value.dtype, device="cpu").numpy().dtype
         return np.asarray(value).dtype
 
     def _local_input_value(self, name: str) -> Any:
@@ -398,12 +387,8 @@ class CheckpointRuntime:
 
         source = self.model._input
         group = self.model._partition.variable_groups.get(name)
-        if group is None:
-            return source[name]
-        indices = self.model._partition.rank_indices(group)
-        axis = self.model._semantic_plan.input_axes[name]
-        selector = (slice(None), indices) if axis == 1 else indices
-        return source.get_subset(name, selector)
+        indices = None if group is None else self.model._partition.rank_indices(group)
+        return source.read_local(name, indices)
 
     def _field_value(self, field: _InputField) -> Any:
         value = getattr(field.module, field.name)
@@ -436,10 +421,9 @@ class CheckpointRuntime:
                     # declared default is reconstructed from that same default.
                     continue
                 value = self._local_input_value(name)
-            shape = tuple(np.shape(
-                value.detach().cpu().numpy()
-                if isinstance(value, torch.Tensor) else value
-            ))
+            shape = tuple(
+                value.shape if isinstance(value, torch.Tensor) else np.shape(value)
+            )
             coordinate = partition.field_coordinate(info)
             fields[name] = _InputField(
                 name=name,
@@ -450,8 +434,9 @@ class CheckpointRuntime:
                 numpy_dtype=self._numpy_dtype(value),
                 coordinate=coordinate,
                 partition_axis=(
-                    partition.logical_axis(name, info, shape)
-                    if coordinate is not None else None
+                    len(shape) - len(info.tensor.shape)
+                    if coordinate is not None
+                    else None
                 ),
             )
         return tuple(fields[name] for name in sorted(fields))
@@ -463,13 +448,11 @@ class CheckpointRuntime:
         variable_map = model._namespace.build()
         fields = self.plan.fields
         current_time = model.current_time
-        timestamp = (
-            current_time.strftime("%Y%m%d_%H%M%S")
-            if current_time else "latest"
-        )
+        timestamp = current_time.strftime("%Y%m%d_%H%M%S") if current_time else "latest"
         name = (
             f"model_state_rank{model.rank}_{timestamp}.nc"
-            if model.world_size > 1 else f"model_state_{timestamp}.nc"
+            if model.world_size > 1
+            else f"model_state_{timestamp}.nc"
         )
         path = model.output_full_dir / name
         data: dict[str, Any] = {}
@@ -484,7 +467,7 @@ class CheckpointRuntime:
                 continue
             value = self._field_value(field)
             if isinstance(value, torch.Tensor):
-                value = value.detach().cpu().numpy().copy()
+                value = value.detach().to(device="cpu", copy=True).numpy()
             elif isinstance(value, np.ndarray):
                 value = np.array(value, order="K", copy=True, subok=False)
             elif isinstance(value, np.generic):
@@ -505,7 +488,7 @@ class CheckpointRuntime:
             entry = variable_map[coordinate]
             value = getattr(entry.module, entry.field_name)
             if isinstance(value, torch.Tensor):
-                value = value.detach().cpu().numpy().copy()
+                value = value.detach().to(device="cpu", copy=True).numpy()
             data[coordinate] = value
             groups[coordinate] = coordinate
             distributed.append(coordinate)
@@ -565,16 +548,22 @@ class CheckpointRuntime:
         for event, message, fields in (
             (
                 "checkpoint.saved_distributed",
-                "Saved distributed state fields", distributed,
+                "Saved distributed state fields",
+                distributed,
             ),
             (
                 "checkpoint.saved_global",
-                "Saved global state fields", global_fields,
+                "Saved global state fields",
+                global_fields,
             ),
         ):
             if fields:
                 emit(
-                    model, "info", event, message, rank=model.rank,
+                    model,
+                    "info",
+                    event,
+                    message,
+                    rank=model.rank,
                     fields=tuple(fields),
                 )
 
@@ -590,7 +579,9 @@ class CheckpointRuntime:
         rollback_error: BaseException | None = None
         try:
             suppressed = transaction.__exit__(
-                type(primary), primary, primary.__traceback__,
+                type(primary),
+                primary,
+                primary.__traceback__,
             )
             if suppressed:
                 rollback_error = RuntimeError(
@@ -631,9 +622,12 @@ class CheckpointRuntime:
             staging_path = transaction.__enter__()
             if path.exists():
                 emit(
-                    model, "warning", "checkpoint.overwrite",
+                    model,
+                    "warning",
+                    "checkpoint.overwrite",
                     "Overwriting existing model state",
-                    rank=model.rank, path=path,
+                    rank=model.rank,
+                    path=path,
                 )
             proxy._to_nc(
                 staging_path,
@@ -651,7 +645,9 @@ class CheckpointRuntime:
             if staging_path is None:
                 raise failure
             self._rollback_single_rank_save(
-                transaction, failure, checkpoint_id=checkpoint_id,
+                transaction,
+                failure,
+                checkpoint_id=checkpoint_id,
             )
 
         event_error: BaseException | None = None
@@ -678,9 +674,7 @@ class CheckpointRuntime:
         try:
             transaction.__exit__(None, None, None)
             if not path.is_file():
-                raise FileNotFoundError(
-                    f"Checkpoint commit point is missing: {path}"
-                )
+                raise FileNotFoundError(f"Checkpoint commit point is missing: {path}")
         except BaseException as error:
             commit_error = error
         commit_failures = self._coordinate_phase(
@@ -699,13 +693,17 @@ class CheckpointRuntime:
 
         model = self.model
         stage = None
+        proxy = None
         stage_error: BaseException | None = None
         try:
+            model._ensure_healthy_runtime()
             stage = self._stage_save()
+            proxy = InputProxy(data=stage.data)
         except BaseException as error:
             stage_error = error
         stage_failures, checkpoint_id = self._coordinate_save_entry(
-            stage_error, stage,
+            stage_error,
+            stage,
         )
         if any(failure is not None for failure in stage_failures):
             if stage_error is not None:
@@ -715,32 +713,34 @@ class CheckpointRuntime:
                 stage_failures,
             )
         stage = cast(_CheckpointSaveStage, stage)
+        proxy = cast(InputProxy, proxy)
         checkpoint_id = cast(str, checkpoint_id)
         path = stage.path
         timestamp = stage.timestamp
-        data = stage.data
         distributed = stage.distributed
         global_fields = stage.global_fields
         groups = stage.groups
         execution = model._execution
-        proxy = InputProxy(data=data)
         if model.world_size == 1:
             return self._save_single_rank(
-                stage, proxy, checkpoint_id=checkpoint_id,
+                stage,
+                proxy,
+                checkpoint_id=checkpoint_id,
             )
         write_error: BaseException | None = None
         try:
             if path.exists():
                 emit(
-                    model, "warning", "checkpoint.overwrite",
+                    model,
+                    "warning",
+                    "checkpoint.overwrite",
                     "Overwriting existing model state",
-                    rank=model.rank, path=path,
+                    rank=model.rank,
+                    path=path,
                 )
             proxy._to_nc(
                 path,
-                netcdf_options=(
-                    model.checkpoint_netcdf_options if model.world_size == 1 else {}
-                ),
+                netcdf_options={},
             )
         except BaseException as error:
             write_error = error
@@ -759,7 +759,9 @@ class CheckpointRuntime:
                 )
             )
             self._abort_save(
-                path, failure, checkpoint_id=checkpoint_id,
+                path,
+                failure,
+                checkpoint_id=checkpoint_id,
             )
         event_error: BaseException | None = None
         try:
@@ -784,150 +786,159 @@ class CheckpointRuntime:
                 )
             )
             self._abort_save(
-                path, failure, checkpoint_id=checkpoint_id,
+                path,
+                failure,
+                checkpoint_id=checkpoint_id,
             )
 
-        committed_proxy = proxy
-        if model.world_size > 1:
-            merge_error: BaseException | None = None
-            rank_paths = ()
-            merged = model.output_full_dir / f"model_state_{timestamp}.nc"
-            if model.rank == 0:
-                rank_paths = tuple(
-                    model.output_full_dir
-                    / f"model_state_rank{rank}_{timestamp}.nc"
-                    for rank in range(model.world_size)
+        merge_error: BaseException | None = None
+        rank_paths = ()
+        merged = model.output_full_dir / f"model_state_{timestamp}.nc"
+        if model.rank == 0:
+            rank_paths = tuple(
+                model.output_full_dir / f"model_state_rank{rank}_{timestamp}.nc"
+                for rank in range(model.world_size)
+            )
+            try:
+                _merge_rank_checkpoints(
+                    merged,
+                    rank_paths,
+                    groups,
+                    netcdf_options=model.checkpoint_netcdf_options,
                 )
+            except BaseException as error:
+                merge_error = error
+        merge_failures = self._coordinate_phase(
+            merge_error,
+            phase="checkpoint.save.merge",
+            signature=(checkpoint_id, timestamp, str(merged)),
+        )
+        if any(failure is not None for failure in merge_failures):
+            failure = (
+                merge_error
+                if merge_error is not None
+                else distributed_failure_error(
+                    "distributed checkpoint rank merge",
+                    merge_failures,
+                )
+            )
+            self._abort_save(
+                path,
+                failure,
+                checkpoint_id=checkpoint_id,
+            )
+        commit_error: BaseException | None = None
+        if not merged.is_file():
+            commit_error = FileNotFoundError(
+                f"Merged checkpoint commit point is missing: {merged}"
+            )
+        commit_failures = self._coordinate_phase(
+            commit_error,
+            phase="checkpoint.save.commit",
+            signature=(checkpoint_id, timestamp, str(merged)),
+        )
+        if any(failure is not None for failure in commit_failures):
+            failure = (
+                commit_error
+                if commit_error is not None
+                else distributed_failure_error(
+                    "distributed checkpoint commit",
+                    commit_failures,
+                )
+            )
+            execution.poison(failure, phase="checkpoint save commit")
+            raise failure
+        # The atomic merged file is the checkpoint commit point. Rank-file
+        # removal is post-commit garbage collection: allowing a partial
+        # cleanup failure to turn a published checkpoint into a reported
+        # merge failure would make retry impossible once an earlier rank
+        # file had already been removed.
+        post_commit_errors: list[BaseException] = []
+        if model.rank == 0:
+            try:
+                emit(
+                    model,
+                    "info",
+                    "checkpoint.merged",
+                    "Merged distributed state",
+                    rank=0,
+                    path=merged,
+                )
+            except BaseException as error:
+                post_commit_errors.append(error)
+            cleanup_failures = []
+            for rank_path in rank_paths:
                 try:
-                    _merge_rank_checkpoints(
-                        merged, rank_paths, groups,
-                        netcdf_options=model.checkpoint_netcdf_options,
-                    )
+                    rank_path.unlink(missing_ok=True)
                 except BaseException as error:
-                    merge_error = error
-            merge_failures = self._coordinate_phase(
-                merge_error,
-                phase="checkpoint.save.merge",
-                signature=(checkpoint_id, timestamp, str(merged)),
-            )
-            if any(failure is not None for failure in merge_failures):
-                failure = (
-                    merge_error
-                    if merge_error is not None
-                    else distributed_failure_error(
-                        "distributed checkpoint rank merge",
-                        merge_failures,
+                    cleanup_failures.append(
+                        {
+                            "path": str(rank_path),
+                            **failure_description(error),
+                        }
                     )
-                )
-                self._abort_save(
-                    path, failure, checkpoint_id=checkpoint_id,
-                )
-            commit_error: BaseException | None = None
-            if not merged.is_file():
-                commit_error = FileNotFoundError(
-                    f"Merged checkpoint commit point is missing: {merged}"
-                )
-            commit_failures = self._coordinate_phase(
-                commit_error,
-                phase="checkpoint.save.commit",
-                signature=(checkpoint_id, timestamp, str(merged)),
-            )
-            if any(failure is not None for failure in commit_failures):
-                failure = (
-                    commit_error
-                    if commit_error is not None
-                    else distributed_failure_error(
-                        "distributed checkpoint commit",
-                        commit_failures,
-                    )
-                )
-                execution.poison(failure, phase="checkpoint save commit")
-                raise failure
-            # The atomic merged file is the checkpoint commit point. Rank-file
-            # removal is post-commit garbage collection: allowing a partial
-            # cleanup failure to turn a published checkpoint into a reported
-            # merge failure would make retry impossible once an earlier rank
-            # file had already been removed.
-            post_commit_errors: list[BaseException] = []
-            if model.rank == 0:
+            if cleanup_failures:
                 try:
                     emit(
-                        model, "info", "checkpoint.merged",
-                        "Merged distributed state", rank=0, path=merged,
+                        model,
+                        "warning",
+                        "checkpoint.cleanup_failed",
+                        "Merged checkpoint was published but temporary rank "
+                        "files could not all be removed",
+                        rank=0,
+                        failures=tuple(cleanup_failures),
                     )
                 except BaseException as error:
                     post_commit_errors.append(error)
-                cleanup_failures = []
-                for rank_path in rank_paths:
-                    try:
-                        rank_path.unlink(missing_ok=True)
-                    except BaseException as error:
-                        cleanup_failures.append({
-                            "path": str(rank_path),
-                            **failure_description(error),
-                        })
-                if cleanup_failures:
-                    try:
-                        emit(
-                            model, "warning", "checkpoint.cleanup_failed",
-                            "Merged checkpoint was published but temporary rank "
-                            "files could not all be removed",
-                            rank=0, failures=tuple(cleanup_failures),
-                        )
-                    except BaseException as error:
-                        post_commit_errors.append(error)
-            post_commit_error = (
-                None
-                if not post_commit_errors
-                else post_commit_errors[0]
-                if len(post_commit_errors) == 1
-                else ResourceCleanupError(
-                    "checkpoint post-commit events",
-                    post_commit_errors,
+        post_commit_error = (
+            None
+            if not post_commit_errors
+            else post_commit_errors[0]
+            if len(post_commit_errors) == 1
+            else ResourceCleanupError(
+                "checkpoint post-commit events",
+                post_commit_errors,
+            )
+        )
+        post_commit_failures = self._coordinate_phase(
+            post_commit_error,
+            phase="checkpoint.save.events.postcommit",
+            signature=(checkpoint_id, timestamp),
+        )
+        if any(failure is not None for failure in post_commit_failures):
+            error = (
+                post_commit_error
+                if post_commit_error is not None
+                else distributed_failure_error(
+                    "distributed checkpoint post-commit event",
+                    post_commit_failures,
                 )
             )
-            post_commit_failures = self._coordinate_phase(
-                post_commit_error,
-                phase="checkpoint.save.events.postcommit",
-                signature=(checkpoint_id, timestamp),
-            )
-            if any(
-                failure is not None for failure in post_commit_failures
-            ):
-                error = (
-                    post_commit_error
-                    if post_commit_error is not None
-                    else distributed_failure_error(
-                        "distributed checkpoint post-commit event",
-                        post_commit_failures,
-                    )
+            execution.poison(error, phase="checkpoint post-commit event")
+            raise error
+        # Return the committed, globally merged construction input on
+        # every rank. A rank-local staging proxy omits global fields away
+        # from rank zero and is therefore not a complete model input.
+        reopen_error: BaseException | None = None
+        reopened_proxy: InputProxy | None = None
+        try:
+            reopened_proxy = InputProxy.from_nc(merged, lazy=True)
+        except BaseException as error:
+            reopen_error = error
+        reopen_failures = self._coordinate_phase(
+            reopen_error,
+            phase="checkpoint.save.reopen",
+            signature=(checkpoint_id, timestamp, str(merged)),
+        )
+        if any(failure is not None for failure in reopen_failures):
+            failure = (
+                reopen_error
+                if reopen_error is not None
+                else distributed_failure_error(
+                    "distributed checkpoint merged checkpoint reopen",
+                    reopen_failures,
                 )
-                execution.poison(error, phase="checkpoint post-commit event")
-                raise error
-            # Return the committed, globally merged construction input on
-            # every rank. A rank-local staging proxy omits global fields away
-            # from rank zero and is therefore not a complete model input.
-            reopen_error: BaseException | None = None
-            reopened_proxy: InputProxy | None = None
-            try:
-                reopened_proxy = InputProxy.from_nc(merged, lazy=True)
-            except BaseException as error:
-                reopen_error = error
-            reopen_failures = self._coordinate_phase(
-                reopen_error,
-                phase="checkpoint.save.reopen",
-                signature=(checkpoint_id, timestamp, str(merged)),
             )
-            if any(failure is not None for failure in reopen_failures):
-                failure = (
-                    reopen_error
-                    if reopen_error is not None
-                    else distributed_failure_error(
-                        "distributed checkpoint merged checkpoint reopen",
-                        reopen_failures,
-                    )
-                )
-                execution.poison(failure, phase="checkpoint save reopen")
-                raise failure
-            committed_proxy = cast(InputProxy, reopened_proxy)
-        return committed_proxy
+            execution.poison(failure, phase="checkpoint save reopen")
+            raise failure
+        return cast(InputProxy, reopened_proxy)

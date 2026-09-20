@@ -7,7 +7,10 @@ from functools import cache
 import torch
 
 from hydroforge.kernels.backends.metal.online import (
-    MetalBuffer, MetalCommand, MetalScalar, make_online_metal_dispatcher,
+    MetalBuffer,
+    MetalCommand,
+    MetalScalar,
+    make_online_metal_dispatcher,
 )
 
 
@@ -20,7 +23,8 @@ def _fixed_end_dispatcher():
             MetalBuffer("counter_ptr", torch.int32, "read_write"),
             MetalBuffer("continue_ptr", torch.int32, "write"),
         ),
-        scalars=(MetalScalar("n", "index"),), size_key="n",
+        scalars=(MetalScalar("n", "index"),),
+        size_key="n",
         body="""    if (i == 0) {
         int next = args.counter_ptr[0] + 1;
         args.counter_ptr[0] = next;
@@ -38,8 +42,10 @@ def fixed_control_command(
     return MetalCommand(
         _fixed_end_dispatcher(),
         {
-            "count_ptr": count, "counter_ptr": counter,
-            "continue_ptr": continue_flag, "n": 1,
+            "count_ptr": count,
+            "counter_ptr": counter,
+            "continue_ptr": continue_flag,
+            "n": 1,
         },
     )
 
@@ -56,7 +62,8 @@ def _statistics_control_dispatcher():
             MetalBuffer("sub_step_ptr", torch.int32, "write"),
             MetalBuffer("num_sub_steps_ptr", torch.int32, "write"),
         ),
-        scalars=(MetalScalar("n", "index"),), size_key="n",
+        scalars=(MetalScalar("n", "index"),),
+        size_key="n",
         body="""    if (i == 0) {
         bool first = args.counter_ptr[0] == 1;
         bool last = args.continue_ptr[0] == 0;
@@ -102,7 +109,8 @@ def _adaptive_begin_dispatcher():
         "hf_adaptive_substep_begin",
         buffers=(MetalBuffer("candidate_ptr", torch.float32, "write"),),
         scalars=(
-            MetalScalar("maximum", "float32"), MetalScalar("n", "index"),
+            MetalScalar("maximum", "float32"),
+            MetalScalar("n", "index"),
         ),
         size_key="n",
         body="""    if (i == 0) {
@@ -122,7 +130,8 @@ def _adaptive_accept_dispatcher():
             MetalBuffer("dt_ptr", torch.float32, "write"),
             MetalBuffer("error_ptr", torch.int32, "write"),
         ),
-        scalars=(MetalScalar("n", "index"),), size_key="n",
+        scalars=(MetalScalar("n", "index"),),
+        size_key="n",
         body="""    if (i == 0) {
         float remaining = args.duration_ptr[0] - args.elapsed_ptr[0];
         float dt = min(args.candidate_ptr[0], remaining);
@@ -149,7 +158,8 @@ def _adaptive_end_dispatcher():
         scalars=(
             MetalScalar("maximum_steps", "index"),
             MetalScalar("n", "index"),
-        ), size_key="n",
+        ),
+        size_key="n",
         body="""    if (i == 0) {
         float elapsed = args.elapsed_ptr[0] + args.dt_ptr[0];
         args.elapsed_ptr[0] = elapsed;
@@ -182,17 +192,24 @@ def adaptive_control_commands(
     accept = MetalCommand(
         _adaptive_accept_dispatcher(),
         {
-            "candidate_ptr": candidate, "duration_ptr": duration,
-            "elapsed_ptr": elapsed, "dt_ptr": dt,
-            "error_ptr": error_flag, "n": 1,
+            "candidate_ptr": candidate,
+            "duration_ptr": duration,
+            "elapsed_ptr": elapsed,
+            "dt_ptr": dt,
+            "error_ptr": error_flag,
+            "n": 1,
         },
     )
     end = MetalCommand(
         _adaptive_end_dispatcher(),
         {
-            "duration_ptr": duration, "dt_ptr": dt,
-            "elapsed_ptr": elapsed, "counter_ptr": counter,
-            "continue_ptr": continue_flag, "error_ptr": error_flag, "n": 1,
+            "duration_ptr": duration,
+            "dt_ptr": dt,
+            "elapsed_ptr": elapsed,
+            "counter_ptr": counter,
+            "continue_ptr": continue_flag,
+            "error_ptr": error_flag,
+            "n": 1,
             "maximum_steps": maximum_steps,
         },
     )

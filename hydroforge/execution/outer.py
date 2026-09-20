@@ -1,12 +1,14 @@
 """Cached compiled operator scopes outside the physical substep clock."""
+
 from __future__ import annotations
 
-import sys
-from typing import TYPE_CHECKING, Any, Iterator
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any
 
 from pydantic import PrivateAttr, model_validator
 
 from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.execution.program import _close_program_resources
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -44,10 +46,7 @@ class _OuterProgram:
             self.operators.prepare_metal(self.capture)
 
     def launch(self) -> None:
-        if (
-            self.capture_mode == "cuda_graph"
-            and self.operators.cuda_graph_capture_safe
-        ):
+        if self.capture_mode == "cuda_graph" and self.operators.cuda_graph_capture_safe:
             if self.graph is None:
                 self.graph = self.capture.capture_cuda(
                     self.operators.launch,
@@ -61,16 +60,15 @@ class _OuterProgram:
         self.operators.check_metal_errors()
 
     def close(self) -> None:
-        if self.graph is not None:
-            self.capture.release(self.graph)
-            self.graph = None
+        graph, self.graph = self.graph, None
         operators, self.operators = self.operators, None
-        if operators is not None:
-            operators.close(self.capture)
+        _close_program_resources(
+            self.capture, (graph,), (operators,), scope="outer operator program"
+        )
 
 
 class _OnceScope:
-    def __init__(self, runtime: "OuterRuntime", *, key: tuple[Any, ...]) -> None:
+    def __init__(self, runtime: OuterRuntime, *, key: tuple[Any, ...]) -> None:
         self.runtime = runtime
         self.key = key
 
@@ -84,7 +82,8 @@ class _OnceScope:
         program = programs.get(self.key, _MISSING)
         if program is _MISSING:
             with record_operator_scope(
-                self.runtime.model, scope_kind="outer",
+                self.runtime.model,
+                scope_kind="outer",
             ) as recording:
                 yield None
             program = _OuterProgram(self.runtime.model, recording.program)
@@ -100,12 +99,15 @@ class OuterRuntime:
         self.model = model
         self.step = step
 
-    def once(self, *, specialization: Any = None) -> _OnceScope:
+    def once(
+        self,
+        *,
+        site: tuple[Any, int],
+        specialization: Any = None,
+    ) -> _OnceScope:
         request = _OuterScopeRequest(specialization=specialization)
-        caller = sys._getframe(1)
-        lexical_site = (caller.f_code, caller.f_lasti)
         key = self.step.claim_outer_scope(
-            site=lexical_site,
+            site=site,
             specialization=request.specialization_key,
         )
         return _OnceScope(self, key=key)

@@ -3,83 +3,77 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self, Sequence
+from typing import Annotated, Any
 
-from pydantic import model_validator
+from pydantic import Field, ValidationInfo, field_validator
 
 from hydroforge.contracts.validation import HydroForgeModel
+
+_NonemptyText = Annotated[str, Field(min_length=1)]
 
 
 class CudaExtensionSpec(HydroForgeModel):
     source: Path
-    cflags: tuple[str, ...] = ("-O3", "--use_fast_math")
+    cflags: tuple[_NonemptyText, ...] = ("-O3", "--use_fast_math")
     source_prefixes: tuple[Path, ...] = ()
     inline_includes: tuple[Path, ...] = ()
-    cpp_headers: tuple[str, ...] = ()
+    include_root: Path | None = None
+    cpp_headers: tuple[_NonemptyText, ...] = ()
     include_paths: tuple[Path, ...] = ()
-    ldflags: tuple[str, ...] = ()
+    ldflags: tuple[_NonemptyText, ...] = ()
 
-    @model_validator(mode="after")
-    def _validate_extension(self) -> Self:
-        if not isinstance(self.source, Path):
-            raise ValueError("CUDA extension source must be a pathlib.Path")
-        tuple_fields = {
-            "cflags": (self.cflags, str),
-            "source_prefixes": (self.source_prefixes, Path),
-            "inline_includes": (self.inline_includes, Path),
-            "cpp_headers": (self.cpp_headers, str),
-            "include_paths": (self.include_paths, Path),
-            "ldflags": (self.ldflags, str),
-        }
-        for name, (values, element_type) in tuple_fields.items():
-            if type(values) is not tuple:
-                raise ValueError(f"CUDA extension {name} must be an exact tuple")
-            invalid = [
-                type(value).__name__
-                for value in values if not isinstance(value, element_type)
-            ]
-            if invalid:
-                raise ValueError(
-                    f"CUDA extension {name} elements must be "
-                    f"{element_type.__name__}: {invalid}"
-                )
-        for name in (
-            "cflags", "source_prefixes", "cpp_headers",
-            "include_paths", "ldflags",
-        ):
-            values = getattr(self, name)
-            if len(values) != len(set(values)):
-                raise ValueError(f"CUDA extension {name} must be unique")
-        if any(not value for value in (*self.cflags, *self.cpp_headers, *self.ldflags)):
-            raise ValueError("CUDA extension flags and headers must be non-empty")
-        return self
+    @field_validator(
+        "cflags", "source_prefixes", "cpp_headers", "include_paths", "ldflags"
+    )
+    @classmethod
+    def _unique_entries(cls, values: tuple, info: ValidationInfo) -> tuple:
+        if len(values) != len(set(values)):
+            raise ValueError(f"CUDA extension {info.field_name} must be unique")
+        return values
 
-    def _materialize_source(self) -> str:
-        names = [path.name for path in self.inline_includes]
-        duplicates = sorted({name for name in names if names.count(name) > 1})
+    @field_validator("inline_includes")
+    @classmethod
+    def _unique_include_names(cls, paths: tuple[Path, ...]) -> tuple[Path, ...]:
+        counts = Counter(path.name for path in paths)
+        duplicates = sorted(name for name, count in counts.items() if count > 1)
         if duplicates:
             raise ValueError(
-                "CUDA inline include basenames must be unique: "
-                f"{duplicates}"
+                f"CUDA inline include basenames must be unique: {duplicates}"
             )
-        includes = dict(zip(names, self.inline_includes, strict=True))
+        return paths
+
+    def _materialize_source(self) -> str:
+        includes = {path.name: path for path in self.inline_includes}
         emitted: set[Path] = set()
+        root = None if self.include_root is None else self.include_root.resolve()
+        if root is not None and not root.is_dir():
+            raise ValueError(f"CUDA include_root is not a directory: {root}")
         include_pattern = re.compile(
-            r'^\s*#include\s+"([^"]+)"', re.MULTILINE,
+            r'^\s*#include\s+"([^"]+)"',
+            re.MULTILINE,
         )
 
-        def expand(text: str) -> str:
+        def expand(text: str, origin: Path) -> str:
             def replace(match: re.Match[str]) -> str:
                 name = match.group(1)
                 path = includes.get(name)
+                if path is None and root is not None:
+                    path = (origin.parent / name).resolve()
+                    if not path.is_relative_to(root):
+                        raise ValueError(
+                            f"CUDA include {name!r} escapes include_root {root}"
+                        )
                 if path is None:
                     return match.group(0)
+                path = path.resolve()
                 if path in emitted:
                     return ""
                 emitted.add(path)
-                return expand(path.read_text())
+                return expand(path.read_text(), path)
 
             return include_pattern.sub(replace, text)
 
@@ -87,10 +81,9 @@ class CudaExtensionSpec(HydroForgeModel):
         for path in (*self.source_prefixes, self.source):
             if source and not source.endswith("\n"):
                 source += "\n"
-            source += path.read_text()
-        source = expand(source)
+            source += expand(path.read_text(), path)
         unused = sorted(
-            str(path) for path in self.inline_includes if path not in emitted
+            str(path) for path in self.inline_includes if path.resolve() not in emitted
         )
         if unused:
             raise ValueError(f"CUDA inline includes are not referenced: {unused}")
@@ -115,32 +108,50 @@ class _CompiledCudaExtension:
     include_paths: tuple[Path, ...]
     ldflags: tuple[str, ...]
 
+    def loader_arguments(self, name: str, env_prefix: str) -> dict[str, Any]:
+        """Build isolated loader options for this immutable source/ABI plan."""
+        return {
+            "name": name,
+            "cpp_sources": "\n".join((*self.cpp_headers, *self.declarations)),
+            "cuda_sources": self.source,
+            "functions": self.functions,
+            "extra_cuda_cflags": self.cflags,
+            "extra_include_paths": tuple(map(str, self.include_paths)),
+            "extra_ldflags": self.ldflags,
+            "env_prefix": env_prefix,
+        }
+
+
+def _function_definition(source: str, function: str) -> re.Match[str]:
+    match = re.search(
+        rf"(?m)^void\s+{re.escape(function)}\s*\((.*?)\)\s*\{{",
+        source,
+        re.DOTALL,
+    )
+    if match is None:
+        raise ValueError(f"CUDA source does not define {function}()")
+    return match
+
 
 def cuda_declarations(source: str, functions: Sequence[str]) -> tuple[str, ...]:
     declarations = []
     for function in functions:
-        cuda_function_signature(source, function)
-        match = re.search(
-            rf"(?m)^void\s+{re.escape(function)}\s*\((.*?)\)\s*\{{",
-            source, re.DOTALL,
-        )
-        if match is None:
-            raise ValueError(f"CUDA source does not define {function}()")
-        declarations.append(f"void {function}({match.group(1)});")
+        definition = _function_definition(source, function).group(1)
+        _parse_parameters(definition, function)
+        declarations.append(f"void {function}({definition});")
     return tuple(declarations)
 
 
 def cuda_function_signature(
-    source: str, function: str,
+    source: str,
+    function: str,
 ) -> tuple[tuple[str, str], ...]:
     """Return exact ``(name, normalized type)`` launcher parameters."""
-    match = re.search(
-        rf"(?m)^void\s+{re.escape(function)}\s*\((.*?)\)\s*\{{",
-        source, re.DOTALL,
-    )
-    if match is None:
-        raise ValueError(f"CUDA source does not define {function}()")
-    declaration = match.group(1).strip()
+    return _parse_parameters(_function_definition(source, function).group(1), function)
+
+
+def _parse_parameters(declaration: str, function: str) -> tuple[tuple[str, str], ...]:
+    declaration = declaration.strip()
     if not declaration:
         return ()
     parameters: list[tuple[str, str]] = []
@@ -152,9 +163,7 @@ def cuda_function_signature(
             depth += 1
         elif character in ">)]":
             if depth == 0:
-                raise ValueError(
-                    f"unbalanced parameter delimiters in {function}()"
-                )
+                raise ValueError(f"unbalanced parameter delimiters in {function}()")
             depth -= 1
         elif character == "," and depth == 0:
             chunks.append(declaration[start:index])
@@ -177,12 +186,11 @@ def cuda_function_signature(
                 f"cannot parse parameter in {function}(): {chunk.strip()!r}"
             )
         parameter_name = name.group(1)
-        native_type = parameter[:name.start()].strip()
+        native_type = parameter[: name.start()].strip()
         native_type = re.sub(r"\s+", " ", native_type)
         if not native_type:
             raise ValueError(
-                f"cannot parse parameter type in {function}(): "
-                f"{chunk.strip()!r}"
+                f"cannot parse parameter type in {function}(): {chunk.strip()!r}"
             )
         parameters.append((parameter_name, native_type))
     names = tuple(name for name, _native_type in parameters)
@@ -192,7 +200,9 @@ def cuda_function_signature(
 
 
 def cuda_narrowed_index_parameters(
-    source: str, function: str, index_parameters: Sequence[str],
+    source: str,
+    function: str,
+    index_parameters: Sequence[str],
 ) -> tuple[str, ...]:
     """Find signed-64 to signed-32 conversions in one launcher body.
 
@@ -212,19 +222,13 @@ def cuda_narrowed_index_parameters(
 
         def mask(match: re.Match[str]) -> str:
             return "".join(
-                "\n" if character == "\n" else " "
-                for character in match.group(0)
+                "\n" if character == "\n" else " " for character in match.group(0)
             )
 
         return pattern.sub(mask, text)
 
     code = code_only(source)
-    match = re.search(
-        rf"(?m)^void\s+{re.escape(function)}\s*\((.*?)\)\s*\{{",
-        code, re.DOTALL,
-    )
-    if match is None:
-        raise ValueError(f"CUDA source does not define {function}()")
+    match = _function_definition(code, function)
     start = match.end() - 1
     depth = 0
     end = None
@@ -238,36 +242,30 @@ def cuda_narrowed_index_parameters(
                 break
     if end is None:
         raise ValueError(f"CUDA function {function}() has an unclosed body")
-    body = code[start + 1:end]
+    body = code[start + 1 : end]
     signed_int32 = r"(?:signed\s+int|int|(?:std\s*::\s*)?int32_t)"
 
     def split_arguments(arguments: str) -> tuple[str, ...]:
         if not arguments.strip():
             return ()
         chunks: list[str] = []
-        depth = 0
         start = 0
-        pairs = {')': '(', ']': '[', '}': '{'}
+        pairs = {")": "(", "]": "[", "}": "{"}
         stack: list[str] = []
         for offset, character in enumerate(arguments):
             if character in "([{":
                 stack.append(character)
-                depth += 1
             elif character in ")]}":
                 if not stack or stack[-1] != pairs[character]:
                     raise ValueError(
-                        f"unbalanced call arguments in CUDA launcher "
-                        f"{function}()"
+                        f"unbalanced call arguments in CUDA launcher {function}()"
                     )
                 stack.pop()
-                depth -= 1
-            elif character == "," and depth == 0:
+            elif character == "," and not stack:
                 chunks.append(arguments[start:offset].strip())
                 start = offset + 1
         if stack:
-            raise ValueError(
-                f"unbalanced call arguments in CUDA launcher {function}()"
-            )
+            raise ValueError(f"unbalanced call arguments in CUDA launcher {function}()")
         chunks.append(arguments[start:].strip())
         return tuple(chunks)
 
@@ -291,7 +289,7 @@ def cuda_narrowed_index_parameters(
                     f"call to {name}() in CUDA launcher {function}() "
                     "has unbalanced parentheses"
                 )
-            found.append(split_arguments(body[open_paren + 1:close_paren]))
+            found.append(split_arguments(body[open_paren + 1 : close_paren]))
         return tuple(found)
 
     helper_signatures: dict[str, tuple[tuple[str, str], ...]] = {}
@@ -303,17 +301,29 @@ def cuda_narrowed_index_parameters(
         helper_name = helper.group(1)
         if helper_name == function or helper_name in helper_signatures:
             continue
-        helper_signatures[helper_name] = cuda_function_signature(
-            code, helper_name,
-        )
+        helper_signatures[helper_name] = _parse_parameters(helper.group(2), helper_name)
+
+    local_int32_names = tuple(re.findall(rf"\b{signed_int32}\s+([A-Za-z_]\w*)\b", body))
+    int32_arguments: list[str] = []
+    for helper_name, signature in helper_signatures.items():
+        positions = [
+            index
+            for index, (_name, native_type) in enumerate(signature)
+            if re.fullmatch(
+                signed_int32,
+                re.sub(r"\b(?:const|volatile)\b", "", native_type)
+                .strip()
+                .rstrip("&")
+                .strip(),
+            )
+        ]
+        for arguments in calls(helper_name):
+            if len(arguments) == len(signature):
+                int32_arguments.extend(arguments[index] for index in positions)
 
     narrowed = []
     for name in index_parameters:
         escaped = re.escape(name)
-        local_int32_names = tuple(re.findall(
-            rf"\b{signed_int32}\s+([A-Za-z_]\w*)\b",
-            body,
-        ))
         local_assignment = any(
             re.search(
                 rf"\b{re.escape(local)}\s*(?:=(?!=)|[+\-*/%]=)"
@@ -322,33 +332,18 @@ def cuda_narrowed_index_parameters(
             )
             for local in local_int32_names
         )
-        direct_conversion = any(re.search(pattern, body) for pattern in (
-            rf"\(\s*{signed_int32}\s*\)\s*{escaped}\b",
-            rf"static_cast\s*<\s*{signed_int32}\s*>\s*"
-            rf"\(\s*{escaped}\b",
-            rf"\b{signed_int32}\s*[({{]\s*{escaped}\b",
-        ))
-        call_conversion = False
-        for helper_name, signature in helper_signatures.items():
-            for arguments in calls(helper_name):
-                if len(arguments) != len(signature):
-                    continue
-                for argument, (_formal_name, formal_type) in zip(
-                    arguments, signature, strict=True,
-                ):
-                    normalized = re.sub(
-                        r"\b(?:const|volatile)\b", "", formal_type,
-                    ).strip().rstrip("&").strip()
-                    if (
-                        re.fullmatch(signed_int32, normalized)
-                        and re.search(rf"\b{escaped}\b", argument)
-                    ):
-                        call_conversion = True
-                        break
-                if call_conversion:
-                    break
-            if call_conversion:
-                break
+        direct_conversion = any(
+            re.search(pattern, body)
+            for pattern in (
+                rf"\(\s*{signed_int32}\s*\)\s*{escaped}\b",
+                rf"static_cast\s*<\s*{signed_int32}\s*>\s*"
+                rf"\(\s*{escaped}\b",
+                rf"\b{signed_int32}\s*[({{]\s*{escaped}\b",
+            )
+        )
+        call_conversion = any(
+            re.search(rf"\b{escaped}\b", argument) for argument in int32_arguments
+        )
         if direct_conversion or local_assignment or call_conversion:
             narrowed.append(name)
     return tuple(narrowed)
