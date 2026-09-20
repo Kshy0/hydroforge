@@ -6,6 +6,7 @@ model: catchments, glacier cells and regular cells are all just target
 supports.  Two overlap engines feed it: analytic separable area overlap between
 regular grids, and area-weighted high-resolution pixel aggregation.
 """
+
 from hydroforge.data.mapping.build import (
     build_regular_grid_mapping,
 )

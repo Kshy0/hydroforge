@@ -8,10 +8,10 @@ from typing import Any
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode, _disable_current_modes
 
-from hydroforge.kernels.context import _ACTIVE_OPERATOR_RECORDER
-from hydroforge.kernels.backends.metal.protocol import MetalCommandNode
-from hydroforge.contracts.kernels import buffer_access_semantics
 from hydroforge.contracts.errors import ResourceCleanupError
+from hydroforge.contracts.kernels import buffer_access_semantics
+from hydroforge.kernels.backends.metal.protocol import MetalCommandNode
+from hydroforge.kernels.context import _ACTIVE_OPERATOR_RECORDER
 
 
 class SubstepCompileError(RuntimeError):
@@ -39,26 +39,25 @@ def _map(value: Any, function) -> Any:
     return function(value)
 
 
-def _tensors(value: Any):
-    if isinstance(value, torch.Tensor):
-        yield value
-    elif isinstance(value, (tuple, list)):
+def _leaves(value: Any):
+    if isinstance(value, (tuple, list)):
         for item in value:
-            yield from _tensors(item)
+            yield from _leaves(item)
     elif isinstance(value, dict):
         for item in value.values():
-            yield from _tensors(item)
+            yield from _leaves(item)
+    else:
+        yield value
+
+
+def _tensors(value: Any):
+    return (item for item in _leaves(value) if isinstance(item, torch.Tensor))
 
 
 def _refs(value: Any):
-    if isinstance(value, (_StableRef, _ValueRef)):
-        yield value
-    elif isinstance(value, (tuple, list)):
-        for item in value:
-            yield from _refs(item)
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from _refs(item)
+    return (
+        item for item in _leaves(value) if isinstance(item, (_StableRef, _ValueRef))
+    )
 
 
 @dataclass(slots=True)
@@ -92,7 +91,9 @@ class TorchOperator:
         if isinstance(outputs, (tuple, list)) and len(outputs) == 1:
             outputs = outputs[0]
         return (
-            self._static(self.arguments), self._static(self.keywords), outputs,
+            self._static(self.arguments),
+            self._static(self.keywords),
+            outputs,
         )
 
     def launch(self, values: dict[int, torch.Tensor]) -> None:
@@ -108,25 +109,14 @@ class TorchOperator:
                 return values[value.index]
             return value
 
-        result = self.function(
-            *_map(self.arguments, resolve), **_map(self.keywords, resolve),
+        self.function(
+            *_map(self.arguments, resolve),
+            **_map(self.keywords, resolve),
         )
 
-        def retain(reference: Any, value: Any) -> None:
+        for reference in _refs(self.outputs):
             if isinstance(reference, _ValueRef):
                 values[reference.index] = reference.tensor
-
-        def walk(reference: Any, value: Any) -> None:
-            if isinstance(reference, (tuple, list)):
-                for ref_item, value_item in zip(reference, value):
-                    walk(ref_item, value_item)
-            elif isinstance(reference, dict):
-                for key in reference:
-                    walk(reference[key], value[key])
-            else:
-                retain(reference, value)
-
-        walk(self.outputs, result)
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,10 +126,23 @@ class CompiledKernelCall(MetalCommandNode):
     launch: Any
     reads: tuple[torch.Tensor, ...]
     writes: tuple[torch.Tensor, ...]
+    entry: Any = None
+    arguments: Any = None
+    buffer_dtypes: Any = None
 
     def record(self) -> None:
         """Record the specialized native launch through its dispatcher."""
         self.launch()
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundKernelCall:
+    """A validated CUDA call awaiting the complete lexical build batch."""
+
+    request: Any
+    reads: tuple[torch.Tensor, ...]
+    writes: tuple[torch.Tensor, ...]
+    entry: Any
 
 
 @dataclass(slots=True)
@@ -152,6 +155,7 @@ class CollectiveOperator:
     reads: tuple[torch.Tensor, ...]
     writes: tuple[torch.Tensor, ...]
     cuda_graph_capture_safe: bool = False
+    scope: str = "spatial"
 
     def launch(self) -> None:
         from hydroforge.execution.collectives import (
@@ -164,6 +168,7 @@ class CollectiveOperator:
             operation=self.operation,
             reduction=self.reduction,
             destination=self.destination,
+            scope=self.scope,
         )
 
 
@@ -198,7 +203,10 @@ class _MetalKernelSegment:
 
 
 def capture_metal_commands(
-    capture: Any, commands: tuple[Any, ...], *, cyclic: bool = False,
+    capture: Any,
+    commands: tuple[Any, ...],
+    *,
+    cyclic: bool = False,
 ):
     """Compile one ordered command tuple into a single owned Metal ICB.
 
@@ -207,7 +215,8 @@ def capture_metal_commands(
     """
 
     from hydroforge.kernels.backends.metal.runtime import (
-        MetalCommandSequence, record_metal_commands,
+        MetalCommandSequence,
+        record_metal_commands,
     )
 
     sequence = MetalCommandSequence()
@@ -218,9 +227,9 @@ def capture_metal_commands(
             sequence.mark_barrier()
     return _MetalKernelSegment(
         capture.register(sequence.capture()),
-        tuple(dict.fromkeys(
-            tensor for command in commands for tensor in command.writes
-        )),
+        tuple(
+            dict.fromkeys(tensor for command in commands for tensor in command.writes)
+        ),
     )
 
 
@@ -235,11 +244,11 @@ class OperatorProgram:
         self._metal_prepared = False
         self._metal_commands: tuple[Any, ...] | None = None
         self._metal_error_flags: tuple[torch.Tensor, ...] = ()
-        self.mutated_tensors = tuple(dict.fromkeys(
-            tensor
-            for operator in self.operators
-            for tensor in operator.writes
-        ))
+        self.mutated_tensors = tuple(
+            dict.fromkeys(
+                tensor for operator in self.operators for tensor in operator.writes
+            )
+        )
         tensors: list[torch.Tensor] = []
         for operator in self.operators:
             tensors.extend(getattr(operator, "reads", ()))
@@ -254,6 +263,7 @@ class OperatorProgram:
                     )
                 )
         self.referenced_tensors = tuple(dict.fromkeys(tensors))
+        self._referenced_tensor_ids = frozenset(map(id, self.referenced_tensors))
         self.cuda_graph_capture_safe = all(
             getattr(operator, "cuda_graph_capture_safe", True)
             for operator in self.operators
@@ -262,7 +272,52 @@ class OperatorProgram:
     def references_tensor(self, tensor: torch.Tensor) -> bool:
         """Return whether this compiled program reads or writes ``tensor``."""
 
-        return any(candidate is tensor for candidate in self.referenced_tensors)
+        return id(tensor) in self._referenced_tensor_ids
+
+    def materialize_cuda(self) -> None:
+        """Build exact variants across this scope and nested predicate bodies."""
+        from hydroforge.kernels.backends.cuda.precompile import (
+            precompile_cuda_requests,
+        )
+
+        programs: list[OperatorProgram] = []
+        requests: list[dict[str, Any]] = []
+
+        def collect(program: OperatorProgram) -> None:
+            programs.append(program)
+            for operator in program.operators:
+                if isinstance(operator, PredicateLoopOperator):
+                    collect(operator.program.body_operators)
+                elif isinstance(operator, _BoundKernelCall):
+                    request = operator.request
+                    provider = request.implementation._implementation
+                    prepare = getattr(provider, "_precompile_arguments", None)
+                    if prepare is not None:
+                        arguments = prepare(dict(request.arguments))
+                        if arguments is not None:
+                            requests.append(arguments)
+
+        collect(self)
+        precompile_cuda_requests(requests)
+        replacements = []
+        for program in programs:
+            operators = []
+            for operator in program.operators:
+                if isinstance(operator, _BoundKernelCall):
+                    request = operator.request
+                    operator = CompiledKernelCall(
+                        request.materialize(),
+                        operator.reads,
+                        operator.writes,
+                        operator.entry,
+                        dict(request.arguments),
+                        request.buffer_dtypes,
+                    )
+                operators.append(operator)
+            replacements.append((program, tuple(operators)))
+        for program, operators in replacements:
+            program.operators = operators
+            program._launch_operators = operators
 
     def _validate_temporary_uses(self) -> None:
         """Reject pure local results that no later operator can observe."""
@@ -271,17 +326,19 @@ class OperatorProgram:
             if not isinstance(operator, TorchOperator):
                 continue
             produced = tuple(
-                reference for reference in _refs(operator.outputs)
+                reference
+                for reference in _refs(operator.outputs)
                 if isinstance(reference, _ValueRef)
             )
             for reference in produced:
                 consumed = False
-                for later in self.operators[index + 1:]:
+                for later in self.operators[index + 1 :]:
                     if isinstance(later, TorchOperator):
                         consumed = any(
                             candidate is reference
                             for candidate in (
-                                *_refs(later.arguments), *_refs(later.keywords),
+                                *_refs(later.arguments),
+                                *_refs(later.keywords),
                             )
                         )
                     else:
@@ -294,9 +351,7 @@ class OperatorProgram:
                 if not consumed:
                     schema = operator.function._schema
                     overload = schema.overload_name
-                    qualified = schema.name + (
-                        f".{overload}" if overload else ""
-                    )
+                    qualified = schema.name + (f".{overload}" if overload else "")
                     raise SubstepCompileError(
                         f"compiled substep discards local result of "
                         f"{qualified}; write it to registered model state or "
@@ -306,10 +361,15 @@ class OperatorProgram:
     def launch(self) -> None:
         values: dict[int, torch.Tensor] = {}
         for operator in self._launch_operators:
-            if isinstance(operator, (
-                CompiledKernelCall, CollectiveOperator, PredicateLoopOperator,
-                _MetalKernelSegment,
-            )):
+            if isinstance(
+                operator,
+                (
+                    CompiledKernelCall,
+                    CollectiveOperator,
+                    PredicateLoopOperator,
+                    _MetalKernelSegment,
+                ),
+            ):
                 operator.launch()
             else:
                 operator.launch(values)
@@ -350,11 +410,11 @@ class OperatorProgram:
                 )
             else:
                 commands.extend(lower_metal_aten(operator))
-        self._metal_error_flags = tuple(dict.fromkeys(
-            flag
-            for command in commands
-            for flag in getattr(command, "errors", ())
-        ))
+        self._metal_error_flags = tuple(
+            dict.fromkeys(
+                flag for command in commands for flag in getattr(command, "errors", ())
+            )
+        )
         self._metal_commands = tuple(commands)
         return self._metal_commands
 
@@ -368,12 +428,20 @@ class OperatorProgram:
 
     def close(self, capture: Any) -> None:
         segments, self._metal_segments = self._metal_segments, ()
+        operators, self.operators = self.operators, ()
+        failures: list[BaseException] = []
         for segment in segments:
-            capture.release(segment.icb)
-        for operator in self.operators:
-            close = getattr(operator, "close", None)
-            if close is not None:
-                close(capture)
+            try:
+                capture.release(segment.icb)
+            except BaseException as error:
+                failures.append(error)
+        for operator in operators:
+            try:
+                close = getattr(operator, "close", None)
+                if close is not None:
+                    close(capture)
+            except BaseException as error:
+                failures.append(error)
         # Commands may own online-lowering scratch tensors referenced by an
         # ICB (for example the Metal scatter bounds-error flag).  Drop those
         # references only after every ICB release has been attempted.
@@ -381,12 +449,21 @@ class OperatorProgram:
         self._metal_prepared = False
         self._metal_commands = None
         self._metal_error_flags = ()
+        self.mutated_tensors = ()
+        self.referenced_tensors = ()
+        self._referenced_tensor_ids = frozenset()
+        if failures:
+            error = ResourceCleanupError("operator program", failures)
+            raise error from failures[0]
 
 
 class _OperatorRecorder:
     def __init__(
-        self, execution: Any, stable_tensors: tuple[torch.Tensor, ...],
-        *, scope_kind: str,
+        self,
+        execution: Any,
+        stable_tensors: tuple[torch.Tensor, ...],
+        *,
+        scope_kind: str,
     ) -> None:
         self.execution = execution
         self.scope_kind = scope_kind
@@ -430,9 +507,16 @@ class _OperatorRecorder:
         return writes
 
     def restore(self) -> None:
+        failures: list[BaseException] = []
         with _disable_current_modes(), torch.no_grad():
-            for tensor, snapshot in self.snapshots.values():
-                tensor.copy_(snapshot)
+            for tensor, snapshot in reversed(tuple(self.snapshots.values())):
+                try:
+                    tensor.copy_(snapshot)
+                except BaseException as error:
+                    failures.append(error)
+        if failures:
+            error = ResourceCleanupError("substep recorded tensors", failures)
+            raise error from failures[0]
 
     def record(self, entry: Any, arguments: dict[str, Any]) -> None:
         # Explicitly supplied tensors must already belong to model/runtime
@@ -451,31 +535,55 @@ class _OperatorRecorder:
                 self.execution.backend,
                 precision=getattr(self.binder.model, "precision", None),
             )
-            specialized = implementation.specialize(
-                bound,
-                buffer_dtypes=binding.buffer_dtypes,
-            )
+            if self.execution.backend == "cuda":
+                from hydroforge.kernels.registry import _KernelSpecializationRequest
+
+                request = _KernelSpecializationRequest(
+                    implementation=implementation,
+                    arguments=bound,
+                    buffer_dtypes=binding.buffer_dtypes,
+                )
+            else:
+                specialized = implementation.specialize(
+                    bound,
+                    buffer_dtypes=binding.buffer_dtypes,
+                )
         for name, value in bound.items():
             if not isinstance(value, torch.Tensor):
                 continue
             if name not in arguments and id(value) not in self.references:
                 self.references[id(value)] = _StableRef(value)
-        launch = specialized
         # Registered kernels are intercepted and do not execute while the IR
         # is recorded, so their write set needs no trace-time snapshot.
-        reads = tuple(dict.fromkeys(
-            bound[name]
-            for name, access in entry.metadata.buffers.items()
-            if buffer_access_semantics(access).reads
-            and isinstance(bound.get(name), torch.Tensor)
-        ))
-        writes = tuple(dict.fromkeys(
-            bound[name]
-            for name, access in entry.metadata.buffers.items()
-            if buffer_access_semantics(access).writes
-            and isinstance(bound.get(name), torch.Tensor)
-        ))
-        self.operators.append(CompiledKernelCall(launch, reads, writes))
+        reads = tuple(
+            dict.fromkeys(
+                bound[name]
+                for name, access in entry.metadata.buffers.items()
+                if buffer_access_semantics(access).reads
+                and isinstance(bound.get(name), torch.Tensor)
+            )
+        )
+        writes = tuple(
+            dict.fromkeys(
+                bound[name]
+                for name, access in entry.metadata.buffers.items()
+                if buffer_access_semantics(access).writes
+                and isinstance(bound.get(name), torch.Tensor)
+            )
+        )
+        if self.execution.backend == "cuda":
+            self.operators.append(_BoundKernelCall(request, reads, writes, entry))
+        else:
+            self.operators.append(
+                CompiledKernelCall(
+                    specialized,
+                    reads,
+                    writes,
+                    entry,
+                    bound,
+                    binding.buffer_dtypes,
+                )
+            )
 
     def record_collective_batch(
         self,
@@ -483,7 +591,9 @@ class _OperatorRecorder:
         abis: tuple[tuple[int, int, int], ...],
         reduction: str,
         *,
-        operation: str = "all_reduce", destination: int | None = None,
+        operation: str = "all_reduce",
+        destination: int | None = None,
+        scope: str = "spatial",
     ) -> None:
         """Record one validated communication batch at its sequence point."""
 
@@ -493,35 +603,44 @@ class _OperatorRecorder:
             raise SubstepCompileError(
                 "Metal ICB substeps do not support distributed collectives"
             )
-        self.operators.append(CollectiveOperator(
-            tensors=tensors,
-            abis=abis,
-            operation=operation,
-            reduction=reduction,
-            destination=destination,
-            reads=tensors,
-            writes=tensors,
-        ))
+        self.operators.append(
+            CollectiveOperator(
+                tensors=tensors,
+                abis=abis,
+                operation=operation,
+                reduction=reduction,
+                destination=destination,
+                scope=scope,
+                reads=tensors,
+                writes=tensors,
+            )
+        )
 
     def record_predicate_loop(self, program: Any) -> None:
         """Append one nested predicate program to the current lexical IR."""
 
         body = program.body_operators
         reads = body.referenced_tensors
-        writes = tuple(dict.fromkeys((
-            program.predicate,
-            program.counter,
-            program.continue_flag,
-            program.has_more,
-            program.under_limit,
-            *body.mutated_tensors,
-        )))
+        writes = tuple(
+            dict.fromkeys(
+                (
+                    program.predicate,
+                    program.counter,
+                    program.continue_flag,
+                    program.has_more,
+                    program.under_limit,
+                    *body.mutated_tensors,
+                )
+            )
+        )
         self.snapshot_writes(writes)
-        self.operators.append(PredicateLoopOperator(
-            program=program,
-            reads=reads,
-            writes=writes,
-        ))
+        self.operators.append(
+            PredicateLoopOperator(
+                program=program,
+                reads=reads,
+                writes=writes,
+            )
+        )
 
     def encode(self, value: Any) -> Any:
         def encode_one(item: Any) -> Any:
@@ -572,7 +691,8 @@ class _TorchOperatorMode(TorchDispatchMode):
         write_values = tuple(
             values_by_name[argument.name]
             for argument in function._schema.arguments
-            if argument.alias_info is not None and argument.alias_info.is_write
+            if argument.alias_info is not None
+            and argument.alias_info.is_write
             and argument.name in values_by_name
         )
         # Validate every mutation against its pre-call shape/dtype.  PyTorch
@@ -580,7 +700,8 @@ class _TorchOperatorMode(TorchDispatchMode):
         # the post-call contract sees it, invalidating native pointer captures.
         if write_values:
             if len(write_values) != 1 or not isinstance(
-                write_values[0], torch.Tensor,
+                write_values[0],
+                torch.Tensor,
             ):
                 raise SubstepCompileError(
                     "compiled ATen mutations must have exactly one tensor output"
@@ -588,7 +709,10 @@ class _TorchOperatorMode(TorchDispatchMode):
             from hydroforge.execution.aten import validate_compiled_aten
 
             validate_compiled_aten(
-                function, args, kwargs, write_values[0],
+                function,
+                args,
+                kwargs,
+                write_values[0],
             )
         writes = self.recorder.snapshot_writes(write_values)
         encoded_args = self.recorder.encode(args)
@@ -599,7 +723,8 @@ class _TorchOperatorMode(TorchDispatchMode):
         validate_compiled_aten(function, args, kwargs, result)
         outputs = self.recorder.encode_outputs(result)
         value_outputs = tuple(
-            reference for reference in _refs(outputs)
+            reference
+            for reference in _refs(outputs)
             if isinstance(reference, _ValueRef)
         )
         if value_outputs:
@@ -624,10 +749,15 @@ class _TorchOperatorMode(TorchDispatchMode):
             for reference in _refs(outputs)
             if isinstance(reference, _ValueRef)
         )
-        self.recorder.operators.append(TorchOperator(
-            function, encoded_args, encoded_kwargs, outputs,
-            tuple(dict.fromkeys((*writes, *output_writes))),
-        ))
+        self.recorder.operators.append(
+            TorchOperator(
+                function,
+                encoded_args,
+                encoded_kwargs,
+                outputs,
+                tuple(dict.fromkeys((*writes, *output_writes))),
+            )
+        )
         return result
 
 
@@ -648,13 +778,17 @@ class OperatorRecording:
         )
         stable = tuple(dict.fromkeys((*tensor_arguments, *stable_tensors)))
         self.recorder = _OperatorRecorder(
-            execution, stable, scope_kind=scope_kind,
+            execution,
+            stable,
+            scope_kind=scope_kind,
         )
         self.mode = _TorchOperatorMode(self.recorder)
         self.token = None
+        self.parent = None
         self.program: OperatorProgram | None = None
 
     def __enter__(self) -> OperatorRecording:
+        self.parent = _ACTIVE_OPERATOR_RECORDER.get()
         self.token = _ACTIVE_OPERATOR_RECORDER.set(self.recorder)
         try:
             self.mode.__enter__()
@@ -687,7 +821,20 @@ class OperatorRecording:
             error = ResourceCleanupError("substep recording rollback", causes)
             raise error from (exc if exc is not None else failures[0])
         if exc_type is None:
-            self.program = OperatorProgram(self.recorder.operators)
+            program = OperatorProgram(self.recorder.operators)
+            try:
+                if self.parent is None and self.recorder.execution.backend == "cuda":
+                    with _disable_current_modes():
+                        program.materialize_cuda()
+            except BaseException as primary:
+                try:
+                    program.close(self.recorder.execution.capture)
+                except BaseException as cleanup:
+                    raise ResourceCleanupError(
+                        "CUDA operator compilation", (primary, cleanup),
+                    ) from primary
+                raise
+            self.program = program
 
 
 def record_operator_scope(
@@ -699,6 +846,8 @@ def record_operator_scope(
 ) -> OperatorRecording:
     """Open an operator recording transaction without requiring a callback."""
     return OperatorRecording(
-        model, arguments=arguments, stable_tensors=stable_tensors,
+        model,
+        arguments=arguments,
+        stable_tensors=stable_tensors,
         scope_kind=scope_kind,
     )

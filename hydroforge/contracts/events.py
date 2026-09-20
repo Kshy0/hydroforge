@@ -2,24 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any, Callable, Protocol, Self, runtime_checkable
+from collections.abc import Callable
+from typing import Any, Protocol, runtime_checkable
 
-from pydantic import model_validator
-
-from hydroforge.contracts.validation import HydroForgeModel, _immutable_dict
+from hydroforge.contracts.validation import FrozenMapping, HydroForgeModel
 
 
 class ModelEvent(HydroForgeModel):
     level: str
     name: str
     message: str
-    fields: Mapping[str, Any]
-
-    @model_validator(mode="after")
-    def _freeze_fields(self) -> Self:
-        object.__setattr__(self, "fields", _immutable_dict(self.fields))
-        return self
+    fields: FrozenMapping[str, Any]
 
 
 @runtime_checkable

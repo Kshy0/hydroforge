@@ -2,26 +2,30 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Mapping, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
-from hydroforge.statistics.runtime import (
-    StatisticsInstallation,
-    StatisticsRuntime,
-    StatisticsStaticBinding,
-)
-from hydroforge.statistics.observer import StatisticsObserver
-from hydroforge.statistics.ir import (
-    _StatisticsDeclaration, ExpressionSource, ScatterSource,
-    StatisticsProgram, TensorSource,
-)
 from hydroforge.contracts.events import emit
 from hydroforge.contracts.fields import RuntimeTensorMetadata, TensorMetadata
 from hydroforge.contracts.runtime import (
     DEFAULT_BLOCK_SIZE,
     _effective_block_size,
+)
+from hydroforge.statistics.ir import (
+    ExpressionSource,
+    ScatterSource,
+    StatisticsProgram,
+    TensorSource,
+    _StatisticsDeclaration,
+)
+from hydroforge.statistics.observer import StatisticsObserver
+from hydroforge.statistics.runtime import (
+    StatisticsInstallation,
+    StatisticsRuntime,
+    StatisticsStaticBinding,
 )
 
 if TYPE_CHECKING:
@@ -63,7 +67,8 @@ class StatisticsBindingCompiler:
         )
         self._aggregator = self._create(installation)
         model._execution.statistics = StatisticsObserver(
-            model, self._aggregator,
+            model,
+            self._aggregator,
         )
 
     @property
@@ -75,7 +80,8 @@ class StatisticsBindingCompiler:
         return self._aggregator
 
     def _create(
-        self, installation: StatisticsInstallation,
+        self,
+        installation: StatisticsInstallation,
     ) -> StatisticsRuntime:
         model = self.model
         aggregator = StatisticsRuntime(
@@ -86,11 +92,16 @@ class StatisticsBindingCompiler:
             base_dtype=model.dtype,
             mixed_precision=model.mixed_precision,
             output_dir=model.output_full_dir,
-            rank=model.rank,
-            world_size=model.world_size,
+            rank=model.spatial_rank,
+            world_size=model.spatial_world_size,
             num_workers=model.output_workers,
             output_split_by_year=model.output_split_by_year,
-            num_trials=(1 if model.num_trials is None else model.num_trials),
+            ensemble_size=(
+                1 if model.local_ensemble_size is None else model.local_ensemble_size
+            ),
+            ensemble_member_ids=(
+                None if model.parallel is None else model.parallel.member_ids
+            ),
             save_kernels=model.save_kernels,
             max_pending_steps=model.max_pending_steps,
             max_pending_output_bytes=model.max_pending_output_bytes,
@@ -116,25 +127,32 @@ class StatisticsBindingCompiler:
         return aggregator
 
     def _compile_static(
-        self, values: tuple[str, ...],
+        self,
+        values: tuple[str, ...],
     ) -> tuple[StatisticsStaticBinding, ...]:
         model = self.model
         bindings: list[StatisticsStaticBinding] = []
         for name in values:
             entry = self.variable_map[name]
             tensor = getattr(entry.module, entry.field_name)
-            field = entry.module._get_tensor_schema(entry.field_name)
+            field = entry.module._get_tensor_schema(
+                entry.field_name,
+                opened_modules=model.opened_modules,
+                field_demand=model._field_demand,
+            )
             bound, tensors = model._partition.bind_output(field)
             coordinate = bound.output_coord
             if name == coordinate:
                 continue
             output_index = tensors.get(bound.output_index)
-            bindings.append(StatisticsStaticBinding(
-                name=name,
-                tensor=tensor,
-                output_index=output_index,
-                coordinate=coordinate,
-            ))
+            bindings.append(
+                StatisticsStaticBinding(
+                    name=name,
+                    tensor=tensor,
+                    output_index=output_index,
+                    coordinate=coordinate,
+                )
+            )
         return tuple(bindings)
 
     def prepare_virtuals(
@@ -160,16 +178,28 @@ class StatisticsBindingCompiler:
                 if isinstance(source, ScatterSource)
                 else source.name
             )
-            tensor_shape, output, coordinate = self._field_metadata(
-                dependencies[0],
-            )[:3]
+            references = tuple(self._field_metadata(item) for item in dependencies)
+            reference = next(
+                (item for item in references if item.tensor.dtype != "bool"),
+                references[0],
+            )
+            coordinate = reference.tensor.dim_coords
+            if coordinate:
+                coordinate = coordinate.rsplit(".", 1)[-1]
             adhoc[name] = RuntimeTensorMetadata(
-                tensor=TensorMetadata.compile({
-                    "tensor_shape": tensor_shape, "category": "virtual",
-                    "expr": expression, "dim_coords": coordinate,
-                    "output": output,
-                }),
+                tensor=TensorMetadata.compile(
+                    {
+                        "tensor_shape": reference.tensor.shape,
+                        "category": "virtual",
+                        "expr": expression,
+                        "dim_coords": coordinate,
+                        "output": reference.tensor.output,
+                        "tensor_dtype": reference.tensor.dtype,
+                    }
+                ),
                 description=f"Ad-hoc expression: {expression}",
+                output_index=reference.output_index,
+                output_coord=reference.output_coord,
             )
         return adhoc
 
@@ -185,8 +215,8 @@ class StatisticsBindingCompiler:
         while cursor < len(ordered):
             name = ordered[cursor]
             cursor += 1
-            source = program.sources.get(name, TensorSource(name))
-            if isinstance(source, TensorSource):
+            source = program.sources.get(name)
+            if source is None or isinstance(source, TensorSource):
                 continue
             dependencies = (
                 (*source.value.dependencies, source.index)
@@ -222,8 +252,8 @@ class StatisticsBindingCompiler:
             output_index: bool = False,
         ) -> None:
             if output_coordinate:
-                installed = tensor.detach().to(torch.int64).clone(
-                    memory_format=torch.contiguous_format,
+                installed = tensor.detach().to(
+                    torch.int64, copy=True, memory_format=torch.contiguous_format
                 )
             elif output_index:
                 installed = tensor.detach().clone(
@@ -244,47 +274,61 @@ class StatisticsBindingCompiler:
 
             entry = self.variable_map[name]
             tensor = getattr(entry.module, entry.field_name)
-            field = entry.module._get_tensor_schema(entry.field_name)
+            field = entry.module._get_tensor_schema(
+                entry.field_name,
+                opened_modules=model.opened_modules,
+                field_demand=model._field_demand,
+            )
             info, bindings = model._partition.bind_output(field)
             category = info.tensor.category
             if category == "virtual" and info.tensor.expression:
                 fields[name] = info
             else:
                 install_tensor(
-                    name, tensor, info,
+                    name,
+                    tensor,
+                    info,
                 )
 
             for binding_name in (info.output_index, info.output_coord):
                 if not binding_name:
                     continue
                 binding = bindings[binding_name]
-                pending_bindings.append((
-                    binding_name, binding,
-                    binding_name == info.output_coord,
-                ))
+                pending_bindings.append(
+                    (
+                        binding_name,
+                        binding,
+                        binding_name == info.output_coord,
+                    )
+                )
 
         for binding_name, binding, output_coordinate in pending_bindings:
             existing = tensors.get(binding_name)
             if existing is not None:
                 continue
             install_tensor(
-                binding_name, binding, None,
+                binding_name,
+                binding,
+                None,
                 output_coordinate=output_coordinate,
                 output_index=not output_coordinate,
             )
 
         for shape, names in by_shape.items():
             emit(
-                model, "info", "statistics.tensors_registered",
+                model,
+                "info",
+                "statistics.tensors_registered",
                 "Registered tensors for streaming statistics",
-                rank=model.rank, variables=tuple(names), shape=str(shape),
+                rank=model.rank,
+                variables=tuple(names),
+                shape=str(shape),
             )
 
         return StatisticsInstallation(
-            variable_ops=MappingProxyType({
-                name: tuple(operations)
-                for name, operations in variable_ops.items()
-            }),
+            variable_ops=MappingProxyType(
+                {name: tuple(operations) for name, operations in variable_ops.items()}
+            ),
             program=program,
             tensors=MappingProxyType(tensors),
             fields=MappingProxyType(fields),
@@ -293,14 +337,17 @@ class StatisticsBindingCompiler:
         )
 
     def _field_metadata(
-        self, name: str,
-    ) -> tuple[tuple[str | int, ...], str, str | None]:
+        self,
+        name: str,
+    ) -> RuntimeTensorMetadata:
         entry = self.variable_map[name]
-        field = entry.module._get_tensor_schema(entry.field_name)
-        coordinate = field.tensor.dim_coords
-        if coordinate:
-            coordinate = coordinate.split(".")[-1]
-        return field.tensor.shape, field.tensor.output, coordinate
+        field = entry.module._get_tensor_schema(
+            entry.field_name,
+            opened_modules=self.model.opened_modules,
+            field_demand=self.model._field_demand,
+        )
+        metadata, _bindings = self.model._partition.bind_output(field)
+        return metadata
 
     def close(self) -> None:
         self._aggregator._shutdown()
@@ -308,14 +355,26 @@ class StatisticsBindingCompiler:
     def memory_usage(self) -> int:
         return self._aggregator.get_memory_usage()
 
-    def results(self, *, stacked: bool) -> dict[str, torch.Tensor]:
-        return self._aggregator.get_results(as_stacked=stacked)
+    def results(
+        self, *, stacked: bool, start: int | None = None, stop: int | None = None
+    ) -> dict[str, torch.Tensor]:
+        return self._aggregator.get_results(as_stacked=stacked, start=start, stop=stop)
 
     def result(
-        self, variable: str, operation: str, *, stacked: bool,
+        self,
+        variable: str,
+        operation: str,
+        *,
+        stacked: bool,
+        start: int | None = None,
+        stop: int | None = None,
     ) -> torch.Tensor:
         return self._aggregator.get_result(
-            variable, operation, as_stacked=stacked,
+            variable,
+            operation,
+            as_stacked=stacked,
+            start=start,
+            stop=stop,
         )
 
     def time_index(self) -> int:
@@ -332,7 +391,9 @@ class StatisticsBindingCompiler:
         return accumulator.clone(memory_format=torch.preserve_format)
 
     def pop_result(
-        self, variable: str, operation: str,
+        self,
+        variable: str,
+        operation: str,
     ) -> torch.Tensor | None:
         """Remove and return the newest finalized in-memory result."""
 

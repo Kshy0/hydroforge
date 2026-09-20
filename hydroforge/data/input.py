@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, List, Optional, Self, Set, Tuple, Union, cast
+from typing import Annotated, Any, Self, cast
 
 import numpy as np
 import numpy.ma as ma
@@ -24,16 +24,22 @@ from pydantic import (
     model_validator,
 )
 
+from hydroforge.contracts.validation import (
+    FrozenMapping,
+    HydroForgeModel,
+    _immutable_dict,
+)
 from hydroforge.data.netcdf import (
-    _NetCDFReadHandlePool,
     _as_integer_array,
     _is_scalar_integer,
+    _NetCDFReadHandlePool,
     _normalize_integer_slice,
     _normalize_netcdf_index,
     _output_axis,
     _read_netcdf_var_sliced_trusted,
     read_netcdf_var_sliced,
 )
+from hydroforge.data.numeric import immutable_array, immutable_metadata
 from hydroforge.serialization.netcdf import (
     LOGICAL_DTYPE_ATTR,
     _atomic_netcdf_dataset_trusted,
@@ -42,11 +48,6 @@ from hydroforge.serialization.netcdf import (
     decode_netcdf_logical_array,
     netcdf_dtype_encoding,
 )
-from hydroforge.contracts.validation import (
-    HydroForgeModel,
-    _immutable_dict,
-)
-from hydroforge.data.numeric import immutable_array, immutable_metadata
 
 
 def _name_set(value: Any, *, label: str) -> frozenset[str]:
@@ -73,13 +74,9 @@ def _preserve_input_value(value: Any) -> Any:
             "InputProxy values must be NumPy arrays/scalars, torch tensors, "
             "or exact bool/int/float scalars",
         )
-    if isinstance(value, np.ndarray):
-        if value.dtype.hasobject:
-            raise ValueError("InputProxy arrays must not use object dtype")
-        return np.array(value, order="K", copy=True, subok=False)
-    if isinstance(value, torch.Tensor):
-        return value.detach().clone(memory_format=torch.preserve_format)
-    return value
+    if isinstance(value, np.ndarray) and value.dtype.hasobject:
+        raise ValueError("InputProxy arrays must not use object dtype")
+    return _clone_input_value_trusted(value)
 
 
 def _clone_input_value_trusted(value: Any) -> Any:
@@ -97,9 +94,7 @@ def _snapshot_input_value(value: Any) -> Any:
 
     if isinstance(value, np.ndarray):
         return immutable_array(value, order="K")
-    if isinstance(value, torch.Tensor):
-        return value.detach().clone(memory_format=torch.preserve_format)
-    return value
+    return _clone_input_value_trusted(value)
 
 
 InputValue = Annotated[
@@ -111,9 +106,9 @@ InputValue = Annotated[
 class _ResidentInputData(Mapping[str, InputValue]):
     """Expose resident values without exposing trusted Tensor storage.
 
-    NumPy values use an immutable backing buffer, so sharing them is safe.
-    PyTorch has no read-only Tensor, therefore ordinary mapping access returns
-    a snapshot while trusted HydroForge paths use the private accessor below.
+    Ordinary mapping access returns an independent snapshot: immutable NumPy
+    storage or a detached Tensor clone. Trusted HydroForge paths use the
+    private accessor below.
     """
 
     __slots__ = ("_values",)
@@ -147,10 +142,7 @@ def _netcdf_attribute_equal(left: Any, right: Any) -> bool:
             and np.array_equal(left, right, equal_nan=True)
         )
     if isinstance(left, (float, np.floating)):
-        return bool(
-            left == right
-            or (np.isnan(left) and np.isnan(right))
-        )
+        return bool(left == right or (np.isnan(left) and np.isnan(right)))
     return bool(left == right)
 
 
@@ -175,12 +167,18 @@ def _read_netcdf_input_var(
         if indices is None
         else read_netcdf_var_sliced(variable, indices)
     )
-    value = decode_netcdf_logical_array(variable, value, name=var_name)
+    return _decode_netcdf_input_array(variable, value, name=var_name)
+
+
+def _decode_netcdf_input_array(variable: Any, value: Any, *, name: str) -> np.ndarray:
+    value = decode_netcdf_logical_array(variable, value, name=name)
     if ma.isMaskedArray(value) and np.any(ma.getmaskarray(value)):
-        raise ValueError(
-            f"NetCDF input variable {var_name!r} contains missing values"
-        )
+        raise ValueError(f"NetCDF input variable {name!r} contains missing values")
     return np.asarray(value)
+
+
+_InputName = Annotated[str, Field(min_length=1)]
+_InputExtent = Annotated[int, Field(ge=0)]
 
 
 class _NetCDFFileIdentity(HydroForgeModel):
@@ -213,26 +211,17 @@ class NetCDFInputSource(HydroForgeModel):
 
     path: Path
     file_identity: _NetCDFFileIdentity
-    dimensions: tuple[str, ...]
-    shape: tuple[int, ...]
+    dimensions: tuple[_InputName, ...]
+    shape: tuple[_InputExtent, ...]
     dtype: str
-    alignment_dim: str | None = None
+    alignment_dim: _InputName | None = None
     alignment_indices: np.ndarray | None = None
 
     @model_validator(mode="after")
     def _validate_source(self) -> Self:
         if len(self.dimensions) != len(self.shape):
             raise ValueError(
-                "NetCDF variable source dimensions and shape must have "
-                "equal lengths"
-            )
-        if any(type(name) is not str or not name for name in self.dimensions):
-            raise ValueError(
-                "NetCDF variable source dimensions must be non-empty strings"
-            )
-        if any(type(size) is not int or size < 0 for size in self.shape):
-            raise ValueError(
-                "NetCDF variable source shape must contain nonnegative ints"
+                "NetCDF variable source dimensions and shape must have equal lengths"
             )
         aligned = self.alignment_indices is not None
         if aligned != (self.alignment_dim is not None):
@@ -242,9 +231,11 @@ class NetCDFInputSource(HydroForgeModel):
             )
         if not aligned:
             return self
-        if not isinstance(self.alignment_dim, str) or not self.alignment_dim:
-            raise ValueError("NetCDF alignment dimension must be a non-empty string")
         indices = self.alignment_indices
+        if np.ma.isMaskedArray(indices):
+            if np.any(np.ma.getmaskarray(indices)):
+                raise ValueError("NetCDF alignment indices contain missing positions")
+            indices = np.asarray(indices)
         if indices.ndim != 1:
             raise ValueError("NetCDF alignment indices must be one-dimensional")
         if indices.dtype != np.dtype(np.int64):
@@ -263,11 +254,15 @@ class NetCDFInputSource(HydroForgeModel):
                 "NetCDF alignment indices must cover the aligned dimension"
             )
         if indices.size and np.any(indices >= self.shape[axis]):
+            raise ValueError("NetCDF alignment indices exceed the aligned dimension")
+        if np.unique(indices).size != indices.size:
             raise ValueError(
-                "NetCDF alignment indices exceed the aligned dimension"
+                "NetCDF alignment indices must be a permutation of the aligned dimension"
             )
         owned_indices = immutable_array(
-            indices, dtype=np.int64, order="C",
+            indices,
+            dtype=np.int64,
+            order="C",
         )
         object.__setattr__(self, "alignment_indices", owned_indices)
         return self
@@ -290,12 +285,9 @@ class NetCDFInputSource(HydroForgeModel):
         if self.alignment_indices is None:
             return indices
         axis = self.dimensions.index(self.alignment_dim)
-        return InputProxy._compose_alignment_indices(
-            indices,
-            ndim=len(self.shape),
-            axis=axis,
-            alignment_idx=self.alignment_indices,
-        )
+        selectors = list(indices)
+        selectors[axis] = self.alignment_indices[selectors[axis]]
+        return tuple(selectors)
 
 
 class _NetCDFChunkRequest(HydroForgeModel):
@@ -311,18 +303,12 @@ class _NetCDFChunkRequest(HydroForgeModel):
     def _read_and_validate(self) -> Self:
         variable = self.dataset.variables[self.name]
         raw = _read_netcdf_var_sliced_trusted(
-            variable, self.selector,
+            variable,
+            self.selector,
         )
-        decoded = decode_netcdf_logical_array(
-            variable, raw, name=self.name,
+        self._array = _preserve_input_value(
+            _decode_netcdf_input_array(variable, raw, name=self.name)
         )
-        if ma.isMaskedArray(decoded) and np.any(
-            ma.getmaskarray(decoded)
-        ):
-            raise ValueError(
-                f"NetCDF input variable {self.name!r} contains missing values"
-            )
-        self._array = _preserve_input_value(np.asarray(decoded))
         return self
 
     @property
@@ -369,18 +355,13 @@ def _compile_input_proxy_netcdf_plan(
                 if align_on is not None and align_on in ds.variables:
                     align_variable = ds.variables[align_on]
                     raw_keys = read_netcdf_var_sliced(align_variable)
-                    if ma.isMaskedArray(raw_keys) and np.any(
-                        ma.getmaskarray(raw_keys)
-                    ):
+                    if ma.isMaskedArray(raw_keys) and np.any(ma.getmaskarray(raw_keys)):
                         raise ValueError(
                             f"align_on variable {align_on!r} in "
                             f"{str(path)!r} contains missing keys"
                         )
                     current_keys = np.asarray(raw_keys)
-                    if (
-                        current_keys.ndim != 1
-                        or len(align_variable.dimensions) != 1
-                    ):
+                    if current_keys.ndim != 1 or len(align_variable.dimensions) != 1:
                         raise ValueError(
                             f"align_on variable {align_on!r} in "
                             f"{str(path)!r} must be one-dimensional"
@@ -420,7 +401,8 @@ def _compile_input_proxy_netcdf_plan(
                         sorter = np.argsort(current_keys)
                         sorted_keys = current_keys[sorter]
                         insert_idx = np.searchsorted(
-                            sorted_keys, reference_keys,
+                            sorted_keys,
+                            reference_keys,
                         )
                         if np.any(insert_idx >= len(current_keys)):
                             raise ValueError(
@@ -436,7 +418,9 @@ def _compile_input_proxy_netcdf_plan(
                                 "reference key set"
                             )
                         alignment_idx = immutable_array(
-                            sorter[insert_idx], dtype=np.int64, order="C",
+                            sorter[insert_idx],
+                            dtype=np.int64,
+                            order="C",
                         )
 
                 for attr_name in ds.ncattrs():
@@ -444,7 +428,8 @@ def _compile_input_proxy_netcdf_plan(
                         ds.getncattr(attr_name),
                     )
                     if attr_name in attrs and not _netcdf_attribute_equal(
-                        attrs[attr_name], value,
+                        attrs[attr_name],
+                        value,
                     ):
                         raise ValueError(
                             f"Global attribute {attr_name!r} changes across "
@@ -487,7 +472,9 @@ def _compile_input_proxy_netcdf_plan(
                         and alignment_dim in variable.dimensions
                     )
                     logical_dtype = getattr(
-                        variable, LOGICAL_DTYPE_ATTR, None,
+                        variable,
+                        LOGICAL_DTYPE_ATTR,
+                        None,
                     )
                     source = NetCDFInputSource(
                         path=path,
@@ -499,13 +486,8 @@ def _compile_input_proxy_netcdf_plan(
                             if logical_dtype == "bool"
                             else str(np.dtype(variable.dtype))
                         ),
-                        alignment_dim=(
-                            alignment_dim
-                            if aligned_variable else None
-                        ),
-                        alignment_indices=(
-                            alignment_idx if aligned_variable else None
-                        ),
+                        alignment_dim=(alignment_dim if aligned_variable else None),
+                        alignment_indices=(alignment_idx if aligned_variable else None),
                     )
                     sources[var_name] = source
                     if not lazy:
@@ -513,9 +495,7 @@ def _compile_input_proxy_netcdf_plan(
                         data[var_name] = source.align_loaded(value)
             file_identity._verify(path)
         except (OSError, RuntimeError) as error:
-            error.add_note(
-                f"while inspecting InputProxy data from {str(path)}"
-            )
+            error.add_note(f"while inspecting InputProxy data from {str(path)}")
             raise
 
     if align_on is not None and reference_keys is None:
@@ -533,8 +513,7 @@ def _compile_input_proxy_netcdf_plan(
     missing_skip = skip_fields.difference(available_vars)
     if missing_skip:
         raise ValueError(
-            "requested skipped variable(s) were not found: "
-            f"{sorted(missing_skip)}"
+            f"requested skipped variable(s) were not found: {sorted(missing_skip)}"
         )
 
     return _InputProxyNetCDFPlan(
@@ -552,7 +531,7 @@ class _InputProxyNetCDFDeclaration(HydroForgeModel):
     file_path: str | Path | list[str | Path]
     lazy: bool = False
     visible_vars: list[str] | set[str] | frozenset[str] | None = None
-    align_on: str | None = None
+    align_on: _InputName | None = None
     skip_fields: list[str] | set[str] | frozenset[str] | None = None
     _plan: _InputProxyNetCDFPlan = PrivateAttr()
 
@@ -579,8 +558,6 @@ class _InputProxyNetCDFDeclaration(HydroForgeModel):
             if self.skip_fields is None
             else _name_set(self.skip_fields, label="skip_fields")
         )
-        if self.align_on is not None and not self.align_on:
-            raise ValueError("align_on must be None or a non-empty exact string")
         if visible is not None:
             overlap = visible.intersection(skipped)
             if overlap:
@@ -612,38 +589,8 @@ class _InputProxyNetCDFDeclaration(HydroForgeModel):
 class _InputProxyUpdate(HydroForgeModel):
     """Validated functional update accepted by :meth:`InputProxy.updated`."""
 
-    values: Mapping[str, InputValue] = Field(default_factory=dict)
-    dimensions: Mapping[str, int] = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def _validate_update(self) -> Self:
-        invalid_names = [
-            name for name in self.values
-            if type(name) is not str or not name
-        ]
-        if invalid_names:
-            raise ValueError(
-                "InputProxy update names must be non-empty exact strings"
-            )
-        invalid_dimensions = {
-            name: size for name, size in self.dimensions.items()
-            if (
-                type(name) is not str
-                or not name
-                or type(size) is not int
-                or size < 0
-            )
-        }
-        if invalid_dimensions:
-            raise ValueError(
-                "InputProxy update dimensions require non-empty exact string "
-                "names and exact non-negative int sizes"
-            )
-        object.__setattr__(self, "values", _immutable_dict(self.values))
-        object.__setattr__(
-            self, "dimensions", _immutable_dict(self.dimensions),
-        )
-        return self
+    values: FrozenMapping[_InputName, InputValue] = Field(default_factory=dict)
+    dimensions: FrozenMapping[_InputName, _InputExtent] = Field(default_factory=dict)
 
 
 _INPUT_PROXY_CONTEXT = "hydroforge_input_proxy"
@@ -652,54 +599,37 @@ _INPUT_PROXY_CONTEXT = "hydroforge_input_proxy"
 class _InputProxyRemoval(HydroForgeModel):
     """Validated functional removal accepted by :meth:`InputProxy.without`."""
 
-    names: tuple[str, ...]
+    names: tuple[_InputName, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def _validate_removal(self, info: ValidationInfo) -> Self:
-        if not self.names:
-            raise ValueError(
-                "InputProxy.without requires at least one variable"
-            )
-        if any(type(name) is not str or not name for name in self.names):
-            raise ValueError(
-                "InputProxy.without names must be non-empty exact strings"
-            )
         if len(self.names) != len(set(self.names)):
             raise ValueError("InputProxy.without names must be unique")
         context = info.context
         proxy = (
-            context.get(_INPUT_PROXY_CONTEXT)
-            if isinstance(context, Mapping) else None
+            context.get(_INPUT_PROXY_CONTEXT) if isinstance(context, Mapping) else None
         )
         if proxy is None:
             raise ValueError("InputProxy removal requires proxy context")
         known = proxy.keys().union(proxy.sources)
         missing = set(self.names).difference(known)
         if missing:
-            raise ValueError(
-                f"InputProxy variable(s) not found: {sorted(missing)}"
-            )
+            raise ValueError(f"InputProxy variable(s) not found: {sorted(missing)}")
         return self
 
 
 class _InputReadRequest(HydroForgeModel):
     """One orthogonal selection interpreted by resident or lazy storage."""
 
-    name: str
+    name: _InputName
     selector: Any = Field(default_factory=lambda: Ellipsis)
     allow_missing: bool = False
 
     @model_validator(mode="after")
     def _validate_read(self, info: ValidationInfo):
-        if not self.name:
-            raise ValueError(
-                "input read variable name must be a non-empty string"
-            )
-
         context = info.context
         proxy = (
-            context.get(_INPUT_PROXY_CONTEXT)
-            if isinstance(context, Mapping) else None
+            context.get(_INPUT_PROXY_CONTEXT) if isinstance(context, Mapping) else None
         )
         if proxy is None:
             raise ValueError("input read validation requires proxy context")
@@ -707,16 +637,12 @@ class _InputReadRequest(HydroForgeModel):
         if not known:
             if self.allow_missing:
                 return self
-            raise ValueError(
-                f"InputProxy variable {self.name!r} does not exist"
-            )
+            raise ValueError(f"InputProxy variable {self.name!r} does not exist")
 
         raw = self.selector
         selectors = raw if isinstance(raw, tuple) else (raw,)
         if any(value is None for value in selectors):
-            raise ValueError(
-                "input subset selection does not support new axes"
-            )
+            raise ValueError("input subset selection does not support new axes")
         for selector in selectors:
             if selector is Ellipsis:
                 continue
@@ -724,9 +650,7 @@ class _InputReadRequest(HydroForgeModel):
                 _normalize_integer_slice(selector)
                 continue
             if isinstance(selector, (bool, np.bool_)):
-                raise ValueError(
-                    "input subset scalar boolean selectors are invalid"
-                )
+                raise ValueError("input subset scalar boolean selectors are invalid")
             if isinstance(selector, (int, np.integer)):
                 continue
             array = np.asarray(selector)
@@ -788,42 +712,44 @@ def _select_resident_trusted(value: Any, selector: Any) -> Any:
             and item.step is not None
             and item.step < 0
         ):
-            sequence_indices.append((
-                axis,
-                np.arange(
-                    *item.indices(value.shape[axis]),
-                    dtype=np.int64,
-                ),
-            ))
+            sequence_indices.append(
+                (
+                    axis,
+                    np.arange(
+                        *item.indices(value.shape[axis]),
+                        dtype=np.int64,
+                    ),
+                )
+            )
             selectors[axis] = slice(None)
     selected = value[tuple(selectors)]
     for axis, index in sequence_indices:
         output_axis = _output_axis(selectors, axis)
         if isinstance(selected, torch.Tensor):
             indices = torch.as_tensor(
-                index, dtype=torch.int64, device=selected.device,
+                index,
+                dtype=torch.int64,
+                device=selected.device,
             )
             selected = torch.index_select(selected, output_axis, indices)
-        elif np.ma.isMaskedArray(selected):
-            selected = np.ma.take(selected, index, axis=output_axis)
         else:
-            selected = np.take(selected, index, axis=output_axis)
+            selected = selected.take(index, axis=output_axis)
     return selected
 
 
 class InputProxy(HydroForgeModel):
     """
     A proxy class for NetCDF input/output.
-    Stores data in CPU memory (numpy arrays or torch tensors).
+    Owns resident NumPy values or tensors and reads declared NetCDF sources lazily.
     """
 
-    data: Mapping[str, InputValue]
-    attrs: Mapping[str, Any] = Field(default_factory=dict)
-    dims: Mapping[str, int] = Field(default_factory=dict)
+    data: Mapping[_InputName, InputValue]
+    attrs: Mapping[_InputName, Any] = Field(default_factory=dict)
+    dims: FrozenMapping[_InputName, _InputExtent] = Field(default_factory=dict)
     lazy: bool = True
-    visible_vars: frozenset[str]
-    injected_vars: frozenset[str] = Field(default_factory=frozenset)
-    sources: Mapping[str, NetCDFInputSource] = Field(default_factory=dict)
+    visible_vars: frozenset[_InputName]
+    injected_vars: frozenset[_InputName] = Field(default_factory=frozenset)
+    sources: FrozenMapping[_InputName, NetCDFInputSource] = Field(default_factory=dict)
 
     _cache: dict[str, InputValue] = PrivateAttr(default_factory=dict)
     _read_handles: _NetCDFReadHandlePool = PrivateAttr(
@@ -832,7 +758,8 @@ class InputProxy(HydroForgeModel):
 
     @field_serializer("data")
     def _serialize_data(
-        self, value: Mapping[str, InputValue],
+        self,
+        value: Mapping[str, InputValue],
     ) -> dict[str, InputValue]:
         return {name: value[name] for name in value}
 
@@ -852,56 +779,7 @@ class InputProxy(HydroForgeModel):
 
     @model_validator(mode="after")
     def _validate_proxy(self) -> Self:
-        invalid_data_names = [
-            name for name in self.data
-            if type(name) is not str or not name
-        ]
-        if invalid_data_names:
-            raise ValueError(
-                "InputProxy data names must be non-empty exact strings"
-            )
-        if any(type(name) is not str or not name for name in self.attrs):
-            raise ValueError(
-                "InputProxy attribute names must be non-empty exact strings"
-            )
-        invalid_dims = {
-            name: size for name, size in self.dims.items()
-            if (
-                type(name) is not str
-                or not name
-                or type(size) is not int
-                or size < 0
-            )
-        }
-        if invalid_dims:
-            raise ValueError(
-                "InputProxy dimensions must have non-empty exact string "
-                "names and exact non-negative int sizes"
-            )
-        if type(self.lazy) is not bool:
-            raise ValueError("InputProxy lazy must be an exact bool")
-        invalid_source_names = [
-            name for name in self.sources
-            if type(name) is not str or not name
-        ]
-        if invalid_source_names:
-            raise ValueError(
-                "InputProxy source names must be non-empty exact strings"
-            )
-        invalid_sources = {
-            name: type(source).__name__
-            for name, source in self.sources.items()
-            if not isinstance(source, NetCDFInputSource)
-        }
-        if invalid_sources:
-            raise ValueError(
-                f"InputProxy sources must be NetCDF variable sources: "
-                f"{invalid_sources}"
-            )
-        visible_vars = _name_set(
-            self.visible_vars, label="visible_vars",
-        )
-        object.__setattr__(self, "visible_vars", visible_vars)
+        visible_vars = self.visible_vars
         unresolved = visible_vars.difference(self.data).difference(
             self.sources,
         )
@@ -916,9 +794,7 @@ class InputProxy(HydroForgeModel):
                 "InputProxy with lazy=False cannot expose source-only "
                 f"variables: {sorted(lazy_only)}"
             )
-        injected_vars = _name_set(
-            self.injected_vars, label="injected_vars",
-        )
+        injected_vars = self.injected_vars
         invalid_injected = injected_vars.difference(self.data).union(
             injected_vars.difference(visible_vars),
         )
@@ -933,19 +809,13 @@ class InputProxy(HydroForgeModel):
             "attrs",
             immutable_metadata(self.attrs, label="InputProxy attrs"),
         )
-        object.__setattr__(self, "dims", _immutable_dict(self.dims))
-        object.__setattr__(self, "visible_vars", visible_vars)
-        object.__setattr__(self, "injected_vars", injected_vars)
-        object.__setattr__(self, "sources", _immutable_dict(self.sources))
         return self
 
     @property
     def _source_paths(self) -> tuple[Path, ...]:
         """Return distinct physical paths behind lazy variable sources."""
 
-        return tuple(Path(path) for path in dict.fromkeys(
-            source.path for source in self.sources.values()
-        ))
+        return tuple(dict.fromkeys(source.path for source in self.sources.values()))
 
     def _resident_value(self, name: str) -> InputValue:
         """Return resident storage to an already validated internal path."""
@@ -961,12 +831,7 @@ class InputProxy(HydroForgeModel):
 
     @property
     def file_path(self) -> str | list[str] | None:
-        """Compatibility view of :attr:`source_paths`.
-
-        New code should use ``source_paths`` because one proxy can span more
-        than one file.  Keeping this read-only view avoids forcing downstream
-        parameter-contract errors to lose their source location.
-        """
+        """Return the source filename or filenames for downstream diagnostics."""
 
         paths = tuple(str(path) for path in self._source_paths)
         if not paths:
@@ -987,11 +852,7 @@ class InputProxy(HydroForgeModel):
         """Build a derived proxy from validated fields with a fresh cache."""
 
         payload = {
-            name: (
-                self.data
-                if name == "data"
-                else getattr(self, name)
-            )
+            name: (self.data if name == "data" else getattr(self, name))
             for name in type(self).model_fields
         }
         payload.update(updates)
@@ -1000,14 +861,16 @@ class InputProxy(HydroForgeModel):
             if isinstance(payload["data"], _ResidentInputData)
             else payload["data"].items()
         )
-        payload["data"] = _ResidentInputData({
-            name: (
-                value
-                if name in _owned_data_names
-                else _clone_input_value_trusted(value)
-            )
-            for name, value in source_data
-        })
+        payload["data"] = _ResidentInputData(
+            {
+                name: (
+                    value
+                    if name in _owned_data_names
+                    else _clone_input_value_trusted(value)
+                )
+                for name, value in source_data
+            }
+        )
         payload["attrs"] = self.attrs
         payload["dims"] = _immutable_dict(payload["dims"])
         payload["visible_vars"] = frozenset(payload["visible_vars"])
@@ -1054,13 +917,15 @@ class InputProxy(HydroForgeModel):
         removed = set(request.names)
         return self._rebuild(
             data={
-                name: value for name, value in self._resident_items()
+                name: value
+                for name, value in self._resident_items()
                 if name not in removed
             },
             visible_vars=self.visible_vars.difference(removed),
             injected_vars=self.injected_vars.difference(removed),
             sources={
-                name: source for name, source in self.sources.items()
+                name: source
+                for name, source in self.sources.items()
                 if name not in removed
             },
         )
@@ -1068,10 +933,10 @@ class InputProxy(HydroForgeModel):
     @classmethod
     def from_nc(
         cls,
-        file_path: Union[str, Path, List[Union[str, Path]]],
+        file_path: str | Path | list[str | Path],
         lazy: bool = False,
         visible_vars: list[str] | set[str] | frozenset[str] | None = None,
-        align_on: Optional[str] = None,
+        align_on: str | None = None,
         skip_fields: list[str] | set[str] | frozenset[str] | None = None,
     ) -> Self:
         """
@@ -1111,9 +976,6 @@ class InputProxy(HydroForgeModel):
             sources=plan.sources,
         )
 
-    def _source_for(self, key: str) -> NetCDFInputSource:
-        return self.sources[key]
-
     def _shape_for_trusted(self, key: str) -> tuple[int, ...]:
         if key in self.data:
             value = self._resident_value(key)
@@ -1144,9 +1006,11 @@ class InputProxy(HydroForgeModel):
         )
 
     def _read_lazy_trusted(
-        self, name: str, selector: Any,
+        self,
+        name: str,
+        selector: Any,
     ) -> np.ndarray:
-        source = self._source_for(name)
+        source = self.sources[name]
         target_path = source.path
 
         try:
@@ -1161,21 +1025,8 @@ class InputProxy(HydroForgeModel):
             source.file_identity._verify(target_path)
             return value
         except (OSError, RuntimeError) as exc:
-            exc.add_note(
-                f"while lazily loading {name!r} from {target_path}"
-            )
+            exc.add_note(f"while lazily loading {name!r} from {target_path}")
             raise
-
-    @staticmethod
-    def _compose_alignment_indices(
-        indices: Any, *, ndim: int, axis: int, alignment_idx: np.ndarray,
-    ) -> tuple[Any, ...]:
-        """Map a reference-order selection onto one source NetCDF variable."""
-
-        del ndim
-        selectors = list(indices)
-        selectors[axis] = alignment_idx[selectors[axis]]
-        return tuple(selectors)
 
     def get_subset(self, key: str, indices: Any) -> Any:
         """
@@ -1203,48 +1054,34 @@ class InputProxy(HydroForgeModel):
         normalized = tuple(_normalize_netcdf_index(selector, len(shape)))
         if key in self.data:
             return _select_resident_trusted(
-                self._resident_value(key), normalized,
+                self._resident_value(key),
+                normalized,
             )
         if key in self._cache:
             return _select_resident_trusted(self._cache[key], normalized)
         return self._read_lazy_trusted(key, normalized)
 
-    def get_var_shape(self, key: str) -> Tuple[int, ...]:
+    def get_var_shape(self, key: str) -> tuple[int, ...]:
         """
         Get the shape of a variable without loading it fully if possible.
         """
         request = self._read_request(key)
-        key = request.name
-        # If in memory, return shape
-        if key in self.data:
-            val = self._resident_value(key)
-            # Handle list/scalar or other types if necessary, though data usually is ndarray/tensor
-            if hasattr(val, "shape"):
-                return tuple(val.shape)
-            return ()
-        if key in self._cache:
-            return tuple(self._cache[key].shape)
-
-        return self._source_for(key).shape
+        return self._shape_for_trusted(request.name)
 
     def _get_var_dtype(self, key: str) -> np.dtype | torch.dtype:
         """Return logical storage dtype without loading a lazy variable."""
 
         if key in self.data or key in self._cache:
-            value = (
-                self._resident_value(key)
-                if key in self.data else self._cache[key]
-            )
+            value = self._resident_value(key) if key in self.data else self._cache[key]
             if isinstance(value, torch.Tensor):
                 return value.dtype
             return np.asarray(value).dtype
 
-        return self._source_for(key).numpy_dtype
-
+        return self.sources[key].numpy_dtype
 
     def _to_nc(
         self,
-        file_path: Union[str, Path],
+        file_path: str | Path,
         *,
         netcdf_options: Mapping[str, Any],
     ) -> None:
@@ -1256,41 +1093,28 @@ class InputProxy(HydroForgeModel):
             # Write global attributes
             ds.setncatts(self.attrs)
 
-            # Helper to ensure dimension exists
-            def _ensure_dim(name: str, size: Optional[int], unlimited: bool = False) -> None:
-                if name in ds.dimensions:
-                    return
-                ds.createDimension(name, None if unlimited else size)
-
             # Helper to infer and write variable
             def _infer_and_write_var(name: str, data: Any) -> None:
                 # Convert to numpy if tensor
                 if isinstance(data, torch.Tensor):
                     arr = data.detach().cpu().numpy()
                 else:
-                    if np.ma.isMaskedArray(data):
-                        raise TypeError(
-                            f"InputProxy variable {name!r} must not be a "
-                            "masked array"
-                        )
                     arr = np.asarray(data)
 
                 vtype, logical_dtype = netcdf_dtype_encoding(arr.dtype)
                 arr_to_write = arr.astype(vtype, copy=False)
 
-                # Define dimensions
-                if arr.ndim == 0:
-                    dims = ()
-                else:
-                    dims = []
-                    for ax, sz in enumerate(arr.shape):
-                        dim_name = f"{name}_dim{ax}"
-                        _ensure_dim(dim_name, sz, unlimited=False)
-                        dims.append(dim_name)
+                dims = tuple(f"{name}_dim{axis}" for axis in range(arr.ndim))
+                for dim_name, size in zip(dims, arr.shape, strict=True):
+                    if dim_name not in ds.dimensions:
+                        ds.createDimension(dim_name, size)
 
                 # Create variable
                 variable_options = _prepare_netcdf_variable_options_trusted(
-                    create_options, dtype=vtype, dimensions=dims, name=name,
+                    create_options,
+                    dtype=vtype,
+                    dimensions=dims,
+                    name=name,
                     logical_dtype=logical_dtype,
                 )
                 var = _create_netcdf_variable_trusted(
@@ -1315,7 +1139,7 @@ class InputProxy(HydroForgeModel):
             return default
         return self._get_trusted(request)
 
-    def keys(self) -> Set[str]:
+    def keys(self) -> set[str]:
         return set(self.visible_vars).union(self.data)
 
     def __getitem__(self, key: str) -> Any:
@@ -1334,12 +1158,8 @@ class InputProxy(HydroForgeModel):
         if key in self._cache:
             return self._cache[key]
 
-        selector = tuple(
-            slice(None) for _ in range(len(self.sources[key].shape))
-        )
-        loaded_data = _preserve_input_value(
-            self._read_lazy_trusted(key, selector),
-        )
+        selector = tuple(slice(None) for _ in range(len(self.sources[key].shape)))
+        loaded_data = self._read_lazy_trusted(key, selector)
         self._cache[key] = loaded_data
         return loaded_data
 

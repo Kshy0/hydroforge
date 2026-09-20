@@ -8,16 +8,15 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Dict, List
 
+from hydroforge.statistics.emitters.common import StatisticsEmitter
 from hydroforge.statistics.ir import (
-    ExpressionDialect, ExpressionSource, ScatterSource, TensorSource,
+    ExpressionDialect,
+    ExpressionSource,
+    ScatterSource,
+    TensorSource,
     render_expression,
 )
-from hydroforge.statistics.emitters.common import StatisticsEmitter
-
-if TYPE_CHECKING:
-    from hydroforge.statistics.runtime import StatisticsRuntime
 
 
 class TorchStatisticsEmitter(StatisticsEmitter):
@@ -31,7 +30,10 @@ class TorchStatisticsEmitter(StatisticsEmitter):
     # ========================================================================
 
     def _pytorch_expression(
-        self: StatisticsRuntime, name: str, expression, names: dict[str, str],
+        self,
+        name: str,
+        expression,
+        names: dict[str, str],
     ) -> str:
         dtype = self._statistics_layouts[name].dtype
         value_type = {
@@ -39,102 +41,110 @@ class TorchStatisticsEmitter(StatisticsEmitter):
             "torch.float64": "float64",
         }[str(dtype)]
         return render_expression(
-            expression, ExpressionDialect.TORCH, names,
+            expression,
+            ExpressionDialect.TORCH,
+            names,
             value_type=value_type,
         )
 
-    def _pytorch_state_expression(self: StatisticsRuntime, name: str) -> str:
-        source = self._statistics_ir.sources.get(name, TensorSource(name))
+    def _pytorch_state_expression(
+        self, name: str, lines: list[str], emitted: dict[str, str]
+    ) -> str:
+        if name in emitted:
+            return emitted[name]
+        source = self._statistics_ir.sources.get(name) or TensorSource(name)
         if isinstance(source, TensorSource):
             return f'states["{source.name}"]'
         if isinstance(source, ScatterSource):
             return f'states["__scatter_buf_{name}"]'
         names = {
-            dependency: self._pytorch_state_expression(dependency)
+            dependency: self._pytorch_state_expression(dependency, lines, emitted)
             for dependency in source.expression.dependencies
         }
-        return self._pytorch_expression(name, source.expression, names)
+        value = f"{self._get_safe_name(name)}_val"
+        expression = self._pytorch_expression(name, source.expression, names)
+        lines.append(f"    {value} = {expression}")
+        emitted[name] = value
+        return value
 
-    def _generate_pytorch_header(self: StatisticsRuntime) -> List[str]:
+    def _generate_pytorch_header(self) -> list[str]:
         """Generate header for PyTorch-based aggregation code."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        var_list = sorted(list(self._variables))
+        var_list = sorted(self._variables)
         return [
             '"""',
-            'Auto-generated PyTorch aggregation functions for hydroforge statistics.',
-            f'Generated at: {timestamp}',
-            f'Rank: {self.rank}',
-            f'Variables: {", ".join(var_list)}',
-            f'Device: {self.device}',
-            '',
-            'This module uses pure PyTorch operations (no Triton dependency).',
+            "Auto-generated PyTorch aggregation functions for hydroforge statistics.",
+            f"Generated at: {timestamp}",
+            f"Rank: {self.rank}",
+            f"Variables: {', '.join(var_list)}",
+            f"Device: {self.device}",
+            "",
+            "This module uses pure PyTorch operations (no Triton dependency).",
             '"""',
-            '',
-            'import torch',
-            '',
-            'def _hydroforge_tensor_operand(value, reference):',
-            '    if isinstance(value, torch.Tensor):',
-            '        return value',
-            '    return torch.as_tensor(',
-            '        value, dtype=reference.dtype, device=reference.device,',
-            '    )',
-            '',
-            'def hydroforge_maximum(left, right):',
-            '    if isinstance(left, torch.Tensor):',
-            '        right = _hydroforge_tensor_operand(right, left)',
-            '    elif isinstance(right, torch.Tensor):',
-            '        left = _hydroforge_tensor_operand(left, right)',
-            '    else:',
-            '        left = torch.as_tensor(left)',
-            '        right = torch.as_tensor(right)',
-            '    return torch.fmax(left, right)',
-            '',
-            'def hydroforge_minimum(left, right):',
-            '    if isinstance(left, torch.Tensor):',
-            '        right = _hydroforge_tensor_operand(right, left)',
-            '    elif isinstance(right, torch.Tensor):',
-            '        left = _hydroforge_tensor_operand(left, right)',
-            '    else:',
-            '        left = torch.as_tensor(left)',
-            '        right = torch.as_tensor(right)',
-            '    return torch.fmin(left, right)',
-            '',
-            'def hydroforge_weighted_mean(old, old_weight, value, weight):',
-            '    new_weight = old_weight + weight',
-            '    return (',
-            '        old * (old_weight / new_weight)',
-            '        + value * (weight / new_weight)',
-            '    )',
-            '',
-            'def hydroforge_remainder(left, right):',
-            '    if isinstance(left, torch.Tensor):',
-            '        right = _hydroforge_tensor_operand(right, left)',
-            '    elif isinstance(right, torch.Tensor):',
-            '        left = _hydroforge_tensor_operand(left, right)',
-            '    else:',
-            '        return left % right',
-            '    return torch.remainder(left, right)',
-            '',
-            'def hydroforge_where(condition, positive, negative):',
-            '    if isinstance(condition, torch.Tensor):',
-            '        return torch.where(condition, positive, negative)',
-            '    reference = (',
-            '        positive if isinstance(positive, torch.Tensor)',
-            '        else negative if isinstance(negative, torch.Tensor)',
-            '        else None',
-            '    )',
-            '    if reference is None:',
-            '        return positive if bool(condition) else negative',
-            '    condition = torch.full_like(',
-            '        reference, bool(condition), dtype=torch.bool,',
-            '    )',
-            '    return torch.where(condition, positive, negative)',
-            '',
+            "",
+            "import torch",
+            "",
+            "def _hydroforge_tensor_operand(value, reference):",
+            "    if isinstance(value, torch.Tensor):",
+            "        return value",
+            "    return torch.as_tensor(",
+            "        value, dtype=reference.dtype, device=reference.device,",
+            "    )",
+            "",
+            "def _hydroforge_binary_operands(left, right):",
+            "    if isinstance(left, torch.Tensor):",
+            "        right = _hydroforge_tensor_operand(right, left)",
+            "    elif isinstance(right, torch.Tensor):",
+            "        left = _hydroforge_tensor_operand(left, right)",
+            "    else:",
+            "        left = torch.as_tensor(left)",
+            "        right = torch.as_tensor(right)",
+            "    return left, right",
+            "",
+            "def hydroforge_maximum(left, right):",
+            "    return torch.fmax(*_hydroforge_binary_operands(left, right))",
+            "",
+            "def hydroforge_minimum(left, right):",
+            "    return torch.fmin(*_hydroforge_binary_operands(left, right))",
+            "",
+            "def hydroforge_weighted_mean(old, old_weight, value, weight):",
+            "    new_weight = old_weight + weight",
+            "    return (",
+            "        old * (old_weight / new_weight)",
+            "        + value * (weight / new_weight)",
+            "    )",
+            "",
+            "def hydroforge_remainder(left, right):",
+            "    if not isinstance(left, torch.Tensor) and not isinstance(right, torch.Tensor):",
+            "        return left % right",
+            "    return torch.remainder(*_hydroforge_binary_operands(left, right))",
+            "",
+            "def hydroforge_where(condition, positive, negative):",
+            "    if isinstance(condition, torch.Tensor):",
+            "        return torch.where(condition, positive, negative)",
+            "    reference = (",
+            "        positive if isinstance(positive, torch.Tensor)",
+            "        else negative if isinstance(negative, torch.Tensor)",
+            "        else None",
+            "    )",
+            "    if reference is None:",
+            "        return positive if bool(condition) else negative",
+            "    condition = torch.full_like(",
+            "        reference, bool(condition), dtype=torch.bool,",
+            "    )",
+            "    return torch.where(condition, positive, negative)",
+            "",
         ]
 
-    def _pytorch_emit_val_load(self: StatisticsRuntime, var_name: str,
-                                lines: List[str], emitted: set,
-                                indent: str, idx_expr: str) -> str:
+    def _pytorch_emit_val_load(
+        self,
+        var_name: str,
+        lines: list[str],
+        emitted: set,
+        indent: str,
+        *,
+        n_levels: int | None = None,
+    ) -> str:
         """Emit PyTorch code to load a variable value (handling virtuals recursively).
 
         Returns the expression name for the loaded value.
@@ -144,704 +154,395 @@ class TorchStatisticsEmitter(StatisticsEmitter):
         if safe_var in emitted:
             return val_name
 
-        source = self._statistics_ir.sources.get(var_name, TensorSource(var_name))
-        if isinstance(source, TensorSource):
-            lines.append(
-                f'{indent}{val_name} = states["{var_name}"][{idx_expr}]'
+        source = self._statistics_ir.sources.get(var_name) or TensorSource(var_name)
+        if isinstance(source, (TensorSource, ScatterSource)):
+            key = (
+                source.name
+                if isinstance(source, TensorSource)
+                else f"__scatter_buf_{var_name}"
             )
-        elif isinstance(source, ScatterSource):
-            buf_key = f"__scatter_buf_{var_name}"
-            lines.append(
-                f'{indent}{val_name} = states["{buf_key}"][{idx_expr}]'
-            )
+            stride = self._source_stride(key, logical_rank=1 if n_levels is None else 2)
+            offset = f"t * {stride} + idx" if self.ensemble_size > 1 else "idx"
+            if n_levels is not None:
+                offset = f"({offset}) * {n_levels} + level"
+            lines.append(f'{indent}{val_name} = states["{key}"][{offset}]')
         elif isinstance(source, ExpressionSource):
             names = {
                 dependency: self._pytorch_emit_val_load(
-                    dependency, lines, emitted, indent, idx_expr,
+                    dependency,
+                    lines,
+                    emitted,
+                    indent,
+                    n_levels=n_levels,
                 )
                 for dependency in source.expression.dependencies
             }
             expression = self._pytorch_expression(
-                var_name, source.expression, names,
+                var_name,
+                source.expression,
+                names,
             )
-            lines.append(f'{indent}{val_name} = {expression}')
+            lines.append(f"{indent}{val_name} = {expression}")
 
         emitted.add(safe_var)
         return val_name
 
     def _generate_pytorch_full_function(
-        self: StatisticsRuntime, lines: List[str], full_vars: List[str],
+        self,
+        lines: list[str],
+        full_vars: list[str],
     ) -> None:
         """Generate a PyTorch function for variables saved at full tensor shape."""
         if not full_vars:
             return
 
-        lines.extend([
-            'def _update___full__(states, weight, total_weight, num_macro_steps,',
-            '                     is_inner_first, is_inner_last,',
-            '                     is_outer_first, is_outer_last):',
-            '',
-        ])
+        lines.extend(
+            [
+                "def _update___full__(states, weight, total_weight, num_macro_steps,",
+                "                     is_inner_first, is_inner_last,",
+                "                     is_outer_first, is_outer_last):",
+                "",
+            ]
+        )
 
+        emitted: dict[str, str] = {}
         for var in full_vars:
             safe_var = self._get_safe_name(var)
-            value_expression = self._pytorch_state_expression(var)
-            lines.extend([
-                f'    # === full tensor variable: {var} ===',
-                f'    {safe_var}_val = {value_expression}',
-            ])
+            value_expression = self._pytorch_state_expression(var, lines, emitted)
+            lines.extend(
+                [
+                    f"    # === full tensor variable: {var} ===",
+                    f"    {safe_var}_val = {value_expression}",
+                ]
+            )
 
             for reduction in self._statistics_lowering.inner_reductions(var):
                 inner = reduction.value
-                if inner == 'last':
+                if inner == "last":
                     continue
-                inner_val = f'{safe_var}_{inner}_val'
-                lines.append(
-                    f'    {inner_val} = torch.zeros_like({safe_var}_val)'
-                )
-                inner_key = f'{var}_{inner}_inner_state'
-                if inner == 'mean':
-                    weight_key = f'{var}_{inner}_weight_state'
-                    lines.extend([
-                        f'    _inner_old = states["{inner_key}"].clone()',
-                        f'    _w_old = states["{weight_key}"].clone()',
-                        '    _w_new = _w_old + weight',
-                        f'    _inner_new = hydroforge_weighted_mean(_inner_old, _w_old, {safe_var}_val, weight)',
-                        '    if is_inner_last:',
-                        f'        {inner_val} = _inner_new',
-                        f'        states["{inner_key}"].zero_()',
-                        f'        states["{weight_key}"].zero_()',
-                        '    else:',
-                        f'        states["{inner_key}"].copy_(_inner_new)',
-                        f'        states["{weight_key}"].copy_(_w_new)',
-                    ])
-                elif inner == 'sum':
-                    lines.extend([
-                        f'    _inner_old = states["{inner_key}"].clone()',
-                        f'    _inner_new = _inner_old + {safe_var}_val * weight',
-                        '    if is_inner_last:',
-                        f'        {inner_val} = _inner_new',
-                        f'        states["{inner_key}"].zero_()',
-                        '    else:',
-                        f'        states["{inner_key}"].copy_(_inner_new)',
-                    ])
-                elif inner == 'max':
-                    lines.extend([
-                        '    if is_inner_first:',
-                        f'        states["{inner_key}"].copy_({safe_var}_val)',
-                        '    else:',
-                        f'        states["{inner_key}"].copy_(hydroforge_maximum(states["{inner_key}"], {safe_var}_val))',
-                        '    if is_inner_last:',
-                        f'        {inner_val} = states["{inner_key}"].clone()',
-                        f'        states["{inner_key}"].fill_(float("-inf"))',
-                    ])
-                elif inner == 'min':
-                    lines.extend([
-                        '    if is_inner_first:',
-                        f'        states["{inner_key}"].copy_({safe_var}_val)',
-                        '    else:',
-                        f'        states["{inner_key}"].copy_(hydroforge_minimum(states["{inner_key}"], {safe_var}_val))',
-                        '    if is_inner_last:',
-                        f'        {inner_val} = states["{inner_key}"].clone()',
-                        f'        states["{inner_key}"].fill_(float("inf"))',
-                    ])
-                elif inner == 'first':
-                    lines.extend([
-                        '    if is_inner_first:',
-                        f'        states["{inner_key}"].copy_({safe_var}_val)',
-                        '    if is_inner_last:',
-                        f'        {inner_val} = states["{inner_key}"]',
-                    ])
+                inner_val = f"{safe_var}_{inner}_val"
+                lines.append(f"    {inner_val} = torch.zeros_like({safe_var}_val)")
+                inner_key = f"{var}_{inner}_inner_state"
+                if inner == "mean":
+                    weight_key = f"{var}_{inner}_weight_state"
+                    lines.extend(
+                        [
+                            f'    _inner_old = states["{inner_key}"].clone()',
+                            f'    _w_old = states["{weight_key}"].clone()',
+                            "    _w_new = _w_old + weight",
+                            f"    _inner_new = hydroforge_weighted_mean(_inner_old, _w_old, {safe_var}_val, weight)",
+                            "    if is_inner_last:",
+                            f"        {inner_val} = _inner_new",
+                            f'        states["{inner_key}"].zero_()',
+                            f'        states["{weight_key}"].zero_()',
+                            "    else:",
+                            f'        states["{inner_key}"].copy_(_inner_new)',
+                            f'        states["{weight_key}"].copy_(_w_new)',
+                        ]
+                    )
+                elif inner == "sum":
+                    lines.extend(
+                        [
+                            f'    _inner_old = states["{inner_key}"].clone()',
+                            f"    _inner_new = _inner_old + {safe_var}_val * weight",
+                            "    if is_inner_last:",
+                            f"        {inner_val} = _inner_new",
+                            f'        states["{inner_key}"].zero_()',
+                            "    else:",
+                            f'        states["{inner_key}"].copy_(_inner_new)',
+                        ]
+                    )
+                elif inner in {"max", "min"}:
+                    comparison = (
+                        "hydroforge_maximum" if inner == "max" else "hydroforge_minimum"
+                    )
+                    identity = "-inf" if inner == "max" else "inf"
+                    lines.extend(
+                        [
+                            "    if is_inner_first:",
+                            f'        states["{inner_key}"].copy_({safe_var}_val)',
+                            "    else:",
+                            f'        states["{inner_key}"].copy_({comparison}(states["{inner_key}"], {safe_var}_val))',
+                            "    if is_inner_last:",
+                            f'        {inner_val} = states["{inner_key}"].clone()',
+                            f'        states["{inner_key}"].fill_(float("{identity}"))',
+                        ]
+                    )
+                elif inner == "first":
+                    lines.extend(
+                        [
+                            "    if is_inner_first:",
+                            f'        states["{inner_key}"].copy_({safe_var}_val)',
+                            "    if is_inner_last:",
+                            f'        {inner_val} = states["{inner_key}"]',
+                        ]
+                    )
 
             for operation in self._statistics_lowering.operations(var):
                 op = operation.spelling
-                out_key = f'{var}_{op}'
+                out_key = f"{var}_{op}"
 
                 if operation.compound:
                     outer = operation.outer.value
                     inner = operation.inner.value
                     inner_val = (
-                        f'{safe_var}_val' if inner == 'last'
-                        else f'{safe_var}_{inner}_val'
+                        f"{safe_var}_val"
+                        if inner == "last"
+                        else f"{safe_var}_{inner}_val"
                     )
 
-                    lines.append('    if is_inner_last:')
-                    if outer == 'max':
-                        lines.extend([
-                            '        if is_outer_first:',
-                            f'            states["{out_key}"].copy_({inner_val})',
-                            '        else:',
-                            f'            states["{out_key}"].copy_(hydroforge_maximum(states["{out_key}"], {inner_val}))',
-                        ])
-                    elif outer == 'min':
-                        lines.extend([
-                            '        if is_outer_first:',
-                            f'            states["{out_key}"].copy_({inner_val})',
-                            '        else:',
-                            f'            states["{out_key}"].copy_(hydroforge_minimum(states["{out_key}"], {inner_val}))',
-                        ])
-                    elif outer == 'sum':
-                        lines.extend([
-                            '        if is_outer_first:',
-                            f'            states["{out_key}"].copy_({inner_val})',
-                            '        else:',
-                            f'            states["{out_key}"].add_({inner_val})',
-                        ])
-                    elif outer == 'mean':
-                        lines.extend([
-                            '        if is_outer_first:',
-                            f'            states["{out_key}"].copy_({inner_val})',
-                            '        else:',
-                            '            _count = num_macro_steps.to(dtype=' + inner_val + '.dtype)',
-                            f'            states["{out_key}"].copy_(hydroforge_weighted_mean(states["{out_key}"], _count - 1, {inner_val}, 1))',
-                        ])
-                    elif outer == 'last':
+                    lines.append("    if is_inner_last:")
+                    if outer in {"max", "min"}:
+                        comparison = (
+                            "hydroforge_maximum"
+                            if outer == "max"
+                            else "hydroforge_minimum"
+                        )
+                        lines.extend(
+                            [
+                                "        if is_outer_first:",
+                                f'            states["{out_key}"].copy_({inner_val})',
+                                "        else:",
+                                f'            states["{out_key}"].copy_({comparison}(states["{out_key}"], {inner_val}))',
+                            ]
+                        )
+                    elif outer == "sum":
+                        lines.extend(
+                            [
+                                "        if is_outer_first:",
+                                f'            states["{out_key}"].copy_({inner_val})',
+                                "        else:",
+                                f'            states["{out_key}"].add_({inner_val})',
+                            ]
+                        )
+                    elif outer == "mean":
+                        lines.extend(
+                            [
+                                "        if is_outer_first:",
+                                f'            states["{out_key}"].copy_({inner_val})',
+                                "        else:",
+                                "            _count = num_macro_steps.to(dtype="
+                                + inner_val
+                                + ".dtype)",
+                                f'            states["{out_key}"].copy_(hydroforge_weighted_mean(states["{out_key}"], _count - 1, {inner_val}, 1))',
+                            ]
+                        )
+                    elif outer == "last":
                         lines.append(f'        states["{out_key}"].copy_({inner_val})')
-                    elif outer == 'first':
-                        lines.extend([
-                            '        if is_outer_first:',
-                            f'            states["{out_key}"].copy_({inner_val})',
-                        ])
-                    lines.append('')
+                    elif outer == "first":
+                        lines.extend(
+                            [
+                                "        if is_outer_first:",
+                                f'            states["{out_key}"].copy_({inner_val})',
+                            ]
+                        )
+                    lines.append("")
                     continue
 
-                if op == 'mean':
-                    weight_key = f'{var}_mean_sample_weight_state'
-                    lines.extend([
-                        f'    _old_weight = torch.zeros_like(states["{weight_key}"]) if is_inner_first else states["{weight_key}"].clone()',
-                        f'    _old_mean = torch.zeros_like({safe_var}_val) if is_inner_first else states["{out_key}"].clone()',
-                        f'    _new_mean = hydroforge_weighted_mean(_old_mean, _old_weight, {safe_var}_val, weight)',
-                        f'    states["{out_key}"].copy_(_new_mean)',
-                        '    if is_inner_last:',
-                        f'        states["{weight_key}"].zero_()',
-                        '    else:',
-                        f'        states["{weight_key}"].copy_(_old_weight + weight)',
-                    ])
-                elif op == 'sum':
-                    lines.extend([
-                        '    if is_inner_first:',
-                        f'        states["{out_key}"].zero_()',
-                        f'    states["{out_key}"].add_({safe_var}_val * weight)',
-                    ])
-                elif op == 'max':
-                    lines.extend([
-                        '    if is_inner_first:',
-                        f'        states["{out_key}"].copy_({safe_var}_val)',
-                        '    else:',
-                        f'        states["{out_key}"].copy_(hydroforge_maximum(states["{out_key}"], {safe_var}_val))',
-                    ])
-                elif op == 'min':
-                    lines.extend([
-                        '    if is_inner_first:',
-                        f'        states["{out_key}"].copy_({safe_var}_val)',
-                        '    else:',
-                        f'        states["{out_key}"].copy_(hydroforge_minimum(states["{out_key}"], {safe_var}_val))',
-                    ])
-                elif op == 'last':
-                    lines.extend([
-                        '    if is_inner_last:',
-                        f'        states["{out_key}"].copy_({safe_var}_val)',
-                    ])
-                elif op == 'first':
-                    lines.extend([
-                        '    if is_inner_first:',
-                        f'        states["{out_key}"].copy_({safe_var}_val)',
-                    ])
-                lines.append('')
+                if op == "mean":
+                    weight_key = f"{var}_mean_sample_weight_state"
+                    lines.extend(
+                        [
+                            f'    _old_weight = torch.zeros_like(states["{weight_key}"]) if is_inner_first else states["{weight_key}"].clone()',
+                            f'    _old_mean = torch.zeros_like({safe_var}_val) if is_inner_first else states["{out_key}"].clone()',
+                            f"    _new_mean = hydroforge_weighted_mean(_old_mean, _old_weight, {safe_var}_val, weight)",
+                            f'    states["{out_key}"].copy_(_new_mean)',
+                            "    if is_inner_last:",
+                            f'        states["{weight_key}"].zero_()',
+                            "    else:",
+                            f'        states["{weight_key}"].copy_(_old_weight + weight)',
+                        ]
+                    )
+                elif op == "sum":
+                    lines.extend(
+                        [
+                            "    if is_inner_first:",
+                            f'        states["{out_key}"].zero_()',
+                            f'    states["{out_key}"].add_({safe_var}_val * weight)',
+                        ]
+                    )
+                elif op in {"max", "min"}:
+                    comparison = (
+                        "hydroforge_maximum" if op == "max" else "hydroforge_minimum"
+                    )
+                    lines.extend(
+                        [
+                            "    if is_inner_first:",
+                            f'        states["{out_key}"].copy_({safe_var}_val)',
+                            "    else:",
+                            f'        states["{out_key}"].copy_({comparison}(states["{out_key}"], {safe_var}_val))',
+                        ]
+                    )
+                elif op == "last":
+                    lines.extend(
+                        [
+                            "    if is_inner_last:",
+                            f'        states["{out_key}"].copy_({safe_var}_val)',
+                        ]
+                    )
+                elif op == "first":
+                    lines.extend(
+                        [
+                            "    if is_inner_first:",
+                            f'        states["{out_key}"].copy_({safe_var}_val)',
+                        ]
+                    )
+                lines.append("")
 
     def _generate_pytorch_group_function(
-        self: StatisticsRuntime, lines: List[str],
-        output_index: str, var_list: List[str],
+        self,
+        lines: list[str],
+        output_index: str,
+        var_list: list[str],
     ) -> None:
         """Generate a PyTorch function for one output_index group."""
         dims_1d, dims_2d = self._statistics_lowering.split_indexed(var_list)
 
         func_name = f"_update_{self._get_safe_name(output_index)}"
-        lines.extend([
-            f'def {func_name}(states, weight, total_weight, num_macro_steps,',
-            '               is_inner_first, is_inner_last,',
-            '               is_outer_first, is_outer_last,',
-            '               macro_step_index, num_trials):',
-            '    states = {key: value.reshape(-1) for key, value in states.items()}',
-        ])
-        lines.extend([
-            f'    idx = states["{output_index}"]',
-            '    n = len(idx)',
-            '',
-        ])
+        lines.extend(
+            [
+                f"def {func_name}(states, weight, total_weight, num_macro_steps,",
+                "               is_inner_first, is_inner_last,",
+                "               is_outer_first, is_outer_last,",
+                "               macro_step_index, ensemble_size):",
+                "    states = {key: value.reshape(-1) for key, value in states.items()}",
+            ]
+        )
+        lines.extend(
+            [
+                f'    idx = states["{output_index}"]',
+                "    n = len(idx)",
+                "",
+            ]
+        )
 
-        indent = '        '  # inside for t loop
-        indent2 = indent + '    '
+        indent = "        "  # inside for t loop
 
-        lines.append('    for t in range(num_trials):')
+        lines.append("    for t in range(ensemble_size):")
 
-        # ---------- 1D variables ----------
-        if dims_1d:
-            lines.append(f'{indent}# === 1D variables ===')
-            emitted = set()
+        for batched in (True, False):
+            vectors = [
+                name
+                for name in dims_1d
+                if self._statistics_layouts[name].batched == batched
+            ]
+            levels = [
+                name
+                for name in dims_2d
+                if self._statistics_layouts[name].batched == batched
+            ]
+            if not vectors and not levels:
+                continue
+            body_indent = indent
+            if not batched:
+                lines.append(f"{indent}if t == 0:")
+                body_indent += "    "
+            self._emit_indexed_scalar_updates(
+                dims_1d=vectors,
+                indent=body_indent,
+                indent2=body_indent + "    ",
+                lines=lines,
+            )
+            self._emit_indexed_vector_updates(
+                dims_2d=levels,
+                indent=body_indent,
+                indent2=body_indent + "    ",
+                lines=lines,
+            )
 
-            # Pre-load all needed values
-            for var in dims_1d:
-                stride = self._stride_input(var)
-                idx_expr = f"t * {stride} + idx" if self.num_trials > 1 else "idx"
-                self._pytorch_emit_val_load(
-                    var, lines, emitted, indent, idx_expr,
-                )
-
-            # Inner aggregation states (for compound ops)
-            # Emit inner aggregation state updates
-            for reduction, inner_vars in (
-                self._statistics_lowering.variables_by_inner(dims_1d).items()
-            ):
-                inner_type = reduction.value
-                for var in inner_vars:
-                    safe_var = self._get_safe_name(var)
-                    var_val = f"{safe_var}_val"
-                    val_for = f"val_for_{safe_var}_{inner_type}"
-                    sl = 'slice(t * n, (t + 1) * n)'
-
-                    if inner_type == 'last':
-                        # val_for_X_last == X_val at is_inner_last, no state needed
-                        pass
-                    elif inner_type == 'mean':
-                        inner_key = f'{var}_{inner_type}_inner_state'
-                        weight_key = f'{var}_{inner_type}_weight_state'
-                        lines.extend([
-                            f'{indent}_isl = {sl}',
-                            f'{indent}_inner_old = states["{inner_key}"][_isl].clone()',
-                            f'{indent}_w_old = states["{weight_key}"][_isl].clone()',
-                            f'{indent}_w_new = _w_old + weight',
-                            f'{indent}_inner_new = hydroforge_weighted_mean(_inner_old, _w_old, {var_val}, weight)',
-                            f'{indent}if is_inner_last:',
-                            f'{indent2}states["{inner_key}"][_isl] = 0.0',
-                            f'{indent2}states["{weight_key}"][_isl] = 0.0',
-                            f'{indent2}{val_for} = _inner_new',
-                            f'{indent}else:',
-                            f'{indent2}states["{inner_key}"][_isl] = _inner_new',
-                            f'{indent2}states["{weight_key}"][_isl] = _w_new',
-                            f'{indent2}{val_for} = torch.zeros_like({var_val})',
-                        ])
-                    elif inner_type == 'sum':
-                        inner_key = f'{var}_{inner_type}_inner_state'
-                        lines.extend([
-                            f'{indent}_isl = {sl}',
-                            f'{indent}_inner_old = states["{inner_key}"][_isl].clone()',
-                            f'{indent}_inner_new = _inner_old + {var_val} * weight',
-                            f'{indent}if is_inner_last:',
-                            f'{indent2}states["{inner_key}"][_isl] = 0.0',
-                            f'{indent2}{val_for} = _inner_new',
-                            f'{indent}else:',
-                            f'{indent2}states["{inner_key}"][_isl] = _inner_new',
-                            f'{indent2}{val_for} = torch.zeros_like({var_val})',
-                        ])
-                    elif inner_type == 'max':
-                        inner_key = f'{var}_{inner_type}_inner_state'
-                        lines.extend([
-                            f'{indent}_isl = {sl}',
-                            f'{indent}_inner_old = states["{inner_key}"][_isl].clone()',
-                            f'{indent}if is_inner_first:',
-                            f'{indent2}_inner_new = {var_val}',
-                            f'{indent}else:',
-                            f'{indent2}_inner_new = hydroforge_maximum(_inner_old, {var_val})',
-                            f'{indent}if is_inner_last:',
-                            f'{indent2}states["{inner_key}"][_isl] = float("-inf")',
-                            f'{indent2}{val_for} = _inner_new',
-                            f'{indent}else:',
-                            f'{indent2}states["{inner_key}"][_isl] = _inner_new',
-                            f'{indent2}{val_for} = torch.zeros_like({var_val})',
-                        ])
-                    elif inner_type == 'min':
-                        inner_key = f'{var}_{inner_type}_inner_state'
-                        lines.extend([
-                            f'{indent}_isl = {sl}',
-                            f'{indent}_inner_old = states["{inner_key}"][_isl].clone()',
-                            f'{indent}if is_inner_first:',
-                            f'{indent2}_inner_new = {var_val}',
-                            f'{indent}else:',
-                            f'{indent2}_inner_new = hydroforge_minimum(_inner_old, {var_val})',
-                            f'{indent}if is_inner_last:',
-                            f'{indent2}states["{inner_key}"][_isl] = float("inf")',
-                            f'{indent2}{val_for} = _inner_new',
-                            f'{indent}else:',
-                            f'{indent2}states["{inner_key}"][_isl] = _inner_new',
-                            f'{indent2}{val_for} = torch.zeros_like({var_val})',
-                        ])
-                    elif inner_type == 'first':
-                        inner_key = f'{var}_{inner_type}_inner_state'
-                        lines.extend([
-                            f'{indent}_isl = {sl}',
-                            f'{indent}if is_inner_first:',
-                            f'{indent2}states["{inner_key}"][_isl] = {var_val}',
-                            f'{indent}if is_inner_last:',
-                            f'{indent2}{val_for} = states["{inner_key}"][_isl].clone()',
-                            f'{indent}else:',
-                            f'{indent2}{val_for} = torch.zeros_like({var_val})',
-                        ])
-            # Now emit the actual ops
-            for var in dims_1d:
-                safe_var = self._get_safe_name(var)
-                var_val = f"{safe_var}_val"
-                operations = self._statistics_lowering.operations(var)
-
-                for operation in operations:
-                    op = operation.spelling
-                    out_key = f'{var}_{op}'
-                    sl_expr = 'slice(t * n, (t + 1) * n)'
-
-                    # ---- Compound ops ----
-                    if operation.compound:
-                        outer = operation.outer.value
-                        inner = operation.inner.value
-                        k_val = operation.k
-                        is_arg = operation.stores_index
-                        outer_base = operation.outer.value
-
-                        if inner == 'last':
-                            val_var = var_val
-                        else:
-                            val_var = f"val_for_{safe_var}_{inner}"
-
-                        lines.append(f'{indent}# Compound {op} for {safe_var}')
-                        lines.append(f'{indent}_csl = {sl_expr}')
-
-                        if is_arg:
-                            # argmax_*/argmin_* compound
-                            arg_type = outer_base
-                            aux_key = f'{var}_{op}_aux'
-                            if k_val == 1:
-                                candidate = f'_candidate_{safe_var}_{op}'
-                                if self._statistics_layouts[
-                                    var
-                                ].dtype.is_floating_point:
-                                    lines.extend([
-                                        f'{indent}if is_inner_last:',
-                                        f'{indent2}{candidate} = {val_var}',
-                                        f'{indent2}if is_outer_first:',
-                                        f'{indent2}    states["{out_key}"][_csl] = -1',
-                                        f'{indent2}    states["{aux_key}"][_csl] = float("nan")',
-                                        f'{indent2}_old_aux = states["{aux_key}"][_csl].clone()',
-                                        f'{indent2}_valid = {candidate} == {candidate}',
-                                        f'{indent2}_cond = _valid & ((_old_aux != _old_aux) | ({candidate} {">" if arg_type == "max" else "<"} _old_aux))',
-                                        f'{indent2}states["{aux_key}"][_csl] = torch.where(_cond, {candidate}, _old_aux)',
-                                        f'{indent2}_old_idx = states["{out_key}"][_csl].clone()',
-                                        f'{indent2}_mi = macro_step_index.to(dtype=_old_idx.dtype).expand_as(_old_idx)',
-                                        f'{indent2}states["{out_key}"][_csl] = torch.where(_cond, _mi, _old_idx)',
-                                    ])
-                                else:
-                                    lines.extend([
-                                        f'{indent}if is_inner_last:',
-                                        f'{indent2}{candidate} = {val_var}',
-                                        f'{indent2}if is_outer_first:',
-                                        f'{indent2}    states["{out_key}"][_csl] = macro_step_index',
-                                        f'{indent2}    states["{aux_key}"][_csl] = {candidate}',
-                                        f'{indent2}else:',
-                                        f'{indent2}    _old_aux = states["{aux_key}"][_csl].clone()',
-                                        f'{indent2}    _cond = {candidate} {">" if arg_type == "max" else "<"} _old_aux',
-                                        f'{indent2}    states["{aux_key}"][_csl] = torch.where(_cond, {candidate}, _old_aux)',
-                                        f'{indent2}    _old_idx = states["{out_key}"][_csl].clone()',
-                                        f'{indent2}    _mi = macro_step_index.to(dtype=_old_idx.dtype).expand_as(_old_idx)',
-                                        f'{indent2}    states["{out_key}"][_csl] = torch.where(_cond, _mi, _old_idx)',
-                                    ])
-                            else:
-                                comparison = '>' if arg_type == 'max' else '<'
-                                lines.extend([
-                                    f'{indent}if is_inner_last:',
-                                    f'{indent2}_k_slice = slice(t * n * {k_val}, (t + 1) * n * {k_val})',
-                                    f'{indent2}_top_values = states["{aux_key}"][_k_slice].view(n, {k_val})',
-                                    f'{indent2}_top_indices = states["{out_key}"][_k_slice].view(n, {k_val})',
-                                    f'{indent2}_candidate = {val_var}',
-                                    f'{indent2}if is_outer_first:',
-                                    f'{indent2}    _top_values.fill_(float("nan"))',
-                                    f'{indent2}    _top_indices.fill_(-1)',
-                                    f'{indent2}_new_value = _candidate.clone()',
-                                    f'{indent2}_new_index = macro_step_index.to(dtype=_top_indices.dtype).expand_as(_new_value)',
-                                    f'{indent2}for _rank in range({k_val}):',
-                                    f'{indent2}    _old_value = _top_values[:, _rank].clone()',
-                                    f'{indent2}    _old_index = _top_indices[:, _rank].clone()',
-                                    f'{indent2}    _valid = _new_value == _new_value',
-                                    f'{indent2}    _better = _new_value {comparison} _old_value',
-                                    f'{indent2}    _earlier_tie = (_new_value == _old_value) & (_new_index < _old_index)',
-                                    f'{indent2}    _swap = _valid & ((_old_value != _old_value) | _better | _earlier_tie)',
-                                    f'{indent2}    _top_values[:, _rank] = torch.where(_swap, _new_value, _old_value)',
-                                    f'{indent2}    _top_indices[:, _rank] = torch.where(_swap, _new_index, _old_index)',
-                                    f'{indent2}    _new_value = torch.where(_swap, _old_value, _new_value)',
-                                    f'{indent2}    _new_index = torch.where(_swap, _old_index, _new_index)',
-                                ])
-                        elif outer_base in ('max', 'min'):
-                            cmp = (
-                                'hydroforge_maximum'
-                                if outer_base == 'max'
-                                else 'hydroforge_minimum'
-                            )
-                            if k_val == 1:
-                                lines.extend([
-                                    f'{indent}if is_inner_last:',
-                                    f'{indent2}if is_outer_first:',
-                                    f'{indent2}    states["{out_key}"][_csl] = {val_var}',
-                                    f'{indent2}else:',
-                                    f'{indent2}    _old = states["{out_key}"][_csl].clone()',
-                                    f'{indent2}    states["{out_key}"][_csl] = {cmp}(_old, {val_var})',
-                                ])
-                            else:
-                                comparison = '>' if outer_base == 'max' else '<'
-                                lines.extend([
-                                    f'{indent}if is_inner_last:',
-                                    f'{indent2}_k_slice = slice(t * n * {k_val}, (t + 1) * n * {k_val})',
-                                    f'{indent2}_top_values = states["{out_key}"][_k_slice].view(n, {k_val})',
-                                    f'{indent2}_candidate = {val_var}',
-                                    f'{indent2}if is_outer_first:',
-                                    f'{indent2}    _top_values.fill_(float("nan"))',
-                                    f'{indent2}_new_value = _candidate.clone()',
-                                    f'{indent2}for _rank in range({k_val}):',
-                                    f'{indent2}    _old_value = _top_values[:, _rank].clone()',
-                                    f'{indent2}    _valid = _new_value == _new_value',
-                                    f'{indent2}    _swap = _valid & ((_old_value != _old_value) | (_new_value {comparison} _old_value))',
-                                    f'{indent2}    _top_values[:, _rank] = torch.where(_swap, _new_value, _old_value)',
-                                    f'{indent2}    _new_value = torch.where(_swap, _old_value, _new_value)',
-                                ])
-                        elif outer == 'mean':
-                            lines.extend([
-                                f'{indent}if is_inner_last:',
-                                f'{indent2}if is_outer_first:',
-                                f'{indent2}    states["{out_key}"][_csl] = {val_var}',
-                                f'{indent2}else:',
-                                f'{indent2}    _count = num_macro_steps.to(dtype={val_var}.dtype)',
-                                f'{indent2}    _old = states["{out_key}"][_csl].clone()',
-                                f'{indent2}    states["{out_key}"][_csl] = hydroforge_weighted_mean(_old, _count - 1, {val_var}, 1)',
-                            ])
-                        elif outer == 'sum':
-                            lines.extend([
-                                f'{indent}if is_inner_last:',
-                                f'{indent2}if is_outer_first:',
-                                f'{indent2}    states["{out_key}"][_csl] = {val_var}',
-                                f'{indent2}else:',
-                                f'{indent2}    states["{out_key}"][_csl] += {val_var}',
-                            ])
-                        elif outer == 'last':
-                            lines.extend([
-                                f'{indent}if is_inner_last:',
-                                f'{indent2}states["{out_key}"][_csl] = {val_var}',
-                            ])
-                        elif outer == 'first':
-                            lines.extend([
-                                f'{indent}if is_inner_last and is_outer_first:',
-                                f'{indent2}states["{out_key}"][_csl] = {val_var}',
-                            ])
-                        continue
-
-                    # ---- Simple ops ----
-                    lines.append(f'{indent}# {op} for {safe_var}')
-                    lines.append(f'{indent}_sl = {sl_expr}')
-
-                    if op == 'mean':
-                        weight_key = f'{var}_mean_sample_weight_state'
-                        lines.extend([
-                            f'{indent}if is_inner_first:',
-                            f'{indent2}_old = torch.zeros_like({var_val})',
-                            f'{indent2}_old_weight = torch.zeros_like(states["{weight_key}"][_sl])',
-                            f'{indent}else:',
-                            f'{indent2}_old = states["{out_key}"][_sl].clone()',
-                            f'{indent2}_old_weight = states["{weight_key}"][_sl].clone()',
-                            f'{indent}_new = hydroforge_weighted_mean(_old, _old_weight, {var_val}, weight)',
-                            f'{indent}states["{out_key}"][_sl] = _new',
-                            f'{indent}if is_inner_last:',
-                            f'{indent2}states["{weight_key}"][_sl] = 0.0',
-                            f'{indent}else:',
-                            f'{indent2}states["{weight_key}"][_sl] = _old_weight + weight',
-                        ])
-                    elif op == 'sum':
-                        lines.extend([
-                            f'{indent}if is_inner_first:',
-                            f'{indent2}_old = torch.zeros_like({var_val})',
-                            f'{indent}else:',
-                            f'{indent2}_old = states["{out_key}"][_sl].clone()',
-                            f'{indent}states["{out_key}"][_sl] = _old + {var_val} * weight',
-                        ])
-                    elif op == 'max':
-                        lines.extend([
-                            f'{indent}if is_inner_first:',
-                            f'{indent2}states["{out_key}"][_sl] = {var_val}',
-                            f'{indent}else:',
-                            f'{indent2}_old = states["{out_key}"][_sl].clone()',
-                            f'{indent2}states["{out_key}"][_sl] = hydroforge_maximum(_old, {var_val})',
-                        ])
-                    elif op == 'min':
-                        lines.extend([
-                            f'{indent}if is_inner_first:',
-                            f'{indent2}states["{out_key}"][_sl] = {var_val}',
-                            f'{indent}else:',
-                            f'{indent2}_old = states["{out_key}"][_sl].clone()',
-                            f'{indent2}states["{out_key}"][_sl] = hydroforge_minimum(_old, {var_val})',
-                        ])
-                    elif op == 'last':
-                        lines.extend([
-                            f'{indent}if is_inner_last:',
-                            f'{indent2}states["{out_key}"][_sl] = {var_val}',
-                        ])
-                    elif op == 'first':
-                        lines.extend([
-                            f'{indent}if is_inner_first:',
-                            f'{indent2}states["{out_key}"][_sl] = {var_val}',
-                        ])
-                    lines.append('')
-
-        # ---------- 2D variables ----------
-        if dims_2d:
-            lines.append(f'{indent}# === 2D variables ===')
-            for var in dims_2d:
-                safe_var = self._get_safe_name(var)
-                actual_shape = (
-                    self._statistics_lowering.by_name[var].variable.actual_shape
-                )
-                n_levels = actual_shape[-1]
-                lines.append(f'{indent}n_levels = {n_levels}')
-
-                for operation in self._statistics_lowering.operations(var):
-                    op = operation.spelling
-                    out_key = f'{var}_{op}'
-                    lines.append(f'{indent}# 2D {op} for {safe_var}')
-                    lines.append(f'{indent}for level in range(n_levels):')
-                    emitted: set[str] = set()
-                    stride = self._stride_input(var)
-                    idx_expr = (
-                        f"(t * {stride} + idx) * n_levels + level"
-                        if self.num_trials > 1
-                        else "idx * n_levels + level"
-                    )
-                    var_val = self._pytorch_emit_val_load(
-                        var, lines, emitted, indent2, idx_expr,
-                    )
-                    lines.append(f'{indent2}_val = {var_val}')
-
-                    lines.append(f'{indent2}_out_idx = (t * n + torch.arange(n, device=idx.device)) * n_levels + level')
-
-                    if op == 'mean':
-                        weight_key = f'{var}_mean_sample_weight_state'
-                        lines.extend([
-                            f'{indent2}if is_inner_first:',
-                            f'{indent2}    _old = torch.zeros_like(_val)',
-                            f'{indent2}    _old_weight = torch.zeros_like(states["{weight_key}"][_out_idx])',
-                            f'{indent2}else:',
-                            f'{indent2}    _old = states["{out_key}"][_out_idx]',
-                            f'{indent2}    _old_weight = states["{weight_key}"][_out_idx]',
-                            f'{indent2}_new = hydroforge_weighted_mean(_old, _old_weight, _val, weight)',
-                            f'{indent2}states["{out_key}"][_out_idx] = _new',
-                            f'{indent2}if is_inner_last:',
-                            f'{indent2}    states["{weight_key}"][_out_idx] = 0.0',
-                            f'{indent2}else:',
-                            f'{indent2}    states["{weight_key}"][_out_idx] = _old_weight + weight',
-                        ])
-                    elif op == 'sum':
-                        lines.extend([
-                            f'{indent2}if is_inner_first:',
-                            f'{indent2}    _old = torch.zeros_like(_val)',
-                            f'{indent2}else:',
-                            f'{indent2}    _old = states["{out_key}"][_out_idx]',
-                            f'{indent2}states["{out_key}"][_out_idx] = _old + _val * weight',
-                        ])
-                    elif op == 'max':
-                        lines.extend([
-                            f'{indent2}if is_inner_first:',
-                            f'{indent2}    states["{out_key}"][_out_idx] = _val',
-                            f'{indent2}else:',
-                            f'{indent2}    _old = states["{out_key}"][_out_idx]',
-                            f'{indent2}    states["{out_key}"][_out_idx] = hydroforge_maximum(_old, _val)',
-                        ])
-                    elif op == 'min':
-                        lines.extend([
-                            f'{indent2}if is_inner_first:',
-                            f'{indent2}    states["{out_key}"][_out_idx] = _val',
-                            f'{indent2}else:',
-                            f'{indent2}    _old = states["{out_key}"][_out_idx]',
-                            f'{indent2}    states["{out_key}"][_out_idx] = hydroforge_minimum(_old, _val)',
-                        ])
-                    elif op == 'last':
-                        lines.extend([
-                            f'{indent2}if is_inner_last:',
-                            f'{indent2}    states["{out_key}"][_out_idx] = _val',
-                        ])
-                    elif op == 'first':
-                        lines.extend([
-                            f'{indent2}if is_inner_first:',
-                            f'{indent2}    states["{out_key}"][_out_idx] = _val',
-                        ])
-                    lines.append('')
-
-        lines.append('')
+        lines.append("")
 
     def _generate_pytorch_main_function(
-        self: StatisticsRuntime, lines: List[str],
-        grouped_by_output_index: Dict[str, List[str]],
+        self,
+        lines: list[str],
+        grouped_by_output_index: dict[str, list[str]],
     ) -> None:
         """Generate the main entry-point function that calls per-group functions."""
-        num_trials = self.num_trials if self.num_trials > 1 else 1
+        ensemble_size = self.ensemble_size
         full_vars = grouped_by_output_index.get("__full__", [])
         if not full_vars:
-            lines.append('@torch.compile')
-        lines.extend([
-            '# Tensor update body. Python phase controls have only a finite',
-            '# set of combinations; data values remain device tensors.',
-            'def _compiled_update_statistics(',
-            '    states, BLOCK_SIZE, is_inner_first, is_inner_last,',
-            '    is_outer_first, is_outer_last,',
-            '):',
-            '    weight = states["__weight"]',
-            '    total_weight = states["__total_weight"]',
-            '    num_macro_steps = states["__num_macro_steps"]',
-            '    macro_step_index = states["__macro_step_index"]',
-            f'    num_trials = {num_trials}',
-        ])
+            lines.append("@torch.compile")
+        lines.extend(
+            [
+                "# Tensor update body. Python phase controls have only a finite",
+                "# set of combinations; data values remain device tensors.",
+                "def _compiled_update_statistics(",
+                "    states, BLOCK_SIZE, is_inner_first, is_inner_last,",
+                "    is_outer_first, is_outer_last,",
+                "):",
+                '    weight = states["__weight"]',
+                '    total_weight = states["__total_weight"]',
+                '    num_macro_steps = states["__num_macro_steps"]',
+                '    macro_step_index = states["__macro_step_index"]',
+                f"    ensemble_size = {ensemble_size}",
+            ]
+        )
 
         scatters = self._statistics_ir.ordered_scatters()
         if scatters:
-            lines.append('    # Materialize all scatter virtuals in dependency order')
+            lines.append("    # Materialize all scatter virtuals in dependency order")
         for variable in scatters:
             var = variable.name
             scatter = variable.source
             buf_key = f"__scatter_buf_{var}"
             lines.append(f'    states["{buf_key}"].zero_()')
+            target_size = int(self._storage[buf_key].shape[-1])
+            if target_size == 0:
+                if scatter.reduction.value == "mean":
+                    lines.append(f'    states["__scatter_cnt_{var}"].zero_()')
+                continue
+            emitted: dict[str, str] = {}
             names = {
-                dependency: self._pytorch_state_expression(dependency)
+                dependency: self._pytorch_state_expression(dependency, lines, emitted)
                 for dependency in scatter.value.dependencies
             }
             expression = self._pytorch_expression(
-                var, scatter.value, names,
+                var,
+                scatter.value,
+                names,
             )
-            lines.append(f'    _scatter_val = {expression}')
+            lines.append(f"    _scatter_val = {expression}")
             lines.append(f'    _scatter_idx = states["{scatter.index}"].long()')
-            if num_trials > 1:
+            lines.extend(
+                [
+                    f"    _scatter_valid = (_scatter_idx >= 0) & (_scatter_idx < {target_size})",
+                    f"    _scatter_idx = _scatter_idx.clamp(0, {target_size - 1})",
+                    "    _scatter_val = torch.where(_scatter_valid, _scatter_val, 0.0)",
+                ]
+            )
+            if self._statistics_layouts[var].batched:
                 lines.append(
-                    '    _scatter_idx_exp = '
-                    '_scatter_idx.unsqueeze(0).expand_as(_scatter_val)'
+                    "    _scatter_idx_exp = "
+                    "_scatter_idx.unsqueeze(0).expand_as(_scatter_val)"
                 )
                 lines.append(
                     f'    states["{buf_key}"].scatter_add_('
-                    '1, _scatter_idx_exp, _scatter_val)'
+                    "1, _scatter_idx_exp, _scatter_val)"
                 )
             else:
                 lines.append(
                     f'    states["{buf_key}"].scatter_add_('
-                    '0, _scatter_idx, _scatter_val)'
+                    "0, _scatter_idx, _scatter_val)"
                 )
-            if scatter.reduction.value == 'mean':
+            if scatter.reduction.value == "mean":
                 cnt_key = f"__scatter_cnt_{var}"
-                lines.extend([
-                    f'    states["{cnt_key}"].zero_()',
-                    f'    _scatter_cnt = states["{cnt_key}"]',
-                ])
-                lines.append(
-                    '    _scatter_ones = torch.ones_like('
-                    '        _scatter_val, dtype=torch.int32)'
+                lines.extend(
+                    [
+                        f'    states["{cnt_key}"].zero_()',
+                        f'    _scatter_cnt = states["{cnt_key}"]',
+                    ]
                 )
-                if num_trials > 1:
+                lines.append(
+                    "    _scatter_valid_count = _scatter_valid.to(torch.int32).expand_as(_scatter_val)"
+                )
+                if self._statistics_layouts[var].batched:
                     lines.append(
-                        '    _scatter_cnt.scatter_add_('
-                        '1, _scatter_idx_exp, _scatter_ones)'
+                        "    _scatter_cnt.scatter_add_("
+                        "1, _scatter_idx_exp, _scatter_valid_count)"
                     )
                 else:
                     lines.append(
-                        '    _scatter_cnt.scatter_add_('
-                        '0, _scatter_idx, _scatter_ones)'
+                        "    _scatter_cnt.scatter_add_(0, _scatter_idx, _scatter_valid_count)"
                     )
                 lines.append(f'    states["{buf_key}"].div_(_scatter_cnt)')
                 lines.append(
@@ -849,46 +550,52 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                     '_scatter_cnt == 0, float("nan"))'
                 )
         if scatters:
-            lines.append('')
+            lines.append("")
 
         if full_vars:
-            lines.extend([
-                '    _update___full__(states, weight, total_weight, num_macro_steps,',
-                '                     is_inner_first, is_inner_last,',
-                '                     is_outer_first, is_outer_last)',
-            ])
+            lines.extend(
+                [
+                    "    _update___full__(states, weight, total_weight, num_macro_steps,",
+                    "                     is_inner_first, is_inner_last,",
+                    "                     is_outer_first, is_outer_last)",
+                ]
+            )
 
         for output_index, var_list in grouped_by_output_index.items():
             if output_index == "__full__":
                 continue
             safe_output_index = self._get_safe_name(output_index)
-            lines.extend([
-                f'    _update_{safe_output_index}(states, weight, total_weight, num_macro_steps,',
-                '                      is_inner_first, is_inner_last,',
-                '                      is_outer_first, is_outer_last,',
-                '                      macro_step_index, num_trials)',
-            ])
-        lines.extend([
-            '',
-            '# Host dispatcher. Read each control tensor once, outside',
-            '# torch.compile, so exact step/index values do not create guards.',
-            'def internal_update_statistics(states, BLOCK_SIZE):',
-            '    sub_step = int(states["__sub_step"].item())',
-            '    num_sub_steps = int(states["__num_sub_steps"].item())',
-            '    flags = int(states["__flags"].item())',
-            '    is_inner_first = (flags & 1) != 0 and sub_step == 0',
-            '    is_inner_last = (flags & 2) != 0 and sub_step == num_sub_steps - 1',
-            '    is_outer_first = (flags & 4) != 0 and is_inner_last',
-            '    is_outer_last = (flags & 8) != 0 and is_inner_last',
-            '    _compiled_update_statistics(',
-            '        states, BLOCK_SIZE, is_inner_first, is_inner_last,',
-            '        is_outer_first, is_outer_last,',
-            '    )',
-            '',
-        ])
+            lines.extend(
+                [
+                    f"    _update_{safe_output_index}(states, weight, total_weight, num_macro_steps,",
+                    "                      is_inner_first, is_inner_last,",
+                    "                      is_outer_first, is_outer_last,",
+                    "                      macro_step_index, ensemble_size)",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "# Host dispatcher. Read each control tensor once, outside",
+                "# torch.compile, so exact step/index values do not create guards.",
+                "def internal_update_statistics(states, BLOCK_SIZE):",
+                '    sub_step = int(states["__sub_step"].item())',
+                '    num_sub_steps = int(states["__num_sub_steps"].item())',
+                '    flags = int(states["__flags"].item())',
+                "    is_inner_first = (flags & 1) != 0 and sub_step == 0",
+                "    is_inner_last = (flags & 2) != 0 and sub_step == num_sub_steps - 1",
+                "    is_outer_first = (flags & 4) != 0 and is_inner_last",
+                "    is_outer_last = (flags & 8) != 0 and is_inner_last",
+                "    _compiled_update_statistics(",
+                "        states, BLOCK_SIZE, is_inner_first, is_inner_last,",
+                "        is_outer_first, is_outer_last,",
+                "    )",
+                "",
+            ]
+        )
 
     def _generate_pytorch_aggregator_function(
-        self: StatisticsRuntime,
+        self,
     ) -> None:
         """Generate and compile a pure-PyTorch aggregation function (no Triton dependency)."""
         grouped_by_output_index = self._statistics_lowering.groups
@@ -910,3 +617,428 @@ class TorchStatisticsEmitter(StatisticsEmitter):
 
         if self.save_kernels:
             self._save_kernel_file(kernel_code)
+
+    def _emit_indexed_scalar_updates(
+        self, *, dims_1d: list[str], indent: str, indent2: str, lines: list[str]
+    ) -> None:
+        if dims_1d:
+            lines.append(f"{indent}# === 1D variables ===")
+            emitted = set()
+
+            # Pre-load all needed values
+            for var in dims_1d:
+                self._pytorch_emit_val_load(
+                    var,
+                    lines,
+                    emitted,
+                    indent,
+                )
+
+            # Inner aggregation states (for compound ops)
+            # Emit inner aggregation state updates
+            for reduction, inner_vars in self._statistics_lowering.variables_by_inner(
+                dims_1d
+            ).items():
+                inner_type = reduction.value
+                for var in inner_vars:
+                    safe_var = self._get_safe_name(var)
+                    var_val = f"{safe_var}_val"
+                    val_for = f"val_for_{safe_var}_{inner_type}"
+                    sl = "slice(t * n, (t + 1) * n)"
+
+                    if inner_type == "last":
+                        # val_for_X_last == X_val at is_inner_last, no state needed
+                        pass
+                    elif inner_type == "mean":
+                        inner_key = f"{var}_{inner_type}_inner_state"
+                        weight_key = f"{var}_{inner_type}_weight_state"
+                        lines.extend(
+                            [
+                                f"{indent}_isl = {sl}",
+                                f'{indent}_inner_old = states["{inner_key}"][_isl].clone()',
+                                f'{indent}_w_old = states["{weight_key}"][_isl].clone()',
+                                f"{indent}_w_new = _w_old + weight",
+                                f"{indent}_inner_new = hydroforge_weighted_mean(_inner_old, _w_old, {var_val}, weight)",
+                                f"{indent}if is_inner_last:",
+                                f'{indent2}states["{inner_key}"][_isl] = 0.0',
+                                f'{indent2}states["{weight_key}"][_isl] = 0.0',
+                                f"{indent2}{val_for} = _inner_new",
+                                f"{indent}else:",
+                                f'{indent2}states["{inner_key}"][_isl] = _inner_new',
+                                f'{indent2}states["{weight_key}"][_isl] = _w_new',
+                                f"{indent2}{val_for} = torch.zeros_like({var_val})",
+                            ]
+                        )
+                    elif inner_type == "sum":
+                        inner_key = f"{var}_{inner_type}_inner_state"
+                        lines.extend(
+                            [
+                                f"{indent}_isl = {sl}",
+                                f'{indent}_inner_old = states["{inner_key}"][_isl].clone()',
+                                f"{indent}_inner_new = _inner_old + {var_val} * weight",
+                                f"{indent}if is_inner_last:",
+                                f'{indent2}states["{inner_key}"][_isl] = 0.0',
+                                f"{indent2}{val_for} = _inner_new",
+                                f"{indent}else:",
+                                f'{indent2}states["{inner_key}"][_isl] = _inner_new',
+                                f"{indent2}{val_for} = torch.zeros_like({var_val})",
+                            ]
+                        )
+                    elif inner_type in {"max", "min"}:
+                        inner_key = f"{var}_{inner_type}_inner_state"
+                        comparison = (
+                            "hydroforge_maximum"
+                            if inner_type == "max"
+                            else "hydroforge_minimum"
+                        )
+                        identity = "-inf" if inner_type == "max" else "inf"
+                        lines.extend(
+                            [
+                                f"{indent}_isl = {sl}",
+                                f'{indent}_inner_old = states["{inner_key}"][_isl].clone()',
+                                f"{indent}if is_inner_first:",
+                                f"{indent2}_inner_new = {var_val}",
+                                f"{indent}else:",
+                                f"{indent2}_inner_new = {comparison}(_inner_old, {var_val})",
+                                f"{indent}if is_inner_last:",
+                                f'{indent2}states["{inner_key}"][_isl] = float("{identity}")',
+                                f"{indent2}{val_for} = _inner_new",
+                                f"{indent}else:",
+                                f'{indent2}states["{inner_key}"][_isl] = _inner_new',
+                                f"{indent2}{val_for} = torch.zeros_like({var_val})",
+                            ]
+                        )
+                    elif inner_type == "first":
+                        inner_key = f"{var}_{inner_type}_inner_state"
+                        lines.extend(
+                            [
+                                f"{indent}_isl = {sl}",
+                                f"{indent}if is_inner_first:",
+                                f'{indent2}states["{inner_key}"][_isl] = {var_val}',
+                                f"{indent}if is_inner_last:",
+                                f'{indent2}{val_for} = states["{inner_key}"][_isl].clone()',
+                                f"{indent}else:",
+                                f"{indent2}{val_for} = torch.zeros_like({var_val})",
+                            ]
+                        )
+            # Now emit the actual ops
+            for var in dims_1d:
+                safe_var = self._get_safe_name(var)
+                var_val = f"{safe_var}_val"
+                operations = self._statistics_lowering.operations(var)
+
+                for operation in operations:
+                    op = operation.spelling
+                    out_key = f"{var}_{op}"
+                    sl_expr = "slice(t * n, (t + 1) * n)"
+
+                    # ---- Compound ops ----
+                    if operation.compound:
+                        outer = operation.outer.value
+                        inner = operation.inner.value
+                        k_val = operation.k
+                        is_arg = operation.stores_index
+
+                        if inner == "last":
+                            val_var = var_val
+                        else:
+                            val_var = f"val_for_{safe_var}_{inner}"
+
+                        lines.append(f"{indent}# Compound {op} for {safe_var}")
+                        lines.append(f"{indent}_csl = {sl_expr}")
+
+                        if is_arg:
+                            # argmax_*/argmin_* compound
+                            aux_key = f"{var}_{op}_aux"
+                            if k_val == 1:
+                                candidate = f"_candidate_{safe_var}_{op}"
+                                if self._statistics_layouts[
+                                    var
+                                ].dtype.is_floating_point:
+                                    lines.extend(
+                                        [
+                                            f"{indent}if is_inner_last:",
+                                            f"{indent2}{candidate} = {val_var}",
+                                            f"{indent2}if is_outer_first:",
+                                            f'{indent2}    states["{out_key}"][_csl] = -1',
+                                            f'{indent2}    states["{aux_key}"][_csl] = float("nan")',
+                                            f'{indent2}_old_aux = states["{aux_key}"][_csl].clone()',
+                                            f"{indent2}_valid = {candidate} == {candidate}",
+                                            f"{indent2}_cond = _valid & ((_old_aux != _old_aux) | ({candidate} {'>' if outer == 'max' else '<'} _old_aux))",
+                                            f'{indent2}states["{aux_key}"][_csl] = torch.where(_cond, {candidate}, _old_aux)',
+                                            f'{indent2}_old_idx = states["{out_key}"][_csl].clone()',
+                                            f"{indent2}_mi = macro_step_index.to(dtype=_old_idx.dtype).expand_as(_old_idx)",
+                                            f'{indent2}states["{out_key}"][_csl] = torch.where(_cond, _mi, _old_idx)',
+                                        ]
+                                    )
+                                else:
+                                    lines.extend(
+                                        [
+                                            f"{indent}if is_inner_last:",
+                                            f"{indent2}{candidate} = {val_var}",
+                                            f"{indent2}if is_outer_first:",
+                                            f'{indent2}    states["{out_key}"][_csl] = macro_step_index',
+                                            f'{indent2}    states["{aux_key}"][_csl] = {candidate}',
+                                            f"{indent2}else:",
+                                            f'{indent2}    _old_aux = states["{aux_key}"][_csl].clone()',
+                                            f"{indent2}    _cond = {candidate} {'>' if outer == 'max' else '<'} _old_aux",
+                                            f'{indent2}    states["{aux_key}"][_csl] = torch.where(_cond, {candidate}, _old_aux)',
+                                            f'{indent2}    _old_idx = states["{out_key}"][_csl].clone()',
+                                            f"{indent2}    _mi = macro_step_index.to(dtype=_old_idx.dtype).expand_as(_old_idx)",
+                                            f'{indent2}    states["{out_key}"][_csl] = torch.where(_cond, _mi, _old_idx)',
+                                        ]
+                                    )
+                            else:
+                                comparison = ">" if outer == "max" else "<"
+                                lines.extend(
+                                    [
+                                        f"{indent}if is_inner_last:",
+                                        f"{indent2}_k_slice = slice(t * n * {k_val}, (t + 1) * n * {k_val})",
+                                        f'{indent2}_top_values = states["{aux_key}"][_k_slice].view(n, {k_val})',
+                                        f'{indent2}_top_indices = states["{out_key}"][_k_slice].view(n, {k_val})',
+                                        f"{indent2}_candidate = {val_var}",
+                                        f"{indent2}if is_outer_first:",
+                                        f'{indent2}    _top_values.fill_(float("nan"))',
+                                        f"{indent2}    _top_indices.fill_(-1)",
+                                        f"{indent2}_new_value = _candidate.clone()",
+                                        f"{indent2}_new_index = macro_step_index.to(dtype=_top_indices.dtype).expand_as(_new_value)",
+                                        f"{indent2}for _rank in range({k_val}):",
+                                        f"{indent2}    _old_value = _top_values[:, _rank].clone()",
+                                        f"{indent2}    _old_index = _top_indices[:, _rank].clone()",
+                                        f"{indent2}    _valid = _new_value == _new_value",
+                                        f"{indent2}    _better = _new_value {comparison} _old_value",
+                                        f"{indent2}    _earlier_tie = (_new_value == _old_value) & (_new_index < _old_index)",
+                                        f"{indent2}    _swap = _valid & ((_old_value != _old_value) | _better | _earlier_tie)",
+                                        f"{indent2}    _top_values[:, _rank] = torch.where(_swap, _new_value, _old_value)",
+                                        f"{indent2}    _top_indices[:, _rank] = torch.where(_swap, _new_index, _old_index)",
+                                        f"{indent2}    _new_value = torch.where(_swap, _old_value, _new_value)",
+                                        f"{indent2}    _new_index = torch.where(_swap, _old_index, _new_index)",
+                                    ]
+                                )
+                        elif outer in ("max", "min"):
+                            cmp = (
+                                "hydroforge_maximum"
+                                if outer == "max"
+                                else "hydroforge_minimum"
+                            )
+                            if k_val == 1:
+                                lines.extend(
+                                    [
+                                        f"{indent}if is_inner_last:",
+                                        f"{indent2}if is_outer_first:",
+                                        f'{indent2}    states["{out_key}"][_csl] = {val_var}',
+                                        f"{indent2}else:",
+                                        f'{indent2}    _old = states["{out_key}"][_csl].clone()',
+                                        f'{indent2}    states["{out_key}"][_csl] = {cmp}(_old, {val_var})',
+                                    ]
+                                )
+                            else:
+                                comparison = ">" if outer == "max" else "<"
+                                lines.extend(
+                                    [
+                                        f"{indent}if is_inner_last:",
+                                        f"{indent2}_k_slice = slice(t * n * {k_val}, (t + 1) * n * {k_val})",
+                                        f'{indent2}_top_values = states["{out_key}"][_k_slice].view(n, {k_val})',
+                                        f"{indent2}_candidate = {val_var}",
+                                        f"{indent2}if is_outer_first:",
+                                        f'{indent2}    _top_values.fill_(float("nan"))',
+                                        f"{indent2}_new_value = _candidate.clone()",
+                                        f"{indent2}for _rank in range({k_val}):",
+                                        f"{indent2}    _old_value = _top_values[:, _rank].clone()",
+                                        f"{indent2}    _valid = _new_value == _new_value",
+                                        f"{indent2}    _swap = _valid & ((_old_value != _old_value) | (_new_value {comparison} _old_value))",
+                                        f"{indent2}    _top_values[:, _rank] = torch.where(_swap, _new_value, _old_value)",
+                                        f"{indent2}    _new_value = torch.where(_swap, _old_value, _new_value)",
+                                    ]
+                                )
+                        elif outer == "mean":
+                            lines.extend(
+                                [
+                                    f"{indent}if is_inner_last:",
+                                    f"{indent2}if is_outer_first:",
+                                    f'{indent2}    states["{out_key}"][_csl] = {val_var}',
+                                    f"{indent2}else:",
+                                    f"{indent2}    _count = num_macro_steps.to(dtype={val_var}.dtype)",
+                                    f'{indent2}    _old = states["{out_key}"][_csl].clone()',
+                                    f'{indent2}    states["{out_key}"][_csl] = hydroforge_weighted_mean(_old, _count - 1, {val_var}, 1)',
+                                ]
+                            )
+                        elif outer == "sum":
+                            lines.extend(
+                                [
+                                    f"{indent}if is_inner_last:",
+                                    f"{indent2}if is_outer_first:",
+                                    f'{indent2}    states["{out_key}"][_csl] = {val_var}',
+                                    f"{indent2}else:",
+                                    f'{indent2}    states["{out_key}"][_csl] += {val_var}',
+                                ]
+                            )
+                        elif outer == "last":
+                            lines.extend(
+                                [
+                                    f"{indent}if is_inner_last:",
+                                    f'{indent2}states["{out_key}"][_csl] = {val_var}',
+                                ]
+                            )
+                        elif outer == "first":
+                            lines.extend(
+                                [
+                                    f"{indent}if is_inner_last and is_outer_first:",
+                                    f'{indent2}states["{out_key}"][_csl] = {val_var}',
+                                ]
+                            )
+                        continue
+
+                    # ---- Simple ops ----
+                    lines.append(f"{indent}# {op} for {safe_var}")
+                    lines.append(f"{indent}_sl = {sl_expr}")
+
+                    if op == "mean":
+                        weight_key = f"{var}_mean_sample_weight_state"
+                        lines.extend(
+                            [
+                                f"{indent}if is_inner_first:",
+                                f"{indent2}_old = torch.zeros_like({var_val})",
+                                f'{indent2}_old_weight = torch.zeros_like(states["{weight_key}"][_sl])',
+                                f"{indent}else:",
+                                f'{indent2}_old = states["{out_key}"][_sl].clone()',
+                                f'{indent2}_old_weight = states["{weight_key}"][_sl].clone()',
+                                f"{indent}_new = hydroforge_weighted_mean(_old, _old_weight, {var_val}, weight)",
+                                f'{indent}states["{out_key}"][_sl] = _new',
+                                f"{indent}if is_inner_last:",
+                                f'{indent2}states["{weight_key}"][_sl] = 0.0',
+                                f"{indent}else:",
+                                f'{indent2}states["{weight_key}"][_sl] = _old_weight + weight',
+                            ]
+                        )
+                    elif op == "sum":
+                        lines.extend(
+                            [
+                                f"{indent}if is_inner_first:",
+                                f"{indent2}_old = torch.zeros_like({var_val})",
+                                f"{indent}else:",
+                                f'{indent2}_old = states["{out_key}"][_sl].clone()',
+                                f'{indent}states["{out_key}"][_sl] = _old + {var_val} * weight',
+                            ]
+                        )
+                    elif op in {"max", "min"}:
+                        comparison = (
+                            "hydroforge_maximum"
+                            if op == "max"
+                            else "hydroforge_minimum"
+                        )
+                        lines.extend(
+                            [
+                                f"{indent}if is_inner_first:",
+                                f'{indent2}states["{out_key}"][_sl] = {var_val}',
+                                f"{indent}else:",
+                                f'{indent2}_old = states["{out_key}"][_sl].clone()',
+                                f'{indent2}states["{out_key}"][_sl] = {comparison}(_old, {var_val})',
+                            ]
+                        )
+                    elif op == "last":
+                        lines.extend(
+                            [
+                                f"{indent}if is_inner_last:",
+                                f'{indent2}states["{out_key}"][_sl] = {var_val}',
+                            ]
+                        )
+                    elif op == "first":
+                        lines.extend(
+                            [
+                                f"{indent}if is_inner_first:",
+                                f'{indent2}states["{out_key}"][_sl] = {var_val}',
+                            ]
+                        )
+                    lines.append("")
+
+    def _emit_indexed_vector_updates(
+        self, *, dims_2d: list[str], indent: str, indent2: str, lines: list[str]
+    ) -> None:
+        if dims_2d:
+            lines.append(f"{indent}# === 2D variables ===")
+            for var in dims_2d:
+                safe_var = self._get_safe_name(var)
+                actual_shape = self._statistics_lowering.by_name[
+                    var
+                ].variable.actual_shape
+                n_levels = actual_shape[-1]
+                lines.append(f"{indent}n_levels = {n_levels}")
+
+                for operation in self._statistics_lowering.operations(var):
+                    op = operation.spelling
+                    out_key = f"{var}_{op}"
+                    lines.append(f"{indent}# 2D {op} for {safe_var}")
+                    lines.append(f"{indent}for level in range(n_levels):")
+                    emitted: set[str] = set()
+                    var_val = self._pytorch_emit_val_load(
+                        var,
+                        lines,
+                        emitted,
+                        indent2,
+                        n_levels=n_levels,
+                    )
+                    lines.append(f"{indent2}_val = {var_val}")
+
+                    lines.append(
+                        f"{indent2}_out_idx = (t * n + torch.arange(n, device=idx.device)) * n_levels + level"
+                    )
+
+                    if op == "mean":
+                        weight_key = f"{var}_mean_sample_weight_state"
+                        lines.extend(
+                            [
+                                f"{indent2}if is_inner_first:",
+                                f"{indent2}    _old = torch.zeros_like(_val)",
+                                f'{indent2}    _old_weight = torch.zeros_like(states["{weight_key}"][_out_idx])',
+                                f"{indent2}else:",
+                                f'{indent2}    _old = states["{out_key}"][_out_idx]',
+                                f'{indent2}    _old_weight = states["{weight_key}"][_out_idx]',
+                                f"{indent2}_new = hydroforge_weighted_mean(_old, _old_weight, _val, weight)",
+                                f'{indent2}states["{out_key}"][_out_idx] = _new',
+                                f"{indent2}if is_inner_last:",
+                                f'{indent2}    states["{weight_key}"][_out_idx] = 0.0',
+                                f"{indent2}else:",
+                                f'{indent2}    states["{weight_key}"][_out_idx] = _old_weight + weight',
+                            ]
+                        )
+                    elif op == "sum":
+                        lines.extend(
+                            [
+                                f"{indent2}if is_inner_first:",
+                                f"{indent2}    _old = torch.zeros_like(_val)",
+                                f"{indent2}else:",
+                                f'{indent2}    _old = states["{out_key}"][_out_idx]',
+                                f'{indent2}states["{out_key}"][_out_idx] = _old + _val * weight',
+                            ]
+                        )
+                    elif op in {"max", "min"}:
+                        comparison = (
+                            "hydroforge_maximum"
+                            if op == "max"
+                            else "hydroforge_minimum"
+                        )
+                        lines.extend(
+                            [
+                                f"{indent2}if is_inner_first:",
+                                f'{indent2}    states["{out_key}"][_out_idx] = _val',
+                                f"{indent2}else:",
+                                f'{indent2}    _old = states["{out_key}"][_out_idx]',
+                                f'{indent2}    states["{out_key}"][_out_idx] = {comparison}(_old, _val)',
+                            ]
+                        )
+                    elif op == "last":
+                        lines.extend(
+                            [
+                                f"{indent2}if is_inner_last:",
+                                f'{indent2}    states["{out_key}"][_out_idx] = _val',
+                            ]
+                        )
+                    elif op == "first":
+                        lines.extend(
+                            [
+                                f"{indent2}if is_inner_first:",
+                                f'{indent2}    states["{out_key}"][_out_idx] = _val',
+                            ]
+                        )
+                    lines.append("")

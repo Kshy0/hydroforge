@@ -1,7 +1,7 @@
 """Compiled model orchestration and backend-owned execution."""
 
-from hydroforge.execution.collectives import all_reduce_, reduce_many_
 from hydroforge.execution.boundaries import between_steps
+from hydroforge.execution.collectives import all_reduce_, reduce_many_
 from hydroforge.execution.step import ManagedStep, managed_step
 
 __all__ = [

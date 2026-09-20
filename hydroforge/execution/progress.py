@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import time
+from dataclasses import dataclass
 from typing import Any
-
 
 
 @dataclass
@@ -18,7 +17,10 @@ class ProgressState:
     _schedule_start_fraction: float | None = None
 
     def start(
-        self, phase: str, *, schedule_fraction: float | None = None,
+        self,
+        phase: str,
+        *,
+        schedule_fraction: float | None = None,
     ) -> None:
         self.phase = phase
         self.current_step = 0
@@ -27,14 +29,14 @@ class ProgressState:
         self._schedule_start_fraction = schedule_fraction
 
     def begin_step(
-        self, phase: str, *, schedule_fraction: float | None = None,
+        self,
+        phase: str,
+        *,
+        schedule_fraction: float | None = None,
     ) -> None:
         if phase != self.phase:
             self.start(phase, schedule_fraction=schedule_fraction)
-        elif (
-            self._schedule_start_fraction is None
-            and schedule_fraction is not None
-        ):
+        elif self._schedule_start_fraction is None and schedule_fraction is not None:
             self._schedule_start_fraction = schedule_fraction
 
     def tick(self, phase: str, *, force_emit: bool = False) -> bool:
@@ -75,8 +77,7 @@ class ProgressState:
         completed_steps = completed * total_steps
         speed = completed_steps / elapsed if elapsed > 0.0 else 0.0
         eta = (
-            elapsed * (1.0 - fraction) / completed
-            if completed > 0.0 else float("inf")
+            elapsed * (1.0 - fraction) / completed if completed > 0.0 else float("inf")
         )
         return (
             f"[{fraction * 100:5.1f}%] "
@@ -86,10 +87,7 @@ class ProgressState:
     def format_unbounded(self) -> str:
         label = "spin-up" if self.phase == "spinup" else "running"
         unit = "step" if self.current_step == 1 else "steps"
-        return (
-            f"[{label} {self.current_step} {unit}] "
-            f"{self.speed:.2f} steps/s"
-        )
+        return f"[{label} {self.current_step} {unit}] {self.speed:.2f} steps/s"
 
 
 class ProgressRuntime:
@@ -102,33 +100,32 @@ class ProgressRuntime:
         step = None if runtime is None else runtime.scheduled_step
         return self.owner.simulation_schedule, step
 
-    def _phase(self) -> str:
-        schedule, step = self._schedule_position()
-        if schedule is None or step is None:
-            return "unbounded"
-        return step.phase
-
     def begin_step(self) -> None:
         schedule, step = self._schedule_position()
+        phase = "unbounded" if schedule is None or step is None else step.phase
         fraction = None
-        if schedule is not None and step is not None:
+        if (
+            schedule is not None
+            and step is not None
+            and (
+                phase != self.state.phase or self.state._schedule_start_fraction is None
+            )
+        ):
             elapsed = (step.start - schedule.execution_start).total_seconds()
-            duration = (
-                schedule._end - schedule.execution_start
-            ).total_seconds()
+            duration = (schedule._end - schedule.execution_start).total_seconds()
             fraction = elapsed / duration
         self.state.begin_step(
-            self._phase(), schedule_fraction=fraction,
+            phase,
+            schedule_fraction=fraction,
         )
 
     def progress_tick(self) -> bool:
         schedule, step = self._schedule_position()
+        phase = "unbounded" if schedule is None or step is None else step.phase
         final_step = (
-            schedule is not None
-            and step is not None
-            and step.end == schedule._end
+            schedule is not None and step is not None and step.end == schedule._end
         )
-        return self.state.tick(self._phase(), force_emit=final_step)
+        return self.state.tick(phase, force_emit=final_step)
 
     def format_progress(self) -> str:
         schedule, step = self._schedule_position()

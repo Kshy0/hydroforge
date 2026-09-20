@@ -3,34 +3,51 @@
 from __future__ import annotations
 
 import logging
+import math
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Literal
 
 import numpy as np
 import torch
-from pydantic import Field, PrivateAttr, field_validator, model_validator
+from pydantic import PrivateAttr, field_validator, model_validator
 
-from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.contracts.naming import validate_safe_path_component
+from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.data.aggregation import build_cama_mapping
 from hydroforge.data.datasets.base import (
     SourceDataset,
     _validated_forcing_shard,
 )
 from hydroforge.data.datasets.export import DatasetExporter
+from hydroforge.data.distributed import is_rank_zero
 from hydroforge.data.mapping.table import MappingTable
 from hydroforge.data.numeric import (
     canonical_float64,
     canonical_ids,
     immutable_array,
 )
-from hydroforge.data.distributed import is_rank_zero
 from hydroforge.serialization.netcdf import DEFAULT_NETCDF_OPTIONS
 
-
 logger = logging.getLogger(__name__)
+
+
+def _own_source_nan_mask(
+    value: np.ndarray, *, expected_shape: tuple[int, int] | None = None
+) -> np.ndarray:
+    """Validate and snapshot a caller- or storage-provided source mask."""
+    if np.ma.isMaskedArray(value):
+        raise ValueError("source_nan_mask must not be a masked array")
+    if value.dtype != np.dtype(np.bool_):
+        raise ValueError("source_nan_mask must use exact boolean dtype")
+    if expected_shape is not None and value.shape != expected_shape:
+        raise ValueError(
+            f"source_nan_mask shape {value.shape} does not match "
+            f"mapping source shape {expected_shape}"
+        )
+    return immutable_array(value, order="C")
 
 
 class _BuildLocalMappingRequest(HydroForgeModel):
@@ -75,7 +92,7 @@ class _GenerateMappingTableRequest(HydroForgeModel):
     hires_idx_precision: str = "<i2"
     map_precision: str = "<f4"
     parameter_nc: str | Path | None = None
-    allow_oob_zero: bool = Field(default=False, strict=True)
+    allow_oob_zero: bool = False
     source_nan_policy: Literal["keep", "drop", "nearest"] = "keep"
     source_nan_mask: np.ndarray | None = None
 
@@ -87,20 +104,10 @@ class _GenerateMappingTableRequest(HydroForgeModel):
             validate_safe_path_component(self.npz_file, label="npz_file"),
         )
         if self.source_nan_mask is not None:
-            if np.ma.isMaskedArray(self.source_nan_mask):
-                raise ValueError("source_nan_mask must not be a masked array")
-            if self.source_nan_mask.dtype != np.dtype(np.bool_):
-                raise ValueError("source_nan_mask must use exact boolean dtype")
-            mask = np.array(
-                self.source_nan_mask,
-                dtype=np.bool_,
-                order="C",
-                copy=True,
-            )
             object.__setattr__(
                 self,
                 "source_nan_mask",
-                immutable_array(mask, order="C"),
+                _own_source_nan_mask(self.source_nan_mask),
             )
         return self
 
@@ -119,18 +126,12 @@ class _MappingNanMaskRequest(HydroForgeModel):
                 "dataset cannot infer a source NaN mask; pass "
                 "source_nan_mask explicitly or use source_nan_policy='keep'"
             )
-        if np.ma.isMaskedArray(self.nan_mask):
-            raise ValueError("source_nan_mask must not be a masked array")
-        if self.nan_mask.dtype != np.dtype(np.bool_):
-            raise ValueError("source_nan_mask must use exact boolean dtype")
-        if self.nan_mask.shape != self.mapping._source_shape:
-            raise ValueError(
-                f"source_nan_mask shape {self.nan_mask.shape} does not match "
-                f"mapping source shape {self.mapping._source_shape}"
-            )
-        mask = np.array(self.nan_mask, dtype=np.bool_, order="C", copy=True)
         object.__setattr__(
-            self, "nan_mask", immutable_array(mask, order="C"),
+            self,
+            "nan_mask",
+            _own_source_nan_mask(
+                self.nan_mask, expected_shape=self.mapping._source_shape
+            ),
         )
         return self
 
@@ -169,21 +170,21 @@ class GriddedDataset(SourceDataset, ABC):
         default=None,
     )
 
-    def _get_first_frame_nan_mask(self) -> Optional[np.ndarray]:
+    def _get_first_frame_nan_mask(self) -> np.ndarray | None:
         """Return a flat full-grid NaN mask for mapping generation, if supported."""
         return None
 
     def _shard_forcing(
         self,
-        chunk_data: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        chunk_data: torch.Tensor | dict[str, torch.Tensor],
         local_mapping: torch.Tensor,
-    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
         """
         Map grid data to catchments and handle distributed sync.
 
         Expected input shape:
-          - (T, N) for single trial
-          - (T, K, N) for K trials
+          - (T, N) for single member
+          - (T, K, N) for K members
 
         N matches the active source-grid axis installed on this Dataset.
         Output shape: (M, C) where M is the product of non-spatial dims, C = number of catchments.
@@ -194,27 +195,21 @@ class GriddedDataset(SourceDataset, ABC):
                 for name, block in chunk_data.items()
             }
 
-        if chunk_data.dim() == 2:
-            flat = chunk_data
-        else:
-            T, K, N = chunk_data.shape
-            flat = chunk_data.reshape(T * K, N)
+        leading_shape = chunk_data.shape[:-1]
+        rows = math.prod(leading_shape)
+        flat = chunk_data.reshape(rows, chunk_data.shape[-1])
         if self.clip_negative:
             flat = torch.clamp_min(flat, 0)
 
         out = (flat @ local_mapping).contiguous()
 
-        if chunk_data.dim() == 3:
-            T, K, _ = chunk_data.shape
-            out = out.view(T, K, -1)
-
-        return out
+        return out.view(*leading_shape, local_mapping.shape[1])
 
     def build_local_mapping(
         self,
         mapping_file: str | Path,
-        desired_catchment_ids: Optional[np.ndarray] = None,
-        device: Optional[Union[str, torch.device]] = None,
+        desired_catchment_ids: np.ndarray | None = None,
+        device: str | torch.device | None = None,
         precision: Literal["float32", "float64"] = "float32",
     ) -> torch.Tensor:
         """Load a v2 mapping, install its source selection, and materialize it."""
@@ -256,14 +251,35 @@ class GriddedDataset(SourceDataset, ABC):
 
         local = mapping._local(desired_catchment_ids)
         resolved_device = torch.device("cpu") if device is None else device
-        self._install_local_selection(
-            source_indices=local.source_indices,
-            target_ids=local.target_ids,
-            device=resolved_device,
-            precision=precision,
-        )
         dtype = torch.float32 if precision == "float32" else torch.float64
-        return local.to_torch(device=resolved_device, dtype=dtype)
+        tensor = local.to_torch(device=resolved_device, dtype=dtype)
+        with self._mapping_transaction():
+            self._install_local_selection(
+                source_indices=local.source_indices,
+                target_ids=local.target_ids,
+                device=resolved_device,
+                precision=precision,
+            )
+        return tensor
+
+    @contextmanager
+    def _mapping_transaction(self) -> Iterator[None]:
+        """Restore this source's selection if any mapping installation fails."""
+
+        previous = (
+            self.local_indices,
+            self.desired_catchment_ids,
+            self._mapping_device,
+            self._mapping_precision,
+        )
+        try:
+            yield
+        except BaseException:
+            object.__setattr__(self, "local_indices", previous[0])
+            object.__setattr__(self, "desired_catchment_ids", previous[1])
+            self._mapping_device = previous[2]
+            self._mapping_precision = previous[3]
+            raise
 
     def _install_local_selection(
         self,
@@ -289,11 +305,7 @@ class GriddedDataset(SourceDataset, ABC):
         )
         compute_bbox = getattr(self, "_compute_bbox_from_indices", None)
         if callable(compute_bbox):
-            if source_indices.size:
-                compute_bbox()
-            else:
-                self._bbox = None
-                self._bbox_local_indices = None
+            compute_bbox()
 
     def shard_forcing(
         self,
@@ -312,11 +324,7 @@ class GriddedDataset(SourceDataset, ABC):
             raise ValueError(
                 "build_local_mapping() must be called before shard_forcing()"
             )
-        dtype = (
-            torch.float32
-            if self._mapping_precision == "float32"
-            else torch.float64
-        )
+        dtype = torch.float32 if self._mapping_precision == "float32" else torch.float64
         return _validated_forcing_shard(
             chunk_data,
             columns=self.data_size,
@@ -356,10 +364,10 @@ class GriddedDataset(SourceDataset, ABC):
         normalized: bool = False,
         device: str | torch.device = "cpu",
         split_by_year: bool = False,
-        units: str | Dict[str, str] = "m3/s",
-        description: Optional[Union[str, Dict[str, str]]] = None,
-        filename: Optional[Union[str, Dict[str, str]]] = None,
-    ) -> Union[Path, List[Path], Dict[str, Path], Dict[str, List[Path]]]:
+        units: str | dict[str, str] = "m3/s",
+        description: str | dict[str, str] | None = None,
+        filename: str | dict[str, str] | None = None,
+    ) -> Path | list[Path] | dict[str, Path] | dict[str, list[Path]]:
         return DatasetExporter(self).export_catchment_data(
             out_dir=out_dir,
             local_mapping=local_mapping,
@@ -380,14 +388,14 @@ class GriddedDataset(SourceDataset, ABC):
         out_dir: str | Path,
         npz_file: str = "grid_mapping.npz",
         mapinfo_txt: str = "location.txt",
-        hires_tag: Optional[str] = "1min",
+        hires_tag: str | None = "1min",
         lowres_idx_precision: str = "<i4",
         hires_idx_precision: str = "<i2",
         map_precision: str = "<f4",
         parameter_nc: str | Path | None = None,
         allow_oob_zero: bool = False,
         source_nan_policy: Literal["keep", "drop", "nearest"] = "keep",
-        source_nan_mask: Optional[np.ndarray] = None,
+        source_nan_mask: np.ndarray | None = None,
     ) -> Path:
         """Generate the CaMa grid mapping table and save it as an npz file.
 
@@ -472,7 +480,7 @@ class GriddedDataset(SourceDataset, ABC):
         return output_path
 
     @abstractmethod
-    def get_coordinates(self) -> Tuple[np.ndarray, np.ndarray]:
+    def get_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
         """
         To be implemented by subclasses, returns the coordinates of the dataset.
         """
@@ -488,7 +496,7 @@ class GriddedDataset(SourceDataset, ABC):
         return len(lon) * len(lat)
 
     @property
-    def _grid_shape(self) -> Tuple[int, int]:
+    def _grid_shape(self) -> tuple[int, int]:
         """
         Returns (ny, nx) = (lat_size, lon_size) grid dimensions.
 

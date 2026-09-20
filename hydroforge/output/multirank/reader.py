@@ -7,32 +7,35 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import (
-    Any, Callable, List, Optional, Sequence, Tuple, Union,
+    Annotated,
+    Any,
 )
 
 import cftime
 import netCDF4 as nc
 import numpy as np
-from pydantic import Field, PrivateAttr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, model_validator
 
-from hydroforge.data.netcdf import _NetCDFReadHandlePool
-from hydroforge.output.multirank.catalog import RankOutputCatalog
-from hydroforge.output.multirank.data import (
-    MultiRankDataAccess, _OutputTimeRequest,
-)
-from hydroforge.output.multirank.plan import (
-    _ReaderFileIdentity, _ReaderStoragePlan,
-)
-from hydroforge.serialization.netcdf import decode_netcdf_logical_array
-from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.contracts.temporal import (
     normalize_calendar_dates,
 )
+from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.data.netcdf import _NetCDFReadHandlePool
+from hydroforge.output.multirank.catalog import RankOutputCatalog
+from hydroforge.output.multirank.data import (
+    MultiRankDataAccess,
+    _OutputTimeRequest,
+)
+from hydroforge.output.multirank.plan import (
+    _ReaderFileIdentity,
+    _ReaderStoragePlan,
+)
+from hydroforge.serialization.netcdf import decode_netcdf_logical_array
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +48,7 @@ class _ReaderSeriesQuery(HydroForgeModel):
 
     points: Any
     level: int | None = Field(default=None, ge=0, strict=True)
-    trial: int = Field(default=0, ge=0, strict=True)
+    member: int = Field(default=0, ge=0, strict=True)
     dtype: Any = None
     time_slice: slice | None = None
 
@@ -53,12 +56,22 @@ class _ReaderSeriesQuery(HydroForgeModel):
     _target_dtype: np.dtype = PrivateAttr()
     _rank_to_columns: dict[int, list[tuple[int, int]]] = PrivateAttr()
 
+    @staticmethod
+    def _points_array(value: Any) -> np.ndarray:
+        array = np.ma.asarray(value)
+        if np.ma.is_masked(array):
+            raise ValueError(
+                "point IDs and XY coordinates must not contain missing values"
+            )
+        return np.asarray(array)
+
     @model_validator(mode="after")
     def _resolve_query(self, info):
         context = info.context
         reader = (
             context.get(_SERIES_READER_CONTEXT)
-            if isinstance(context, Mapping) else None
+            if isinstance(context, Mapping)
+            else None
         )
         if reader is None:
             raise ValueError("reader series query requires reader context")
@@ -66,7 +79,7 @@ class _ReaderSeriesQuery(HydroForgeModel):
         request = reader._data_access._make_series_request(
             time_slice=self.time_slice,
             level=self.level,
-            trial=self.trial,
+            member=self.member,
         )
         target_dtype = reader._data_access._result_dtype(self.dtype)
 
@@ -78,11 +91,11 @@ class _ReaderSeriesQuery(HydroForgeModel):
                 and all(np.isscalar(value) for value in item)
                 for item in raw
             ):
-                arrays = [np.asarray(raw)]
+                arrays = [self._points_array(raw)]
             else:
-                arrays = [np.asarray(value) for value in raw]
+                arrays = [self._points_array(value) for value in raw]
         else:
-            arrays = [np.asarray(raw)]
+            arrays = [self._points_array(raw)]
 
         if not arrays:
             use_xy = False
@@ -95,37 +108,25 @@ class _ReaderSeriesQuery(HydroForgeModel):
                 elif array.ndim in {0, 1}:
                     kinds.add("id")
                 else:
-                    raise ValueError(
-                        f"unsupported points shape: {array.shape}"
-                    )
+                    raise ValueError(f"unsupported points shape: {array.shape}")
                 if array.dtype.kind not in "iu":
-                    raise ValueError(
-                        "point IDs and XY coordinates must be integers"
-                    )
+                    raise ValueError("point IDs and XY coordinates must be integers")
                 if (
                     array.dtype.kind == "u"
                     and array.size
                     and int(array.max()) > np.iinfo(np.int64).max
                 ):
-                    raise ValueError(
-                        "point IDs and XY coordinates exceed int64 range"
-                    )
+                    raise ValueError("point IDs and XY coordinates exceed int64 range")
             if len(kinds) != 1:
                 raise ValueError(
                     "provide either all XY (N,2) or all IDs (N,); do not mix"
                 )
             use_xy = kinds.pop() == "xy"
             if use_xy:
-                queries = tuple(
-                    (int(x), int(y))
-                    for array in arrays
-                    for x, y in np.asarray(array)
-                )
+                queries = tuple((int(x), int(y)) for array in arrays for x, y in array)
             else:
                 queries = tuple(
-                    int(value)
-                    for array in arrays
-                    for value in np.asarray(array).ravel()
+                    int(value) for array in arrays for value in array.ravel()
                 )
         if len(queries) != len(set(queries)):
             raise ValueError("duplicate points are not allowed")
@@ -133,7 +134,8 @@ class _ReaderSeriesQuery(HydroForgeModel):
         self._time_request = request
         self._target_dtype = target_dtype
         self._rank_to_columns = reader._data_access.resolve_series_points(
-            queries, use_xy=use_xy,
+            queries,
+            use_xy=use_xy,
         )
         return self
 
@@ -166,9 +168,11 @@ class MultiRankStatsReader(HydroForgeModel):
     """
 
     base_dir: Path
-    var_name: str
-    coord_name: str | None = None
-    map_shape_input: tuple[int, int] | None = Field(
+    var_name: str = Field(min_length=1)
+    coord_name: Annotated[str, Field(min_length=1)] | None = None
+    map_shape_input: (
+        tuple[Annotated[int, Field(gt=0)], Annotated[int, Field(gt=0)]] | None
+    ) = Field(
         default=None,
         validation_alias="map_shape",
         serialization_alias="map_shape",
@@ -176,13 +180,14 @@ class MultiRankStatsReader(HydroForgeModel):
         description="Explicit immutable map shape supplied by the caller",
     )
     map_shape_nc: Path | None = None
-    coord_converter: (
-        Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]] | None
+    coord_converter: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None
+    time_range: (
+        tuple[
+            datetime | cftime.datetime,
+            datetime | cftime.datetime,
+        ]
+        | None
     ) = None
-    time_range: tuple[
-        datetime | cftime.datetime,
-        datetime | cftime.datetime,
-    ] | None = None
     cache_enabled: bool = False
     split_by_year: bool = False
     row_chunk_size: int | None = Field(default=None, ge=1, strict=True)
@@ -233,19 +238,6 @@ class MultiRankStatsReader(HydroForgeModel):
     def _t_indices(self) -> np.ndarray:
         return self._storage_plan.time_indices
 
-    @field_validator("map_shape_input")
-    @classmethod
-    def _validate_map_shape(
-        cls, value: tuple[int, int] | None,
-    ) -> tuple[int, int] | None:
-        if value is None:
-            return None
-        if type(value) is not tuple or len(value) != 2:
-            raise ValueError("map_shape must be an exact (nx, ny) tuple")
-        if any(type(extent) is not int or extent < 1 for extent in value):
-            raise ValueError("map_shape values must be exact positive ints")
-        return value
-
     @property
     def map_shape(self) -> tuple[int, int] | None:
         """Return the construction-time-resolved coordinate grid shape."""
@@ -254,16 +246,12 @@ class MultiRankStatsReader(HydroForgeModel):
 
     @model_validator(mode="after")
     def _validate_reader_declaration(self):
-        if not self.var_name:
-            raise ValueError("var_name must be non-empty")
         if (
             Path(self.var_name).name != self.var_name
             or "/" in self.var_name
             or "\\" in self.var_name
         ):
             raise ValueError("var_name must not contain path separators")
-        if self.coord_name is not None and not self.coord_name:
-            raise ValueError("coord_name must be None or non-empty")
         coordinate_sources = sum(
             source is not None
             for source in (
@@ -290,9 +278,7 @@ class MultiRankStatsReader(HydroForgeModel):
             start = normalized["time_range start"]
             end = normalized["time_range end"]
             if start > end:
-                raise ValueError(
-                    "time_range start must be <= end (closed interval)"
-                )
+                raise ValueError("time_range start must be <= end (closed interval)")
             object.__setattr__(self, "time_range", (start, end))
         return self
 
@@ -302,16 +288,16 @@ class MultiRankStatsReader(HydroForgeModel):
     def _safe_time_str(self, t_obj, fmt="%Y-%m-%d %H:%M:%S") -> str:
         """Format datetime-like objects without assuming one implementation."""
         if hasattr(t_obj, "strftime"):
-             try:
-                 return t_obj.strftime(fmt)
-             except (TypeError, ValueError, OverflowError):
-                 pass
+            try:
+                return t_obj.strftime(fmt)
+            except (TypeError, ValueError, OverflowError):
+                pass
 
         if hasattr(t_obj, "isoformat"):
-             try:
-                 return t_obj.isoformat()
-             except (TypeError, ValueError, OverflowError):
-                 pass
+            try:
+                return t_obj.isoformat()
+            except (TypeError, ValueError, OverflowError):
+                pass
 
         return str(t_obj)
 
@@ -327,14 +313,12 @@ class MultiRankStatsReader(HydroForgeModel):
 
             # Iterate through files and extract relevant parts
             for i, fp in enumerate(info["paths"]):
-                file_start_global, file_end_global = info[
-                    "file_time_offsets"
-                ][i]
+                file_start_global, file_end_global = info["file_time_offsets"][i]
 
                 # Check intersection with requested slice [self._slice_start, self._slice_end]
                 # Intersection: max(start1, start2) to min(end1, end2)
                 req_start = max(self._slice_start, file_start_global)
-                req_end = min(self._slice_end + 1, file_end_global) # exclusive end
+                req_end = min(self._slice_end + 1, file_end_global)  # exclusive end
 
                 if req_start < req_end:
                     # Calculate local indices
@@ -344,37 +328,21 @@ class MultiRankStatsReader(HydroForgeModel):
                     path = self._checked_source_path(fp)
                     with self._read_handles.acquire(path) as ds:
                         var = ds.variables[self.var_name]
-                        # Slicing logic: always take all spatial/trial dims.
+                        # Slicing logic: always take all spatial/member dims.
                         # Dimensions are
-                        # (time, [trial], saved_points, [value_axis]).
-                        if self.row_chunk_size is None:
-                            data = var[local_start:local_end, ...]
-                            chunks = ((req_start, data),)
-                        else:
-                            chunks = (
-                                (
-                                    file_start_global + t0,
-                                    var[
-                                        t0:min(
-                                            t0 + self.row_chunk_size,
-                                            local_end,
-                                        ),
-                                        ...,
-                                    ],
-                                )
-                                for t0 in range(
-                                    local_start,
-                                    local_end,
-                                    self.row_chunk_size,
-                                )
-                            )
-
-                        for global_start, chunk in chunks:
+                        # (time, [member], saved_points, [value_axis]).
+                        step = self.row_chunk_size or (local_end - local_start)
+                        for start in range(local_start, local_end, step):
+                            global_start = file_start_global + start
+                            chunk = var[start : min(start + step, local_end), ...]
                             chunk = decode_netcdf_logical_array(
-                                var, chunk, name=self.var_name,
+                                var,
+                                chunk,
+                                name=self.var_name,
                             )
                             array = self._data_access._array(
-                                chunk, source=fp.name,
+                                chunk,
+                                source=fp.name,
                             )
                             if cache is None:
                                 cache = np.empty(
@@ -382,9 +350,7 @@ class MultiRankStatsReader(HydroForgeModel):
                                     dtype=array.dtype,
                                 )
                             destination = global_start - self._slice_start
-                            cache[
-                                destination:destination + array.shape[0]
-                            ] = array
+                            cache[destination : destination + array.shape[0]] = array
                     self._verify_source_path(path)
 
             self._rank_cache[info["rank_id"]] = cache
@@ -401,20 +367,18 @@ class MultiRankStatsReader(HydroForgeModel):
     # Validated source construction
     # ----------------------------------------------------------------------------------
     def _compile_storage_plan(
-        self, resolved_map_shape: tuple[int, int] | None,
+        self,
+        resolved_map_shape: tuple[int, int] | None,
     ) -> _ReaderStoragePlan:
         """
         time_range: CLOSED interval (start_dt, end_dt), both inclusive.
         """
         candidate_paths = tuple(
             path.absolute()
-            for path in sorted(
-                self.base_dir.glob(f"{self.var_name}_rank*.nc")
-            )
+            for path in sorted(self.base_dir.glob(f"{self.var_name}_rank*.nc"))
         )
         identities = {
-            path: _ReaderFileIdentity.capture(path)
-            for path in candidate_paths
+            path: _ReaderFileIdentity.capture(path) for path in candidate_paths
         }
         state = SimpleNamespace(
             base_dir=self.base_dir,
@@ -431,7 +395,7 @@ class MultiRankStatsReader(HydroForgeModel):
             _time_len=0,
         )
         catalog = RankOutputCatalog(state)
-        state._rank_files = catalog.scan()
+        state._rank_files = catalog.scan(candidate_paths)
         if not state._rank_files:
             raise FileNotFoundError(
                 f"No files found in {self.base_dir} matching: {self.var_name}_rank*.nc"
@@ -455,10 +419,14 @@ class MultiRankStatsReader(HydroForgeModel):
             object.__setattr__(self, "time_range", (start_in, end_in))
 
             t_start_val = nc.date2num(
-                start_in, state._time_units, state._time_calendar,
+                start_in,
+                state._time_units,
+                state._time_calendar,
             )
             t_end_val = nc.date2num(
-                end_in, state._time_units, state._time_calendar,
+                end_in,
+                state._time_units,
+                state._time_calendar,
             )
             file_min = state._time_values_num[0]
             file_max = state._time_values_num[-1]
@@ -471,29 +439,19 @@ class MultiRankStatsReader(HydroForgeModel):
                     f"{self._safe_time_str(state._time_datetimes[-1])}]."
                 )
 
-            valid_mask = (
-                (state._time_values_num >= t_start_val)
-                & (state._time_values_num <= t_end_val)
+            slice_start = int(
+                np.searchsorted(state._time_values_num, t_start_val, side="left")
             )
-            indices = np.flatnonzero(valid_mask)
-            if indices.size == 0:
+            stop = int(np.searchsorted(state._time_values_num, t_end_val, side="right"))
+            if slice_start == stop:
                 raise ValueError("No time steps found in the request range.")
-            left = int(indices[0])
-            right = int(indices[-1])
-
-            slice_start = left
-            slice_end = right
-            time_indices = np.arange(left, right + 1, dtype=np.int64)
-            time_values = state._time_values_num[time_indices]
-            time_datetimes = [
-                state._time_datetimes[index] for index in time_indices
-            ]
+            slice_end = stop - 1
         else:
             slice_start = 0
             slice_end = state._time_len - 1
-            time_indices = np.arange(state._time_len, dtype=np.int64)
-            time_values = state._time_values_num
-            time_datetimes = state._time_datetimes
+        time_indices = np.arange(slice_start, slice_end + 1, dtype=np.int64)
+        time_values = state._time_values_num[slice_start : slice_end + 1]
+        time_datetimes = state._time_datetimes[slice_start : slice_end + 1]
 
         catalog.compute_coordinates()
         for identity_path, identity in identities.items():
@@ -535,7 +493,12 @@ class MultiRankStatsReader(HydroForgeModel):
             )
             self._data_access = MultiRankDataAccess(self)
         except (
-            KeyError, IndexError, OSError, RuntimeError, TypeError, ValueError,
+            KeyError,
+            IndexError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
             OverflowError,
         ) as error:
             raise ValueError(str(error)) from error
@@ -545,26 +508,38 @@ class MultiRankStatsReader(HydroForgeModel):
     # Data getters
     # ----------------------------------------------------------------------------------
     def _get_vector(
-        self, t_index: int, level: Optional[int] = None, trial: int = 0,
-        dtype: Optional[np.dtype] = None,
+        self,
+        t_index: int,
+        level: int | None = None,
+        member: int = 0,
+        dtype: np.dtype | None = None,
     ) -> np.ndarray:
-        self._ensure_cache_materialized()
-        return self._data_access.get_vector(t_index, level, trial, dtype)
+        return self._data_access.get_vector(t_index, level, member, dtype)
 
     def _get_grid(
-        self, t_index: int, level: Optional[int] = None, trial: int = 0,
-        fill_value: float = np.nan, dtype: Optional[np.dtype] = None,
+        self,
+        t_index: int,
+        level: int | None = None,
+        member: int = 0,
+        fill_value: float = np.nan,
+        dtype: np.dtype | None = None,
     ) -> np.ndarray:
-        self._ensure_cache_materialized()
         return self._data_access.get_grid(
-            t_index, level, trial, fill_value, dtype,
+            t_index,
+            level,
+            member,
+            fill_value,
+            dtype,
         )
 
     def get_series(
-        self, points: Union[np.ndarray, Sequence[np.ndarray]],
-        level: Optional[int] = None, trial: int = 0,
-        dtype: Optional[np.dtype] = None,
-        *, time_slice: slice | None = None,
+        self,
+        points: np.ndarray | Sequence[np.ndarray],
+        level: int | None = None,
+        member: int = 0,
+        dtype: np.dtype | None = None,
+        *,
+        time_slice: slice | None = None,
     ) -> np.ndarray:
         """Read point series over a half-open slice of this reader's view."""
 
@@ -572,7 +547,7 @@ class MultiRankStatsReader(HydroForgeModel):
             {
                 "points": points,
                 "level": level,
-                "trial": trial,
+                "member": member,
                 "dtype": dtype,
                 "time_slice": time_slice,
             },
@@ -591,7 +566,7 @@ class MultiRankStatsReader(HydroForgeModel):
     def times(self) -> tuple[datetime | cftime.datetime, ...]:
         """Return the immutable validated reader timeline."""
 
-        return tuple(self._time_datetimes)
+        return self._time_datetimes
 
     def close(self) -> None:
         """Close process-local NetCDF handles retained by this reader."""
@@ -600,16 +575,15 @@ class MultiRankStatsReader(HydroForgeModel):
 
     @staticmethod
     def _map_extent(value, *, label: str) -> int:
-        if np.ma.isMaskedArray(value) and np.any(
-            np.ma.getmaskarray(value)
-        ):
+        if np.ma.isMaskedArray(value) and np.any(np.ma.getmaskarray(value)):
             raise ValueError(f"{label} contains missing values")
         array = np.asarray(value)
         if array.shape != ():
             raise ValueError(f"{label} must be a scalar positive integer")
         scalar = array.item()
         if isinstance(scalar, (bool, np.bool_)) or not isinstance(
-            scalar, (int, np.integer),
+            scalar,
+            (int, np.integer),
         ):
             raise ValueError(f"{label} must be an integer")
         result = int(scalar)
@@ -622,69 +596,71 @@ class MultiRankStatsReader(HydroForgeModel):
         cls,
         nc_path: Path,
     ) -> tuple[int, int]:
-        p = Path(nc_path)
-        with nc.Dataset(p, "r") as ds:
-            attrs = {a: ds.getncattr(a) for a in ds.ncattrs()}
+        with nc.Dataset(nc_path, "r") as ds:
+            attrs = {name: ds.getncattr(name) for name in ds.ncattrs()}
             candidates: list[tuple[str, tuple[int, int]]] = []
-            if ("nx" in attrs) != ("ny" in attrs):
-                raise ValueError("map-shape attributes must define both nx and ny")
-            if "nx" in attrs:
-                candidates.append(("nx/ny attributes", (
-                    cls._map_extent(attrs["nx"], label="nx attribute"),
-                    cls._map_extent(attrs["ny"], label="ny attribute"),
-                )))
-            if ("nx" in ds.variables) != ("ny" in ds.variables):
-                raise ValueError("map-shape variables must define both nx and ny")
-            if "nx" in ds.variables:
-                candidates.append(("nx/ny variables", (
-                    cls._map_extent(ds.variables["nx"][:], label="nx variable"),
-                    cls._map_extent(ds.variables["ny"][:], label="ny variable"),
-                )))
-            if "map_shape" in ds.variables:
-                raw_shape = ds.variables["map_shape"][:]
-                if np.ma.isMaskedArray(raw_shape) and np.any(
-                    np.ma.getmaskarray(raw_shape)
-                ):
-                    raise ValueError("map_shape variable contains missing values")
-                arr = np.asarray(raw_shape)
-                if arr.shape != (2,):
-                    raise ValueError("map_shape variable must have shape (2,)")
-                candidates.append(("map_shape variable", (
-                    cls._map_extent(arr[0], label="map_shape[0]"),
-                    cls._map_extent(arr[1], label="map_shape[1]"),
-                )))
-            if "map_shape" in attrs:
-                arr = np.asarray(attrs["map_shape"])
-                if arr.shape != (2,):
-                    raise ValueError("map_shape attribute must have shape (2,)")
-                candidates.append(("map_shape attribute", (
-                    cls._map_extent(arr[0], label="map_shape[0]"),
-                    cls._map_extent(arr[1], label="map_shape[1]"),
-                )))
+            for kind, source in (("attribute", attrs), ("variable", ds.variables)):
+
+                def read(name):
+                    return source[name] if kind == "attribute" else source[name][:]
+
+                if ("nx" in source) != ("ny" in source):
+                    raise ValueError(f"map-shape {kind}s must define both nx and ny")
+                if "nx" in source:
+                    candidates.append(
+                        (
+                            f"nx/ny {kind}s",
+                            tuple(
+                                cls._map_extent(read(name), label=f"{name} {kind}")
+                                for name in ("nx", "ny")
+                            ),
+                        )
+                    )
+                if "map_shape" in source:
+                    raw_shape = read("map_shape")
+                    if np.ma.isMaskedArray(raw_shape) and np.any(
+                        np.ma.getmaskarray(raw_shape)
+                    ):
+                        raise ValueError(f"map_shape {kind} contains missing values")
+                    array = np.asarray(raw_shape)
+                    if array.shape != (2,):
+                        raise ValueError(f"map_shape {kind} must have shape (2,)")
+                    candidates.append(
+                        (
+                            f"map_shape {kind}",
+                            tuple(
+                                cls._map_extent(value, label=f"map_shape[{index}]")
+                                for index, value in enumerate(array)
+                            ),
+                        )
+                    )
             for a, b in (("nx", "ny"), ("x", "y"), ("lon", "lat")):
                 if a in ds.dimensions and b in ds.dimensions:
-                    candidates.append((f"{a}/{b} dimensions", (
-                        cls._map_extent(ds.dimensions[a].size, label=a),
-                        cls._map_extent(ds.dimensions[b].size, label=b),
-                    )))
+                    candidates.append(
+                        (
+                            f"{a}/{b} dimensions",
+                            (
+                                cls._map_extent(ds.dimensions[a].size, label=a),
+                                cls._map_extent(ds.dimensions[b].size, label=b),
+                            ),
+                        )
+                    )
         if not candidates:
             raise KeyError("Could not find nx/ny or map_shape (attrs/vars/dims).")
         shapes = {shape for _source, shape in candidates}
         if len(shapes) != 1:
             raise ValueError(
                 "conflicting map-shape metadata: "
-                + ", ".join(
-                    f"{source}={shape}" for source, shape in candidates
-                )
+                + ", ".join(f"{source}={shape}" for source, shape in candidates)
             )
         return candidates[0][1]
 
     # ----------------------------------------------------------------------------------
     # Utilities
     # ----------------------------------------------------------------------------------
-    def get_all_coords_xy(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        xs: List[np.ndarray] = []
-        ys: List[np.ndarray] = []
+    def get_all_coords_xy(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        xs: list[np.ndarray] = []
+        ys: list[np.ndarray] = []
         for info in self._rank_files:
             if info["saved_points"] == 0:
                 continue
@@ -696,8 +672,8 @@ class MultiRankStatsReader(HydroForgeModel):
             return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
         return np.concatenate(xs), np.concatenate(ys)
 
-    def get_all_cids(self) -> Optional[np.ndarray]:
-        cids: List[np.ndarray] = []
+    def get_all_cids(self) -> np.ndarray | None:
+        cids: list[np.ndarray] = []
         for info in self._rank_files:
             if info["saved_points"] == 0 or info["coord_raw"] is None:
                 continue

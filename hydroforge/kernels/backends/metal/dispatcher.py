@@ -5,32 +5,48 @@ from __future__ import annotations
 import os
 import re
 import struct
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
 
-from hydroforge.contracts.kernels import (
-    BackendLoweringSpec, BufferDTypeABI, KernelSpec, buffer_access_semantics,
-)
+from pydantic import PrivateAttr, model_validator
+
 from hydroforge.contracts.errors import ResourceCleanupError
-from hydroforge.contracts.kernels import validate_launch_extent
+from hydroforge.contracts.kernels import (
+    BackendLoweringSpec,
+    BufferDTypeABI,
+    KernelSpec,
+    buffer_access_semantics,
+    validate_launch_extent,
+)
+from hydroforge.contracts.naming import Identifier
+from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.kernels.backends.metal.limits import (
     validate_metal_launch_extent,
 )
 from hydroforge.kernels.backends.metal.types import NATIVE_BUFFER_DTYPES
-from hydroforge.kernels.context import active_kernel_spec
+from hydroforge.kernels.context import resolve_factory_spec
 
 _MSL_SCALARS = {
-    "bool": "bool", "int": "int32", "uint": "uint32",
-    "long": "int64", "float": "float32",
+    "bool": "bool",
+    "int": "int32",
+    "uint": "uint32",
+    "long": "int64",
+    "float": "float32",
 }
 _PACK_FORMATS = {"int": "i", "uint": "I", "long": "q", "float": "f"}
 _PACK_LAYOUTS = {
-    "int": (4, 4), "uint": (4, 4), "long": (8, 8), "float": (4, 4),
+    "int": (4, 4),
+    "uint": (4, 4),
+    "long": (8, 8),
+    "float": (4, 4),
 }
 _SPEC_TO_NATIVE_SCALAR = {
-    "bool": "bool", "int32": "int32", "uint32": "uint32",
+    "bool": "bool",
+    "int32": "int32",
+    "uint32": "uint32",
     "index": "int64",
     "float32": "float32",
 }
@@ -63,18 +79,23 @@ def _parse_metal_abi(source: str, kernel_name: str) -> _MetalABI:
 
     struct_match = re.search(
         rf"struct\s+{re.escape(kernel_name)}_args\s*\{{(.*?)\}}\s*;",
-        source, re.DOTALL,
+        source,
+        re.DOTALL,
     )
     if struct_match is None:
-        raise ValueError(
-            f"Metal source must define struct {kernel_name}_args"
+        raise ValueError(f"Metal source must define struct {kernel_name}_args")
+    if (
+        re.search(
+            rf"\bkernel\s+void\s+{re.escape(kernel_name)}\s*\(",
+            source,
         )
-    if re.search(
-        rf"\bkernel\s+void\s+{re.escape(kernel_name)}\s*\(", source,
-    ) is None:
+        is None
+    ):
         raise ValueError(f"Metal source does not define kernel {kernel_name!r}")
     body = re.sub(
-        r"//.*?$|/\*.*?\*/", "", struct_match.group(1),
+        r"//.*?$|/\*.*?\*/",
+        "",
+        struct_match.group(1),
         flags=re.MULTILINE | re.DOTALL,
     )
     fields: list[_MetalArgument] = []
@@ -90,11 +111,16 @@ def _parse_metal_abi(source: str, kernel_name: str) -> _MetalABI:
             if address_space == "device" or is_atomic
             else _MSL_SCALARS.get(native_type, "buffer")
         )
-        fields.append(_MetalArgument(
-            index=int(index), name=name, kind=kind, native_type=native_type,
-            is_const=address_space == "constant" or bool(const),
-            is_atomic=is_atomic,
-        ))
+        fields.append(
+            _MetalArgument(
+                index=int(index),
+                name=name,
+                kind=kind,
+                native_type=native_type,
+                is_const=address_space == "constant" or bool(const),
+                is_atomic=is_atomic,
+            )
+        )
     if not fields:
         raise ValueError(f"Metal argument struct {kernel_name}_args is empty")
     residual = pattern.sub("", body).strip()
@@ -112,9 +138,7 @@ def _parse_metal_abi(source: str, kernel_name: str) -> _MetalABI:
         )
     names = [field.name for field in fields]
     if len(names) != len(set(names)):
-        raise ValueError(
-            f"Metal argument names for {kernel_name!r} must be unique"
-        )
+        raise ValueError(f"Metal argument names for {kernel_name!r} must be unique")
     constant_fields = re.findall(
         r"constant\s+(bool|int|float)\s+([A-Za-z_]\w*)\s*"
         r"\[\[function_constant\((\d+)\)\]\]",
@@ -127,8 +151,7 @@ def _parse_metal_abi(source: str, kernel_name: str) -> _MetalABI:
     if len(constant_indices) != len(set(constant_indices)):
         raise ValueError("Metal function-constant indices must be unique")
     constants = {
-        name: (int(index), _MSL_SCALARS[kind])
-        for kind, name, index in constant_fields
+        name: (int(index), _MSL_SCALARS[kind]) for kind, name, index in constant_fields
     }
     return _MetalABI(tuple(fields), constants)
 
@@ -143,13 +166,17 @@ def _parse_packed_struct(
     """Derive one host packing layout from its authoritative MSL struct."""
     match = re.search(
         rf"struct\s+{re.escape(name)}\s*\{{(.*?)\}}\s*;",
-        source, re.DOTALL,
+        source,
+        re.DOTALL,
     )
     if match is None:
         raise ValueError(f"Metal source does not define packed struct {name!r}")
-    body = re.sub(r"//.*?$|/\*.*?\*/", "", match.group(1), flags=re.MULTILINE | re.DOTALL)
+    body = re.sub(
+        r"//.*?$|/\*.*?\*/", "", match.group(1), flags=re.MULTILINE | re.DOTALL
+    )
     fields = re.findall(
-        r"\b(int|uint|long|float)\s+([A-Za-z_]\w*)\s*;", body,
+        r"\b(int|uint|long|float)\s+([A-Za-z_]\w*)\s*;",
+        body,
     )
     if not fields or body.count(";") != len(fields):
         raise TypeError(
@@ -158,17 +185,20 @@ def _parse_packed_struct(
         )
     native_names = {field_name for _kind, field_name in fields}
     entry = re.search(
-        rf"\bkernel\s+void\s+{re.escape(kernel_name)}\s*\(", source,
+        rf"\bkernel\s+void\s+{re.escape(kernel_name)}\s*\(",
+        source,
     )
     if entry is None:
         raise ValueError(f"Metal source does not define kernel {kernel_name!r}")
-    following = re.search(r"\bkernel\s+void\s+", source[entry.end():])
+    following = re.search(r"\bkernel\s+void\s+", source[entry.end() :])
     end = len(source) if following is None else entry.end() + following.start()
-    kernel_source = source[entry.start():end]
-    referenced = set(re.findall(
-        rf"\bargs\.{re.escape(target)}\s*->\s*([A-Za-z_]\w*)",
-        kernel_source,
-    ))
+    kernel_source = source[entry.start() : end]
+    referenced = set(
+        re.findall(
+            rf"\bargs\.{re.escape(target)}\s*->\s*([A-Za-z_]\w*)",
+            kernel_source,
+        )
+    )
     unknown_references = referenced.difference(native_names)
     if unknown_references:
         raise ValueError(
@@ -177,7 +207,8 @@ def _parse_packed_struct(
         )
     sources = [
         _match_canonical_parameter(
-            field_name, spec.parameters,
+            field_name,
+            spec.parameters,
             context=f"Metal packed struct {name!r} field",
         )
         for _kind, field_name in fields
@@ -188,7 +219,9 @@ def _parse_packed_struct(
             "canonical parameter"
         )
     for (native_kind, native_name), source_name in zip(
-        fields, sources, strict=True,
+        fields,
+        sources,
+        strict=True,
     ):
         expected = spec.runtime_scalars.get(source_name)
         if expected is None:
@@ -241,8 +274,7 @@ def _match_canonical_parameter(
         return native_name
     normalized = _normalized_identifier(native_name)
     matches = tuple(
-        name for name in parameters
-        if _normalized_identifier(name) == normalized
+        name for name in parameters if _normalized_identifier(name) == normalized
     )
     if len(matches) != 1:
         detail = "no match" if not matches else f"ambiguous matches {matches}"
@@ -275,7 +307,11 @@ def _packed_layouts(
             )
         struct_name = parsed_buffer_types[target]
         layouts[target] = _parse_packed_struct(
-            source, kernel_name, target, struct_name, spec,
+            source,
+            kernel_name,
+            target,
+            struct_name,
+            spec,
         )
     return layouts
 
@@ -283,18 +319,27 @@ def _packed_layouts(
 def _template_variables(source: str, spec: KernelSpec) -> dict[str, str]:
     """Infer source-template tokens from exact compile-time Spec names."""
 
-    tokens = tuple(dict.fromkeys(re.findall(
-        r"__[A-Z][A-Z0-9_]*__", source,
-    )))
+    tokens = tuple(
+        dict.fromkeys(
+            re.findall(
+                r"__[A-Z][A-Z0-9_]*__",
+                source,
+            )
+        )
+    )
     result = {
         token: _match_canonical_parameter(
-            token, tuple(spec.compile_time), context="Metal template token",
+            token,
+            tuple(spec.compile_time),
+            context="Metal template token",
         )
         for token in tokens
     }
     sources = tuple(result.values())
     if len(sources) != len(set(sources)):
-        duplicates = sorted({name for name in sources if sources.count(name) > 1})
+        duplicates = sorted(
+            name for name, count in Counter(sources).items() if count > 1
+        )
         raise TypeError(
             "Metal source contains multiple template tokens for canonical "
             f"compile-time parameter(s) {duplicates}"
@@ -307,7 +352,6 @@ def _scalar_value(value: Any) -> Any:
 
 
 def _constant_kind(value: Any) -> str:
-    value = _scalar_value(value)
     if value.__class__ is bool:
         return "bool"
     if isinstance(value, int):
@@ -342,14 +386,13 @@ class MetalDispatcher:
     ) -> None:
         self.source = (
             Path(msl_source).read_text()
-            if isinstance(msl_source, (os.PathLike, Path)) else msl_source
+            if isinstance(msl_source, (os.PathLike, Path))
+            else msl_source
         )
         self.kernel_name = kernel_name
         native_abi = _parse_metal_abi(self.source, kernel_name)
         parsed_args = tuple(field.name for field in native_abi.arguments)
-        parsed_types = {
-            field.name: field.kind for field in native_abi.arguments
-        }
+        parsed_types = {field.name: field.kind for field in native_abi.arguments}
         parsed_constants = native_abi.constants
         parsed_qualifiers = {
             field.name: (field.is_const, field.is_atomic)
@@ -360,20 +403,18 @@ class MetalDispatcher:
         }
         canonical_spec = spec
         packed_layouts = _packed_layouts(
-            self.source, kernel_name, parsed_args, parsed_buffer_types,
-            parsed_qualifiers, canonical_spec,
+            self.source,
+            kernel_name,
+            parsed_args,
+            parsed_buffer_types,
+            parsed_qualifiers,
+            canonical_spec,
         )
         template_vars = _template_variables(self.source, canonical_spec)
         for name, access in canonical_spec.buffers.items():
             if name not in parsed_args:
                 continue
-            try:
-                is_const, is_atomic = parsed_qualifiers[name]
-            except KeyError as error:
-                raise TypeError(
-                    f"{kernel_name}: KernelSpec buffer {name!r} is not a "
-                    "device pointer in the Metal argument struct"
-                ) from error
+            is_const, is_atomic = parsed_qualifiers[name]
             if access == "read" and not is_const:
                 raise TypeError(
                     f"{kernel_name}: read-only KernelSpec buffer {name!r} "
@@ -409,51 +450,28 @@ class MetalDispatcher:
                 )
         packed_names = set(packed_layouts)
         shader_fields = set(parsed_args)
-        missing_packs = packed_names.difference(shader_fields)
-        if missing_packs:
-            raise TypeError(
-                f"{kernel_name}: packed target(s) are absent from Metal "
-                f"argument struct: {sorted(missing_packs)}"
-            )
-        mutable_packs = sorted(
-            name for name in packed_names
-            if not parsed_qualifiers.get(name, (False, False))[0]
-        )
-        if mutable_packs:
-            raise TypeError(
-                f"{kernel_name}: packed Metal configuration pointers must be "
-                "const-qualified: " + ", ".join(mutable_packs)
-            )
         packed_sources = [
             source_name
             for _target, (_fmt, source_names) in packed_layouts.items()
             for source_name in source_names
         ]
         if len(packed_sources) != len(set(packed_sources)):
-            duplicates = sorted({
-                name for name in packed_sources
-                if packed_sources.count(name) > 1
-            })
+            duplicates = sorted(
+                name for name, count in Counter(packed_sources).items() if count > 1
+            )
             raise TypeError(
                 f"{kernel_name}: canonical values feed multiple packed "
                 f"fields: {duplicates}"
             )
         template_sources = set(template_vars.values())
-        unknown_sources = (
-            set(packed_sources) | template_sources
-        ).difference(canonical_spec.parameters)
-        if unknown_sources:
-            raise TypeError(
-                f"{kernel_name}: Metal lowering sources are outside "
-                f"KernelSpec: {sorted(unknown_sources)}"
-            )
         compile_time_paths = (
             shader_constants,
             template_sources,
             set(packed_sources).intersection(canonical_spec.compile_time),
         )
         duplicate_compile_time = sorted(
-            name for name in canonical_spec.compile_time
+            name
+            for name in canonical_spec.compile_time
             if sum(name in path for path in compile_time_paths) > 1
         )
         if duplicate_compile_time:
@@ -492,11 +510,7 @@ class MetalDispatcher:
             if expects_buffer:
                 continue
             if name in spec.runtime_scalars:
-                expected_kind = {
-                    "bool": "bool", "int32": "int32",
-                    "uint32": "uint32", "index": "int64",
-                    "float32": "float32",
-                }[spec.runtime_scalars[name]]
+                expected_kind = _SPEC_TO_NATIVE_SCALAR[spec.runtime_scalars[name]]
             else:
                 raise TypeError(
                     f"{kernel_name}: Metal scalar field {name!r} is not a "
@@ -509,7 +523,8 @@ class MetalDispatcher:
                 )
         buffer_access = {
             name: buffer_access_semantics(spec.buffers[name]).dependency
-            for name in parsed_args if name in spec.buffers
+            for name in parsed_args
+            if name in spec.buffers
         }
         buffer_access.update({name: "read" for name in packed_names})
         scalar_types = {
@@ -520,8 +535,7 @@ class MetalDispatcher:
         if variant_role != "standalone" and batch_key is None:
             raise ValueError("Metal variant construction requires batch_key")
         expected_omitted = (
-            frozenset({batch_key})
-            if variant_role == "shared" else frozenset()
+            frozenset({batch_key}) if variant_role == "shared" else frozenset()
         )
         if frozenset(omitted) != expected_omitted:
             raise TypeError(
@@ -535,10 +549,11 @@ class MetalDispatcher:
                 f"{kernel_name}: variant role and explicit parallel axes "
                 "cannot be combined"
             )
-        self.args = tuple(parsed_args)
+        self.args = parsed_args
         if variant_role == "batched":
             base_axes = (
-                (spec.size_key,) if isinstance(spec.size_key, str)
+                (spec.size_key,)
+                if isinstance(spec.size_key, str)
                 else tuple(spec.size_key)
             )
             axes = () if batch_key in base_axes else (batch_key,)
@@ -546,20 +561,15 @@ class MetalDispatcher:
             axes = parallel_axes
         self.size_key = spec._execution_size_key(axes)
         self.spec = spec
-        self.template_vars = MappingProxyType(dict(template_vars))
-        self.pack_info = MappingProxyType(dict(packed_layouts))
-        self.function_constants = MappingProxyType(dict(function_constants))
+        self.template_vars = MappingProxyType(template_vars)
+        self.pack_info = MappingProxyType(packed_layouts)
+        self.function_constants = MappingProxyType(function_constants)
         self._runtime = None
         self._pipeline_cache: dict[tuple[Any, ...], int] = {}
         self.variant_role = variant_role
         self.batch_key = batch_key
 
-        invalid = set(buffer_access.values()).difference(
-            {"read", "write", "read_write"},
-        )
-        if invalid:
-            raise ValueError(f"Invalid Metal buffer access modes: {sorted(invalid)}")
-        self.buffer_access = MappingProxyType(dict(buffer_access))
+        self.buffer_access = MappingProxyType(buffer_access)
         self.buffer_args = frozenset(buffer_access)
         packed_targets = frozenset(self.pack_info)
         buffer_native_types = {
@@ -568,8 +578,7 @@ class MetalDispatcher:
             if name not in packed_targets
         }
         bool_buffers = sorted(
-            name for name, native in buffer_native_types.items()
-            if native == "bool"
+            name for name, native in buffer_native_types.items() if native == "bool"
         )
         if bool_buffers:
             raise TypeError(
@@ -587,20 +596,9 @@ class MetalDispatcher:
                 f"types {unsupported_buffers}"
             )
         self.buffer_native_types = MappingProxyType(buffer_native_types)
-        unknown = self.buffer_args.difference(parsed_args)
-        if unknown:
-            raise ValueError(
-                f"Metal kernel {kernel_name!r} has unknown buffer_args: {sorted(unknown)}"
-            )
-        scalar_kinds = dict(scalar_types)
-        self.scalar_types = MappingProxyType(scalar_kinds)
-        missing = set(parsed_args).difference(self.buffer_args, scalar_kinds)
-        if missing:
-            raise TypeError(
-                f"Metal kernel {kernel_name!r} must declare scalar_types for: {sorted(missing)}"
-            )
+        self.scalar_types = MappingProxyType(scalar_types)
         self.native_types = tuple(
-            "buffer" if name in self.buffer_args else scalar_kinds[name]
+            "buffer" if name in self.buffer_args else scalar_types[name]
             for name in parsed_args
         )
         self.__hydroforge_kernel__ = spec._canonical_metadata
@@ -629,12 +627,10 @@ class MetalDispatcher:
 
         result = {}
         for target, (fmt, source_names) in self.pack_info.items():
-            packed_values = tuple(
-                _scalar_value(values[name])
-                for name in source_names
-            )
+            packed_values = tuple(_scalar_value(values[name]) for name in source_names)
             result[target] = torch.frombuffer(
-                bytearray(struct.pack(fmt, *packed_values)), dtype=torch.uint8,
+                bytearray(struct.pack(fmt, *packed_values)),
+                dtype=torch.uint8,
             ).to("mps")
         return result
 
@@ -642,21 +638,20 @@ class MetalDispatcher:
         resolved = []
         constants = []
         for name, index in self.function_constants.items():
-            value = values[name]
-            value = _scalar_value(value)
+            value = _scalar_value(values[name])
             kind = _constant_kind(value)
             resolved.append(value)
             constants.append((index, kind, float(value)))
         return resolved, constants
 
     def _templates(self, values: dict[str, Any]) -> list[Any]:
-        result = []
-        for name in self.template_vars.values():
-            result.append(_scalar_value(values[name]))
-        return result
+        return [_scalar_value(values[name]) for name in self.template_vars.values()]
 
     def _validate_specialization_input(
-        self, values: dict[str, Any], *, buffer_dtypes: BufferDTypeABI,
+        self,
+        values: dict[str, Any],
+        *,
+        buffer_dtypes: BufferDTypeABI,
     ) -> None:
         """Validate Metal-only ABI limits inside the Pydantic call request."""
 
@@ -676,7 +671,8 @@ class MetalDispatcher:
         _validated_group_size(values["BLOCK_SIZE"])
 
     def _trusted_launch_geometry(
-        self, values: dict[str, Any],
+        self,
+        values: dict[str, Any],
     ) -> tuple[int, int]:
         keys = (self.size_key,) if isinstance(self.size_key, str) else self.size_key
         threads = 1
@@ -703,11 +699,16 @@ class MetalDispatcher:
         if pipeline is None:
             source = self.source
             for (token, _), value in zip(
-                self.template_vars.items(), template_values, strict=True,
+                self.template_vars.items(),
+                template_values,
+                strict=True,
             ):
                 source = source.replace(token, self._literal(value))
             pipeline = native.compile_pipeline(
-                source, self.kernel_name, constants, self.native_types,
+                source,
+                self.kernel_name,
+                constants,
+                self.native_types,
                 [self.buffer_access.get(name, "none") for name in self.args],
             )
             self._pipeline_cache[cache_key] = pipeline
@@ -718,44 +719,44 @@ class MetalDispatcher:
         from hydroforge.kernels.backends.metal.runtime import recording_metal_sequence
 
         sequence = recording_metal_sequence()
-        if sequence is not None:
-            buffers = {
-                name: values[name]
-                for name in self.buffer_access
-            }
-            reads = tuple(
-                value for name, value in buffers.items()
-                if value is not None
-                and self.buffer_access[name] in {"read", "read_write"}
-            )
-            writes = tuple(
-                value for name, value in buffers.items()
-                if value is not None
-                and self.buffer_access[name] in {"write", "read_write"}
-            )
-            try:
-                sequence.add_prepared(
-                    prepared, barrier=False, reads=reads, writes=writes,
-                )
-            except BaseException as error:
-                native, _pipeline, binding, _threads, _group_size = prepared
-                try:
-                    native.release_argument_binding(binding)
-                except BaseException as cleanup_error:
-                    combined = ResourceCleanupError(
-                        "Metal command enqueue", (error, cleanup_error),
-                    )
-                    raise combined from error
-                raise
-            return
         native, pipeline, binding, threads, group_size = prepared
+        scope = (
+            "Metal command enqueue"
+            if sequence is not None
+            else "Metal command dispatch"
+        )
         try:
-            native.dispatch(pipeline, binding, threads, group_size)
-        finally:
+            if sequence is not None:
+                reads, writes = [], []
+                for name, access in self.buffer_access.items():
+                    value = values[name]
+                    if value is None:
+                        continue
+                    if access in {"read", "read_write"}:
+                        reads.append(value)
+                    if access in {"write", "read_write"}:
+                        writes.append(value)
+                sequence.add_prepared(
+                    prepared,
+                    barrier=False,
+                    reads=tuple(reads),
+                    writes=tuple(writes),
+                )
+            else:
+                native.dispatch(pipeline, binding, threads, group_size)
+        except BaseException as primary:
+            try:
+                native.release_argument_binding(binding)
+            except BaseException as cleanup_error:
+                raise ResourceCleanupError(scope, (primary, cleanup_error)) from primary
+            raise
+        if sequence is None:
             native.release_argument_binding(binding)
 
     def specialize(
-        self, arguments: dict[str, Any], *,
+        self,
+        arguments: dict[str, Any],
+        *,
         buffer_dtypes: BufferDTypeABI,
     ):
         """Own packed tensors in the model-local specialized launch."""
@@ -763,6 +764,7 @@ class MetalDispatcher:
         values = dict(arguments)
         threads, group_size = self._trusted_launch_geometry(values)
         if threads == 0:
+
             def no_op() -> None:
                 return None
 
@@ -780,22 +782,40 @@ class MetalDispatcher:
 
         return launch
 
+
+class _MetalDispatcherDeclaration(HydroForgeModel):
+    msl_source: str | os.PathLike[str]
+    kernel_name: Identifier
+    spec: KernelSpec | None = None
+    parallel_axes: tuple[Identifier, ...] = ()
+
+    _dispatcher: MetalDispatcher = PrivateAttr()
+
+    @model_validator(mode="after")
+    def _build(self):
+        try:
+            spec = resolve_factory_spec(self.spec, factory="make_metal_dispatcher")
+            self._dispatcher = MetalDispatcher(
+                self.msl_source,
+                self.kernel_name,
+                spec=spec,
+                parallel_axes=self.parallel_axes,
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(str(error)) from error
+        return self
+
+
 def make_metal_dispatcher(
-    msl_source: str, kernel_name: str, *,
+    msl_source: str | os.PathLike[str],
+    kernel_name: str,
+    *,
     spec: KernelSpec | None = None,
     parallel_axes: tuple[str, ...] = (),
 ) -> MetalDispatcher:
-    active = active_kernel_spec()
-    if active is not None:
-        if spec is not None:
-            raise TypeError(
-                "Metal factory may not repeat active KernelSpec metadata"
-            )
-        spec = active
-    if spec is None:
-        raise TypeError(
-            f"{kernel_name}: Metal dispatch requires one canonical KernelSpec"
-        )
-    return MetalDispatcher(
-        msl_source, kernel_name, spec=spec, parallel_axes=parallel_axes,
-    )
+    return _MetalDispatcherDeclaration(
+        msl_source=msl_source,
+        kernel_name=kernel_name,
+        spec=spec,
+        parallel_axes=parallel_axes,
+    )._dispatcher

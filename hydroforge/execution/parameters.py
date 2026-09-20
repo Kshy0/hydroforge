@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -135,7 +135,10 @@ class ParameterPlanRuntime:
             target[selected] += value
 
     def _apply_grouped_changes(
-        self, module: Any, attr: str, plans: list[ActivePlan],
+        self,
+        module: Any,
+        attr: str,
+        plans: list[ActivePlan],
     ) -> None:
         current = getattr(module, attr)
         for active in sorted(plans, key=lambda item: item.item.is_incremental):
@@ -151,17 +154,16 @@ class ParameterPlanRuntime:
 
     @staticmethod
     def _snapshot_value(
-        value: torch.Tensor, plans: list[ActivePlan],
+        value: torch.Tensor,
+        plans: list[ActivePlan],
     ) -> _TensorSnapshot:
         indexed = [active.item.indices for active in plans]
         if all(indices is not None for indices in indexed):
             index_axis = plans[0].item.index_axis
-            indices = torch.unique(torch.cat([
-                item for item in indexed if item is not None
-            ]))
-            values = value.index_select(index_axis, indices).detach().clone(
-                memory_format=torch.preserve_format,
+            indices = torch.unique(
+                torch.cat([item for item in indexed if item is not None])
             )
+            values = value.detach().index_select(index_axis, indices)
             return _TensorSnapshot(values, indices, index_axis)
         return _TensorSnapshot(
             value.detach().clone(memory_format=torch.preserve_format),
@@ -171,7 +173,9 @@ class ParameterPlanRuntime:
 
     @staticmethod
     def _restore_value(
-        module: Any, attr: str, snapshot: _TensorSnapshot,
+        module: Any,
+        attr: str,
+        snapshot: _TensorSnapshot,
     ) -> None:
         current = getattr(module, attr)
         if snapshot.indices is None:
@@ -183,10 +187,24 @@ class ParameterPlanRuntime:
                 snapshot.values,
             )
 
-    @contextmanager
     def step_transaction(self):
         """Keep parameter application atomic with one managed model step."""
 
+        if not self._plans:
+            return nullcontext()
+        return self._step_transaction()
+
+    def _restore_snapshots(self, snapshots) -> list[BaseException]:
+        failures: list[BaseException] = []
+        for module, attr, snapshot in reversed(snapshots):
+            try:
+                self._restore_value(module, attr, snapshot)
+            except BaseException as error:
+                failures.append(error)
+        return failures
+
+    @contextmanager
+    def _step_transaction(self):
         cursor = (
             self._next_plan_idx,
             tuple(
@@ -202,14 +220,7 @@ class ParameterPlanRuntime:
         try:
             yield
         except BaseException as step_error:
-            rollback_errors: list[BaseException] = []
-            for module, attr, snapshot in reversed(
-                self._step_transaction_snapshots,
-            ):
-                try:
-                    self._restore_value(module, attr, snapshot)
-                except BaseException as rollback_error:
-                    rollback_errors.append(rollback_error)
+            rollback_errors = self._restore_snapshots(self._step_transaction_snapshots)
             self._next_plan_idx, active_plans = cursor
             self._active_plans = list(active_plans)
             if rollback_errors:
@@ -223,7 +234,8 @@ class ParameterPlanRuntime:
             self._step_transaction_snapshots = []
 
     def execute_parameter_change_plan(
-        self, current_time: datetime | cftime.datetime | None,
+        self,
+        current_time: datetime | cftime.datetime | None,
     ) -> ParameterChangeEffect:
         """Apply one transactional plan step."""
 
@@ -239,7 +251,8 @@ class ParameterPlanRuntime:
             else:
                 break
         active_plans = [
-            active for active in active_plans
+            active
+            for active in active_plans
             if active.steps_executed < active.item.active_steps
         ]
         if not active_plans:
@@ -256,22 +269,19 @@ class ParameterPlanRuntime:
         for (_, attr), plans in grouped.items():
             module = plans[0].item.module
             current = getattr(module, attr)
-            snapshots.append((
-                module,
-                attr,
-                self._snapshot_value(current, plans),
-            ))
+            snapshots.append(
+                (
+                    module,
+                    attr,
+                    self._snapshot_value(current, plans),
+                )
+            )
         self._step_transaction_snapshots = snapshots
         try:
             for (_, attr), plans in grouped.items():
                 self._apply_grouped_changes(plans[0].item.module, attr, plans)
         except BaseException as apply_error:
-            rollback_errors: list[BaseException] = []
-            for module, attr, snapshot in reversed(snapshots):
-                try:
-                    self._restore_value(module, attr, snapshot)
-                except BaseException as rollback_error:
-                    rollback_errors.append(rollback_error)
+            rollback_errors = self._restore_snapshots(snapshots)
             if rollback_errors:
                 error = ResourceCleanupError(
                     "parameter change rollback",

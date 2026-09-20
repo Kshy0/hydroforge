@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from hydroforge.contracts.errors import ResourceCleanupError
-from hydroforge.kernels.binding import KernelBinder
+from hydroforge.contracts.errors import ResourceCleanupError, failure_description
 from hydroforge.execution.capture import CaptureRuntime
+from hydroforge.execution.cuda_graph import supports_conditional_cuda_graph
+from hydroforge.execution.step_fields import StepFieldRuntime
+from hydroforge.kernels.binding import KernelBinder
 from hydroforge.statistics.observer import DisabledStatisticsObserver
 
 if TYPE_CHECKING:
@@ -24,7 +27,10 @@ class ModelExecution:
         self.backend = model._backend
         if model.execution_mode == "eager":
             self.capture_mode = "eager"
-        elif self.backend in {"cuda", "triton"} and self.device.type == "cuda":
+        elif (
+            self.backend in {"cuda", "triton"}
+            and supports_conditional_cuda_graph(self.device)
+        ):
             self.capture_mode = "cuda_graph"
         elif self.backend == "metal" and self.device.type == "mps":
             self.capture_mode = "metal_icb"
@@ -33,6 +39,7 @@ class ModelExecution:
         self.capture = CaptureRuntime(model)
         self.statistics = DisabledStatisticsObserver(model)
         self.kernel_binding = KernelBinder(model)
+        self.step_fields = StepFieldRuntime(model, execution=self)
         self.step_policies: dict[Any, Any] = {}
         self.programs: dict[Any, Any] = {}
         self._model_tensor_ids: frozenset[int] = frozenset()
@@ -58,7 +65,9 @@ class ModelExecution:
         )
 
     def precompile_cuda_catalogs(
-        self, catalogs: Any, opened_modules: Any,
+        self,
+        catalogs: Any,
+        opened_modules: Any,
     ) -> dict[str, Any]:
         """Materialize CUDA extensions required by the opened model modules."""
         from hydroforge.kernels.backends.cuda.precompile import (
@@ -66,7 +75,8 @@ class ModelExecution:
         )
 
         return precompile_cuda_modules(
-            catalogs, opened_modules=opened_modules,
+            catalogs,
+            opened_modules=opened_modules,
         )
 
     def poison(self, error: BaseException, *, phase: str) -> None:
@@ -76,7 +86,9 @@ class ModelExecution:
             return
         if self._failure is None:
             self._failure = (
-                phase, type(error).__name__, str(error),
+                phase,
+                type(error).__name__,
+                failure_description(error)["message"],
             )
 
     def is_model_tensor(self, tensor: torch.Tensor) -> bool:
@@ -88,6 +100,8 @@ class ModelExecution:
         module handles that the model body did not reference.
         """
 
+        if id(tensor) in self.step_fields.identities:
+            return True
         if not self._tensor_index_valid:
             self._refresh_model_tensor_index()
         return id(tensor) in self._model_tensor_ids
@@ -99,7 +113,13 @@ class ModelExecution:
             for owner in owners:
                 schema_getter = getattr(owner.owner, "_get_tensor_schema", None)
                 schema = (
-                    None if schema_getter is None else schema_getter(field_name)
+                    None
+                    if schema_getter is None
+                    else schema_getter(
+                        field_name,
+                        opened_modules=self.model.opened_modules,
+                        field_demand=self.model._field_demand,
+                    )
                 )
                 if (
                     schema is not None
@@ -119,7 +139,10 @@ class ModelExecution:
         self._tensor_index_valid = True
 
     def loop_mode(
-        self, *, world_size: int, allow_distributed: bool,
+        self,
+        *,
+        world_size: int,
+        allow_distributed: bool,
     ) -> str:
         supported = self.capture_mode == "cuda_graph" and (
             world_size == 1 or allow_distributed
@@ -132,12 +155,19 @@ class ModelExecution:
     def run_statistics(self, statistics: Any, block_size: int) -> None:
         """Execute cached statistics without leaking backend policy outward."""
 
-        if self.capture_mode == "cuda_graph":
-            self.capture.run_statistics(statistics, block_size)
-        else:
-            statistics._aggregator_function(
-                statistics._kernel_states, block_size,
-            )
+        scope = (
+            torch.cuda.device(self.device)
+            if self.device.type == "cuda"
+            else nullcontext()
+        )
+        with scope:
+            if self.capture_mode == "cuda_graph":
+                self.capture.run_statistics(statistics, block_size)
+            else:
+                statistics._aggregator_function(
+                    statistics._kernel_states,
+                    block_size,
+                )
 
     def invalidate_statistics(self, aggregator: Any) -> None:
         """Release every cache that retains a statistics specialization."""
@@ -165,7 +195,8 @@ class ModelExecution:
             failures.append(error)
         if failures:
             error = ResourceCleanupError(
-                "statistics execution caches", failures,
+                "statistics execution caches",
+                failures,
             )
             self.poison(error, phase="statistics invalidation")
             raise error from failures[0]
@@ -182,6 +213,10 @@ class ModelExecution:
                 program.close()
             except BaseException as error:
                 failures.append(error)
+        try:
+            self.step_fields.invalidate_program()
+        except BaseException as error:
+            failures.append(error)
         try:
             self.capture.invalidate()
         except BaseException as error:
@@ -204,6 +239,7 @@ class ModelExecution:
         except BaseException as error:
             failures.append(error)
         self.step_policies.clear()
+        self.step_fields.close()
         self.closed = True
         if len(failures) == 1:
             raise failures[0]

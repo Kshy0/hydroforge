@@ -6,13 +6,16 @@
 
 """Shared NetCDF indexing and process-local read resources."""
 
+import math
 import os
 from collections import OrderedDict
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from threading import RLock
-from typing import Any, Iterator, List, Optional, Tuple, Union
+from typing import Any
 from weakref import WeakSet
 
 import cftime
@@ -21,7 +24,6 @@ from netCDF4 import Dataset
 
 from hydroforge.contracts.errors import ResourceCleanupError
 from hydroforge.contracts.validation import HydroForgeModel
-
 
 _READ_HANDLE_POOLS: WeakSet[Any] = WeakSet()
 _READ_HANDLE_POOLS_LOCK = RLock()
@@ -155,20 +157,17 @@ def _planned_netcdf_chunk_len(
         variable = dataset.variables[var_name]
         chunking = variable.chunking()
         time_axes = [
-            index for index, name in enumerate(variable.dimensions)
+            index
+            for index, name in enumerate(variable.dimensions)
             if name in {"time", "valid_time"}
         ]
         if len(time_axes) != 1:
             return fallback
         time_axis = time_axes[0]
         element_bytes = np.dtype(variable.dtype).itemsize
-        bytes_per_step = element_bytes * int(np.prod(
-            [
-                size for index, size in enumerate(variable.shape)
-                if index != time_axis
-            ],
-            dtype=np.int64,
-        ))
+        bytes_per_step = element_bytes * math.prod(
+            size for index, size in enumerate(variable.shape) if index != time_axis
+        )
         memory_steps = max(1, max_bytes // max(1, bytes_per_step))
         if chunking == "contiguous" or not chunking:
             return max(1, min(fallback, max_steps, memory_steps))
@@ -187,9 +186,7 @@ def _planned_netcdf_chunk_len(
             target_steps = (
                 (target_steps + step_alignment - 1) // step_alignment
             ) * step_alignment
-            aligned_capacity = (
-                capacity_steps // step_alignment
-            ) * step_alignment
+            aligned_capacity = (capacity_steps // step_alignment) * step_alignment
             if aligned_capacity >= step_alignment:
                 capacity_steps = aligned_capacity
         return max(1, min(target_steps, capacity_steps))
@@ -223,9 +220,14 @@ def _configure_netcdf_variable_cache(
         return
     chunk_shape = tuple(int(value) for value in chunking)
     touched_chunks = 1
-    for axis, (selector, chunk_size, axis_size) in enumerate(zip(
-        selectors, chunk_shape, variable.shape, strict=True,
-    )):
+    for axis, (selector, chunk_size, axis_size) in enumerate(
+        zip(
+            selectors,
+            chunk_shape,
+            variable.shape,
+            strict=True,
+        )
+    ):
         if axis == time_axis:
             continue
         if isinstance(selector, slice):
@@ -245,9 +247,7 @@ def _configure_netcdf_variable_cache(
         else:
             count = 1
         touched_chunks *= max(1, int(count))
-    chunk_bytes = int(np.prod(chunk_shape, dtype=np.int64)) * np.dtype(
-        variable.dtype,
-    ).itemsize
+    chunk_bytes = math.prod(chunk_shape) * np.dtype(variable.dtype).itemsize
     desired_bytes = min(max_bytes, max(chunk_bytes, touched_chunks * chunk_bytes))
     current_bytes, current_elements, preemption = variable.get_var_chunk_cache()
     if desired_bytes <= current_bytes:
@@ -280,22 +280,22 @@ def _monthly_time_to_key_trusted(dt: datetime | cftime.datetime) -> str:
     return f"{dt.year:04d}_{dt.month:02d}"
 
 
-def single_file_key(dt: Union[datetime, cftime.datetime]) -> str:
+def single_file_key(dt: datetime | cftime.datetime) -> str:
     """Constant key for single-file mode."""
     return _single_file_key_trusted(_TimeKeyRequest(value=dt).value)
 
 
-def daily_time_to_key(dt: Union[datetime, cftime.datetime]) -> str:
+def daily_time_to_key(dt: datetime | cftime.datetime) -> str:
     """Default time-to-file key: one file per day (YYYYMMDD)."""
-    return _daily_time_to_key_trusted(dt)
+    return _daily_time_to_key_trusted(_TimeKeyRequest(value=dt).value)
 
 
-def yearly_time_to_key(dt: Union[datetime, cftime.datetime]) -> str:
+def yearly_time_to_key(dt: datetime | cftime.datetime) -> str:
     """Default time-to-file key: one file per year."""
     return _yearly_time_to_key_trusted(_TimeKeyRequest(value=dt).value)
 
 
-def monthly_time_to_key(dt: Union[datetime, cftime.datetime]) -> str:
+def monthly_time_to_key(dt: datetime | cftime.datetime) -> str:
     """Default time-to-file key: one file per month (YYYY_MM)."""
     return _monthly_time_to_key_trusted(_TimeKeyRequest(value=dt).value)
 
@@ -341,7 +341,7 @@ def _read_netcdf_var_sliced_trusted(
     return _read_netcdf_var_sliced_recursive(var, list(selectors))
 
 
-def _normalize_netcdf_index(index: Any, ndim: int) -> Tuple[Any, ...]:
+def _normalize_netcdf_index(index: Any, ndim: int) -> tuple[Any, ...]:
     """Expand an index into one selector per dimension, resolving Ellipsis."""
     if ndim == 0:
         if index is None or index is Ellipsis:
@@ -351,9 +351,7 @@ def _normalize_netcdf_index(index: Any, ndim: int) -> Tuple[Any, ...]:
         if isinstance(index, tuple) and len(index) == 1 and index[0] is Ellipsis:
             return ()
 
-    if index is None:
-        return tuple(slice(None) for _ in range(ndim))
-    if index is Ellipsis:
+    if index is None or index is Ellipsis:
         return tuple(slice(None) for _ in range(ndim))
     if not isinstance(index, tuple):
         index = (index,)
@@ -377,7 +375,7 @@ def _normalize_netcdf_index(index: Any, ndim: int) -> Tuple[Any, ...]:
 
     if len(index) > ndim:
         raise IndexError("NetCDF index has too many dimensions")
-    return tuple(index)
+    return index
 
 
 def _is_scalar_integer(value: Any) -> bool:
@@ -404,7 +402,8 @@ def _normalize_integer_slice(value: slice) -> slice:
             normalized.append(None)
             continue
         if isinstance(component, (bool, np.bool_)) or not isinstance(
-            component, (int, np.integer),
+            component,
+            (int, np.integer),
         ):
             raise TypeError("NetCDF slice bounds must be integer values")
         normalized.append(int(component))
@@ -413,7 +412,7 @@ def _normalize_integer_slice(value: slice) -> slice:
     return slice(*normalized)
 
 
-def _as_integer_array(selector: Any, axis_length: int) -> Optional[np.ndarray]:
+def _as_integer_array(selector: Any, axis_length: int) -> np.ndarray | None:
     """Convert a sequence/boolean selector to a 1-D int64 index, else None."""
     if np.ma.isMaskedArray(selector):
         raise TypeError("NetCDF selectors must not be masked arrays")
@@ -443,15 +442,10 @@ def _as_integer_array(selector: Any, axis_length: int) -> Optional[np.ndarray]:
     else:
         return None
 
-    if arr.size == 0:
-        return arr.astype(np.int64, copy=False)
-    arr = np.where(arr < 0, arr + axis_length, arr).astype(np.int64, copy=False)
-    if np.any((arr < 0) | (arr >= axis_length)):
-        raise IndexError("Integer index exceeds dimension size")
-    return arr
+    return np.where(arr < 0, arr + axis_length, arr).astype(np.int64, copy=False)
 
 
-def _read_netcdf_var_sliced_recursive(var: Any, selectors: List[Any]) -> np.ndarray:
+def _read_netcdf_var_sliced_recursive(var: Any, selectors: list[Any]) -> np.ndarray:
     """Read the variable, expanding the first array selector via slices."""
     for axis, selector in enumerate(selectors):
         if isinstance(selector, np.ndarray):
@@ -461,9 +455,51 @@ def _read_netcdf_var_sliced_recursive(var: Any, selectors: List[Any]) -> np.ndar
     return var[tuple(selectors)]
 
 
+def _compile_sequence_read_plan(index: np.ndarray, chunk_size: int | None):
+    unique_index, inverse = np.unique(index, return_inverse=True)
+    runs = []
+    positions = []
+    output_offset = 0
+    for start, stop, run_index in _coalesced_runs(unique_index, chunk_size):
+        runs.append((start, stop))
+        positions.append(output_offset + run_index - start)
+        output_offset += stop - start
+    selected = np.concatenate(positions) if positions else np.empty(0, dtype=np.int64)
+    if np.array_equal(selected, np.arange(selected.size, dtype=np.int64)):
+        selected = None
+    else:
+        selected.setflags(write=False)
+    if np.array_equal(index, unique_index):
+        inverse = None
+    else:
+        inverse.setflags(write=False)
+    return tuple(runs), selected, inverse
+
+
+@lru_cache(maxsize=16)
+def _cached_sequence_read_plan(payload: bytes, chunk_size: int | None):
+    return _compile_sequence_read_plan(
+        np.frombuffer(payload, dtype=np.int64), chunk_size
+    )
+
+
+def _prefer_sparse_axis(var: Any, axis: int, index: np.ndarray) -> bool:
+    """Avoid whole rows only when selection and physical coverage are sparse."""
+
+    extent = var.shape[axis]
+    if index.size * 4 >= extent:
+        return False
+    chunking = var.chunking()
+    if chunking == "contiguous" or not chunking:
+        return index.size <= 128
+    chunk_size = int(chunking[axis])
+    touched = np.unique(index // chunk_size).size
+    return touched <= 128 and touched * chunk_size * 2 < extent
+
+
 def _read_sequence_axis(
     var: Any,
-    selectors: List[Any],
+    selectors: list[Any],
     axis: int,
     index: np.ndarray,
 ) -> np.ndarray:
@@ -474,22 +510,22 @@ def _read_sequence_axis(
         empty_selectors[axis] = slice(0, 0)
         return _read_netcdf_var_sliced_recursive(var, empty_selectors)
 
-    unique_index, inverse = np.unique(index, return_inverse=True)
     chunking = var.chunking()
     chunk_size = (
-        None
-        if chunking == "contiguous" or not chunking
-        else int(chunking[axis])
+        None if chunking == "contiguous" or not chunking else int(chunking[axis])
+    )
+    runs, selected_positions, inverse = (
+        _cached_sequence_read_plan(
+            index.astype(np.int64, copy=False).tobytes(), chunk_size
+        )
+        if index.nbytes <= 128 * 1024
+        else _compile_sequence_read_plan(index, chunk_size)
     )
     chunks = []
-    selected_positions = []
-    output_offset = 0
-    for start, stop, run_index in _coalesced_runs(unique_index, chunk_size):
+    for start, stop in runs:
         slice_selectors = selectors.copy()
         slice_selectors[axis] = slice(start, stop)
         chunks.append(_read_netcdf_var_sliced_recursive(var, slice_selectors))
-        selected_positions.extend(output_offset + run_index - start)
-        output_offset += stop - start
 
     if len(chunks) == 1:
         data = chunks[0]
@@ -498,36 +534,17 @@ def _read_sequence_axis(
     else:
         data = np.concatenate(chunks, axis=axis_out)
 
-    selected_positions = np.asarray(selected_positions, dtype=np.int64)
-    if not np.array_equal(
-        selected_positions,
-        np.arange(selected_positions.size, dtype=np.int64),
-    ):
-        if np.ma.isMaskedArray(data):
-            data = np.ma.take(data, selected_positions, axis=axis_out)
-        else:
-            data = np.take(data, selected_positions, axis=axis_out)
-    if index.shape == unique_index.shape and np.array_equal(index, unique_index):
-        return data
-    if np.ma.isMaskedArray(data):
-        return np.ma.take(data, inverse, axis=axis_out)
-    return np.take(data, inverse, axis=axis_out)
+    for positions in (selected_positions, inverse):
+        if positions is not None:
+            data = data.take(positions, axis=axis_out)
+    return data
 
 
-def _output_axis(selectors: List[Any], axis: int) -> int:
+def _output_axis(selectors: list[Any], axis: int) -> int:
     """Map an input axis to its output axis after scalar dimensions collapse."""
-    return sum(0 if _is_scalar_integer(selector) else 1 for selector in selectors[:axis])
-
-
-def _contiguous_runs(index: np.ndarray) -> Iterator[Tuple[int, int]]:
-    """Yield (start, stop) half-open ranges for each run of consecutive ints."""
-    run_start = 0
-    split_points = np.flatnonzero(np.diff(index) != 1) + 1
-    for run_stop in np.concatenate((split_points, np.array([index.size]))):
-        start = int(index[run_start])
-        stop = int(index[run_stop - 1]) + 1
-        yield start, stop
-        run_start = int(run_stop)
+    return sum(
+        0 if _is_scalar_integer(selector) else 1 for selector in selectors[:axis]
+    )
 
 
 def _coalesced_runs(
@@ -536,17 +553,13 @@ def _coalesced_runs(
 ) -> Iterator[tuple[int, int, np.ndarray]]:
     """Coalesce fragmented selectors that occupy the same physical chunk."""
 
-    if chunk_size is None:
-        for start, stop in _contiguous_runs(index):
-            mask = (index >= start) & (index < stop)
-            yield start, stop, index[mask]
+    if index.size == 0:
         return
-
     run_start = 0
-    chunk_ids = index // chunk_size
-    split_points = np.flatnonzero(
-        (np.diff(index) != 1) & (np.diff(chunk_ids) != 0),
-    ) + 1
+    breaks = np.diff(index) != 1
+    if chunk_size is not None:
+        breaks &= np.diff(index // chunk_size) != 0
+    split_points = np.flatnonzero(breaks) + 1
     for run_stop in np.concatenate((split_points, np.array([index.size]))):
         run_index = index[run_start:run_stop]
         yield int(run_index[0]), int(run_index[-1]) + 1, run_index

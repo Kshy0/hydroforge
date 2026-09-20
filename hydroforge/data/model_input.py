@@ -33,18 +33,20 @@ if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
 
 
-_TORCH_DTYPE_KINDS: Mapping[torch.dtype, str] = MappingProxyType({
-    torch.bool: "bool",
-    torch.uint8: "integer",
-    torch.int8: "integer",
-    torch.int16: "integer",
-    torch.int32: "integer",
-    torch.int64: "integer",
-    torch.float16: "floating",
-    torch.bfloat16: "floating",
-    torch.float32: "floating",
-    torch.float64: "floating",
-})
+_TORCH_DTYPE_KINDS: Mapping[torch.dtype, str] = MappingProxyType(
+    {
+        torch.bool: "bool",
+        torch.uint8: "integer",
+        torch.int8: "integer",
+        torch.int16: "integer",
+        torch.int32: "integer",
+        torch.int64: "integer",
+        torch.float16: "floating",
+        torch.bfloat16: "floating",
+        torch.float32: "floating",
+        torch.float64: "floating",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +76,7 @@ class _ModelTensorPayload(HydroForgeModel):
         value = self.value
         name = contract.name
         external_contiguous: bool | None = None
+        owns_storage = False
         if isinstance(value, torch.Tensor):
             source = value.detach()
         elif isinstance(value, (np.ndarray, np.generic)):
@@ -90,6 +93,7 @@ class _ModelTensorPayload(HydroForgeModel):
                     order="C",
                     copy=True,
                 )
+                owns_storage = True
             source = torch.as_tensor(array)
         else:
             array = np.asarray(value)
@@ -99,22 +103,31 @@ class _ModelTensorPayload(HydroForgeModel):
         original_device = source.device
         original_contiguous = (
             source.is_contiguous()
-            if external_contiguous is None else external_contiguous
+            if external_contiguous is None
+            else external_contiguous
         )
         if source.dtype != contract.dtype:
+            previous = source
             source = cast_declared_tensor(
-                source, contract.dtype, name=f"input.{name}",
+                source,
+                contract.dtype,
+                name=f"input.{name}",
             )
+            owns_storage = owns_storage or source is not previous
         tensor = source.to(device=self.model.device)
-        trials = getattr(self.model, "num_trials", None)
-        shared_trial_state = (
-            trials is not None
+        owns_storage = owns_storage or tensor is not source
+        members = getattr(self.model, "local_ensemble_size", None)
+        shared_ensemble_state = (
+            members is not None
             and contract.category in {"state", "init_state"}
             and tensor.ndim == contract.logical_rank
         )
-        if shared_trial_state:
-            tensor = tensor.unsqueeze(0).expand(trials, *tensor.shape)
-        tensor = tensor.detach().clone(memory_format=torch.contiguous_format)
+        if shared_ensemble_state:
+            tensor = tensor.unsqueeze(0).expand(members, *tensor.shape)
+        if shared_ensemble_state or not owns_storage:
+            tensor = tensor.detach().clone(memory_format=torch.contiguous_format)
+        else:
+            tensor = tensor.detach().contiguous()
 
         if (
             original_dtype != tensor.dtype
@@ -170,10 +183,7 @@ class ModelInput:
                     field.computed
                     or field.excluded
                     or field.name in MODEL_OWNED_MODULE_FIELDS
-                    or (
-                        field.tensor is not None
-                        and field.tensor.category == "forcing"
-                    )
+                    or (field.tensor is not None and field.tensor.category == "forcing")
                     or not model._is_tensor_field_active(module_name, field)
                 ):
                     continue
@@ -199,7 +209,9 @@ class ModelInput:
                 name=name,
                 owners=tuple(owners[name]),
                 dtype=concrete_tensor_dtype(
-                    field.tensor.dtype, model.dtype, model.mixed_precision,
+                    field.tensor.dtype,
+                    model.dtype,
+                    model.mixed_precision,
                 ),
                 logical_rank=len(field.tensor.shape),
                 category=field.tensor.category,
@@ -216,7 +228,8 @@ class ModelInput:
                 f"{unknown}; available={sorted(self.fields)}"
             )
         missing = sorted(
-            name for name, field in self.fields.items()
+            name
+            for name, field in self.fields.items()
             if field.required and name not in self.proxy
         )
         if missing:
@@ -231,18 +244,23 @@ class ModelInput:
                 continue
             source_dtype = self.proxy._get_var_dtype(name)
             self._validate_dtype_family(
-                name, source_dtype, contract.dtype,
+                name,
+                source_dtype,
+                contract.dtype,
             )
             self._validate_source_shape(
-                contract, self.proxy._shape_for_trusted(name),
+                contract,
+                self.proxy._shape_for_trusted(name),
             )
 
     def _validate_source_shape(
-        self, contract: TensorInputSpec, shape: tuple[int, ...],
+        self,
+        contract: TensorInputSpec,
+        shape: tuple[int, ...],
     ) -> None:
         logical_rank = contract.logical_rank
-        trials = self.model.num_trials
-        if trials is None:
+        members = self.model.ensemble_size
+        if members is None:
             allowed_ranks = (logical_rank,)
         elif contract.category in {"state", "init_state", "param", "forcing"}:
             allowed_ranks = (logical_rank, logical_rank + 1)
@@ -252,14 +270,12 @@ class ModelInput:
             raise ValueError(
                 f"Input field {contract.name!r} has rank {len(shape)}, but "
                 f"category {contract.category!r} permits rank(s) "
-                f"{allowed_ranks} for num_trials={trials}"
+                f"{allowed_ranks} for ensemble_size={members}"
             )
-        if len(shape) == logical_rank + 1 and (
-            trials is None or shape[0] != trials
-        ):
+        if len(shape) == logical_rank + 1 and (members is None or shape[0] != members):
             raise ValueError(
-                f"Input field {contract.name!r} has leading trial size "
-                f"{shape[0]}, expected num_trials={trials}"
+                f"Input field {contract.name!r} has leading member size "
+                f"{shape[0]}, expected ensemble_size={members}"
             )
 
     @staticmethod
@@ -280,7 +296,10 @@ class ModelInput:
 
     @classmethod
     def _validate_dtype_family(
-        cls, name: str, source_dtype: Any, target_dtype: torch.dtype,
+        cls,
+        name: str,
+        source_dtype: Any,
+        target_dtype: torch.dtype,
     ) -> None:
         source_kind = cls._dtype_kind(source_dtype)
         target_kind = cls._dtype_kind(target_dtype)
@@ -291,11 +310,12 @@ class ModelInput:
             )
 
     def compile_partition_axes(
-        self, partition: PartitionCompiler,
+        self,
+        partition: PartitionCompiler,
     ) -> Mapping[str, int]:
         """Compile global logical axes before any rank-local slicing."""
 
-        return partition.compile_input_axes(dict(self.fields))
+        return partition.compile_input_axes(self.fields)
 
     @property
     def injected_vars(self) -> set[str]:
@@ -315,9 +335,13 @@ class ModelInput:
             return self._full_cache[name]
         except KeyError:
             pass
-        value = self._prepare(name, self.proxy._get_value_trusted(name))
+        value = self.read_value(name)
         self._full_cache[name] = value
         return value
+
+    def read_value(self, name: str) -> Any:
+        """Read owned payload data without sharing semantic-validation caches."""
+        return self._prepare(name, self.proxy._get_value_trusted(name))
 
     def get_subset(self, name: str, selector: Any) -> Any:
         return self._prepare(
@@ -325,21 +349,39 @@ class ModelInput:
             self.proxy._get_subset_trusted(name, selector),
         )
 
+    def read_local(self, name: str, spatial_indices=None) -> Any:
+        axis = self.model._semantic_plan.input_axes.get(name, 0)
+        mesh = self.model.parallel
+        members = slice(None) if mesh is None else mesh.member_slice
+        if spatial_indices is not None:
+            selector = (members, spatial_indices) if axis == 1 else spatial_indices
+        elif axis == 1:
+            selector = members
+        else:
+            return self.read_value(name)
+        return self.get_subset(name, selector)
+
+    def clear_cache(self) -> None:
+        """Release normalized values after transferring module input ownership."""
+        self._full_cache.clear()
+
     def _prepare(self, name: str, value: Any) -> Any:
         contract = self.tensor_contracts.get(name)
         if contract is None:
-            return self._copy_scalar_or_object(name, value)
-        return self._prepare_tensor(contract, value)
+            return self._copy_scalar_or_object(value)
+        return _ModelTensorPayload(
+            model=self.model,
+            contract=contract,
+            value=value,
+        ).tensor
 
     @staticmethod
-    def _copy_scalar_or_object(name: str, value: Any) -> Any:
-        del name
+    def _copy_scalar_or_object(value: Any) -> Any:
         if isinstance(value, torch.Tensor):
-            if value.ndim != 0:
-                return np.array(
-                    value.detach().cpu().numpy(), order="C", copy=True,
-                )
-            return value.detach().cpu().item()
+            value = value.detach().cpu()
+            if value.ndim == 0:
+                return value.item()
+            value = value.numpy()
         if isinstance(value, np.ndarray):
             if value.ndim == 0:
                 return value.item()
@@ -347,15 +389,6 @@ class ModelInput:
         if isinstance(value, np.generic):
             return value.item()
         return deepcopy(value)
-
-    def _prepare_tensor(
-        self, contract: TensorInputSpec, value: Any,
-    ) -> torch.Tensor:
-        return _ModelTensorPayload(
-            model=self.model,
-            contract=contract,
-            value=value,
-        ).tensor
 
 
 __all__: list[str] = []

@@ -7,31 +7,22 @@
 from __future__ import annotations
 
 from abc import ABC
-from datetime import datetime, timedelta
+from collections.abc import Mapping
+from datetime import datetime
 from functools import cache, cached_property
-from hashlib import sha256
-import json
 from pathlib import Path
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
-    Dict,
-    List,
     Literal,
-    Optional,
-    Mapping,
     Self,
-    Union,
     cast,
 )
-from uuid import uuid4
 
 import cftime
-import numpy as np
 import torch
-import torch.distributed as dist
 from pydantic import (
     ConfigDict,
     Field,
@@ -41,283 +32,82 @@ from pydantic import (
     model_validator,
 )
 
-from hydroforge.statistics.ir import (
-    _StatisticsDeclaration,
-    ExpressionSource,
-    Reduction,
-    ScatterSource,
-    StatisticsProgram,
-    TensorSource,
-    build_variable_storage_plan,
-    parse_operation,
-    parse_value_source,
-    validate_expression_constants,
-)
-from hydroforge.contracts.naming import RESERVED_CONTROL_STATE, sanitize_symbol
 from hydroforge.compiler.namespace import NamespaceEntry
-from hydroforge.data.distributed import ProcessTopology
-from hydroforge.data.input import InputProxy
-from hydroforge.contracts.kernel_field import _KernelField
-from hydroforge.contracts.validation import HydroForgeModel, _immutable_dict
+from hydroforge.contracts.events import ConsoleEventSink, EventSink, emit
 from hydroforge.contracts.fields import FieldDemandPlan, tensor_is_active
+from hydroforge.contracts.kernel_field import _KernelField
+from hydroforge.contracts.naming import DottedPath, Identifier
+from hydroforge.contracts.options import OptionsConfig
+from hydroforge.contracts.parameters import ParameterChange
+from hydroforge.contracts.runtime import (
+    BackendRequirement,
+    ModuleRequirement,
+)
+from hydroforge.contracts.step_fields import StepFieldProvider
 from hydroforge.contracts.temporal import (
-    EveryStep,
     SimulationSchedule,
     StatisticsPlan,
     _StatisticsOutput,
-    canonical_calendar,
     normalize_calendar_dates,
 )
-from hydroforge.contracts.events import ConsoleEventSink, EventSink, emit
-from hydroforge.contracts.errors import (
-    ResourceCleanupError,
-    distributed_failure_error,
-    failure_description,
+from hydroforge.contracts.validation import (
+    FrozenMapping,
+    HydroForgeModel,
+    _immutable_dict,
 )
-from hydroforge.contracts.runtime import (
-    BackendRequirement,
-    DEFAULT_BACKEND_REQUIREMENT,
-    DEFAULT_MODULE_REQUIREMENT,
-    _effective_block_size,
-    ModuleRequirement,
-    RUNTIME_BACKEND_REQUIREMENTS,
-)
-from hydroforge.contracts.parameters import ParameterChange
+from hydroforge.data.distributed import ProcessTopology
+from hydroforge.data.input import InputProxy
+from hydroforge.data.parallel import EnsembleParallel
 from hydroforge.model.module import AbstractModule, ModuleReference
 from hydroforge.serialization.netcdf import default_netcdf_options
+from hydroforge.statistics.ir import (
+    Expression,
+    _StatisticsDeclaration,
+)
 
 if TYPE_CHECKING:
     from hydroforge.compiler.data import ModelDataCompiler
+    from hydroforge.compiler.model import FieldOwner, _ModelSemanticPlan
     from hydroforge.compiler.namespace import NamespaceCompiler
     from hydroforge.compiler.partition import (
         GroupRankLookup,
         PartitionCompiler,
     )
-    from hydroforge.compiler.model import FieldOwner, _ModelSemanticPlan
     from hydroforge.compiler.statistics_binding import (
         DisabledStatisticsBinding,
         StatisticsBindingCompiler,
     )
+    from hydroforge.contracts.fields import PartitionSchema
     from hydroforge.data.model_input import ModelInput
-    from hydroforge.execution.parameters import ParameterChangeEffect
-    from hydroforge.execution.parameters import ParameterPlanRuntime
+    from hydroforge.execution.lifecycle import RuntimeLifecycle
+    from hydroforge.execution.parameters import (
+        ParameterChangeEffect,
+        ParameterPlanRuntime,
+    )
     from hydroforge.execution.progress import ProgressRuntime
     from hydroforge.execution.runtime import ModelExecution
     from hydroforge.output.checkpoint import CheckpointRuntime
-    from hydroforge.contracts.fields import PartitionSchema
 
 
 _STATISTICS_QUERY_CONTEXT = "hydroforge_statistics_model"
 _MODEL_METHOD_CONTEXT = "hydroforge_model_method"
-
-
-def _xpu_supports_fp64(device: torch.device) -> bool:
-    """Return compiler-relevant XPU FP64 support or fail before lowering."""
-
-    runtime = getattr(torch, "xpu", None)
-    properties_getter = getattr(runtime, "get_device_properties", None)
-    if properties_getter is None:
-        raise RuntimeError(
-            "this PyTorch XPU runtime cannot report FP64 capability; "
-            "HydroForge cannot safely select float64 Triton storage"
-        )
-    try:
-        properties = properties_getter(device)
-    except (AssertionError, RuntimeError, TypeError, ValueError) as error:
-        raise RuntimeError(
-            f"cannot query FP64 capability for XPU device {str(device)!r}"
-        ) from error
-    supported = getattr(properties, "has_fp64", None)
-    if type(supported) is not bool:
-        raise RuntimeError(
-            f"XPU device {str(device)!r} did not expose an exact has_fp64 "
-            "capability; HydroForge cannot safely select float64 Triton storage"
-        )
-    return supported
-
-
-def _default_mixed_precision(
-    backend: str,
-    device: torch.device,
-    *,
-    xpu_supports_fp64: bool | None = None,
-) -> bool:
-    """Return the native accelerator default for hpfloat model storage."""
-
-    if backend == "cuda" and device.type == "cuda":
-        return True
-    if backend != "triton":
-        return False
-    if device.type == "cuda":
-        return True
-    if device.type != "xpu":
-        return False
-    if xpu_supports_fp64 is None:
-        xpu_supports_fp64 = _xpu_supports_fp64(device)
-    return xpu_supports_fp64
-
-
-def _qualified_type_name(value: type[Any]) -> str:
-    return f"{value.__module__}.{value.__qualname__}"
-
-
-def _distributed_date_signature(
-    value: datetime | cftime.datetime | None,
-) -> tuple[Any, ...] | None:
-    if value is None:
-        return None
-    return (
-        _qualified_type_name(type(value)),
-        canonical_calendar(getattr(value, "calendar", "standard")),
-        value.year,
-        value.month,
-        value.day,
-        value.hour,
-        value.minute,
-        value.second,
-        value.microsecond,
-        getattr(value, "fold", None),
-        getattr(value, "has_year_zero", None),
-    )
-
-
-def _distributed_array_signature(value: np.ndarray) -> tuple[Any, ...]:
-    array = np.asarray(value)
-    canonical = np.ascontiguousarray(array)
-    return (
-        "numpy",
-        canonical.dtype.str,
-        tuple(array.shape),
-        sha256(canonical.view(np.uint8).tobytes()).hexdigest(),
-    )
-
-
-def _distributed_tensor_signature(value: torch.Tensor) -> tuple[Any, ...]:
-    canonical = value.detach().to(device="cpu").contiguous().reshape(-1)
-    payload = canonical.view(torch.uint8).numpy().tobytes()
-    return (
-        "torch",
-        str(value.dtype),
-        tuple(value.shape),
-        sha256(payload).hexdigest(),
-    )
-
-
-def _distributed_value_signature(value: Any) -> Any:
-    """Encode one declaration as stable, equality-safe Python primitives."""
-
-    if value is None or type(value) in {bool, int, str}:
-        return value
-    if type(value) is float:
-        return ("float", value.hex())
-    if isinstance(value, (datetime, cftime.datetime)):
-        return _distributed_date_signature(value)
-    if type(value) is timedelta:
-        return ("timedelta", value.days, value.seconds, value.microseconds)
-    if isinstance(value, Path):
-        return ("path", str(value.absolute()))
-    if isinstance(value, torch.device):
-        return ("device", value.type)
-    if isinstance(value, torch.dtype):
-        return ("dtype", str(value))
-    if isinstance(value, torch.Tensor):
-        return _distributed_tensor_signature(value)
-    if isinstance(value, np.ndarray):
-        return _distributed_array_signature(value)
-    if isinstance(value, np.generic):
-        return _distributed_array_signature(np.asarray(value))
-    if isinstance(value, HydroForgeModel):
-        fields = object.__getattribute__(value, "__dict__")
-        return (
-            "model",
-            _qualified_type_name(type(value)),
-            tuple(
-                (name, _distributed_value_signature(fields[name]))
-                for name in type(value).model_fields
-            ),
-        )
-    if isinstance(value, Mapping):
-        entries = tuple(
-            (
-                _distributed_value_signature(key),
-                _distributed_value_signature(item),
-            )
-            for key, item in value.items()
-        )
-        return (
-            "mapping",
-            tuple(sorted(entries, key=lambda item: repr(item[0]))),
-        )
-    if isinstance(value, tuple):
-        return ("tuple", tuple(map(_distributed_value_signature, value)))
-    if isinstance(value, (set, frozenset)):
-        items = tuple(map(_distributed_value_signature, value))
-        return ("set", tuple(sorted(items, key=repr)))
-    if isinstance(value, bytes):
-        return ("bytes", value.hex())
-    raise TypeError(
-        "distributed runtime declarations cannot contain unsupported value "
-        f"{type(value).__name__}"
-    )
-
-
-def _distributed_schedule_signature(
-    schedule: SimulationSchedule | None,
-) -> tuple[Any, ...] | None:
-    """Digest explicit schedules without publishing every step object."""
-
-    if schedule is None:
-        return None
-    if schedule._is_regular:
-        return (
-            "regular",
-            schedule.calendar,
-            _distributed_date_signature(schedule.regular_start),
-            _distributed_date_signature(schedule.regular_end),
-            _distributed_value_signature(schedule.regular_step),
-            _distributed_value_signature(schedule.source_interval),
-            _distributed_value_signature(schedule.spinup),
-            schedule.num_spinup_steps,
-            schedule.num_main_steps,
-        )
-
-    digest = sha256()
-    for step in schedule.explicit_steps:
-        encoded = json.dumps(
-            _distributed_value_signature(step),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "big"))
-        digest.update(encoded)
-    return (
-        "explicit",
-        schedule.calendar,
-        len(schedule.explicit_steps),
-        _distributed_date_signature(schedule.execution_start),
-        _distributed_date_signature(schedule.execution_end),
-        digest.hexdigest(),
-    )
+_EMPTY_STRUCTURE_HOOK = AbstractModule.update_structure
 
 
 class _ModelClassDeclaration(HydroForgeModel):
     """Validated subclass-authoring declaration for ``AbstractModel``."""
 
-    backend_requirements: Mapping[str, BackendRequirement]
-    module_requirements: Mapping[str, ModuleRequirement]
+    backend_requirements: FrozenMapping[
+        Literal["torch", "cuda", "triton", "metal"], BackendRequirement
+    ]
+    module_requirements: FrozenMapping[str, ModuleRequirement]
     module_names: frozenset[str]
-    partition_key: str | None
-    partition_group: str
-    cuda_extension_modules: tuple[str, ...]
+    partition_key: Identifier | None
+    partition_group: Identifier
+    cuda_extension_modules: tuple[DottedPath, ...]
 
     @model_validator(mode="after")
     def _validate_declaration(self) -> Self:
-        supported = {"torch", "cuda", "triton", "metal"}
-        unknown_backends = set(self.backend_requirements).difference(supported)
-        if unknown_backends:
-            raise ValueError(
-                f"backend_requirements has unknown backends: {sorted(unknown_backends)}"
-            )
         unknown_modules = set(self.module_requirements).difference(
             self.module_names,
         )
@@ -325,37 +115,12 @@ class _ModelClassDeclaration(HydroForgeModel):
             raise ValueError(
                 f"module_requirements names unknown modules: {sorted(unknown_modules)}"
             )
-        if self.partition_key is not None and not self.partition_key.isidentifier():
-            raise ValueError("partition_key must be a Python identifier or None")
-        if not self.partition_group.isidentifier():
-            raise ValueError("partition_group must be a Python identifier")
-        invalid_catalogs = tuple(
-            name
-            for name in self.cuda_extension_modules
-            if not name
-            or any(not component.isidentifier() for component in name.split("."))
-        )
-        if invalid_catalogs:
-            raise ValueError(
-                "cuda_extension_modules must contain dotted Python module "
-                f"names; invalid={invalid_catalogs}"
-            )
         if len(self.cuda_extension_modules) != len(set(self.cuda_extension_modules)):
             raise ValueError("cuda_extension_modules must not contain duplicates")
-        object.__setattr__(
-            self,
-            "backend_requirements",
-            MappingProxyType(dict(self.backend_requirements)),
-        )
-        object.__setattr__(
-            self,
-            "module_requirements",
-            MappingProxyType(dict(self.module_requirements)),
-        )
         return self
 
 
-def _statistics_query_model(info: ValidationInfo) -> "AbstractModel":
+def _statistics_query_model(info: ValidationInfo) -> AbstractModel:
     context = info.context
     if not isinstance(context, Mapping):
         raise ValueError("statistics query requires model context")
@@ -365,10 +130,8 @@ def _statistics_query_model(info: ValidationInfo) -> "AbstractModel":
     return model
 
 
-class _StatisticsCollectionQuery(HydroForgeModel):
-    """Validated request for one in-memory statistics collection view."""
-
-    as_stacked: bool = True
+class _StatisticsHistoryQuery(HydroForgeModel):
+    """Require a declared, retained statistics history before materialization."""
 
     @model_validator(mode="after")
     def _validate_query(self, info: ValidationInfo) -> Self:
@@ -380,6 +143,30 @@ class _StatisticsCollectionQuery(HydroForgeModel):
         return self
 
 
+class _StatisticsCollectionQuery(_StatisticsHistoryQuery):
+    """Validated request for one in-memory statistics collection view."""
+
+    as_stacked: bool = True
+    start: int | None = None
+    stop: int | None = None
+
+
+class _StatisticsDrainQuery(_StatisticsHistoryQuery):
+    as_stacked: bool = True
+    max_steps: int | None = Field(default=None, ge=0)
+
+
+class _StatisticsBatchQuery(_StatisticsHistoryQuery):
+    batch_size: int = Field(default=64, gt=0)
+
+    @field_validator("batch_size", mode="before")
+    @classmethod
+    def _validate_exact_count(cls, value: Any) -> int:
+        if type(value) is not int:
+            raise ValueError("batch_size must be an exact integer")
+        return value
+
+
 class _StatisticsItemQuery(HydroForgeModel):
     """Validated lookup of one output already declared by StatisticsPlan."""
 
@@ -387,6 +174,8 @@ class _StatisticsItemQuery(HydroForgeModel):
     operation: str = "mean"
     as_stacked: bool = True
     access: Literal["result", "accumulator", "pop"]
+    start: int | None = Field(default=None, strict=True)
+    stop: int | None = Field(default=None, strict=True)
 
     @model_validator(mode="after")
     def _validate_query(self, info: ValidationInfo) -> Self:
@@ -419,7 +208,7 @@ class _SaveStateRequest(HydroForgeModel):
         )
         if model is None:
             raise ValueError("save_state requires model context")
-        if model.num_trials is not None:
+        if model.ensemble_size is not None:
             raise ValueError("checkpoint save currently requires a non-ensemble model")
         return self
 
@@ -430,11 +219,6 @@ class AbstractModel(HydroForgeModel, ABC):
     """
 
     model_config = ConfigDict(
-        arbitrary_types_allowed=True,
-        frozen=True,
-        extra="forbid",
-        strict=True,
-        validate_default=True,
         ignored_types=(_KernelField, ModuleReference),
     )
 
@@ -445,9 +229,13 @@ class AbstractModel(HydroForgeModel, ABC):
     module_requirements: ClassVar[Mapping[str, ModuleRequirement]] = MappingProxyType(
         {}
     )
-    partition_key: ClassVar[Optional[str]] = None
+    partition_key: ClassVar[str | None] = None
     partition_group: ClassVar[str] = "group_id"
     cuda_extension_modules: ClassVar[tuple[str, ...]] = ()
+    step_field_providers: ClassVar[Mapping[str, StepFieldProvider]] = MappingProxyType(
+        {}
+    )
+    step_field_expressions: ClassVar[Mapping[str, str]] = MappingProxyType({})
     # Instance fields
     experiment_name: str = Field(
         default="experiment",
@@ -464,6 +252,10 @@ class AbstractModel(HydroForgeModel, ABC):
     opened_modules: tuple[str, ...] = Field(
         default_factory=tuple,
         description="Ordered tuple of active modules",
+    )
+    options: OptionsConfig = Field(
+        default_factory=OptionsConfig,
+        description="Immutable typed model options and constants",
     )
     variables_to_save: Mapping[str, tuple[str | Mapping[str, str], ...]] = Field(
         default_factory=dict,
@@ -482,14 +274,14 @@ class AbstractModel(HydroForgeModel, ABC):
         default="float32",
         description="Base precision of the model",
     )
-    statistics_save_precision: Optional[Literal["float32", "float64"]] = Field(
+    statistics_save_precision: Literal["float32", "float64"] | None = Field(
         default="float32",
         description=(
             "Floating-point precision used for persisted statistics; None "
             "preserves each statistics tensor's resolved precision."
         ),
     )
-    mixed_precision: Optional[bool] = Field(
+    mixed_precision: bool | None = Field(
         default=None,
         strict=True,
         description=(
@@ -505,8 +297,10 @@ class AbstractModel(HydroForgeModel, ABC):
         default="auto",
         description=(
             "Execution scheduling policy. 'auto' selects the cached native "
-            "capture supported by the active device; 'eager' keeps every "
-            "launch directly observable for differentiation and debugging."
+            "capture supported by the active device. CUDA conditional graphs "
+            "require a native CUDA build with CUDA >= 12.4; ROCm/HIP uses "
+            "the eager fallback. 'eager' keeps every launch directly "
+            "observable for differentiation and debugging."
         ),
     )
     device: torch.device = Field(
@@ -517,7 +311,7 @@ class AbstractModel(HydroForgeModel, ABC):
         default_factory=ConsoleEventSink,
         description="Structured lifecycle/progress event destination",
     )
-    BLOCK_SIZE: Optional[int] = Field(
+    BLOCK_SIZE: int | None = Field(
         default=None,
         description=(
             "Global GPU block-size override. None lets each kernel select its "
@@ -538,19 +332,20 @@ class AbstractModel(HydroForgeModel, ABC):
         strict=True,
         description="Whether to split output files by year",
     )
-    num_trials: Optional[int] = Field(
+    ensemble_size: int | None = Field(
         default=None,
         ge=2,
         strict=True,
         description="Number of parallel simulations (ensemble members)",
     )
-    trial_forcing_fields: Mapping[str, tuple[str, ...]] = Field(
+    ensemble_forcing_fields: Mapping[str, tuple[str, ...]] = Field(
         default_factory=dict,
         description=(
-            "Construction-time trial-batched forcing fields grouped by module; "
+            "Construction-time member-batched forcing fields grouped by module; "
             "unlisted forcing fields remain shared"
         ),
     )
+    parallel: EnsembleParallel | None = Field(default=None, exclude=True, repr=False)
     save_kernels: bool = Field(
         default=False,
         strict=True,
@@ -571,15 +366,15 @@ class AbstractModel(HydroForgeModel, ABC):
             "submitted writer tasks"
         ),
     )
-    initial_time: Optional[Union[datetime, cftime.datetime]] = Field(
+    initial_time: datetime | cftime.datetime | None = Field(
         default=None,
         description=("Initial runtime clock when no simulation schedule is supplied"),
     )
-    simulation_schedule: Optional[SimulationSchedule] = Field(
+    simulation_schedule: SimulationSchedule | None = Field(
         default=None,
         description="Runtime-owned model call schedule and calendar contract",
     )
-    statistics_plan: Optional[StatisticsPlan] = Field(
+    statistics_plan: StatisticsPlan | None = Field(
         default=None,
         description=(
             "Optional temporal window policy for variables_to_save; omitted "
@@ -590,7 +385,7 @@ class AbstractModel(HydroForgeModel, ABC):
         default=(),
         description="Complete immutable scheduled parameter declarations",
     )
-    calendar: Optional[str] = Field(
+    calendar: str | None = Field(
         default=None,
         description=(
             "Calendar when no simulation schedule is configured. A schedule "
@@ -602,7 +397,7 @@ class AbstractModel(HydroForgeModel, ABC):
         strict=True,
         description="Store output in memory instead of writing to NC files",
     )
-    result_device: Optional[torch.device] = Field(
+    result_device: torch.device | None = Field(
         default=None,
         description="Device for in-memory results (default: CPU)",
     )
@@ -621,12 +416,13 @@ class AbstractModel(HydroForgeModel, ABC):
         ),
     )
 
-    _modules: Dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
+    _modules: dict[str, AbstractModule] = PrivateAttr(default_factory=dict)
     _module_links: Mapping[str, AbstractModule | None] | None = PrivateAttr(
         default=None,
     )
     _process_topology: ProcessTopology | None = PrivateAttr(default=None)
     _runtime_materialized: bool = PrivateAttr(default=False)
+    _lifecycle_service: RuntimeLifecycle | None = PrivateAttr(default=None)
     _distributed_public_sequence: int = PrivateAttr(default=0)
 
     # Imports remain TYPE_CHECKING-only so the declarative layer does not gain
@@ -641,7 +437,7 @@ class AbstractModel(HydroForgeModel, ABC):
     _field_namespace: Mapping[str, tuple[FieldOwner, ...]] = PrivateAttr()
     _parameters: ParameterPlanRuntime = PrivateAttr()
     _progress_service: ProgressRuntime = PrivateAttr()
-    _current_time: Optional[Union[datetime, cftime.datetime]] = PrivateAttr(
+    _current_time: datetime | cftime.datetime | None = PrivateAttr(
         default=None,
     )
     _backend: str = PrivateAttr()
@@ -658,9 +454,21 @@ class AbstractModel(HydroForgeModel, ABC):
         default_factory=FieldDemandPlan.empty,
     )
     _semantic_plan: _ModelSemanticPlan = PrivateAttr()
+    _step_field_providers: Mapping[str, StepFieldProvider] = PrivateAttr()
+    _step_field_expressions: Mapping[str, Expression] = PrivateAttr()
+
+    @property
+    def _runtime_lifecycle(self) -> RuntimeLifecycle:
+        lifecycle = self.__pydantic_private__["_lifecycle_service"]
+        if lifecycle is None:
+            from hydroforge.execution.lifecycle import RuntimeLifecycle
+
+            lifecycle = RuntimeLifecycle(self)
+            self._lifecycle_service = lifecycle
+        return lifecycle
 
     def _topology(self) -> ProcessTopology:
-        topology = self._process_topology
+        topology = self.__pydantic_private__["_process_topology"]
         if topology is None:
             topology = ProcessTopology.capture()
             self._process_topology = topology
@@ -679,7 +487,37 @@ class AbstractModel(HydroForgeModel, ABC):
         return self._topology().world_size
 
     @property
-    def current_time(self) -> Optional[Union[datetime, cftime.datetime]]:
+    def local_ensemble_size(self) -> int | None:
+        return (
+            self.ensemble_size
+            if self.parallel is None
+            else self.parallel.local_ensemble_size
+        )
+
+    @property
+    def spatial_rank(self) -> int:
+        return self.rank if self.parallel is None else self.parallel.spatial_rank
+
+    @property
+    def spatial_world_size(self) -> int:
+        return (
+            self.world_size
+            if self.parallel is None
+            else self.parallel.spatial_partitions
+        )
+
+    @model_validator(mode="after")
+    def _validate_parallel(self) -> Self:
+        if self.parallel is not None:
+            self.parallel.validate_live()
+            if self.ensemble_size != self.parallel.ensemble_size:
+                raise ValueError(
+                    "model ensemble_size must match the ensemble process mesh"
+                )
+        return self
+
+    @property
+    def current_time(self) -> datetime | cftime.datetime | None:
         """Return the private clock of the next managed model step."""
 
         self._ensure_runtime_materialized()
@@ -687,7 +525,7 @@ class AbstractModel(HydroForgeModel, ABC):
 
     def _set_runtime_current_time(
         self,
-        value: Union[datetime, cftime.datetime],
+        value: datetime | cftime.datetime,
     ) -> None:
         """Advance the private clock from the managed-step runtime."""
 
@@ -831,236 +669,66 @@ class AbstractModel(HydroForgeModel, ABC):
             normalized[canonical] = tuple(compiled_items)
         return _immutable_dict(normalized)
 
-    @field_validator("trial_forcing_fields", mode="before")
+    @field_validator("ensemble_forcing_fields", mode="before")
     @classmethod
-    def _validate_trial_forcing_declaration(cls, value: Any):
+    def _validate_ensemble_forcing_declaration(cls, value: Any):
         if type(value) is not dict:
-            raise ValueError("trial_forcing_fields must be an exact dict")
+            raise ValueError("ensemble_forcing_fields must be an exact dict")
         normalized: dict[str, tuple[str, ...]] = {}
         for module_name, field_names in value.items():
             if type(module_name) is not str or not module_name:
                 raise ValueError(
-                    "trial_forcing_fields module names must be non-empty strings"
+                    "ensemble_forcing_fields module names must be non-empty strings"
                 )
             if type(field_names) is not tuple:
                 raise ValueError(
-                    f"trial_forcing_fields[{module_name!r}] must be an exact tuple"
+                    f"ensemble_forcing_fields[{module_name!r}] must be an exact tuple"
                 )
             if any(
                 type(field_name) is not str or not field_name
                 for field_name in field_names
             ):
                 raise ValueError(
-                    f"trial_forcing_fields[{module_name!r}] must contain "
+                    f"ensemble_forcing_fields[{module_name!r}] must contain "
                     "non-empty strings"
                 )
             if len(field_names) != len(set(field_names)):
                 raise ValueError(
-                    f"trial_forcing_fields[{module_name!r}] contains duplicates"
+                    f"ensemble_forcing_fields[{module_name!r}] contains duplicates"
                 )
             normalized[module_name] = field_names
         return _immutable_dict(normalized)
 
     @model_validator(mode="after")
-    def _validate_trial_forcing_fields(self) -> Self:
-        declaration = self.trial_forcing_fields
-        if declaration and self.num_trials is None:
-            raise ValueError("trial_forcing_fields require num_trials")
-        module_types = self._module_types()
-        opened = frozenset(self.opened_modules)
-        for module_name, field_names in declaration.items():
-            if module_name not in opened:
-                raise ValueError(
-                    f"trial forcing module {module_name!r} is not open"
-                )
-            module_type = module_types[module_name]
-            for field_name in field_names:
-                schema = module_type._get_tensor_schema(field_name)
-                if schema is None or schema.tensor is None:
-                    raise ValueError(
-                        f"unknown trial forcing field "
-                        f"{module_name}.{field_name}"
-                    )
-                if schema.tensor.category != "forcing":
-                    raise ValueError(
-                        f"trial forcing field {module_name}.{field_name} has "
-                        f"category {schema.tensor.category!r}, expected 'forcing'"
-                    )
-                if not tensor_is_active(schema.tensor, self.opened_modules):
-                    raise ValueError(
-                        f"trial forcing field {module_name}.{field_name} is inactive"
-                    )
-        object.__setattr__(
-            self,
-            "trial_forcing_fields",
-            _immutable_dict(declaration),
-        )
-        return self
+    def _validate_ensemble_forcing_fields(self) -> Self:
+        from hydroforge.compiler.declarations import validate_ensemble_forcing_fields
+
+        return validate_ensemble_forcing_fields(self)
 
     @model_validator(mode="after")
     def _validate_module_requirements(self) -> Self:
-        for name in self.opened_modules:
-            rule = self.module_requirements.get(
-                name,
-                DEFAULT_MODULE_REQUIREMENT,
-            )
-            if not rule.trials and self.num_trials is not None:
-                raise ValueError(f"module {name!r} does not support ensemble trials")
-        return self
+        from hydroforge.compiler.declarations import validate_module_requirements
+
+        return validate_module_requirements(self)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _include_option_required_modules(cls, data: Any) -> Any:
+        from hydroforge.compiler.declarations import include_option_required_modules
+
+        return include_option_required_modules(cls, data)
+
+    @model_validator(mode="after")
+    def _validate_option_module_requirements(self) -> Self:
+        from hydroforge.compiler.declarations import validate_option_module_requirements
+
+        return validate_option_module_requirements(self)
 
     @model_validator(mode="after")
     def _validate_runtime_declaration(self) -> Self:
-        """Canonicalize every model/runtime choice before initialization."""
+        from hydroforge.compiler.declarations import validate_runtime_declaration
 
-        from hydroforge.kernels.registry import (
-            _backend_device_types,
-            _resolve_model_backend_trusted,
-        )
-
-        backend = _resolve_model_backend_trusted(self.device)
-        self._backend = backend
-        required_devices = _backend_device_types(backend)
-        if (
-            required_devices is not None
-            and self.device.type not in required_devices
-        ):
-            required_label = (
-                repr(required_devices[0])
-                if len(required_devices) == 1
-                else " or ".join(repr(item) for item in required_devices)
-            )
-            raise ValueError(
-                f"HydroForge backend {backend!r} requires a "
-                f"{required_label} model device, got {str(self.device)!r}"
-            )
-
-        mixed_precision = self.mixed_precision
-        needs_xpu_fp64_capability = (
-            self.device.type == "xpu"
-            and (
-                mixed_precision is None
-                or mixed_precision
-                or self.precision == "float64"
-            )
-        )
-        xpu_supports_fp64 = (
-            _xpu_supports_fp64(self.device)
-            if needs_xpu_fp64_capability
-            else None
-        )
-        if mixed_precision is None:
-            mixed_precision = _default_mixed_precision(
-                backend,
-                self.device,
-                xpu_supports_fp64=xpu_supports_fp64,
-            )
-            object.__setattr__(self, "mixed_precision", mixed_precision)
-        if (
-            self.device.type == "xpu"
-            and (self.precision == "float64" or mixed_precision)
-            and xpu_supports_fp64 is False
-        ):
-            raise ValueError(
-                f"XPU device {str(self.device)!r} does not support FP64, but "
-                "the model requests float64 storage through precision or "
-                "mixed_precision"
-            )
-
-        if self.result_device is None:
-            object.__setattr__(self, "result_device", torch.device("cpu"))
-
-        if self.variables_to_save:
-            plan = (
-                StatisticsPlan()
-                if self.statistics_plan is None
-                else self.statistics_plan
-            )
-        else:
-            if self.statistics_plan is not None:
-                raise ValueError(
-                    "statistics_plan requires a non-empty variables_to_save"
-                )
-            plan = None
-        schedule = self.simulation_schedule
-        if (
-            plan is not None
-            and schedule is None
-            and not (
-                isinstance(plan.inner, EveryStep)
-                and isinstance(plan._effective_outer, EveryStep)
-            )
-        ):
-            raise ValueError(
-                "calendar or explicit statistics windows require simulation_schedule"
-            )
-
-        if plan is not None and schedule is not None:
-            from hydroforge.execution.windows import (
-                bind_statistics_plan_schedule,
-                validate_statistics_window_schedule,
-            )
-
-            plan = bind_statistics_plan_schedule(plan, schedule)
-            if self.statistics_plan is not None:
-                object.__setattr__(self, "statistics_plan", plan)
-            validate_statistics_window_schedule(plan, schedule)
-        self._statistics_plan = plan
-
-        if schedule is not None:
-            if self.initial_time is not None:
-                raise ValueError(
-                    "initial_time must not be configured together with "
-                    "simulation_schedule"
-                )
-            if self.calendar is not None:
-                configured = canonical_calendar(self.calendar)
-                if configured != schedule.calendar:
-                    raise ValueError(
-                        f"model calendar {configured!r} differs from "
-                        f"simulation schedule {schedule.calendar!r}"
-                    )
-            calendar = schedule.calendar
-        else:
-            calendar, normalized, _defaulted = normalize_calendar_dates(
-                {"model initial_time": self.initial_time},
-                calendar=self.calendar,
-            )
-            object.__setattr__(
-                self,
-                "initial_time",
-                normalized["model initial_time"],
-            )
-        object.__setattr__(self, "calendar", calendar)
-
-        runtime_rule = RUNTIME_BACKEND_REQUIREMENTS.get(
-            backend,
-            DEFAULT_BACKEND_REQUIREMENT,
-        )
-        model_rule = self.backend_requirements.get(
-            backend,
-            DEFAULT_BACKEND_REQUIREMENT,
-        )
-        runtime_rule._validate_precision(
-            self.precision,
-            mixed_precision,
-            backend=backend,
-        )
-        model_rule._validate_precision(
-            self.precision,
-            mixed_precision,
-            backend=backend,
-        )
-        if self.BLOCK_SIZE is not None or backend == "metal":
-            block_size = _effective_block_size(
-                self.BLOCK_SIZE,
-                backend=backend,
-            )
-            if backend == "metal":
-                object.__setattr__(self, "BLOCK_SIZE", block_size)
-            model_rule._validate_block_size(block_size, backend=backend)
-        if not model_rule.trials and self.num_trials is not None:
-            raise ValueError(f"backend {backend!r} does not support ensemble trials")
-        return self
+        return validate_runtime_declaration(self)
 
     @model_validator(mode="after")
     def _compile_module_order(self) -> Self:
@@ -1070,190 +738,15 @@ class AbstractModel(HydroForgeModel, ABC):
         return self
 
     def _resolved_module_order(self) -> tuple[str, ...]:
-        """Return the deterministic dependency order for validated modules."""
+        from hydroforge.compiler.declarations import resolved_module_order
 
-        from graphlib import CycleError, TopologicalSorter
-
-        module_types = self._module_types()
-        opened = frozenset(self.opened_modules)
-        sorter: TopologicalSorter[str] = TopologicalSorter()
-        for name in self.opened_modules:
-            references = module_types[name]._module_reference_fields().values()
-            sorter.add(
-                name,
-                *(
-                    reference.module_name
-                    for reference in references
-                    if reference.module_name in opened
-                ),
-            )
-        try:
-            return tuple(sorter.static_order())
-        except CycleError as error:
-            raise ValueError(
-                "opened module references must form an acyclic construction "
-                f"graph: {error.args[1]}"
-            ) from error
+        return resolved_module_order(self)
 
     @model_validator(mode="after")
     def _compile_output_tensor_activation(self) -> Self:
-        """Resolve output requests to their concrete field dependencies."""
+        from hydroforge.compiler.declarations import compile_output_tensor_activation
 
-        if self._statistics_plan is None and not self.materialized_outputs:
-            self._field_demand = FieldDemandPlan.empty()
-            return self
-
-        opened = frozenset(self.opened_modules)
-        schema = type(self)._compiled_schema()
-        module_types = self._module_types()
-        qualified: dict[str, Any] = {}
-        bare: dict[str, Any] = {}
-        virtual: set[str] = set()
-        ambiguous: set[str] = set()
-
-        def install_bare(field: Any) -> None:
-            name = field.name
-            expression_virtual = bool(
-                field.tensor.category == "virtual"
-                and field.tensor.expression
-            )
-            if expression_virtual:
-                if name not in virtual:
-                    bare[name] = field
-                    virtual.add(name)
-                ambiguous.discard(name)
-                return
-            if name in virtual or name in ambiguous:
-                return
-            if name in bare:
-                bare.pop(name)
-                ambiguous.add(name)
-                return
-            bare[name] = field
-
-        for module_name in self.opened_modules:
-            excluded = set(module_types[module_name].nc_excluded_fields)
-            for field in schema.fields(module_name):
-                tensor = field.tensor
-                if (
-                    tensor is None
-                    or field.excluded
-                    or field.name in excluded
-                    or not all(
-                        dependency in opened
-                        for dependency in tensor.depends_on
-                    )
-                ):
-                    continue
-                qualified[f"{module_name}.{field.name}"] = field
-                install_bare(field)
-            # Reference indices may appear in virtual expressions but not schema.fields.
-            for field_name in module_types[module_name]._reference_index_fields():
-                field = module_types[module_name]._get_tensor_schema(field_name)
-                if field is None:
-                    raise ValueError(
-                        f"ReferenceIndexField {module_name}.{field_name} "
-                        "has no tensor schema"
-                    )
-                qualified[f"{module_name}.{field.name}"] = field
-                install_bare(field)
-
-        # Propagate virtual-output demand before module construction.
-        required: dict[str, set[str]] = {}
-        observed: dict[str, set[str]] = {}
-        known = set(qualified) | set(bare)
-        visited: set[str] = set()
-
-        def field_key(field: Any) -> str:
-            return f"{field.module_name}.{field.name}"
-
-        def source_dependencies(source: Any) -> tuple[str, ...]:
-            if isinstance(source, TensorSource):
-                return (source.name,)
-            if isinstance(source, ExpressionSource):
-                return source.expression.dependencies
-            return (*source.value.dependencies, source.index)
-
-        def resolve_field(name: str) -> Any | None:
-            # Statistics use bare names; aliases may use qualified names.
-            return bare.get(name) or qualified.get(name)
-
-        def visit_field(field: Any) -> None:
-            key = field_key(field)
-            if key in visited:
-                return
-            visited.add(key)
-            observed.setdefault(field.module_name, set()).add(field.name)
-            required.setdefault(field.module_name, set()).add(field.name)
-            tensor = field.tensor
-            if (
-                tensor is None
-                or tensor.category != "virtual"
-                or not tensor.expression
-            ):
-                return
-            source = parse_value_source(tensor.expression, known)
-            for dependency in source_dependencies(source):
-                dependency_field = resolve_field(dependency)
-                if dependency_field is not None:
-                    visit_field(dependency_field)
-
-        for name in self.materialized_outputs:
-            field = qualified.get(name) if "." in name else bare.get(name)
-            if field is None:
-                raise ValueError(
-                    f"materialized output {name!r} is unknown, ambiguous, "
-                    "or inactive"
-                )
-            if field.tensor.output == "disabled":
-                raise ValueError(
-                    f"materialized output {name!r} is disabled for output"
-                )
-            visit_field(field)
-
-        for items in self.variables_to_save.values():
-            for item in items:
-                direct = isinstance(item, str)
-                name = item if direct else next(iter(item))
-                field = qualified.get(name) if "." in name else bare.get(name)
-                if direct:
-                    if field is None:
-                        continue
-                    tensor = field.tensor
-                    if tensor.output == "disabled":
-                        raise ValueError(
-                            f"statistics field {name!r} is disabled for output"
-                        )
-                    visit_field(field)
-                    continue
-
-                # Activate every concrete dependency of an alias expression.
-                expression = next(iter(item.values()))
-                if field is not None:
-                    tensor = field.tensor
-                    if (
-                        tensor.depends_on
-                        or tensor.required_by
-                        or tensor.output_only
-                    ):
-                        observed.setdefault(field.module_name, set()).add(
-                            field.name,
-                        )
-                        # Active conditional fields take precedence over aliases.
-                        if tensor_is_active(
-                            tensor,
-                            self.opened_modules,
-                            output_required=False,
-                        ):
-                            continue
-                source = parse_value_source(expression, known)
-                for dependency in source_dependencies(source):
-                    dependency_field = resolve_field(dependency)
-                    if dependency_field is not None:
-                        visit_field(dependency_field)
-
-        self._field_demand = FieldDemandPlan.from_sets(required, observed)
-        return self
+        return compile_output_tensor_activation(self)
 
     def _is_tensor_field_active(
         self,
@@ -1263,7 +756,8 @@ class AbstractModel(HydroForgeModel, ABC):
         """Resolve one field against the frozen model output specialization."""
 
         output_required = self._field_demand.is_required(
-            module_name, field.name,
+            module_name,
+            field.name,
         )
         tensor = field.tensor
         return tensor_is_active(
@@ -1274,328 +768,56 @@ class AbstractModel(HydroForgeModel, ABC):
 
     @cached_property
     def dtype(self) -> torch.dtype:
-        _dtype_map = {
-            "float32": torch.float32,
-            "float64": torch.float64,
-        }
-        return _dtype_map[self.precision]
+        return torch.float32 if self.precision == "float32" else torch.float64
 
     @cached_property
     def output_full_dir(self) -> Path:
-        output_full_dir = self.output_dir / self.experiment_name
-        return output_full_dir
+        directory = self.output_dir / self.experiment_name
+        if self.parallel is not None and self.parallel.ensemble_partitions > 1:
+            directory /= f"ensemble_{self.parallel.ensemble_rank:04d}"
+        return directory
 
     @cached_property
     def log_path(self) -> Path:
-        log_path = self.output_full_dir / "log.txt"
-        return log_path
+        return self.output_full_dir / "log.txt"
 
     @model_validator(mode="after")
     def _validate_namespace(self) -> Self:
-        """
-        Check for namespace conflicts across all opened modules.
+        from hydroforge.compiler.declarations import validate_namespace
 
-        Virtual fields with an ``expr`` (scatter / plain aggregation outputs)
-        are allowed to share a name with their source counterpart in another
-        module — this is the standard subcell→cell aggregation pattern.
-        """
-        field_definitions = {}
-        schema = self._compiled_schema()
-        module_types = self._module_types()
-        for module_name in self.opened_modules:
-            excluded = set(module_types[module_name].nc_excluded_fields)
-            for field in schema.fields(module_name):
-                if field.tensor is not None:
-                    unknown_dependencies = sorted(
-                        set(
-                            (*field.tensor.depends_on, *field.tensor.required_by),
-                        ).difference(module_types)
-                    )
-                    if unknown_dependencies:
-                        raise ValueError(
-                            f"Tensor field {module_name}.{field.name} depends "
-                            "on unknown modules: "
-                            f"{unknown_dependencies}"
-                        )
-                if field.excluded or field.name in excluded:
-                    continue
-                if field.tensor is not None and not self._is_tensor_field_active(
-                    module_name, field,
-                ):
-                    continue
-                previous = field_definitions.get(field.name)
-                if previous is None:
-                    field_definitions[field.name] = field
-                    continue
-                new_virtual = bool(
-                    field.tensor is not None
-                    and field.tensor.category == "virtual"
-                    and field.tensor.expression
-                )
-                old_virtual = bool(
-                    previous.tensor is not None
-                    and previous.tensor.category == "virtual"
-                    and previous.tensor.expression
-                )
-                if new_virtual or old_virtual:
-                    if new_virtual and not old_virtual:
-                        field_definitions[field.name] = field
-                    continue
-                if (
-                    field.tensor is not None
-                    and previous.tensor is not None
-                    and field.tensor.category == "init_state"
-                    and previous.tensor.category == "init_state"
-                ):
-                    raise ValueError(
-                        f"checkpoint state name {field.name!r} is declared by "
-                        f"both {previous.module_name!r} and {module_name!r}; "
-                        "state ownership must be unique"
-                    )
-                if (
-                    field.annotation != previous.annotation
-                    or field.tensor != previous.tensor
-                ):
-                    raise ValueError(
-                        f"Namespace conflict for {field.name!r}: "
-                        f"{previous.module_name} and {module_name} declare "
-                        "different types or tensor metadata"
-                    )
-        self._namespace_declaration = MappingProxyType(field_definitions)
-        return self
+        return validate_namespace(self)
 
     def _materialize_runtime(self) -> None:
-        """Build private runtime services from a validated model identity."""
-
-        from hydroforge.compiler.initialization import ModelInitializer
-
-        schedule = self.simulation_schedule
-        self._current_time = (
-            schedule.execution_start if schedule is not None else self.initial_time
-        )
-
-        self._prepare_output_directory()
-        ModelInitializer(self).run()
+        return self._runtime_lifecycle.materialize_runtime()
 
     def _ensure_runtime_materialized(self) -> None:
-        """Materialize runtime state as one rank-synchronous transaction."""
-
-        if self._runtime_materialized:
+        if self.__pydantic_private__["_runtime_materialized"]:
             return
-        if self.world_size > 1:
-            self._coordinate_runtime_materialization_preflight()
-        initialization_error: BaseException | None = None
-        try:
-            self._materialize_runtime()
-        except BaseException as error:
-            initialization_error = error
-
-        if self.world_size > 1:
-            self._coordinate_runtime_materialization(initialization_error)
-            return
-
-        if initialization_error is not None:
-            self._discard_runtime_materialization()
-            raise initialization_error
-        self._runtime_materialized = True
+        return self._runtime_lifecycle.ensure_runtime_materialized()
 
     def _distributed_input_schema_signature(self) -> tuple[Any, ...]:
-        """Describe external storage shape without hashing physical fields."""
-
-        proxy = self.input_proxy
-        return tuple(
-            (
-                name,
-                self._input.get_var_shape(name),
-                str(proxy._get_var_dtype(name)),
-                self._semantic_plan.input_axes.get(name),
-                self._semantic_plan.variable_groups.get(name),
-            )
-            for name in sorted(self._input.fields)
-            if name in self._input
-        )
+        return self._runtime_lifecycle.distributed_input_schema_signature()
 
     def _distributed_input_storage_signature(self) -> tuple[Any, ...]:
-        """Identify active resident values and lazy source declarations."""
-
-        proxy = self.input_proxy
-        resident = dict(proxy._resident_items())
-        fields: list[tuple[Any, ...]] = []
-        for name in sorted(self._input.fields):
-            if name not in self._input:
-                continue
-            if name in resident:
-                fields.append((
-                    name,
-                    "resident",
-                    _distributed_value_signature(resident[name]),
-                ))
-                continue
-            source = proxy.sources[name]
-            identity = source.file_identity
-            fields.append((
-                name,
-                "netcdf",
-                source.dimensions,
-                source.shape,
-                source.dtype,
-                source.alignment_dim,
-                _distributed_value_signature(source.alignment_indices),
-                identity.size,
-                identity.mtime_ns,
-            ))
-        return (
-            tuple(fields),
-            tuple(sorted(proxy.injected_vars)),
-        )
+        return self._runtime_lifecycle.distributed_input_storage_signature()
 
     def _distributed_partition_identity_signature(self) -> tuple[Any, ...]:
-        """Hash values that decide rank ownership and reference routing."""
-
-        schema = self._semantic_plan.partition_schema
-        names = set(schema.coordinates)
-        if self.partition_group in self._input:
-            names.add(self.partition_group)
-        for name, metadata in schema.fields.items():
-            if metadata.references or metadata.partition_by or metadata.selects:
-                names.add(name)
-        proxy = self.input_proxy
-        return tuple(
-            (
-                name,
-                _distributed_value_signature(proxy._get_value_trusted(name)),
-            )
-            for name in sorted(names)
-            if name in proxy
-        )
+        return self._runtime_lifecycle.distributed_partition_identity_signature()
 
     def _distributed_runtime_declaration_signature(self) -> tuple[Any, ...]:
-        """Return the complete rank-shared model control-plane identity."""
-
-        module_types = self._module_types()
-        return (
-            ("model", _qualified_type_name(type(self))),
-            (
-                "modules",
-                tuple(
-                    (name, _qualified_type_name(module_types[name]))
-                    for name in self.opened_modules
-                ),
-            ),
-            ("module_order", self._module_order),
-            ("partition", self.partition_key, self.partition_group),
-            ("cuda_catalogs", self.cuda_extension_modules),
-            ("backend", self._backend),
-            ("device_type", self.device.type),
-            ("precision", self.precision, self.mixed_precision),
-            ("execution", self.execution_mode, self.BLOCK_SIZE),
-            (
-                "trials",
-                self.num_trials,
-                _distributed_value_signature(self.trial_forcing_fields),
-            ),
-            (
-                "output",
-                self.experiment_name,
-                str(self.output_full_dir.absolute()),
-                self.output_workers,
-                self.output_split_by_year,
-                self.max_pending_steps,
-                self.max_pending_output_bytes,
-                self.save_kernels,
-                self.in_memory_output,
-                cast(torch.device, self.result_device).type,
-            ),
-            ("calendar", self.calendar),
-            ("initial_time", _distributed_date_signature(self.initial_time)),
-            (
-                "schedule",
-                _distributed_schedule_signature(self.simulation_schedule),
-            ),
-            (
-                "statistics",
-                _distributed_value_signature(self.variables_to_save),
-                _distributed_value_signature(self._statistics_plan),
-                self.statistics_save_precision,
-            ),
-            (
-                "netcdf",
-                _distributed_value_signature(self.output_netcdf_options),
-                _distributed_value_signature(self.checkpoint_netcdf_options),
-            ),
-            (
-                "parameter_changes",
-                _distributed_value_signature(self.parameter_changes),
-            ),
-            ("input_schema", self._distributed_input_schema_signature()),
-            ("input_storage", self._distributed_input_storage_signature()),
-            (
-                "partition_identity",
-                self._distributed_partition_identity_signature(),
-            ),
-        )
+        return self._runtime_lifecycle.distributed_runtime_declaration_signature()
 
     def _coordinate_runtime_materialization_preflight(self) -> None:
-        """Prove every rank will initialize the same runtime transaction."""
-
-        signature: tuple[Any, ...] | None = None
-        local_error: BaseException | None = None
-        try:
-            signature = self._distributed_runtime_declaration_signature()
-        except BaseException as error:
-            local_error = error
-        failures = self._gather_distributed_failures(
-            local_error,
-            phase="runtime.materialization.preflight",
-            signature=signature,
-        )
-        if not any(failure is not None for failure in failures):
-            return
-        if local_error is not None:
-            raise local_error
-        raise distributed_failure_error(
-            "distributed model runtime declaration validation",
-            failures,
-        )
+        return self._runtime_lifecycle.coordinate_runtime_materialization_preflight()
 
     def _distributed_compiled_runtime_signature(self) -> tuple[Any, ...]:
-        """Describe rank-invariant services produced by initialization."""
-
-        return (
-            self._execution.backend,
-            self._execution.capture_mode,
-            self._checkpoint.plan.layout_signature,
-            tuple(sorted(
-                descriptor.protocol_name
-                for descriptor in self._execution.step_policies
-            )),
-        )
+        return self._runtime_lifecycle.distributed_compiled_runtime_signature()
 
     def _install_distributed_output_run_id(
-        self, payloads: tuple[Any, ...],
+        self,
+        payloads: tuple[Any, ...],
     ) -> None:
-        """Install the rank-zero output identity exchanged at runtime commit."""
-
-        if len(payloads) != self.world_size:
-            raise RuntimeError(
-                "distributed runtime materialization returned an invalid "
-                "output run-ID payload count"
-            )
-        run_id = payloads[0]
-        if not isinstance(run_id, str) or not run_id:
-            raise RuntimeError(
-                "distributed runtime materialization did not publish a "
-                "non-empty output run ID from rank zero"
-            )
-        if any(payload is not None for payload in payloads[1:]):
-            raise RuntimeError(
-                "distributed runtime materialization received output run IDs "
-                "from nonzero ranks"
-            )
-        statistics = getattr(self, "_statistics", None)
-        aggregator = getattr(statistics, "aggregator", None)
-        if aggregator is not None:
-            aggregator.run_id = run_id
+        return self._runtime_lifecycle.install_distributed_output_run_id(payloads)
 
     def _gather_distributed_failures(
         self,
@@ -1604,14 +826,9 @@ class AbstractModel(HydroForgeModel, ABC):
         phase: str,
         signature: tuple[Any, ...] | None = None,
     ) -> tuple[dict[str, str] | None, ...]:
-        """Publish one phase-tagged public transaction result to every rank."""
-
-        failures, _payloads = self._exchange_distributed_public_transaction(
-            error,
-            phase=phase,
-            signature=signature,
+        return self._runtime_lifecycle.gather_distributed_failures(
+            error, phase=phase, signature=signature
         )
-        return failures
 
     def _exchange_distributed_public_transaction(
         self,
@@ -1624,234 +841,37 @@ class AbstractModel(HydroForgeModel, ABC):
         tuple[dict[str, str] | None, ...],
         tuple[Any, ...],
     ]:
-        """Exchange one tagged transaction record and optional phase payload."""
-
-        if not dist.is_available() or not dist.is_initialized():
-            raise RuntimeError(
-                "multi-rank model transactions require an "
-                "initialized torch.distributed process group"
-            )
-        if type(phase) is not str or not phase:
-            raise RuntimeError(
-                "distributed public transaction phase must be a non-empty string"
-            )
-        sequence = self._distributed_public_sequence
-        self._distributed_public_sequence = sequence + 1
-        local = (
-            sequence,
-            phase,
-            signature,
-            None if error is None else failure_description(error),
-            payload,
-        )
-        observed: list[Any] = [None] * self.world_size
-        dist.all_gather_object(
-            observed,
-            local,
-        )
-        if any(
-            not isinstance(value, tuple)
-            or len(value) != 5
-            or type(value[0]) is not int
-            or type(value[1]) is not str
-            for value in observed
-        ):
-            raise RuntimeError(
-                "distributed public transaction protocol received a malformed "
-                f"record: {observed!r}"
-            )
-        identities = tuple((value[0], value[1]) for value in observed)
-        if len(set(identities)) != 1:
-            raise RuntimeError(
-                "distributed public phase mismatch across ranks: "
-                f"{identities!r}"
-            )
-        failures = tuple(value[3] for value in observed)
-        if not any(failure is not None for failure in failures):
-            signatures = tuple(value[2] for value in observed)
-            if any(value != signatures[0] for value in signatures[1:]):
-                raise RuntimeError(
-                    "distributed public transaction inputs differ across "
-                    f"ranks during {phase!r}: {signatures!r}"
-                )
-        return (
-            cast(tuple[dict[str, str] | None, ...], failures),
-            tuple(value[4] for value in observed),
+        return self._runtime_lifecycle.exchange_distributed_public_transaction(
+            error, phase=phase, signature=signature, payload=payload
         )
 
     def _release_runtime_materialization(self) -> None:
-        """Release every service created by one materialization attempt."""
-
-        failures: list[BaseException] = []
-        statistics = getattr(self, "_statistics", None)
-        execution = getattr(self, "_execution", None)
-        if statistics is not None:
-            try:
-                statistics.close()
-            except BaseException as error:
-                failures.append(error)
-        if execution is not None:
-            try:
-                execution.close()
-            except BaseException as error:
-                failures.append(error)
-        self._discard_runtime_materialization()
-        self._runtime_materialized = False
-        if failures:
-            error = ResourceCleanupError("model resources", failures)
-            raise error from failures[0]
+        return self._runtime_lifecycle.release_runtime_materialization()
 
     def _coordinate_runtime_materialization(
         self,
         initialization_error: BaseException | None,
     ) -> None:
-        """Commit initialization only after every rank reports success."""
-
-        compiled_signature: tuple[Any, ...] | None = None
-        if initialization_error is None:
-            try:
-                compiled_signature = self._distributed_compiled_runtime_signature()
-            except BaseException as error:
-                initialization_error = error
-        run_id_candidate: str | None = None
-        if initialization_error is None and self.rank == 0:
-            try:
-                run_id_candidate = str(uuid4())
-            except BaseException as error:
-                initialization_error = error
-        try:
-            initialization_failures, run_id_payloads = (
-                self._exchange_distributed_public_transaction(
-                    initialization_error,
-                    phase="runtime.materialization",
-                    signature=compiled_signature,
-                    payload=run_id_candidate,
-                )
-            )
-        except BaseException as coordination_error:
-            cleanup_error: BaseException | None = None
-            try:
-                self._release_runtime_materialization()
-            except BaseException as error:
-                cleanup_error = error
-            failures = tuple(
-                error for error in (
-                    initialization_error,
-                    coordination_error,
-                    cleanup_error,
-                )
-                if error is not None
-            )
-            if len(failures) == 1:
-                raise failures[0]
-            error = ResourceCleanupError(
-                "distributed model initialization coordination",
-                failures,
-            )
-            raise error from coordination_error
-
-        if not any(failure is not None for failure in initialization_failures):
-            try:
-                self._install_distributed_output_run_id(run_id_payloads)
-            except BaseException as error:
-                initialization_error = error
-                description = failure_description(error)
-                initialization_failures = tuple(
-                    description for _ in range(self.world_size)
-                )
-            else:
-                self._runtime_materialized = True
-                return
-
-        cleanup_error: BaseException | None = None
-        try:
-            self._release_runtime_materialization()
-        except BaseException as error:
-            cleanup_error = error
-        try:
-            cleanup_failures = self._gather_distributed_failures(
-                cleanup_error,
-                phase="runtime.materialization.cleanup",
-            )
-        except BaseException as coordination_error:
-            primary = (
-                initialization_error
-                if initialization_error is not None
-                else distributed_failure_error(
-                    "distributed model initialization",
-                    initialization_failures,
-                )
-            )
-            failures = [primary, coordination_error]
-            if cleanup_error is not None:
-                failures.append(cleanup_error)
-            error = ResourceCleanupError(
-                "distributed model initialization cleanup coordination",
-                failures,
-            )
-            raise error from primary
-
-        primary = (
+        return self._runtime_lifecycle.coordinate_runtime_materialization(
             initialization_error
-            if initialization_error is not None
-            else distributed_failure_error(
-                "distributed model initialization",
-                initialization_failures,
-            )
         )
-        if any(failure is not None for failure in cleanup_failures):
-            cleanup_failure = (
-                cleanup_error
-                if cleanup_error is not None
-                else distributed_failure_error(
-                    "distributed model initialization cleanup",
-                    cleanup_failures,
-                )
-            )
-            error = ResourceCleanupError(
-                "distributed model initialization rollback",
-                (primary, cleanup_failure),
-            )
-            raise error from primary
-        raise primary
 
     def _discard_runtime_materialization(self) -> None:
-        """Remove every object derived from one materialized runtime."""
-
-        self._modules.clear()
-        self._module_links = None
-        for name in ("_variable_map", "group_id_to_rank"):
-            self.__dict__.pop(name, None)
+        return self._runtime_lifecycle.discard_runtime_materialization()
 
     def _ensure_healthy_runtime(self) -> None:
-        """Enter trusted runtime only after a public request has validated."""
-
-        self._ensure_runtime_materialized()
-        failure = self._execution.failure
-        if failure is not None:
-            raise self._execution.poisoned_error(failure)
+        return self._runtime_lifecycle.ensure_healthy_runtime()
 
     def _prepare_output_directory(self) -> None:
-        """Acquire the output directory only after validation completes."""
-
-        if self.rank != 0:
-            return
-        if not self.output_full_dir.exists():
-            self.output_full_dir.mkdir(parents=True, exist_ok=True)
-            return
-        emit(
-            self,
-            "warning",
-            "output.directory_exists",
-            "Output directory already exists; contents may be overwritten",
-            directory=self.output_full_dir,
-        )
+        return self._runtime_lifecycle.prepare_output_directory()
 
     def initialize_model_state(self) -> None:
         """Initialize ordered model state inside HydroForge's transaction.
 
-        HydroForge does not invoke module initialization hooks automatically;
-        model authors explicitly call any module helpers here in physical order.
+        Model subclasses own the complete initialization order.  This hook is
+        called after all modules have been constructed and tensor modes applied,
+        so a controller can explicitly sequence cross-module cold starts and
+        workspace materialization inside HydroForge's transaction.
         """
 
     def _update_module_structures(self):
@@ -1859,9 +879,19 @@ class AbstractModel(HydroForgeModel, ABC):
 
         from hydroforge.model.structure import StructuralUpdateContext
 
+        hooks = tuple(
+            hook
+            for module_name in self.opened_modules
+            if getattr(
+                hook := self._modules[module_name].update_structure, "__func__", None
+            )
+            is not _EMPTY_STRUCTURE_HOOK
+        )
+        if not hooks:
+            return None
         context = StructuralUpdateContext(self)
-        for module_name in self.opened_modules:
-            self._modules[module_name].update_structure(context)
+        for hook in hooks:
+            hook(context)
         return context.commit()
 
     def update_structure(self):
@@ -1893,7 +923,7 @@ class AbstractModel(HydroForgeModel, ABC):
             return
         total_memory = 0
         global_seen_ptrs: set = set()
-        module_memory: Dict[str, float] = {}
+        module_memory: dict[str, float] = {}
 
         for module_name in self.opened_modules:
             if module_name not in self._modules:
@@ -1965,15 +995,11 @@ class AbstractModel(HydroForgeModel, ABC):
         return self._partition.group_ranks
 
     def close(self) -> None:
-        """Atomically release output workers and backend execution resources."""
-
-        if not self._runtime_materialized:
-            return
-        self._release_runtime_materialization()
+        return self._runtime_lifecycle.close()
 
     def _execute_parameter_changes(
         self,
-        current_time: Union[datetime, cftime.datetime],
+        current_time: datetime | cftime.datetime,
     ) -> ParameterChangeEffect:
         return self._parameters.execute_parameter_change_plan(current_time)
 
@@ -1989,7 +1015,10 @@ class AbstractModel(HydroForgeModel, ABC):
     def get_output_results(
         self,
         as_stacked: bool = True,
-    ) -> Dict[str, torch.Tensor | List[torch.Tensor]]:
+        *,
+        start: int | None = None,
+        stop: int | None = None,
+    ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
         """
         Get the in-memory output results (only available when in_memory_output=True).
 
@@ -2005,19 +1034,24 @@ class AbstractModel(HydroForgeModel, ABC):
             RuntimeError: If not in in_memory_output mode or aggregator not initialized.
         """
         query = _StatisticsCollectionQuery.model_validate(
-            {"as_stacked": as_stacked},
+            {"as_stacked": as_stacked, "start": start, "stop": stop},
             context={_STATISTICS_QUERY_CONTEXT: self},
         )
         self._ensure_healthy_runtime()
         statistics = cast("StatisticsBindingCompiler", self._statistics)
-        return statistics.results(stacked=query.as_stacked)
+        return statistics.results(
+            stacked=query.as_stacked, start=query.start, stop=query.stop
+        )
 
     def get_output_result(
         self,
         variable_name: str,
         op: str = "mean",
         as_stacked: bool = True,
-    ) -> torch.Tensor | List[torch.Tensor]:
+        *,
+        start: int | None = None,
+        stop: int | None = None,
+    ) -> torch.Tensor | list[torch.Tensor]:
         """
         Get a specific output result tensor by variable name and operation.
 
@@ -2039,6 +1073,8 @@ class AbstractModel(HydroForgeModel, ABC):
                 "operation": op,
                 "as_stacked": as_stacked,
                 "access": "result",
+                "start": start,
+                "stop": stop,
             },
             context={_STATISTICS_QUERY_CONTEXT: self},
         )
@@ -2048,7 +1084,32 @@ class AbstractModel(HydroForgeModel, ABC):
             query.variable_name,
             query.operation,
             stacked=query.as_stacked,
+            start=query.start,
+            stop=query.stop,
         )
+
+    def drain_output_results(
+        self, max_steps: int | None = None, *, as_stacked: bool = True
+    ):
+        """Copy and release oldest retained samples; keep the simulation timeline."""
+
+        query = _StatisticsDrainQuery.model_validate(
+            {"as_stacked": as_stacked, "max_steps": max_steps},
+            context={_STATISTICS_QUERY_CONTEXT: self},
+        )
+        self._ensure_healthy_runtime()
+        return self._statistics.aggregator.drain_results(
+            query.max_steps, as_stacked=query.as_stacked
+        )
+
+    def iter_output_results(self, batch_size: int = 64):
+        """Read retained samples in bounded, ownership-isolated batches."""
+
+        query = _StatisticsBatchQuery.model_validate(
+            {"batch_size": batch_size}, context={_STATISTICS_QUERY_CONTEXT: self}
+        )
+        self._ensure_healthy_runtime()
+        return self._statistics.aggregator.iter_results(query.batch_size)
 
     def get_output_time_index(self) -> int:
         """Get the current output time index (number of finalized time steps)."""
@@ -2104,12 +1165,14 @@ class AbstractModel(HydroForgeModel, ABC):
         self._ensure_healthy_runtime()
         self._statistics.reset_time_index()
 
-    def shard_param(self) -> Dict[str, Any]:
+    def shard_param(self) -> dict[str, Any]:
         """Load and rank-slice parameters through the internal data service."""
         return self._data.shard()
 
     def save_state(self) -> InputProxy:
         """Persist a complete construction input at the committed clock."""
+        from hydroforge.execution.boundaries import coordinate_preflight
+
         validation_error: BaseException | None = None
         try:
             _SaveStateRequest.model_validate(
@@ -2118,800 +1181,31 @@ class AbstractModel(HydroForgeModel, ABC):
             )
         except BaseException as error:
             validation_error = error
-        if self.world_size > 1:
-            failures = self._gather_distributed_failures(
-                validation_error,
-                phase="checkpoint.save.api-validation",
-            )
-            if any(failure is not None for failure in failures):
-                if validation_error is not None:
-                    raise validation_error
-                raise distributed_failure_error(
-                    "distributed checkpoint save entry validation",
-                    failures,
-                )
-        elif validation_error is not None:
-            raise validation_error
-        self._ensure_healthy_runtime()
+        coordinate_preflight(
+            self,
+            validation_error,
+            phase="checkpoint.save.api-validation",
+            scope="distributed checkpoint save entry validation",
+        )
+        self._ensure_runtime_materialized()
         return self._checkpoint.save()
 
     @field_validator("opened_modules", mode="before")
     @classmethod
     def _validate_modules(cls, v: Any) -> tuple[str, ...]:
-        """Validate module names are valid"""
-        if type(v) is not tuple:
-            raise ValueError("opened_modules must be an exact tuple")
-        if any(type(module) is not str or not module for module in v):
-            raise ValueError("opened_modules must contain non-empty exact strings")
-        if not v:
-            raise ValueError(
-                "No modules opened. Please specify at least one module in opened_modules."
-            )
-        if len(v) != len(set(v)):
-            raise ValueError("opened_modules must not contain duplicates")
-        module_types = cls._module_types()
-        for module in v:
-            if module not in module_types:
-                raise ValueError(
-                    f"Invalid module name: {module}. Available modules: {list(module_types)}"
-                )
-        missing_model_modules = [
-            name
-            for name, reference in cls._module_reference_fields().items()
-            if not reference.optional and name not in v
-        ]
-        if missing_model_modules:
-            raise ValueError(
-                "Missing required model modules in opened_modules: "
-                f"{missing_model_modules}. Available modules: {v}"
-            )
-        for module in v:
-            module_class = module_types[module]
-            references = module_class._module_reference_fields().values()
-            unknown_references = sorted(
-                {
-                    reference.module_name
-                    for reference in references
-                    if reference.module_name not in module_types
-                }
-            )
-            if unknown_references:
-                raise ValueError(
-                    f"Module '{module}' declares references to unknown modules: "
-                    f"{unknown_references}. Available modules: "
-                    f"{list(module_types)}"
-                )
-            required = module_class._required_modules()
-            missing_deps = [dep for dep in required if dep not in v]
-            if missing_deps:
-                raise ValueError(
-                    f"Module '{module}' has missing required modules in "
-                    f"opened_modules: {missing_deps}. "
-                    f"Required modules: {required}. "
-                    f"Available modules: {v}"
-                )
-            present_conflicts = [
-                conflict
-                for conflict in module_class.conflicts
-                if conflict in v and conflict != module
-            ]
-            if present_conflicts:
-                raise ValueError(
-                    f"Module '{module}' conflicts with modules present in opened_modules: "
-                    f"{present_conflicts}. These modules cannot be enabled together."
-                )
-        return v
+        from hydroforge.compiler.declarations import validate_modules
+
+        return validate_modules(cls, v)
 
     @model_validator(mode="after")
     def _validate_statistics_outputs(
         self,
     ) -> Self:
-        cls = type(self)
-        plan = self._statistics_plan
-        if plan is None:
-            return self
-        outputs: list[_StatisticsOutput] = []
-        expressions: dict[str, str | None] = {}
-        pairs: set[tuple[str, str]] = set()
-        for operation, items in self.variables_to_save.items():
-            for item in items:
-                if isinstance(item, str):
-                    name = item
-                    expression = None
-                else:
-                    name, expression = next(iter(item.items()))
-                output = _StatisticsOutput(
-                    name=name,
-                    operation=operation,
-                    expression=expression,
-                )
-                pair = (output.name, output.operation)
-                if pair in pairs:
-                    raise ValueError(
-                        "variables_to_save must not repeat a field/operation"
-                    )
-                pairs.add(pair)
-                previous = expressions.setdefault(
-                    output.name,
-                    output.expression,
-                )
-                if previous != output.expression:
-                    raise ValueError(
-                        f"statistics output {output.name!r} has conflicting expressions"
-                    )
-                outputs.append(output)
-        if not any(output.operation != "static" for output in outputs):
-            raise ValueError("variables_to_save requires at least one dynamic output")
-        self._statistics_outputs = tuple(outputs)
-        opened_modules = self.opened_modules
-        fields: dict[str, Any] = {}
-        virtual_fields: set[str] = set()
-        ambiguous: set[str] = set()
-        schema = cls._compiled_schema()
-
-        def install_field(module_name: str, field: Any) -> None:
-            fields[f"{module_name}.{field.name}"] = field
-            tensor = field.tensor
-            expression_virtual = bool(
-                tensor is not None
-                and tensor.category == "virtual"
-                and tensor.expression
-            )
-            if expression_virtual:
-                if field.name not in virtual_fields:
-                    fields[field.name] = field
-                    virtual_fields.add(field.name)
-                ambiguous.discard(field.name)
-                return
-            if field.name in virtual_fields or field.name in ambiguous:
-                return
-            if field.name in fields:
-                fields.pop(field.name)
-                ambiguous.add(field.name)
-                return
-            fields[field.name] = field
-
-        module_types = cls._module_types()
-        for module_name in opened_modules:
-            for field in schema.fields(module_name):
-                tensor = field.tensor
-                if tensor is None:
-                    continue
-                # Keep inactive output-only metadata visible to expressions.
-                if (
-                    not self._is_tensor_field_active(module_name, field)
-                    and not tensor.output_only
-                ):
-                    continue
-                install_field(module_name, field)
-            module_type = module_types[module_name]
-            for field_name in module_type._reference_index_fields():
-                field = module_type._get_tensor_schema(field_name)
-                if field is None:
-                    raise ValueError(
-                        f"ReferenceIndexField {module_name}.{field_name} "
-                        "has no tensor schema"
-                    )
-                install_field(module_name, field)
-        known = set(fields)
-        def active_declared_field(name: str) -> bool:
-            field = fields.get(name)
-            if field is None or field.tensor is None:
-                return False
-            return self._is_tensor_field_active(field.module_name, field)
-
-        selection_targets = {
-            field.tensor.selects.split(".")[-1]
-            for field in fields.values()
-            if field.tensor is not None and field.tensor.selects
-        }
-
-        def metadata(name: str) -> tuple[Any, ...]:
-            tensor = fields[name].tensor
-            coordinate = tensor.dim_coords
-            if coordinate:
-                coordinate = coordinate.split(".")[-1]
-            return (
-                tuple(
-                    dimension.rsplit(".", 1)[-1]
-                    if isinstance(dimension, str)
-                    else dimension
-                    for dimension in tensor.shape
-                ),
-                tensor.output,
-                coordinate,
-                tensor.dtype,
-                tensor.category,
-            )
-
-        def dependencies(source: Any) -> tuple[str, ...]:
-            if isinstance(source, TensorSource):
-                return (source.name,)
-            if isinstance(source, ExpressionSource):
-                return source.expression.dependencies
-            return (
-                *source.value.dependencies,
-                source.index,
-            )
-
-        def validate_expression(
-            *,
-            name: str,
-            expression: str,
-            target_metadata: tuple[Any, ...] | None,
-            allow_scatter: bool,
-        ) -> tuple[Any, ...]:
-            source = parse_value_source(expression, known)
-            if isinstance(source, ScatterSource) and not allow_scatter:
-                raise ValueError(
-                    "ad-hoc scatter statistics must be declared as a "
-                    "computed tensor field"
-                )
-            names = (
-                source.value.dependencies
-                if isinstance(source, ScatterSource)
-                else dependencies(source)
-            )
-            if not names:
-                raise ValueError(
-                    f"statistics expression {name!r} has no field dependency"
-                )
-            forcing_dependencies = tuple(
-                dependency
-                for dependency in names
-                if metadata(dependency)[4] == "forcing"
-            )
-            if forcing_dependencies:
-                raise ValueError(
-                    f"statistics expression {name!r} depends on forcing fields "
-                    f"{forcing_dependencies}; forcing layout is run-specific "
-                    "and cannot define persistent output storage"
-                )
-            reference_name = next(
-                (
-                    dependency
-                    for dependency in names
-                    if metadata(dependency)[3] != "bool"
-                ),
-                names[0],
-            )
-            reference = metadata(reference_name)
-            definite_trial_layouts: set[str] = set()
-            for dependency in names:
-                observed = metadata(dependency)
-                incompatible = (
-                    observed[0] != reference[0]
-                    or observed[2] != reference[2]
-                    or (
-                        observed[3] != "bool"
-                        and observed[3] != reference[3]
-                    )
-                )
-                if incompatible:
-                    raise ValueError(
-                        f"statistics expression {name!r} mixes incompatible "
-                        f"field metadata: {reference_name!r} has {reference}, but "
-                        f"{dependency!r} has {observed}"
-                    )
-                if self.num_trials is not None:
-                    if observed[4] in {"state", "init_state"}:
-                        definite_trial_layouts.add("batched")
-                    elif observed[4] in {"topology", "shared_state"}:
-                        definite_trial_layouts.add("shared")
-            if len(definite_trial_layouts) > 1:
-                raise ValueError(
-                    f"statistics expression {name!r} mixes shared and "
-                    "trial-batched fields"
-                )
-            coordinates = {
-                metadata(dependency)[2]
-                for dependency in names
-                if metadata(dependency)[2] is not None
-            }
-            if len(coordinates) > 1:
-                raise ValueError(
-                    f"statistics expression {name!r} mixes coordinate axes "
-                    f"{sorted(coordinates)}"
-                )
-            target = None if target_metadata is None else target_metadata[2]
-            if (
-                not isinstance(source, ScatterSource)
-                and coordinates
-                and target is not None
-                and target not in coordinates
-            ):
-                raise ValueError(
-                    f"statistics field {name!r} declares dim_coords={target!r}, "
-                    f"but its expression uses {next(iter(coordinates))!r}"
-                )
-            if len(reference[0]) < 1:
-                raise ValueError(
-                    f"statistics expression {name!r} must have at least one "
-                    "logical dimension"
-                )
-            if len(reference[0]) > 2:
-                raise ValueError(
-                    f"statistics expression {name!r} has logical rank "
-                    f"{len(reference[0])}; only rank <= 2 is supported"
-                )
-            shared_categories = {
-                metadata(dependency)[4]
-                for dependency in names
-                if metadata(dependency)[4] in {"topology", "shared_state"}
-            }
-            if self.num_trials is not None and shared_categories:
-                raise ValueError(
-                    f"dynamic statistics expression {name!r} uses shared "
-                    f"field categories {sorted(shared_categories)!r} in a "
-                    "multi-trial model"
-                )
-            if isinstance(source, ScatterSource):
-                index_tensor = fields[source.index].tensor
-                index_coordinate = index_tensor.dim_coords
-                if index_coordinate:
-                    index_coordinate = index_coordinate.rsplit(".", 1)[-1]
-                if coordinates and index_coordinate not in coordinates:
-                    raise ValueError(
-                        f"statistics scatter index {source.index!r} uses "
-                        f"coordinate {index_coordinate!r}, but its values use "
-                        f"{next(iter(coordinates))!r}"
-                    )
-                if (
-                    len(index_tensor.shape) != 1
-                    or index_tensor.dtype not in {"idx", "int"}
-                    or index_tensor.category != "topology"
-                ):
-                    raise ValueError(
-                        f"statistics scatter index {source.index!r} must be a "
-                        "shared one-dimensional topology integer field"
-                    )
-                if len(reference[0]) != 1:
-                    raise ValueError(
-                        f"statistics scatter value {name!r} must be one-dimensional"
-                    )
-                target_field = fields.get(name)
-                target_tensor = None if target_field is None else target_field.tensor
-                target_coord = (
-                    None if target_tensor is None else target_tensor.dim_coords
-                )
-                bare_target = (
-                    None if target_coord is None else target_coord.split(".")[-1]
-                )
-                if (
-                    target_tensor is None
-                    or target_tensor.output != "auto"
-                    or bare_target not in selection_targets
-                ):
-                    raise ValueError(
-                        f"scatter statistics field {name!r} requires an "
-                        "output selection on its declared coordinate"
-                    )
-            value_expression = (
-                source.value
-                if isinstance(source, ScatterSource)
-                else source.expression
-                if isinstance(source, ExpressionSource)
-                else None
-            )
-            if value_expression is not None:
-                from hydroforge.contracts.fields import concrete_tensor_dtype
-
-                validate_expression_constants(
-                    name,
-                    value_expression,
-                    concrete_tensor_dtype(
-                        (
-                            reference[3]
-                            if target_metadata is None
-                            else target_metadata[3]
-                        ),
-                        self.dtype,
-                        self.mixed_precision,
-                    ),
-                )
-            return reference if target_metadata is None else target_metadata
-
-        def compile_operation(
-            output_name: str,
-            operation: str,
-            field_metadata: tuple[Any, ...],
-        ) -> Any:
-            parsed = parse_operation(operation)
-            shape, output, coordinate, dtype, _category = field_metadata
-            if dtype not in {"float", "hpfloat"}:
-                unsupported = (
-                    parsed.inner is None
-                    and parsed.outer
-                    in {
-                        Reduction.MEAN,
-                        Reduction.SUM,
-                    }
-                ) or (
-                    parsed.inner is not None
-                    and (
-                        parsed.inner
-                        in {
-                            Reduction.MEAN,
-                            Reduction.SUM,
-                            Reduction.MAX,
-                            Reduction.MIN,
-                        }
-                        or parsed.outer
-                        in {
-                            Reduction.MEAN,
-                            Reduction.SUM,
-                        }
-                        or parsed.k > 1
-                    )
-                )
-                if unsupported:
-                    raise ValueError(
-                        f"statistics operation {operation!r} for non-floating "
-                        f"field {output_name!r} is unsupported"
-                    )
-
-            selected = output == "auto" and coordinate in selection_targets
-            if not selected and (parsed.k > 1 or parsed.stores_index):
-                raise ValueError(
-                    f"full-output statistics field {output_name!r} does not "
-                    f"support top-k or arg operation {operation!r}"
-                )
-            if (
-                selected
-                and len(shape) == 2
-                and (parsed.compound or parsed.k > 1 or parsed.stores_index)
-            ):
-                raise ValueError(
-                    f"indexed-level statistics field {output_name!r} does not "
-                    f"support compound, top-k, or arg operation {operation!r}"
-                )
-            return parsed
-
-        def compile_output_options(
-            output_name: str,
-            field_metadata: tuple[Any, ...],
-        ) -> Mapping[str, Any]:
-            from hydroforge.contracts.fields import concrete_tensor_dtype
-            from hydroforge.data.distributed import torch_to_numpy_dtype
-            from hydroforge.serialization.netcdf import (
-                _prepare_netcdf_variable_options_trusted,
-                netcdf_dtype_encoding,
-            )
-
-            shape, _output, _coordinate, dtype, category = field_metadata
-            batched = bool(
-                self.num_trials is not None and category in {"state", "init_state"}
-            )
-            chunks = self.output_netcdf_options.get("chunksizes")
-            if (
-                chunks is not None
-                and self.num_trials is not None
-                and category in {"param", "derived_param", "virtual"}
-            ):
-                raise ValueError(
-                    f"NetCDF chunksizes for statistics output {output_name!r} "
-                    "cannot be fixed because its trial batching depends on "
-                    "materialized parameter/expression storage"
-                )
-            dimensions = tuple(
-                f"axis_{index}" for index in range(1 + len(shape) + int(batched))
-            )
-            tensor_dtype = concrete_tensor_dtype(
-                dtype,
-                self.dtype,
-                self.mixed_precision,
-            )
-            saved_dtype = tensor_dtype
-            if tensor_dtype.is_floating_point and self.statistics_save_precision:
-                saved_dtype = {
-                    "float32": torch.float32,
-                    "float64": torch.float64,
-                }[self.statistics_save_precision]
-            storage_dtype, logical_dtype = netcdf_dtype_encoding(
-                torch_to_numpy_dtype(saved_dtype),
-            )
-            options = _prepare_netcdf_variable_options_trusted(
-                self.output_netcdf_options,
-                dtype=storage_dtype,
-                dimensions=dimensions,
-                name=output_name,
-                logical_dtype=logical_dtype,
-            )
-            return MappingProxyType(dict(options))
-
-        compiled_operations: dict[tuple[str, str], Any] = {}
-        compiled_output_metadata: dict[tuple[str, str], tuple[Any, ...]] = {}
-        compiled_netcdf_options: dict[str, Mapping[str, Any]] = {}
-        for output in outputs:
-            if output.operation == "static":
-                operation = None
-            else:
-                operation = output.operation
-            if output.expression is not None and not active_declared_field(
-                output.name,
-            ):
-                expression_metadata = validate_expression(
-                    name=output.name,
-                    expression=output.expression,
-                    target_metadata=None,
-                    allow_scatter=False,
-                )
-                compiled_operations[(output.name, operation)] = compile_operation(
-                    output.name,
-                    operation,
-                    expression_metadata,
-                )
-                compiled_output_metadata[(output.name, operation)] = expression_metadata
-                compiled_netcdf_options[f"{output.name}_{operation}"] = (
-                    compile_output_options(
-                        f"{output.name}_{operation}",
-                        expression_metadata,
-                    )
-                )
-                continue
-            field = fields[output.name]
-            tensor = field.tensor
-            if output.expression is not None and not (
-                tensor.depends_on
-                or tensor.required_by
-                or tensor.output_only
-            ):
-                raise ValueError(
-                    f"statistics alias {output.name!r} shadows an "
-                    "unconditional model field"
-                )
-            if tensor.output == "disabled" and output.expression is None:
-                raise ValueError(
-                    f"statistics field {output.name!r} is disabled for output"
-                )
-            if output.operation == "static" and (
-                len(tensor.shape) != 1 or tensor.dim_coords is None
-            ):
-                raise ValueError(
-                    f"static statistics field {output.name!r} must be "
-                    "one-dimensional and declare dim_coords"
-                )
-            if output.operation != "static" and tensor.category not in {
-                "state",
-                "shared_state",
-                "init_state",
-                "param",
-                "virtual",
-            }:
-                raise ValueError(
-                    f"statistics field {output.name!r} has unsupported "
-                    f"category {tensor.category!r}"
-                )
-            if output.operation != "static" and not tensor.shape:
-                raise ValueError(
-                    f"statistics field {output.name!r} must have at least one "
-                    "logical dimension"
-                )
-            if output.operation != "static" and len(tensor.shape) > 2:
-                raise ValueError(
-                    f"statistics field {output.name!r} has logical rank "
-                    f"{len(tensor.shape)}; only rank <= 2 is supported"
-                )
-            if (
-                output.operation != "static"
-                and self.num_trials is not None
-                and tensor.category in {"topology", "shared_state"}
-            ):
-                raise ValueError(
-                    f"dynamic statistics field {output.name!r} is shared in "
-                    "a multi-trial model"
-                )
-            if tensor.category == "virtual" and tensor.expression:
-                validate_expression(
-                    name=output.name,
-                    expression=tensor.expression,
-                    target_metadata=metadata(output.name),
-                    allow_scatter=True,
-                )
-            if operation is not None:
-                field_metadata = metadata(output.name)
-                compiled_operations[(output.name, operation)] = compile_operation(
-                    output.name,
-                    operation,
-                    field_metadata,
-                )
-                compiled_output_metadata[(output.name, operation)] = field_metadata
-                compiled_netcdf_options[f"{output.name}_{operation}"] = (
-                    compile_output_options(
-                        f"{output.name}_{operation}",
-                        field_metadata,
-                    )
-                )
-
-        virtual_graph: dict[str, tuple[str, ...]] = {}
-        for name, field in fields.items():
-            tensor = field.tensor
-            if tensor.category != "virtual" or not tensor.expression:
-                continue
-            virtual_graph[name] = dependencies(
-                parse_value_source(tensor.expression, known),
-            )
-        visiting: set[str] = set()
-        visited: set[str] = set()
-
-        def visit(name: str) -> None:
-            if name in visited or name not in virtual_graph:
-                return
-            if name in visiting:
-                raise ValueError(f"cyclic statistics dependency involving {name!r}")
-            visiting.add(name)
-            for dependency in virtual_graph[name]:
-                visit(dependency)
-            visiting.remove(name)
-            visited.add(name)
-
-        for name in tuple(virtual_graph):
-            visit(name)
-
-        grouped_operations: dict[str, list[Any]] = {}
-        compiled_sources: dict[str, Any] = {}
-        kernel_inputs: set[str] = set()
-        safe_outputs: dict[str, str] = {}
-        generated_output_names: set[str] = set()
-
-        def resolve_declared_source(name: str) -> Any:
-            existing = compiled_sources.get(name)
-            if existing is not None:
-                return existing
-            tensor = fields[name].tensor
-            expression = (
-                tensor.expression
-                if tensor.category == "virtual" and tensor.expression
-                else None
-            )
-            source = (
-                TensorSource(name)
-                if expression is None
-                else parse_value_source(expression, known)
-            )
-            compiled_sources[name] = source
-            source_dependencies = (
-                source.value.dependencies
-                if isinstance(source, ScatterSource)
-                else source.expression.dependencies
-                if isinstance(source, ExpressionSource)
-                else ()
-            )
-            for dependency in source_dependencies:
-                dependency_field = fields[dependency]
-                dependency_tensor = dependency_field.tensor
-                if (
-                    dependency_tensor.category == "virtual"
-                    and dependency_tensor.expression
-                ):
-                    resolve_declared_source(dependency)
-            return source
-
-        for output in outputs:
-            if output.operation == "static":
-                continue
-            grouped_operations.setdefault(output.name, []).append(
-                compiled_operations[(output.name, output.operation)],
-            )
-            if output.expression is None or active_declared_field(output.name):
-                source = resolve_declared_source(output.name)
-            else:
-                source = parse_value_source(output.expression, known)
-                compiled_sources[output.name] = source
-                source_dependencies = (
-                    source.value.dependencies
-                    if isinstance(source, ScatterSource)
-                    else source.expression.dependencies
-                    if isinstance(source, ExpressionSource)
-                    else ()
-                )
-                for dependency in source_dependencies:
-                    dependency_tensor = fields[dependency].tensor
-                    if (
-                        dependency_tensor.category == "virtual"
-                        and dependency_tensor.expression
-                    ):
-                        resolve_declared_source(dependency)
-            kernel_inputs.update(dependencies(source))
-            output_name = f"{output.name}_{output.operation}"
-            safe_name = sanitize_symbol(output_name)
-            if not safe_name:
-                raise ValueError(
-                    f"statistics output {output_name!r} has no valid NetCDF characters"
-                )
-            previous = safe_outputs.get(safe_name)
-            if previous is not None and previous != output_name:
-                raise ValueError(
-                    f"statistics outputs {previous!r} and {output_name!r} "
-                    f"both map to NetCDF variable {safe_name!r}"
-                )
-            safe_outputs[safe_name] = output_name
-            operation = compiled_operations[(output.name, output.operation)]
-            if operation.k > 1:
-                output_storage_names = {
-                    f"{safe_name}_{index}" for index in range(operation.k)
-                }
-            else:
-                output_storage_names = {safe_name}
-            generated_output_names.update(output_storage_names)
-
-            output_metadata = compiled_output_metadata[(output.name, output.operation)]
-            coordinate = output_metadata[2]
-            if (
-                coordinate is not None
-                and sanitize_symbol(coordinate) in output_storage_names
-            ):
-                raise ValueError(
-                    f"statistics output {output_name!r} conflicts with its "
-                    f"NetCDF coordinate {coordinate!r}"
-                )
-
-        for static_name in (
-            output.name for output in outputs if output.operation == "static"
-        ):
-            safe_static = sanitize_symbol(static_name)
-            if safe_static == "time":
-                raise ValueError(
-                    f"static statistics field {static_name!r} conflicts with "
-                    "the reserved NetCDF time variable"
-                )
-            if safe_static in generated_output_names:
-                raise ValueError(
-                    f"static statistics field {static_name!r} conflicts with "
-                    "a generated NetCDF output variable"
-                )
-
-        storage_names: set[str] = set()
-        for name, operations in grouped_operations.items():
-            storage = build_variable_storage_plan(
-                name,
-                (),
-                tuple(operations),
-            )
-            storage_names.update(slot.name for slot in storage.slots)
-
-        reserved_collision = kernel_inputs.intersection(
-            RESERVED_CONTROL_STATE,
+        from hydroforge.compiler.statistics_declaration import (
+            StatisticsDeclarationCompiler,
         )
-        if reserved_collision:
-            raise ValueError(
-                "statistics input names collide with reserved control state: "
-                f"{sorted(reserved_collision)}"
-            )
-        storage_collision = kernel_inputs.intersection(storage_names)
-        if storage_collision:
-            raise ValueError(
-                "statistics inputs collide with generated accumulator state: "
-                f"{sorted(storage_collision)}"
-            )
-        symbols: dict[str, str] = {}
-        for name in sorted(
-            kernel_inputs | storage_names | set(grouped_operations),
-        ):
-            symbol = sanitize_symbol(name)
-            previous = symbols.get(symbol)
-            if previous is not None and previous != name:
-                raise ValueError(
-                    f"statistics names {previous!r} and {name!r} both map "
-                    f"to generated symbol {symbol!r}"
-                )
-            symbols[symbol] = name
-        self._statistics_declaration = _StatisticsDeclaration(
-            program=StatisticsProgram(
-                operations=MappingProxyType(
-                    {
-                        name: tuple(operations)
-                        for name, operations in grouped_operations.items()
-                    }
-                ),
-                sources=MappingProxyType(dict(compiled_sources)),
-            ),
-            static_names=tuple(
-                output.name for output in outputs if output.operation == "static"
-            ),
-            netcdf_options=MappingProxyType(dict(compiled_netcdf_options)),
-        )
-        return self
+
+        return StatisticsDeclarationCompiler(self).compile()
 
     @field_validator("parameter_changes")
     @classmethod
@@ -2932,16 +1226,14 @@ class AbstractModel(HydroForgeModel, ABC):
         for change in changes:
             _calendar, normalized, _defaulted = normalize_calendar_dates(
                 {
-                    f"parameter change {change.variable!r} start": (
-                        change.start
-                    ),
+                    f"parameter change {change.variable!r} start": (change.start),
                 },
                 calendar=schedule.calendar,
             )
-            start = normalized[
-                f"parameter change {change.variable!r} start"
-            ]
-            bound = ParameterChange(
+            start = normalized[f"parameter change {change.variable!r} start"]
+            # Only the date changes. The source declaration owns its tensor
+            # snapshots, and normalization above validated the new calendar date.
+            bound = ParameterChange.model_construct(
                 variable=change.variable,
                 start=start,
                 active_steps=change.active_steps,
@@ -2970,44 +1262,6 @@ class AbstractModel(HydroForgeModel, ABC):
 
     @model_validator(mode="after")
     def _validate_input_contract(self) -> Self:
-        """Bind external storage to the complete validated model schema.
+        from hydroforge.compiler.declarations import validate_input_contract
 
-        This is pure semantic validation.  It may inspect the already
-        validated ``InputProxy`` identity, but it does not allocate model
-        tensors, initialize a backend, open persistent resources or start the
-        execution runtime.
-        """
-
-        from hydroforge.compiler.model import _ModelSemanticPlan
-        from hydroforge.compiler.parameters import ParameterSemanticCompiler
-        from hydroforge.compiler.partition import _PartitionSemanticCompiler
-        from hydroforge.data.model_input import ModelInput
-
-        self._input = ModelInput(self)
-        partition = _PartitionSemanticCompiler(self)
-        partition_schema = partition.schema
-        variable_groups = partition.variable_groups
-        input_axes = self._input.compile_partition_axes(partition)
-        partition.validate_global_reference_integrity()
-        reference_targets, inverse_sources = partition.compile_reference_targets()
-        partition.validate_inverse_reference_integrity(inverse_sources)
-        parameter_changes = ParameterSemanticCompiler(
-            self,
-            partition,
-            input_axes=input_axes,
-        ).compile(self.parameter_changes)
-        self._semantic_plan = _ModelSemanticPlan(
-            backend=self._backend,
-            module_order=self._module_order,
-            namespace=self._namespace_declaration,
-            input_binding=self._input,
-            partition_schema=partition_schema,
-            variable_groups=variable_groups,
-            input_axes=input_axes,
-            reference_targets=reference_targets,
-            trial_forcing_fields=self.trial_forcing_fields,
-            field_demand=self._field_demand,
-            statistics=self._statistics_declaration,
-            parameter_changes=parameter_changes,
-        )
-        return self
+        return validate_input_contract(self)

@@ -4,20 +4,29 @@ from __future__ import annotations
 
 import hashlib
 import re
+from pathlib import Path
 from typing import Any
 
 from pydantic import PrivateAttr, model_validator
 
 from hydroforge.contracts.kernels import (
-    BackendLoweringSpec, BufferDTypeABI, KernelSpec,
+    BackendLoweringSpec,
+    BufferDTypeABI,
+    KernelSpec,
 )
 from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.kernels.backends.cuda.dispatcher import (
-    CudaDispatcher, CudaNativeProjection, CudaRoute, _compile_cuda_route,
+    CudaDispatcher,
+    CudaNativeProjection,
+    CudaRoute,
+    _compile_cuda_route,
 )
-from hydroforge.kernels.backends.cuda.spec import cuda_declarations
-from hydroforge.kernels.context import active_kernel_spec
-
+from hydroforge.kernels.backends.cuda.spec import (
+    CudaExtensionSpec,
+    _CompiledCudaExtension,
+    cuda_declarations,
+)
+from hydroforge.kernels.context import resolve_factory_spec
 
 _SCALAR_TYPES = {
     "bool": "bool",
@@ -49,6 +58,37 @@ def _constant_literal(kind: str, value: Any) -> str:
     raise TypeError(f"unsupported CUDA compile-time kind {kind!r}")
 
 
+def cuda_compile_time_source(spec: KernelSpec, constants: dict[str, Any]) -> str:
+    """Declare canonical constants and their zero-storage C++ parameter type."""
+    expected = set(spec.compile_time)
+    supplied = set(constants)
+    if supplied != expected:
+        raise TypeError(
+            f"{spec.name}: CUDA source specialization requires exact compile-time "
+            f"values; missing={sorted(expected - supplied)}, "
+            f"extra={sorted(supplied - expected)}"
+        )
+    spec._validate_compile_time(constants)
+    declarations = [
+        f"static constexpr {_SCALAR_TYPES[kind]} {name} = "
+        f"{_constant_literal(kind, constants[name])};"
+        for name, kind in spec.compile_time.items()
+    ]
+    declarations.extend(
+        f"static constexpr uint32_t {name} = "
+        f"{spec.compile_time_mask(name, constants)}u;"
+        for name in spec.compile_time_masks
+    )
+    members = "\n".join(
+        f"    static constexpr auto {name} = ::{name};"
+        for name in (*spec.compile_time, *spec.compile_time_masks)
+    )
+    return "\n".join(declarations) + (
+        "\nnamespace hydroforge {\nstruct KernelParameters {\n"
+        f"{members}\n}};\n}}\n"
+    )
+
+
 def _split_source(source: str) -> tuple[str, str]:
     count = source.count(CUDA_LAUNCH_BODY_MARKER)
     if count != 1:
@@ -71,7 +111,11 @@ class _TemplateCudaGroup:
     """Minimal lazy module provider consumed by :class:`CudaDispatcher`."""
 
     def __init__(
-        self, source: str, launch: str, *, cflags: tuple[str, ...],
+        self,
+        source: str,
+        launch: str,
+        *,
+        cflags: tuple[str, ...],
         env_prefix: str,
     ) -> None:
         digest = hashlib.sha256(
@@ -85,36 +129,43 @@ class _TemplateCudaGroup:
         self._module = None
         self.declaration = cuda_declarations(source, (launch,))[0]
 
+    def _precompile_arguments(
+        self,
+        extension: str,
+        masks: tuple[tuple[str, int], ...] = (),
+    ) -> dict[str, Any] | None:
+        del extension, masks
+        if self._module is not None:
+            return None
+        spec = _CompiledCudaExtension(
+            source=self.source,
+            functions=(self.launch,),
+            declarations=(self.declaration,),
+            cflags=self.cflags,
+            cpp_headers=("#include <torch/extension.h>", "#include <optional>"),
+            include_paths=(),
+            ldflags=(),
+        )
+        return spec.loader_arguments(self.name, self.env_prefix)
+
     def _load(self, extension: str):
-        del extension
         if self._module is None:
             from hydroforge.kernels.backends.cuda.build import load_inline_cu_module
 
             self._module = load_inline_cu_module(
-                self.name,
-                cpp_sources=(
-                    "#include <torch/extension.h>\n"
-                    "#include <optional>\n"
-                    f"{self.declaration}"
-                ),
-                cuda_sources=self.source,
-                functions=(self.launch,),
-                extra_cuda_cflags=self.cflags,
-                env_prefix=self.env_prefix,
+                **self._precompile_arguments(extension),
             )
         return self._module
 
     def _load_variant(
-        self, extension: str, masks: tuple[tuple[str, int], ...],
+        self,
+        extension: str,
+        masks: tuple[tuple[str, int], ...],
     ):
         """Return the module whose masks are already rendered in source."""
 
         del masks
         return self._load(extension)
-
-    def ensure_precompiled(self):
-        return {"template": self._load("template")}
-
 
 class SpecCudaTemplateDispatcher:
     """Generate the host CUDA launcher ABI from one canonical KernelSpec.
@@ -126,7 +177,10 @@ class SpecCudaTemplateDispatcher:
     """
 
     def __init__(
-        self, spec: KernelSpec, source: str, *,
+        self,
+        spec: KernelSpec,
+        source: str,
+        *,
         cflags: tuple[str, ...] = ("-O3", "--use_fast_math"),
         env_prefix: str = "HYDROFORGE",
     ) -> None:
@@ -135,18 +189,25 @@ class SpecCudaTemplateDispatcher:
         if type(source) is not str or not source.strip():
             raise ValueError("CUDA template source must be a non-empty string")
         prelude, body = _split_source(source)
-        if type(cflags) is not tuple or not cflags or any(
-            type(flag) is not str or not flag for flag in cflags
+        if (
+            type(cflags) is not tuple
+            or not cflags
+            or any(type(flag) is not str or not flag for flag in cflags)
         ):
             raise TypeError("CUDA template cflags must be a non-empty string tuple")
         if (
-            type(env_prefix) is not str or not env_prefix
+            type(env_prefix) is not str
+            or not env_prefix
             or not env_prefix.isidentifier()
         ):
             raise ValueError("CUDA template env_prefix must be an identifier")
         forbidden = tuple(
-            token for token in (
-                "#include", "__global__", "PYBIND", "TORCH_LIBRARY",
+            token
+            for token in (
+                "#include",
+                "__global__",
+                "PYBIND",
+                "TORCH_LIBRARY",
             )
             if token in body
         )
@@ -158,8 +219,12 @@ class SpecCudaTemplateDispatcher:
         physics = _without_comments(body)
         identifiers = set(re.findall(r"\b[A-Za-z_]\w*\b", physics))
         unknown_ptrs = {
-            name for name in identifiers
-            if name.endswith("_ptr") and name not in spec.parameters
+            name
+            for qualifier, name in re.findall(
+                r"(\.|->|::)?\s*\b([A-Za-z_]\w*)\b",
+                physics,
+            )
+            if not qualifier and name.endswith("_ptr") and name not in spec.parameters
         }
         if unknown_ptrs:
             raise ValueError(
@@ -196,7 +261,8 @@ class SpecCudaTemplateDispatcher:
         if name in self.spec.buffers:
             native = (
                 "std::optional<at::Tensor>"
-                if name in self.spec.optional_buffers else "at::Tensor"
+                if name in self.spec.optional_buffers
+                else "at::Tensor"
             )
         else:
             native = _SCALAR_TYPES[self.spec.runtime_scalars[name]]
@@ -204,19 +270,11 @@ class SpecCudaTemplateDispatcher:
 
     def _render_source(self, constants: dict[str, Any]) -> str:
         parameters = ",\n    ".join(
-            self._parameter(name) for name in self.spec.parameters
+            self._parameter(name)
+            for name in self.spec.parameters
             if name not in self.spec.compile_time
         )
-        constant_source = "\n".join(
-            f"static constexpr {_SCALAR_TYPES[kind]} {name} = "
-            f"{_constant_literal(kind, constants[name])};"
-            for name, kind in self.spec.compile_time.items()
-        )
-        mask_source = "\n".join(
-            f"static constexpr uint32_t {name} = "
-            f"{self.spec.compile_time_mask(name, constants)}u;"
-            for name in self.spec.compile_time_masks
-        )
+        constant_source = cuda_compile_time_source(self.spec, constants)
         return f"""
 #include <cuda_runtime.h>
 #include <torch/extension.h>
@@ -225,7 +283,6 @@ class SpecCudaTemplateDispatcher:
 #include <cstdint>
 #include <optional>
 {constant_source}
-{mask_source}
 {self.prelude}
 void {self.launch}(
     {parameters},
@@ -235,51 +292,34 @@ void {self.launch}(
 }}
 """
 
-    def _constants(self, arguments: dict[str, Any] | None) -> dict[str, Any]:
-        arguments = {} if arguments is None else arguments
-        expected = set(self.spec.compile_time)
-        supplied = set(arguments)
-        if supplied != expected:
-            raise TypeError(
-                f"{self.spec.name}: CUDA source specialization requires "
-                f"exact compile-time values; missing="
-                f"{sorted(expected - supplied)}, extra="
-                f"{sorted(supplied - expected)}"
-            )
-        self.spec._validate_compile_time(arguments)
-        return {
-            name: arguments[name] for name in self.spec.compile_time
-        }
-
     def source_for(
-        self, compile_time: dict[str, Any] | None = None,
+        self,
+        compile_time: dict[str, Any] | None = None,
     ) -> str:
         """Return the deterministic generated CUDA source for cold-path audit."""
 
-        return self._render_source(self._constants(compile_time))
+        return self._render_source({} if compile_time is None else compile_time)
 
     def _specialization_key(
-        self, arguments: dict[str, Any],
-    ) -> tuple[Any, ...]:
-        constants = {
-            name: arguments[name] for name in self.spec.compile_time
-        }
+        self,
+        arguments: dict[str, Any],
+    ) -> tuple[str, ...]:
         return tuple(
-            (type(constants[name]), constants[name])
-            for name in self.spec.compile_time
+            _constant_literal(kind, arguments[name])
+            for name, kind in self.spec.compile_time.items()
         )
 
     def _dispatcher_for(self, arguments: dict[str, Any]) -> CudaDispatcher:
-        constants = {
-            name: arguments[name] for name in self.spec.compile_time
-        }
         key = self._specialization_key(arguments)
         dispatcher = self._dispatchers.get(key)
         if dispatcher is None:
+            constants = {name: arguments[name] for name in self.spec.compile_time}
             source = self._render_source(constants)
             group = _TemplateCudaGroup(
-                source, self.launch,
-                cflags=self.cflags, env_prefix=self.env_prefix,
+                source,
+                self.launch,
+                cflags=self.cflags,
+                env_prefix=self.env_prefix,
             )
             route = _compile_cuda_route(
                 CudaRoute(
@@ -291,35 +331,48 @@ void {self.launch}(
                 source,
             )
             dispatcher = CudaDispatcher(
-                group, route, spec=self.spec,
+                group,
+                route,
+                spec=self.spec,
             )
             self._dispatchers[key] = dispatcher
         return dispatcher
 
     def _validate_specialization_input(
-        self, arguments: dict[str, Any], *,
+        self,
+        arguments: dict[str, Any],
+        *,
         buffer_dtypes: BufferDTypeABI,
     ) -> None:
         """Build and validate the concrete source ABI inside Pydantic."""
 
         dispatcher = self._dispatcher_for(arguments)
         dispatcher._validate_specialization_input(
-            arguments, buffer_dtypes=buffer_dtypes,
+            arguments,
+            buffer_dtypes=buffer_dtypes,
         )
 
     def specialize(
-        self, arguments: dict[str, Any], *,
+        self,
+        arguments: dict[str, Any],
+        *,
         buffer_dtypes: BufferDTypeABI,
     ):
         dispatcher = self._dispatchers[self._specialization_key(arguments)]
         return dispatcher.specialize(
-            arguments, buffer_dtypes=buffer_dtypes,
+            arguments,
+            buffer_dtypes=buffer_dtypes,
         )
+
+    def _precompile_arguments(self, arguments: dict[str, Any]):
+        dispatcher = self._dispatchers[self._specialization_key(arguments)]
+        return dispatcher._precompile_arguments(arguments)
 
 
 class _SpecCudaDispatcherDeclaration(HydroForgeModel):
     spec: KernelSpec | None = None
-    source: str
+    source: str | Path
+    include_root: Path | None = None
     cflags: tuple[str, ...] = ("-O3", "--use_fast_math")
     env_prefix: str = "HYDROFORGE"
 
@@ -327,25 +380,19 @@ class _SpecCudaDispatcherDeclaration(HydroForgeModel):
 
     @model_validator(mode="after")
     def _build(self):
-        active = active_kernel_spec()
-        if active is not None:
-            if self.spec is not None:
-                raise ValueError(
-                    "CUDA template factory may not repeat active KernelSpec "
-                    "metadata"
-                )
-            spec = active
-        elif self.spec is None:
-            raise ValueError(
-                "make_spec_cuda_dispatcher requires a KernelSpec outside a "
-                "BackendRegistry factory"
-            )
-        else:
-            spec = self.spec
         try:
+            spec = resolve_factory_spec(self.spec, factory="make_spec_cuda_dispatcher")
+            source = self.source
+            if isinstance(source, Path):
+                source = CudaExtensionSpec(
+                    source=source,
+                    include_root=self.include_root,
+                )._materialize_source()
+            elif self.include_root is not None:
+                raise ValueError("CUDA include_root requires a source Path")
             self._dispatcher = SpecCudaTemplateDispatcher(
                 spec,
-                self.source,
+                source,
                 cflags=self.cflags,
                 env_prefix=self.env_prefix,
             )
@@ -353,13 +400,12 @@ class _SpecCudaDispatcherDeclaration(HydroForgeModel):
             raise ValueError(str(error)) from error
         return self
 
-    @property
-    def dispatcher(self) -> SpecCudaTemplateDispatcher:
-        return self._dispatcher
-
 
 def make_spec_cuda_dispatcher(
-    spec: KernelSpec | None = None, *, source: str,
+    spec: KernelSpec | None = None,
+    *,
+    source: str | Path,
+    include_root: Path | None = None,
     cflags: tuple[str, ...] = ("-O3", "--use_fast_math"),
     env_prefix: str = "HYDROFORGE",
 ) -> SpecCudaTemplateDispatcher:
@@ -368,11 +414,14 @@ def make_spec_cuda_dispatcher(
     return _SpecCudaDispatcherDeclaration(
         spec=spec,
         source=source,
+        include_root=include_root,
         cflags=cflags,
         env_prefix=env_prefix,
-    ).dispatcher
+    )._dispatcher
 
 
 __all__ = [
-    "CUDA_LAUNCH_BODY_MARKER", "make_spec_cuda_dispatcher",
+    "CUDA_LAUNCH_BODY_MARKER",
+    "cuda_compile_time_source",
+    "make_spec_cuda_dispatcher",
 ]

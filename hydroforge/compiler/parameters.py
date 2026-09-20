@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-import math
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING
 
 import cftime
 import numpy as np
@@ -17,6 +16,7 @@ from hydroforge.contracts.fields import (
 )
 from hydroforge.contracts.parameters import ParameterChange, ParameterValue
 from hydroforge.data.distributed import _find_indices_in_trusted
+from hydroforge.model.tensors import ModuleTensors
 
 if TYPE_CHECKING:
     from hydroforge.compiler.partition import _PartitionSemanticCompiler
@@ -57,25 +57,42 @@ class ParameterSemanticCompiler:
         self,
         model: AbstractModel,
         partition: _PartitionSemanticCompiler,
-        *,
-        input_axes: Mapping[str, int],
     ) -> None:
         self.model = model
         self.partition = partition
-        self.input_axes = input_axes
         self._qualified, self._unqualified = self._field_index()
 
+    def _parameter_shape(self, resolved: _ResolvedParameterField) -> tuple[int, ...]:
+        view = self.model._data.prepare_modules()[resolved.module_name]
+        tensors = ModuleTensors(view)
+        field = resolved.schema
+        shape = tensors._expected_shape(field.name)
+        if shape is None:
+            raise ValueError(f"Inactive parameter {field.name!r}")
+        if field.name in view.model_fields_set:
+            value = getattr(view, field.name)
+            if isinstance(value, torch.Tensor):
+                if tuple(value.shape) != shape:
+                    tensors._resolve_batch_shape(field, value, shape)
+                return tuple(value.shape)
+        return shape
+
     def compile(
-        self, changes: tuple[ParameterChange, ...],
+        self,
+        changes: tuple[ParameterChange, ...],
     ) -> tuple[_ParameterChangePlan, ...]:
-        plans = tuple(sorted(
-            (self._compile_change(change) for change in changes),
-            key=lambda item: item.start_time,
-        ))
+        plans = tuple(
+            sorted(
+                (self._compile_change(change) for change in changes),
+                key=lambda item: item.start_time,
+            )
+        )
         self._validate_set_conflicts(plans)
         return plans
 
-    def _field_index(self) -> tuple[
+    def _field_index(
+        self,
+    ) -> tuple[
         dict[str, _ResolvedParameterField],
         dict[str, _ResolvedParameterField | None],
     ]:
@@ -86,16 +103,15 @@ class ParameterSemanticCompiler:
             for field in schema.fields(module_name):
                 tensor = field.tensor
                 if tensor is None or not self.model._is_tensor_field_active(
-                    module_name, field,
+                    module_name,
+                    field,
                 ):
                     continue
                 resolved = _ResolvedParameterField(module_name, field)
                 qualified[f"{module_name}.{field.name}"] = resolved
-                previous = unqualified.get(field.name)
-                if previous is None and field.name not in unqualified:
-                    unqualified[field.name] = resolved
-                else:
-                    unqualified[field.name] = None
+                unqualified[field.name] = (
+                    None if field.name in unqualified else resolved
+                )
         return qualified, unqualified
 
     def _resolve_field(
@@ -110,19 +126,20 @@ class ParameterSemanticCompiler:
         else:
             resolved = (
                 self._qualified.get(f"{owner_module}.{name}")
-                if owner_module is not None else None
+                if owner_module is not None
+                else None
             )
             if resolved is None:
                 resolved = self._unqualified.get(name)
         if resolved is None:
             raise ValueError(
-                f"{label} {name!r} was not found unambiguously in an "
-                "opened module"
+                f"{label} {name!r} was not found unambiguously in an opened module"
             )
         return resolved
 
     def _compile_change(
-        self, change: ParameterChange,
+        self,
+        change: ParameterChange,
     ) -> _ParameterChangePlan:
         resolved = self._resolve_field(
             change.variable,
@@ -140,31 +157,28 @@ class ParameterSemanticCompiler:
                 f"parameter change variable {change.variable!r} cannot use "
                 "mode='discard'"
             )
-        source_shape = self.model._input.get_var_shape(field.name)
-        index_axis = self.input_axes.get(field.name)
-        if index_axis is None:
-            index_axis = self.partition.logical_axis(
-                field.name, field, source_shape,
-            )
-        local_shape = list(source_shape)
+        local_shape = self._parameter_shape(resolved)
+        index_axis = len(local_shape) - len(tensor.shape)
         group = self.partition.variable_groups.get(field.name)
         local_rows: np.ndarray | None = None
         if group is not None:
             local_rows = self.partition.rank_indices(group)
-            local_shape[index_axis] = int(local_rows.size)
 
         expected_dtype = concrete_tensor_dtype(
-            tensor.dtype, self.model.dtype, self.model.mixed_precision,
+            tensor.dtype,
+            self.model.dtype,
+            self.model.mixed_precision,
         )
         expected_device = (
             torch.device("cpu")
-            if tensor.mode == "cpu" else torch.device(self.model.device)
+            if tensor.mode == "cpu"
+            else torch.device(self.model.device)
         )
 
         target_ids: tuple[int, ...] | None = None
         local_indices: tuple[int, ...] | None = None
         local_positions: tuple[int, ...] | None = None
-        update_shape = tuple(local_shape)
+        update_shape = local_shape
         resolved_id_name: str | None = None
         if change._trusted_value("target_ids") is not None:
             (
@@ -175,7 +189,7 @@ class ParameterSemanticCompiler:
             ) = self._compile_target_ids(
                 change,
                 parameter=resolved,
-                source_shape=source_shape,
+                local_shape=local_shape,
                 index_axis=index_axis,
                 local_rows=local_rows,
             )
@@ -187,6 +201,17 @@ class ParameterSemanticCompiler:
         delta = change._trusted_value("delta")
         is_set = target_value is not None
         raw_value = target_value if is_set else delta
+        if (
+            self.model.parallel is not None
+            and index_axis == 1
+            and isinstance(raw_value, torch.Tensor)
+            and raw_value.ndim == len(update_shape)
+        ):
+            if raw_value.shape[0] != self.model.ensemble_size:
+                raise ValueError(
+                    "ensemble parameter changes require the global member axis"
+                )
+            raw_value = raw_value[self.model.parallel.member_slice]
         value = self._validate_update_value(
             raw_value,
             expected_shape=update_shape,
@@ -226,11 +251,14 @@ class ParameterSemanticCompiler:
         change: ParameterChange,
         *,
         parameter: _ResolvedParameterField,
-        source_shape: tuple[int, ...],
+        local_shape: tuple[int, ...],
         index_axis: int,
         local_rows: np.ndarray | None,
     ) -> tuple[
-        tuple[int, ...], tuple[int, ...], tuple[int, ...], str,
+        tuple[int, ...],
+        tuple[int, ...],
+        tuple[int, ...],
+        str,
     ]:
         parameter_tensor = parameter.schema.tensor
         id_name = change.target_id_field or parameter_tensor.dim_coords
@@ -248,24 +276,24 @@ class ParameterSemanticCompiler:
         id_tensor = id_field.tensor
         if not id_tensor.is_key:
             raise ValueError(
-                f"parameter target ID field {id_name!r} must declare "
-                "is_key=True"
+                f"parameter target ID field {id_name!r} must declare is_key=True"
             )
         if len(id_tensor.shape) != 1:
             raise ValueError(
-                f"parameter target ID field {id_name!r} must be "
-                "one-dimensional"
+                f"parameter target ID field {id_name!r} must be one-dimensional"
             )
         parameter_coordinate = (
             parameter_tensor.dim_coords.rsplit(".", 1)[-1]
-            if parameter_tensor.dim_coords else None
+            if parameter_tensor.dim_coords
+            else None
         )
         id_coordinate = (
             id_field.name
             if id_tensor.is_coordinate
             else (
                 id_tensor.dim_coords.rsplit(".", 1)[-1]
-                if id_tensor.dim_coords else None
+                if id_tensor.dim_coords
+                else None
             )
         )
         if parameter_coordinate != id_coordinate:
@@ -274,12 +302,17 @@ class ParameterSemanticCompiler:
                 f"{change.variable!r} coordinate {parameter_coordinate!r}"
             )
 
-        id_shape = self.model._input.get_var_shape(id_field.name)
-        if id_shape != (source_shape[index_axis],):
+        local_view = self.model._data.prepare_modules()[resolved_id.module_name]
+        local_id_tensor = getattr(local_view, id_field.name)
+        if not isinstance(local_id_tensor, torch.Tensor):
+            raise ValueError(f"parameter target ID field {id_name!r} must be a tensor")
+        ModuleTensors._validate_key(id_field, local_id_tensor)
+        id_shape = tuple(local_id_tensor.shape)
+        if id_shape != (local_shape[index_axis],):
             raise ValueError(
                 f"parameter target ID field {id_name!r} shape {id_shape} is "
                 f"not co-indexed with {change.variable!r} axis "
-                f"length {source_shape[index_axis]}"
+                f"length {local_shape[index_axis]}"
             )
         id_values_tensor = self.model._input[id_field.name]
         id_values = id_values_tensor.detach().cpu().numpy().reshape(-1)
@@ -288,10 +321,11 @@ class ParameterSemanticCompiler:
                 f"parameter target ID field {id_name!r} contains duplicate IDs"
             )
 
-        target_ids = self._canonical_target_ids(
-            change._trusted_value("target_ids"),
-            expected_dtype=id_values_tensor.dtype,
-            variable_name=change.variable,
+        requested_ids = change._trusted_value("target_ids")
+        target_ids = (
+            requested_ids
+            if isinstance(requested_ids, tuple)
+            else tuple(requested_ids.tolist())
         )
         target_array = np.asarray(target_ids, dtype=id_values.dtype)
         global_indices = _find_indices_in_trusted(target_array, id_values)
@@ -305,14 +339,23 @@ class ParameterSemanticCompiler:
 
         if local_rows is None:
             local_rows = np.arange(id_values.size, dtype=np.int64)
+        local_id_values = local_id_tensor.detach().cpu().numpy()
+        prepared_global_indices = _find_indices_in_trusted(local_id_values, id_values)
+        if np.any(prepared_global_indices < 0) or not np.all(
+            np.isin(prepared_global_indices, local_rows)
+        ):
+            raise ValueError(
+                f"prepared parameter target ID field {id_name!r} contains IDs "
+                "outside its rank-local input partition"
+            )
         local_by_global = {
-            int(global_index): local_index
-            for local_index, global_index in enumerate(local_rows.tolist())
+            global_index: local_index
+            for local_index, global_index in enumerate(prepared_global_indices.tolist())
         }
         local_positions: list[int] = []
         local_indices: list[int] = []
         for request_position, global_index in enumerate(global_indices.tolist()):
-            local_index = local_by_global.get(int(global_index))
+            local_index = local_by_global.get(global_index)
             if local_index is None:
                 continue
             local_positions.append(request_position)
@@ -323,18 +366,6 @@ class ParameterSemanticCompiler:
             tuple(local_positions),
             f"{resolved_id.module_name}.{id_field.name}",
         )
-
-    @staticmethod
-    def _canonical_target_ids(
-        values: tuple[int, ...] | torch.Tensor,
-        *,
-        expected_dtype: torch.dtype,
-        variable_name: str,
-    ) -> tuple[int, ...]:
-        if isinstance(values, tuple):
-            return values
-        del expected_dtype, variable_name
-        return tuple(int(value) for value in values.tolist())
 
     @staticmethod
     def _validate_update_value(
@@ -358,8 +389,7 @@ class ParameterSemanticCompiler:
                 )
             if not value.is_contiguous():
                 raise ValueError(
-                    f"parameter {variable_name!r} update tensor must be "
-                    "contiguous"
+                    f"parameter {variable_name!r} update tensor must be contiguous"
                 )
             if value.ndim != 0 and tuple(value.shape) != expected_shape:
                 raise ValueError(
@@ -400,10 +430,6 @@ class ParameterSemanticCompiler:
                     f"floating parameter {variable_name!r} update must be an "
                     "exact float or matching tensor"
                 )
-            if not math.isfinite(value):
-                raise ValueError(
-                    f"parameter {variable_name!r} update must be finite"
-                )
             if abs(value) > torch.finfo(expected_dtype).max:
                 raise ValueError(
                     f"parameter {variable_name!r} update is outside "
@@ -417,8 +443,13 @@ class ParameterSemanticCompiler:
                 )
             return value
         if expected_dtype in {
-            torch.int8, torch.uint8, torch.int16, torch.uint16,
-            torch.int32, torch.uint32, torch.int64,
+            torch.int8,
+            torch.uint8,
+            torch.int16,
+            torch.uint16,
+            torch.int32,
+            torch.uint32,
+            torch.int64,
         }:
             if type(value) is not int:
                 raise ValueError(
@@ -433,8 +464,7 @@ class ParameterSemanticCompiler:
                 )
             return value
         raise ValueError(
-            f"parameter {variable_name!r} has unsupported dtype "
-            f"{expected_dtype}"
+            f"parameter {variable_name!r} has unsupported dtype {expected_dtype}"
         )
 
     @staticmethod

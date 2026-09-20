@@ -6,19 +6,42 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import cache
 from types import MappingProxyType
-from typing import Any, Self, TypeAlias, get_args
+from typing import Annotated, Any, Literal, Self, TypeAlias, get_args
 
 import torch
-from pydantic import PrivateAttr, model_validator
-
-from hydroforge.contracts.validation import (
-    HydroForgeModel,
-    _immutable_dict,
+from pydantic import (
+    AfterValidator,
+    Field,
+    PrivateAttr,
+    ValidationInfo,
+    field_validator,
+    model_validator,
 )
 
+from hydroforge.contracts.validation import (
+    FrozenMapping,
+    HydroForgeModel,
+)
 
 ModuleType: TypeAlias = type[Any]
 DimensionToken: TypeAlias = str | int
+
+TensorName: TypeAlias = Annotated[str, Field(min_length=1)]
+TensorShape: TypeAlias = tuple[TensorName | Annotated[int, Field(ge=0)], ...]
+TensorDType = Literal["float", "hpfloat", "int", "idx", "bool"]
+TensorOutput = Literal["auto", "full", "disabled"]
+
+
+def _unique_module_names(values: tuple[str, ...]) -> tuple[str, ...]:
+    if len(values) != len(set(values)):
+        raise ValueError("contains duplicate module names")
+    return values
+
+
+_ModuleNames: TypeAlias = Annotated[
+    tuple[TensorName, ...], AfterValidator(_unique_module_names)
+]
+TensorDependencies: TypeAlias = TensorName | _ModuleNames | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,8 +79,7 @@ class FieldDemandPlan:
                         f"field demand for module {module!r} must be iterable"
                     ) from error
                 if any(
-                    type(field) is not str or not field
-                    for field in normalized[module]
+                    type(field) is not str or not field for field in normalized[module]
                 ):
                     raise TypeError(
                         f"field demand for module {module!r} must contain "
@@ -140,24 +162,27 @@ def tensor_is_active(
     Output demand activates ``output_only`` and ``required_by`` storage but
     never bypasses ``depends_on``.
     """
+    if isinstance(metadata, RuntimeTensorMetadata):
+        metadata = metadata.tensor
     opened = set(opened_modules)
     required = getattr(metadata, "depends_on", ())
     consumers = getattr(metadata, "required_by", ())
     output_only = getattr(metadata, "output_only", False)
-    return all(
-        dependency in opened
-        for dependency in required
-    ) and (
-        not output_only or output_required
-    ) and (
-        not consumers
-        or output_required
-        or any(item in opened for item in consumers)
+    return (
+        all(dependency in opened for dependency in required)
+        and (not output_only or output_required)
+        and (
+            not consumers
+            or output_required
+            or any(item in opened for item in consumers)
+        )
     )
 
 
 def concrete_tensor_dtype(
-    kind: str, base_dtype: torch.dtype, mixed_precision: bool,
+    kind: str,
+    base_dtype: torch.dtype,
+    mixed_precision: bool,
 ) -> torch.dtype:
     """Resolve one semantic TensorField dtype without intermediate casting."""
 
@@ -180,7 +205,10 @@ def concrete_tensor_dtype(
 
 
 def cast_declared_tensor(
-    tensor: torch.Tensor, target: torch.dtype, *, name: str,
+    tensor: torch.Tensor,
+    target: torch.dtype,
+    *,
+    name: str,
 ) -> torch.Tensor:
     """Convert one external tensor at the model-input boundary.
 
@@ -191,8 +219,13 @@ def cast_declared_tensor(
     if tensor.dtype == target:
         return tensor
     integer_types = {
-        torch.int8, torch.uint8, torch.int16, torch.uint16,
-        torch.int32, torch.uint32, torch.int64,
+        torch.int8,
+        torch.uint8,
+        torch.int16,
+        torch.uint16,
+        torch.int32,
+        torch.uint32,
+        torch.int64,
     }
     if target in {torch.float32, torch.float64}:
         if not tensor.is_floating_point():
@@ -202,9 +235,7 @@ def cast_declared_tensor(
             )
         if target == torch.float32 and tensor.numel():
             finite = torch.isfinite(tensor)
-            outside = finite & (
-                torch.abs(tensor) > torch.finfo(torch.float32).max
-            )
+            outside = finite & (torch.abs(tensor) > torch.finfo(torch.float32).max)
             if bool(outside.any().item()):
                 raise OverflowError(
                     f"{name} cannot convert {tensor.dtype} to {target}: "
@@ -219,7 +250,8 @@ def cast_declared_tensor(
         if tensor.numel():
             range_tensor = (
                 tensor.to(torch.int64)
-                if tensor.dtype in {torch.uint16, torch.uint32} else tensor
+                if tensor.dtype in {torch.uint16, torch.uint32}
+                else tensor
             )
             lower = int(range_tensor.min().item())
             upper = int(range_tensor.max().item())
@@ -230,16 +262,16 @@ def cast_declared_tensor(
                     f"observed range [{lower}, {upper}]"
                 )
     elif target == torch.bool:
-        raise TypeError(
-            f"{name} declares bool but received dtype {tensor.dtype}"
-        )
+        raise TypeError(f"{name} declares bool but received dtype {tensor.dtype}")
     else:
         raise TypeError(f"{name} has unsupported declared dtype {target}")
     converted = tensor.to(target)
     if (
         target == torch.float32
         and tensor.numel()
-        and bool((torch.isfinite(tensor) & (tensor != 0) & (converted == 0)).any().item())
+        and bool(
+            (torch.isfinite(tensor) & (tensor != 0) & (converted == 0)).any().item()
+        )
     ):
         raise OverflowError(
             f"{name} cannot convert {tensor.dtype} to {target}: "
@@ -265,128 +297,99 @@ def _resolve_dimension(
 
 
 class TensorMetadata(HydroForgeModel):
-    """Typed TensorField metadata compiled from Pydantic exactly once."""
+    """Canonical field metadata validated once when class metadata is read."""
 
-    shape: tuple[DimensionToken, ...]
-    dtype: str
-    category: str
-    mode: str
-    dim_coords: str | None
-    is_key: bool
-    is_coordinate: bool
-    partition_by: str | None
-    references: str | None
-    selects: str | None
-    replicated: bool
-    output: str
-    depends_on: tuple[str, ...]
-    required_by: tuple[str, ...]
-    expression: str
+    shape: TensorShape
+    dtype: TensorDType = "float"
+    category: Literal[
+        "topology",
+        "param",
+        "forcing",
+        "init_state",
+        "state",
+        "derived_param",
+        "shared_state",
+        "virtual",
+    ] = "param"
+    mode: Literal["device", "cpu", "discard"] = "device"
+    dim_coords: TensorName | None = None
+    is_key: bool = False
+    is_coordinate: bool = False
+    partition_by: TensorName | None = None
+    references: TensorName | None = None
+    selects: TensorName | None = None
+    replicated: bool = False
+    output: TensorOutput = "auto"
+    depends_on: _ModuleNames = ()
+    required_by: _ModuleNames = ()
+    expression: str = ""
     output_only: bool = False
+
+    @field_validator("shape", mode="before")
+    @classmethod
+    def _canonical_shape(cls, value: Any, info: ValidationInfo):
+        # Raw FieldInfo metadata must already contain canonical Python types.
+        # A before validator receives JSON arrays as Python lists. Restore the
+        # tuple representation before strict Python validation resumes.
+        if info.mode == "json" and type(value) is list:
+            return tuple(value)
+        if info.mode == "python" and (
+            type(value) is not tuple
+            or any(type(dimension) not in (str, int) for dimension in value)
+        ):
+            raise ValueError("tensor_shape must be an exact tuple of strings or ints")
+        return value
+
+    @field_validator("depends_on", "required_by", mode="before")
+    @classmethod
+    def _canonical_dependencies(cls, value: Any, info: ValidationInfo):
+        if value is None:
+            return ()
+        if type(value) is str:
+            return (value,)
+        if info.mode == "json" and type(value) is list:
+            return tuple(value)
+        if info.mode == "python" and (
+            type(value) is not tuple or any(type(name) is not str for name in value)
+        ):
+            raise ValueError("dependencies must be a module name, exact tuple, or None")
+        return value
+
+    @field_validator(
+        "dtype",
+        "category",
+        "mode",
+        "dim_coords",
+        "partition_by",
+        "references",
+        "selects",
+        "output",
+        "expression",
+        mode="before",
+    )
+    @classmethod
+    def _canonical_string(cls, value: Any, info: ValidationInfo):
+        if value is None and info.field_name == "expression":
+            return ""
+        if value is not None and type(value) is not str:
+            raise ValueError("metadata strings must use exact str values")
+        return value
 
     @classmethod
     def compile(cls, raw: Mapping[str, Any]) -> Self:
-        def enum_value(
-            key: str, default: str, allowed: frozenset[str],
-        ) -> str:
-            value = raw.get(key, default)
-            if type(value) is not str:
-                raise ValueError(f"{key} must be a string")
-            if value not in allowed:
-                choices = ", ".join(sorted(allowed))
-                raise ValueError(f"{key} must be one of: {choices}")
-            return value
-
-        def exact_bool(key: str) -> bool:
-            value = raw.get(key, False)
-            if type(value) is not bool:
-                raise ValueError(f"{key} must be an exact bool")
-            return value
-
-        def optional_name(key: str) -> str | None:
-            value = raw.get(key)
-            if value is None:
-                return None
-            if type(value) is not str or not value:
-                raise ValueError(f"{key} must be a non-empty string or None")
-            return value
-
-        def dependencies(key: str) -> tuple[str, ...]:
-            values = raw.get(key)
-            if values is None:
-                return ()
-            if isinstance(values, str):
-                values = (values,)
-            elif type(values) is not tuple:
-                raise ValueError(
-                    f"{key} must be a module name, a tuple of module "
-                    "names, or None"
-                )
-            if any(
-                type(dependency) is not str or not dependency
-                for dependency in values
-            ):
-                raise ValueError(f"{key} must contain non-empty module names")
-            if len(values) != len(set(values)):
-                raise ValueError(f"{key} contains duplicate module names")
-            return tuple(values)
-
-        raw_shape = raw["tensor_shape"]
-        if type(raw_shape) is not tuple:
-            raise ValueError("tensor_shape must be an exact tuple")
-        shape = raw_shape
-        for dimension in shape:
-            if type(dimension) is int:
-                if dimension < 0:
-                    raise ValueError(
-                        "integer tensor_shape dimensions must be non-negative"
-                    )
-            elif type(dimension) is not str or not dimension:
-                raise ValueError(
-                    "tensor_shape dimensions must be exact non-negative ints "
-                    "or non-empty strings"
-                )
-
-        depends_on = dependencies("depends_on")
-        required_by = dependencies("required_by")
-        expression_value = raw.get("expr")
-        if expression_value is None:
-            expression = ""
-        elif type(expression_value) is not str:
-            raise ValueError("expr must be a string or None")
-        else:
-            expression = expression_value
-        return cls(
-            shape=shape,
-            dtype=enum_value(
-                "tensor_dtype", "float",
-                frozenset({"float", "hpfloat", "int", "idx", "bool"}),
-            ),
-            category=enum_value(
-                "category", "param",
-                frozenset({
-                    "topology", "param", "forcing", "init_state", "state",
-                    "derived_param", "shared_state", "virtual",
-                }),
-            ),
-            mode=enum_value(
-                "mode", "device", frozenset({"device", "cpu", "discard"}),
-            ),
-            dim_coords=optional_name("dim_coords"),
-            is_key=exact_bool("is_key"),
-            is_coordinate=exact_bool("is_coordinate"),
-            partition_by=optional_name("partition_by"),
-            references=optional_name("references"),
-            selects=optional_name("selects"),
-            replicated=exact_bool("replicated"),
-            output=enum_value(
-                "output", "auto", frozenset({"auto", "full", "disabled"}),
-            ),
-            depends_on=depends_on,
-            required_by=required_by,
-            expression=expression,
-            output_only=exact_bool("output_only"),
-        )
+        # Class FieldInfo remains externally mutable, so validate its current
+        # metadata here. Unrelated JSON schema annotations are intentionally ignored.
+        aliases = {
+            "shape": "tensor_shape",
+            "dtype": "tensor_dtype",
+            "expression": "expr",
+        }
+        values = {
+            name: raw[source]
+            for name in cls.model_fields
+            if (source := aliases.get(name, name)) in raw
+        }
+        return cls(**values)
 
 
 class ModuleFieldSchema(HydroForgeModel):
@@ -415,15 +418,11 @@ class ModuleFieldSchema(HydroForgeModel):
     def selects(self) -> str | None:
         return None if self.tensor is None else self.tensor.selects
 
+
 class ModuleSchema(HydroForgeModel):
     """Tensor fields grouped by their owning module."""
 
-    modules: Mapping[str, tuple[ModuleFieldSchema, ...]]
-
-    @model_validator(mode="after")
-    def _freeze_modules(self) -> Self:
-        object.__setattr__(self, "modules", _immutable_dict(self.modules))
-        return self
+    modules: FrozenMapping[str, tuple[ModuleFieldSchema, ...]]
 
     def resolve_dimensions(
         self,
@@ -442,7 +441,8 @@ class ModuleSchema(HydroForgeModel):
                     continue
                 try:
                     module_fields[field.name] = tuple(
-                        str(dimension) if isinstance(dimension, int)
+                        str(dimension)
+                        if isinstance(dimension, int)
                         else _resolve_dimension(dimensions, dimension)
                         for dimension in field.shape
                     )
@@ -461,6 +461,7 @@ class ModuleSchema(HydroForgeModel):
         except KeyError as exc:
             raise KeyError(f"Module {module_name!r} is absent from schema") from exc
 
+
 def _field_schema(
     module_name: str,
     name: str,
@@ -477,13 +478,11 @@ def _field_schema(
         )
     else:
         metadata = raw_metadata
-    tensor = (
-        TensorMetadata.compile(metadata)
-        if "tensor_shape" in metadata
-        else None
-    )
+    tensor = TensorMetadata.compile(metadata) if "tensor_shape" in metadata else None
     annotation = getattr(
-        field, "annotation", getattr(field, "return_type", None),
+        field,
+        "annotation",
+        getattr(field, "return_type", None),
     )
     if tensor is not None and tensor.category != "virtual":
         may_be_inactive = bool(
@@ -507,9 +506,7 @@ def _field_schema(
     if excluded is None:
         excluded = False
     elif type(excluded) is not bool:
-        raise ValueError(
-            f"{module_name}.{name} exclude must be an exact bool or None"
-        )
+        raise ValueError(f"{module_name}.{name} exclude must be an exact bool or None")
     description = getattr(field, "description", None)
     if description is None:
         description = ""
@@ -587,13 +584,11 @@ class _ModuleSchemaDeclaration(HydroForgeModel):
         invalid = [
             getattr(module, "__name__", type(module).__name__)
             for module in self.modules
-            if not isinstance(module, type)
-            or not issubclass(module, AbstractModule)
+            if not isinstance(module, type) or not issubclass(module, AbstractModule)
         ]
         if invalid:
             raise ValueError(
-                "module schema entries must be AbstractModule classes: "
-                f"{invalid}"
+                f"module schema entries must be AbstractModule classes: {invalid}"
             )
         self._schema = _parse_module_schema_cached(
             self.modules,
@@ -613,7 +608,8 @@ def parse_module_schema(
 ) -> ModuleSchema:
     """Return one immutable schema shared by all instances of these modules."""
     declaration = _ModuleSchemaDeclaration(
-        modules=modules, include_computed=include_computed,
+        modules=modules,
+        include_computed=include_computed,
     )
     return declaration.schema
 
@@ -621,17 +617,9 @@ def parse_module_schema(
 class PartitionSchema(HydroForgeModel):
     """Validated coordinate/reference graph used by data partitioning."""
 
-    fields: Mapping[str, TensorMetadata]
+    fields: FrozenMapping[str, TensorMetadata]
     coordinates: frozenset[str]
-    selections: Mapping[str, str]
-
-    @model_validator(mode="after")
-    def _freeze_mappings(self) -> Self:
-        object.__setattr__(self, "fields", _immutable_dict(self.fields))
-        object.__setattr__(
-            self, "selections", _immutable_dict(self.selections),
-        )
-        return self
+    selections: FrozenMapping[str, str]
 
 
 class RuntimeTensorMetadata(HydroForgeModel):

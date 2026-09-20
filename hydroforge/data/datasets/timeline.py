@@ -6,12 +6,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from itertools import groupby
 from pathlib import Path
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Callable, cast
+from typing import TYPE_CHECKING, cast
 
 import cftime
 import numpy as np
@@ -21,7 +22,7 @@ from hydroforge.contracts.temporal import (
     canonical_calendar,
     timedelta_microseconds,
 )
-from hydroforge.data.datasets.base import AbstractDataset
+from hydroforge.data.datasets.base import SourceDataset
 
 if TYPE_CHECKING:
     from hydroforge.data.datasets.chunking import SourceChunk
@@ -51,7 +52,7 @@ class DatasetTimeline:
 
     def __init__(
         self,
-        owner: AbstractDataset,
+        owner: SourceDataset,
         *,
         base_dir: str | Path,
         prefix: str,
@@ -87,7 +88,7 @@ class DatasetTimeline:
         self._scan(required_times)
         self._build_plan()
 
-    def _rebind_trusted(self, owner: AbstractDataset) -> "DatasetTimeline":
+    def _rebind_trusted(self, owner: SourceDataset) -> DatasetTimeline:
         """Clone a validated storage plan for a derived Dataset view."""
 
         rebound = copy(self)
@@ -106,16 +107,14 @@ class DatasetTimeline:
         """Read one shard's CF calendar without decoding its heavy variable."""
 
         path = self._path(key)
-        with Dataset(path, "r") as dataset:
+        with self.owner._inspect_source_file(path), Dataset(path, "r") as dataset:
             time_var = self._time_variable(dataset, path)
             return canonical_calendar(getattr(time_var, "calendar", "standard"))
 
     def _bind_source_calendar(self, required_times: list[DateTime]) -> bool:
         """Probe lightweight time metadata before freezing logical dates."""
 
-        candidates = {
-            self._storage_key(timestamp) for timestamp in required_times
-        }
+        candidates = {self._storage_key(timestamp) for timestamp in required_times}
         probe = sorted(key for key in candidates if self._path(key).exists())
         if not probe:
             probe = sorted(self._discover_keys())
@@ -144,7 +143,7 @@ class DatasetTimeline:
             stop = len(name) - len(self.suffix) if self.suffix else len(name)
             if stop < len(self.prefix):
                 continue
-            key = name[len(self.prefix):stop]
+            key = name[len(self.prefix) : stop]
             if self._path(key) == path:
                 keys.add(key)
         return keys
@@ -163,7 +162,8 @@ class DatasetTimeline:
 
     @staticmethod
     def _support_ranges(
-        starts: list[DateTime], width: timedelta,
+        starts: list[DateTime],
+        width: timedelta,
     ) -> tuple[tuple[DateTime, DateTime], ...]:
         """Merge the half-open source windows supporting output timestamps."""
 
@@ -189,9 +189,7 @@ class DatasetTimeline:
         aggregate = self.time_aggregation is not None
         required_set = set(required_times)
         supports = self._support_ranges(required_times, owner.time_interval)
-        candidates = {
-            self._storage_key(timestamp) for timestamp in required_times
-        }
+        candidates = {self._storage_key(timestamp) for timestamp in required_times}
 
         if aggregate:
             # An output interval can span multiple file partitions. Deriving
@@ -208,7 +206,7 @@ class DatasetTimeline:
         seen_times: dict[DateTime, Path] = {}
         for key in sorted(keys):
             path = self._path(key)
-            with Dataset(path, "r") as dataset:
+            with owner._inspect_source_file(path), Dataset(path, "r") as dataset:
                 time_var = self._time_variable(dataset, path)
                 self._validate_data_units(dataset, path)
                 file_calendar = canonical_calendar(
@@ -229,7 +227,8 @@ class DatasetTimeline:
                 for index, dt in enumerate(dates):
                     in_range = (
                         self._inside_supports(dt, supports)
-                        if aggregate else dt in required_set
+                        if aggregate
+                        else dt in required_set
                     )
                     if in_range:
                         self.dt_to_loc[dt] = (key, index)
@@ -238,7 +237,9 @@ class DatasetTimeline:
 
         if aggregate:
             self.source_time_interval = self._infer_source_interval(source_times)
-            self.aggregation_factor = owner._get_time_aggregation_factor(self.source_time_interval)
+            self.aggregation_factor = owner._get_time_aggregation_factor(
+                self.source_time_interval
+            )
             self._validate_aggregation_times(required_times)
         else:
             missing = [dt for dt in required_times if dt not in self.dt_to_loc]
@@ -266,41 +267,27 @@ class DatasetTimeline:
         return key
 
     def _time_variable(self, dataset: Dataset, path: Path):
-        var_name = self.data_variable
-        if var_name is None:
-            candidates = [
-                dataset.variables[name] for name in ("time", "valid_time")
-                if name in dataset.variables
-            ]
-            if not candidates:
-                raise ValueError(
-                    f"Time variable not found in file: {path.name}"
-                )
-            if len(candidates) > 1:
-                names = [variable.name for variable in candidates]
-                raise ValueError(
-                    f"Ambiguous time variables in {path.name}: {names}"
-                )
-            return candidates[0]
-        if type(var_name) is not str or not var_name:
-            raise TypeError("dataset var_name must be a non-empty exact string")
-        data_dimensions = set(
-            dataset.variables[var_name].dimensions
+        data_dimensions = (
+            None
+            if self.data_variable is None
+            else set(dataset.variables[self.data_variable].dimensions)
         )
         candidates = []
         for name in ("time", "valid_time"):
             variable = dataset.variables.get(name)
-            if variable is None or len(variable.dimensions) != 1:
+            if variable is None:
                 continue
-            if variable.dimensions[0] in data_dimensions:
-                candidates.append(variable)
+            if data_dimensions is not None and (
+                len(variable.dimensions) != 1
+                or variable.dimensions[0] not in data_dimensions
+            ):
+                continue
+            candidates.append(variable)
         if not candidates:
             raise ValueError(f"Time variable not found in file: {path.name}")
         if len(candidates) > 1:
             names = [variable.name for variable in candidates]
-            raise ValueError(
-                f"Ambiguous time variables in {path.name}: {names}"
-            )
+            raise ValueError(f"Ambiguous time variables in {path.name}: {names}")
         return candidates[0]
 
     def _validate_data_units(self, dataset: Dataset, path: Path) -> None:
@@ -336,20 +323,22 @@ class DatasetTimeline:
         dates = self._decode_dates(time_var, path, key)
         if not dates:
             raise ValueError(f"Time axis is empty in {path.name}")
-        non_increasing = [
-            right for left, right in zip(dates, dates[1:])
-            if right <= left
-        ]
-        if non_increasing:
+        non_increasing = next(
+            (right for left, right in zip(dates, dates[1:]) if right <= left),
+            None,
+        )
+        if non_increasing is not None:
             raise ValueError(
                 f"Time axis in {path.name} must be strictly increasing; "
-                f"first invalid timestamp is {non_increasing[0]}"
+                f"first invalid timestamp is {non_increasing}"
             )
         return dates
 
     @staticmethod
     def _require_unique(
-        dates: list[DateTime], existing: dict[DateTime, Path], path: Path,
+        dates: list[DateTime],
+        existing: dict[DateTime, Path],
+        path: Path,
     ) -> None:
         duplicate = next((date for date in dates if date in existing), None)
         if duplicate is not None:
@@ -372,14 +361,10 @@ class DatasetTimeline:
             )
         raw = time_var[:]
         if np.ma.isMaskedArray(raw) and np.any(np.ma.getmaskarray(raw)):
-            raise ValueError(
-                f"Time variable in {path.name} contains missing values"
-            )
+            raise ValueError(f"Time variable in {path.name} contains missing values")
         values = np.asarray(raw)
         if values.ndim != 1:
-            raise ValueError(
-                f"Time variable in {path.name} must be one-dimensional"
-            )
+            raise ValueError(f"Time variable in {path.name} must be one-dimensional")
         if values.dtype.kind not in "iuf" or not np.isfinite(values).all():
             raise ValueError(
                 f"Time variable in {path.name} must contain finite numeric values"
@@ -446,7 +431,7 @@ class DatasetTimeline:
         dates = self.file_times.get(key)
         path = self._path(key)
         if dates is None:
-            with Dataset(path, "r") as dataset:
+            with self.owner._inspect_source_file(path), Dataset(path, "r") as dataset:
                 time_var = self._time_variable(dataset, path)
                 self._validate_data_units(dataset, path)
                 file_calendar = canonical_calendar(
@@ -479,16 +464,23 @@ class DatasetTimeline:
     @staticmethod
     def _infer_source_interval(source_times: list[DateTime]) -> timedelta:
         source_times = sorted(source_times)
-        duplicates = [right for left, right in zip(source_times, source_times[1:]) if left == right]
+        duplicates = [
+            right
+            for left, right in zip(source_times, source_times[1:])
+            if left == right
+        ]
         if duplicates:
             preview = ", ".join(str(dt) for dt in duplicates[:10])
-            raise ValueError(f"Duplicate source timestamps found. First duplicates: {preview}")
+            raise ValueError(
+                f"Duplicate source timestamps found. First duplicates: {preview}"
+            )
         diffs = [right - left for left, right in zip(source_times, source_times[1:])]
         if not diffs:
-            raise ValueError("Unable to infer source_time_interval from NetCDF time axis")
+            raise ValueError(
+                "Unable to infer source_time_interval from NetCDF time axis"
+            )
         widths = [
-            timedelta_microseconds(diff, label="source_time_interval")
-            for diff in diffs
+            timedelta_microseconds(diff, label="source_time_interval") for diff in diffs
         ]
         interval_width = min(widths)
         if interval_width <= 0:
@@ -499,7 +491,8 @@ class DatasetTimeline:
         # an actual aggregation window are rejected separately by
         # _validate_aggregation_times().
         irregular = [
-            diff for diff, width in zip(diffs, widths, strict=True)
+            diff
+            for diff, width in zip(diffs, widths, strict=True)
             if width % interval_width
         ]
         if irregular:
@@ -519,7 +512,9 @@ class DatasetTimeline:
         ]
 
     def _validate_aggregation_times(self, output_times: list[DateTime]) -> None:
-        missing = [dt for dt in self.source_times(output_times) if dt not in self.dt_to_loc]
+        missing = [
+            dt for dt in self.source_times(output_times) if dt not in self.dt_to_loc
+        ]
         if missing:
             preview = ", ".join(str(dt) for dt in missing[:10])
             raise ValueError(
@@ -531,25 +526,11 @@ class DatasetTimeline:
         # Preserve the logical time order.  Grouping by file globally is
         # incorrect when a custom key function revisits a shard (A, B, A):
         # concatenating all A reads before B silently permutes the timeline.
-        operations: list[ReadOp] = []
-        current_key: str | None = None
-        current_indices: list[int] = []
-
-        def flush() -> None:
-            nonlocal current_key, current_indices
-            if current_key is not None and current_indices:
-                operations.append((current_key, tuple(current_indices)))
-            current_key = None
-            current_indices = []
-
-        for dt in times:
-            key, index = self.dt_to_loc[dt]
-            if key != current_key:
-                flush()
-                current_key = key
-            current_indices.append(index)
-        flush()
-        return tuple(operations)
+        locations = (self.dt_to_loc[dt] for dt in times)
+        return tuple(
+            (key, tuple(index for _key, index in group))
+            for key, group in groupby(locations, key=lambda location: location[0])
+        )
 
     def _build_read(self, times: list[DateTime]) -> TimelineRead:
         if self.time_aggregation is None:
@@ -563,7 +544,8 @@ class DatasetTimeline:
         )
 
     def operations_for_times(
-        self, times: list[DateTime],
+        self,
+        times: list[DateTime],
     ) -> tuple[ReadOp, ...]:
         """Compile storage operations for an arbitrary logical time window."""
 

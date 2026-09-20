@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import math
+import os
+import sys
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from functools import lru_cache
+from importlib.metadata import distributions
 from inspect import signature
-import math
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import MappingProxyType
-from typing import Any, TypedDict, Unpack
+from typing import Annotated, Any, TypedDict, Unpack
 
+import netCDF4 as _netcdf4
 import numpy as np
 from netCDF4 import Dataset
-from pydantic import model_validator
+from pydantic import BeforeValidator, Field, validate_call
 
-from hydroforge.contracts.validation import HydroForgeModel, _immutable_dict
+from hydroforge.contracts.validation import FrozenMapping, HydroForgeModel
 from hydroforge.serialization.files import atomic_output_path
 
 
@@ -24,14 +30,7 @@ class _NetCDFDatasetOptions(TypedDict, total=False):
 
 class _AtomicNetCDFDeclaration(HydroForgeModel):
     file_path: str | Path
-    dataset_options: Mapping[str, Any]
-
-    @model_validator(mode="after")
-    def _validate_declaration(self):
-        object.__setattr__(
-            self, "dataset_options", _immutable_dict(self.dataset_options),
-        )
-        return self
+    dataset_options: FrozenMapping[str, Any]
 
 
 OUTPUT_FORMAT = "hydroforge.statistics"
@@ -39,38 +38,120 @@ OUTPUT_VERSION = 3
 COMMITTED_STEPS_ATTR = "hydroforge_committed_steps"
 RUN_ID_ATTR = "hydroforge_run_id"
 
-DEFAULT_NETCDF_OPTIONS: Mapping[str, Any] = MappingProxyType({
-    "compression": "blosc_zstd",
-    "complevel": 5,
-    "blosc_shuffle": 1,
-})
+DEFAULT_NETCDF_OPTIONS: Mapping[str, Any] = MappingProxyType(
+    {
+        "compression": "blosc_zstd",
+        "complevel": 5,
+        "blosc_shuffle": 1,
+    }
+)
 
-_ZLIB_FALLBACK_OPTIONS: Mapping[str, Any] = MappingProxyType({
-    "compression": "zlib",
-    "complevel": 4,
-})
+_ZLIB_FALLBACK_OPTIONS: Mapping[str, Any] = MappingProxyType(
+    {
+        "compression": "zlib",
+        "complevel": 4,
+    }
+)
 
 DEFAULT_NETCDF_CHUNK_BYTES = 4 * 1024 * 1024
 MIN_BLOSC_CHUNK_BYTES = 128
 
 _NETCDF_CREATE_VARIABLE_SIGNATURE = signature(Dataset.createVariable)
 
-_NETCDF_COMPRESSION_FILTERS = frozenset({
-    "zlib",
-    "szip",
-    "zstd",
-    "bzip2",
-    "blosc_lz",
-    "blosc_lz4",
-    "blosc_lz4hc",
-    "blosc_zlib",
-    "blosc_zstd",
-})
+_NETCDF_COMPRESSION_FILTERS = frozenset(
+    {
+        "zlib",
+        "szip",
+        "zstd",
+        "bzip2",
+        "blosc_lz",
+        "blosc_lz4",
+        "blosc_lz4hc",
+        "blosc_zlib",
+        "blosc_zstd",
+    }
+)
 
 LOGICAL_DTYPE_ATTR = "hydroforge_dtype"
 BOOL_LOGICAL_DTYPE = "bool"
 BOOL_NETCDF_STORAGE_DTYPE = np.dtype("u1")
 BOOL_NETCDF_READ_DTYPES = frozenset({np.dtype("i1"), np.dtype("u1")})
+
+
+def _conda_hdf5_plugin_directories() -> tuple[Path, ...]:
+    """Return standard Conda HDF5 filter-plugin directories that exist."""
+
+    prefixes: list[Path] = []
+    for raw_prefix in (sys.prefix, os.environ.get("CONDA_PREFIX")):
+        if not raw_prefix:
+            continue
+        prefix = Path(raw_prefix)
+        if prefix not in prefixes and (prefix / "conda-meta").is_dir():
+            prefixes.append(prefix)
+    candidates = tuple(
+        candidate
+        for prefix in prefixes
+        for candidate in (
+            prefix / "lib" / "hdf5" / "plugin",
+            prefix / "lib" / "hdf5" / "plugins",
+            prefix / "lib" / "plugin",
+            prefix / "Library" / "hdf5" / "lib" / "plugin",
+        )
+        if candidate.is_dir()
+        and any(
+            path.is_file()
+            and ("nch5blosc" in path.name or "nczhdf5filters" in path.name)
+            for path in candidate.iterdir()
+        )
+    )
+    return candidates
+
+
+@lru_cache(maxsize=1)
+def _netcdf4_installer() -> str | None:
+    """Return the installer recorded for the imported ``netCDF4`` package."""
+
+    package_directory = Path(_netcdf4.__file__).resolve().parent
+    matches: list[str] = []
+    for distribution in distributions():
+        name = distribution.metadata.get("Name", "")
+        if name.lower().replace("-", "_") != "netcdf4":
+            continue
+        try:
+            distribution_package = Path(
+                distribution.locate_file("netCDF4")
+            ).resolve()
+        except (OSError, ValueError):
+            continue
+        if distribution_package != package_directory:
+            continue
+        installer = distribution.read_text("INSTALLER")
+        if installer:
+            matches.append(installer.strip().lower())
+
+    if "pip" in matches:
+        return "pip"
+    return matches[0] if matches else None
+
+
+def _prefer_conda_hdf5_plugin_directory() -> None:
+    """Use Conda's HDF5 plugins only for a Conda-installed netCDF4 package."""
+
+    if _netcdf4_installer() != "conda":
+        return
+    candidates = _conda_hdf5_plugin_directories()
+    if not candidates:
+        return
+    current = os.environ.get("HDF5_PLUGIN_PATH")
+    package_plugins = Path(_netcdf4.__file__).resolve().parent / "plugins"
+    if current and Path(current).resolve() != package_plugins:
+        return
+    os.environ["HDF5_PLUGIN_PATH"] = os.pathsep.join(
+        str(candidate) for candidate in candidates
+    )
+
+
+_prefer_conda_hdf5_plugin_directory()
 
 
 def netcdf_dtype_encoding(dtype: Any) -> tuple[np.dtype, str | None]:
@@ -131,7 +212,7 @@ def _blosc_chunk_is_too_small(
     dimensions: Sequence[str],
     options: Mapping[str, Any],
 ) -> bool:
-    """Detect Blosc chunks at or below the filter's unsafe boundary."""
+    """Reject chunks whose size is unsafe or left to unlimited-axis heuristics."""
 
     dims = tuple(dimensions)
     if not dims:
@@ -143,9 +224,40 @@ def _blosc_chunk_is_too_small(
         return math.prod(chunks) * np.dtype(dtype).itemsize <= MIN_BLOSC_CHUNK_BYTES
     resolved = tuple(dataset.dimensions[name] for name in dims)
     if any(dimension.isunlimited() for dimension in resolved):
-        return False
+        return True
     elements = math.prod(len(dimension) for dimension in resolved)
     return elements * np.dtype(dtype).itemsize <= MIN_BLOSC_CHUNK_BYTES
+
+
+@lru_cache(maxsize=1)
+def _probe_blosc_zstd_filter() -> bool:
+    """Verify that the active NetCDF/HDF5 stack can round-trip Blosc data."""
+
+    values = np.arange(64, dtype=np.float32)
+    try:
+        with TemporaryDirectory(prefix="hydroforge_netcdf_probe-") as directory:
+            path = Path(directory) / "blosc_zstd.nc"
+            with Dataset(path, "w", format="NETCDF4") as probe:
+                probe.createDimension("cell", values.size)
+                variable = probe.createVariable(
+                    "value",
+                    values.dtype,
+                    ("cell",),
+                    chunksizes=(values.size,),
+                    compression="blosc_zstd",
+                    complevel=5,
+                    blosc_shuffle=1,
+                )
+                filters = variable.filters()
+                if not isinstance(filters, Mapping) or not filters.get("blosc"):
+                    return False
+                variable[:] = values
+                probe.sync()
+            with Dataset(path, "r") as probe:
+                restored = np.asarray(probe.variables["value"][:])
+            return np.array_equal(restored, values)
+    except Exception:
+        return False
 
 
 def _resolve_netcdf_compression_options_trusted(
@@ -170,7 +282,7 @@ def _resolve_netcdf_compression_options_trusted(
         dtype=dtype,
         dimensions=dimensions,
         options=resolved,
-    ):
+    ) and _probe_blosc_zstd_filter():
         return resolved
     resolved.pop("blosc_shuffle", None)
     resolved.update(_ZLIB_FALLBACK_OPTIONS)
@@ -212,9 +324,7 @@ def normalize_netcdf_variable_options(options: Mapping[str, Any]) -> dict[str, A
             **normalized,
         )
     except TypeError as error:
-        raise ValueError(
-            f"unsupported NetCDF variable options: {error}"
-        ) from error
+        raise ValueError(f"unsupported NetCDF variable options: {error}") from error
 
     for name in ("zlib", "shuffle", "fletcher32", "contiguous"):
         if name in normalized and type(normalized[name]) is not bool:
@@ -227,13 +337,8 @@ def normalize_netcdf_variable_options(options: Mapping[str, Any]) -> dict[str, A
                 "NetCDF option 'compression' must be an exact str, False, or None"
             )
         if compression not in _NETCDF_COMPRESSION_FILTERS:
-            raise ValueError(
-                f"unsupported NetCDF compression filter {compression!r}"
-            )
-    if (
-        normalized.get("zlib") is True
-        and compression not in {None, False, "zlib"}
-    ):
+            raise ValueError(f"unsupported NetCDF compression filter {compression!r}")
+    if normalized.get("zlib") is True and compression not in {None, False, "zlib"}:
         raise ValueError(
             "NetCDF zlib=True cannot be combined with a different compression filter"
         )
@@ -254,24 +359,27 @@ def normalize_netcdf_variable_options(options: Mapping[str, Any]) -> dict[str, A
             raise ValueError("NetCDF chunksizes must contain positive exact integers")
         normalized["chunksizes"] = chunks
 
-    if "blosc_shuffle" in normalized:
-        value = normalized["blosc_shuffle"]
-        if type(value) is not int or value not in {0, 1, 2}:
-            raise ValueError("NetCDF blosc_shuffle must be exactly 0, 1, or 2")
-    if "szip_coding" in normalized:
-        value = normalized["szip_coding"]
-        if type(value) is not str or value not in {"nn", "ec"}:
-            raise ValueError("NetCDF szip_coding must be 'nn' or 'ec'")
+    for name, kind, choices, description in (
+        ("blosc_shuffle", int, {0, 1, 2}, "exactly 0, 1, or 2"),
+        ("szip_coding", str, {"nn", "ec"}, "'nn' or 'ec'"),
+        ("endian", str, {"native", "little", "big"}, "'native', 'little', or 'big'"),
+        (
+            "quantize_mode",
+            str,
+            {"BitGroom", "GranularBitRound", "BitRound"},
+            "'BitGroom', 'GranularBitRound', or 'BitRound'",
+        ),
+    ):
+        if name in normalized:
+            value = normalized[name]
+            if type(value) is not kind or value not in choices:
+                raise ValueError(f"NetCDF {name} must be {description}")
     if "szip_pixels_per_block" in normalized:
         value = normalized["szip_pixels_per_block"]
         if type(value) is not int or value < 4 or value > 32 or value % 2:
             raise ValueError(
                 "NetCDF szip_pixels_per_block must be an even exact int in [4, 32]"
             )
-    if "endian" in normalized:
-        value = normalized["endian"]
-        if type(value) is not str or value not in {"native", "little", "big"}:
-            raise ValueError("NetCDF endian must be 'native', 'little', or 'big'")
     for name, minimum in (
         ("least_significant_digit", 0),
         ("significant_digits", 1),
@@ -282,15 +390,6 @@ def normalize_netcdf_variable_options(options: Mapping[str, Any]) -> dict[str, A
                 raise ValueError(
                     f"NetCDF {name} must be an exact int >= {minimum} or None"
                 )
-    if "quantize_mode" in normalized:
-        value = normalized["quantize_mode"]
-        if type(value) is not str or value not in {
-            "BitGroom", "GranularBitRound", "BitRound",
-        }:
-            raise ValueError(
-                "NetCDF quantize_mode must be 'BitGroom', "
-                "'GranularBitRound', or 'BitRound'"
-            )
     if "chunk_cache" in normalized and normalized["chunk_cache"] is not None:
         value = normalized["chunk_cache"]
         if type(value) is not int or value <= 0:
@@ -322,7 +421,9 @@ def _largest_divisor_not_exceeding(value: int, limit: int) -> int:
 
 
 def _fit_spatial_chunks(
-    shape: Sequence[int], *, max_elements: int,
+    shape: Sequence[int],
+    *,
+    max_elements: int,
 ) -> tuple[int, ...]:
     """Tile a row deterministically without exceeding an element budget.
 
@@ -332,13 +433,10 @@ def _fit_spatial_chunks(
     of zero.
     """
 
-    extents = [int(extent) for extent in shape]
-    if any(extent < 0 for extent in extents):
-        raise ValueError("NetCDF output dimensions must be non-negative")
-    chunks = [max(1, extent) for extent in extents]
+    chunks = [max(1, extent) for extent in shape]
     while math.prod(chunks) > max_elements:
         axis = max(range(len(chunks)), key=chunks.__getitem__)
-        other = math.prod(chunks[:axis] + chunks[axis + 1:])
+        other = math.prod(chunks[:axis] + chunks[axis + 1 :])
         fitted = max(1, max_elements // max(other, 1))
         if fitted >= chunks[axis]:
             fitted = max(1, chunks[axis] // 2)
@@ -346,39 +444,52 @@ def _fit_spatial_chunks(
     return tuple(chunks)
 
 
+def _exact_chunk_count(value: Any) -> int:
+    if type(value) is not int:
+        raise ValueError("NetCDF chunk counts must be exact integers")
+    return value
+
+
+_ChunkExtent = Annotated[int, BeforeValidator(_exact_chunk_count), Field(ge=0)]
+_PositiveChunkCount = Annotated[_ChunkExtent, Field(gt=0)]
+
+
+@validate_call(config=HydroForgeModel.model_config)
 def plan_streaming_netcdf_chunks(
     options: Mapping[str, Any],
     *,
     dtype: Any,
-    row_shape: Sequence[int],
-    write_batch_size: int,
-    target_bytes: int = DEFAULT_NETCDF_CHUNK_BYTES,
+    row_shape: Sequence[_ChunkExtent],
+    write_batch_size: _PositiveChunkCount,
+    target_bytes: _PositiveChunkCount = DEFAULT_NETCDF_CHUNK_BYTES,
 ) -> dict[str, Any]:
     """Add an aligned streaming chunk layout unless the caller chose one."""
 
     normalized = dict(options)
     if "chunksizes" in normalized or normalized.get("contiguous") is True:
         return normalized
-    if type(write_batch_size) is not int or write_batch_size <= 0:
-        raise ValueError("NetCDF write_batch_size must be a positive exact int")
-    if type(target_bytes) is not int or target_bytes <= 0:
-        raise ValueError("NetCDF target chunk bytes must be a positive exact int")
 
     storage = np.dtype(dtype)
-    shape = tuple(int(extent) for extent in row_shape)
-    row_elements = math.prod(shape) if shape else 1
+    shape = tuple(row_shape)
+    row_elements = math.prod(shape)
     row_bytes = max(1, row_elements * storage.itemsize)
     max_time_chunk = max(1, min(write_batch_size, target_bytes // row_bytes))
     time_chunk = _largest_divisor_not_exceeding(
-        write_batch_size, max_time_chunk,
+        write_batch_size,
+        max_time_chunk,
     )
     spatial_budget = max(1, target_bytes // (time_chunk * storage.itemsize))
-    spatial_chunks = _fit_spatial_chunks(
-        shape, max_elements=spatial_budget,
-    ) if shape else ()
+    spatial_chunks = (
+        _fit_spatial_chunks(
+            shape,
+            max_elements=spatial_budget,
+        )
+        if shape
+        else ()
+    )
     compression = normalized.get("compression")
     if type(compression) is str and compression.startswith("blosc_"):
-        spatial_elements = math.prod(spatial_chunks) if spatial_chunks else 1
+        spatial_elements = math.prod(spatial_chunks)
         minimum_time = math.ceil(
             MIN_BLOSC_CHUNK_BYTES / (spatial_elements * storage.itemsize)
         )
@@ -400,7 +511,8 @@ def prepare_netcdf_variable_options(
     if logical_dtype not in {None, BOOL_LOGICAL_DTYPE}:
         raise ValueError(f"unsupported NetCDF logical dtype {logical_dtype!r}")
     if not isinstance(dimensions, Sequence) or isinstance(
-        dimensions, (str, bytes),
+        dimensions,
+        (str, bytes),
     ):
         raise TypeError("NetCDF variable dimensions must be a sequence")
     dims = tuple(dimensions)
@@ -436,23 +548,15 @@ def _prepare_netcdf_variable_options_trusted(
             f"NetCDF chunksizes for {name!r} have rank {len(chunks)}, "
             f"expected rank {len(dims)}"
         )
-    if normalized.get("contiguous") is True and chunks is not None:
-        raise ValueError(
-            f"NetCDF variable {name!r} cannot be contiguous and chunked"
-        )
     if storage.kind != "f" and any(
         normalized.get(option) is not None
         for option in ("least_significant_digit", "significant_digits")
     ):
-        raise TypeError(
-            f"NetCDF quantization for {name!r} requires floating storage"
-        )
+        raise TypeError(f"NetCDF quantization for {name!r} requires floating storage")
     if "fill_value" not in normalized:
         return normalized
     fill = normalized["fill_value"]
-    if fill is None or fill is False or (
-        type(fill) is str and fill == "default"
-    ):
+    if fill is None or fill is False or (type(fill) is str and fill == "default"):
         return normalized
     if logical_dtype == BOOL_LOGICAL_DTYPE:
         raise TypeError(
@@ -473,8 +577,7 @@ def _prepare_netcdf_variable_options_trusted(
     if storage.kind == "f":
         if type(fill) is not float:
             raise TypeError(
-                f"floating NetCDF variable {name!r} requires an exact float "
-                "fill_value"
+                f"floating NetCDF variable {name!r} requires an exact float fill_value"
             )
         if math.isfinite(fill):
             limits = np.finfo(storage)
@@ -509,11 +612,12 @@ def atomic_netcdf_dataset(
     """Create and atomically publish one complete NetCDF dataset."""
 
     declaration = _AtomicNetCDFDeclaration(
-        file_path=file_path, dataset_options=dataset_options,
+        file_path=file_path,
+        dataset_options=dataset_options,
     )
     with _atomic_netcdf_dataset_trusted(
         declaration.file_path,
-        **dict(declaration.dataset_options),
+        **declaration.dataset_options,
     ) as dataset:
         yield dataset
 
@@ -527,6 +631,8 @@ def _atomic_netcdf_dataset_trusted(
 
     with atomic_netcdf_output(file_path) as temporary:
         with Dataset(
-            temporary, "w", **dataset_options,
+            temporary,
+            "w",
+            **dataset_options,
         ) as dataset:
             yield dataset

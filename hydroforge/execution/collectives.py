@@ -14,21 +14,32 @@ from typing import Literal
 
 import torch
 import torch.distributed as dist
-from pydantic import PrivateAttr, model_validator
+from pydantic import Field, PrivateAttr, model_validator
 
 from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.data.parallel import ParallelAxis
 from hydroforge.kernels.context import (
-    active_operator_recorder, compiled_operator_entry,
+    active_operator_recorder,
+    compiled_operator_entry,
 )
-
 
 Reduction = Literal["min", "max", "sum"]
 
 _DTYPE_CODES = {
-    dtype: index for index, dtype in enumerate((
-        torch.uint8, torch.int8, torch.int32, torch.int64,
-        torch.float16, torch.float32, torch.float64, torch.bfloat16,
-    ), start=1)
+    dtype: index
+    for index, dtype in enumerate(
+        (
+            torch.uint8,
+            torch.int8,
+            torch.int32,
+            torch.int64,
+            torch.float16,
+            torch.float32,
+            torch.float64,
+            torch.bfloat16,
+        ),
+        start=1,
+    )
 }
 # MPS has an ABI code so a Metal recorder can reject collectives with its
 # backend-specific compile error before any process group exists. XPU uses the
@@ -52,7 +63,8 @@ class _CollectiveRequest(HydroForgeModel):
     tensors: tuple[torch.Tensor, ...] | list[torch.Tensor]
     operation: Literal["all_reduce", "reduce"]
     reduction: Reduction
-    destination: int | None = None
+    destination: int | None = Field(default=None, ge=0)
+    scope: ParallelAxis = "spatial"
 
     _abis: tuple[tuple[int, int, int], ...] = PrivateAttr()
 
@@ -63,8 +75,6 @@ class _CollectiveRequest(HydroForgeModel):
             raise ValueError("all_reduce does not accept a destination")
         if self.operation == "reduce" and self.destination is None:
             raise ValueError("reduce requires a destination")
-        if self.destination is not None and self.destination < 0:
-            raise ValueError("reduce destination must be non-negative")
         devices = {tensor.device for tensor in batch}
         if len(devices) > 1:
             raise ValueError(
@@ -72,8 +82,7 @@ class _CollectiveRequest(HydroForgeModel):
                 f"{sorted(map(str, devices))}"
             )
         self._abis = tuple(
-            _tensor_abi(tensor, operation=self.operation)
-            for tensor in batch
+            _tensor_abi(tensor, operation=self.operation) for tensor in batch
         )
         object.__setattr__(self, "tensors", batch)
         return self
@@ -91,12 +100,12 @@ def _require_distributed(operation: str) -> None:
 
 
 def _tensor_abi(
-    tensor: torch.Tensor, *, operation: str,
+    tensor: torch.Tensor,
+    *,
+    operation: str,
 ) -> tuple[int, int, int]:
     """Validate and encode the process-group-independent tensor ABI."""
 
-    if not isinstance(tensor, torch.Tensor):
-        raise ValueError(f"{operation} tensor must be a torch.Tensor")
     if tensor.layout != torch.strided or not tensor.is_contiguous():
         raise ValueError(f"{operation} tensor must be contiguous and strided")
     if tensor.numel() < 1:
@@ -114,9 +123,7 @@ def _tensor_abi(
             f"{operation} does not support device {tensor.device.type!r}"
         ) from error
     if tensor.device.type not in _COLLECTIVE_DEVICES:
-        raise ValueError(
-            f"{operation} does not support device {tensor.device.type!r}"
-        )
+        raise ValueError(f"{operation} does not support device {tensor.device.type!r}")
     return dtype_code, tensor.numel(), device_code
 
 
@@ -137,22 +144,32 @@ def _batch_signature(
         -1 if destination is None else destination,
         *(field for abi in abis for field in abi),
     ):
-        digest = ((digest ^ (value & 0xFFFFFFFFFFFFFFFF)) * _FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+        digest = (
+            (digest ^ (value & 0xFFFFFFFFFFFFFFFF)) * _FNV_PRIME
+        ) & 0xFFFFFFFFFFFFFFFF
     return len(abis), digest & _SIGNATURE_MASK, sum(abi[1] for abi in abis)
 
 
 def _validate_collective_environment(
-    tensor: torch.Tensor | None, *, operation: str,
+    tensor: torch.Tensor | None,
+    *,
+    operation: str,
     destination: int | None = None,
+    group=None,
+    group_size: int | None = None,
 ) -> None:
     """Validate batch-invariant process-group state exactly once."""
 
-    _require_distributed(operation)
-    if destination is not None and not 0 <= destination < dist.get_world_size():
-        raise ValueError(f"{operation} destination is outside the process group")
-    if tensor is None:
+    if group_size != 1:
+        _require_distributed(operation)
+    group_kwargs = {} if group is None else {"group": group}
+    if destination is not None:
+        size = dist.get_world_size(**group_kwargs) if group_size is None else group_size
+        if not 0 <= destination < size:
+            raise ValueError(f"{operation} destination is outside the process group")
+    if tensor is None or group_size == 1:
         return
-    backend = str(dist.get_backend()).lower()
+    backend = str(dist.get_backend(**group_kwargs)).lower()
     required_device = {"nccl": "cuda", "xccl": "xpu"}
     for backend_name, device_type in required_device.items():
         if backend_name in backend and tensor.device.type != device_type:
@@ -167,12 +184,14 @@ def _validate_collective_environment(
         raise ValueError(
             f"{operation} of a {tensor.device.type.upper()} tensor requires "
             f"the {required_backend.upper()} process-group backend, got "
-            f"{dist.get_backend()!s}"
+            f"{backend}"
         )
 
 
 def _event_kind(
-    operation: str, reduction: Reduction, destination: int | None = None,
+    operation: str,
+    reduction: Reduction,
+    destination: int | None = None,
 ) -> int:
     reduction_code = _REDUCTIONS[reduction][0]
     if operation == "all_reduce":
@@ -180,15 +199,16 @@ def _event_kind(
     return 100 + destination * 3 + reduction_code
 
 
-def _coalescing_group(device: torch.device):
+def _coalescing_group(device: torch.device, group=None):
     """Group the batch into one NCCL submission when the backend allows it."""
 
     manager = getattr(dist, "_coalescing_manager", None)
     if manager is None or device.type != "cuda":
         return nullcontext()
-    if "nccl" not in str(dist.get_backend()).lower():
+    group_kwargs = {} if group is None else {"group": group}
+    if "nccl" not in str(dist.get_backend(**group_kwargs)).lower():
         return nullcontext()
-    return manager(device=device, async_ops=False)
+    return manager(device=device, async_ops=False, **group_kwargs)
 
 
 def _run_validated_batch(
@@ -198,6 +218,7 @@ def _run_validated_batch(
     operation: str,
     reduction: Reduction,
     destination: int | None,
+    scope: ParallelAxis = "spatial",
 ) -> None:
     """Synchronize once and launch one already validated batch."""
 
@@ -210,27 +231,52 @@ def _run_validated_batch(
         )
     _code, op = _REDUCTIONS[reduction]
 
-    from hydroforge.execution.step import synchronize_collective
+    from hydroforge.execution.step import (
+        _ENSEMBLE_COLLECTIVE_FLAG,
+        _collective_mesh,
+        synchronize_collective,
+    )
 
+    mesh = _collective_mesh()
+    if mesh is None and scope == "ensemble":
+        raise ValueError("ensemble collectives require an EnsembleParallel mesh")
+    group = None if mesh is None else mesh.group(scope)
+    group_size = (
+        None
+        if mesh is None
+        else mesh.spatial_partitions
+        if scope == "spatial"
+        else mesh.ensemble_partitions
+    )
     _validate_collective_environment(
         tensors[0] if tensors else None,
         operation=operation,
         destination=destination,
+        group=group,
+        group_size=group_size,
     )
     # The handshake runs even for an empty batch: a rank that contributes no
     # tensors must still be seen to disagree with one that does.
     synchronize_collective(
-        _event_kind(operation, reduction, destination),
+        _event_kind(operation, reduction, destination)
+        | (_ENSEMBLE_COLLECTIVE_FLAG if scope == "ensemble" else 0),
         _batch_signature(abis, reduction, destination),
     )
-    if not tensors:
+    if not tensors or group_size == 1:
         return
-    with _coalescing_group(tensors[0].device):
+    global_destination = destination
+    if destination is not None and mesh is not None:
+        ranks = mesh.rank_groups(scope)[
+            mesh.ensemble_rank if scope == "spatial" else mesh.spatial_rank
+        ]
+        global_destination = ranks[destination]
+    group_kwargs = {} if group is None else {"group": group}
+    with _coalescing_group(tensors[0].device, **group_kwargs):
         for tensor in tensors:
             if destination is None:
-                dist.all_reduce(tensor, op=op)
+                dist.all_reduce(tensor, op=op, **group_kwargs)
             else:
-                dist.reduce(tensor, dst=destination, op=op)
+                dist.reduce(tensor, dst=global_destination, op=op, **group_kwargs)
 
 
 def _submit_collective(request: _CollectiveRequest) -> None:
@@ -242,21 +288,16 @@ def _submit_collective(request: _CollectiveRequest) -> None:
             request.reduction,
             operation=request.operation,
             destination=request.destination,
+            scope=request.scope,
         )
         return
-    from hydroforge.execution.step import _managed_step_active
-
-    if not _managed_step_active():
-        raise RuntimeError(
-            "HydroForge collectives may be called only inside a managed step "
-            "or an operator recorder"
-        )
     _run_validated_batch(
         request.tensors,
         request.abis,
         operation=request.operation,
         reduction=request.reduction,
         destination=request.destination,
+        scope=request.scope,
     )
 
 
@@ -267,55 +308,87 @@ def launch_recorded_collective_batch(
     operation: str,
     reduction: Reduction,
     destination: int | None,
+    scope: ParallelAxis = "spatial",
 ) -> None:
     """Replay one compiled batch without repeating its tensor ABI checks."""
 
     _run_validated_batch(
-        tensors, abis, operation=operation, reduction=reduction,
+        tensors,
+        abis,
+        operation=operation,
+        reduction=reduction,
         destination=destination,
+        scope=scope,
     )
 
 
 @compiled_operator_entry
-def all_reduce_(tensor: torch.Tensor, *, reduction: Reduction) -> None:
+def all_reduce_(
+    tensor: torch.Tensor, *, reduction: Reduction, scope: ParallelAxis = "spatial"
+) -> None:
     """Apply an in-place distributed reduction as an explicit IR operator.
 
     Unlike calling ``torch.distributed`` directly inside a lexical substep,
     this operation is recorded once and replayed on every physical iteration.
     """
 
-    _submit_collective(_CollectiveRequest(
-        tensors=(tensor,), operation="all_reduce", reduction=reduction,
-    ))
+    _submit_collective(
+        _CollectiveRequest(
+            tensors=(tensor,),
+            operation="all_reduce",
+            reduction=reduction,
+            scope=scope,
+        )
+    )
 
 
 @compiled_operator_entry
 def all_reduce_many_(
-    tensors: Sequence[torch.Tensor], *, reduction: Reduction = "sum",
+    tensors: Sequence[torch.Tensor],
+    *,
+    reduction: Reduction = "sum",
+    scope: ParallelAxis = "spatial",
 ) -> None:
     """All-reduce a batch behind one handshake and one coalescing group."""
 
-    _submit_collective(_CollectiveRequest(
-        tensors=tensors, operation="all_reduce", reduction=reduction,
-    ))
+    _submit_collective(
+        _CollectiveRequest(
+            tensors=tensors,
+            operation="all_reduce",
+            reduction=reduction,
+            scope=scope,
+        )
+    )
 
 
 @compiled_operator_entry
 def reduce_(
-    tensor: torch.Tensor, *, destination: int, reduction: Reduction = "sum",
+    tensor: torch.Tensor,
+    *,
+    destination: int,
+    reduction: Reduction = "sum",
+    scope: ParallelAxis = "spatial",
 ) -> None:
     """Reduce one tensor to ``destination`` through the managed-step protocol."""
 
-    _submit_collective(_CollectiveRequest(
-        tensors=(tensor,), operation="reduce", reduction=reduction,
-        destination=destination,
-    ))
+    _submit_collective(
+        _CollectiveRequest(
+            tensors=(tensor,),
+            operation="reduce",
+            reduction=reduction,
+            destination=destination,
+            scope=scope,
+        )
+    )
 
 
 @compiled_operator_entry
 def reduce_many_(
-    tensors: Sequence[torch.Tensor], *, destination: int,
+    tensors: Sequence[torch.Tensor],
+    *,
+    destination: int,
     reduction: Reduction = "sum",
+    scope: ParallelAxis = "spatial",
 ) -> None:
     """Reduce a batch to ``destination`` behind one handshake.
 
@@ -323,7 +396,12 @@ def reduce_many_(
     length, order and ABI; a mismatch raises at the handshake, not in NCCL.
     """
 
-    _submit_collective(_CollectiveRequest(
-        tensors=tensors, operation="reduce", reduction=reduction,
-        destination=destination,
-    ))
+    _submit_collective(
+        _CollectiveRequest(
+            tensors=tensors,
+            operation="reduce",
+            reduction=reduction,
+            destination=destination,
+            scope=scope,
+        )
+    )

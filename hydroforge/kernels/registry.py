@@ -36,33 +36,47 @@ import torch
 from pydantic import PrivateAttr, model_validator
 
 from hydroforge.contracts.kernels import (
-    BackendLoweringSpec, BufferDTypeABI, KernelMetadata, KernelSpec,
+    BackendLoweringSpec,
+    BufferDTypeABI,
+    KernelMetadata,
+    KernelSpec,
 )
-from hydroforge.contracts.validation import HydroForgeModel, _immutable_dict
+from hydroforge.contracts.naming import Identifier
+from hydroforge.contracts.validation import FrozenMapping, HydroForgeModel
+from hydroforge.kernels.backends.cuda.template import make_spec_cuda_dispatcher
+from hydroforge.kernels.backends.metal.template import make_spec_metal_dispatcher
 from hydroforge.kernels.context import (
-    active_operator_recorder, kernel_factory_contract, registry_factory,
+    active_operator_recorder,
+    kernel_factory_contract,
+    registry_factory,
 )
 from hydroforge.kernels.devices import devices_match
 from hydroforge.kernels.dispatcher import (
-    make_metal_dispatcher, make_torch_dispatcher, make_triton_dispatcher,
-    make_triton_program_dispatcher, make_triton_sequence_dispatcher,
+    make_metal_dispatcher,
+    make_torch_dispatcher,
+    make_triton_dispatcher,
+    make_triton_program_dispatcher,
+    make_triton_sequence_dispatcher,
 )
-from hydroforge.kernels.backends.metal.template import make_spec_metal_dispatcher
-from hydroforge.kernels.backends.cuda.template import make_spec_cuda_dispatcher
 
 __all__ = [
     "BackendRegistry",
-    "devices_match", "make_metal_dispatcher", "make_torch_dispatcher",
+    "devices_match",
+    "make_metal_dispatcher",
+    "make_torch_dispatcher",
     "registry_factory",
     "make_spec_metal_dispatcher",
     "make_spec_cuda_dispatcher",
-    "make_triton_dispatcher", "make_triton_program_dispatcher",
-    "make_triton_sequence_dispatcher", "resolve_model_backend",
+    "make_triton_dispatcher",
+    "make_triton_program_dispatcher",
+    "make_triton_sequence_dispatcher",
+    "resolve_model_backend",
 ]
 
 
 _ACTIVE_AUTO_BINDER: ContextVar[Any | None] = ContextVar(
-    "hydroforge_automatic_kernel_binder", default=None,
+    "hydroforge_automatic_kernel_binder",
+    default=None,
 )
 
 _BACKEND_DEVICE_TYPES: Mapping[str, tuple[str, ...]] = {
@@ -139,13 +153,15 @@ def _matching_triton_drivers(
             target_backend, active_device = _inspect_triton_driver(active)
         except (AttributeError, ImportError, RuntimeError, TypeError, ValueError):
             continue
-        if (
-            target_backend in expected_targets
-            and devices_match(active_device, device)
-        ):
-            candidates.append((
-                str(registration), active, target_backend, active_device,
-            ))
+        if target_backend in expected_targets and devices_match(active_device, device):
+            candidates.append(
+                (
+                    str(registration),
+                    active,
+                    target_backend,
+                    active_device,
+                )
+            )
     return tuple(candidates)
 
 
@@ -171,10 +187,7 @@ def _active_triton_runtime(
         original_error = error
     else:
         expected_targets = _TRITON_DEVICE_TARGETS[device.type]
-        if (
-            current[0] in expected_targets
-            and devices_match(current[1], device)
-        ):
+        if current[0] in expected_targets and devices_match(current[1], device):
             return current
 
     candidates = _matching_triton_drivers(device)
@@ -185,8 +198,7 @@ def _active_triton_runtime(
     if len(candidates) > 1:
         descriptions = [
             f"{registration}:{target_backend}@{active_device}"
-            for registration, _active, target_backend, active_device
-            in candidates
+            for registration, _active, target_backend, active_device in candidates
         ]
         reason = (
             "none"
@@ -236,9 +248,11 @@ def _require_triton_device_backend(device: torch.device) -> None:
         installed = _installed_triton_backends()
         discovered = sorted(installed) or ["none"]
         reason = f"{type(error).__name__}: {error}"
-        matching_registration = bool(installed.intersection(
-            registration_hints,
-        ))
+        matching_registration = bool(
+            installed.intersection(
+                registration_hints,
+            )
+        )
         if matching_registration:
             advice = (
                 "hide non-target accelerators or explicitly select the matching "
@@ -294,23 +308,18 @@ def _configured_backend() -> str | None:
     supported = {"torch", "triton", "cuda", "metal"}
     if env and env not in supported:
         raise ValueError(
-            "HYDROFORGE_BACKEND must be one of "
-            f"{sorted(supported)}, got {env!r}"
+            f"HYDROFORGE_BACKEND must be one of {sorted(supported)}, got {env!r}"
         )
     return env or None
 
 
 class _ModelBackendRequest(HydroForgeModel):
-    device: Any
+    device: torch.device
 
     _backend: str = PrivateAttr()
 
     @model_validator(mode="after")
     def _resolve(self):
-        import torch
-
-        if not isinstance(self.device, torch.device):
-            raise ValueError("device must be a torch.device")
         self._backend = _resolve_model_backend_trusted(self.device)
         return self
 
@@ -319,7 +328,7 @@ class _ModelBackendRequest(HydroForgeModel):
         return self._backend
 
 
-def resolve_model_backend(device: Any) -> str:
+def resolve_model_backend(device: torch.device) -> str:
     """Resolve one model's backend from its declared device.
 
     An explicit ``HYDROFORGE_BACKEND`` remains authoritative.  In automatic
@@ -331,7 +340,7 @@ def resolve_model_backend(device: Any) -> str:
     return _ModelBackendRequest(device=device).backend
 
 
-def _resolve_model_backend_trusted(device: Any) -> str:
+def _resolve_model_backend_trusted(device: torch.device) -> str:
     """Resolve a backend from an already validated torch device."""
 
     device_type = device.type
@@ -342,13 +351,8 @@ def _resolve_model_backend_trusted(device: Any) -> str:
         if configured == "triton":
             _require_triton_device_backend(device)
         required_devices = _backend_device_types(configured)
-        if (
-            required_devices is not None
-            and device_type not in required_devices
-        ):
-            required_label = " or ".join(
-                repr(item) for item in required_devices
-            )
+        if required_devices is not None and device_type not in required_devices:
+            required_label = " or ".join(repr(item) for item in required_devices)
             raise ValueError(
                 f"HydroForge backend {configured!r} requires a "
                 f"{required_label} model device, got {str(device)!r}"
@@ -366,15 +370,11 @@ class _KernelInvocationRequest(HydroForgeModel):
     """Validate the caller-supplied portion of one canonical kernel ABI."""
 
     spec: KernelSpec
-    arguments: Mapping[str, Any]
+    arguments: FrozenMapping[Identifier, Any]
 
     @model_validator(mode="after")
     def _validate_arguments(self) -> Self:
-        if not isinstance(self.arguments, Mapping):
-            raise ValueError("kernel arguments must be a mapping")
-        supplied = dict(self.arguments)
-        if any(type(name) is not str or not name for name in supplied):
-            raise ValueError("kernel argument names must be non-empty strings")
+        supplied = self.arguments
         unknown = set(supplied).difference(self.spec.parameters)
         if unknown:
             raise ValueError(
@@ -386,22 +386,18 @@ class _KernelInvocationRequest(HydroForgeModel):
                 f"{self.spec.name}.BLOCK_SIZE is compiler-owned; configure "
                 "model.BLOCK_SIZE instead"
             )
-        if (
-            active_operator_recorder() is None
-            and _ACTIVE_AUTO_BINDER.get() is None
-        ):
+        if active_operator_recorder() is None and _ACTIVE_AUTO_BINDER.get() is None:
             raise ValueError(
                 f"{self.spec.name} may be called only while HydroForge records "
                 "or executes a validated model step"
             )
-        object.__setattr__(self, "arguments", _immutable_dict(supplied))
         return self
 
 
 class BackendRegistry(HydroForgeModel):
     """Explicit lazy implementations of one logical kernel by backend."""
 
-    implementations: Mapping[str, Callable[[], Any]]
+    implementations: FrozenMapping[str, Callable[[], Any]]
     name: str = "kernel"
     spec: KernelSpec
 
@@ -412,11 +408,6 @@ class BackendRegistry(HydroForgeModel):
                 f"registry name {self.name!r} differs from KernelSpec "
                 f"name {self.spec.name!r}"
             )
-        object.__setattr__(
-            self,
-            "implementations",
-            _immutable_dict(self.implementations),
-        )
         return self
 
     @cached_property
@@ -443,6 +434,7 @@ class BackendRegistry(HydroForgeModel):
         )
         return self.selected._invoke_trusted(dict(request.arguments))
 
+
 class KernelEntry(HydroForgeModel):
     """A lazy registered operator recorded by an active compiled substep."""
 
@@ -456,17 +448,19 @@ class KernelEntry(HydroForgeModel):
         self._registry = registry
 
     def _implementation(
-        self, backend: str, *, precision: str | None = None,
+        self,
+        backend: str,
+        *,
+        precision: str | None = None,
     ) -> Any:
         """Return one backend implementation, constructed and checked once."""
-        precision_key = (
-            precision if self._registry.spec._uses_precision else None
-        )
+        precision_key = precision if self._registry.spec._uses_precision else None
         key = (backend, precision_key)
         implementation = self._implementations.get(key)
         if implementation is None:
             implementation = self._registry.resolve(
-                backend, precision=precision_key,
+                backend,
+                precision=precision_key,
             )
             self._implementations[key] = implementation
         return implementation
@@ -505,6 +499,7 @@ class KernelEntry(HydroForgeModel):
         )
         return launch()
 
+
 class StrictImplementation(HydroForgeModel):
     """Trusted backend implementation built by a validated adapter factory."""
 
@@ -516,7 +511,8 @@ class StrictImplementation(HydroForgeModel):
 
     @classmethod
     def _from_validated(
-        cls, request: "_ResolvedImplementationRequest",
+        cls,
+        request: "_ResolvedImplementationRequest",
     ) -> "StrictImplementation":
         result = cls(spec=request.spec, backend=request.backend)
         result._implementation = request.implementation
@@ -537,15 +533,20 @@ class StrictImplementation(HydroForgeModel):
         )()
 
     def _compile_trusted(
-        self, arguments: dict[str, Any], *,
+        self,
+        arguments: dict[str, Any],
+        *,
         buffer_dtypes: BufferDTypeABI,
     ) -> Callable:
         return self._specializer(
-            arguments, buffer_dtypes=buffer_dtypes,
+            arguments,
+            buffer_dtypes=buffer_dtypes,
         )
 
     def specialize(
-        self, arguments: dict[str, Any], *,
+        self,
+        arguments: dict[str, Any],
+        *,
         buffer_dtypes: BufferDTypeABI,
     ) -> Callable:
         """Validate one public kernel call and return its compiled launch."""
@@ -570,10 +571,14 @@ class _ResolvedImplementationRequest(HydroForgeModel):
     @model_validator(mode="after")
     def _validate_implementation(self) -> Self:
         metadata = getattr(
-            self.implementation, "__hydroforge_kernel__", None,
+            self.implementation,
+            "__hydroforge_kernel__",
+            None,
         )
         lowering = getattr(
-            self.implementation, "__hydroforge_lowering__", None,
+            self.implementation,
+            "__hydroforge_lowering__",
+            None,
         )
         specializer = getattr(self.implementation, "specialize", None)
         if not isinstance(metadata, KernelMetadata):
@@ -642,8 +647,8 @@ class _KernelSpecializationRequest(HydroForgeModel):
     """One complete canonical kernel call validated before compilation."""
 
     implementation: StrictImplementation
-    arguments: Mapping[str, Any]
-    buffer_dtypes: Mapping[str, Any]
+    arguments: FrozenMapping[str, Any]
+    buffer_dtypes: FrozenMapping[str, torch.dtype | None]
 
     @model_validator(mode="after")
     def _validate_specialization_request(self):
@@ -672,10 +677,7 @@ class _KernelSpecializationRequest(HydroForgeModel):
                         f"{spec.name}.{name} must be a tensor, got "
                         f"{type(value).__name__}"
                     )
-                if (
-                    value.layout is not torch.strided
-                    or not value.is_contiguous()
-                ):
+                if value.layout is not torch.strided or not value.is_contiguous():
                     raise ValueError(
                         f"{spec.name}.{name} must be a contiguous strided tensor"
                     )
@@ -714,11 +716,12 @@ class _KernelSpecializationRequest(HydroForgeModel):
                     _require_triton_device_backend(reference)
 
             expected_buffers = set(spec.buffers)
-            if set(buffer_dtypes) != expected_buffers:
+            supplied_buffers = set(buffer_dtypes)
+            if supplied_buffers != expected_buffers:
                 raise ValueError(
                     f"{spec.name}: specialization buffer ABI mismatch: "
-                    f"missing={sorted(expected_buffers - set(buffer_dtypes))}, "
-                    f"extra={sorted(set(buffer_dtypes) - expected_buffers)}"
+                    f"missing={sorted(expected_buffers - supplied_buffers)}, "
+                    f"extra={sorted(supplied_buffers - expected_buffers)}"
                 )
             for name, dtype in buffer_dtypes.items():
                 value = arguments[name]
@@ -728,11 +731,7 @@ class _KernelSpecializationRequest(HydroForgeModel):
                     raise ValueError(
                         f"{spec.name}.{name} buffer dtype must be torch.dtype"
                     )
-                if not isinstance(dtype, torch.dtype):
-                    raise ValueError(
-                        f"{spec.name}.{name} buffer dtype must be torch.dtype"
-                    )
-                if isinstance(value, torch.Tensor) and value.dtype != dtype:
+                if value is not None and value.dtype != dtype:
                     raise ValueError(
                         f"{spec.name}.{name} specialization declares {dtype}, "
                         f"but the tensor has dtype {value.dtype}"
@@ -744,27 +743,17 @@ class _KernelSpecializationRequest(HydroForgeModel):
             )
             if backend_validator is not None:
                 backend_validator(
-                    arguments, buffer_dtypes=buffer_dtypes,
+                    arguments,
+                    buffer_dtypes=buffer_dtypes,
                 )
         except (TypeError, ValueError, OverflowError) as error:
             raise ValueError(str(error)) from error
-        object.__setattr__(
-            self,
-            "arguments",
-            _immutable_dict(self.arguments),
-        )
-        object.__setattr__(
-            self,
-            "buffer_dtypes",
-            _immutable_dict(self.buffer_dtypes),
-        )
         return self
 
     def materialize(self) -> Callable:
         """Compile a zero-argument launch after semantic validation."""
 
-        launch = self.implementation._compile_trusted(
+        return self.implementation._compile_trusted(
             dict(self.arguments),
             buffer_dtypes=self.buffer_dtypes,
         )
-        return launch

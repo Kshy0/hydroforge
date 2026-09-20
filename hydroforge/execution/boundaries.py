@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from functools import wraps
 import inspect
-from typing import Any, Callable, TypeVar, cast
+from collections.abc import Callable
+from functools import wraps
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from pydantic import model_validator
 
@@ -14,8 +15,44 @@ from hydroforge.contracts.errors import (
 )
 from hydroforge.contracts.validation import HydroForgeModel
 
+if TYPE_CHECKING:
+    from hydroforge.model.model import AbstractModel
 
 _F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def coordinate_preflight(
+    model: AbstractModel,
+    error: BaseException | None,
+    *,
+    phase: str,
+    scope: str,
+    signature: tuple[Any, ...] | None = None,
+) -> None:
+    """Coordinate an entry check before its guarded side effects begin."""
+
+    if model.world_size > 1:
+        failures = model._gather_distributed_failures(
+            error, phase=phase, signature=signature
+        )
+        if any(failure is not None for failure in failures):
+            if error is not None:
+                raise error
+            raise distributed_failure_error(scope, failures)
+    elif error is not None:
+        raise error
+
+
+def _validate_synchronous_function(function: Callable, *, decorator: str) -> None:
+    def is_deferred(implementation: Callable) -> bool:
+        return (
+            inspect.iscoroutinefunction(implementation)
+            or inspect.isgeneratorfunction(implementation)
+            or inspect.isasyncgenfunction(implementation)
+        )
+
+    if is_deferred(inspect.unwrap(function, stop=is_deferred)):
+        raise ValueError(f"{decorator} requires a synchronous non-generator function")
 
 
 class _BetweenStepsDeclaration(HydroForgeModel):
@@ -26,14 +63,14 @@ class _BetweenStepsDeclaration(HydroForgeModel):
     @model_validator(mode="after")
     def _validate_function(self) -> _BetweenStepsDeclaration:
         if getattr(self.function, "__hydroforge_managed_step__", None) is not None:
-            raise ValueError(
-                "@between_steps cannot decorate a @managed_step method"
-            )
+            raise ValueError("@between_steps cannot decorate a @managed_step method")
+        _validate_synchronous_function(self.function, decorator="@between_steps")
         parameters = tuple(inspect.signature(self.function).parameters.values())
         if (
             not parameters
             or parameters[0].name != "self"
-            or parameters[0].kind not in {
+            or parameters[0].kind
+            not in {
                 inspect.Parameter.POSITIONAL_ONLY,
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
             }
@@ -57,6 +94,35 @@ def between_steps(function: _F) -> _F:
     function = declaration.function
     signature = inspect.signature(function)
     protocol_name = f"{function.__module__}.{function.__qualname__}"
+    parameter_names = set(signature.parameters).difference({"self"})
+    parameters = tuple(signature.parameters.values())[1:]
+    simple_binding = all(
+        parameter.kind
+        not in {
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        }
+        for parameter in parameters
+    )
+    keyword_names = frozenset(
+        parameter.name
+        for parameter in parameters
+        if parameter.kind
+        in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    )
+    required_names = frozenset(
+        parameter.name
+        for parameter in parameters
+        if parameter.default is inspect.Parameter.empty
+    )
+    defaults = {
+        parameter.name: parameter.default
+        for parameter in parameters
+        if parameter.default is not inspect.Parameter.empty
+    }
 
     @wraps(function)
     def guarded(self, *args, **kwargs):
@@ -64,52 +130,51 @@ def between_steps(function: _F) -> _F:
 
         if _managed_step_active():
             raise RuntimeError(
-                "@between_steps APIs cannot be called from an active "
-                "@managed_step"
+                "@between_steps APIs cannot be called from an active @managed_step"
             )
 
         invocation_error: BaseException | None = None
         try:
-            signature.bind(self, *args, **kwargs)
+            if (
+                simple_binding
+                and not args
+                and kwargs.keys() <= keyword_names
+                and required_names <= kwargs.keys()
+            ):
+                arguments = {"self": self, **defaults, **kwargs}
+            else:
+                bound = signature.bind(self, *args, **kwargs)
+                bound.apply_defaults()
+                arguments = bound.arguments
+            from hydroforge.contracts.options import OptionsConfig
+
+            options = getattr(self, "options", None)
+            if isinstance(options, OptionsConfig):
+                options.validate_forcing_arguments(
+                    parameter_names,
+                    arguments,
+                )
         except BaseException as error:
             invocation_error = error
-        if self.world_size > 1:
-            invocation_failures = self._gather_distributed_failures(
-                invocation_error,
-                phase=f"between-steps.invocation:{protocol_name}",
-                signature=(self._runtime_materialized,),
-            )
-            if any(
-                failure is not None for failure in invocation_failures
-            ):
-                if invocation_error is not None:
-                    raise invocation_error
-                raise distributed_failure_error(
-                    "distributed between-steps invocation validation",
-                    invocation_failures,
-                )
-        elif invocation_error is not None:
-            raise invocation_error
+        coordinate_preflight(
+            self,
+            invocation_error,
+            phase=f"between-steps.invocation:{protocol_name}",
+            scope="distributed between-steps invocation validation",
+            signature=(self._runtime_materialized,) if self.world_size > 1 else None,
+        )
 
         health_error: BaseException | None = None
         try:
             self._ensure_healthy_runtime()
         except BaseException as error:
             health_error = error
-        if self.world_size > 1:
-            health_failures = self._gather_distributed_failures(
-                health_error,
-                phase=f"between-steps.health:{protocol_name}",
-            )
-            if any(failure is not None for failure in health_failures):
-                if health_error is not None:
-                    raise health_error
-                raise distributed_failure_error(
-                    "distributed between-steps runtime health validation",
-                    health_failures,
-                )
-        elif health_error is not None:
-            raise health_error
+        coordinate_preflight(
+            self,
+            health_error,
+            phase=f"between-steps.health:{protocol_name}",
+            scope="distributed between-steps runtime health validation",
+        )
 
         result: Any = None
         body_error: BaseException | None = None
@@ -163,7 +228,8 @@ def is_between_steps_api(value: Any) -> bool:
 
     try:
         marker = inspect.getattr_static(
-            value, "__hydroforge_between_steps__",
+            value,
+            "__hydroforge_between_steps__",
         )
     except AttributeError:
         return False

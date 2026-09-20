@@ -2,22 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timedelta
-from typing import Any, Literal, Mapping, Self, TypeAlias, cast
+from typing import Annotated, Any, Literal, Self, TypeAlias, cast
 
 import cftime
 from pydantic import (
     Field,
     PrivateAttr,
     ValidationInfo,
-    field_validator,
     model_validator,
 )
 
 from hydroforge.contracts.validation import (
     HydroForgeModel,
 )
-
 
 DateLike: TypeAlias = datetime | cftime.datetime
 CalendarPeriod = Literal["day", "month", "year"]
@@ -85,17 +84,10 @@ class _TimedeltaQuotientRequest(HydroForgeModel):
 
     duration: timedelta
     interval: timedelta
-    duration_label: str = "duration"
-    interval_label: str = "interval"
+    duration_label: str = Field(default="duration", min_length=1)
+    interval_label: str = Field(default="interval", min_length=1)
 
     _quotient: int = PrivateAttr()
-
-    @field_validator("duration_label", "interval_label")
-    @classmethod
-    def _validate_label(cls, value: str) -> str:
-        if not value:
-            raise ValueError("duration labels must be non-empty strings")
-        return value
 
     @model_validator(mode="after")
     def _resolve(self):
@@ -140,7 +132,12 @@ def canonical_calendar(calendar: str) -> str:
 def convert_calendar_date(value: DateLike, calendar: str) -> DateLike:
     """Rebuild one date in HydroForge's canonical calendar representation."""
     _require_date(value, label="calendar value")
-    calendar = canonical_calendar(calendar)
+    return _convert_calendar_date_trusted(value, canonical_calendar(calendar))
+
+
+def _convert_calendar_date_trusted(value: DateLike, calendar: str) -> DateLike:
+    """Rebuild a checked date using an already canonical calendar name."""
+
     components = (
         value.year,
         value.month,
@@ -207,16 +204,13 @@ def normalize_calendar_dates(
             f"{inferred!r} from {labels}"
         )
     resolved = configured or inferred or "standard"
-    standard_template = next(
-        (
-            value
-            for value in values.values()
-            if (
-                isinstance(value, cftime.datetime)
-                and date_calendar(value) == "standard"
-            )
-        ),
-        None,
+    standard_template = (
+        next(
+            (value for value in values.values() if isinstance(value, cftime.datetime)),
+            None,
+        )
+        if preserve_cftime_declaration and resolved == "standard"
+        else None
     )
     normalized: dict[str, DateLike | None] = {}
     for label, value in values.items():
@@ -224,11 +218,7 @@ def normalize_calendar_dates(
             normalized[label] = None
             continue
         try:
-            if (
-                preserve_cftime_declaration
-                and resolved == "standard"
-                and standard_template is not None
-            ):
+            if standard_template is not None:
                 normalized[label] = cftime.DatetimeGregorian(
                     value.year,
                     value.month,
@@ -240,11 +230,10 @@ def normalize_calendar_dates(
                     has_year_zero=standard_template.has_year_zero,
                 )
             else:
-                normalized[label] = convert_calendar_date(value, resolved)
+                normalized[label] = _convert_calendar_date_trusted(value, resolved)
         except (TypeError, ValueError, OverflowError) as error:
             raise ValueError(
-                f"{label} cannot be represented in calendar {resolved!r}: "
-                f"{value!r}"
+                f"{label} cannot be represented in calendar {resolved!r}: {value!r}"
             ) from error
     return resolved, normalized, configured is None and inferred is None
 
@@ -278,21 +267,19 @@ def _require_date(value: Any, *, label: str) -> None:
 class SimulationStep(HydroForgeModel):
     """One half-open model interval ``[start, end)``."""
 
-    index: int
+    index: int = Field(ge=0)
     start: DateLike
     end: DateLike
     source_start: DateLike | None = None
     source_end: DateLike | None = None
     phase: SimulationPhase = "main"
-    spinup_cycle: int | None = None
-    source_index: int = 0
-    reuse_index: int = 0
-    reuse_count: int = 1
+    spinup_cycle: int | None = Field(default=None, ge=0)
+    source_index: int = Field(default=0, ge=0)
+    reuse_index: int = Field(default=0, ge=0)
+    reuse_count: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def _validate_step(self) -> Self:
-        if type(self.index) is not int or self.index < 0:
-            raise ValueError("simulation step index must be a non-negative int")
         source_start = self.start if self.source_start is None else self.source_start
         source_end = self.end if self.source_end is None else self.source_end
         date_values = {
@@ -309,31 +296,21 @@ class SimulationStep(HydroForgeModel):
         start = cast(DateLike, normalized["simulation step start"])
         end = cast(DateLike, normalized["simulation step end"])
         source_start = cast(
-            DateLike, normalized["simulation step source start"],
+            DateLike,
+            normalized["simulation step source start"],
         )
         source_end = cast(DateLike, normalized["simulation step source end"])
         if end <= start:
             raise ValueError("simulation step must have positive duration")
         if source_end <= source_start:
             raise ValueError("simulation step source interval must be positive")
-        if type(self.phase) is not str or self.phase not in {"spinup", "main"}:
-            raise ValueError("simulation step phase must be 'spinup' or 'main'")
         if self.phase == "main" and self.spinup_cycle is not None:
             raise ValueError("main simulation steps cannot have a spinup cycle")
-        if self.phase == "spinup" and (
-            type(self.spinup_cycle) is not int or self.spinup_cycle < 0
-        ):
+        if self.phase == "spinup" and self.spinup_cycle is None:
             raise ValueError(
                 "spinup simulation steps require a non-negative cycle index"
             )
-        if type(self.source_index) is not int or self.source_index < 0:
-            raise ValueError("simulation source index must be a non-negative int")
-        if type(self.reuse_count) is not int or self.reuse_count < 1:
-            raise ValueError("simulation reuse count must be a positive int")
-        if (
-            type(self.reuse_index) is not int
-            or not 0 <= self.reuse_index < self.reuse_count
-        ):
+        if self.reuse_index >= self.reuse_count:
             raise ValueError("simulation reuse index must be in [0, reuse_count)")
         object.__setattr__(self, "start", start)
         object.__setattr__(self, "end", end)
@@ -355,7 +332,7 @@ class SimulationStep(HydroForgeModel):
         source_index: int,
         reuse_index: int,
         reuse_count: int,
-    ) -> "SimulationStep":
+    ) -> SimulationStep:
         """Materialize values already proved by a validated schedule."""
 
         return cls.model_construct(
@@ -381,7 +358,7 @@ class SpinupSchedule(HydroForgeModel):
 
     source_start: DateLike
     source_end: DateLike
-    cycles: int = 1
+    cycles: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def _validate_spinup(self) -> Self:
@@ -398,8 +375,6 @@ class SpinupSchedule(HydroForgeModel):
         source_end = cast(DateLike, normalized["spinup source end"])
         if source_end <= source_start:
             raise ValueError("spinup source end must be after its start")
-        if type(self.cycles) is not int or self.cycles < 1:
-            raise ValueError("spinup cycles must be an exact positive int")
         object.__setattr__(self, "source_start", source_start)
         object.__setattr__(self, "source_end", source_end)
         return self
@@ -449,11 +424,6 @@ class SimulationSchedule(HydroForgeModel):
         regular = all(present)
         if regular and self.explicit_steps:
             raise ValueError("schedule cannot be both regular and explicit")
-        if self.spinup is not None and not isinstance(
-            self.spinup,
-            SpinupSchedule,
-        ):
-            raise ValueError("schedule spinup must be a SpinupSchedule or None")
         if self.spinup is not None and not regular:
             raise ValueError("spinup is currently supported only by regular schedules")
         if regular:
@@ -508,10 +478,12 @@ class SimulationSchedule(HydroForgeModel):
             if self.spinup is not None:
                 spinup = SpinupSchedule(
                     source_start=cast(
-                        DateLike, normalized["spinup source start"],
+                        DateLike,
+                        normalized["spinup source start"],
                     ),
                     source_end=cast(
-                        DateLike, normalized["spinup source end"],
+                        DateLike,
+                        normalized["spinup source end"],
                     ),
                     cycles=self.spinup.cycles,
                 )
@@ -532,21 +504,17 @@ class SimulationSchedule(HydroForgeModel):
             return self
         if not self.explicit_steps:
             raise ValueError("schedule must contain model intervals")
-        if not isinstance(self.explicit_steps, tuple) or any(
-            not isinstance(step, SimulationStep) for step in self.explicit_steps
-        ):
-            raise ValueError(
-                "explicit schedule steps must be a tuple of SimulationStep values"
-            )
         normalized_steps = []
         for index, step in enumerate(self.explicit_steps):
             normalized_step = SimulationStep(
                 index=step.index,
                 start=cast(
-                    DateLike, normalized[f"simulation step {index} start"],
+                    DateLike,
+                    normalized[f"simulation step {index} start"],
                 ),
                 end=cast(
-                    DateLike, normalized[f"simulation step {index} end"],
+                    DateLike,
+                    normalized[f"simulation step {index} end"],
                 ),
                 source_start=cast(
                     DateLike,
@@ -574,8 +542,6 @@ class SimulationSchedule(HydroForgeModel):
                     "explicit schedules cannot contain spinup steps; use a "
                     "regular schedule with SpinupSchedule"
                 )
-            if step.end <= step.start:
-                raise ValueError("simulation steps must have positive duration")
             if previous_end is not None and step.start != previous_end:
                 raise ValueError(
                     "simulation steps must be contiguous without gaps or overlap"
@@ -626,7 +592,8 @@ class SimulationSchedule(HydroForgeModel):
         schedule._compiled_reuse_count = reuse_count
         schedule._compiled_main_steps = contract.count * reuse_count
         schedule._compiled_spinup_steps = (
-            contract.spinup_count * reuse_count
+            contract.spinup_count
+            * reuse_count
             * (0 if contract.spinup is None else contract.spinup.cycles)
         )
         return schedule
@@ -770,30 +737,8 @@ class SimulationSchedule(HydroForgeModel):
     def _main_index_at(self, start: DateLike) -> int:
         """Resolve a main-simulation boundary independently of spinup."""
 
-        _require_date(start, label="parameter change start")
-        require_calendar(
-            start,
-            self.calendar,
-            label="parameter change start",
-        )
-        if type(start) is not type(self._start):
-            raise TypeError(
-                "parameter change start and schedule must use the same "
-                "datetime representation"
-            )
-        if not self._is_regular:
-            return self._index_at(start)
-        regular_step = cast(timedelta, self.regular_step)
-        offset = timedelta_microseconds(
-            start - self._start,
-            label="parameter change schedule offset",
-        )
-        cadence = timedelta_microseconds(
-            regular_step,
-            label="simulation step",
-        )
-        index, remainder = divmod(offset, cadence)
-        if index < 0 or index >= self.num_main_steps or remainder != 0:
+        index = self._index_at(start) - self._num_spinup_steps
+        if index < 0:
             raise KeyError(start)
         return index
 
@@ -944,9 +889,7 @@ class _DatasetTemporalDomain(HydroForgeModel):
                 "spin-up dates are required when spin_up_cycles is positive"
             )
         if self.spin_up_cycles == 0 and self.spin_up_start_date is not None:
-            raise ValueError(
-                "spin-up dates require a positive spin_up_cycles value"
-            )
+            raise ValueError("spin-up dates require a positive spin_up_cycles value")
         spin_start = normalized["dataset spin_up_start_date"]
         spin_end = normalized["dataset spin_up_end_date"]
         if spin_start is not None and spin_end is not None:
@@ -960,21 +903,6 @@ class _DatasetTemporalDomain(HydroForgeModel):
                 source_end=spin_end + self.time_interval,
                 cycles=self.spin_up_cycles,
             )
-            require_calendar(
-                spinup.source_start,
-                calendar,
-                label="dataset spinup source start",
-            )
-            require_calendar(
-                spinup.source_end,
-                calendar,
-                label="dataset spinup source end",
-            )
-            if type(spinup.source_start) is not type(start):
-                raise ValueError(
-                    "dataset spinup and main bounds must use the same datetime "
-                    "representation"
-                )
             spinup_count = _timedelta_quotient_trusted(
                 spinup.source_end - spinup.source_start,
                 self.time_interval,
@@ -1052,8 +980,9 @@ def _combine_temporal_domains_trusted(
 ) -> _DatasetTemporalDomain:
     """Combine validated named domains inside a composite validator."""
 
-    name, reference = next(iter(contracts.items()))
-    for other_name, other in tuple(contracts.items())[1:]:
+    items = iter(contracts.items())
+    name, reference = next(items)
+    for other_name, other in items:
         if type(other.start) is not type(reference.start):
             raise ValueError(
                 f"dataset timelines {name!r} and {other_name!r} use "
@@ -1077,17 +1006,14 @@ def _combine_temporal_domains_trusted(
 class _DatasetTemporalCombineRequest(HydroForgeModel):
     """Validated internal request for combining named Dataset domains."""
 
-    contracts: Mapping[str, _DatasetTemporalDomain]
+    contracts: Mapping[Annotated[str, Field(min_length=1)], _DatasetTemporalDomain] = (
+        Field(min_length=1)
+    )
 
     _reference: _DatasetTemporalDomain = PrivateAttr()
 
     @model_validator(mode="after")
     def _combine(self) -> Self:
-        if not self.contracts:
-            raise ValueError("at least one dataset temporal contract is required")
-        invalid_names = [name for name in self.contracts if not name]
-        if invalid_names:
-            raise ValueError("dataset timeline names must be non-empty strings")
         self._reference = _combine_temporal_domains_trusted(self.contracts)
         return self
 
@@ -1102,39 +1028,23 @@ class EveryStep(HydroForgeModel):
 
 class CalendarWindow(HydroForgeModel):
     period: CalendarPeriod
-    start_month: int = 1
-    start_day: int = 1
+    start_month: int = Field(default=1, ge=1, le=12)
+    start_day: int = Field(default=1, ge=1, le=31)
 
     @model_validator(mode="after")
     def _validate_window(self) -> Self:
-        if type(self.period) is not str or self.period not in {
-            "day",
-            "month",
-            "year",
-        }:
-            raise ValueError("calendar window period must be 'day', 'month', or 'year'")
-        if type(self.start_month) is not int:
-            raise ValueError("start_month must be an exact int")
-        if type(self.start_day) is not int:
-            raise ValueError("start_day must be an exact int")
-        if not 1 <= self.start_month <= 12:
-            raise ValueError("start_month must be in 1..12")
-        if not 1 <= self.start_day <= 31:
-            raise ValueError("start_day must be in 1..31")
         if self.period != "year" and (self.start_month != 1 or self.start_day != 1):
             raise ValueError("custom origins are supported only for year windows")
         return self
 
 
 class ExplicitWindow(HydroForgeModel):
-    name: str
+    name: str = Field(min_length=1)
     start: DateLike
     end: DateLike
 
     @model_validator(mode="after")
     def _validate_window(self) -> Self:
-        if not isinstance(self.name, str) or not self.name:
-            raise ValueError("explicit window name must be a non-empty string")
         date_values = {
             f"explicit window {self.name!r} start": self.start,
             f"explicit window {self.name!r} end": self.end,
@@ -1145,10 +1055,12 @@ class ExplicitWindow(HydroForgeModel):
             preserve_cftime_declaration=True,
         )
         start = cast(
-            DateLike, normalized[f"explicit window {self.name!r} start"],
+            DateLike,
+            normalized[f"explicit window {self.name!r} start"],
         )
         end = cast(
-            DateLike, normalized[f"explicit window {self.name!r} end"],
+            DateLike,
+            normalized[f"explicit window {self.name!r} end"],
         )
         if end <= start:
             raise ValueError(f"explicit window {self.name!r} is empty")
@@ -1158,18 +1070,10 @@ class ExplicitWindow(HydroForgeModel):
 
 
 class ExplicitWindows(HydroForgeModel):
-    windows: tuple[ExplicitWindow, ...]
+    windows: tuple[ExplicitWindow, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def _validate_windows(self) -> Self:
-        if not self.windows:
-            raise ValueError("explicit windows must not be empty")
-        if not isinstance(self.windows, tuple) or any(
-            not isinstance(window, ExplicitWindow) for window in self.windows
-        ):
-            raise ValueError(
-                "explicit windows must be a tuple of ExplicitWindow values"
-            )
         names = tuple(window.name for window in self.windows)
         if len(set(names)) != len(names):
             raise ValueError("explicit statistics window names must be unique")
@@ -1190,10 +1094,12 @@ class ExplicitWindows(HydroForgeModel):
             normalized_window = ExplicitWindow(
                 name=window.name,
                 start=cast(
-                    DateLike, normalized[f"explicit window {index} start"],
+                    DateLike,
+                    normalized[f"explicit window {index} start"],
                 ),
                 end=cast(
-                    DateLike, normalized[f"explicit window {index} end"],
+                    DateLike,
+                    normalized[f"explicit window {index} end"],
                 ),
             )
             windows.append(normalized_window)
@@ -1213,16 +1119,12 @@ WindowRule = EveryStep | CalendarWindow | ExplicitWindows
 class _StatisticsOutput(HydroForgeModel):
     """One canonical output compiled from ``variables_to_save``."""
 
-    name: str
-    operation: str
-    expression: str | None = None
+    name: str = Field(min_length=1)
+    operation: str = Field(min_length=1)
+    expression: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _validate_output(self) -> Self:
-        if not self.name:
-            raise ValueError("statistics output name must be non-empty")
-        if not self.operation:
-            raise ValueError("statistics output operation must be non-empty")
         if self.operation == "static":
             if self.expression is not None:
                 raise ValueError("static statistics outputs must name a declared field")
@@ -1230,8 +1132,6 @@ class _StatisticsOutput(HydroForgeModel):
         from hydroforge.statistics.ir import parse_operation
 
         parse_operation(self.operation)
-        if self.expression is not None and not self.expression:
-            raise ValueError("statistics output expression must be non-empty")
         return self
 
 
@@ -1247,17 +1147,3 @@ class StatisticsPlan(HydroForgeModel):
         """Return the resolved outer rule without rewriting caller input."""
 
         return self.inner if self.outer is None else self.outer
-
-    @model_validator(mode="after")
-    def _validate_plan(self) -> Self:
-        valid_rules = (EveryStep, CalendarWindow, ExplicitWindows)
-        if not isinstance(self.inner, valid_rules):
-            raise ValueError("statistics inner must be a WindowRule")
-        if self.outer is not None and not isinstance(self.outer, valid_rules):
-            raise ValueError("statistics outer must be a WindowRule or None")
-        if type(self.partial_period) is not str or self.partial_period not in {
-            "close",
-            "drop",
-        }:
-            raise ValueError("partial_period must be 'close' or 'drop'")
-        return self

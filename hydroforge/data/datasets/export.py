@@ -3,19 +3,34 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Union
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from uuid import uuid4
 
 import netCDF4 as nc
 import numpy as np
 import torch
-from pydantic import Field, PrivateAttr, field_validator, model_validator
+from pydantic import (
+    BeforeValidator,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 from tqdm import tqdm
 
+from hydroforge.contracts.errors import cleanup_on_exit
+from hydroforge.contracts.naming import sanitize_symbol
+from hydroforge.contracts.validation import (
+    FrozenMapping,
+    HydroForgeModel,
+    _immutable_dict,
+)
+from hydroforge.data.numeric import canonical_floating_array
 from hydroforge.serialization.netcdf import (
     COMMITTED_STEPS_ATTR,
     DEFAULT_NETCDF_OPTIONS,
@@ -25,12 +40,9 @@ from hydroforge.serialization.netcdf import (
     _atomic_netcdf_dataset_trusted,
     _create_netcdf_variable_trusted,
     _prepare_netcdf_variable_options_trusted,
+    default_netcdf_options,
     normalize_netcdf_variable_options,
 )
-from hydroforge.contracts.naming import sanitize_symbol
-from hydroforge.contracts.validation import HydroForgeModel, _immutable_dict
-from hydroforge.data.numeric import canonical_floating_array
-
 
 logger = logging.getLogger(__name__)
 
@@ -41,22 +53,9 @@ if TYPE_CHECKING:
 def _output_name(value: Any, *, label: str) -> str:
     if type(value) is not str or not value:
         raise ValueError(f"{label} must be a non-empty exact string")
-    if (
-        Path(value).name != value
-        or value in {".", ".."}
-        or sanitize_symbol(value) != value
-    ):
+    if sanitize_symbol(value) != value:
         raise ValueError(f"{label} must be one safe NetCDF/file component")
     return value
-
-
-def _output_path(value: Any, *, label: str) -> Path:
-    del label
-    return Path(value)
-
-
-def _output_device(value: Any) -> torch.device:
-    return torch.device(value)
 
 
 def _metadata_values(
@@ -79,40 +78,28 @@ def _metadata_values(
     return MappingProxyType({name: value[name] for name in names})
 
 
-class _ClimatologyExportRequest(HydroForgeModel):
+class _ExportRequest(HydroForgeModel):
     owner: Any = Field(exclude=True)
     local_mapping: torch.Tensor = Field(exclude=True, repr=False)
-    out_path: Path
     var_name: str
     dtype: Literal["float32", "float64"] = "float32"
-    netcdf_options: Mapping[str, Any] = Field(
-        default_factory=lambda: dict(DEFAULT_NETCDF_OPTIONS),
-    )
-    device: torch.device = torch.device("cpu")
-    units: str = "m3/s"
-    description: str | None = None
-
-    _create_options: Mapping[str, Any] = PrivateAttr()
-
-    @field_validator("out_path", mode="before")
-    @classmethod
-    def _validate_path(cls, value: Any) -> Path:
-        return _output_path(value, label="out_path")
+    netcdf_options: Annotated[
+        FrozenMapping[str, Any], BeforeValidator(normalize_netcdf_variable_options)
+    ] = Field(default_factory=default_netcdf_options)
+    device: Annotated[torch.device, BeforeValidator(torch.device)] = torch.device("cpu")
 
     @field_validator("var_name")
     @classmethod
     def _validate_name(cls, value: str) -> str:
         return _output_name(value, label="var_name")
 
-    @field_validator("device", mode="before")
-    @classmethod
-    def _validate_device(cls, value: Any) -> torch.device:
-        return _output_device(value)
 
-    @field_validator("netcdf_options", mode="before")
-    @classmethod
-    def _validate_options(cls, value: Any) -> Mapping[str, Any]:
-        return normalize_netcdf_variable_options(value)
+class _ClimatologyExportRequest(_ExportRequest):
+    out_path: Annotated[Path, BeforeValidator(lambda value: Path(value))]
+    units: str = "m3/s"
+    description: str | None = None
+
+    _create_options: Mapping[str, Any] = PrivateAttr()
 
     @model_validator(mode="after")
     def _compile(self):
@@ -123,9 +110,6 @@ class _ClimatologyExportRequest(HydroForgeModel):
             dimensions=("saved_points",),
             name=self.var_name,
         )
-        object.__setattr__(
-            self, "netcdf_options", _immutable_dict(self.netcdf_options),
-        )
         self._create_options = _immutable_dict(options)
         return self
 
@@ -134,19 +118,12 @@ class _ClimatologyExportRequest(HydroForgeModel):
         return self._create_options
 
 
-class _CatchmentExportRequest(HydroForgeModel):
-    owner: Any = Field(exclude=True)
-    local_mapping: torch.Tensor = Field(exclude=True, repr=False)
-    out_dir: Path
+class _CatchmentExportRequest(_ExportRequest):
+    out_dir: Annotated[Path, BeforeValidator(lambda value: Path(value))]
     var_name: str = "var"
     filename: str | Mapping[str, str] | None = None
-    dtype: Literal["float32", "float64"] = "float32"
-    netcdf_options: Mapping[str, Any] = Field(
-        default_factory=lambda: dict(DEFAULT_NETCDF_OPTIONS),
-    )
-    normalized: bool = Field(default=False, strict=True)
-    device: torch.device = torch.device("cpu")
-    split_by_year: bool = Field(default=False, strict=True)
+    normalized: bool = False
+    split_by_year: bool = False
     units: str | Mapping[str, str] = "m3/s"
     description: str | Mapping[str, str] | None = None
 
@@ -156,26 +133,6 @@ class _CatchmentExportRequest(HydroForgeModel):
     _units: Mapping[str, str] = PrivateAttr()
     _descriptions: Mapping[str, str] = PrivateAttr()
     _create_options: Mapping[str, Mapping[str, Any]] = PrivateAttr()
-
-    @field_validator("out_dir", mode="before")
-    @classmethod
-    def _validate_path(cls, value: Any) -> Path:
-        return _output_path(value, label="out_dir")
-
-    @field_validator("var_name")
-    @classmethod
-    def _validate_name(cls, value: str) -> str:
-        return _output_name(value, label="var_name")
-
-    @field_validator("device", mode="before")
-    @classmethod
-    def _validate_device(cls, value: Any) -> torch.device:
-        return _output_device(value)
-
-    @field_validator("netcdf_options", mode="before")
-    @classmethod
-    def _validate_options(cls, value: Any) -> Mapping[str, Any]:
-        return normalize_netcdf_variable_options(value)
 
     @model_validator(mode="after")
     def _compile(self):
@@ -196,10 +153,14 @@ class _CatchmentExportRequest(HydroForgeModel):
             names=output_names,
             default=lambda name: name,
         )
-        filenames = MappingProxyType({
-            name: _output_name(value, label=f"filename[{name!r}]")
-            for name, value in filenames.items()
-        })
+        filenames = MappingProxyType(
+            {
+                name: _output_name(value, label=f"filename[{name!r}]")
+                for name, value in filenames.items()
+            }
+        )
+        if len(set(filenames.values())) != len(filenames):
+            raise ValueError("output filenames must be unique across variables")
         descriptions = _metadata_values(
             self.description,
             label="description",
@@ -218,18 +179,17 @@ class _CatchmentExportRequest(HydroForgeModel):
         )
         dtype_nc = "f4" if self.dtype == "float32" else "f8"
         create_options = {
-            name: _immutable_dict(_prepare_netcdf_variable_options_trusted(
-                self.netcdf_options,
-                dtype=dtype_nc,
-                dimensions=("time", "saved_points"),
-                name=name,
-            ))
+            name: _immutable_dict(
+                _prepare_netcdf_variable_options_trusted(
+                    self.netcdf_options,
+                    dtype=dtype_nc,
+                    dimensions=("time", "saved_points"),
+                    name=name,
+                )
+            )
             for name in output_names
         }
 
-        object.__setattr__(
-            self, "netcdf_options", _immutable_dict(self.netcdf_options),
-        )
         self._output_methods = MappingProxyType(output_methods)
         self._returns_mapping = returns_mapping
         self._filenames = filenames
@@ -270,12 +230,6 @@ class DatasetExporter:
         self.owner = owner
 
     @staticmethod
-    def _output_array(
-        value: Any, *, dtype: str, label: str,
-    ) -> np.ndarray:
-        return canonical_floating_array(value, dtype=dtype, label=label)
-
-    @staticmethod
     def _prepare_mapping(
         local_mapping: torch.Tensor,
         *,
@@ -299,21 +253,24 @@ class DatasetExporter:
     ) -> Path:
         """Validate one export request before reading or creating files."""
 
-        request = _ClimatologyExportRequest.model_validate({
-            "owner": self.owner,
-            "out_path": out_path,
-            "local_mapping": local_mapping,
-            "var_name": var_name,
-            "dtype": dtype,
-            "netcdf_options": netcdf_options,
-            "device": device,
-            "units": units,
-            "description": description,
-        })
+        request = _ClimatologyExportRequest.model_validate(
+            {
+                "owner": self.owner,
+                "out_path": out_path,
+                "local_mapping": local_mapping,
+                "var_name": var_name,
+                "dtype": dtype,
+                "netcdf_options": netcdf_options,
+                "device": device,
+                "units": units,
+                "description": description,
+            }
+        )
         return self._export_climatology_trusted(request)
 
     def _export_climatology_trusted(
-        self, request: _ClimatologyExportRequest,
+        self,
+        request: _ClimatologyExportRequest,
     ) -> Path:
         """
         Compute the temporal-mean (climatological average) and export to NetCDF.
@@ -363,29 +320,27 @@ class DatasetExporter:
         accumulator = torch.zeros(n_catch, dtype=torch.float64, device=dev)
 
         pbar = tqdm(
-            range(first_chunk, n_chunks),
-            desc="Computing climatology", unit="chunk",
+            range(first_chunk, n_chunks), desc="Computing climatology", unit="chunk"
         )
-        for ci in pbar:
-            chunk = self.owner.chunk_plan._at_trusted(ci)
-            block = self.owner._read_chunk_trusted(chunk)  # (T, n_grids)
-            valid_T = chunk.length
-            block = np.ascontiguousarray(
-                block, dtype=np.float64,
-            )
-            block_t = torch.as_tensor(block, dtype=torch.float64, device=dev)
-            # (n_catch, n_grids) @ (n_grids, T) -> (n_catch, T)
-            agg = torch.sparse.mm(t_mapping_T, block_t.T)
-            accumulator += agg.sum(dim=1).to(torch.float64)
+        with cleanup_on_exit("climatology progress", (pbar.close,)):
+            for ci in pbar:
+                chunk = self.owner.chunk_plan._at_trusted(ci)
+                block = self.owner._read_chunk_trusted(chunk)
+                valid_T = chunk.length
+                block = np.ascontiguousarray(
+                    block,
+                    dtype=np.float64,
+                )
+                block_t = torch.as_tensor(block, dtype=torch.float64, device=dev)
+                agg = torch.sparse.mm(t_mapping_T, block_t.T)
+                accumulator += agg.sum(dim=1)
 
-            total_steps += valid_T
-
-        pbar.close()
+                total_steps += valid_T
 
         if total_steps == 0:
             raise RuntimeError("No valid timesteps found — cannot compute climatology.")
 
-        mean_data = self._output_array(
+        mean_data = canonical_floating_array(
             (accumulator / total_steps).cpu().numpy(),
             dtype=dtype,
             label="climatology result",
@@ -398,11 +353,13 @@ class DatasetExporter:
         create_options = request.create_options
         desc = (
             f"Time-averaged {var_name} over {total_steps} steps"
-            if description is None else description
+            if description is None
+            else description
         )
 
         with _atomic_netcdf_dataset_trusted(
-            out_path, format="NETCDF4",
+            out_path,
+            format="NETCDF4",
         ) as ds:
             ds.setncattr("title", f"Climatology ({var_name})")
             ds.setncattr("total_timesteps", total_steps)
@@ -439,28 +396,31 @@ class DatasetExporter:
         units: str | Mapping[str, str] = "m3/s",
         description: str | Mapping[str, str] | None = None,
         filename: str | Mapping[str, str] | None = None,
-    ) -> Union[Path, List[Path], Dict[str, Path], Dict[str, List[Path]]]:
+    ) -> Path | list[Path] | dict[str, Path] | dict[str, list[Path]]:
         """Validate one export request before reading or creating files."""
 
-        request = _CatchmentExportRequest.model_validate({
-            "owner": self.owner,
-            "out_dir": out_dir,
-            "local_mapping": local_mapping,
-            "var_name": var_name,
-            "dtype": dtype,
-            "netcdf_options": netcdf_options,
-            "normalized": normalized,
-            "device": device,
-            "split_by_year": split_by_year,
-            "units": units,
-            "description": description,
-            "filename": filename,
-        })
+        request = _CatchmentExportRequest.model_validate(
+            {
+                "owner": self.owner,
+                "out_dir": out_dir,
+                "local_mapping": local_mapping,
+                "var_name": var_name,
+                "dtype": dtype,
+                "netcdf_options": netcdf_options,
+                "normalized": normalized,
+                "device": device,
+                "split_by_year": split_by_year,
+                "units": units,
+                "description": description,
+                "filename": filename,
+            }
+        )
         return self._export_catchment_data_trusted(request)
 
     def _export_catchment_data_trusted(
-        self, request: _CatchmentExportRequest,
-    ) -> Union[Path, List[Path], Dict[str, Path], Dict[str, List[Path]]]:
+        self,
+        request: _CatchmentExportRequest,
+    ) -> Path | list[Path] | dict[str, Path] | dict[str, list[Path]]:
         """
         Export catchment-aggregated data to a NetCDF file readable by MultiRankStatsReader.
 
@@ -519,17 +479,19 @@ class DatasetExporter:
             col_sums = torch.sparse.sum(t_mapping, dim=0).to_dense()  # (n_catch,)
             # Create a diagonal scaling matrix or normalize in-place
             # For COO tensor, we need to work with the values
-            t_mapping = t_mapping.coalesce()
             indices = t_mapping.indices()  # (2, nnz)
-            values = t_mapping.values()    # (nnz,)
-            col_indices = indices[1]       # column index for each value
+            values = t_mapping.values()  # (nnz,)
+            col_indices = indices[1]  # column index for each value
             col_sums_expanded = col_sums[col_indices]
             nz_mask = col_sums_expanded > 0
             new_values = torch.zeros_like(values)
             new_values[nz_mask] = values[nz_mask] / col_sums_expanded[nz_mask]
             t_mapping = torch.sparse_coo_tensor(
-                indices, new_values, t_mapping.size(),
-                dtype=torch.float64, device=dev,
+                indices,
+                new_values,
+                t_mapping.size(),
+                dtype=torch.float64,
+                device=dev,
             ).coalesce()
 
         # Pre-compute transposed mapping matrix for efficient batch multiplication
@@ -562,7 +524,8 @@ class DatasetExporter:
             time_var = ds.createVariable("time", "f8", ("time",))
             time_var.setncattr("units", "seconds since 1900-01-01 00:00:00")
             time_var.setncattr(
-                "calendar", getattr(self.owner, "calendar", "standard"),
+                "calendar",
+                getattr(self.owner, "calendar", "standard"),
             )
 
             output_coord = ds.createVariable("catchment_id", "i8", ("saved_points",))
@@ -588,30 +551,32 @@ class DatasetExporter:
 
         def _close_writers(error=None):
             nonlocal writers, writer_stack
-            if writer_stack is not None:
-                if error is None:
-                    try:
-                        for dataset, time_variable, _variable in writers.values():
-                            dataset.setncattr(
-                                COMMITTED_STEPS_ATTR, len(time_variable),
-                            )
-                            dataset.sync()
-                    except BaseException as commit_error:
-                        writer_stack.__exit__(
-                            type(commit_error), commit_error,
+            closing_writers, stack = writers, writer_stack
+            writers, writer_stack = {}, None
+            if stack is None:
+                return
+            if error is not None:
+                stack.__exit__(type(error), error, error.__traceback__)
+                return
+            try:
+                for dataset, time_variable, _variable in closing_writers.values():
+                    dataset.setncattr(COMMITTED_STEPS_ATTR, len(time_variable))
+                    dataset.sync()
+            except BaseException as commit_error:
+                with cleanup_on_exit(
+                    "export commit",
+                    (
+                        partial(
+                            stack.__exit__,
+                            type(commit_error),
+                            commit_error,
                             commit_error.__traceback__,
-                        )
-                        writers = {}
-                        writer_stack = None
-                        raise
-                    else:
-                        writer_stack.close()
-                else:
-                    writer_stack.__exit__(
-                        type(error), error, error.__traceback__,
-                    )
-            writers = {}
-            writer_stack = None
+                        ),
+                    ),
+                ):
+                    raise
+            else:
+                stack.close()
 
         def _open_writers(year=None):
             nonlocal write_idx, writer_stack
@@ -623,101 +588,111 @@ class DatasetExporter:
                     if year is None:
                         nc_path = out_dir / f"{filename}_rank0.nc"
                     else:
-                        nc_path = (
-                            out_dir
-                            / f"{filename}_rank0_{year}.nc"
-                        )
+                        nc_path = out_dir / f"{filename}_rank0_{year}.nc"
                     writers[name] = _init_nc(
-                        writer_stack, nc_path, name, method,
+                        writer_stack,
+                        nc_path,
+                        name,
+                        method,
                     )
                     created_files[name].append(nc_path)
             except BaseException as error:
-                _close_writers(error)
-                raise
+                with cleanup_on_exit("export setup", (partial(_close_writers, error),)):
+                    raise
             write_idx = 0
 
         pbar = None
         failure = None
-        try:
-            if not split_by_year:
-                _open_writers()
 
-            first_chunk = self.owner._num_spin_up_chunks
-            n_chunks = len(self.owner)
-            pbar = tqdm(total=total_steps, desc="Exporting", unit="step")
-            for ci in range(first_chunk, n_chunks):
-                chunk = self.owner.chunk_plan._at_trusted(ci)
-                read_data = self.owner._read_chunk_trusted(chunk)
-                if isinstance(read_data, dict):
-                    blocks = read_data
-                else:
-                    name = next(iter(output_methods))
-                    blocks = {name: read_data}
-
-                T = chunk.length
-                mapped_blocks = {}
-                for name, block in blocks.items():
-                    # t_mapping_T @ block.T = (n_catch, n_cols) @ (n_cols, T)
-                    block = np.ascontiguousarray(
-                        block, dtype=np.float64,
-                    )
-                    block_tensor = torch.as_tensor(
-                        block, dtype=torch.float64, device=dev,
-                    )
-                    agg_block = torch.sparse.mm(t_mapping_T, block_tensor.T)
-                    mapped_blocks[name] = self._output_array(
-                        agg_block.T.contiguous().to("cpu").numpy(),
-                        dtype=dtype,
-                        label=(
-                            f"aggregated variable {name!r} at chunk {ci}"
-                        ),
-                    )
-
-                # Write maximal same-file runs as blocks.  Chunk data is
-                # already resident, so row-at-a-time writes only add HDF5
-                # extension, chunk lookup and compression overhead.
-                chunk_times = chunk._source_times()
-                run_start = 0
-                while run_start < T:
-                    if split_by_year:
-                        year = chunk_times[run_start].year
-                        if year != current_year:
-                            current_year = year
-                            _open_writers(current_year)
-                        run_end = run_start + 1
-                        while (
-                            run_end < T
-                            and chunk_times[run_end].year == current_year
-                        ):
-                            run_end += 1
-                    else:
-                        run_end = T
-
-                    _ds, first_time_var, _out_var = next(
-                        iter(writers.values())
-                    )
-                    time_values = nc.date2num(
-                        chunk_times[run_start:run_end],
-                        units=first_time_var.getncattr("units"),
-                        calendar=first_time_var.getncattr("calendar"),
-                    )
-                    write_end = write_idx + run_end - run_start
-                    for name in output_methods:
-                        _ds, time_var, out_var = writers[name]
-                        out_var[write_idx:write_end, :] = mapped_blocks[name][
-                            run_start:run_end, :
-                        ]
-                        time_var[write_idx:write_end] = time_values
-                    pbar.update(run_end - run_start)
-                    write_idx = write_end
-                    run_start = run_end
-        except BaseException as error:
-            failure = error
-            raise
-        finally:
+        def _close_progress():
+            nonlocal failure
             if pbar is not None:
-                pbar.close()
-            _close_writers(failure)
+                try:
+                    pbar.close()
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+                    raise
+
+        with (
+            cleanup_on_exit("export writers", (lambda: _close_writers(failure),)),
+            cleanup_on_exit("export progress", (_close_progress,)),
+        ):
+            try:
+                if not split_by_year:
+                    _open_writers()
+
+                first_chunk = self.owner._num_spin_up_chunks
+                n_chunks = len(self.owner)
+                pbar = tqdm(total=total_steps, desc="Exporting", unit="step")
+                for ci in range(first_chunk, n_chunks):
+                    chunk = self.owner.chunk_plan._at_trusted(ci)
+                    read_data = self.owner._read_chunk_trusted(chunk)
+                    if isinstance(read_data, dict):
+                        blocks = read_data
+                    else:
+                        name = next(iter(output_methods))
+                        blocks = {name: read_data}
+
+                    T = chunk.length
+                    mapped_blocks = {}
+                    for name, block in blocks.items():
+                        # t_mapping_T @ block.T = (n_catch, n_cols) @ (n_cols, T)
+                        block = np.ascontiguousarray(
+                            block,
+                            dtype=np.float64,
+                        )
+                        block_tensor = torch.as_tensor(
+                            block,
+                            dtype=torch.float64,
+                            device=dev,
+                        )
+                        agg_block = torch.sparse.mm(t_mapping_T, block_tensor.T)
+                        mapped_blocks[name] = canonical_floating_array(
+                            agg_block.T.contiguous().to("cpu").numpy(),
+                            dtype=dtype,
+                            label=(f"aggregated variable {name!r} at chunk {ci}"),
+                        )
+
+                    # Write maximal same-file runs as blocks.  Chunk data is
+                    # already resident, so row-at-a-time writes only add HDF5
+                    # extension, chunk lookup and compression overhead.
+                    chunk_times = chunk._source_times()
+                    run_start = 0
+                    while run_start < T:
+                        if split_by_year:
+                            year = chunk_times[run_start].year
+                            if year != current_year:
+                                current_year = year
+                                _open_writers(current_year)
+                            run_end = run_start + 1
+                            while (
+                                run_end < T
+                                and chunk_times[run_end].year == current_year
+                            ):
+                                run_end += 1
+                        else:
+                            run_end = T
+
+                        _ds, first_time_var, _out_var = next(iter(writers.values()))
+                        time_values = nc.date2num(
+                            chunk_times[run_start:run_end],
+                            units=first_time_var.getncattr("units"),
+                            calendar=first_time_var.getncattr("calendar"),
+                        )
+                        write_end = write_idx + run_end - run_start
+                        for name in output_methods:
+                            _ds, time_var, out_var = writers[name]
+                            out_var[write_idx:write_end, :] = mapped_blocks[name][
+                                run_start:run_end, :
+                            ]
+                            time_var[write_idx:write_end] = time_values
+                        pbar.update(run_end - run_start)
+                        write_idx = write_end
+                        run_start = run_end
+            except BaseException as error:
+                failure = error
+                raise
 
         if returns_mapping:
             if split_by_year:
@@ -725,4 +700,6 @@ class DatasetExporter:
             return {name: paths[0] for name, paths in created_files.items()}
 
         only_name = next(iter(output_methods))
-        return created_files[only_name] if split_by_year else created_files[only_name][0]
+        return (
+            created_files[only_name] if split_by_year else created_files[only_name][0]
+        )

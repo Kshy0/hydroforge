@@ -8,24 +8,24 @@ from __future__ import annotations
 
 import hashlib
 import json
-from math import prod
 import re
-from typing import TYPE_CHECKING, Any, Dict, List, Sequence, Tuple
+from collections.abc import Sequence
+from math import prod
+from typing import Any
 
 import torch
 
 from hydroforge.serialization.files import atomic_write_text
-
+from hydroforge.statistics.emitters.common import StatisticsEmitter
 from hydroforge.statistics.ir import (
-    Expression, ExpressionDialect, ExpressionSource, ScatterSource,
-    TensorSource, render_expression,
+    Expression,
+    ExpressionDialect,
+    ExpressionSource,
+    ScatterSource,
+    TensorSource,
+    render_expression,
 )
 from hydroforge.statistics.lowering import OutputLayout
-from hydroforge.statistics.emitters.common import StatisticsEmitter
-
-if TYPE_CHECKING:
-    from hydroforge.statistics.runtime import StatisticsRuntime
-
 
 _FLOAT_DTYPES = {
     torch.float32: ("float", "at::kFloat"),
@@ -37,7 +37,8 @@ _INT_DTYPES = {
     torch.int64: ("int64_t", "at::kLong"),
 }
 _CONTROL_FLOAT_KEYS = (
-    "__weight", "__total_weight",
+    "__weight",
+    "__total_weight",
 )
 _INTEGER_SCALAR_TYPES = {
     "__num_macro_steps": ("int64_t", "at::kLong"),
@@ -54,6 +55,10 @@ def _scalar_types(dtype: torch.dtype) -> dict[str, tuple[str, str]]:
         **{key: floating for key in _CONTROL_FLOAT_KEYS},
         **_INTEGER_SCALAR_TYPES,
     }
+
+
+def _kernel_start(name: str, params: Sequence[str]) -> list[str]:
+    return [f"__global__ void {name}(", "    " + ",\n    ".join(params), ") {"]
 
 
 def _c_ident(name: str) -> str:
@@ -77,13 +82,15 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         return self.result()
 
     def _generate_cuda_aggregator_function(
-        self: StatisticsRuntime,
+        self,
     ) -> None:
         cpp_sources, cuda_sources = self._generate_cuda_extension_sources()
 
         from hydroforge.kernels.backends.cuda.build import load_inline_cu_module
 
-        digest = hashlib.sha256((cpp_sources + "\n" + cuda_sources).encode()).hexdigest()[:12]
+        digest = hashlib.sha256(
+            (cpp_sources + "\n" + cuda_sources).encode()
+        ).hexdigest()[:12]
         module_name = f"hydroforge_cuda_aggregator_r{self.rank}_{digest}"
         ext = load_inline_cu_module(
             module_name,
@@ -103,9 +110,9 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             self._save_cuda_kernel_file(cpp_sources, cuda_sources)
 
     def _generate_cuda_extension_sources(
-        self: StatisticsRuntime,
-    ) -> Tuple[str, str]:
-        params: Dict[str, Dict[str, str]] = {}
+        self,
+    ) -> tuple[str, str]:
+        params: dict[str, dict[str, str]] = {}
 
         def add_param(key: str, ctype: str, scalar_type: str, *, const: bool) -> None:
             ident = _c_ident(key)
@@ -138,11 +145,12 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 "",
             ]
         )
-        lines: List[str] = [
+        lines: list[str] = [
             "#include <torch/extension.h>",
             "#include <pybind11/pybind11.h>",
             "#include <cuda_runtime.h>",
             "#include <c10/cuda/CUDAStream.h>",
+            "#include <c10/cuda/CUDAGuard.h>",
             "#include <cmath>",
             "#include <cstdint>",
             "#include <limits>",
@@ -177,9 +185,9 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         return cpp_sources, "\n".join(lines)
 
     def _build_cuda_specs(
-        self: StatisticsRuntime,
+        self,
         add_param,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         def add_tensor_param(key: str, *, const: bool) -> None:
             ctype, scalar_type = self._state_ctype(key)
             add_param(key, ctype, scalar_type, const=const)
@@ -192,7 +200,8 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             add_tensor_param(buf_key, const=False)
             cnt_key = (
                 f"__scatter_cnt_{var_name}"
-                if scatter.reduction.value == "mean" else None
+                if scatter.reduction.value == "mean"
+                else None
             )
             if cnt_key:
                 add_tensor_param(cnt_key, const=False)
@@ -208,9 +217,11 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                     "scatter": scatter,
                     "buf_key": buf_key,
                     "cnt_key": cnt_key,
-                    "source_size": int(self._tensor_registry[scatter.index].numel()),
-                    "target_size": int(self._storage[buf_key].shape[-1]),
-                    "num_trials": int(self.num_trials),
+                    "source_size": self._tensor_registry[scatter.index].numel(),
+                    "target_size": self._storage[buf_key].shape[-1],
+                    "ensemble_size": self.ensemble_size
+                    if self._statistics_layouts[var_name].batched
+                    else 1,
                     "ctype": self._state_ctype(buf_key)[0],
                 }
             )
@@ -226,16 +237,16 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             for var in var_list:
                 variable = self._statistics_lowering.by_name[var]
                 is_2d = variable.layout is OutputLayout.INDEXED_LEVEL
-                n_levels = (
-                    int(variable.variable.actual_shape[-1]) if is_2d else 1
-                )
+                n_levels = variable.variable.actual_shape[-1] if is_2d else 1
                 max_levels = max(max_levels, n_levels)
                 var_numel = (
                     prod(self._statistics_layouts[var].actual_shape)
-                    if full_output else 0
+                    if full_output
+                    else 0
                 )
                 full_total = max(full_total, var_numel)
-                self._add_value_params(var, add_tensor_param)
+                for key in self._statistics_ir.materialized_inputs(var):
+                    add_tensor_param(key, const=True)
 
                 ops = []
                 for operation in variable.operations:
@@ -243,7 +254,6 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                     out_key = f"{var}_{op}"
                     add_tensor_param(out_key, const=False)
                     info = {
-                        "outer": operation.outer.value,
                         "base": operation.outer.value,
                         "is_arg": operation.stores_index,
                         "k": operation.k,
@@ -259,17 +269,20 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                             "outer": info,
                             "inner": (
                                 operation.inner.value
-                                if operation.inner is not None else None
+                                if operation.inner is not None
+                                else None
                             ),
                             "aux_key": aux_key,
                         }
                     )
 
-                inner_ops = sorted({
-                    operation.inner.value
-                    for operation in variable.operations
-                    if operation.inner is not None
-                })
+                inner_ops = sorted(
+                    {
+                        operation.inner.value
+                        for operation in variable.operations
+                        if operation.inner is not None
+                    }
+                )
                 inner_states = {}
                 for inner in inner_ops:
                     if inner == "last":
@@ -284,16 +297,13 @@ class CudaStatisticsEmitter(StatisticsEmitter):
 
                 sample_weight_key = None
                 if any(
-                    operation.inner is None
-                    and operation.outer.value == "mean"
+                    operation.inner is None and operation.outer.value == "mean"
                     for operation in variable.operations
                 ):
                     sample_weight_key = f"{var}_mean_sample_weight_state"
                     add_tensor_param(sample_weight_key, const=False)
 
-                stride_input = int(
-                    self._statistics_layouts[var].stride_input
-                )
+                stride_input = self._statistics_layouts[var].stride_input
 
                 group_vars.append(
                     {
@@ -322,7 +332,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                         }
                         for v in group_vars
                     ],
-                    "num_trials": self.num_trials,
+                    "ensemble_size": self.ensemble_size,
                     "full_output": full_output,
                 },
                 sort_keys=True,
@@ -333,7 +343,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                     "kernel_name": f"hf_aggr_{_c_ident(output_index)}_{hashlib.sha1(payload.encode()).hexdigest()[:10]}",
                     "vars": group_vars,
                     "max_levels": max_levels,
-                    "num_trials": int(self.num_trials),
+                    "ensemble_size": self.ensemble_size,
                     "full_output": full_output,
                     "full_total": full_total,
                 }
@@ -341,7 +351,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
 
         return {"groups": groups, "scatters": scatters}
 
-    def _value_ctype(self: StatisticsRuntime, name: str) -> str:
+    def _value_ctype(self, name: str) -> str:
         if name in self._tensor_registry:
             return self._state_ctype(name)[0]
         if f"__scatter_buf_{name}" in self._storage:
@@ -353,14 +363,18 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 if aux_key in self._storage:
                     return self._state_ctype(aux_key)[0]
             out_key = f"{name}_{operation.spelling}"
-            if out_key in self._storage and self._storage[out_key].dtype in _FLOAT_DTYPES:
+            if (
+                out_key in self._storage
+                and self._storage[out_key].dtype in _FLOAT_DTYPES
+            ):
                 return self._state_ctype(out_key)[0]
         return "float"
 
-    def _state_ctype(self: StatisticsRuntime, key: str) -> Tuple[str, str]:
-        scalar_types = _scalar_types(self._control_dtype)
-        if key in scalar_types:
-            return scalar_types[key]
+    def _state_ctype(self, key: str) -> tuple[str, str]:
+        if key in _CONTROL_FLOAT_KEYS:
+            return _FLOAT_DTYPES[self._control_dtype]
+        if key in _INTEGER_SCALAR_TYPES:
+            return _INTEGER_SCALAR_TYPES[key]
         tensor = self._tensor_registry.get(key)
         if tensor is None:
             tensor = self._storage[key]
@@ -368,52 +382,63 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             return _FLOAT_DTYPES[tensor.dtype]
         return _INT_DTYPES[tensor.dtype]
 
-    def _add_value_params(self: StatisticsRuntime, name: str, add_tensor_param) -> None:
-        for key in self._statistics_ir.materialized_inputs(name):
-            add_tensor_param(key, const=True)
-
     def _value_expr(
-        self: StatisticsRuntime,
+        self,
         name: str,
-        lines: List[str],
-        emitted: Dict[str, str],
+        lines: list[str],
+        emitted: dict[str, str],
         *,
         context: str,
         is_2d: bool,
         n_levels: int,
         ctype: str,
+        full_variable: str | None = None,
     ) -> str:
         key = f"{context}:{name}:{is_2d}:{n_levels}"
         if key in emitted:
             return emitted[key]
 
         safe = _c_ident(f"{context}_{name}_val_{len(emitted)}")
-        source = self._statistics_ir.sources.get(name, TensorSource(name))
+        source = self._statistics_ir.sources.get(name) or TensorSource(name)
 
-        if context == "scatter":
-            offset = "src_off"
-        elif context == "full":
-            offset = "linear"
-        elif is_2d:
-            offset = f"(t * {self._stride_expr(name)} + idx) * {n_levels} + level"
-        else:
-            offset = f"t * {self._stride_expr(name)} + idx"
-
-        if isinstance(source, TensorSource):
-            lines.append(f"    {ctype} {safe} = static_cast<{ctype}>(p_{_c_ident(name)}[{offset}]);")
-        elif isinstance(source, ScatterSource):
-            buf = f"__scatter_buf_{name}"
-            lines.append(f"    {ctype} {safe} = static_cast<{ctype}>(p_{_c_ident(buf)}[{offset}]);")
+        if isinstance(source, (TensorSource, ScatterSource)):
+            input_key = (
+                source.name
+                if isinstance(source, TensorSource)
+                else f"__scatter_buf_{name}"
+            )
+            stride = self._source_stride(input_key, logical_rank=2 if is_2d else 1)
+            if context == "scatter":
+                offset = f"t * {stride} + src"
+            elif context == "full":
+                offset = self._full_source_offset(
+                    input_key, full_variable or name, "linear"
+                )
+            elif is_2d:
+                offset = f"(t * {stride} + idx) * {n_levels} + level"
+            else:
+                offset = f"t * {stride} + idx"
+            lines.append(
+                f"    {ctype} {safe} = static_cast<{ctype}>(p_{_c_ident(input_key)}[{offset}]);"
+            )
         elif isinstance(source, ExpressionSource):
             names = {
                 dependency: self._value_expr(
-                    dependency, lines, emitted, context=context, is_2d=is_2d,
-                    n_levels=n_levels, ctype=ctype,
+                    dependency,
+                    lines,
+                    emitted,
+                    context=context,
+                    is_2d=is_2d,
+                    n_levels=n_levels,
+                    ctype=ctype,
+                    full_variable=full_variable,
                 )
                 for dependency in source.expression.dependencies
             }
             rendered = render_expression(
-                source.expression, ExpressionDialect.CUDA, names,
+                source.expression,
+                ExpressionDialect.CUDA,
+                names,
                 value_type=("float32" if ctype == "float" else "float64"),
             )
             lines.append(f"    {ctype} {safe} = static_cast<{ctype}>({rendered});")
@@ -421,40 +446,23 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         emitted[key] = safe
         return safe
 
-    def _stride_expr(self: StatisticsRuntime, name: str) -> str:
-        if self.num_trials <= 1:
-            return "0"
-        source = self._statistics_ir.sources.get(name, TensorSource(name))
-        if isinstance(source, ScatterSource):
-            return str(int(self._storage[f"__scatter_buf_{name}"].shape[-1]))
-        for key in self._statistics_ir.materialized_inputs(name):
-            tensor = self._tensor_registry.get(key)
-            if tensor is not None:
-                return str(int(tensor.shape[1])) if tensor.ndim >= 2 else "0"
-        return "0"
-
-    def _generate_scatter_kernel(self: StatisticsRuntime, scatter_spec: Dict[str, Any]) -> List[str]:
+    def _generate_scatter_kernel(self, scatter_spec: dict[str, Any]) -> list[str]:
         scatter = scatter_spec["scatter"]
         safe = scatter_spec["safe"]
         ctype = scatter_spec["ctype"]
         cnt_ctype = (
             self._state_ctype(scatter_spec["cnt_key"])[0]
-            if scatter_spec["cnt_key"] else None
+            if scatter_spec["cnt_key"]
+            else None
         )
         index_ctype = self._state_ctype(scatter.index)[0]
         zero_params = [f"{ctype}* p_{_c_ident(scatter_spec['buf_key'])}"]
         if scatter_spec["cnt_key"]:
-            zero_params.append(
-                f"{cnt_ctype}* p_{_c_ident(scatter_spec['cnt_key'])}"
-            )
+            zero_params.append(f"{cnt_ctype}* p_{_c_ident(scatter_spec['cnt_key'])}")
         zero_params.append("long total")
-        lines = [f"__global__ void hf_scatter_zero_{safe}("]
-        for i, param in enumerate(zero_params):
-            comma = "," if i < len(zero_params) - 1 else ""
-            lines.append(f"    {param}{comma}")
+        lines = _kernel_start(f"hf_scatter_zero_{safe}", zero_params)
         lines.extend(
             [
-                ") {",
                 "    long linear = blockIdx.x * blockDim.x + threadIdx.x;",
                 "    if (linear >= total) return;",
                 f"    p_{_c_ident(scatter_spec['buf_key'])}[linear] = static_cast<{ctype}>(0);",
@@ -472,34 +480,32 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             f"const {index_ctype}* p_{_c_ident(scatter.index)}",
         ]
         if scatter_spec["cnt_key"]:
-            add_params.append(
-                f"{cnt_ctype}* p_{_c_ident(scatter_spec['cnt_key'])}"
-            )
+            add_params.append(f"{cnt_ctype}* p_{_c_ident(scatter_spec['cnt_key'])}")
         for key in self._statistics_ir.scatter_inputs(scatter_spec["name"]):
             if key != scatter.index:
                 pc, _ = self._state_ctype(key)
                 add_params.append(f"const {pc}* p_{_c_ident(key)}")
-        add_params.extend(["long source_size", "long target_size", "long num_trials"])
+        add_params.extend(
+            ["long source_size", "long target_size", "long ensemble_size"]
+        )
         add_params = list(dict.fromkeys(add_params))
-        lines.append(f"__global__ void hf_scatter_add_{safe}(")
-        for i, param in enumerate(add_params):
-            comma = "," if i < len(add_params) - 1 else ""
-            lines.append(f"    {param}{comma}")
+        lines.extend(_kernel_start(f"hf_scatter_add_{safe}", add_params))
         lines.extend(
             [
-                ") {",
                 "    long linear = blockIdx.x * blockDim.x + threadIdx.x;",
-                "    long source_total = source_size * num_trials;",
+                "    long source_total = source_size * ensemble_size;",
                 "    if (linear >= source_total) return;",
                 "    long t = linear / source_size;",
                 "    long src = linear - t * source_size;",
-                "    long src_off = num_trials > 1 ? t * source_size + src : src;",
                 f"    long dst = static_cast<long>(p_{_c_ident(scatter.index)}[src]);",
+                "    if (dst < 0 || dst >= target_size) return;",
             ]
         )
-        emitted: Dict[str, str] = {}
+        emitted: dict[str, str] = {}
         val = self._scatter_value_expr(scatter.value, lines, emitted, ctype)
-        lines.append(f"    atomicAdd(p_{_c_ident(scatter_spec['buf_key'])} + t * target_size + dst, {val});")
+        lines.append(
+            f"    atomicAdd(p_{_c_ident(scatter_spec['buf_key'])} + t * target_size + dst, {val});"
+        )
         if scatter_spec["cnt_key"]:
             lines.append(
                 f"    atomicAdd(p_{_c_ident(scatter_spec['cnt_key'])} + "
@@ -513,13 +519,10 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 f"const {cnt_ctype}* p_{_c_ident(scatter_spec['cnt_key'])}",
                 "long total",
             ]
-            lines.extend(["", f"__global__ void hf_scatter_divide_{safe}("])
-            for i, param in enumerate(div_params):
-                comma = "," if i < len(div_params) - 1 else ""
-                lines.append(f"    {param}{comma}")
+            lines.append("")
+            lines.extend(_kernel_start(f"hf_scatter_divide_{safe}", div_params))
             lines.extend(
                 [
-                    ") {",
                     "    long linear = blockIdx.x * blockDim.x + threadIdx.x;",
                     "    if (linear >= total) return;",
                     f"        {cnt_ctype} cnt = p_{_c_ident(scatter_spec['cnt_key'])}[linear];",
@@ -534,83 +537,90 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         return lines
 
     def _scatter_value_expr(
-        self: StatisticsRuntime,
+        self,
         expression: Expression,
-        lines: List[str],
-        emitted: Dict[str, str],
+        lines: list[str],
+        emitted: dict[str, str],
         ctype: str,
     ) -> str:
         names = {
             dependency: self._value_expr(
-                dependency, lines, emitted, context="scatter", is_2d=False,
-                n_levels=1, ctype=ctype,
+                dependency,
+                lines,
+                emitted,
+                context="scatter",
+                is_2d=False,
+                n_levels=1,
+                ctype=ctype,
             )
             for dependency in expression.dependencies
         }
         return render_expression(
-            expression, ExpressionDialect.CUDA, names,
+            expression,
+            ExpressionDialect.CUDA,
+            names,
             value_type=("float32" if ctype == "float" else "float64"),
         )
 
-    def _collect_value_param_keys(self: StatisticsRuntime, name: str) -> List[str]:
-        return list(self._statistics_ir.materialized_inputs(name))
+    def _group_parameters(self, group: dict[str, Any]) -> dict[str, bool]:
+        """Share pointer order and mutability between kernels and their launchers."""
+        params: dict[str, bool] = {}
 
-    def _generate_group_kernel(self: StatisticsRuntime, group: Dict[str, Any]) -> List[str]:
-        if group.get("full_output"):
-            return self._generate_full_group_kernel(group)
+        def add(key: str, *, const: bool) -> None:
+            params[key] = params.get(key, True) and const
 
-        scalar_types = _scalar_types(self._control_dtype)
-        control_ctype = _FLOAT_DTYPES[self._control_dtype][0]
-        params = [f"const {self._state_ctype(group['output_index'])[0]}* p_{_c_ident(group['output_index'])}"]
+        if not group["full_output"]:
+            add(group["output_index"], const=True)
         for var in group["vars"]:
-            for key in self._collect_value_param_keys(var["name"]):
-                ctype, _ = self._state_ctype(key)
-                params.append(f"const {ctype}* p_{_c_ident(key)}")
+            for key in self._statistics_ir.materialized_inputs(var["name"]):
+                add(key, const=True)
             for op in var["ops"]:
-                out_ctype, _ = self._state_ctype(op["out_key"])
-                params.append(f"{out_ctype}* p_{_c_ident(op['out_key'])}")
+                add(op["out_key"], const=False)
                 if op["aux_key"]:
-                    aux_ctype, _ = self._state_ctype(op["aux_key"])
-                    params.append(f"{aux_ctype}* p_{_c_ident(op['aux_key'])}")
+                    add(op["aux_key"], const=False)
             for state in var["inner_states"].values():
-                ctype, _ = self._state_ctype(state["state_key"])
-                params.append(f"{ctype}* p_{_c_ident(state['state_key'])}")
-                if "weight_key" in state:
-                    wc, _ = self._state_ctype(state["weight_key"])
-                    params.append(f"{wc}* p_{_c_ident(state['weight_key'])}")
+                for key in state.values():
+                    add(key, const=False)
             if var["sample_weight_key"] is not None:
-                wc, _ = self._state_ctype(var["sample_weight_key"])
-                params.append(
-                    f"{wc}* p_{_c_ident(var['sample_weight_key'])}"
-                )
-        for key, (ctype, _) in scalar_types.items():
-            params.append(f"const {ctype}* p_{_c_ident(key)}")
-        params.extend(["long n_saved_points", "long num_trials"])
-        params = list(dict.fromkeys(params))
+                add(var["sample_weight_key"], const=False)
+        for key in _scalar_types(self._control_dtype):
+            add(key, const=True)
+        return params
 
-        lines = [f"__global__ void {group['kernel_name']}("]
-        for i, param in enumerate(params):
-            comma = "," if i < len(params) - 1 else ""
-            lines.append(f"    {param}{comma}")
+    def _generate_group_kernel(self, group: dict[str, Any]) -> list[str]:
+        full_output = group["full_output"]
+        params = [
+            f"{'const ' if const else ''}{self._state_ctype(key)[0]}* p_{_c_ident(key)}"
+            for key, const in self._group_parameters(group).items()
+        ]
+        params.extend(
+            ["long n_elements"]
+            if full_output
+            else ["long n_saved_points", "long ensemble_size"]
+        )
+        lines = _kernel_start(group["kernel_name"], params)
+        lines.append("    long linear = blockIdx.x * blockDim.x + threadIdx.x;")
+        if full_output:
+            lines.append("    if (linear >= n_elements) return;")
+        else:
+            lines.extend(
+                [
+                    f"    long max_levels = {group['max_levels']};",
+                    "    long total = n_saved_points * ensemble_size * max_levels;",
+                    "    if (linear >= total) return;",
+                    "    long level = linear % max_levels;",
+                    "    long point_linear = linear / max_levels;",
+                    "    long t = point_linear / n_saved_points;",
+                    "    long offs = point_linear - t * n_saved_points;",
+                    f"    long idx = static_cast<long>(p_{_c_ident(group['output_index'])}[offs]);",
+                ]
+            )
+        for key, (ctype, _) in _scalar_types(self._control_dtype).items():
+            lines.append(
+                f"    {ctype} {key.removeprefix('__')} = p_{_c_ident(key)}[0];"
+            )
         lines.extend(
             [
-                ") {",
-                "    long linear = blockIdx.x * blockDim.x + threadIdx.x;",
-                f"    long max_levels = {group['max_levels']};",
-                "    long total = n_saved_points * num_trials * max_levels;",
-                "    if (linear >= total) return;",
-                "    long level = linear % max_levels;",
-                "    long point_linear = linear / max_levels;",
-                "    long t = point_linear / n_saved_points;",
-                "    long offs = point_linear - t * n_saved_points;",
-                f"    long idx = static_cast<long>(p_{_c_ident(group['output_index'])}[offs]);",
-                f"    {control_ctype} weight = p___weight[0];",
-                f"    {control_ctype} total_weight = p___total_weight[0];",
-                "    int64_t num_macro_steps = p___num_macro_steps[0];",
-                "    int32_t sub_step = p___sub_step[0];",
-                "    int32_t num_sub_steps = p___num_sub_steps[0];",
-                "    int32_t flags = p___flags[0];",
-                "    int64_t macro_step_index = p___macro_step_index[0];",
                 "    bool is_inner_first = ((flags & 1) != 0) && (sub_step == 0);",
                 "    bool is_inner_last = (((flags >> 1) & 1) != 0) && (sub_step == num_sub_steps - 1);",
                 "    bool is_outer_first = (((flags >> 2) & 1) != 0) && is_inner_last;",
@@ -618,109 +628,45 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 "",
             ]
         )
-
         for var in group["vars"]:
-            condition = f"level < {var['n_levels']}" if var["is_2d"] else "level == 0"
+            if full_output:
+                condition = f"linear < {var['numel']}"
+                out_offset = "linear"
+            else:
+                condition = (
+                    f"level < {var['n_levels']}" if var["is_2d"] else "level == 0"
+                )
+                if not self._statistics_layouts[var["name"]].batched:
+                    condition = f"({condition}) && t == 0"
+                out_offset = self._out_offset_expr(var)
             lines.append(f"    if ({condition}) {{")
-            lines.append(f"        long out_off = {self._out_offset_expr(var)};")
-            emitted: Dict[str, str] = {}
+            lines.append(f"        long out_off = {out_offset};")
+            emitted: dict[str, str] = {}
             val = self._value_expr(
                 var["name"],
                 lines,
                 emitted,
-                context="group",
-                is_2d=var["is_2d"],
-                n_levels=var["n_levels"],
+                context="full" if full_output else "group",
+                is_2d=False if full_output else var["is_2d"],
+                n_levels=1 if full_output else var["n_levels"],
                 ctype=var["ctype"],
+                full_variable=var["name"] if full_output else None,
             )
             lines.append(f"        {var['ctype']} val = {val};")
             lines.extend(self._generate_inner_updates(var))
             for op in var["ops"]:
                 lines.extend(self._generate_op_update(var, op))
-            lines.append("    }")
-            lines.append("")
+            lines.extend(["    }", ""])
         lines.append("}")
         return lines
 
-    def _generate_full_group_kernel(self: StatisticsRuntime, group: Dict[str, Any]) -> List[str]:
-        scalar_types = _scalar_types(self._control_dtype)
-        control_ctype = _FLOAT_DTYPES[self._control_dtype][0]
-        params = []
-        for var in group["vars"]:
-            for key in self._collect_value_param_keys(var["name"]):
-                ctype, _ = self._state_ctype(key)
-                params.append(f"const {ctype}* p_{_c_ident(key)}")
-            for op in var["ops"]:
-                out_ctype, _ = self._state_ctype(op["out_key"])
-                params.append(f"{out_ctype}* p_{_c_ident(op['out_key'])}")
-                if op["aux_key"]:
-                    aux_ctype, _ = self._state_ctype(op["aux_key"])
-                    params.append(f"{aux_ctype}* p_{_c_ident(op['aux_key'])}")
-            for state in var["inner_states"].values():
-                ctype, _ = self._state_ctype(state["state_key"])
-                params.append(f"{ctype}* p_{_c_ident(state['state_key'])}")
-                if "weight_key" in state:
-                    wc, _ = self._state_ctype(state["weight_key"])
-                    params.append(f"{wc}* p_{_c_ident(state['weight_key'])}")
-            if var["sample_weight_key"] is not None:
-                wc, _ = self._state_ctype(var["sample_weight_key"])
-                params.append(
-                    f"{wc}* p_{_c_ident(var['sample_weight_key'])}"
-                )
-        for key, (ctype, _) in scalar_types.items():
-            params.append(f"const {ctype}* p_{_c_ident(key)}")
-        params.append("long n_elements")
-        params = list(dict.fromkeys(params))
-
-        lines = [f"__global__ void {group['kernel_name']}("]
-        for i, param in enumerate(params):
-            comma = "," if i < len(params) - 1 else ""
-            lines.append(f"    {param}{comma}")
-        lines.extend(
-            [
-                ") {",
-                "    long linear = blockIdx.x * blockDim.x + threadIdx.x;",
-                "    if (linear >= n_elements) return;",
-                f"    {control_ctype} weight = p___weight[0];",
-                f"    {control_ctype} total_weight = p___total_weight[0];",
-                "    int64_t num_macro_steps = p___num_macro_steps[0];",
-                "    int32_t sub_step = p___sub_step[0];",
-                "    int32_t num_sub_steps = p___num_sub_steps[0];",
-                "    int32_t flags = p___flags[0];",
-                "    int64_t macro_step_index = p___macro_step_index[0];",
-                "    bool is_inner_first = ((flags & 1) != 0) && (sub_step == 0);",
-                "    bool is_inner_last = (((flags >> 1) & 1) != 0) && (sub_step == num_sub_steps - 1);",
-                "    bool is_outer_first = (((flags >> 2) & 1) != 0) && is_inner_last;",
-                "    bool is_outer_last = (((flags >> 3) & 1) != 0) && is_inner_last;",
-                "",
-            ]
-        )
-
-        for var in group["vars"]:
-            lines.append(f"    if (linear < {var['numel']}) {{")
-            lines.append("        long out_off = linear;")
-            ctype = var["ctype"]
-            emitted: Dict[str, str] = {}
-            val = self._value_expr(
-                var["name"], lines, emitted, context="full", is_2d=False,
-                n_levels=1, ctype=ctype,
-            )
-            lines.append(f"        {ctype} val = {val};")
-            lines.extend(self._generate_inner_updates(var))
-            for op in var["ops"]:
-                lines.extend(self._generate_op_update(var, op))
-            lines.append("    }")
-            lines.append("")
-        lines.append("}")
-        return lines
-
-    def _out_offset_expr(self, var: Dict[str, Any]) -> str:
+    def _out_offset_expr(self, var: dict[str, Any]) -> str:
         if var["is_2d"]:
             return f"(t * n_saved_points + offs) * {var['n_levels']} + level"
         return "t * n_saved_points + offs"
 
-    def _generate_inner_updates(self, var: Dict[str, Any]) -> List[str]:
-        lines: List[str] = []
+    def _generate_inner_updates(self, var: dict[str, Any]) -> list[str]:
+        lines: list[str] = []
         ctype = var["ctype"]
         for inner in var["inner_ops"]:
             if inner == "last":
@@ -755,7 +701,11 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 )
             elif inner in {"max", "min"}:
                 fn = "hf_max" if inner == "max" else "hf_min"
-                reset = f"hf_neg_inf<{ctype}>()" if inner == "max" else f"hf_pos_inf<{ctype}>()"
+                reset = (
+                    f"hf_neg_inf<{ctype}>()"
+                    if inner == "max"
+                    else f"hf_pos_inf<{ctype}>()"
+                )
                 lines.extend(
                     [
                         "        {",
@@ -775,16 +725,18 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 )
         return lines
 
-    def _generate_op_update(self, var: Dict[str, Any], op: Dict[str, Any]) -> List[str]:
+    def _generate_op_update(self, var: dict[str, Any], op: dict[str, Any]) -> list[str]:
         outer = op["outer"]
         compound = op["inner"] is not None
         out = f"p_{_c_ident(op['out_key'])}"
         ctype = var["ctype"]
-        value = "val" if not compound or op["inner"] == "last" else f"val_for_{op['inner']}"
+        value = (
+            "val" if not compound or op["inner"] == "last" else f"val_for_{op['inner']}"
+        )
         guard = "        if (is_inner_last) {\n" if compound else ""
         end_guard = "        }\n" if compound else ""
         indent = "            " if compound else "        "
-        lines: List[str] = []
+        lines: list[str] = []
 
         if outer["k"] > 1:
             body = self._topk_update(var, op, value, indent)
@@ -801,9 +753,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             aux = f"p_{_c_ident(op['aux_key'])}"
             cmp = ">" if outer["base"] == "max" else "<"
             reset = "is_outer_first" if compound else "is_inner_first"
-            if self._statistics_layouts[
-                var["name"]
-            ].dtype.is_floating_point:
+            if self._statistics_layouts[var["name"]].dtype.is_floating_point:
                 body = [
                     f"{indent}{ctype} candidate = {value};",
                     f"{indent}if ({reset}) {{ {out}[out_off] = -1; {aux}[out_off] = static_cast<{ctype}>(NAN); }}",
@@ -822,9 +772,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 ]
         elif outer["base"] == "mean":
             if not compound:
-                weight_ptr = (
-                    f"p_{_c_ident(var['sample_weight_key'])}"
-                )
+                weight_ptr = f"p_{_c_ident(var['sample_weight_key'])}"
                 body = [
                     f"{indent}{ctype} old_v = is_inner_first ? static_cast<{ctype}>(0) : {out}[out_off];",
                     f"{indent}{ctype} old_w = is_inner_first ? static_cast<{ctype}>(0) : {weight_ptr}[out_off];",
@@ -867,7 +815,9 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             lines.extend(body)
         return lines
 
-    def _topk_update(self, var: Dict[str, Any], op: Dict[str, Any], value: str, indent: str) -> List[str]:
+    def _topk_update(
+        self, var: dict[str, Any], op: dict[str, Any], value: str, indent: str
+    ) -> list[str]:
         outer = op["outer"]
         k = outer["k"]
         ctype = var["ctype"]
@@ -904,40 +854,41 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             f"{indent}}}",
         ]
 
-    def _generate_launcher(self, specs: Dict[str, Any], params: Sequence[Dict[str, str]]) -> List[str]:
-        scalar_types = _scalar_types(self._control_dtype)
+    def _generate_launcher(
+        self, specs: dict[str, Any], params: Sequence[dict[str, str]]
+    ) -> list[str]:
         lines = [
             "static void hf_check_tensor(const at::Tensor& t, const char* name, at::ScalarType dtype) {",
-            "    TORCH_CHECK(t.is_cuda(), name, \" must be a CUDA/HIP tensor\");",
-            "    TORCH_CHECK(t.is_contiguous(), name, \" must be contiguous\");",
-            "    TORCH_CHECK(t.scalar_type() == dtype, name, \" has unexpected dtype\");",
+            '    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA/HIP tensor");',
+            '    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");',
+            '    TORCH_CHECK(t.scalar_type() == dtype, name, " has unexpected dtype");',
             "}",
             "",
             "static long hf_checked_product(long lhs, long rhs, const char* name) {",
-            "    TORCH_CHECK(lhs >= 0 && rhs >= 0, name, \" has a negative launch extent\");",
+            '    TORCH_CHECK(lhs >= 0 && rhs >= 0, name, " has a negative launch extent");',
             "    TORCH_CHECK(lhs == 0 || rhs <= std::numeric_limits<long>::max() / lhs,",
-            "                name, \" launch extent exceeds signed long range\");",
+            '                name, " launch extent exceeds signed long range");',
             "    return lhs * rhs;",
             "}",
             "",
             "static int hf_grid_blocks(long total, int threads) {",
-            "    TORCH_CHECK(total >= 0, \"kernel launch extent must be nonnegative\");",
+            '    TORCH_CHECK(total >= 0, "kernel launch extent must be nonnegative");',
             "    TORCH_CHECK(threads >= 1 && threads <= 1024,",
-            "                \"CUDA statistics block_size must be in [1, 1024]\");",
+            '                "CUDA statistics block_size must be in [1, 1024]");',
             "    if (total == 0) return 0;",
             "    long blocks = total / threads + (total % threads != 0);",
             "    TORCH_CHECK(blocks <= std::numeric_limits<int>::max(),",
-            "                \"CUDA statistics grid exceeds the supported block count\");",
+            '                "CUDA statistics grid exceeds the supported block count");',
             "    return static_cast<int>(blocks);",
             "}",
             "",
             "void launch_update(py::dict states, long block_size) {",
             "    TORCH_CHECK(block_size >= 1 && block_size <= 1024,",
-            "                \"CUDA statistics block_size must be in [1, 1024]\");",
+            '                "CUDA statistics block_size must be in [1, 1024]");',
             "    int threads = static_cast<int>(block_size);",
-            "    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();",
         ]
-        for param in sorted(params, key=lambda p: p["key"]):
+        ordered_params = sorted(params, key=lambda param: param["key"])
+        for index, param in enumerate(ordered_params):
             key = param["key"]
             key_lit = json.dumps(key)
             tname = f"t_{param['ident']}"
@@ -945,7 +896,23 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 [
                     f"    at::Tensor {tname} = states[{key_lit}].cast<at::Tensor>();",
                     f"    hf_check_tensor({tname}, {key_lit}, {param['scalar_type']});",
-                    f"    {param['ctype']}* {param['ptr']} = {tname}.data_ptr<{param['ctype']}>();",
+                ]
+            )
+            if index:
+                device_owner = f"t_{ordered_params[0]['ident']}"
+                lines.append(
+                    f"    TORCH_CHECK({tname}.device() == {device_owner}.device(), "
+                    f'{key_lit}, " must be on the same CUDA/HIP device as all statistics buffers");'
+                )
+            lines.append(
+                f"    {param['ctype']}* {param['ptr']} = {tname}.data_ptr<{param['ctype']}>();"
+            )
+        if ordered_params:
+            device_owner = f"t_{ordered_params[0]['ident']}"
+            lines.extend(
+                [
+                    f"    const c10::cuda::CUDAGuard device_guard({device_owner}.device());",
+                    "    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();",
                 ]
             )
         for scatter in specs["scatters"]:
@@ -954,11 +921,11 @@ class CudaStatisticsEmitter(StatisticsEmitter):
             ]
             if scatter["cnt_key"]:
                 zero_args.append(f"p_{_c_ident(scatter['cnt_key'])}")
-            zero_args.append(str(scatter["target_size"] * scatter["num_trials"]))
+            zero_args.append(str(scatter["target_size"] * scatter["ensemble_size"]))
             lines.extend(
                 [
                     "    {",
-                    f"        long total = {scatter['target_size'] * scatter['num_trials']};",
+                    f"        long total = {scatter['target_size'] * scatter['ensemble_size']};",
                     "        int blocks = hf_grid_blocks(total, threads);",
                     f"        if (blocks > 0) hf_scatter_zero_{scatter['safe']}<<<blocks, threads, 0, stream>>>({', '.join(zero_args)});",
                     "    }",
@@ -975,11 +942,17 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 if key != scatter["scatter"].index:
                     add_args.append(f"p_{_c_ident(key)}")
             add_args = list(dict.fromkeys(add_args))
-            add_args.extend([str(scatter["source_size"]), str(scatter["target_size"]), str(scatter["num_trials"])])
+            add_args.extend(
+                [
+                    str(scatter["source_size"]),
+                    str(scatter["target_size"]),
+                    str(scatter["ensemble_size"]),
+                ]
+            )
             lines.extend(
                 [
                     "    {",
-                    f"        long total = {scatter['source_size'] * scatter['num_trials']};",
+                    f"        long total = {scatter['source_size'] * scatter['ensemble_size']};",
                     "        int blocks = hf_grid_blocks(total, threads);",
                     f"        if (blocks > 0) hf_scatter_add_{scatter['safe']}<<<blocks, threads, 0, stream>>>({', '.join(add_args)});",
                     "    }",
@@ -989,37 +962,19 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                 divide_args = [
                     f"p_{_c_ident(scatter['buf_key'])}",
                     f"p_{_c_ident(scatter['cnt_key'])}",
-                    str(scatter["target_size"] * scatter["num_trials"]),
+                    str(scatter["target_size"] * scatter["ensemble_size"]),
                 ]
                 lines.extend(
                     [
                         "    {",
-                        f"        long total = {scatter['target_size'] * scatter['num_trials']};",
+                        f"        long total = {scatter['target_size'] * scatter['ensemble_size']};",
                         "        int blocks = hf_grid_blocks(total, threads);",
                         f"        if (blocks > 0) hf_scatter_divide_{scatter['safe']}<<<blocks, threads, 0, stream>>>({', '.join(divide_args)});",
                         "    }",
                     ]
                 )
         for group in specs["groups"]:
-            args = [] if group.get("full_output") else [f"p_{_c_ident(group['output_index'])}"]
-            for var in group["vars"]:
-                for key in self._collect_value_param_keys(var["name"]):
-                    args.append(f"p_{_c_ident(key)}")
-                for op in var["ops"]:
-                    args.append(f"p_{_c_ident(op['out_key'])}")
-                    if op["aux_key"]:
-                        args.append(f"p_{_c_ident(op['aux_key'])}")
-                for state in var["inner_states"].values():
-                    args.append(f"p_{_c_ident(state['state_key'])}")
-                    if "weight_key" in state:
-                        args.append(f"p_{_c_ident(state['weight_key'])}")
-                if var["sample_weight_key"] is not None:
-                    args.append(
-                        f"p_{_c_ident(var['sample_weight_key'])}"
-                    )
-            for key in scalar_types:
-                args.append(f"p_{_c_ident(key)}")
-            args = list(dict.fromkeys(args))
+            args = [f"p_{_c_ident(key)}" for key in self._group_parameters(group)]
             if group.get("full_output"):
                 args.append(str(group["full_total"]))
                 lines.extend(
@@ -1032,12 +987,17 @@ class CudaStatisticsEmitter(StatisticsEmitter):
                     ]
                 )
             else:
-                args.extend([f"t_{_c_ident(group['output_index'])}.numel()", str(group["num_trials"])])
+                args.extend(
+                    [
+                        f"t_{_c_ident(group['output_index'])}.numel()",
+                        str(group["ensemble_size"]),
+                    ]
+                )
                 lines.extend(
                     [
                         "    {",
-                        f"        long total = hf_checked_product(t_{_c_ident(group['output_index'])}.numel(), {group['num_trials']}, \"{group['kernel_name']}\");",
-                        f"        total = hf_checked_product(total, {group['max_levels']}, \"{group['kernel_name']}\");",
+                        f'        long total = hf_checked_product(t_{_c_ident(group["output_index"])}.numel(), {group["ensemble_size"]}, "{group["kernel_name"]}");',
+                        f'        total = hf_checked_product(total, {group["max_levels"]}, "{group["kernel_name"]}");',
                         "        int blocks = hf_grid_blocks(total, threads);",
                         f"        if (blocks > 0) {group['kernel_name']}<<<blocks, threads, 0, stream>>>({', '.join(args)});",
                         "    }",
@@ -1046,7 +1006,7 @@ class CudaStatisticsEmitter(StatisticsEmitter):
         lines.append("}")
         return lines
 
-    def _save_cuda_kernel_file(self: StatisticsRuntime, cpp_sources: str, cuda_sources: str) -> None:
+    def _save_cuda_kernel_file(self, cpp_sources: str, cuda_sources: str) -> None:
         unique_name = self._generate_unique_name()
         self._saved_kernel_file = self.kernels_dir / f"kern_cuda_{unique_name}.cu"
         atomic_write_text(

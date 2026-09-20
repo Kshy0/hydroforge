@@ -11,11 +11,13 @@ from hydroforge.contracts.kernels import KernelSpec, buffer_access_semantics
 from hydroforge.contracts.runtime import DEFAULT_BLOCK_SIZE
 from hydroforge.kernels.backends.metal.dispatcher import make_metal_dispatcher
 from hydroforge.kernels.backends.metal.protocol import MetalCommandNode
-from hydroforge.kernels.backends.metal.types import (
-    TENSOR_TYPES,
-)
 from hydroforge.kernels.backends.metal.template import (
-    METAL_KERNEL_BODY_MARKER, make_spec_metal_dispatcher,
+    METAL_KERNEL_BODY_MARKER,
+    make_spec_metal_dispatcher,
+)
+from hydroforge.kernels.backends.metal.types import (
+    RUNTIME_SCALAR_TYPES,
+    TENSOR_TYPES,
 )
 
 
@@ -28,8 +30,7 @@ def launch_metal_dispatcher(
     arguments = {**arguments, "BLOCK_SIZE": DEFAULT_BLOCK_SIZE}
     metadata = dispatcher.__hydroforge_kernel__
     buffer_dtypes = {
-        name: getattr(arguments.get(name), "dtype", None)
-        for name in metadata.buffers
+        name: getattr(arguments.get(name), "dtype", None) for name in metadata.buffers
     }
     dispatcher._validate_specialization_input(
         arguments,
@@ -74,8 +75,7 @@ class MetalCommand(MetalCommandNode):
         # Online framework kernels are not bound through a model KernelBinder,
         # but the Metal dispatcher still requires the same specialization
         # inputs as registered kernels, plus an explicit threadgroup size.
-        arguments = {**self.arguments, "BLOCK_SIZE": DEFAULT_BLOCK_SIZE}
-        launch_metal_dispatcher(self.dispatcher, arguments)
+        launch_metal_dispatcher(self.dispatcher, self.arguments)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,15 +96,14 @@ class MetalBuffer:
                 f"int32 storage, got {self.dtype}"
             )
 
+
 @dataclass(frozen=True, slots=True)
 class MetalScalar:
     name: str
     kind: str
 
     def __post_init__(self) -> None:
-        if self.kind not in {
-            "bool", "int32", "uint32", "index", "float32",
-        }:
+        if self.kind not in RUNTIME_SCALAR_TYPES:
             raise ValueError(f"invalid Metal scalar kind {self.kind!r}")
 
 
@@ -131,16 +130,11 @@ def make_online_metal_dispatcher(
         parameters=names,
         size_key=size_key,
         buffers={field.name: field.access for field in buffers},
-        runtime_scalars={
-            field.name: field.kind
-            for field in scalars
-        },
+        runtime_scalars={field.name: field.kind for field in scalars},
     )
     template = make_spec_metal_dispatcher(
-        spec=spec, source=f"{METAL_KERNEL_BODY_MARKER}: {name}\n{body}",
+        spec=spec,
+        source=f"{METAL_KERNEL_BODY_MARKER}: {name}\n{body}",
     )
-    source = template.source_for_types({
-        field.name: field.dtype
-        for field in buffers
-    })
+    source = template.source_for_types({field.name: field.dtype for field in buffers})
     return make_metal_dispatcher(source, name, spec=spec)

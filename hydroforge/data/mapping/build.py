@@ -1,39 +1,50 @@
 """Orchestrators that assemble :class:`MappingTable` objects from engines."""
+
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
-from typing import Any, Literal, Mapping, Self
+from typing import Annotated, Any, Literal, Self
 
 import numpy as np
-from pydantic import PrivateAttr, model_validator
+from pydantic import AfterValidator, PrivateAttr, model_validator
 from scipy.sparse import csr_matrix
 
+from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.data.mapping.engine import (
-    aggregate_hires_coo,
+    _aggregate_hires_coo_trusted,
+    _HiresPixelDeclaration,
     normalise_row,
     regular_overlap_rows,
 )
 from hydroforge.data.mapping.grid import RegularGrid
-from hydroforge.data.numeric import canonical_ids
 from hydroforge.data.mapping.table import MappingTable
 from hydroforge.data.mapping.target import TargetSupport
 from hydroforge.data.numeric import canonical_floating_array
-from hydroforge.contracts.validation import HydroForgeModel
-
 
 MappingMethod = Literal["nearest", "overlap"]
 Normalization = Literal["mean", "sum"]
 _MIN_FULL_COVERAGE = 1.0 - 1e-6
-_MAPPING_METADATA_KEYS = frozenset({
-    "method", "normalization", "source_shape", "source_order",
-    "source_is_geographic", "source_x_name", "source_y_name",
-    "target_kind", "overlap_engine",
-})
+_MAPPING_METADATA_KEYS = frozenset(
+    {
+        "method",
+        "normalization",
+        "source_shape",
+        "source_order",
+        "source_is_geographic",
+        "source_x_name",
+        "source_y_name",
+        "target_kind",
+        "overlap_engine",
+    }
+)
 
 
 def _float32_mapping_matrix(matrix: csr_matrix, *, label: str) -> csr_matrix:
     data = canonical_floating_array(
-        matrix.data, dtype="float32", label=label,
+        matrix.data,
+        dtype="float32",
+        label=label,
     )
     converted = csr_matrix(
         (data, matrix.indices.copy(), matrix.indptr.copy()),
@@ -48,16 +59,27 @@ def _float32_mapping_matrix(matrix: csr_matrix, *, label: str) -> csr_matrix:
 def _mapping_metadata(value: Mapping[str, Any] | None) -> dict[str, Any]:
     if value is None:
         return {}
-    if not isinstance(value, Mapping):
-        raise ValueError("mapping metadata must be a mapping or None")
     if any(type(name) is not str or not name for name in value):
         raise ValueError("mapping metadata keys must be non-empty exact strings")
     reserved = sorted(set(value).intersection(_MAPPING_METADATA_KEYS))
     if reserved:
-        raise ValueError(
-            f"mapping metadata cannot override derived keys: {reserved}"
-        )
+        raise ValueError(f"mapping metadata cannot override derived keys: {reserved}")
     return deepcopy(dict(value))
+
+
+_MappingMetadata = Annotated[
+    Mapping[str, Any] | None, AfterValidator(_mapping_metadata)
+]
+
+
+def _source_metadata(source: RegularGrid) -> dict[str, Any]:
+    return {
+        "source_shape": list(source._shape),
+        "source_order": source.order,
+        "source_is_geographic": source.is_geographic,
+        "source_x_name": source.x_name,
+        "source_y_name": source.y_name,
+    }
 
 
 class _RegularGridMappingDeclaration(HydroForgeModel):
@@ -67,7 +89,7 @@ class _RegularGridMappingDeclaration(HydroForgeModel):
     target: TargetSupport
     method: MappingMethod = "overlap"
     normalization: Normalization = "mean"
-    metadata: Mapping[str, Any] | None = None
+    metadata: _MappingMetadata = None
 
     _mapping: MappingTable = PrivateAttr()
 
@@ -79,7 +101,6 @@ class _RegularGridMappingDeclaration(HydroForgeModel):
             self.target.x is None or self.target.y is None
         ):
             raise ValueError("nearest requires target center coordinates")
-        object.__setattr__(self, "metadata", _mapping_metadata(self.metadata))
         self._mapping = _build_regular_grid_mapping_trusted(
             source=self.source,
             target=self.target,
@@ -104,31 +125,32 @@ def _build_regular_grid_mapping_trusted(
 ) -> MappingTable:
     """Materialize a mapping from already validated immutable inputs."""
 
-    method_name = method
-
     rows: list[int] = []
     cols: list[int] = []
     values: list[float] = []
     coverage = np.zeros(target.target_ids.size, dtype=np.float32)
 
-    if method_name == "nearest":
-        source_idx = source._index_of_points(
-            target.x, target.y, allow_oob=False,
+    if method == "nearest":
+        source_idx = source._index_of_points_trusted(
+            target.x,
+            target.y,
+            allow_oob=False,
         )
         target_rows = np.arange(source_idx.size, dtype=np.int64)
         rows.extend(target_rows.tolist())
-        cols.extend(source_idx.astype(np.int64).tolist())
+        cols.extend(source_idx.tolist())
         values.extend(np.ones(target_rows.size, dtype=np.float32).tolist())
         coverage[:] = 1.0
     else:
         for row, (
-            row_cols, row_values, row_coverage,
+            row_cols,
+            row_values,
+            row_coverage,
         ) in enumerate(regular_overlap_rows(source, target)):
             coverage[row] = row_coverage
             if row_cols.size == 0:
                 raise ValueError(
-                    f"target {int(target.target_ids[row])} has no "
-                    "source-grid overlap"
+                    f"target {int(target.target_ids[row])} has no source-grid overlap"
                 )
             if row_coverage < _MIN_FULL_COVERAGE:
                 raise ValueError(
@@ -152,22 +174,20 @@ def _build_regular_grid_mapping_trusted(
         shape=(target.target_ids.size, source._size),
         dtype=np.float64,
     )
-    matrix.eliminate_zeros()
     matrix = _float32_mapping_matrix(
-        matrix, label="regular-grid mapping weights",
+        matrix,
+        label="regular-grid mapping weights",
     )
     out_metadata = dict(metadata or {})
-    out_metadata.update({
-        "method": method_name,
-        "normalization": normalization,
-        "source_shape": list(source._shape),
-        "source_order": source.order,
-        "source_is_geographic": bool(source.is_geographic),
-        "source_x_name": source.x_name,
-        "source_y_name": source.y_name,
-        "target_kind": target.metadata.get("kind", "unknown"),
-        "overlap_engine": "separable" if method_name == "overlap" else None,
-    })
+    out_metadata.update(
+        {
+            "method": method,
+            "normalization": normalization,
+            **_source_metadata(source),
+            "target_kind": target.metadata.get("kind", "unknown"),
+            "overlap_engine": "separable" if method == "overlap" else None,
+        }
+    )
     return MappingTable(
         target_ids=target.target_ids,
         matrix=matrix,
@@ -197,29 +217,10 @@ def build_regular_grid_mapping(
     return declaration.mapping
 
 
-class _HiresAggregateMappingDeclaration(HydroForgeModel):
+class _HiresAggregateMappingDeclaration(_HiresPixelDeclaration):
     """Validated public declaration for a high-resolution aggregate build."""
 
-    source: RegularGrid
-    target_ids: np.ndarray
-    pixel_catchment_id: np.ndarray
-    pixel_area: np.ndarray
-    pixel_lon: np.ndarray
-    pixel_lat: np.ndarray
-    allow_oob_zero: bool = False
-    metadata: Mapping[str, Any] | None = None
-
-    @model_validator(mode="after")
-    def _validate_mapping(self) -> Self:
-        if self.target_ids.ndim != 1:
-            raise ValueError("target_ids must be one-dimensional")
-        object.__setattr__(
-            self,
-            "target_ids",
-            canonical_ids(self.target_ids, label="target_ids"),
-        )
-        object.__setattr__(self, "metadata", _mapping_metadata(self.metadata))
-        return self
+    metadata: _MappingMetadata = None
 
 
 def build_hires_aggregate_mapping(
@@ -250,41 +251,31 @@ def build_hires_aggregate_mapping(
     )
     source = declaration.source
     target_ids = declaration.target_ids
-    rows, cols, data = aggregate_hires_coo(
-        source,
-        target_ids,
-        declaration.pixel_catchment_id,
-        declaration.pixel_area,
-        declaration.pixel_lon,
-        declaration.pixel_lat,
-        allow_oob_zero=declaration.allow_oob_zero,
-    )
+    rows, cols, data = _aggregate_hires_coo_trusted(declaration)
     matrix = csr_matrix(
-        (data.astype(np.float64, copy=False), (rows, cols)),
+        (data, (rows, cols)),
         shape=(target_ids.size, source._size),
         dtype=np.float64,
     )
-    matrix.eliminate_zeros()
     coverage = canonical_floating_array(
         np.asarray(matrix.sum(axis=1), dtype=np.float64).ravel(),
         dtype="float32",
         label="hires mapping coverage",
     )
     matrix = _float32_mapping_matrix(
-        matrix, label="hires mapping weights",
+        matrix,
+        label="hires mapping weights",
     )
     out_metadata = dict(declaration.metadata or {})
-    out_metadata.update({
-        "method": "hires_aggregate",
-        "normalization": "sum",
-        "source_shape": list(source._shape),
-        "source_order": source.order,
-        "source_is_geographic": bool(source.is_geographic),
-        "source_x_name": source.x_name,
-        "source_y_name": source.y_name,
-        "target_kind": "catchment",
-        "overlap_engine": "hires_aggregate",
-    })
+    out_metadata.update(
+        {
+            "method": "hires_aggregate",
+            "normalization": "sum",
+            **_source_metadata(source),
+            "target_kind": "catchment",
+            "overlap_engine": "hires_aggregate",
+        }
+    )
     return MappingTable(
         target_ids=target_ids,
         matrix=matrix,

@@ -2,24 +2,43 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import cached_property
-import hashlib
-import math
-from typing import Any, Callable, Dict, Mapping, Self
+from typing import Annotated, Any, Self
 
-from pydantic import Field, PrivateAttr, ValidationInfo, model_validator
-
-from hydroforge.kernels.backends.cuda.spec import (
-    CudaExtensionSpec, _CompiledCudaExtension, cuda_declarations,
-    cuda_function_signature, cuda_narrowed_index_parameters,
+from pydantic import (
+    AfterValidator,
+    Field,
+    FiniteFloat,
+    PrivateAttr,
+    ValidationInfo,
+    model_validator,
 )
+
 from hydroforge.contracts.kernels import (
-    BackendLoweringSpec, BufferDTypeABI, KernelSpec, _host_scalar_is_valid,
+    BackendLoweringSpec,
+    BufferDTypeABI,
+    KernelSpec,
+    _host_scalar_is_valid,
 )
-from hydroforge.contracts.validation import HydroForgeModel, _immutable_dict
+from hydroforge.contracts.naming import DottedPath, Identifier
+from hydroforge.contracts.validation import (
+    FrozenMapping,
+    HydroForgeModel,
+    _immutable_dict,
+)
+from hydroforge.kernels.backends.cuda.spec import (
+    CudaExtensionSpec,
+    _CompiledCudaExtension,
+    cuda_declarations,
+    cuda_function_signature,
+    cuda_narrowed_index_parameters,
+)
 from hydroforge.kernels.context import (
-    active_kernel_spec, registry_factory,
+    active_kernel_spec,
+    registry_factory,
 )
 
 
@@ -34,52 +53,26 @@ class _CudaTensorVector:
         return [values[name] for name in self.sources]
 
 
-CudaProjectionValue = bool | int | float | None
+CudaProjectionValue = bool | int | FiniteFloat | None
+_ExtensionNames = Annotated[
+    set[Identifier] | frozenset[Identifier], AfterValidator(frozenset)
+]
 
 
 class CudaNativeProjection(HydroForgeModel):
     """Semantic preconditions for canonical values absent from a launcher."""
 
-    fixed: Mapping[str, CudaProjectionValue] = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def _validate_projection(self) -> Self:
-        if not isinstance(self.fixed, Mapping):
-            raise ValueError("CUDA native projection fixed values must be a mapping")
-        fixed = dict(self.fixed)
-        invalid = [name for name in fixed if not name.isidentifier()]
-        if invalid:
-            raise ValueError(
-                "CUDA native projection fixed names must be Python "
-                f"identifiers: {invalid}"
-            )
-        invalid_values = {
-            name: type(value).__name__
-            for name, value in fixed.items()
-            if type(value) not in {bool, int, float, type(None)}
-        }
-        if invalid_values:
-            raise ValueError(
-                "CUDA native projection fixed values must be exact immutable "
-                f"host scalars or None: {invalid_values}"
-            )
-        nonfinite = [
-            name for name, value in fixed.items()
-            if type(value) is float and not math.isfinite(value)
-        ]
-        if nonfinite:
-            raise ValueError(
-                "CUDA native projection fixed floats must be finite: "
-                f"{nonfinite}"
-            )
-        object.__setattr__(self, "fixed", _immutable_dict(fixed))
-        return self
+    fixed: FrozenMapping[Identifier, CudaProjectionValue] = Field(default_factory=dict)
 
     def _validate(self, values: Mapping[str, Any], *, kernel: str) -> None:
         mismatched = {
             name: (values[name], expected)
             for name, expected in self.fixed.items()
-            if type(values[name]) is not type(expected) or values[name] != expected
+            if (
+                type(values[name]) is not type(expected)
+                or values[name] != expected
+                or (type(expected) is float and values[name].hex() != expected.hex())
+            )
         }
         if mismatched:
             detail = ", ".join(
@@ -94,20 +87,10 @@ class CudaNativeProjection(HydroForgeModel):
 class CudaRoute(HydroForgeModel):
     """One declarative extension launcher owned by a CUDA extension group."""
 
-    extension: str
-    launch: str
+    extension: Identifier
+    launch: Identifier
     spec: KernelSpec
     projection: CudaNativeProjection | None = None
-
-    @model_validator(mode="after")
-    def _validate_route(self) -> Self:
-        for field in ("extension", "launch"):
-            value = getattr(self, field)
-            if type(value) is not str or not value.isidentifier():
-                raise ValueError(
-                    f"CUDA route {field} must be a Python/C++ identifier"
-                )
-        return self
 
     @property
     def _key(self) -> tuple[str, str]:
@@ -131,15 +114,15 @@ class _CompiledCudaRoute:
 
 def _normalized_native_type(native_type: str) -> str:
     return " ".join(
-        token for token in native_type.replace("&", "").split()
-        if token != "const"
+        token for token in native_type.replace("&", "").split() if token != "const"
     )
 
 
 def _native_kind(native_type: str) -> str:
     normalized = _normalized_native_type(native_type)
     if normalized in {
-        "at::Tensor", "std::optional<at::Tensor>",
+        "at::Tensor",
+        "std::optional<at::Tensor>",
         "c10::optional<at::Tensor>",
     }:
         return "buffer"
@@ -155,9 +138,7 @@ def _native_kind(native_type: str) -> str:
         return "float32"
     if normalized == "double":
         return "float64"
-    raise ValueError(
-        f"unsupported CUDA launcher parameter type {native_type!r}"
-    )
+    raise ValueError(f"unsupported CUDA launcher parameter type {native_type!r}")
 
 
 def _native_buffer_optional(native_type: str) -> bool:
@@ -165,7 +146,8 @@ def _native_buffer_optional(native_type: str) -> bool:
     if normalized == "at::Tensor":
         return False
     if normalized in {
-        "std::optional<at::Tensor>", "c10::optional<at::Tensor>",
+        "std::optional<at::Tensor>",
+        "c10::optional<at::Tensor>",
     }:
         return True
     raise ValueError(f"unsupported CUDA tensor launcher type {native_type!r}")
@@ -196,7 +178,8 @@ def _validate_projection_values(
         kind = spec.runtime_scalars.get(name, spec.compile_time.get(name))
         validation_kind = "float32" if kind == "precision" else kind
         if validation_kind is None or not _host_scalar_is_valid(
-            value, validation_kind,
+            value,
+            validation_kind,
         ):
             raise ValueError(
                 f"{spec.name}: CUDA native projection value {name!r} must "
@@ -206,7 +189,8 @@ def _validate_projection_values(
 
 
 def _compile_cuda_route(
-    route: CudaRoute, source: str,
+    route: CudaRoute,
+    source: str,
 ) -> _CompiledCudaRoute:
     """Parse and validate one route exactly once during group construction."""
 
@@ -215,10 +199,7 @@ def _compile_cuda_route(
     narrowed = cuda_narrowed_index_parameters(
         source,
         route.launch,
-        tuple(
-            name for name, kind in spec.runtime_scalars.items()
-            if kind == "index"
-        ),
+        tuple(name for name, kind in spec.runtime_scalars.items() if kind == "index"),
     )
     if narrowed:
         raise ValueError(
@@ -232,7 +213,8 @@ def _compile_cuda_route(
     native_names = set(launch_args)
     canonical_names = set(parameters)
     vector_arguments = tuple(
-        name for name, native_type in native_signature
+        name
+        for name, native_type in native_signature
         if _normalized_native_type(native_type) == "std::vector<at::Tensor>"
     )
     if len(vector_arguments) > 1:
@@ -249,7 +231,8 @@ def _compile_cuda_route(
                 "physical projection, not a canonical parameter"
             )
         sources = tuple(
-            name for name in parameters
+            name
+            for name in parameters
             if name in spec.buffers and name not in native_names
         )
         if not sources:
@@ -267,9 +250,8 @@ def _compile_cuda_route(
 
     projection = route.projection or CudaNativeProjection()
     consumed_canonical = native_names.intersection(canonical_names) | {
-        source_name for source_name in (
-            () if tensor_vector is None else tensor_vector.sources
-        )
+        source_name
+        for source_name in (() if tensor_vector is None else tensor_vector.sources)
     }
     omitted_canonical = canonical_names.difference(consumed_canonical)
     unknown_fixed = set(projection.fixed).difference(omitted_canonical)
@@ -313,18 +295,13 @@ def _compile_cuda_route(
     )
     if unknown:
         raise ValueError(
-            "CUDA launch arguments are outside canonical ABI: "
-            f"{sorted(unknown)}"
+            f"CUDA launch arguments are outside canonical ABI: {sorted(unknown)}"
         )
 
     canonical_native_kinds = {
         **{name: "buffer" for name in spec.buffers},
-        **{
-            name: kind for name, kind in spec.runtime_scalars.items()
-        },
-        **{
-            name: kind for name, kind in spec.compile_time.items()
-        },
+        **{name: kind for name, kind in spec.runtime_scalars.items()},
+        **{name: kind for name, kind in spec.compile_time.items()},
     }
     for name, native_type in native_signature:
         if tensor_vector is not None and name == tensor_vector.target:
@@ -376,7 +353,8 @@ def _compile_cuda_route(
                 spec._resolve_precision("float32"),
                 spec._resolve_precision("float64"),
             )
-            if spec._uses_precision else (spec,)
+            if spec._uses_precision
+            else (spec,)
         ),
     )
 
@@ -394,7 +372,8 @@ class _CudaFactoryRequest(HydroForgeModel):
     def _resolve_route(self, info: ValidationInfo):
         group = (
             info.context.get(_CUDA_FACTORY_CONTEXT)
-            if isinstance(info.context, Mapping) else None
+            if isinstance(info.context, Mapping)
+            else None
         )
         if group is None:
             raise ValueError("CUDA factory request requires group context")
@@ -431,97 +410,42 @@ class _CudaDispatcherDeclaration(HydroForgeModel):
 class CudaExtensionGroup(HydroForgeModel):
     """Lazily build a named namespace of declarative CUDA extensions."""
 
-    owner_module: str
-    specs: Mapping[str, CudaExtensionSpec]
-    routes: tuple[CudaRoute, ...]
-    binary_prefix: str | None = None
-    env_prefix: str = "HYDROFORGE"
-    module_extensions: Mapping[
-        str, set[str] | frozenset[str]
-    ] = Field(default_factory=dict)
+    owner_module: DottedPath
+    specs: FrozenMapping[Identifier, CudaExtensionSpec] = Field(min_length=1)
+    routes: tuple[CudaRoute, ...] = Field(min_length=1)
+    binary_prefix: Identifier | None = None
+    env_prefix: Identifier = "HYDROFORGE"
+    module_extensions: FrozenMapping[Identifier, _ExtensionNames] = Field(
+        default_factory=dict
+    )
 
     _route_index: Mapping[tuple[str, str], _CompiledCudaRoute] = PrivateAttr(
         default_factory=dict,
     )
-    _exports: Mapping[str, tuple[str, ...]] = PrivateAttr(default_factory=dict)
     _compiled_specs: Mapping[str, _CompiledCudaExtension] = PrivateAttr(
         default_factory=dict,
     )
-    _loaded: Dict[str, Any] = PrivateAttr(default_factory=dict)
-    _variant_loaded: Dict[tuple[str, tuple[tuple[str, int], ...]], Any] = (
-        PrivateAttr(default_factory=dict)
+    _loaded: dict[str, Any] = PrivateAttr(default_factory=dict)
+    _variant_loaded: dict[tuple[str, tuple[tuple[str, int], ...]], Any] = PrivateAttr(
+        default_factory=dict
     )
     _precompiled: set[str] = PrivateAttr(default_factory=set)
 
     @model_validator(mode="after")
     def _validate_group(self) -> Self:
-        if (
-            type(self.owner_module) is not str or not self.owner_module
-            or any(
-                not part.isidentifier()
-                for part in self.owner_module.split(".")
-            )
-        ):
-            raise ValueError(
-                "CUDA extension owner_module must be a dotted Python name"
-            )
-        if not isinstance(self.specs, Mapping) or not self.specs:
-            raise ValueError("CUDA extension specs must be a non-empty mapping")
-        invalid_names = [
-            name for name in self.specs
-            if type(name) is not str or not name.isidentifier()
-        ]
-        if invalid_names:
-            raise ValueError(
-                f"CUDA extension names must be identifiers: {invalid_names}"
-            )
-        invalid_specs = {
-            name: type(spec).__name__
-            for name, spec in self.specs.items()
-            if not isinstance(spec, CudaExtensionSpec)
-        }
-        if invalid_specs:
-            raise ValueError(
-                f"CUDA extension catalog values must be CudaExtensionSpec: "
-                f"{invalid_specs}"
-            )
-        resolved_prefix = (
-            self.binary_prefix or self.owner_module.replace(".", "_")
-        )
-        if type(resolved_prefix) is not str or not resolved_prefix.isidentifier():
-            raise ValueError("CUDA binary_prefix must be a Python identifier")
-        if type(self.env_prefix) is not str or not self.env_prefix.isidentifier():
-            raise ValueError("CUDA env_prefix must be a Python identifier")
-        object.__setattr__(self, "binary_prefix", resolved_prefix)
-        object.__setattr__(self, "specs", _immutable_dict(self.specs))
-        demands = {
-            module: frozenset(extensions)
-            for module, extensions in self.module_extensions.items()
-        }
-        invalid_modules = [
-            module for module in demands
-            if type(module) is not str or not module.isidentifier()
-        ]
-        if invalid_modules:
-            raise ValueError(
-                "CUDA module demand names must be identifiers: "
-                f"{invalid_modules}"
+        if self.binary_prefix is None:
+            object.__setattr__(
+                self, "binary_prefix", self.owner_module.replace(".", "_")
             )
         unknown_demands = {
-            module: sorted(extensions.difference(self.specs))
-            for module, extensions in demands.items()
-            if extensions.difference(self.specs)
+            module: sorted(unknown)
+            for module, extensions in self.module_extensions.items()
+            if (unknown := extensions.difference(self.specs))
         }
         if unknown_demands:
             raise ValueError(
-                "CUDA module demands reference unknown extensions: "
-                f"{unknown_demands}"
+                f"CUDA module demands reference unknown extensions: {unknown_demands}"
             )
-        object.__setattr__(
-            self, "module_extensions", _immutable_dict(demands),
-        )
-        if type(self.routes) is not tuple or not self.routes:
-            raise ValueError("CUDA extension routes must be a non-empty tuple")
         route_index: dict[tuple[str, str], CudaRoute] = {}
         exports: dict[str, list[str]] = {name: [] for name in self.specs}
         for route in self.routes:
@@ -530,12 +454,13 @@ class CudaExtensionGroup(HydroForgeModel):
                     f"CUDA route {route.extension!r}/{route.launch!r} "
                     "references an unknown extension"
                 )
-            if route._key in route_index:
+            key = route._key
+            if key in route_index:
                 raise ValueError(
                     f"CUDA route {route.extension!r}/{route.launch!r} "
                     "is declared more than once"
                 )
-            route_index[route._key] = route
+            route_index[key] = route
             exports[route.extension].append(route.launch)
         missing_routes = sorted(
             name for name, launches in exports.items() if not launches
@@ -566,18 +491,20 @@ class CudaExtensionGroup(HydroForgeModel):
         for key, route in route_index.items():
             try:
                 compiled_routes[key] = _compile_cuda_route(
-                    route, compiled_specs[route.extension].source,
+                    route,
+                    compiled_specs[route.extension].source,
                 )
             except (TypeError, ValueError, OverflowError) as error:
                 raise ValueError(str(error)) from error
         self._route_index = _immutable_dict(compiled_routes)
-        self._exports = _immutable_dict(immutable_exports)
         self._compiled_specs = _immutable_dict(compiled_specs)
         return self
 
     def factory(
-        self, extension: str, launch: str,
-    ) -> Callable[[], "CudaDispatcher"]:
+        self,
+        extension: str,
+        launch: str,
+    ) -> Callable[[], CudaDispatcher]:
         """Return the registry factory for one already-declared route."""
 
         request = _CudaFactoryRequest.model_validate(
@@ -595,23 +522,18 @@ class CudaExtensionGroup(HydroForgeModel):
     def _load(self, name: str) -> Any:
         if name in self._loaded:
             return self._loaded[name]
-        spec = self._compiled_specs[name]
         from hydroforge.kernels.backends.cuda.build import load_inline_cu_module
 
         module = load_inline_cu_module(
-            f"{self.binary_prefix}_{name}",
-            cpp_sources="\n".join((*spec.cpp_headers, *spec.declarations)),
-            cuda_sources=spec.source,
-            functions=spec.functions, extra_cuda_cflags=spec.cflags,
-            extra_include_paths=tuple(map(str, spec.include_paths)),
-            extra_ldflags=spec.ldflags,
-            env_prefix=self.env_prefix,
+            **self._precompile_arguments(name),
         )
         self._loaded[name] = module
         return module
 
     def _load_variant(
-        self, name: str, masks: tuple[tuple[str, int], ...],
+        self,
+        name: str,
+        masks: tuple[tuple[str, int], ...],
     ) -> Any:
         """Compile a CUDA source variant for one grouped-mask tuple."""
 
@@ -621,52 +543,61 @@ class CudaExtensionGroup(HydroForgeModel):
             return cached
         if not masks:
             return self._load(name)
-        spec = self._compiled_specs[name]
-        prefix = "".join(
-            f"#define HYDROFORGE_{mask} {value}u\n"
-            for mask, value in masks
-        )
-        source = prefix + spec.source
-        digest = hashlib.sha256(source.encode()).hexdigest()[:16]
         from hydroforge.kernels.backends.cuda.build import load_inline_cu_module
 
-        module = load_inline_cu_module(
-            f"{self.binary_prefix}_{name}_mask_{digest}",
-            cpp_sources="\n".join((*spec.cpp_headers, *cuda_declarations(
-                source, spec.functions,
-            ))),
-            cuda_sources=source,
-            functions=spec.functions,
-            extra_cuda_cflags=spec.cflags,
-            extra_include_paths=tuple(map(str, spec.include_paths)),
-            extra_ldflags=spec.ldflags,
-            env_prefix=self.env_prefix,
-        )
+        module = load_inline_cu_module(**self._precompile_arguments(name, masks))
         self._variant_loaded[key] = module
         return module
 
+    def _precompile_arguments(
+        self,
+        name: str,
+        masks: tuple[tuple[str, int], ...] = (),
+    ) -> dict[str, Any] | None:
+        if not masks:
+            if name in self._loaded:
+                return None
+            return self._compiled_specs[name].loader_arguments(
+                f"{self.binary_prefix}_{name}", self.env_prefix,
+            )
+        if (name, masks) in self._variant_loaded:
+            return None
+        spec = self._compiled_specs[name]
+        prefix = "".join(
+            f"#define HYDROFORGE_{mask} {value}u\n" for mask, value in masks
+        )
+        source = prefix + spec.source
+        digest = hashlib.sha256(source.encode()).hexdigest()[:16]
+        arguments = spec.loader_arguments(
+            f"{self.binary_prefix}_{name}_mask_{digest}", self.env_prefix
+        )
+        arguments["cuda_sources"] = source
+        return arguments
+
     def _ensure_precompiled(
-        self, extensions: Any = None,
-    ) -> Dict[str, Any]:
+        self,
+        extensions: Any = None,
+    ) -> dict[str, Any]:
         """Build and load the requested subset of this extension catalog.
 
         Repeated calls are cumulative.  Omitting ``extensions`` preserves the
         public whole-catalog precompile behavior used by the CLI.
         """
-        requested = (
-            set(self.specs) if extensions is None else set(extensions)
-        )
+        requested = set(self.specs) if extensions is None else set(extensions)
         pending = requested.difference(self._precompiled)
         if not pending:
             return {name: self._loaded[name] for name in requested}
-        from hydroforge.kernels.backends.cuda.precompile import precompile_extension_specs
+        from hydroforge.kernels.backends.cuda.precompile import (
+            precompile_extension_specs,
+        )
 
         effective = {
-            name: spec for name, spec in self._compiled_specs.items()
-            if name in pending
+            name: spec for name, spec in self._compiled_specs.items() if name in pending
         }
         precompile_extension_specs(
-            self.binary_prefix, effective, env_prefix=self.env_prefix,
+            self.binary_prefix,
+            effective,
+            env_prefix=self.env_prefix,
         )
         for name in pending:
             self._load(name)
@@ -674,28 +605,32 @@ class CudaExtensionGroup(HydroForgeModel):
         return {name: self._loaded[name] for name in requested}
 
     def _ensure_precompiled_for_modules(
-        self, opened_modules: Any,
-    ) -> Dict[str, Any]:
+        self,
+        opened_modules: Any,
+    ) -> dict[str, Any]:
         """Precompile the exact catalog subset required by model modules."""
         if not self.module_extensions:
             return self._ensure_precompiled()
         opened = set(opened_modules)
-        required = set().union(*(
-            self.module_extensions[module] for module in opened
-        ))
+        required = set().union(*(self.module_extensions[module] for module in opened))
         return self._ensure_precompiled(required)
 
-    def _dispatcher(self, route: _CompiledCudaRoute) -> "CudaDispatcher":
+    def _dispatcher(self, route: _CompiledCudaRoute) -> CudaDispatcher:
         declaration = _CudaDispatcherDeclaration(
-            route=route, spec=active_kernel_spec(),
+            route=route,
+            spec=active_kernel_spec(),
         )
         return CudaDispatcher(self, route, spec=declaration.spec)
+
 
 class CudaDispatcher:
     """Trusted adapter over one construction-time compiled CUDA route."""
 
     def __init__(
-        self, group: CudaExtensionGroup, route: _CompiledCudaRoute, *,
+        self,
+        group: CudaExtensionGroup,
+        route: _CompiledCudaRoute,
+        *,
         spec: KernelSpec,
     ) -> None:
         self.group = group
@@ -715,13 +650,16 @@ class CudaDispatcher:
         )
 
     def _validate_specialization_input(
-        self, values: Mapping[str, Any], *, buffer_dtypes: BufferDTypeABI,
+        self,
+        values: Mapping[str, Any],
+        *,
+        buffer_dtypes: BufferDTypeABI,
     ) -> None:
         """Backend-specific validation invoked only by the Pydantic request."""
 
         del buffer_dtypes
         block_size = values["BLOCK_SIZE"]
-        if type(block_size) is not int or not 1 <= block_size <= 1024:
+        if not 1 <= block_size <= 1024:
             raise ValueError(
                 f"{self.spec.name}: CUDA BLOCK_SIZE must be an exact int in "
                 f"[1, 1024], got {block_size!r}"
@@ -732,8 +670,24 @@ class CudaDispatcher:
     def _launcher(self):
         return getattr(self.group._load(self.extension), self.launch)
 
+    def _precompile_arguments(self, arguments: dict[str, Any]):
+        size_keys = (
+            (self.spec.size_key,)
+            if isinstance(self.spec.size_key, str)
+            else self.spec.size_key
+        )
+        if any(arguments[name] == 0 for name in size_keys):
+            return None
+        masks = tuple(
+            (name, self.spec.compile_time_mask(name, arguments))
+            for name in self.spec.compile_time_masks
+        )
+        return self.group._precompile_arguments(self.extension, masks)
+
     def specialize(
-        self, arguments: Dict[str, Any], *,
+        self,
+        arguments: dict[str, Any],
+        *,
         buffer_dtypes: BufferDTypeABI,
     ) -> Any:
         del buffer_dtypes
@@ -749,6 +703,7 @@ class CudaDispatcher:
         for name in size_keys:
             static_extent *= values[name]
         if static_extent == 0:
+
             def no_op() -> None:
                 return None
 
@@ -762,7 +717,8 @@ class CudaDispatcher:
                 for name in self.spec.compile_time_masks
             )
             launcher = getattr(
-                self.group._load_variant(self.extension, masks), self.launch,
+                self.group._load_variant(self.extension, masks),
+                self.launch,
             )
         else:
             launcher = self._launcher

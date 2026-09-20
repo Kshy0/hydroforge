@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
-import inspect
 from numbers import Integral
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
+from hydroforge.contracts.validation import HydroForgeModel
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -25,6 +28,31 @@ class StructuralUpdateResult:
     invalidated: bool = True
 
 
+class _TensorUpdateRequest(HydroForgeModel):
+    bindings: tuple[tuple[torch.Tensor, torch.Tensor], ...] = Field(min_length=1)
+    after_commit: Callable[[StructuralUpdateResult], None] | None = None
+
+    _target_ids: frozenset[int] = PrivateAttr()
+
+    @field_validator("bindings", mode="before")
+    @classmethod
+    def _collect_bindings(cls, value: Any):
+        try:
+            return tuple(tuple(pair) for pair in value)
+        except TypeError as error:
+            raise ValueError(
+                "tensor update bindings must be iterable tensor pairs"
+            ) from error
+
+    @model_validator(mode="after")
+    def _unique_targets(self):
+        identities = frozenset(id(current) for current, _ in self.bindings)
+        if len(identities) != len(self.bindings):
+            raise ValueError("tensor update contains duplicate target tensors")
+        self._target_ids = identities
+        return self
+
+
 class StructuralUpdateContext:
     """One ordered module pass that stages a single structural transaction."""
 
@@ -36,9 +64,7 @@ class StructuralUpdateContext:
         self._bindings: list[tuple[torch.Tensor, torch.Tensor]] = []
         self._content_bindings: list[tuple[torch.Tensor, torch.Tensor]] = []
         self._target_ids: set[int] = set()
-        self._finalizers: list[
-            Callable[[StructuralUpdateResult], None]
-        ] = []
+        self._finalizers: list[Callable[[StructuralUpdateResult], None]] = []
 
     def require_output_coordinate_resize_safe(
         self,
@@ -69,21 +95,7 @@ class StructuralUpdateContext:
     ) -> None:
         """Stage one module's replacements without mutating live state."""
 
-        pairs = tuple(bindings)
-        if not pairs:
-            raise ValueError("a module structural update cannot be empty")
-        identities = [id(current) for current, _replacement in pairs]
-        duplicates = self._target_ids.intersection(identities)
-        if duplicates or len(set(identities)) != len(identities):
-            raise ValueError(
-                "module structural updates contain duplicate target tensors"
-            )
-        if after_commit is not None and not callable(after_commit):
-            raise TypeError("structural after_commit callback must be callable")
-        self._bindings.extend(pairs)
-        self._target_ids.update(identities)
-        if after_commit is not None:
-            self._finalizers.append(after_commit)
+        self._stage(bindings, after_commit=after_commit, target=self._bindings)
 
     def stage_content(
         self,
@@ -93,21 +105,22 @@ class StructuralUpdateContext:
     ) -> None:
         """Stage same-shape content changes that preserve captured addresses."""
 
-        pairs = tuple(bindings)
-        if not pairs:
-            raise ValueError("a module content update cannot be empty")
-        identities = [id(current) for current, _replacement in pairs]
-        duplicates = self._target_ids.intersection(identities)
-        if duplicates or len(set(identities)) != len(identities):
-            raise ValueError(
-                "module updates contain duplicate target tensors"
-            )
-        if after_commit is not None and not callable(after_commit):
-            raise TypeError("content after_commit callback must be callable")
-        self._content_bindings.extend(pairs)
-        self._target_ids.update(identities)
-        if after_commit is not None:
-            self._finalizers.append(after_commit)
+        self._stage(bindings, after_commit=after_commit, target=self._content_bindings)
+
+    def _stage(
+        self,
+        bindings: Iterable[tuple[torch.Tensor, torch.Tensor]],
+        *,
+        after_commit: Callable[[StructuralUpdateResult], None] | None,
+        target: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        request = _TensorUpdateRequest(bindings=bindings, after_commit=after_commit)
+        if self._target_ids.intersection(request._target_ids):
+            raise ValueError("module updates contain duplicate target tensors")
+        target.extend(request.bindings)
+        self._target_ids.update(request._target_ids)
+        if request.after_commit is not None:
+            self._finalizers.append(request.after_commit)
 
     def commit(self) -> StructuralUpdateResult | None:
         """Commit all staged modules once, then finalize them in call order."""
@@ -115,12 +128,12 @@ class StructuralUpdateContext:
         if not self._bindings and not self._content_bindings:
             return None
         if self._bindings:
-            result = commit_structural_update(
+            result = _commit_structural_update(
                 self._model,
                 (*self._bindings, *self._content_bindings),
             )
         else:
-            result = commit_content_update(
+            result = _commit_content_update(
                 self._model,
                 self._content_bindings,
             )
@@ -153,8 +166,7 @@ def _dimension(module: Any, token: str) -> _Dimension:
         owner = getattr(module, owner_name, None)
         if owner is None:
             raise ValueError(
-                f"dimension {token!r} has no owner in module "
-                f"{module.module_name!r}"
+                f"dimension {token!r} has no owner in module {module.module_name!r}"
             )
         label = f"{owner.module_name}.{attribute}"
     else:
@@ -173,9 +185,8 @@ def _logical_shape(
     rank: int,
 ) -> tuple[int, ...]:
     current = getattr(module, field_name)
-    batched = (
-        isinstance(current, torch.Tensor)
-        and module._is_batched_trusted(field_name)
+    batched = isinstance(current, torch.Tensor) and module._is_batched_trusted(
+        field_name
     )
     expected_rank = rank + int(batched)
     if tensor.ndim != expected_rank:
@@ -184,11 +195,11 @@ def _logical_shape(
             f"rank {tensor.ndim}, expected {expected_rank}"
         )
     if batched:
-        if tensor.shape[0] != module.num_trials:
+        if tensor.shape[0] != module.ensemble_size:
             raise ValueError(
                 f"structural replacement {module.module_name}.{field_name} "
-                f"has trial extent {tensor.shape[0]}, expected "
-                f"{module.num_trials}"
+                f"has member extent {tensor.shape[0]}, expected "
+                f"{module.ensemble_size}"
             )
         return tuple(tensor.shape[1:])
     return tuple(tensor.shape)
@@ -209,7 +220,13 @@ def _replacement_fields(
                 continue
             schema_getter = getattr(entry.owner, "_get_tensor_schema", None)
             schema = (
-                None if schema_getter is None else schema_getter(field_name)
+                None
+                if schema_getter is None
+                else schema_getter(
+                    field_name,
+                    opened_modules=model.opened_modules,
+                    field_demand=model._field_demand,
+                )
             )
             fields[identity].append((entry.owner, field_name, schema))
     missing = [identity for identity, matches in fields.items() if not matches]
@@ -233,7 +250,10 @@ def _infer_dimensions(
                 continue
             declared = schema.tensor.shape
             actual = _logical_shape(
-                module, field_name, replacement, len(declared),
+                module,
+                field_name,
+                replacement,
+                len(declared),
             )
             for token, extent in zip(declared, actual, strict=True):
                 if isinstance(token, int):
@@ -280,11 +300,8 @@ def _expected_shape(
             )
         dimensions.append(int(value))
     current = getattr(module, field_name)
-    if (
-        isinstance(current, torch.Tensor)
-        and module._is_batched_trusted(field_name)
-    ):
-        return (module.num_trials, *dimensions)
+    if isinstance(current, torch.Tensor) and module._is_batched_trusted(field_name):
+        return (module.ensemble_size, *dimensions)
     return tuple(dimensions)
 
 
@@ -314,7 +331,10 @@ def _validate_dependent_shapes(
                 continue
             candidate = replacements.get(id(current), current)
             expected = _expected_shape(
-                module, field.name, tensor_schema.shape, inferred,
+                module,
+                field.name,
+                tensor_schema.shape,
+                inferred,
             )
             if tuple(candidate.shape) != expected:
                 raise ValueError(
@@ -345,7 +365,9 @@ def _publish_dimensions(
         if old == extent:
             continue
         descriptor = inspect.getattr_static(
-            type(dimension.owner), dimension.attribute, None,
+            type(dimension.owner),
+            dimension.attribute,
+            None,
         )
         if isinstance(descriptor, cached_property):
             dimension.owner.__dict__.pop(dimension.attribute, None)
@@ -367,50 +389,65 @@ def _verify_dimensions(
             )
 
 
-def commit_content_update(
-    model: AbstractModel,
-    bindings: Iterable[tuple[torch.Tensor, torch.Tensor]],
-) -> StructuralUpdateResult:
-    """Copy same-shape declared tensors without invalidating captured execution."""
-
+def _require_update_boundary(model: AbstractModel, kind: str) -> None:
+    """Check existing services without recursively materializing the runtime."""
     from hydroforge.execution.step import _managed_step_active
 
     if _managed_step_active():
-        raise RuntimeError("content updates are allowed only between managed steps")
-    pairs = tuple(bindings)
-    if not pairs:
-        raise ValueError("content update requires at least one replacement")
-    current_ids = [id(current) for current, _replacement in pairs]
-    if len(set(current_ids)) != len(current_ids):
-        raise ValueError("content update contains duplicate target tensors")
+        raise RuntimeError(f"{kind} updates are allowed only between managed steps")
+    execution = getattr(model, "_execution", None)
+    if execution is None or execution.closed:
+        raise RuntimeError(f"{kind} updates require an initialized, non-closed runtime")
+    failure = execution.failure
+    if failure is not None:
+        raise execution.poisoned_error(failure)
+
+
+def _validate_replacements(
+    pairs: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    kind: Literal["content", "structural"],
+) -> dict[int, torch.Tensor]:
+    """Check live storage at commit; staged tensors may have changed since validation."""
     replacements: dict[int, torch.Tensor] = {}
     for current, replacement in pairs:
-        if not isinstance(current, torch.Tensor) or not isinstance(
-            replacement, torch.Tensor,
-        ):
-            raise TypeError("content replacements must be tensor pairs")
         if current is replacement:
-            raise ValueError("content replacement must use staged storage")
+            raise ValueError(f"{kind} replacement must use staged storage")
         if current.dtype != replacement.dtype:
             raise TypeError(
-                f"content replacement changes dtype from {current.dtype} "
+                f"{kind} replacement changes dtype from {current.dtype} "
                 f"to {replacement.dtype}"
             )
         if current.device != replacement.device:
             raise ValueError(
-                f"content replacement changes device from {current.device} "
+                f"{kind} replacement changes device from {current.device} "
                 f"to {replacement.device}"
             )
-        if current.shape != replacement.shape:
+        if kind == "content" and current.shape != replacement.shape:
             raise ValueError(
                 f"content replacement changes shape from {tuple(current.shape)} "
                 f"to {tuple(replacement.shape)}"
             )
         if replacement.layout is not torch.strided or not replacement.is_contiguous():
-            raise ValueError(
-                "content replacement must be a contiguous strided tensor"
-            )
+            raise ValueError(f"{kind} replacement must be a contiguous strided tensor")
         replacements[id(current)] = replacement
+    return replacements
+
+
+def commit_content_update(
+    model: AbstractModel,
+    bindings: Iterable[tuple[torch.Tensor, torch.Tensor]],
+) -> StructuralUpdateResult:
+    """Copy same-shape declared tensors without invalidating captured execution."""
+    request = _TensorUpdateRequest(bindings=bindings)
+    return _commit_content_update(model, request.bindings)
+
+
+def _commit_content_update(
+    model: AbstractModel, pairs: Sequence[tuple[torch.Tensor, torch.Tensor]]
+) -> StructuralUpdateResult:
+    _require_update_boundary(model, "content")
+    replacements = _validate_replacements(pairs, kind="content")
 
     fields = _replacement_fields(model, replacements)
     for identity, matches in fields.items():
@@ -462,44 +499,15 @@ def commit_structural_update(
     otherwise validation fails before cached execution is invalidated.
     """
 
-    from hydroforge.execution.step import _managed_step_active
+    request = _TensorUpdateRequest(bindings=bindings)
+    return _commit_structural_update(model, request.bindings)
 
-    if _managed_step_active():
-        raise RuntimeError(
-            "structural updates are allowed only between managed steps"
-        )
-    pairs = tuple(bindings)
-    if not pairs:
-        raise ValueError("structural update requires at least one replacement")
-    current_ids = [id(current) for current, _replacement in pairs]
-    if len(set(current_ids)) != len(current_ids):
-        raise ValueError("structural update contains duplicate target tensors")
-    replacements: dict[int, torch.Tensor] = {}
-    for current, replacement in pairs:
-        if not isinstance(current, torch.Tensor) or not isinstance(
-            replacement, torch.Tensor,
-        ):
-            raise TypeError("structural replacements must be tensor pairs")
-        if current is replacement:
-            raise ValueError("structural replacement must use new storage")
-        if current.dtype != replacement.dtype:
-            raise TypeError(
-                f"structural replacement changes dtype from {current.dtype} "
-                f"to {replacement.dtype}"
-            )
-        if current.device != replacement.device:
-            raise ValueError(
-                f"structural replacement changes device from "
-                f"{current.device} to {replacement.device}"
-            )
-        if (
-            replacement.layout is not torch.strided
-            or not replacement.is_contiguous()
-        ):
-            raise ValueError(
-                "structural replacement must be a contiguous strided tensor"
-            )
-        replacements[id(current)] = replacement
+
+def _commit_structural_update(
+    model: AbstractModel, pairs: Sequence[tuple[torch.Tensor, torch.Tensor]]
+) -> StructuralUpdateResult:
+    _require_update_boundary(model, "structural")
+    replacements = _validate_replacements(pairs, kind="structural")
 
     fields = _replacement_fields(model, replacements)
     inferred = _infer_dimensions(fields, replacements)

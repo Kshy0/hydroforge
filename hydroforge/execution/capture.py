@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -17,11 +18,15 @@ class CaptureRuntime:
     """Own every CUDA Graph and Metal ICB created for one model instance."""
 
     def __init__(
-        self, model: AbstractModel, *, warmup_iterations: int = 3,
+        self,
+        model: AbstractModel,
+        *,
+        warmup_iterations: int = 3,
     ) -> None:
         self.model = model
         self.warmup_iterations = warmup_iterations
         self._graph_pool: Any = None
+        self._capture_stream: torch.cuda.Stream | None = None
         self._statistics_graphs: dict[
             int,
             tuple[Any, torch.cuda.CUDAGraph],
@@ -32,8 +37,15 @@ class CaptureRuntime:
     @property
     def graph_pool(self) -> Any:
         if self._graph_pool is None:
-            self._graph_pool = torch.cuda.graph_pool_handle()
+            with torch.cuda.device(self.model.device):
+                self._graph_pool = torch.cuda.graph_pool_handle()
         return self._graph_pool
+
+    @property
+    def capture_stream(self) -> torch.cuda.Stream:
+        if self._capture_stream is None:
+            self._capture_stream = torch.cuda.Stream(device=self.model.device)
+        return self._capture_stream
 
     def register(self, resource: Any) -> Any:
         """Register a closeable backend resource under model ownership."""
@@ -65,7 +77,8 @@ class CaptureRuntime:
         """Release one owned resource and remove every retained reference."""
 
         index = next(
-            index for index, (owned, _finalizer) in enumerate(self._resources)
+            index
+            for index, (owned, _finalizer) in enumerate(self._resources)
             if owned is resource
         )
         _owned, finalizer = self._resources.pop(index)
@@ -77,10 +90,18 @@ class CaptureRuntime:
 
     @staticmethod
     def _restore_extra(
-        tensors: tuple[torch.Tensor, ...], saved: list[torch.Tensor],
+        tensors: tuple[torch.Tensor, ...],
+        saved: list[torch.Tensor],
     ) -> None:
+        failures: list[BaseException] = []
         for live, value in zip(tensors, saved, strict=True):
-            live.copy_(value)
+            try:
+                live.copy_(value)
+            except BaseException as error:
+                failures.append(error)
+        if failures:
+            error = ResourceCleanupError("captured tensor restoration", failures)
+            raise error from failures[0]
 
     def capture_cuda(
         self,
@@ -88,41 +109,52 @@ class CaptureRuntime:
         *,
         mutated_state: Iterable[torch.Tensor],
     ) -> torch.cuda.CUDAGraph:
-        """Warm and capture while restoring the declared write set exactly."""
+        """Capture on the model device while preserving state and caller streams."""
 
-        state = tuple(dict.fromkeys(mutated_state))
-        snapshot = self._save_extra(state)
+        with torch.cuda.device(self.model.device):
+            state = tuple(dict.fromkeys(mutated_state))
+            snapshot = self._save_extra(state)
+            current = torch.cuda.current_stream(self.model.device)
+            side = self.capture_stream
+            side.wait_stream(current)
 
-        def restore() -> None:
-            self._restore_extra(state, snapshot)
+            def restore() -> None:
+                self._restore_extra(state, snapshot)
 
-        graph = None
-        try:
-            for _ in range(self.warmup_iterations):
-                body()
-            restore()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self.graph_pool):
-                body()
-            restore()
-        except BaseException as primary:
-            failures: list[BaseException] = [primary]
+            graph = None
             try:
+                with torch.cuda.stream(side):
+                    for _ in range(self.warmup_iterations):
+                        body()
+                    restore()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, pool=self.graph_pool, stream=side):
+                        body()
+                current.wait_stream(side)
                 restore()
-            except BaseException as cleanup_error:
-                failures.append(cleanup_error)
-            if graph is not None:
+            except BaseException as primary:
+                failures: list[BaseException] = [primary]
                 try:
-                    self._close_resource(graph)
+                    side.synchronize()
                 except BaseException as cleanup_error:
                     failures.append(cleanup_error)
-            if len(failures) > 1:
-                error = ResourceCleanupError(
-                    "CUDA graph capture transaction", failures,
-                )
-                raise error from primary
-            raise
-        return self.register(graph)
+                try:
+                    restore()
+                except BaseException as cleanup_error:
+                    failures.append(cleanup_error)
+                if graph is not None:
+                    try:
+                        self._close_resource(graph)
+                    except BaseException as cleanup_error:
+                        failures.append(cleanup_error)
+                if len(failures) > 1:
+                    error = ResourceCleanupError(
+                        "CUDA graph capture transaction",
+                        failures,
+                    )
+                    raise error from primary
+                raise
+            return self.register(graph)
 
     def run_statistics(self, aggregator: Any, block_size: int) -> None:
         """Execute one statistics kernel through this model's shared capture pool."""
@@ -132,7 +164,8 @@ class CaptureRuntime:
         if cached is None:
             states = aggregator._kernel_states
             extras = tuple(
-                value for name, value in states.items()
+                value
+                for name, value in states.items()
                 if isinstance(value, torch.Tensor)
                 and name not in RESERVED_CONTROL_STATE
             )
@@ -170,6 +203,22 @@ class CaptureRuntime:
         extra_state: Iterable[torch.Tensor] = (),
     ) -> Any:
         """Capture one CUDA conditional-WHILE graph under this owner."""
+        with torch.cuda.device(self.model.device):
+            return self._build_conditional_graph(
+                body=body,
+                reset=reset,
+                continue_flag=continue_flag,
+                extra_state=extra_state,
+            )
+
+    def _build_conditional_graph(
+        self,
+        *,
+        body: Callable[[Any, bool, int], None],
+        reset: Callable[[], None],
+        continue_flag: torch.Tensor,
+        extra_state: Iterable[torch.Tensor],
+    ) -> Any:
         from hydroforge.execution.cuda_graph import ConditionalWhileGraph
 
         device = torch.device(self.model.device)
@@ -178,11 +227,10 @@ class CaptureRuntime:
 
         graph = ConditionalWhileGraph()
         device_index = (
-            torch.cuda.current_device() if device.index is None
-            else device.index
+            torch.cuda.current_device() if device.index is None else device.index
         )
         current = torch.cuda.current_stream(device)
-        side = torch.cuda.Stream(device)
+        side = self.capture_stream
         side.wait_stream(current)
         snapshot: list[torch.Tensor] | None = None
         try:
@@ -201,16 +249,30 @@ class CaptureRuntime:
                     restore()
                 reset()
                 torch._C._cuda_beginAllocateToPool(
-                    device_index, self.graph_pool,
+                    device_index,
+                    self.graph_pool,
                 )
                 try:
                     graph.begin_capture(stream)
-                    body(graph, True, stream)
-                    graph.set_conditional(continue_flag, True, stream)
-                    graph.end_capture(stream)
+                    try:
+                        body(graph, True, stream)
+                        graph.set_conditional(continue_flag, True, stream)
+                    except BaseException as primary:
+                        try:
+                            graph.end_capture(stream)
+                        except BaseException as cleanup_error:
+                            error = ResourceCleanupError(
+                                "conditional CUDA stream capture",
+                                [primary, cleanup_error],
+                            )
+                            raise error from primary
+                        raise
+                    else:
+                        graph.end_capture(stream)
                 finally:
                     torch._C._cuda_endAllocateToPool(
-                        device_index, self.graph_pool,
+                        device_index,
+                        self.graph_pool,
                     )
                 graph.instantiate()
             current.wait_stream(side)
@@ -236,7 +298,8 @@ class CaptureRuntime:
                 failures.append(cleanup_error)
             if len(failures) > 1:
                 error = ResourceCleanupError(
-                    "conditional CUDA graph transaction", failures,
+                    "conditional CUDA graph transaction",
+                    failures,
                 )
                 raise error from primary
             raise
@@ -251,6 +314,7 @@ class CaptureRuntime:
             self.invalidate()
         finally:
             self._graph_pool = None
+            self._capture_stream = None
 
     def invalidate(self) -> None:
         """Release captures whose fixed bindings may have become stale."""

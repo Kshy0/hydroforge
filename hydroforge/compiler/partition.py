@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -10,15 +11,17 @@ import torch
 from numba import njit
 from pydantic import Field, PrivateAttr, model_validator
 
-from hydroforge.data.distributed import (
-    _find_indices_in_trusted,
-    _find_indices_in_torch_trusted,
-)
 from hydroforge.compiler.model import _ReferenceTargetPlan
 from hydroforge.contracts.fields import (
-    ModuleFieldSchema, PartitionSchema, RuntimeTensorMetadata,
+    ModuleFieldSchema,
+    PartitionSchema,
+    RuntimeTensorMetadata,
 )
 from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.data.distributed import (
+    _find_indices_in_torch_trusted,
+    _find_indices_in_trusted,
+)
 from hydroforge.data.numeric import immutable_array
 
 if TYPE_CHECKING:
@@ -37,20 +40,14 @@ class _GroupRankQuery(HydroForgeModel):
     @model_validator(mode="after")
     def _resolve(self):
         values = self.values
-        if type(values) is int:
-            if not -(1 << 63) <= values < (1 << 63):
-                raise ValueError("group ID is outside the int64 range")
-            array = np.asarray(values, dtype=np.int64)
-        elif isinstance(values, np.integer) and not isinstance(values, np.bool_):
+        if type(values) is int or isinstance(values, np.integer):
             integer = int(values)
             if not -(1 << 63) <= integer < (1 << 63):
                 raise ValueError("group ID is outside the int64 range")
             array = np.asarray(integer, dtype=np.int64)
         elif isinstance(values, np.ndarray):
             if values.dtype != np.dtype(np.int64):
-                raise ValueError(
-                    "group ID arrays must use exact int64 dtype"
-                )
+                raise ValueError("group ID arrays must use exact int64 dtype")
             array = values
         else:
             raise ValueError(
@@ -61,9 +58,7 @@ class _GroupRankQuery(HydroForgeModel):
         positions = np.searchsorted(self.group_ids, flat)
         matched = positions < self.group_ids.size
         if np.any(matched):
-            matched[matched] &= (
-                self.group_ids[positions[matched]] == flat[matched]
-            )
+            matched[matched] &= self.group_ids[positions[matched]] == flat[matched]
         if not np.all(matched):
             missing = flat[~matched][:5].tolist()
             raise ValueError(
@@ -92,9 +87,7 @@ class GroupRankLookup(HydroForgeModel):
             or self.group_ids.dtype != np.dtype(np.int64)
             or self.ranks.dtype != np.dtype(np.int64)
         ):
-            raise ValueError(
-                "group IDs and ranks must be one-dimensional int64 arrays"
-            )
+            raise ValueError("group IDs and ranks must be one-dimensional int64 arrays")
         if self.group_ids.shape != self.ranks.shape:
             raise ValueError("group IDs and ranks must have identical shape")
         if self.group_ids.size > 1 and np.any(
@@ -116,7 +109,8 @@ class GroupRankLookup(HydroForgeModel):
         return self
 
     def __getitem__(
-        self, values: int | np.integer | np.ndarray,
+        self,
+        values: int | np.integer | np.ndarray,
     ) -> int | np.ndarray:
         return _GroupRankQuery(
             values=values,
@@ -134,9 +128,10 @@ class GroupRankLookup(HydroForgeModel):
         return len(self.group_ids)
 
 
-@njit
+@njit(cache=True)
 def _compute_group_to_rank(
-    world_size: int, group_assignments: np.ndarray,
+    world_size: int,
+    group_assignments: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Greedily balance original group IDs over ranks."""
     if world_size <= 0 or group_assignments.size == 0:
@@ -156,7 +151,8 @@ def _compute_group_to_rank(
 
 
 def compute_group_to_rank(
-    world_size: int, group_assignments: np.ndarray,
+    world_size: int,
+    group_assignments: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Greedily balance already validated group IDs over validated ranks."""
 
@@ -294,7 +290,8 @@ class _PartitionSemanticCompiler:
             via = self._bare(metadata.partition_by)
             target = (
                 self._bare(fields[via].references)
-                if via else self._bare(metadata.references)
+                if via
+                else self._bare(metadata.references)
             )
             if target is not None:
                 lineage[coordinate] = target
@@ -323,15 +320,21 @@ class _PartitionSemanticCompiler:
         return name.rsplit(".", 1)[-1] if name else None
 
     def coordinate_is_partitioned(self, coordinate: str) -> bool:
-        metadata = self.schema.fields[coordinate]
-        return bool(
-            not metadata.replicated
-            and (
-                coordinate == self.model.partition_key
-                or metadata.partition_by
-                or metadata.references
+        fields = self.schema.fields
+        while coordinate != self.model.partition_key:
+            metadata = fields[coordinate]
+            if metadata.replicated:
+                return False
+            via = self._bare(metadata.partition_by)
+            target = (
+                self._bare(fields[via].references)
+                if via
+                else self._bare(metadata.references)
             )
-        )
+            if target is None:
+                return False
+            coordinate = target
+        return True
 
     @property
     def variable_groups(self) -> MappingProxyType:
@@ -352,14 +355,7 @@ class _PartitionSemanticCompiler:
         return cached
 
     def field_coordinate(self, field: ModuleFieldSchema) -> str | None:
-        if field.tensor is None:
-            return None
-        coordinate = self._bare(field.tensor.dim_coords)
-        return (
-            coordinate
-            if coordinate and self.coordinate_is_partitioned(coordinate)
-            else None
-        )
+        return self.variable_groups.get(field.name)
 
     def logical_axis(
         self,
@@ -372,12 +368,12 @@ class _PartitionSemanticCompiler:
         logical_ndim = len(field.tensor.shape)
         if len(shape) == logical_ndim:
             return 0
-        trials = self.model.num_trials
-        if trials is not None and len(shape) == logical_ndim + 1:
-            if shape[0] != trials:
+        members = self.model.ensemble_size
+        if members is not None and len(shape) == logical_ndim + 1:
+            if shape[0] != members:
                 raise ValueError(
                     f"Batched field '{field_name}' has leading size {shape[0]}, "
-                    f"expected num_trials={trials}."
+                    f"expected ensemble_size={members}."
                 )
             return 1
         raise ValueError(
@@ -386,13 +382,17 @@ class _PartitionSemanticCompiler:
         )
 
     def compile_input_axes(
-        self, fields: dict[str, Any],
+        self,
+        fields: Mapping[str, Any],
     ) -> MappingProxyType:
         proxy = self.model._input
         axes: dict[str, int] = {}
         for name, field in fields.items():
             if name not in proxy or field.tensor is None:
                 continue
+            shape = proxy.get_var_shape(name)
+            axis = self.logical_axis(name, field, shape)
+            axes[name] = axis
             coordinate = self._bare(field.tensor.dim_coords)
             if (
                 coordinate is None
@@ -402,19 +402,16 @@ class _PartitionSemanticCompiler:
                 coordinate = name
             if not coordinate:
                 continue
-            shape = proxy.get_var_shape(name)
             coordinate_shape = proxy.get_var_shape(coordinate)
             if len(coordinate_shape) != 1:
                 raise ValueError(
                     f"Coordinate '{coordinate}' must be 1-D, got {coordinate_shape}."
                 )
-            axis = self.logical_axis(name, field, shape)
             if shape[axis] != coordinate_shape[0]:
                 raise ValueError(
                     f"Field '{name}' logical axis length {shape[axis]} does not match "
                     f"dim_coords '{coordinate}' length {coordinate_shape[0]}."
                 )
-            axes[name] = axis
         return MappingProxyType(axes)
 
     def validate_global_reference_integrity(self) -> None:
@@ -425,14 +422,8 @@ class _PartitionSemanticCompiler:
             target = self._bare(metadata.references)
             if not target or name not in proxy or target not in proxy:
                 continue
-            values = self._numpy(
-                proxy._get_value_trusted(name),
-                label=f"reference field {name!r}",
-            ).reshape(-1)
-            target_values = self._numpy(
-                proxy._get_value_trusted(target),
-                label=f"reference coordinate {target!r}",
-            ).reshape(-1)
+            values = self._numpy(proxy._get_value_trusted(name)).reshape(-1)
+            target_values = self._numpy(proxy._get_value_trusted(target)).reshape(-1)
             if np.unique(target_values).size != target_values.size:
                 raise ValueError(
                     f"Reference target coordinate '{target}' must contain "
@@ -457,101 +448,25 @@ class _PartitionSemanticCompiler:
 
         model = self.model
         module_types = model._module_types()
-        opened = frozenset(model.opened_modules)
         compiled: dict[str, MappingProxyType] = {}
         inverse_sources: set[str] = set()
 
         for module_name in model.opened_modules:
             module_type = module_types[module_name]
-            module_references = module_type._module_reference_fields()
             plans: dict[str, _ReferenceTargetPlan] = {}
-            for descriptor in module_type._reference_index_fields().values():
-                source = module_type._tensor_schema_map().get(
+            for descriptor in module_type._reference_index_fields(
+                opened_modules=model.opened_modules,
+                field_demand=model._field_demand,
+            ).values():
+                target = module_type._reference_target_schema(
                     descriptor.reference,
+                    opened_modules=model.opened_modules,
+                    field_demand=model._field_demand,
                 )
-                if source is None or source.tensor is None:
-                    raise ValueError(
-                        f"ReferenceIndexField {descriptor.reference!r} in "
-                        f"module {module_name!r} does not name a tensor field"
-                    )
-                if not model._is_tensor_field_active(module_name, source):
-                    continue
-                target_name = source.tensor.references
-                if not target_name:
-                    raise ValueError(
-                        f"ReferenceIndexField {descriptor.reference!r} in "
-                        f"module {module_name!r} refers to a field without "
-                        "reference metadata"
-                    )
-
-                parts = target_name.split(".")
-                target_field = parts[-1]
-                candidates: list[tuple[str, str]] = []
-                if len(parts) > 1:
-                    owner_name = parts[-2]
-                    if owner_name == module_name:
-                        owner_type = module_type
-                    else:
-                        reference = module_references.get(owner_name)
-                        owner_type = (
-                            None
-                            if reference is None
-                            or reference.module_name not in opened
-                            else reference.module_type
-                        )
-                    if owner_type is not None:
-                        target = owner_type._tensor_schema_map().get(
-                            target_field,
-                        )
-                        if (
-                            target is not None
-                            and target.tensor is not None
-                            and model._is_tensor_field_active(
-                                owner_type.module_name, target,
-                            )
-                        ):
-                            candidates.append((
-                                owner_type.module_name,
-                                target_field,
-                            ))
-                else:
-                    local = module_type._tensor_schema_map().get(target_field)
-                    if (
-                        local is not None
-                        and local.tensor is not None
-                        and model._is_tensor_field_active(module_name, local)
-                    ):
-                        candidates.append((module_name, target_field))
-                    for reference in module_references.values():
-                        if reference.module_name not in opened:
-                            continue
-                        target = reference.module_type._tensor_schema_map().get(
-                            target_field,
-                        )
-                        if (
-                            target is not None
-                            and target.tensor is not None
-                            and model._is_tensor_field_active(
-                                reference.module_name, target,
-                            )
-                        ):
-                            candidates.append((
-                                reference.module_name,
-                                target_field,
-                            ))
-
-                if len(candidates) != 1:
-                    raise ValueError(
-                        f"Reference target {target_name!r} for "
-                        f"{module_name}.{descriptor.reference} resolves to "
-                        f"{len(candidates)} opened tensor fields; qualify the "
-                        "target with its module name"
-                    )
-                target_module, resolved_field = candidates[0]
                 plans[descriptor.reference] = _ReferenceTargetPlan(
-                    target_module=target_module,
-                    target_field=resolved_field,
-                    qualified_name=f"{target_module}.{resolved_field}",
+                    target_module=target.module_name,
+                    target_field=target.name,
+                    qualified_name=f"{target.module_name}.{target.name}",
                 )
                 if descriptor.inverse:
                     inverse_sources.add(descriptor.reference)
@@ -560,7 +475,8 @@ class _PartitionSemanticCompiler:
         return MappingProxyType(compiled), frozenset(inverse_sources)
 
     def validate_inverse_reference_integrity(
-        self, inverse_sources: frozenset[str],
+        self,
+        inverse_sources: frozenset[str],
     ) -> None:
         """Prove every inverse reference is a one-to-one global relation."""
 
@@ -568,10 +484,7 @@ class _PartitionSemanticCompiler:
         for name in inverse_sources:
             if name not in proxy:
                 continue
-            values = self._numpy(
-                proxy._get_value_trusted(name),
-                label=f"inverse reference field {name!r}",
-            ).reshape(-1)
+            values = self._numpy(proxy._get_value_trusted(name)).reshape(-1)
             if np.unique(values).size != values.size:
                 raise ValueError(
                     f"Inverse reference field {name!r} must contain unique "
@@ -618,7 +531,7 @@ class _PartitionSemanticCompiler:
             return cached
         model = self.model
         ids, ranks = compute_group_to_rank(
-            model.world_size,
+            model.spatial_world_size,
             self._numpy(model._input[model.partition_group]),
         )
         cached = GroupRankLookup(group_ids=ids, ranks=ranks)
@@ -628,17 +541,17 @@ class _PartitionSemanticCompiler:
     def rank_indices(self, coordinate: str) -> np.ndarray:
         groups = self.coordinate_group_values(coordinate)
         ranks = self.group_ranks._lookup_trusted(groups)
-        return np.nonzero(ranks == self.model.rank)[0]
+        return np.nonzero(ranks == self.model.spatial_rank)[0]
 
     @staticmethod
-    def _numpy(value: Any, *, label: str | None = None) -> np.ndarray:
-        del label
+    def _numpy(value: Any) -> np.ndarray:
         if isinstance(value, torch.Tensor):
             return value.detach().cpu().numpy()
         return np.asarray(value)
 
     def bind_output(
-        self, field: ModuleFieldSchema,
+        self,
+        field: ModuleFieldSchema,
     ) -> tuple[RuntimeTensorMetadata, dict[str, torch.Tensor]]:
         policy = field.tensor.output
         coordinate = (
@@ -651,7 +564,8 @@ class _PartitionSemanticCompiler:
         if policy != "disabled" and coordinate:
             coordinate_entry = variable_map[coordinate]
             coordinate_tensor = getattr(
-                coordinate_entry.module, coordinate_entry.field_name,
+                coordinate_entry.module,
+                coordinate_entry.field_name,
             )
             selection = (
                 self.schema.selections.get(coordinate) if policy == "auto" else None
@@ -659,14 +573,16 @@ class _PartitionSemanticCompiler:
             if selection:
                 selection_entry = variable_map[selection]
                 selected = getattr(
-                    selection_entry.module, selection_entry.field_name,
+                    selection_entry.module,
+                    selection_entry.field_name,
                 )
                 if selected is not None:
                     indices = (
                         torch.empty(0, dtype=torch.int32, device=self.model.device)
                         if selected.numel() == 0
                         else _find_indices_in_torch_trusted(
-                            selected, coordinate_tensor,
+                            selected,
+                            coordinate_tensor,
                         )
                     )
                     indices = indices.to(self.model.device)

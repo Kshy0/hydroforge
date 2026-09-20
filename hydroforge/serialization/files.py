@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
 import os
-from pathlib import Path
 import secrets
 import stat
-
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 
 
 @contextmanager
 def atomic_output_path(
-    file_path: str | Path, *, preserve_suffix: bool = False,
+    file_path: str | Path,
+    *,
+    preserve_suffix: bool = False,
 ) -> Iterator[Path]:
     """Yield a same-directory temporary path and publish it on success.
 
@@ -35,14 +36,16 @@ def atomic_output_path(
     for _ in range(100):
         token = secrets.token_hex(8)
         if preserve_suffix and target.suffix:
-            stem = target.name[:-len(target.suffix)]
+            stem = target.name[: -len(target.suffix)]
             temporary_name = f".{stem}.{token}.tmp{target.suffix}"
         else:
             temporary_name = f".{target.name}.{token}.tmp"
         candidate = target.parent / temporary_name
         try:
             descriptor = os.open(
-                candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666,
+                candidate,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o666,
             )
         except FileExistsError:
             continue
@@ -51,9 +54,7 @@ def atomic_output_path(
             temporary = candidate
             break
     if temporary is None:
-        raise FileExistsError(
-            f"could not allocate a temporary output beside {target}"
-        )
+        raise FileExistsError(f"could not allocate a temporary output beside {target}")
     try:
         if existing_mode is not None:
             os.chmod(temporary, existing_mode)
@@ -90,7 +91,4 @@ def atomic_write_text(
     """Durably write and atomically publish one text artifact."""
 
     with atomic_output_path(file_path) as temporary:
-        with temporary.open("w", encoding=encoding) as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
+        temporary.write_text(content, encoding=encoding)

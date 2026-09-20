@@ -8,12 +8,17 @@ from typing import Any
 import torch
 
 from hydroforge.execution.aten import (
-    COMPILED_ATEN, COMPILED_ATEN_CONTRACTS,
-    normalize_fill_scalar, normalize_float32_scalar,
+    COMPILED_ATEN,
+    COMPILED_ATEN_CONTRACTS,
+    normalize_fill_scalar,
+    normalize_float32_scalar,
 )
 from hydroforge.execution.operators import SubstepCompileError
 from hydroforge.kernels.backends.metal.online import (
-    MetalBuffer, MetalCommand, MetalScalar, make_online_metal_dispatcher,
+    MetalBuffer,
+    MetalCommand,
+    MetalScalar,
+    make_online_metal_dispatcher,
 )
 from hydroforge.kernels.backends.metal.types import tensor_type
 
@@ -29,8 +34,7 @@ def _copy_dispatcher(dtype: torch.dtype):
         ),
         scalars=(MetalScalar("n", "index"),),
         size_key="n",
-        body="    if ((long)i < *args.n) "
-        "args.output_ptr[i] = args.input_ptr[i];",
+        body="    if ((long)i < *args.n) args.output_ptr[i] = args.input_ptr[i];",
     )
 
 
@@ -65,7 +69,8 @@ def _scatter_dispatcher(index_dtype: torch.dtype):
             MetalBuffer("error_ptr", torch.int32, "atomic_write"),
         ),
         scalars=(
-            MetalScalar("alpha", "float32"), MetalScalar("n", "index"),
+            MetalScalar("alpha", "float32"),
+            MetalScalar("n", "index"),
             MetalScalar("output_n", "index"),
         ),
         size_key="n",
@@ -97,8 +102,10 @@ def _zero_dispatcher(dtype: torch.dtype):
 @cache
 def _fill_dispatcher(dtype: torch.dtype):
     kinds = {
-        torch.bool: "bool", torch.float32: "float32",
-        torch.int32: "int32", torch.int64: "index",
+        torch.bool: "bool",
+        torch.float32: "float32",
+        torch.int32: "int32",
+        torch.int64: "index",
     }
     if dtype not in kinds:
         raise SubstepCompileError(
@@ -113,8 +120,7 @@ def _fill_dispatcher(dtype: torch.dtype):
             MetalScalar("n", "index"),
         ),
         size_key="n",
-        body="    if ((long)i < *args.n) "
-        "args.output_ptr[i] = *args.value;",
+        body="    if ((long)i < *args.n) args.output_ptr[i] = *args.value;",
     )
 
 
@@ -137,7 +143,10 @@ _BINARY_EXPRESSIONS = {
 
 @cache
 def _binary_dispatcher(
-    name: str, rhs_kind: str, result_dtype: torch.dtype, scaled: bool,
+    name: str,
+    rhs_kind: str,
+    result_dtype: torch.dtype,
+    scaled: bool,
 ):
     try:
         expression = _BINARY_EXPRESSIONS[name]
@@ -160,18 +169,18 @@ def _binary_dispatcher(
     if scaled:
         scalars.insert(0, MetalScalar("alpha", "float32"))
         right = f"(*args.alpha * ({right}))"
-    kernel_name = (
-        f"hf_aten_{name}_float_"
-        f"{rhs_kind}_{tensor_type(result_dtype)}"
-    )
+    kernel_name = f"hf_aten_{name}_float_{rhs_kind}_{tensor_type(result_dtype)}"
     body = f"""    if ((long)i < *args.n) {{
         float left = args.input_ptr[i];
         float right = {right};
         args.output_ptr[i] = {expression};
     }}"""
     return make_online_metal_dispatcher(
-        kernel_name, buffers=tuple(buffers), scalars=tuple(scalars),
-        size_key="n", body=body,
+        kernel_name,
+        buffers=tuple(buffers),
+        scalars=tuple(scalars),
+        size_key="n",
+        body=body,
     )
 
 
@@ -200,13 +209,18 @@ def _lower_lerp(operator: Any) -> tuple[MetalCommand, ...]:
         raise SubstepCompileError(
             "Metal lerp lowering requires float32 model precision"
         )
-    return (MetalCommand(
-        _lerp_dispatcher(),
-        {
-            "input_ptr": start, "end_ptr": end, "weight_ptr": weight,
-            "output_ptr": destination, "n": destination.numel(),
-        },
-    ),)
+    return (
+        MetalCommand(
+            _lerp_dispatcher(),
+            {
+                "input_ptr": start,
+                "end_ptr": end,
+                "weight_ptr": weight,
+                "output_ptr": destination,
+                "n": destination.numel(),
+            },
+        ),
+    )
 
 
 def _lower_scatter(operator: Any) -> tuple[MetalCommand, ...]:
@@ -225,15 +239,21 @@ def _lower_scatter(operator: Any) -> tuple[MetalCommand, ...]:
     if target is not destination:
         calls.append(_copy(target, destination))
     error = torch.zeros(1, dtype=torch.int32, device=index.device)
-    calls.append(MetalCommand(
-        _scatter_dispatcher(index.dtype),
-        {
-            "output_ptr": target, "index_ptr": index,
-            "source_ptr": source, "n": source.numel(),
-            "output_n": target.numel(), "error_ptr": error, "alpha": alpha,
-        },
-        (error,),
-    ))
+    calls.append(
+        MetalCommand(
+            _scatter_dispatcher(index.dtype),
+            {
+                "output_ptr": target,
+                "index_ptr": index,
+                "source_ptr": source,
+                "n": source.numel(),
+                "output_n": target.numel(),
+                "error_ptr": error,
+                "alpha": alpha,
+            },
+            (error,),
+        )
+    )
     return tuple(calls)
 
 
@@ -244,10 +264,12 @@ def _lower_zero(operator: Any) -> tuple[MetalCommand, ...]:
         raise SubstepCompileError(
             "Metal zero_ lowering requires a Metal-supported tensor dtype"
         )
-    return (MetalCommand(
-        _zero_dispatcher(destination.dtype),
-        {"output_ptr": destination, "n": destination.numel()},
-    ),)
+    return (
+        MetalCommand(
+            _zero_dispatcher(destination.dtype),
+            {"output_ptr": destination, "n": destination.numel()},
+        ),
+    )
 
 
 def _lower_fill(operator: Any) -> tuple[MetalCommand, ...]:
@@ -258,13 +280,16 @@ def _lower_fill(operator: Any) -> tuple[MetalCommand, ...]:
             "Metal fill_ lowering requires float32 model precision"
         )
     value = normalize_fill_scalar(destination.dtype, value)
-    return (MetalCommand(
-        _fill_dispatcher(destination.dtype),
-        {
-            "output_ptr": destination, "value": value,
-            "n": destination.numel(),
-        },
-    ),)
+    return (
+        MetalCommand(
+            _fill_dispatcher(destination.dtype),
+            {
+                "output_ptr": destination,
+                "value": value,
+                "n": destination.numel(),
+            },
+        ),
+    )
 
 
 def _lower_binary(operator: Any) -> tuple[MetalCommand, ...]:
@@ -286,7 +311,8 @@ def _lower_binary(operator: Any) -> tuple[MetalCommand, ...]:
     result_dtype = torch.bool if name == "lt" else torch.float32
     rhs_kind = "tensor" if isinstance(right, torch.Tensor) else "scalar"
     arguments: dict[str, Any] = {
-        "input_ptr": left, "output_ptr": destination,
+        "input_ptr": left,
+        "output_ptr": destination,
         "n": destination.numel(),
     }
     if isinstance(right, torch.Tensor):
@@ -297,10 +323,12 @@ def _lower_binary(operator: Any) -> tuple[MetalCommand, ...]:
         arguments["rhs"] = normalize_float32_scalar(name, right)
     if scaled:
         arguments["alpha"] = alpha
-    return (MetalCommand(
-        _binary_dispatcher(name, rhs_kind, result_dtype, scaled),
-        arguments,
-    ),)
+    return (
+        MetalCommand(
+            _binary_dispatcher(name, rhs_kind, result_dtype, scaled),
+            arguments,
+        ),
+    )
 
 
 _METAL_SEMANTIC_LOWERERS = {

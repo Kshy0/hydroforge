@@ -13,11 +13,10 @@ from typing import Literal
 from pydantic import Field, PrivateAttr, model_validator
 
 from hydroforge.contracts.temporal import (
-    _DatasetTemporalDomain,
     DateLike,
-    date_calendar,
-    require_calendar,
+    _DatasetTemporalDomain,
     _timedelta_quotient_trusted,
+    require_calendar,
 )
 from hydroforge.contracts.validation import HydroForgeModel
 
@@ -49,27 +48,21 @@ class _ChunkPlanIndexQuery(HydroForgeModel):
 class SourceChunk(HydroForgeModel):
     """One real, unpadded source read on a logical dataset timeline."""
 
-    index: int
+    index: int = Field(ge=0)
     phase: Literal["spinup", "main"]
     source_start: DateLike
-    length: int
-    phase_offset: int
+    length: int = Field(ge=1)
+    phase_offset: int = Field(ge=0)
     source_offset: int
     # The immutable contract is part of the request identity.  Two plans can
     # otherwise produce identical offsets for different cadences (for example
     # daily and hourly first chunks), allowing a foreign request to be accepted
     # and read silently against the wrong timeline.
     temporal_domain: _DatasetTemporalDomain
-    spinup_cycle: int | None = None
+    spinup_cycle: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _validate_chunk(self):
-        if not isinstance(self.temporal_domain, _DatasetTemporalDomain):
-            raise ValueError("source chunk requires its Dataset timeline")
-        if type(self.index) is not int or self.index < 0:
-            raise ValueError("source chunk index must be a non-negative int")
-        if type(self.phase) is not str or self.phase not in {"spinup", "main"}:
-            raise ValueError("source chunk phase must be 'spinup' or 'main'")
         if type(self.source_start) is not type(self.temporal_domain.start):
             raise ValueError(
                 "source chunk and dataset contract must use the same datetime "
@@ -80,18 +73,6 @@ class SourceChunk(HydroForgeModel):
             self.temporal_domain.calendar,
             label="source chunk start",
         )
-        if date_calendar(self.source_start) != date_calendar(
-            self.temporal_domain.start,
-        ):
-            raise ValueError(
-                "source chunk and dataset contract use different calendars"
-            )
-        if type(self.length) is not int or self.length < 1:
-            raise ValueError("source chunk length must be a positive int")
-        if type(self.phase_offset) is not int or self.phase_offset < 0:
-            raise ValueError("source chunk phase offset must be a non-negative int")
-        if type(self.source_offset) is not int:
-            raise ValueError("source chunk source offset must be an exact int")
         expected_start = (
             self.temporal_domain.start
             + self.temporal_domain.interval * self.source_offset
@@ -114,20 +95,11 @@ class SourceChunk(HydroForgeModel):
         spinup = self.temporal_domain.spinup
         if spinup is None:
             raise ValueError("spinup source chunks require a dataset spinup contract")
-        if (
-            type(self.spinup_cycle) is not int
-            or not 0 <= self.spinup_cycle < spinup.cycles
-        ):
+        if self.spinup_cycle is None or self.spinup_cycle >= spinup.cycles:
             raise ValueError(
                 "spinup source chunk cycle is outside the dataset contract"
             )
-        spinup_count = _timedelta_quotient_trusted(
-            spinup.source_end - spinup.source_start,
-            self.temporal_domain.interval,
-            duration_label="spin-up source duration",
-            interval_label="dataset sample interval",
-        )
-        if self.phase_offset + self.length > spinup_count:
+        if self.phase_offset + self.length > self.temporal_domain.spinup_count:
             raise ValueError("spinup source chunk extends beyond the spinup contract")
         expected_spinup_start = (
             spinup.source_start + self.temporal_domain.interval * self.phase_offset
@@ -183,12 +155,7 @@ class SourceChunkPlan(HydroForgeModel):
         spinup_source_count = 0
         spinup = self.temporal_domain.spinup
         if spinup is not None:
-            spinup_source_count = _timedelta_quotient_trusted(
-                spinup.source_end - spinup.source_start,
-                self.temporal_domain.interval,
-                duration_label="spin-up source duration",
-                interval_label="dataset sample interval",
-            )
+            spinup_source_count = self.temporal_domain.spinup_count
             source_origin_offset = _timedelta_quotient_trusted(
                 spinup.source_start - self.temporal_domain.start,
                 self.temporal_domain.interval,
@@ -231,7 +198,9 @@ class SourceChunkPlan(HydroForgeModel):
     ) -> None:
         for phase_offset in range(0, count, self.chunk_len):
             length = min(self.chunk_len, count - phase_offset)
-            chunk = SourceChunk(
+            # The validated domain, aligned origin and bounded range establish
+            # each chunk's invariants; public SourceChunk requests validate them.
+            chunk = SourceChunk.model_construct(
                 index=len(chunks),
                 phase=phase,
                 source_start=(start + self.temporal_domain.interval * phase_offset),

@@ -10,18 +10,20 @@ hydroforge.data.distributed
 Distributed-training helpers (rank / world-size queries, process-group
 setup) plus low-level numeric utilities shared across modules.
 """
+
 from __future__ import annotations
 
 import os
 from math import prod
 from pathlib import Path
-from typing import Any, Literal, NoReturn, Self
+from typing import Annotated, Any, Literal, NoReturn, Self
 
 import numpy as np
 import torch
-from pydantic import PrivateAttr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 from torch import distributed as dist
 
+from hydroforge.contracts.errors import cleanup_on_exit
 from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.kernels.devices import devices_match
 
@@ -30,26 +32,31 @@ from hydroforge.kernels.devices import devices_match
 # ---------------------------------------------------------------------------
 
 LOCAL_PROCESS_RANK_ENV = (
-    "SLURM_LOCALID", "OMPI_COMM_WORLD_LOCAL_RANK",
-    "MPI_LOCALRANKID", "MV2_COMM_WORLD_LOCAL_RANK",
+    "SLURM_LOCALID",
+    "OMPI_COMM_WORLD_LOCAL_RANK",
+    "MPI_LOCALRANKID",
+    "MV2_COMM_WORLD_LOCAL_RANK",
 )
 
 
-class ProcessTopology(HydroForgeModel):
+_COMMUNICATION_BACKENDS = {"cpu": "gloo", "cuda": "nccl", "xpu": "xccl"}
+
+
+class _ProcessTopology(HydroForgeModel):
     """Immutable process-group identity captured for one model instance."""
 
-    rank: int
-    world_size: int
+    rank: int = Field(ge=0)
+    world_size: int = Field(ge=1)
 
     @model_validator(mode="after")
     def _validate_topology(self) -> Self:
-        if self.rank < 0:
-            raise ValueError("process rank must be an exact non-negative int")
-        if self.world_size < 1:
-            raise ValueError("process world_size must be an exact positive int")
         if self.rank >= self.world_size:
             raise ValueError("process rank must be smaller than world_size")
         return self
+
+
+class ProcessTopology(_ProcessTopology):
+    """Capture the rank identity of the initialized default group."""
 
     @classmethod
     def capture(cls) -> ProcessTopology:
@@ -60,27 +67,15 @@ class ProcessTopology(HydroForgeModel):
         return cls(rank=0, world_size=1)
 
 
-class DistributedContext(HydroForgeModel):
+class DistributedContext(_ProcessTopology):
     """Resolved process topology, communication backend, and model device."""
 
-    local_rank: int
-    rank: int
-    world_size: int
+    local_rank: int = Field(ge=0)
     device: torch.device
     backend: Literal["gloo", "nccl", "xccl"] | None = None
 
-    @field_validator("device", mode="before")
-    @classmethod
-    def _validate_device(cls, value: Any) -> torch.device:
-        if not isinstance(value, torch.device):
-            raise ValueError("distributed context device must be a torch.device")
-        return value
-
     @model_validator(mode="after")
     def _validate_context(self) -> Self:
-        if self.local_rank < 0:
-            raise ValueError("local rank must be an exact non-negative int")
-        ProcessTopology(rank=self.rank, world_size=self.world_size)
         if self.local_rank >= self.world_size:
             raise ValueError("local_rank must be smaller than world_size")
         if self.device.type not in {"cpu", "cuda", "xpu", "mps"}:
@@ -109,11 +104,7 @@ class DistributedContext(HydroForgeModel):
             raise ValueError(
                 "multi-process distributed context requires a communication backend"
             )
-        required_backend = {
-            "cpu": "gloo",
-            "cuda": "nccl",
-            "xpu": "xccl",
-        }.get(self.device.type)
+        required_backend = _COMMUNICATION_BACKENDS.get(self.device.type)
         if self.backend is not None and self.backend != required_backend:
             raise ValueError(
                 f"communication backend {self.backend!r} is incompatible with "
@@ -134,14 +125,13 @@ class _DistributedSetupRequest(HydroForgeModel):
     """Validated public request consumed by distributed initialization."""
 
     allowed_devices: tuple[torch.device, ...]
-    required_kernel_backend: Literal[
-        "torch", "triton", "cuda", "metal"
-    ] | None = None
+    required_kernel_backend: Literal["torch", "triton", "cuda", "metal"] | None = None
 
     @field_validator("allowed_devices", mode="before")
     @classmethod
     def _validate_allowed_devices(
-        cls, value: Any,
+        cls,
+        value: Any,
     ) -> tuple[torch.device, ...]:
         if type(value) is not tuple:
             raise ValueError("allowed_devices must be an exact tuple")
@@ -149,10 +139,7 @@ class _DistributedSetupRequest(HydroForgeModel):
             raise ValueError("allowed_devices must not be empty")
         devices: list[torch.device] = []
         for index, candidate in enumerate(value):
-            if (
-                type(candidate) is str
-                and candidate.lower().partition(":")[0] == "tpu"
-            ):
+            if type(candidate) is str and candidate.lower().partition(":")[0] == "tpu":
                 raise ValueError(
                     "TPU/XLA requires a torch_xla PJRT adapter and cannot be "
                     "initialized by HydroForge setup_distributed"
@@ -223,9 +210,7 @@ def get_local_process_rank() -> int:
                 f"{name} must be a non-negative integer, got {raw!r}"
             ) from error
         if value < 0:
-            raise ValueError(
-                f"{name} must be a non-negative integer, got {raw!r}"
-            )
+            raise ValueError(f"{name} must be a non-negative integer, got {raw!r}")
         observed[name] = value
     ranks = set(observed.values())
     if len(ranks) > 1:
@@ -307,10 +292,7 @@ def _accelerator_candidate(
     device_type = candidate.type
     runtime = getattr(torch, device_type, None)
     if runtime is None or not runtime.is_available():
-        raise RuntimeError(
-            f"{device_type!r} is not available in this "
-            "PyTorch runtime"
-        )
+        raise RuntimeError(f"{device_type!r} is not available in this PyTorch runtime")
     index = local_rank if candidate.index is None else candidate.index
     if world_size > 1 and index != local_rank:
         raise RuntimeError(
@@ -339,16 +321,10 @@ def _accelerator_candidate(
     return torch.device(device_type, index)
 
 
-def _communication_backend(device: torch.device) -> Literal[
-    "gloo", "nccl", "xccl"
-]:
+def _communication_backend(device: torch.device) -> Literal["gloo", "nccl", "xccl"]:
     """Return the only supported collective backend for one device type."""
 
-    return {
-        "cpu": "gloo",
-        "cuda": "nccl",
-        "xpu": "xccl",
-    }[device.type]
+    return _COMMUNICATION_BACKENDS[device.type]
 
 
 def _require_communication_backend(
@@ -392,17 +368,18 @@ def _candidate_device(
     local_rank: int,
     world_size: int,
     initialized_backend: Literal["gloo", "nccl", "xccl"] | None,
-    required_kernel_backend: Literal[
-        "torch", "triton", "cuda", "metal"
-    ] | None,
+    required_kernel_backend: Literal["torch", "triton", "cuda", "metal"] | None,
 ) -> torch.device:
     """Validate, activate, and kernel-preflight one ordered candidate."""
 
-    required_device_type = {
-        "gloo": "cpu",
-        "nccl": "cuda",
-        "xccl": "xpu",
-    }.get(initialized_backend)
+    required_device_type = next(
+        (
+            kind
+            for kind, backend in _COMMUNICATION_BACKENDS.items()
+            if backend == initialized_backend
+        ),
+        None,
+    )
     if required_device_type is not None and candidate.type != required_device_type:
         raise RuntimeError(
             f"initialized {initialized_backend.upper()} communication backend "
@@ -423,19 +400,10 @@ def _candidate_device(
                 "MPS is available only for single-process HydroForge execution"
             )
         if not torch.backends.mps.is_available():
-            raise RuntimeError(
-                "MPS is not available in this PyTorch runtime"
-            )
+            raise RuntimeError("MPS is not available in this PyTorch runtime")
         device = torch.device("mps")
 
-    if initialized_backend is not None:
-        expected = _communication_backend(device) if device.type != "mps" else None
-        if initialized_backend != expected:
-            raise RuntimeError(
-                f"initialized {initialized_backend.upper()} communication "
-                f"backend is incompatible with device {str(device)!r}"
-            )
-    elif world_size > 1:
+    if initialized_backend is None and world_size > 1:
         if not dist.is_available():
             raise RuntimeError("torch.distributed is unavailable")
         _require_communication_backend(device)
@@ -477,9 +445,7 @@ def _rendezvous_environment(world_size: int) -> int:
     _, rank = _rank_environment(world_size, required=True)
     master_addr = os.environ.get("MASTER_ADDR")
     if master_addr is None or not master_addr.strip():
-        raise ValueError(
-            "MASTER_ADDR must be a non-empty string for env:// rendezvous"
-        )
+        raise ValueError("MASTER_ADDR must be a non-empty string for env:// rendezvous")
     raw_port = os.environ.get("MASTER_PORT")
     try:
         port = int(raw_port) if raw_port is not None else -1
@@ -534,8 +500,7 @@ def _setup_distributed_trusted(
         raw_rank, rank_env = _rank_environment(ws_env, required=False)
         if raw_rank is not None and rank_env != 0 and ws_env == 1:
             raise ValueError(
-                f"RANK={rank_env}, but WORLD_SIZE=1; launcher topology is "
-                "incomplete"
+                f"RANK={rank_env}, but WORLD_SIZE=1; launcher topology is incomplete"
             )
         rank = 0
         world_size = ws_env
@@ -562,7 +527,7 @@ def _setup_distributed_trusted(
         # Construct the complete result before the external process-group side
         # effect. This proves that all locally predictable contract failures
         # have already been raised.
-        DistributedContext(
+        context = DistributedContext(
             local_rank=local_rank,
             rank=expected_rank,
             world_size=world_size,
@@ -575,25 +540,35 @@ def _setup_distributed_trusted(
         }
         if device.type in {"cuda", "xpu"}:
             arguments["device_id"] = device
-        dist.init_process_group(**arguments)
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        observed_backend = _backend_name(dist.get_backend())
-        if rank != expected_rank:
-            raise RuntimeError(
-                f"initialized rank={rank} disagrees with preflight "
-                f"RANK={expected_rank}"
-            )
-        if world_size != ws_env:
-            raise RuntimeError(
-                f"initialized world_size={world_size} disagrees with "
-                f"preflight WORLD_SIZE={ws_env}"
-            )
-        if observed_backend != backend:
-            raise RuntimeError(
-                f"initialized communication backend {observed_backend!r} "
-                f"disagrees with preflight backend {backend!r}"
-            )
+        try:
+            dist.init_process_group(**arguments)
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            observed_backend = _backend_name(dist.get_backend())
+            if rank != expected_rank:
+                raise RuntimeError(
+                    f"initialized rank={rank} disagrees with preflight RANK={expected_rank}"
+                )
+            if world_size != ws_env:
+                raise RuntimeError(
+                    f"initialized world_size={world_size} disagrees with "
+                    f"preflight WORLD_SIZE={ws_env}"
+                )
+            if observed_backend != backend:
+                raise RuntimeError(
+                    f"initialized communication backend {observed_backend!r} "
+                    f"disagrees with preflight backend {backend!r}"
+                )
+            ProcessTopology(rank=rank, world_size=world_size)
+        except BaseException:
+
+            def release_owned_group() -> None:
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+
+            with cleanup_on_exit("new process group", (release_owned_group,)):
+                raise
+        return context
 
     return DistributedContext(
         local_rank=local_rank,
@@ -607,9 +582,7 @@ def _setup_distributed_trusted(
 def setup_distributed(
     *,
     allowed_devices: tuple[str | torch.device, ...],
-    required_kernel_backend: Literal[
-        "torch", "triton", "cuda", "metal"
-    ] | None = None,
+    required_kernel_backend: Literal["torch", "triton", "cuda", "metal"] | None = None,
 ) -> DistributedContext:
     """Select a device, preflight kernels, and initialize distributed execution.
 
@@ -640,34 +613,17 @@ def setup_distributed(
 
 class _BinaryReadRequest(HydroForgeModel):
     filename: str | Path
-    shape: tuple[int, ...]
+    shape: tuple[Annotated[int, Field(ge=1)], ...] = Field(min_length=1)
     dtype: Any
 
     _normalized_dtype: np.dtype = PrivateAttr()
     _file_identity: tuple[int, int, int, int] = PrivateAttr()
 
-    @field_validator("filename")
-    @classmethod
-    def _validate_filename(cls, value: str | Path) -> str | Path:
-        return value
-
     @model_validator(mode="after")
     def _validate_binary_identity(self):
-        if not self.shape:
-            raise ValueError("binary shape must be a non-empty tuple")
-        if any(type(size) is not int or size < 1 for size in self.shape):
-            raise ValueError(
-                "binary shape entries must be exact positive integers"
-            )
         dtype = np.dtype(self.dtype)
-        if (
-            dtype.hasobject
-            or dtype.subdtype is not None
-            or dtype.fields is not None
-        ):
-            raise ValueError(
-                "binary dtype must be a plain fixed-width scalar dtype"
-            )
+        if dtype.hasobject or dtype.subdtype is not None or dtype.fields is not None:
+            raise ValueError("binary dtype must be a plain fixed-width scalar dtype")
         self._normalized_dtype = dtype
         path = Path(self.filename).absolute()
         expected_size = prod(self.shape) * dtype.itemsize
@@ -706,9 +662,7 @@ class _BinaryReadRequest(HydroForgeModel):
             status.st_mtime_ns,
         )
         if observed != self._file_identity:
-            raise RuntimeError(
-                f"binary file {path} changed after validation"
-            )
+            raise RuntimeError(f"binary file {path} changed after validation")
 
 
 def _binread_trusted(request: _BinaryReadRequest) -> np.ndarray:
@@ -723,6 +677,7 @@ def _binread_trusted(request: _BinaryReadRequest) -> np.ndarray:
         request.verify_file_identity()
     return array.reshape(request.shape, order="F")
 
+
 def binread(
     filename: str | Path,
     shape: tuple[int, ...],
@@ -730,17 +685,15 @@ def binread(
 ) -> np.ndarray:
     """Read a Fortran-ordered binary file and reshape to *shape*."""
     request = _BinaryReadRequest(
-        filename=filename, shape=shape, dtype=dtype_str,
+        filename=filename,
+        shape=shape,
+        dtype=dtype_str,
     )
     return _binread_trusted(request)
 
 
 class _MapReadRequest(_BinaryReadRequest):
-    @model_validator(mode="after")
-    def _validate_map_rank(self):
-        if len(self.shape) not in {2, 3}:
-            raise ValueError("map_shape must contain exactly two or three axes")
-        return self
+    shape: tuple[Annotated[int, Field(ge=1)], ...] = Field(min_length=2, max_length=3)
 
 
 def read_map(
@@ -750,7 +703,9 @@ def read_map(
 ) -> np.ndarray:
     """Read a spatial map binary file (Fortran-ordered)."""
     request = _MapReadRequest(
-        filename=filename, shape=map_shape, dtype=precision,
+        filename=filename,
+        shape=map_shape,
+        dtype=precision,
     )
     return _binread_trusted(request)
 
@@ -773,7 +728,8 @@ class _NumpyIndexLookup(HydroForgeModel):
         if self.query.ndim != 1 or self.target.ndim != 1:
             raise ValueError("index lookup arrays must be one-dimensional")
         if self.query.dtype.kind not in {"i", "u"} or self.target.dtype.kind not in {
-            "i", "u",
+            "i",
+            "u",
         }:
             raise ValueError("index lookup arrays must contain integers")
         if self.query.dtype != self.target.dtype:
@@ -790,7 +746,8 @@ def find_indices_in(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def _find_indices_in_trusted(
-    query: np.ndarray, target: np.ndarray,
+    query: np.ndarray,
+    target: np.ndarray,
 ) -> np.ndarray:
     """Resolve an already validated one-dimensional integer lookup."""
 
@@ -799,9 +756,7 @@ def _find_indices_in_trusted(
     pos_in_sorted = np.searchsorted(sorted_b, query)
     valid_mask = pos_in_sorted < len(sorted_b)
     hit_mask = np.zeros_like(query, dtype=bool)
-    hit_mask[valid_mask] = (
-        sorted_b[pos_in_sorted[valid_mask]] == query[valid_mask]
-    )
+    hit_mask[valid_mask] = sorted_b[pos_in_sorted[valid_mask]] == query[valid_mask]
     index = np.full_like(pos_in_sorted, -1, dtype=int)
     index[hit_mask] = order[pos_in_sorted[hit_mask]]
     return index
@@ -816,12 +771,15 @@ class _TorchIndexLookup(HydroForgeModel):
     @model_validator(mode="after")
     def _validate_lookup(self) -> Self:
         if self.query.ndim != 1 or self.target.ndim != 1:
-            raise ValueError(
-                "torch index lookup tensors must be one-dimensional"
-            )
+            raise ValueError("torch index lookup tensors must be one-dimensional")
         integer_dtypes = {
-            torch.int8, torch.uint8, torch.int16, torch.uint16,
-            torch.int32, torch.uint32, torch.int64,
+            torch.int8,
+            torch.uint8,
+            torch.int16,
+            torch.uint16,
+            torch.int32,
+            torch.uint32,
+            torch.int64,
         }
         if (
             self.query.dtype not in integer_dtypes
@@ -851,12 +809,14 @@ def find_indices_in_torch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Return indices in *b* for each element of *a* (Torch version)."""
     declaration = _TorchIndexLookup(query=a, target=b)
     return _find_indices_in_torch_trusted(
-        declaration.query, declaration.target,
+        declaration.query,
+        declaration.target,
     )
 
 
 def _find_indices_in_torch_trusted(
-    query: torch.Tensor, target: torch.Tensor,
+    query: torch.Tensor,
+    target: torch.Tensor,
 ) -> torch.Tensor:
     """Resolve an already validated same-device integer tensor lookup."""
 
@@ -884,6 +844,17 @@ def _find_indices_in_torch_trusted(
 # dtype helpers
 # ---------------------------------------------------------------------------
 
+
+_TORCH_NUMPY_DTYPES = {
+    torch.float32: np.float32,
+    torch.float64: np.float64,
+    torch.float16: np.float16,
+    torch.int64: np.int64,
+    torch.int32: np.int32,
+    torch.bool: np.bool_,
+}
+
+
 class _TorchDTypeLookup(HydroForgeModel):
     """Validated declaration consumed by :func:`torch_to_numpy_dtype`."""
 
@@ -891,22 +862,11 @@ class _TorchDTypeLookup(HydroForgeModel):
 
     @model_validator(mode="after")
     def _validate_dtype(self) -> Self:
-        if self.torch_dtype not in {
-            torch.float32, torch.float64, torch.float16,
-            torch.int64, torch.int32, torch.bool,
-        }:
+        if self.torch_dtype not in _TORCH_NUMPY_DTYPES:
             raise ValueError(f"Unsupported torch dtype: {self.torch_dtype}")
         return self
 
 
 def torch_to_numpy_dtype(torch_dtype: torch.dtype) -> type:
     torch_dtype = _TorchDTypeLookup(torch_dtype=torch_dtype).torch_dtype
-    dtype_mapping = {
-        torch.float32: np.float32,
-        torch.float64: np.float64,
-        torch.float16: np.float16,
-        torch.int64: np.int64,
-        torch.int32: np.int32,
-        torch.bool: np.bool_,
-    }
-    return dtype_mapping[torch_dtype]
+    return _TORCH_NUMPY_DTYPES[torch_dtype]
