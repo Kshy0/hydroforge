@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cache
 from typing import Any
 
@@ -21,6 +24,32 @@ from hydroforge.kernels.backends.metal.online import (
     make_online_metal_dispatcher,
 )
 from hydroforge.kernels.backends.metal.types import tensor_type
+
+_scatter_error: ContextVar[list[torch.Tensor | None] | None] = ContextVar(
+    "hydroforge_metal_scatter_error",
+    default=None,
+)
+
+
+@contextmanager
+def scatter_error_scope(seed: torch.Tensor | None = None) -> Iterator[None]:
+    """Share one bounds-error flag among scatter lowerings of one program."""
+
+    token = _scatter_error.set([seed])
+    try:
+        yield
+    finally:
+        _scatter_error.reset(token)
+
+
+def _scatter_error_flag(device: torch.device) -> torch.Tensor:
+    shared = _scatter_error.get()
+    if shared is not None and shared[0] is not None:
+        return shared[0]
+    flag = torch.zeros(1, dtype=torch.int32, device=device)
+    if shared is not None:
+        shared[0] = flag
+    return flag
 
 
 @cache
@@ -238,7 +267,7 @@ def _lower_scatter(operator: Any) -> tuple[MetalCommand, ...]:
         raise SubstepCompileError("Metal scatter_add output is not address-stable")
     if target is not destination:
         calls.append(_copy(target, destination))
-    error = torch.zeros(1, dtype=torch.int32, device=index.device)
+    error = _scatter_error_flag(index.device)
     calls.append(
         MetalCommand(
             _scatter_dispatcher(index.dtype),

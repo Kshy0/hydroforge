@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 
-from hydroforge.contracts.errors import ResourceCleanupError
+from hydroforge.contracts.errors import ResourceCleanupError, cleanup_on_exit
 from hydroforge.kernels.backends.build_environment import (
     serialized_compilation,
     temporary_environment,
@@ -54,7 +54,13 @@ def load_metal_kernel():
     if sys.platform != "darwin":
         raise RuntimeError("Native Metal kernels are only available on macOS")
 
-    from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import _get_build_directory, load
+
+    from hydroforge.kernels.backends.compile_lock import (
+        acquire_compile_lock,
+        clear_abandoned_torch_lock,
+        release_compile_lock,
+    )
 
     # cpp_extension invokes helper programs by name; make the active Python
     # environment discoverable without imposing a package-build dependency.
@@ -62,14 +68,26 @@ def load_metal_kernel():
     executable_dir = str(Path(sys.executable).parent)
     build_path = executable_dir if old_path is None else f"{executable_dir}:{old_path}"
     source = Path(__file__).with_suffix(".mm")
-    with temporary_environment({"PATH": build_path}):
-        return load(
-            name="hydroforge_metal_kernel",
-            sources=[str(source)],
-            extra_cflags=["-O3", "-std=c++20", "-fno-objc-arc", "-fblocks"],
-            extra_ldflags=["-framework", "Metal", "-framework", "Foundation"],
-            verbose=False,
-        )
+    name = "hydroforge_metal_kernel"
+    build_dir = Path(_get_build_directory(name, verbose=False))
+    lock_path = build_dir / ".hydroforge_compile.lock"
+    # Torch's own build lock waits forever on a file left by an interrupted
+    # compile. Holding HydroForge's bounded, liveness-checked lock proves any
+    # torch lock in this directory is abandoned before torch sees it.
+    acquire_compile_lock(lock_path, env_prefix="HYDROFORGE", verbose=False)
+    with cleanup_on_exit(
+        "Metal compile lock", (lambda: release_compile_lock(lock_path),)
+    ):
+        clear_abandoned_torch_lock(build_dir, verbose=False)
+        with temporary_environment({"PATH": build_path}):
+            return load(
+                name=name,
+                sources=[str(source)],
+                extra_cflags=["-O3", "-std=c++20", "-fno-objc-arc", "-fblocks"],
+                extra_ldflags=["-framework", "Metal", "-framework", "Foundation"],
+                build_directory=str(build_dir),
+                verbose=False,
+            )
 
 
 @dataclass

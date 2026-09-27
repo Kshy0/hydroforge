@@ -618,6 +618,7 @@ def validate_input_contract(model: AbstractModel) -> AbstractModel:
         model,
         schema=partition_schema,
         variable_groups=variable_groups,
+        semantic=partition,
     )
     model._data = ModelDataCompiler(model)
     parameter_changes = ParameterSemanticCompiler(model, partition).compile(

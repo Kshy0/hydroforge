@@ -9,7 +9,9 @@ from functools import cache
 from types import MappingProxyType
 
 from hydroforge.statistics.ir import (
+    ExpressionSource,
     Reduction,
+    ScatterSource,
     StatisticOperation,
     StatisticsIR,
     StatisticVariable,
@@ -66,12 +68,28 @@ class ReductionPlan:
         return self.reduction.value
 
 
+# Host/device sample-phase bits shared by generated launch gates.
+INNER_FIRST_BIT = 1
+INNER_LAST_BIT = 2
+
+
+def sample_phase_mask(phases: Iterable[SamplePhase]) -> int | None:
+    """Return the phase bits needing a launch, or ``None`` for every sample."""
+    mask = 0
+    for phase in phases:
+        if phase is SamplePhase.EVERY_SUBSTEP:
+            return None
+        mask |= INNER_FIRST_BIT if phase is SamplePhase.INNER_FIRST else INNER_LAST_BIT
+    return mask
+
+
 @dataclass(frozen=True, slots=True)
 class LoweredOperation:
     """One normalized operation with all scheduling decisions resolved."""
 
     spelling: str
     phase: SamplePhase
+    value_phase: SamplePhase
     outer: ReductionPlan
     inner: ReductionPlan | None
     k: int
@@ -99,6 +117,16 @@ class LoweredVariable:
     operations: tuple[LoweredOperation, ...]
     inner_reductions: tuple[Reduction, ...]
     needs_unconditional_value: bool
+
+    @property
+    def value_phases(self) -> frozenset[SamplePhase]:
+        """Samples at which the source value is read."""
+        return frozenset(operation.value_phase for operation in self.operations)
+
+    @property
+    def launch_phases(self) -> frozenset[SamplePhase]:
+        """Samples at which any source read or state update happens."""
+        return self.value_phases | {operation.phase for operation in self.operations}
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +169,22 @@ class StatisticsLowering:
             {reduction: tuple(variables) for reduction, variables in grouped.items()}
         )
 
+    def group_phase_mask(self, group: str) -> int | None:
+        """Return when one output group's update kernel has any effect."""
+        return sample_phase_mask(
+            phase
+            for variable in self.grouped_variables[group]
+            for phase in variable.launch_phases
+        )
+
+    def scatter_phase_mask(self, name: str) -> int | None:
+        """Return when any consumer reads one materialized scatter buffer."""
+        phases: set[SamplePhase] = set()
+        for variable in self.variables:
+            if name in _source_closure(self.ir, variable.variable.name):
+                phases.update(variable.value_phases)
+        return sample_phase_mask(phases)
+
     def split_indexed(
         self,
         names: Iterable[str],
@@ -177,6 +221,34 @@ def _phase(operation: StatisticOperation) -> SamplePhase:
             return SamplePhase.EVERY_SUBSTEP
 
 
+def _value_phase(operation: StatisticOperation) -> SamplePhase:
+    match operation.inner:
+        case None:
+            return _phase(operation)
+        case Reduction.LAST:
+            return SamplePhase.INNER_LAST
+        case Reduction.FIRST:
+            return SamplePhase.INNER_FIRST
+        case _:
+            return SamplePhase.EVERY_SUBSTEP
+
+
+def _source_closure(ir: StatisticsIR, name: str) -> frozenset[str]:
+    names: set[str] = set()
+    pending = [name]
+    while pending:
+        field = pending.pop()
+        if field in names:
+            continue
+        names.add(field)
+        source = ir.sources.get(field)
+        if isinstance(source, ScatterSource):
+            pending.extend(source.value.dependencies)
+        elif isinstance(source, ExpressionSource):
+            pending.extend(source.expression.dependencies)
+    return frozenset(names)
+
+
 @cache
 def _reduction_plan(reduction: Reduction) -> ReductionPlan:
     action = {
@@ -200,6 +272,7 @@ def lower_statistics(ir: StatisticsIR) -> StatisticsLowering:
             LoweredOperation(
                 spelling=operation.spelling,
                 phase=_phase(operation),
+                value_phase=_value_phase(operation),
                 outer=_reduction_plan(operation.outer),
                 inner=(
                     None
@@ -245,11 +318,7 @@ def lower_statistics(ir: StatisticsIR) -> StatisticsLowering:
                         "is_outer_last",
                     }
                 )
-                if operation.value_reduction in {
-                    Reduction.FIRST,
-                    Reduction.MAX,
-                    Reduction.MIN,
-                }:
+                if operation.value_reduction is not Reduction.LAST:
                     flags.add("is_inner_first")
                 continue
             match operation.output:

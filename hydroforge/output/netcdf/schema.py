@@ -8,7 +8,10 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Self
 
+import torch
+
 from hydroforge.contracts.naming import sanitize_symbol
+from hydroforge.data.distributed import torch_to_numpy_dtype
 from hydroforge.serialization.netcdf import (
     MIN_BLOSC_CHUNK_BYTES,
     _prepare_netcdf_variable_options_trusted,
@@ -35,7 +38,6 @@ class NetCDFSchema:
     dimensions: tuple[tuple[str, int], ...]
     data_dimensions: tuple[str, ...]
     create_options: Mapping[str, Any]
-    metadata: Mapping[str, Any]
 
     @classmethod
     def compile(
@@ -46,11 +48,18 @@ class NetCDFSchema:
         ensemble_size: int,
         netcdf_options: Mapping[str, Any],
         write_batch_size: int = 1,
+        save_precision: torch.dtype | None = None,
     ) -> Self:
-        storage_dtype, logical_dtype = netcdf_dtype_encoding(metadata["dtype"])
+        result_dtype = metadata["dtype"]
+        if save_precision is not None and result_dtype.is_floating_point:
+            result_dtype = save_precision
+        storage_dtype, logical_dtype = netcdf_dtype_encoding(
+            torch_to_numpy_dtype(result_dtype)
+        )
         actual_shape = metadata["actual_shape"]
         tensor_shape = metadata["tensor_shape"]
-        coordinate_name = metadata.get("nc_coord_name")
+        dim_coords = metadata.get("dim_coords")
+        coordinate_name = dim_coords.rsplit(".", 1)[-1] if dim_coords else None
         order = metadata["k"]
         batched = metadata["batched"]
         full_output = metadata["full_output"]
@@ -157,5 +166,4 @@ class NetCDFSchema:
             dimensions=tuple(dimensions),
             data_dimensions=tuple(data_dimensions),
             create_options=MappingProxyType(create_options),
-            metadata=MappingProxyType(dict(metadata)),
         )

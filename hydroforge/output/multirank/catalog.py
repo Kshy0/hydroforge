@@ -17,6 +17,7 @@ from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.serialization.netcdf import (
     BOOL_LOGICAL_DTYPE,
     COMMITTED_STEPS_ATTR,
+    COORDINATE_ATTR,
     LOGICAL_DTYPE_ATTR,
     OUTPUT_FORMAT,
     OUTPUT_VERSION,
@@ -80,23 +81,41 @@ class RankOutputCatalog:
     def __init__(self, owner: Any) -> None:
         self.owner = owner
 
-    def _select_coord_name(self, ds: nc.Dataset, saved_points: int) -> str | None:
-        """Pick a ('saved_points',) variable to serve as output_coord."""
-        if self.owner.coord_name:
-            variable = ds.variables[self.owner.coord_name]
+    def _select_coord_name(
+        self,
+        ds: nc.Dataset,
+        saved_points: int,
+    ) -> tuple[str | None, tuple[str, ...] | None]:
+        """Return the declared coordinate, or legacy automatic candidates.
+
+        Files written by current writers name their coordinate in a global
+        attribute.  Older files fall back to candidate detection, which is
+        resolved across ranks by :meth:`_resolve_legacy_coordinates`.
+        """
+
+        name = self.owner.coord_name
+        if not name and COORDINATE_ATTR in ds.ncattrs():
+            name = ds.getncattr(COORDINATE_ATTR)
+            if type(name) is not str:
+                raise TypeError(f"{COORDINATE_ATTR} must be a string")
+            if not name:
+                return None, None
+        if name:
+            variable = ds.variables[name]
             if (
                 variable.dimensions != ("saved_points",)
                 or len(variable) != saved_points
             ):
                 raise ValueError(
-                    f"requested coordinate {self.owner.coord_name!r} must have "
-                    "dimensions ('saved_points',)"
+                    f"coordinate {name!r} must have dimensions ('saved_points',)"
                 )
-            return self.owner.coord_name
+            return name, None
 
         candidates: list[str] = []
         for name, v in ds.variables.items():
             if name in ("time", self.owner.var_name):
+                continue
+            if getattr(v, LOGICAL_DTYPE_ATTR, None) is not None:
                 continue
             if v.dimensions == ("saved_points",) and len(v) == saved_points:
                 value = v[:]
@@ -109,12 +128,47 @@ class RankOutputCatalog:
                 array = np.asarray(value)
                 if array.dtype.kind in "iu" and np.unique(array).size == array.size:
                     candidates.append(name)
+        return None, tuple(candidates)
+
+    @staticmethod
+    def _resolve_legacy_coordinates(rank_infos: list[dict]) -> None:
+        """Select one legacy coordinate from the most constrained rank.
+
+        Small ranks make every unique integer variable a candidate, so the
+        rank with the most saved points decides and every rank must agree.
+        """
+
+        legacy = [info for info in rank_infos if info["coord_candidates"] is not None]
+        if not legacy:
+            return
+        reference = max(legacy, key=lambda info: (info["saved_points"], -info["rank_id"]))
+        candidates = reference["coord_candidates"]
         if len(candidates) > 1:
             raise ValueError(
                 "multiple integer saved_points coordinates are eligible for "
-                f"automatic selection: {candidates}; specify coord_name"
+                f"automatic selection in rank {reference['rank_id']}: "
+                f"{sorted(candidates)}; specify coord_name"
             )
-        return candidates[0] if candidates else None
+        name = next(iter(candidates), None)
+        for info in legacy:
+            if name is not None and name not in info["coord_candidates"]:
+                raise ValueError(
+                    f"automatic coordinate {name!r} is not a valid saved_points "
+                    f"coordinate in rank {info['rank_id']}"
+                )
+            info["coord_name"] = name
+            info["coord_raw"] = (
+                None if name is None else info["coord_values"][0][name]
+            )
+            for path, values in zip(
+                info["paths"][1:], info["coord_values"][1:], strict=True
+            ):
+                if name is not None and not np.array_equal(
+                    values[name], info["coord_raw"]
+                ):
+                    raise ValueError(
+                        f"coordinate {name!r} changes values or order in {path.name}"
+                    )
 
     def _inspect_rank_file(
         self,
@@ -284,7 +338,8 @@ class RankOutputCatalog:
             try:
                 metadata = None
                 committed_steps = []
-                coord_name = coord_raw = None
+                coord_name = coord_raw = coord_candidates = None
+                coord_values: list[dict[str, np.ndarray]] = []
                 for path in paths:
                     with nc.Dataset(path, "r") as dataset:
                         observed = self._inspect_rank_file(dataset, expected=metadata)
@@ -298,7 +353,33 @@ class RankOutputCatalog:
                                     f"{metadata['contract_rank']}"
                                 )
                         saved_points = metadata["saved_points"]
-                        observed_name = self._select_coord_name(dataset, saved_points)
+                        observed_name, candidates = self._select_coord_name(
+                            dataset, saved_points
+                        )
+                        if candidates is not None:
+                            if not first_file and coord_candidates is None:
+                                raise ValueError(
+                                    "coordinate declaration disappears in "
+                                    f"{path.name}"
+                                )
+                            coord_candidates = (
+                                set(candidates)
+                                if first_file
+                                else coord_candidates.intersection(candidates)
+                            )
+                            coord_values.append(
+                                {
+                                    name: self._read_coordinate(
+                                        dataset, name, saved_points
+                                    )
+                                    for name in candidates
+                                }
+                            )
+                            continue
+                        if not first_file and coord_candidates is not None:
+                            raise ValueError(
+                                f"coordinate declaration appears in {path.name}"
+                            )
                         observed_coordinate = (
                             None
                             if observed_name is None
@@ -329,6 +410,8 @@ class RankOutputCatalog:
                         **metadata,
                         "coord_name": coord_name,
                         "coord_raw": coord_raw,
+                        "coord_candidates": coord_candidates,
+                        "coord_values": coord_values,
                         "x": None,
                         "y": None,
                     }
@@ -343,6 +426,10 @@ class RankOutputCatalog:
                 raise ValueError(
                     f"Failed to inspect rank {rank_id} file {first_fp}"
                 ) from exc
+
+        self._resolve_legacy_coordinates(rank_infos)
+        for info in rank_infos:
+            del info["coord_candidates"], info["coord_values"]
 
         if rank_infos:
             reference = rank_infos[0]

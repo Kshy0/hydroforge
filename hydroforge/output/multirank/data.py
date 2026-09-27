@@ -175,12 +175,9 @@ class MultiRankDataAccess:
                         f"{label} contains values outside {dtype} range"
                     )
             converted = array.astype(dtype, copy=False)
+            # Tiny values may round to subnormals or zero; only overflow fails.
             if np.any(np.isfinite(array) & ~np.isfinite(converted)):
                 raise OverflowError(f"{label} contains values outside {dtype} range")
-            if np.any(np.isfinite(array) & (array != 0) & (converted == 0)):
-                raise OverflowError(
-                    f"{label} contains nonzero values that underflow in {dtype}"
-                )
             if array.dtype.kind in "iu" and not np.array_equal(
                 array.astype(object),
                 converted.astype(object),

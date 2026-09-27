@@ -36,6 +36,7 @@ from hydroforge.data.netcdf import (
     _normalize_integer_slice,
     _normalize_netcdf_index,
     _output_axis,
+    _prefer_sparse_axis,
     _read_netcdf_var_sliced_trusted,
     read_netcdf_var_sliced,
 )
@@ -209,7 +210,7 @@ class _NetCDFFileIdentity(HydroForgeModel):
 class NetCDFInputSource(HydroForgeModel):
     """One complete lazy-storage binding for an input variable."""
 
-    path: Path
+    path: Path = Field(strict=False)
     file_identity: _NetCDFFileIdentity
     dimensions: tuple[_InputName, ...]
     shape: tuple[_InputExtent, ...]
@@ -302,10 +303,25 @@ class _NetCDFChunkRequest(HydroForgeModel):
     @model_validator(mode="after")
     def _read_and_validate(self) -> Self:
         variable = self.dataset.variables[self.name]
-        raw = _read_netcdf_var_sliced_trusted(
-            variable,
-            self.selector,
-        )
+        selectors = list(self.selector)
+        gathers: list[tuple[int, np.ndarray]] = []
+        for axis, index in enumerate(selectors):
+            # A dense selection reads its covering range once; one HDF5 read
+            # per index gap is far slower than an in-memory take.
+            if (
+                isinstance(index, np.ndarray)
+                and index.size
+                and index.dtype.kind in "iu"
+                and not _prefer_sparse_axis(variable, axis, index)
+            ):
+                low = int(index.min())
+                selectors[axis] = slice(low, int(index.max()) + 1)
+                gathers.append((axis, index - low))
+        raw = _read_netcdf_var_sliced_trusted(variable, tuple(selectors))
+        # Gather before decoding: values outside the selection must not be
+        # validated (e.g. missing values between selected cells).
+        for axis, positions in gathers:
+            raw = raw.take(positions, axis=_output_axis(selectors, axis))
         self._array = _preserve_input_value(
             _decode_netcdf_input_array(variable, raw, name=self.name)
         )
@@ -345,6 +361,8 @@ def _compile_input_proxy_netcdf_plan(
     attribute_sources: dict[str, Path] = {}
     available_vars: set[str] = set()
     reference_keys: np.ndarray | None = None
+    alignment_dims: set[str] = set()
+    keyless_variables: list[tuple[Path, str, tuple[str, ...]]] = []
 
     for path in paths:
         try:
@@ -380,6 +398,7 @@ def _compile_input_proxy_netcdf_plan(
                             f"{str(path)!r} contains duplicate keys"
                         )
                     alignment_dim = align_variable.dimensions[0]
+                    alignment_dims.add(alignment_dim)
 
                     if reference_keys is None:
                         reference_keys = current_keys
@@ -467,6 +486,10 @@ def _compile_input_proxy_netcdf_plan(
 
                     found_vars.add(var_name)
                     variable = ds.variables[var_name]
+                    if align_on is not None and align_on not in ds.variables:
+                        keyless_variables.append(
+                            (path, var_name, tuple(variable.dimensions))
+                        )
                     aligned_variable = (
                         alignment_idx is not None
                         and alignment_dim in variable.dimensions
@@ -502,6 +525,14 @@ def _compile_input_proxy_netcdf_plan(
         raise ValueError(
             f"align_on variable {align_on!r} was not found in any input file"
         )
+    for path, var_name, dimensions in keyless_variables:
+        shared = [dim for dim in dimensions if dim in alignment_dims]
+        if shared:
+            raise ValueError(
+                f"Variable {var_name!r} in {str(path)!r} uses alignment "
+                f"dimension {shared[0]!r}, but align_on variable {align_on!r} "
+                "is absent from that file, so its order cannot be aligned"
+            )
 
     if visible_vars is not None:
         missing_visible = visible_vars.difference(available_vars)
@@ -528,7 +559,7 @@ def _compile_input_proxy_netcdf_plan(
 class _InputProxyNetCDFDeclaration(HydroForgeModel):
     """Validated declaration consumed by ``InputProxy.from_nc``."""
 
-    file_path: str | Path | list[str | Path]
+    file_path: Annotated[Path, Field(strict=False)] | list[Annotated[Path, Field(strict=False)]]
     lazy: bool = False
     visible_vars: list[str] | set[str] | frozenset[str] | None = None
     align_on: _InputName | None = None

@@ -126,7 +126,11 @@ def canonical_calendar(calendar: str) -> str:
     if not isinstance(calendar, str) or not calendar.strip():
         raise ValueError("calendar must be a non-empty string")
     normalized = calendar.strip().lower()
-    return _CALENDAR_ALIASES.get(normalized, normalized)
+    canonical = _CALENDAR_ALIASES.get(normalized, normalized)
+    if canonical != "standard" and canonical not in _CFTIME_DATETIME_TYPES:
+        known = sorted({*_CALENDAR_ALIASES, *_CFTIME_DATETIME_TYPES})
+        raise ValueError(f"unknown calendar {calendar!r}; expected one of {known}")
+    return canonical
 
 
 def convert_calendar_date(value: DateLike, calendar: str) -> DateLike:
@@ -265,7 +269,7 @@ def _require_date(value: Any, *, label: str) -> None:
 
 
 class SimulationStep(HydroForgeModel):
-    """One half-open model interval ``[start, end)``."""
+    """One physical-time interval, identified by its execution index."""
 
     index: int = Field(ge=0)
     start: DateLike
@@ -629,14 +633,6 @@ class SimulationSchedule(HydroForgeModel):
         return self.explicit_steps[-1].end
 
     @property
-    def execution_start(self) -> DateLike:
-        """Monotonic model-clock start, including all spinup calls."""
-        if not self._is_regular or self.spinup is None:
-            return self._start
-        cadence = cast(timedelta, self.regular_step)
-        return self._start - cadence * self._num_spinup_steps
-
-    @property
     def _num_spinup_steps(self) -> int:
         return self._compiled_spinup_steps
 
@@ -657,7 +653,6 @@ class SimulationSchedule(HydroForgeModel):
         if not self._is_regular:
             return self.explicit_steps[index]
         cadence = cast(timedelta, self.regular_step)
-        start = self.execution_start + cadence * index
         spinup_steps = self._num_spinup_steps
         reuse_count = self._reuse_count
         source_interval = cast(timedelta, self.source_interval)
@@ -670,6 +665,7 @@ class SimulationSchedule(HydroForgeModel):
                 reuse_count,
             )
             source_start = spinup.source_start + source_interval * source_index
+            start = source_start + cadence * reuse_index
             return SimulationStep._from_schedule_trusted(
                 index=index,
                 start=start,
@@ -683,6 +679,7 @@ class SimulationSchedule(HydroForgeModel):
                 reuse_count=reuse_count,
             )
         main_model_index = index - spinup_steps
+        start = self._start + cadence * main_model_index
         source_index, reuse_index = divmod(main_model_index, reuse_count)
         source_start = self._start + source_interval * source_index
         return SimulationStep._from_schedule_trusted(
@@ -696,7 +693,7 @@ class SimulationSchedule(HydroForgeModel):
             reuse_count=reuse_count,
         )
 
-    def _index_at(self, start: DateLike) -> int:
+    def _main_index_at(self, start: DateLike) -> int:
         _require_date(start, label="model current_time")
         require_calendar(start, self.calendar, label="model current_time")
         if type(start) is not type(self._start):
@@ -719,7 +716,7 @@ class SimulationSchedule(HydroForgeModel):
             ):
                 return lower
             raise KeyError(start)
-        regular_start = self.execution_start
+        regular_start = self._start
         regular_step = cast(timedelta, self.regular_step)
         offset = timedelta_microseconds(
             start - regular_start,
@@ -730,15 +727,7 @@ class SimulationSchedule(HydroForgeModel):
             label="simulation step",
         )
         index, remainder = divmod(offset, cadence)
-        if index < 0 or index >= len(self) or remainder != 0:
-            raise KeyError(start)
-        return index
-
-    def _main_index_at(self, start: DateLike) -> int:
-        """Resolve a main-simulation boundary independently of spinup."""
-
-        index = self._index_at(start) - self._num_spinup_steps
-        if index < 0:
+        if index < 0 or index >= self.num_main_steps or remainder != 0:
             raise KeyError(start)
         return index
 
@@ -766,10 +755,6 @@ class SimulationSchedule(HydroForgeModel):
         fields = (
             ("Schedule type", schedule_type),
             ("Calendar", self.calendar),
-            (
-                "Execution period",
-                f"[{self.execution_start}, {self._end})",
-            ),
             ("Main period", f"[{self._start}, {self._end})"),
             ("Model cadence", cadence),
             ("Source interval", source_interval),

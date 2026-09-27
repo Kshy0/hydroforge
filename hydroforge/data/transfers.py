@@ -1,5 +1,6 @@
 """Bounded transfer staging with explicit stream and buffer ownership."""
 
+from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import closing, nullcontext
 from typing import Annotated, Any
@@ -53,26 +54,66 @@ def plan_pipeline_buffers(
     }
 
 
+class _PendingCPUTransfer:
+    """One enqueued device-to-host staging whose outputs are valid after wait."""
+
+    def __init__(self, outputs, events, sources) -> None:
+        self._outputs = outputs
+        self._events = events
+        self._sources = sources
+
+    @property
+    def asynchronous(self) -> bool:
+        return bool(self._events)
+
+    def wait(self) -> dict[str, torch.Tensor]:
+        """Block until every copy landed, then release the device sources."""
+
+        failures: list[BaseException] = []
+        for event in self._events:
+            try:
+                event.synchronize()
+            except BaseException as error:
+                failures.append(error)
+        self._events = ()
+        self._sources = ()
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            error = ResourceCleanupError("CPU transfer completion", failures)
+            raise error from failures[0]
+        return self._outputs
+
+
 class _TensorCPUStager:
-    """Return borrowed CPU snapshots, valid until the next staging call."""
+    """Return borrowed CPU snapshots in pinned buffers bounded by ``max_bytes``.
+
+    Pinned buffers are cached by slot, name, device, dtype, and shape; a miss
+    evicts least recently used buffers only as needed.  ``stage`` blocks until
+    the copies land.  ``stage_async`` alternates between two buffer slots, so
+    one transfer's outputs stay valid while the next one is in flight.
+    """
 
     def __init__(self, max_bytes: int = 8 * 1024 * 1024):
         self.max_bytes = max_bytes
-        self._buffers = {}
+        self._buffers: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+        self._slot = 0
+        self._copy_streams: dict[torch.device, Any] = {}
 
     @property
     def allocated_bytes(self) -> int:
-        return sum(
-            value.numel() * value.element_size() for value in self._buffers.values()
-        )
+        return sum(_tensor_bytes(value) for value in self._buffers.values())
 
     def clear(self) -> None:
         self._buffers.clear()
 
-    def stage(self, tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        retained = {}
+    def _enqueue(self, tensors, *, slot, copy_stream: bool):
+        cached = self._buffers
+        cached_bytes = sum(_tensor_bytes(value) for value in cached.values())
+        retained = OrderedDict()
         outputs = {}
         streams = {}
+        sources = []
         remaining = self.max_bytes
         failures: list[BaseException] = []
         try:
@@ -83,20 +124,74 @@ class _TensorCPUStager:
                     outputs[name] = tensor.cpu()
                     continue
                 key = (name, tensor.device, tensor.dtype, tuple(tensor.shape))
-                buffer = self._buffers.pop(key, None)
+                if slot is not None:
+                    key = (slot, *key)
+                buffer = cached.pop(key, None)
                 if buffer is None:
-                    self._buffers.clear()
+                    # Buffers retained by this call occupy max_bytes - remaining.
+                    while cached and (
+                        cached_bytes + self.max_bytes - remaining + size
+                        > self.max_bytes
+                    ):
+                        cached_bytes -= _tensor_bytes(cached.popitem(last=False)[1])
                     buffer = torch.empty(
                         tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True
                     )
+                else:
+                    cached_bytes -= size
                 retained[key] = buffer
                 remaining -= size
-                stream = torch.cuda.current_stream(tensor.device)
-                streams[tensor.device] = stream
-                buffer.copy_(tensor, non_blocking=True)
+                stream = streams.get(tensor.device)
+                if stream is None:
+                    stream = torch.cuda.current_stream(tensor.device)
+                    if copy_stream:
+                        # Copy beside compute: the side stream starts after the
+                        # producer's queued work and never delays later kernels.
+                        side = self._copy_streams.get(tensor.device)
+                        if side is None:
+                            side = torch.cuda.Stream(device=tensor.device)
+                            self._copy_streams[tensor.device] = side
+                        side.wait_stream(stream)
+                        stream = side
+                    streams[tensor.device] = stream
+                if copy_stream:
+                    with torch.cuda.stream(stream):
+                        buffer.copy_(tensor, non_blocking=True)
+                    tensor.record_stream(stream)
+                    sources.append(tensor)
+                else:
+                    buffer.copy_(tensor, non_blocking=True)
                 outputs[name] = buffer
         except BaseException as error:
             failures.append(error)
+        cached.update(retained)
+        self._buffers = cached
+        return outputs, streams, sources, failures
+
+    @staticmethod
+    def _record(streams, failures):
+        events = []
+        for stream in streams.values():
+            try:
+                event = torch.cuda.Event()
+                event.record(stream)
+                events.append(event)
+            except BaseException as error:
+                failures.append(error)
+        return events
+
+    @staticmethod
+    def _raise(failures):
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            error = ResourceCleanupError("CPU transfer staging", failures)
+            raise error from failures[0]
+
+    def stage(self, tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        outputs, streams, _sources, failures = self._enqueue(
+            tensors, slot=None, copy_stream=False
+        )
         for stream in streams.values():
             try:
                 event = torch.cuda.Event()
@@ -104,13 +199,33 @@ class _TensorCPUStager:
                 event.synchronize()
             except BaseException as error:
                 failures.append(error)
-        self._buffers = retained
-        if len(failures) == 1:
-            raise failures[0]
-        if failures:
-            error = ResourceCleanupError("CPU transfer staging", failures)
-            raise error from failures[0]
+        self._raise(failures)
         return outputs
+
+    def stage_async(self, tensors: Mapping[str, torch.Tensor]) -> _PendingCPUTransfer:
+        """Enqueue copies of caller-owned snapshots without waiting.
+
+        The caller must not mutate the device tensors, and must finish using
+        the previous transfer's outputs before the next-but-one call.
+        """
+
+        slot, self._slot = self._slot, 1 - self._slot
+        outputs, streams, sources, failures = self._enqueue(
+            tensors, slot=slot, copy_stream=True
+        )
+        events = self._record(streams, failures)
+        if failures:
+            for event in events:
+                try:
+                    event.synchronize()
+                except BaseException as error:
+                    failures.append(error)
+            self._raise(failures)
+        return _PendingCPUTransfer(outputs, tuple(events), tuple(sources))
+
+
+def _tensor_bytes(tensor: torch.Tensor) -> int:
+    return tensor.numel() * tensor.element_size()
 
 
 def _map_tensors(value, operation):
@@ -119,7 +234,10 @@ def _map_tensors(value, operation):
     if isinstance(value, Mapping):
         return {name: _map_tensors(item, operation) for name, item in value.items()}
     if isinstance(value, (tuple, list)):
-        return type(value)(_map_tensors(item, operation) for item in value)
+        items = [_map_tensors(item, operation) for item in value]
+        if isinstance(value, tuple) and hasattr(value, "_fields"):
+            return type(value)(*items)
+        return type(value)(items)
     return value
 
 

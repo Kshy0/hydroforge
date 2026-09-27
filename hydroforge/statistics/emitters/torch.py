@@ -10,13 +10,25 @@ from __future__ import annotations
 from datetime import datetime
 
 from hydroforge.statistics.emitters.common import StatisticsEmitter
-from hydroforge.statistics.ir import (
+from hydroforge.statistics.emitters.expression import (
     ExpressionDialect,
-    ExpressionSource,
-    ScatterSource,
-    TensorSource,
     render_expression,
 )
+from hydroforge.statistics.ir import ExpressionSource, ScatterSource, TensorSource
+
+
+def _extend_gated(lines: list[str], body: list[str], mask: int | None) -> None:
+    """Append function-body statements, skipped at samples outside ``mask``."""
+    if mask is None:
+        lines.extend(body)
+        return
+    condition = " or ".join(
+        name
+        for bit, name in ((1, "is_inner_first"), (2, "is_inner_last"))
+        if mask & bit
+    )
+    lines.append(f"    if {condition or 'False'}:")
+    lines.extend(f"    {line}" for line in body)
 
 
 class TorchStatisticsEmitter(StatisticsEmitter):
@@ -46,6 +58,13 @@ class TorchStatisticsEmitter(StatisticsEmitter):
             names,
             value_type=value_type,
         )
+
+    def _variable_weight(self, name: str) -> str:
+        """Render the sample weight in one variable's own state dtype."""
+        dtype = self._statistics_layouts[name].dtype
+        if dtype == self._control_dtype or not dtype.is_floating_point:
+            return "weight"
+        return f"weight.to(torch.{str(dtype).removeprefix('torch.')})"
 
     def _pytorch_state_expression(
         self, name: str, lines: list[str], emitted: dict[str, str]
@@ -107,11 +126,17 @@ class TorchStatisticsEmitter(StatisticsEmitter):
             "def hydroforge_minimum(left, right):",
             "    return torch.fmin(*_hydroforge_binary_operands(left, right))",
             "",
+            "# Incremental update: its FP32 error stays bounded as the window grows.",
+            "# Non-finite results fall back to the blended form so infinities and",
+            "# NaNs propagate exactly as before.",
             "def hydroforge_weighted_mean(old, old_weight, value, weight):",
             "    new_weight = old_weight + weight",
-            "    return (",
-            "        old * (old_weight / new_weight)",
-            "        + value * (weight / new_weight)",
+            "    ratio = weight / new_weight",
+            "    incremental = old + (value - old) * ratio",
+            "    return torch.where(",
+            "        torch.isfinite(incremental),",
+            "        incremental,",
+            "        old * (old_weight / new_weight) + value * ratio,",
             "    )",
             "",
             "def hydroforge_remainder(left, right):",
@@ -213,6 +238,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                 [
                     f"    # === full tensor variable: {var} ===",
                     f"    {safe_var}_val = {value_expression}",
+                    f"    {safe_var}_weight = {self._variable_weight(var)}",
                 ]
             )
 
@@ -227,10 +253,10 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                     weight_key = f"{var}_{inner}_weight_state"
                     lines.extend(
                         [
-                            f'    _inner_old = states["{inner_key}"].clone()',
-                            f'    _w_old = states["{weight_key}"].clone()',
-                            "    _w_new = _w_old + weight",
-                            f"    _inner_new = hydroforge_weighted_mean(_inner_old, _w_old, {safe_var}_val, weight)",
+                            f'    _inner_old = torch.zeros_like(states["{inner_key}"]) if is_inner_first else states["{inner_key}"].clone()',
+                            f'    _w_old = torch.zeros_like(states["{weight_key}"]) if is_inner_first else states["{weight_key}"].clone()',
+                            f"    _w_new = _w_old + {safe_var}_weight",
+                            f"    _inner_new = hydroforge_weighted_mean(_inner_old, _w_old, {safe_var}_val, {safe_var}_weight)",
                             "    if is_inner_last:",
                             f"        {inner_val} = _inner_new",
                             f'        states["{inner_key}"].zero_()',
@@ -243,8 +269,8 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                 elif inner == "sum":
                     lines.extend(
                         [
-                            f'    _inner_old = states["{inner_key}"].clone()',
-                            f"    _inner_new = _inner_old + {safe_var}_val * weight",
+                            f'    _inner_old = torch.zeros_like(states["{inner_key}"]) if is_inner_first else states["{inner_key}"].clone()',
+                            f"    _inner_new = _inner_old + {safe_var}_val * {safe_var}_weight",
                             "    if is_inner_last:",
                             f"        {inner_val} = _inner_new",
                             f'        states["{inner_key}"].zero_()',
@@ -322,8 +348,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                                 f'            states["{out_key}"].copy_({inner_val})',
                                 "        else:",
                                 "            _count = num_macro_steps.to(dtype="
-                                + inner_val
-                                + ".dtype)",
+                                f'states["{out_key}"].dtype)',
                                 f'            states["{out_key}"].copy_(hydroforge_weighted_mean(states["{out_key}"], _count - 1, {inner_val}, 1))',
                             ]
                         )
@@ -345,12 +370,12 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                         [
                             f'    _old_weight = torch.zeros_like(states["{weight_key}"]) if is_inner_first else states["{weight_key}"].clone()',
                             f'    _old_mean = torch.zeros_like({safe_var}_val) if is_inner_first else states["{out_key}"].clone()',
-                            f"    _new_mean = hydroforge_weighted_mean(_old_mean, _old_weight, {safe_var}_val, weight)",
+                            f"    _new_mean = hydroforge_weighted_mean(_old_mean, _old_weight, {safe_var}_val, {safe_var}_weight)",
                             f'    states["{out_key}"].copy_(_new_mean)',
                             "    if is_inner_last:",
                             f'        states["{weight_key}"].zero_()',
                             "    else:",
-                            f'        states["{weight_key}"].copy_(_old_weight + weight)',
+                            f'        states["{weight_key}"].copy_(_old_weight + {safe_var}_weight)',
                         ]
                     )
                 elif op == "sum":
@@ -358,7 +383,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                         [
                             "    if is_inner_first:",
                             f'        states["{out_key}"].zero_()',
-                            f'    states["{out_key}"].add_({safe_var}_val * weight)',
+                            f'    states["{out_key}"].add_({safe_var}_val * {safe_var}_weight)',
                         ]
                     )
                 elif op in {"max", "min"}:
@@ -481,118 +506,140 @@ class TorchStatisticsEmitter(StatisticsEmitter):
         scatters = self._statistics_ir.ordered_scatters()
         if scatters:
             lines.append("    # Materialize all scatter virtuals in dependency order")
+        main_lines = lines
         for variable in scatters:
             var = variable.name
             scatter = variable.source
             buf_key = f"__scatter_buf_{var}"
-            lines.append(f'    states["{buf_key}"].zero_()')
-            target_size = int(self._storage[buf_key].shape[-1])
-            if target_size == 0:
-                if scatter.reduction.value == "mean":
-                    lines.append(f'    states["__scatter_cnt_{var}"].zero_()')
-                continue
-            emitted: dict[str, str] = {}
-            names = {
-                dependency: self._pytorch_state_expression(dependency, lines, emitted)
-                for dependency in scatter.value.dependencies
-            }
-            expression = self._pytorch_expression(
-                var,
-                scatter.value,
-                names,
+            lines = []
+            self._emit_pytorch_scatter(lines, var, scatter, buf_key)
+            _extend_gated(
+                main_lines,
+                lines,
+                self._statistics_lowering.scatter_phase_mask(var),
             )
-            lines.append(f"    _scatter_val = {expression}")
-            lines.append(f'    _scatter_idx = states["{scatter.index}"].long()')
-            lines.extend(
-                [
-                    f"    _scatter_valid = (_scatter_idx >= 0) & (_scatter_idx < {target_size})",
-                    f"    _scatter_idx = _scatter_idx.clamp(0, {target_size - 1})",
-                    "    _scatter_val = torch.where(_scatter_valid, _scatter_val, 0.0)",
-                ]
-            )
-            if self._statistics_layouts[var].batched:
-                lines.append(
-                    "    _scatter_idx_exp = "
-                    "_scatter_idx.unsqueeze(0).expand_as(_scatter_val)"
-                )
-                lines.append(
-                    f'    states["{buf_key}"].scatter_add_('
-                    "1, _scatter_idx_exp, _scatter_val)"
-                )
-            else:
-                lines.append(
-                    f'    states["{buf_key}"].scatter_add_('
-                    "0, _scatter_idx, _scatter_val)"
-                )
-            if scatter.reduction.value == "mean":
-                cnt_key = f"__scatter_cnt_{var}"
-                lines.extend(
-                    [
-                        f'    states["{cnt_key}"].zero_()',
-                        f'    _scatter_cnt = states["{cnt_key}"]',
-                    ]
-                )
-                lines.append(
-                    "    _scatter_valid_count = _scatter_valid.to(torch.int32).expand_as(_scatter_val)"
-                )
-                if self._statistics_layouts[var].batched:
-                    lines.append(
-                        "    _scatter_cnt.scatter_add_("
-                        "1, _scatter_idx_exp, _scatter_valid_count)"
-                    )
-                else:
-                    lines.append(
-                        "    _scatter_cnt.scatter_add_(0, _scatter_idx, _scatter_valid_count)"
-                    )
-                lines.append(f'    states["{buf_key}"].div_(_scatter_cnt)')
-                lines.append(
-                    f'    states["{buf_key}"].masked_fill_('
-                    '_scatter_cnt == 0, float("nan"))'
-                )
+        lines = main_lines
         if scatters:
             lines.append("")
 
         if full_vars:
-            lines.extend(
+            _extend_gated(
+                lines,
                 [
                     "    _update___full__(states, weight, total_weight, num_macro_steps,",
                     "                     is_inner_first, is_inner_last,",
                     "                     is_outer_first, is_outer_last)",
-                ]
+                ],
+                self._statistics_lowering.group_phase_mask("__full__"),
             )
 
         for output_index, var_list in grouped_by_output_index.items():
             if output_index == "__full__":
                 continue
             safe_output_index = self._get_safe_name(output_index)
-            lines.extend(
+            _extend_gated(
+                lines,
                 [
                     f"    _update_{safe_output_index}(states, weight, total_weight, num_macro_steps,",
                     "                      is_inner_first, is_inner_last,",
                     "                      is_outer_first, is_outer_last,",
                     "                      macro_step_index, ensemble_size)",
-                ]
+                ],
+                self._statistics_lowering.group_phase_mask(output_index),
             )
         lines.extend(
             [
                 "",
-                "# Host dispatcher. Read each control tensor once, outside",
+                "_hydroforge_host_phase = None",
+                "",
+                "# Host dispatcher. Phase flags come from the host when it published",
+                "# them; otherwise each control tensor is read once, outside",
                 "# torch.compile, so exact step/index values do not create guards.",
                 "def internal_update_statistics(states, BLOCK_SIZE):",
-                '    sub_step = int(states["__sub_step"].item())',
-                '    num_sub_steps = int(states["__num_sub_steps"].item())',
-                '    flags = int(states["__flags"].item())',
-                "    is_inner_first = (flags & 1) != 0 and sub_step == 0",
-                "    is_inner_last = (flags & 2) != 0 and sub_step == num_sub_steps - 1",
-                "    is_outer_first = (flags & 4) != 0 and is_inner_last",
-                "    is_outer_last = (flags & 8) != 0 and is_inner_last",
+                "    phase = -1 if _hydroforge_host_phase is None else _hydroforge_host_phase.bits",
+                "    if phase < 0:",
+                '        sub_step = int(states["__sub_step"].item())',
+                '        num_sub_steps = int(states["__num_sub_steps"].item())',
+                '        flags = int(states["__flags"].item())',
+                "        is_inner_last = (flags & 2) != 0 and sub_step == num_sub_steps - 1",
+                "        phase = (",
+                "            ((flags & 1) != 0 and sub_step == 0)",
+                "            | is_inner_last << 1",
+                "            | ((flags & 4) != 0 and is_inner_last) << 2",
+                "            | ((flags & 8) != 0 and is_inner_last) << 3",
+                "        )",
                 "    _compiled_update_statistics(",
-                "        states, BLOCK_SIZE, is_inner_first, is_inner_last,",
-                "        is_outer_first, is_outer_last,",
+                "        states, BLOCK_SIZE, (phase & 1) != 0, (phase & 2) != 0,",
+                "        (phase & 4) != 0, (phase & 8) != 0,",
                 "    )",
                 "",
             ]
         )
+
+    def _emit_pytorch_scatter(self, lines, var, scatter, buf_key) -> None:
+        """Emit one scatter materialization at function-body indentation."""
+        lines.append(f'    states["{buf_key}"].zero_()')
+        target_size = int(self._storage[buf_key].shape[-1])
+        if target_size == 0:
+            if scatter.reduction.value == "mean":
+                lines.append(f'    states["__scatter_cnt_{var}"].zero_()')
+            return
+        emitted: dict[str, str] = {}
+        names = {
+            dependency: self._pytorch_state_expression(dependency, lines, emitted)
+            for dependency in scatter.value.dependencies
+        }
+        expression = self._pytorch_expression(
+            var,
+            scatter.value,
+            names,
+        )
+        lines.append(f"    _scatter_val = {expression}")
+        lines.append(f'    _scatter_idx = states["{scatter.index}"].long()')
+        lines.extend(
+            [
+                f"    _scatter_valid = (_scatter_idx >= 0) & (_scatter_idx < {target_size})",
+                f"    _scatter_idx = _scatter_idx.clamp(0, {target_size - 1})",
+                "    _scatter_val = torch.where(_scatter_valid, _scatter_val, 0.0)",
+            ]
+        )
+        if self._statistics_layouts[var].batched:
+            lines.append(
+                "    _scatter_idx_exp = "
+                "_scatter_idx.unsqueeze(0).expand_as(_scatter_val)"
+            )
+            lines.append(
+                f'    states["{buf_key}"].scatter_add_('
+                "1, _scatter_idx_exp, _scatter_val)"
+            )
+        else:
+            lines.append(
+                f'    states["{buf_key}"].scatter_add_(0, _scatter_idx, _scatter_val)'
+            )
+        if scatter.reduction.value == "mean":
+            cnt_key = f"__scatter_cnt_{var}"
+            lines.extend(
+                [
+                    f'    states["{cnt_key}"].zero_()',
+                    f'    _scatter_cnt = states["{cnt_key}"]',
+                ]
+            )
+            lines.append(
+                "    _scatter_valid_count = _scatter_valid.to(torch.int32).expand_as(_scatter_val)"
+            )
+            if self._statistics_layouts[var].batched:
+                lines.append(
+                    "    _scatter_cnt.scatter_add_("
+                    "1, _scatter_idx_exp, _scatter_valid_count)"
+                )
+            else:
+                lines.append(
+                    "    _scatter_cnt.scatter_add_(0, _scatter_idx, _scatter_valid_count)"
+                )
+            lines.append(f'    states["{buf_key}"].div_(_scatter_cnt)')
+            lines.append(
+                f'    states["{buf_key}"].masked_fill_(_scatter_cnt == 0, float("nan"))'
+            )
 
     def _generate_pytorch_aggregator_function(
         self,
@@ -633,6 +680,10 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                     emitted,
                     indent,
                 )
+                safe_var = self._get_safe_name(var)
+                lines.append(
+                    f"{indent}{safe_var}_weight = {self._variable_weight(var)}"
+                )
 
             # Inner aggregation states (for compound ops)
             # Emit inner aggregation state updates
@@ -655,10 +706,10 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                         lines.extend(
                             [
                                 f"{indent}_isl = {sl}",
-                                f'{indent}_inner_old = states["{inner_key}"][_isl].clone()',
-                                f'{indent}_w_old = states["{weight_key}"][_isl].clone()',
-                                f"{indent}_w_new = _w_old + weight",
-                                f"{indent}_inner_new = hydroforge_weighted_mean(_inner_old, _w_old, {var_val}, weight)",
+                                f'{indent}_inner_old = torch.zeros_like(states["{inner_key}"][_isl]) if is_inner_first else states["{inner_key}"][_isl].clone()',
+                                f'{indent}_w_old = torch.zeros_like(states["{weight_key}"][_isl]) if is_inner_first else states["{weight_key}"][_isl].clone()',
+                                f"{indent}_w_new = _w_old + {safe_var}_weight",
+                                f"{indent}_inner_new = hydroforge_weighted_mean(_inner_old, _w_old, {var_val}, {safe_var}_weight)",
                                 f"{indent}if is_inner_last:",
                                 f'{indent2}states["{inner_key}"][_isl] = 0.0',
                                 f'{indent2}states["{weight_key}"][_isl] = 0.0',
@@ -674,8 +725,8 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                         lines.extend(
                             [
                                 f"{indent}_isl = {sl}",
-                                f'{indent}_inner_old = states["{inner_key}"][_isl].clone()',
-                                f"{indent}_inner_new = _inner_old + {var_val} * weight",
+                                f'{indent}_inner_old = torch.zeros_like(states["{inner_key}"][_isl]) if is_inner_first else states["{inner_key}"][_isl].clone()',
+                                f"{indent}_inner_new = _inner_old + {var_val} * {safe_var}_weight",
                                 f"{indent}if is_inner_last:",
                                 f'{indent2}states["{inner_key}"][_isl] = 0.0',
                                 f"{indent2}{val_for} = _inner_new",
@@ -858,8 +909,8 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                                     f"{indent2}if is_outer_first:",
                                     f'{indent2}    states["{out_key}"][_csl] = {val_var}',
                                     f"{indent2}else:",
-                                    f"{indent2}    _count = num_macro_steps.to(dtype={val_var}.dtype)",
                                     f'{indent2}    _old = states["{out_key}"][_csl].clone()',
+                                    f"{indent2}    _count = num_macro_steps.to(dtype=_old.dtype)",
                                     f'{indent2}    states["{out_key}"][_csl] = hydroforge_weighted_mean(_old, _count - 1, {val_var}, 1)',
                                 ]
                             )
@@ -903,12 +954,12 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                                 f"{indent}else:",
                                 f'{indent2}_old = states["{out_key}"][_sl].clone()',
                                 f'{indent2}_old_weight = states["{weight_key}"][_sl].clone()',
-                                f"{indent}_new = hydroforge_weighted_mean(_old, _old_weight, {var_val}, weight)",
+                                f"{indent}_new = hydroforge_weighted_mean(_old, _old_weight, {var_val}, {safe_var}_weight)",
                                 f'{indent}states["{out_key}"][_sl] = _new',
                                 f"{indent}if is_inner_last:",
                                 f'{indent2}states["{weight_key}"][_sl] = 0.0',
                                 f"{indent}else:",
-                                f'{indent2}states["{weight_key}"][_sl] = _old_weight + weight',
+                                f'{indent2}states["{weight_key}"][_sl] = _old_weight + {safe_var}_weight',
                             ]
                         )
                     elif op == "sum":
@@ -918,7 +969,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                                 f"{indent2}_old = torch.zeros_like({var_val})",
                                 f"{indent}else:",
                                 f'{indent2}_old = states["{out_key}"][_sl].clone()',
-                                f'{indent}states["{out_key}"][_sl] = _old + {var_val} * weight',
+                                f'{indent}states["{out_key}"][_sl] = _old + {var_val} * {safe_var}_weight',
                             ]
                         )
                     elif op in {"max", "min"}:
@@ -964,6 +1015,9 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                 ].variable.actual_shape
                 n_levels = actual_shape[-1]
                 lines.append(f"{indent}n_levels = {n_levels}")
+                lines.append(
+                    f"{indent}{safe_var}_weight = {self._variable_weight(var)}"
+                )
 
                 for operation in self._statistics_lowering.operations(var):
                     op = operation.spelling
@@ -994,12 +1048,12 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                                 f"{indent2}else:",
                                 f'{indent2}    _old = states["{out_key}"][_out_idx]',
                                 f'{indent2}    _old_weight = states["{weight_key}"][_out_idx]',
-                                f"{indent2}_new = hydroforge_weighted_mean(_old, _old_weight, _val, weight)",
+                                f"{indent2}_new = hydroforge_weighted_mean(_old, _old_weight, _val, {safe_var}_weight)",
                                 f'{indent2}states["{out_key}"][_out_idx] = _new',
                                 f"{indent2}if is_inner_last:",
                                 f'{indent2}    states["{weight_key}"][_out_idx] = 0.0',
                                 f"{indent2}else:",
-                                f'{indent2}    states["{weight_key}"][_out_idx] = _old_weight + weight',
+                                f'{indent2}    states["{weight_key}"][_out_idx] = _old_weight + {safe_var}_weight',
                             ]
                         )
                     elif op == "sum":
@@ -1009,7 +1063,7 @@ class TorchStatisticsEmitter(StatisticsEmitter):
                                 f"{indent2}    _old = torch.zeros_like(_val)",
                                 f"{indent2}else:",
                                 f'{indent2}    _old = states["{out_key}"][_out_idx]',
-                                f'{indent2}states["{out_key}"][_out_idx] = _old + _val * weight',
+                                f'{indent2}states["{out_key}"][_out_idx] = _old + _val * {safe_var}_weight',
                             ]
                         )
                     elif op in {"max", "min"}:

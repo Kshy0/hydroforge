@@ -22,6 +22,12 @@ from scipy.sparse import csr_matrix
 
 from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.data.distributed import _find_indices_in_trusted
+from hydroforge.data.mapping.engine import _segment_sums
+from hydroforge.data.mapping.grid import (
+    _axis_bounds,
+    _bounds_are_periodic,
+    _has_duplicates,
+)
 from hydroforge.data.numeric import (
     canonical_floating_array,
     canonical_ids,
@@ -164,7 +170,7 @@ def _canonical_metadata_value(value: Any, *, path: str) -> Any:
 
 
 class _MappingSaveRequest(HydroForgeModel):
-    path: str | Path
+    path: Path = Field(strict=False)
 
 
 class _MappingApplyRequest(HydroForgeModel):
@@ -220,9 +226,9 @@ class LocalMapping(HydroForgeModel):
             self.source_indices,
             label="source_indices",
         )
-        if np.unique(target_ids).size != target_ids.size:
+        if _has_duplicates(target_ids):
             raise ValueError("target_ids must be unique")
-        if np.unique(source_indices).size != source_indices.size:
+        if _has_duplicates(source_indices):
             raise ValueError("source_indices must be unique")
         if source_indices.size and np.any(source_indices < 0):
             raise ValueError("source_indices must be nonnegative")
@@ -387,7 +393,7 @@ class MappingTable(HydroForgeModel):
             raise ValueError("mapping target_ids must be one-dimensional")
         if self.target_ids.dtype != np.dtype(np.int64):
             raise ValueError("mapping target_ids must use exact int64 dtype")
-        if np.unique(self.target_ids).size != self.target_ids.size:
+        if _has_duplicates(self.target_ids):
             raise ValueError("mapping target_ids must be unique")
         _validate_csr_components(
             self.matrix.data,
@@ -397,7 +403,9 @@ class MappingTable(HydroForgeModel):
         )
         if self.matrix.dtype != np.dtype(np.float32):
             raise ValueError("mapping matrix must use exact float32 dtype")
-        matrix = self.matrix.copy()
+        # A fresh shell recomputes the canonical-format flag without copying
+        # storage; freezing below takes the only owned copy.
+        matrix = csr_matrix(self.matrix, copy=False)
         if not matrix.has_canonical_format:
             raise ValueError("mapping matrix must use canonical CSR storage")
         if not np.isfinite(self.matrix.data).all():
@@ -420,8 +428,7 @@ class MappingTable(HydroForgeModel):
         ):
             raise ValueError("mapping source coordinates must be finite")
         if (
-            np.unique(self.source_x).size != self.source_x.size
-            or np.unique(self.source_y).size != self.source_y.size
+            _has_duplicates(self.source_x) or _has_duplicates(self.source_y)
         ):
             raise ValueError("mapping source coordinates must be unique")
         expected_shape = (
@@ -523,63 +530,58 @@ class MappingTable(HydroForgeModel):
         periodic_x: bool,
     ) -> int | None:
         """Find the nearest valid source cell in index space."""
+        nearest = MappingTable._nearest_valid_cols(
+            valid_grid,
+            np.array([start_y], dtype=np.int64),
+            np.array([start_x], dtype=np.int64),
+            periodic_x,
+        )
+        return None if nearest is None else int(nearest[0])
+
+    @staticmethod
+    def _nearest_valid_cols(
+        valid_grid: np.ndarray,
+        start_y: np.ndarray,
+        start_x: np.ndarray,
+        periodic_x: bool,
+    ) -> np.ndarray | None:
+        """Nearest valid source cell (Euclidean, index space) of every start.
+
+        One exact Euclidean distance transform serves all starts; equidistant
+        candidates are resolved by the transform. A periodic x axis is wrapped
+        by padding half a period of columns on each side.
+        """
         ny, nx = valid_grid.shape
-        if periodic_x:
-            start_x %= nx
-        if valid_grid[start_y, start_x]:
-            return start_y * nx + start_x
         if not np.any(valid_grid):
             return None
+        start_x = np.mod(start_x, nx) if periodic_x else start_x
+        pad = min(nx, nx // 2 + 1) if periodic_x else 0
+        grid = (
+            np.concatenate((valid_grid[:, nx - pad :], valid_grid, valid_grid[:, :pad]), axis=1)
+            if pad
+            else valid_grid
+        )
+        from scipy.ndimage import distance_transform_edt
 
-        best_col = None
-        best_distance = None
-        max_radius = max(ny, nx)
-        for radius in range(1, max_radius + 1):
-            cand_y: list[np.ndarray] = []
-            cand_x: list[np.ndarray] = []
+        nearest = distance_transform_edt(
+            ~grid, return_distances=False, return_indices=True
+        )
+        near_y = nearest[0][start_y, start_x + pad].astype(np.int64)
+        near_x = (nearest[1][start_y, start_x + pad].astype(np.int64) - pad) % nx
+        return near_y * nx + near_x
 
-            x_range = np.arange(start_x - radius, start_x + radius + 1, dtype=np.int64)
-            if periodic_x:
-                x_idx = np.mod(x_range, nx)
-            else:
-                x_idx = x_range[(x_range >= 0) & (x_range < nx)]
-
-            for y in (start_y - radius, start_y + radius):
-                if 0 <= y < ny and x_idx.size:
-                    hit = valid_grid[y, x_idx]
-                    if np.any(hit):
-                        cand_y.append(np.full(int(hit.sum()), y, dtype=np.int64))
-                        cand_x.append(x_idx[hit])
-
-            y_inner = np.arange(
-                max(0, start_y - radius + 1),
-                min(ny, start_y + radius),
-                dtype=np.int64,
-            )
-            for x in (start_x - radius, start_x + radius):
-                if y_inner.size and (periodic_x or 0 <= x < nx):
-                    x_mod = int(x % nx) if periodic_x else int(x)
-                    hit = valid_grid[y_inner, x_mod]
-                    if np.any(hit):
-                        cand_y.append(y_inner[hit])
-                        cand_x.append(np.full(int(hit.sum()), x_mod, dtype=np.int64))
-
-            if cand_y:
-                ys = np.concatenate(cand_y)
-                xs = np.concatenate(cand_x)
-                dy = ys - start_y
-                dx = np.abs(xs - start_x)
-                if periodic_x:
-                    dx = np.minimum(dx, nx - dx)
-                distances = dy * dy + dx * dx
-                best = int(np.argmin(distances))
-                distance = int(distances[best])
-                if best_distance is None or distance < best_distance:
-                    best_distance = distance
-                    best_col = int(ys[best] * nx + xs[best])
-            if best_distance is not None and best_distance <= (radius + 1) ** 2:
-                return best_col
-        return best_col
+    def _source_periodic_x(self) -> bool:
+        """Whether the source longitude axis wraps, from its bound span."""
+        recorded = self.metadata.get("source_periodic_x")
+        if type(recorded) is bool:
+            return recorded
+        # Archives written before the flag existed: infer bounds from centers
+        # exactly as RegularGrid does for a grid without explicit bounds.
+        if self.metadata.get("source_is_geographic") is not True:
+            return False
+        if self.source_x.size < 2:
+            return False
+        return _bounds_are_periodic(_axis_bounds(self.source_x))
 
     @staticmethod
     def _weighted_center_index(
@@ -606,6 +608,54 @@ class MappingTable(HydroForgeModel):
             x0 = int(np.round(x_angle / (2.0 * np.pi) * nx)) % nx
         else:
             x0 = int(np.round(float(np.average(xs, weights=weights))))
+        return y0, x0
+
+    @classmethod
+    def _weighted_center_indices(
+        cls,
+        matrix: csr_matrix,
+        rows: np.ndarray,
+        nx: int,
+        periodic_x: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorised :meth:`_weighted_center_index` for non-empty CSR rows.
+
+        Weighted sums use the pairwise order of ``np.average`` on each row.
+        """
+        starts = matrix.indptr[rows]
+        lengths = matrix.indptr[rows + 1] - starts
+        entries = (
+            np.repeat(starts - (np.cumsum(lengths) - lengths), lengths)
+            + np.arange(int(lengths.sum()), dtype=np.int64)
+        )
+        cols = matrix.indices[entries].astype(np.int64)
+        weights = matrix.data[entries].astype(np.float64, copy=False)
+        offsets = np.cumsum(lengths) - lengths
+        ys = (cols // nx).astype(np.float64)
+        weight_sums = _segment_sums(weights, offsets, lengths)
+        y0 = np.round(_segment_sums(ys * weights, offsets, lengths) / weight_sums)
+        if periodic_x:
+            angles = 2.0 * np.pi * ((cols % nx).astype(np.float64) / float(nx))
+            sin_mean = _segment_sums(np.sin(angles) * weights, offsets, lengths)
+            cos_mean = _segment_sums(np.cos(angles) * weights, offsets, lengths)
+            x_angle = np.arctan2(sin_mean / weight_sums, cos_mean / weight_sums)
+            x_angle = np.where(x_angle < 0.0, x_angle + 2.0 * np.pi, x_angle)
+            x0 = np.round(x_angle / (2.0 * np.pi) * nx).astype(np.int64) % nx
+        else:
+            x0 = np.round(
+                _segment_sums((cols % nx).astype(np.float64) * weights, offsets, lengths)
+                / weight_sums
+            ).astype(np.int64)
+        y0 = y0.astype(np.int64)
+        # Rows without positive weight keep the scalar helper's mean fallback.
+        for index in np.flatnonzero(~(weight_sums > 0.0)):
+            start = starts[index]
+            y0[index], x0[index] = cls._weighted_center_index(
+                matrix.indices[start : start + lengths[index]].astype(np.int64),
+                matrix.data[start : start + lengths[index]],
+                nx,
+                periodic_x,
+            )
         return y0, x0
 
     def _with_source_mask_trusted(
@@ -655,52 +705,26 @@ class MappingTable(HydroForgeModel):
         if empty_row_policy == "nearest" and empty_rows.size:
             ny, nx = self._source_shape
             valid_grid = valid.reshape(ny, nx)
-            dx = (
-                abs(float(self.source_x[1] - self.source_x[0]))
-                if self.source_x.size > 1
-                else 0.0
-            )
-            longitude_span = (
-                abs(float(self.source_x[-1] - self.source_x[0]))
-                * self.source_x.size
-                / (self.source_x.size - 1)
-                if self.source_x.size > 1
-                else 0.0
-            )
-            periodic_x = bool(
-                self.metadata.get("source_is_geographic") is True
-                and dx > 0.0
-                and np.isclose(
-                    longitude_span,
-                    360.0,
-                    rtol=0.0,
-                    atol=2.0e-5,
-                )
-            )
+            periodic_x = self._source_periodic_x()
 
             repair_row: list[int] = []
             repair_col: list[int] = []
             repair_val: list[float] = []
-            for row in empty_rows:
-                start, end = original.indptr[row], original.indptr[row + 1]
-                cols = original.indices[start:end]
-                weights = original.data[start:end]
-                if cols.size == 0:
-                    continue
-                y0, x0 = self._weighted_center_index(
-                    cols.astype(np.int64),
-                    weights,
-                    nx,
-                    periodic_x,
+            lengths = np.diff(original.indptr)[empty_rows]
+            candidates = empty_rows[lengths > 0]
+            if candidates.size:
+                y0, x0 = self._weighted_center_indices(
+                    original, candidates, nx, periodic_x
                 )
-                nearest_col = self._nearest_valid_col(valid_grid, y0, x0, periodic_x)
-                if nearest_col is None:
-                    continue
-                repair_row.append(int(row))
-                repair_col.append(int(nearest_col))
-                repair_val.append(
-                    float(original_row_sums[row] if preserve_row_sum else 1.0)
-                )
+                nearest = self._nearest_valid_cols(valid_grid, y0, x0, periodic_x)
+                if nearest is not None:
+                    repair_row = candidates.tolist()
+                    repair_col = nearest.tolist()
+                    repair_val = (
+                        original_row_sums[candidates]
+                        if preserve_row_sum
+                        else np.ones(candidates.size)
+                    ).tolist()
 
             if repair_row:
                 repair = csr_matrix(

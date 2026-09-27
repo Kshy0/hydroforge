@@ -10,13 +10,15 @@ from __future__ import annotations
 from math import prod
 
 from hydroforge.statistics.emitters.common import StatisticsEmitter
-from hydroforge.statistics.ir import (
+from hydroforge.statistics.emitters.expression import (
     ExpressionDialect,
+    render_expression,
+)
+from hydroforge.statistics.ir import (
     ExpressionSource,
     ScatterSource,
     StatisticsIR,
     TensorSource,
-    render_expression,
 )
 
 _FULL_OUTPUT_GROUP = "__full__"
@@ -34,6 +36,33 @@ _CONTROL_SCALARS = (
     ("__hf_flags", "int", "__flags"),
     ("__hf_macro_step_index", "long", "__macro_step_index"),
 )
+
+
+_GATE_FIELDS = (
+    ("device const int*", "p_hf_sub_step", False),
+    ("device const int*", "p_hf_num_sub_steps", False),
+    ("device const int*", "p_hf_flags", False),
+)
+_GATE_ORDER = (
+    ("tensor", "__sub_step", "read"),
+    ("tensor", "__num_sub_steps", "read"),
+    ("tensor", "__flags", "read"),
+)
+
+
+def _device_gate(mask: int | None) -> list[str]:
+    """Return early from a pre-kernel whose consumers skip this sample."""
+    if mask is None:
+        return []
+    terms = []
+    if mask & 1:
+        terms.append("((p_hf_flags[0] & 1) != 0 && p_hf_sub_step[0] == 0)")
+    if mask & 2:
+        terms.append(
+            "(((p_hf_flags[0] >> 1) & 1) != 0 && "
+            "p_hf_sub_step[0] == p_hf_num_sub_steps[0] - 1)"
+        )
+    return [f"    if (!({' || '.join(terms) or 'false'})) return;"]
 
 
 def _emit_argument_kernel_start(
@@ -251,6 +280,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
         return {
             "kernel_name": kernel_name,
             "output_index": output_index,
+            "mask": self._statistics_lowering.group_phase_mask(output_index),
             "full_output": True,
             "n_elements_val": full_total,
             "arg_order": arg_order,
@@ -373,6 +403,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
         return {
             "kernel_name": kernel_name,
             "output_index": output_index,
+            "mask": self._statistics_lowering.group_phase_mask(output_index),
             "arg_order": arg_order,
         }
 
@@ -398,6 +429,10 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             )
             total_target = target_size * ensemble_size
             total_source = source_size * ensemble_size
+            mask = self._statistics_lowering.scatter_phase_mask(name)
+            gate_fields = list(_GATE_FIELDS) if mask is not None else []
+            gate_order = list(_GATE_ORDER) if mask is not None else []
+            gate = _device_gate(mask)
 
             zero_name = f"aggr_scatter_zero_{safe}"
             zero_fields = [("device float*", "p_buf", False)]
@@ -405,11 +440,12 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             if cnt_key is not None:
                 zero_fields.append(("device int*", "p_cnt", False))
                 zero_order.append(("tensor", cnt_key, "write"))
-            zero_fields.append(("long", "total", True))
-            zero_order.append(("scalar", "total", total_target))
+            zero_fields.extend([*gate_fields, ("long", "total", True)])
+            zero_order.extend([*gate_order, ("scalar", "total", total_target)])
             _emit_argument_kernel_start(msl_lines, zero_name, zero_fields)
             msl_lines.extend(
                 [
+                    *gate,
                     "    if ((long)tid >= total) return;",
                     "    p_buf[tid] = 0.0f;",
                 ]
@@ -422,6 +458,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     "kernel_name": zero_name,
                     "arg_order": zero_order,
                     "grid_size": total_target,
+                    "mask": mask,
                 }
             )
 
@@ -451,6 +488,8 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 add_fields.append((f"device const {ctype}*", f"p_{key_safe}", False))
                 add_order.append(("tensor", key, "read"))
                 strides[key] = self._source_stride(key)
+            add_fields.extend(gate_fields)
+            add_order.extend(gate_order)
             for scalar, value in (
                 ("source_size", source_size),
                 ("target_size", target_size),
@@ -461,6 +500,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             _emit_argument_kernel_start(msl_lines, add_name, add_fields)
             msl_lines.extend(
                 [
+                    *gate,
                     "    if ((long)tid >= total) return;",
                     "    long t = (long)tid / source_size;",
                     "    long src = (long)tid - t * source_size;",
@@ -529,6 +569,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                     "kernel_name": add_name,
                     "arg_order": add_order,
                     "grid_size": total_source,
+                    "mask": mask,
                 }
             )
 
@@ -537,16 +578,19 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                 divide_fields = [
                     ("device float*", "p_buf", False),
                     ("device const int*", "p_cnt", False),
+                    *gate_fields,
                     ("long", "total", True),
                 ]
                 divide_order = [
                     ("tensor", buf_key, "read_write"),
                     ("tensor", cnt_key, "read"),
+                    *gate_order,
                     ("scalar", "total", total_target),
                 ]
                 _emit_argument_kernel_start(msl_lines, divide_name, divide_fields)
                 msl_lines.extend(
                     [
+                        *gate,
                         "    if ((long)tid >= total) return;",
                         "    float count = float(p_cnt[tid]);",
                         "    p_buf[tid] = count > 0.0f ? p_buf[tid] / count : hydroforge_nan();",
@@ -559,6 +603,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                         "kernel_name": divide_name,
                         "arg_order": divide_order,
                         "grid_size": total_target,
+                        "mask": mask,
                     }
                 )
         return metas
@@ -597,9 +642,14 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             "    if (hydroforge_isnan(right)) return left;",
             "    return min(left, right);",
             "}",
+            "// Incremental form bounds FP32 drift; non-finite results keep the",
+            "// blended form's infinity/NaN propagation (bit test survives fast math).",
             "inline float hydroforge_weighted_mean(float old_value, float old_weight, float value, float weight) {",
             "    float new_weight = old_weight + weight;",
-            "    return old_value * (old_weight / new_weight) + value * (weight / new_weight);",
+            "    float ratio = weight / new_weight;",
+            "    float incremental = old_value + (value - old_value) * ratio;",
+            "    if ((as_type<uint>(incremental) & 0x7f800000u) != 0x7f800000u) return incremental;",
+            "    return old_value * (old_weight / new_weight) + value * ratio;",
             "}",
             "inline int hydroforge_maximum(int left, int right) { return max(left, right); }",
             "inline int hydroforge_minimum(int left, int right) { return min(left, right); }",
@@ -657,13 +707,20 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             )
 
         # Build the Python wrapper
-        def _make_wrapper(compiled, scatters, metas):
+        def _make_wrapper(compiled, scatters, metas, host_phase):
             from hydroforge.kernels.backends.metal.online import (
                 launch_metal_dispatcher,
             )
 
+            def skipped(meta, phase):
+                mask = meta["mask"]
+                return mask is not None and phase >= 0 and not phase & mask
+
             def internal_update_statistics(states, BLOCK_SIZE):
+                phase = -1 if host_phase is None else host_phase.bits
                 for meta in scatters:
+                    if skipped(meta, phase):
+                        continue
                     dispatcher = compiled[meta["kernel_name"]]
                     args = [
                         states[rest[0]] if kind == "tensor" else rest[1]
@@ -678,6 +735,8 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                         },
                     )
                 for meta in metas:
+                    if skipped(meta, phase):
+                        continue
                     dispatcher = compiled[meta["kernel_name"]]
                     si = meta["output_index"]
                     if meta.get("full_output"):
@@ -715,6 +774,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
             dispatchers,
             scatter_metas,
             group_metas,
+            self._host_phase,
         )
 
         # Save for debugging
@@ -761,8 +821,8 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             [
                                 f"{indent}{ctype} {val_for} = ({ctype})0;",
                                 f"{indent}{{",
-                                f"{indent}    {ctype} inner_old = p_{safe_var}_mean_inner_state[{out_idx}];",
-                                f"{indent}    {ctype} w_old = p_{safe_var}_mean_weight_state[{out_idx}];",
+                                f"{indent}    {ctype} inner_old = is_inner_first ? ({ctype})0 : p_{safe_var}_mean_inner_state[{out_idx}];",
+                                f"{indent}    {ctype} w_old = is_inner_first ? ({ctype})0 : p_{safe_var}_mean_weight_state[{out_idx}];",
                                 f"{indent}    {ctype} w_new = w_old + ({ctype})weight;",
                                 f"{indent}    {ctype} inner_new = hydroforge_weighted_mean(inner_old, w_old, {var_val}, ({ctype})weight);",
                                 f"{indent}    if (is_inner_last) {{",
@@ -781,7 +841,7 @@ class MetalStatisticsEmitter(StatisticsEmitter):
                             [
                                 f"{indent}{ctype} {val_for} = ({ctype})0;",
                                 f"{indent}{{",
-                                f"{indent}    {ctype} inner_old = p_{safe_var}_sum_inner_state[{out_idx}];",
+                                f"{indent}    {ctype} inner_old = is_inner_first ? ({ctype})0 : p_{safe_var}_sum_inner_state[{out_idx}];",
                                 f"{indent}    {ctype} inner_new = inner_old + {var_val} * ({ctype})weight;",
                                 f"{indent}    if (is_inner_last) {{",
                                 f"{indent}        p_{safe_var}_sum_inner_state[{out_idx}] = ({ctype})0;",

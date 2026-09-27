@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from typing import TYPE_CHECKING, Any
 
 from pydantic import PrivateAttr, model_validator
@@ -12,9 +12,6 @@ from hydroforge.execution.program import _close_program_resources
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
-
-
-_MISSING = object()
 
 
 class _OuterScopeRequest(HydroForgeModel):
@@ -73,23 +70,32 @@ class _OnceScope:
         self.key = key
 
     def __iter__(self) -> Iterator[None]:
-        from hydroforge.execution.operators import record_operator_scope
+        from hydroforge.execution.substeps import _cached_program
 
-        execution = self.runtime.model._execution
         step = self.runtime.step
         step.begin_outer_scope_execution()
-        programs = execution.programs
-        program = programs.get(self.key, _MISSING)
-        if program is _MISSING:
-            with record_operator_scope(
-                self.runtime.model,
-                scope_kind="outer",
-            ) as recording:
-                yield None
-            program = _OuterProgram(self.runtime.model, recording.program)
-            programs[self.key] = program
+        program = yield from _cached_program(
+            self.runtime.model._execution,
+            self.key,
+            (step.time_step, step.requested_sub_steps),
+            self._record,
+        )
         program.launch()
         step.complete_outer_scope_execution()
+
+    def _record(self) -> Generator[None, None, Any]:
+        from hydroforge.execution.operators import record_operator_scope
+        from hydroforge.execution.substeps import _Recorded
+
+        model = self.runtime.model
+        with record_operator_scope(model, scope_kind="outer") as recording:
+            yield None
+        program = recording.program
+        return _Recorded(
+            (program.fingerprint({}),),
+            (program,),
+            lambda: _OuterProgram(model, program),
+        )
 
 
 class OuterRuntime:

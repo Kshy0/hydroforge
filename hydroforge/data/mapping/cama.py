@@ -13,10 +13,13 @@ each catchment is composed of, returning plain numpy arrays:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
 from hydroforge.data.distributed import binread, read_map
+from hydroforge.data.mapping.engine import _EARTH_RADIUS_M
+from hydroforge.data.mapping.grid import RegularGrid
 
 
 def _binary_precision(
@@ -211,47 +214,71 @@ def read_cama_catchments(
     return catchment_id, nx, ny, nextxy_data
 
 
-def read_cama_hires_pixels(
-    map_dir: str | Path,
+class _HiresTilePixels(NamedTuple):
+    """Valid pixels of one tile; pixel ``k`` sits at
+    ``(lon[x_index[k]], lat[y_index[k]])``."""
+
+    catchment_id: np.ndarray
+    area: np.ndarray
+    lon: np.ndarray
+    lat: np.ndarray
+    x_index: np.ndarray
+    y_index: np.ndarray
+
+
+def _lowres_cell_areas(
+    map_dir: Path,
+    nx: int,
+    ny: int,
+    x_idx: np.ndarray,
+    y_idx: np.ndarray,
+    *,
+    north: float,
+    csize: float,
+    map_precision: str,
+) -> np.ndarray:
+    """Area in m^2 represented by each active CaMa cell.
+
+    ``ctmare.bin`` (unit-catchment area, what CaMa-Flood itself uses to turn
+    runoff depth into volume) matches the hires path, whose rows sum the
+    hires pixel areas of each catchment.  Without it, the spherical area of
+    the low-resolution cell is the closest geometric equivalent.
+    """
+
+    catchment_area_path = map_dir / "ctmare.bin"
+    if catchment_area_path.exists():
+        areas = np.asarray(
+            read_map(catchment_area_path, (nx, ny), precision=map_precision),
+            dtype=np.float64,
+        )[x_idx, y_idx]
+        if not np.all(np.isfinite(areas) & (areas > 0.0)):
+            raise ValueError(
+                "ctmare.bin must hold finite positive unit-catchment areas "
+                "(m^2) for every active CaMa cell"
+            )
+        return areas
+    edges = np.clip(north - np.arange(ny + 1, dtype=np.float64) * csize, -90.0, 90.0)
+    row_area = (
+        _EARTH_RADIUS_M
+        * _EARTH_RADIUS_M
+        * np.radians(csize)
+        * (np.sin(np.radians(edges[:-1])) - np.sin(np.radians(edges[1:])))
+    )
+    return row_area[y_idx]
+
+
+def _cama_hires_tiles(
+    map_dir: Path,
     nx: int,
     ny: int,
     nextxy_data: np.ndarray,
     *,
-    hires_tag: str | None = "1min",
-    mapinfo_txt: str = "location.txt",
-    hires_idx_precision: str = "<i2",
-    map_precision: str = "<f4",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Decode the high-resolution pixels backing each catchment.
-
-    Returns ``(catchment_id_hires, areas, lon, lat)`` with one entry per valid
-    high-resolution pixel: the linear catchment id it belongs to (on the
-    ``(nx, ny)`` grid), its area in m^2, and its center coordinates.
-
-    When ``hires_tag`` is ``None`` the CaMa grid itself is used as a uniform
-    "hires" grid (each active cell maps to itself with unit area).
-    """
-    _binary_precision(
-        hires_idx_precision,
-        label="hires_idx_precision",
-        kinds=frozenset({"i"}),
-    )
-    _binary_precision(
-        map_precision,
-        label="map_precision",
-        kinds=frozenset({"f"}),
-    )
-    if type(nx) is not int or nx < 1 or type(ny) is not int or ny < 1:
-        raise ValueError("CaMa grid dimensions must be positive exact integers")
-    if np.ma.isMaskedArray(nextxy_data) and np.any(np.ma.getmaskarray(nextxy_data)):
-        raise ValueError("nextxy_data contains missing values")
-    nextxy_data = np.asarray(nextxy_data)
-    if nextxy_data.shape != (nx, ny, 2):
-        raise ValueError(
-            f"nextxy_data must have shape ({nx}, {ny}, 2), got {nextxy_data.shape}"
-        )
-    _validate_nextxy(nextxy_data)
-    map_dir = Path(map_dir)
+    hires_tag: str | None,
+    mapinfo_txt: str,
+    hires_idx_precision: str,
+    map_precision: str,
+) -> list[_HiresTilePixels]:
+    """Decode every tile's valid pixels with per-axis coordinates."""
 
     if hires_tag is None:
         # Use the actual regional CaMa grid as a uniform hires grid.
@@ -264,8 +291,19 @@ def read_cama_hires_pixels(
         hires_lat = north - (np.arange(ny, dtype=np.float64) + 0.5) * csize
         x_idx, y_idx = np.where(nextxy_data[:, :, 0] != -9999)
         catchment_id_hires = np.ravel_multi_index((x_idx, y_idx), (nx, ny))
-        areas = np.ones(len(x_idx), dtype=np.float64)
-        return catchment_id_hires, areas, hires_lon[x_idx], hires_lat[y_idx]
+        areas = _lowres_cell_areas(
+            map_dir,
+            nx,
+            ny,
+            x_idx,
+            y_idx,
+            north=north,
+            csize=csize,
+            map_precision=map_precision,
+        )
+        return [
+            _HiresTilePixels(catchment_id_hires, areas, hires_lon, hires_lat, x_idx, y_idx)
+        ]
 
     hires_map_dir = map_dir / hires_tag
     with open(hires_map_dir / mapinfo_txt) as f:
@@ -312,12 +350,16 @@ def read_cama_hires_pixels(
             label=f"{tile_name}.catmxy.bin",
         )
         catchment_id_hires = np.ravel_multi_index((catm_x, catm_y), (nx, ny))
-        return (
-            catchment_id_hires,
-            grid_area[x_idx, y_idx],
-            hires_lon[x_idx],
-            hires_lat[y_idx],
-        )
+        return [
+            _HiresTilePixels(
+                catchment_id_hires,
+                grid_area[x_idx, y_idx],
+                hires_lon,
+                hires_lat,
+                x_idx,
+                y_idx,
+            )
+        ]
 
     # --- Multi-tile hires map (catmxy stores global indices) ---
     gsize, reg_west, reg_east, reg_south, reg_north = _read_region_parameters(
@@ -339,10 +381,7 @@ def read_cama_hires_pixels(
     if not np.isfinite(csize) or csize <= 0.0:
         raise ValueError("hires tile spacing must be finite and positive")
 
-    all_ids: list[np.ndarray] = []
-    all_areas: list[np.ndarray] = []
-    all_lon: list[np.ndarray] = []
-    all_lat: list[np.ndarray] = []
+    tiles: list[_HiresTilePixels] = []
     occupied_tiles: list[tuple[str, int, int, int, int]] = []
 
     for i in range(narea):
@@ -459,21 +498,165 @@ def read_cama_hires_pixels(
             label=f"{tile_name}.catmxy.bin",
         )
 
-        all_ids.append(np.ravel_multi_index((vx_r, vy_r), (nx, ny)))
-        all_areas.append(sub_grdare[xi_r, yi_r])
-        all_lon.append(sub_lon[xi_r])
-        all_lat.append(sub_lat[yi_r])
+        tiles.append(
+            _HiresTilePixels(
+                np.ravel_multi_index((vx_r, vy_r), (nx, ny)),
+                sub_grdare[xi_r, yi_r],
+                sub_lon,
+                sub_lat,
+                xi_r,
+                yi_r,
+            )
+        )
+    return tiles
 
-    if not all_ids:
+
+def _validate_hires_request(
+    nx: int,
+    ny: int,
+    nextxy_data: np.ndarray,
+    *,
+    hires_idx_precision: str,
+    map_precision: str,
+) -> np.ndarray:
+    _binary_precision(
+        hires_idx_precision,
+        label="hires_idx_precision",
+        kinds=frozenset({"i"}),
+    )
+    _binary_precision(
+        map_precision,
+        label="map_precision",
+        kinds=frozenset({"f"}),
+    )
+    if type(nx) is not int or nx < 1 or type(ny) is not int or ny < 1:
+        raise ValueError("CaMa grid dimensions must be positive exact integers")
+    if np.ma.isMaskedArray(nextxy_data) and np.any(np.ma.getmaskarray(nextxy_data)):
+        raise ValueError("nextxy_data contains missing values")
+    nextxy_data = np.asarray(nextxy_data)
+    if nextxy_data.shape != (nx, ny, 2):
+        raise ValueError(
+            f"nextxy_data must have shape ({nx}, {ny}, 2), got {nextxy_data.shape}"
+        )
+    _validate_nextxy(nextxy_data)
+    return nextxy_data
+
+
+def read_cama_hires_pixels(
+    map_dir: str | Path,
+    nx: int,
+    ny: int,
+    nextxy_data: np.ndarray,
+    *,
+    hires_tag: str | None = "1min",
+    mapinfo_txt: str = "location.txt",
+    hires_idx_precision: str = "<i2",
+    map_precision: str = "<f4",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Decode the high-resolution pixels backing each catchment.
+
+    Returns ``(catchment_id_hires, areas, lon, lat)`` with one entry per valid
+    high-resolution pixel: the linear catchment id it belongs to (on the
+    ``(nx, ny)`` grid), its area in m^2, and its center coordinates.
+
+    When ``hires_tag`` is ``None`` the CaMa grid itself is used as the
+    "hires" grid: each active cell is one pixel at its cell center whose area
+    is the unit-catchment area from ``ctmare.bin`` when present, otherwise the
+    spherical area of the low-resolution cell (both in m^2, like hires areas).
+    """
+    nextxy_data = _validate_hires_request(
+        nx,
+        ny,
+        nextxy_data,
+        hires_idx_precision=hires_idx_precision,
+        map_precision=map_precision,
+    )
+    tiles = _cama_hires_tiles(
+        Path(map_dir),
+        nx,
+        ny,
+        nextxy_data,
+        hires_tag=hires_tag,
+        mapinfo_txt=mapinfo_txt,
+        hires_idx_precision=hires_idx_precision,
+        map_precision=map_precision,
+    )
+    if not tiles:
         return (
             np.empty(0, dtype=np.int64),
             np.empty(0, dtype=np.float64),
             np.empty(0, dtype=np.float64),
             np.empty(0, dtype=np.float64),
         )
+    if len(tiles) == 1:
+        tile = tiles[0]
+        return (
+            tile.catchment_id,
+            tile.area,
+            tile.lon[tile.x_index],
+            tile.lat[tile.y_index],
+        )
     return (
-        np.concatenate(all_ids),
-        np.concatenate(all_areas),
-        np.concatenate(all_lon),
-        np.concatenate(all_lat),
+        np.concatenate([tile.catchment_id for tile in tiles]),
+        np.concatenate([tile.area for tile in tiles]),
+        np.concatenate([tile.lon[tile.x_index] for tile in tiles]),
+        np.concatenate([tile.lat[tile.y_index] for tile in tiles]),
     )
+
+
+def _read_cama_hires_source_cells(
+    map_dir: str | Path,
+    nx: int,
+    ny: int,
+    nextxy_data: np.ndarray,
+    source: RegularGrid,
+    *,
+    allow_oob: bool,
+    hires_tag: str | None = "1min",
+    mapinfo_txt: str = "location.txt",
+    hires_idx_precision: str = "<i2",
+    map_precision: str = "<f4",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Decode hires pixels directly into flattened ``source`` cell indices.
+
+    Equivalent to ``source`` point lookup of :func:`read_cama_hires_pixels`
+    coordinates, but each tile's longitude and latitude axes are looked up
+    once and gathered per pixel, so no per-pixel coordinates are built.
+    Returns ``(catchment_id_hires, areas, source_index)`` with ``-1`` for
+    pixels outside the source grid (rejected unless ``allow_oob``).
+    """
+    nextxy_data = _validate_hires_request(
+        nx,
+        ny,
+        nextxy_data,
+        hires_idx_precision=hires_idx_precision,
+        map_precision=map_precision,
+    )
+    tiles = _cama_hires_tiles(
+        Path(map_dir),
+        nx,
+        ny,
+        nextxy_data,
+        hires_tag=hires_tag,
+        mapinfo_txt=mapinfo_txt,
+        hires_idx_precision=hires_idx_precision,
+        map_precision=map_precision,
+    )
+    source_nx = source.x.size
+    ids: list[np.ndarray] = [np.empty(0, dtype=np.int64)]
+    areas: list[np.ndarray] = [np.empty(0, dtype=np.float64)]
+    cells: list[np.ndarray] = [np.empty(0, dtype=np.int64)]
+    for tile in tiles:
+        ix = source._x_indices_trusted(tile.lon)[tile.x_index]
+        iy = source._y_indices_trusted(tile.lat)[tile.y_index]
+        cells.append(np.where((ix >= 0) & (iy >= 0), iy * source_nx + ix, -1))
+        ids.append(tile.catchment_id.astype(np.int64, copy=False))
+        areas.append(tile.area)
+    source_index = np.concatenate(cells)
+    if not allow_oob:
+        bad = int(np.count_nonzero(source_index < 0))
+        if bad:
+            raise ValueError(
+                f"{bad}/{source_index.size} points fall outside the source grid"
+            )
+    return np.concatenate(ids), np.concatenate(areas), source_index

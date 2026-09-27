@@ -1,9 +1,10 @@
-"""Initialization-only tensor compilation for one physics module."""
+"""Module tensor materialization and scoped parameter dependency observation."""
 
 from __future__ import annotations
 
 import inspect
 from collections.abc import Mapping
+from contextvars import ContextVar
 from numbers import Integral
 from typing import Any, get_args
 
@@ -13,6 +14,12 @@ from pydantic_core import PydanticUndefined
 from hydroforge.contracts.fields import (
     concrete_tensor_dtype,
 )
+
+# Enabled only while discovering parameter dependencies. Keys identify declared
+# fields, so helper/method/scalar accesses never become graph nodes.
+_PARAMETER_TENSOR_READS: ContextVar[
+    tuple[dict[tuple[int, str], str], set[str]] | None
+] = ContextVar("hydroforge_parameter_tensor_reads", default=None)
 
 
 def copy_tensor_inputs(

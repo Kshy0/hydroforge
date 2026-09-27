@@ -10,6 +10,29 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
+def fsync_file(path: str | Path) -> None:
+    """Flush one closed or externally written file's data to stable storage."""
+
+    # Windows _commit requires a writable file descriptor.
+    descriptor = os.open(path, os.O_RDWR if os.name == "nt" else os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def fsync_directory(path: str | Path) -> None:
+    """Make directory entries durable where Python can open directories."""
+
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 @contextmanager
 def atomic_output_path(
     file_path: str | Path,
@@ -20,6 +43,8 @@ def atomic_output_path(
 
     ``preserve_suffix`` keeps the target suffix at the end of the temporary
     name for writers that select their container format from the filename.
+    File data is synced before publication; directory entries are additionally
+    synced on POSIX, where Python supports opening directory descriptors.
     """
 
     target = Path(file_path)
@@ -63,20 +88,9 @@ def atomic_output_path(
         # Writers using this primitive (including netCDF/HDF5) have closed the
         # temporary when control returns here.  Make its data durable before
         # publishing the name, then make the directory entry durable as well.
-        descriptor = os.open(temporary, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        fsync_file(temporary)
         temporary.replace(target)
-        directory = os.open(
-            target.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        fsync_directory(target.parent)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise

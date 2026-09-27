@@ -14,6 +14,7 @@ setup) plus low-level numeric utilities shared across modules.
 from __future__ import annotations
 
 import os
+import socket
 from math import prod
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn, Self
@@ -36,6 +37,13 @@ LOCAL_PROCESS_RANK_ENV = (
     "OMPI_COMM_WORLD_LOCAL_RANK",
     "MPI_LOCALRANKID",
     "MV2_COMM_WORLD_LOCAL_RANK",
+)
+
+LOCAL_PROCESS_COUNT_ENV = (
+    "SLURM_NTASKS_PER_NODE",
+    "OMPI_COMM_WORLD_LOCAL_SIZE",
+    "MPI_LOCALNRANKS",
+    "MV2_COMM_WORLD_LOCAL_SIZE",
 )
 
 
@@ -89,9 +97,12 @@ class DistributedContext(_ProcessTopology):
                 raise ValueError(
                     "accelerator distributed devices must have a concrete index"
                 )
-            if self.world_size > 1 and self.device.index != self.local_rank:
+            # Per-process device binding (one visible device per task) maps
+            # several local ranks onto index 0, so the index may be smaller.
+            if self.world_size > 1 and self.device.index > self.local_rank:
                 raise ValueError(
-                    "multi-process accelerator device index must equal local_rank"
+                    "multi-process accelerator device index must not exceed "
+                    "local_rank"
                 )
         if self.device.type == "mps":
             if self.world_size != 1 or self.local_rank != 0:
@@ -195,27 +206,53 @@ class _DistributedSetupRequest(HydroForgeModel):
         return self
 
 
-def get_local_process_rank() -> int:
-    """Resolve one strict local rank directly from launcher environment."""
+def _environment_index(name: str, *, minimum: int = 0) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    kind = "non-negative" if minimum == 0 else "positive"
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a {kind} integer, got {raw!r}") from error
+    if value < minimum:
+        raise ValueError(f"{name} must be a {kind} integer, got {raw!r}")
+    return value
 
+
+def get_local_process_rank() -> int:
+    """Resolve one strict local rank directly from launcher environment.
+
+    ``LOCAL_RANK`` is written by the innermost launcher (``torchrun``) and is
+    authoritative: scheduler variables inherited from an outer ``srun`` or
+    ``mpirun`` describe the launcher task, not this worker. Without
+    ``LOCAL_RANK`` the scheduler variables must agree with each other.
+    """
+
+    local_rank = _environment_index("LOCAL_RANK")
+    if local_rank is not None:
+        return local_rank
     observed: dict[str, int] = {}
-    for name in ("LOCAL_RANK", *LOCAL_PROCESS_RANK_ENV):
-        raw = os.environ.get(name)
-        if raw is None:
-            continue
-        try:
-            value = int(raw)
-        except ValueError as error:
-            raise ValueError(
-                f"{name} must be a non-negative integer, got {raw!r}"
-            ) from error
-        if value < 0:
-            raise ValueError(f"{name} must be a non-negative integer, got {raw!r}")
-        observed[name] = value
+    for name in LOCAL_PROCESS_RANK_ENV:
+        value = _environment_index(name)
+        if value is not None:
+            observed[name] = value
     ranks = set(observed.values())
     if len(ranks) > 1:
         raise ValueError(f"conflicting local-rank environment: {observed}")
     return next(iter(ranks), 0)
+
+
+def _local_process_count() -> int | None:
+    """Return the launcher's process count on this node, when declared."""
+
+    if os.environ.get("LOCAL_RANK") is not None:
+        return _environment_index("LOCAL_WORLD_SIZE", minimum=1)
+    for name in LOCAL_PROCESS_COUNT_ENV:
+        value = _environment_index(name, minimum=1)
+        if value is not None:
+            return value
+    return None
 
 
 def is_rank_zero() -> bool:
@@ -281,6 +318,46 @@ def _backend_name(value: Any) -> str:
     return normalized
 
 
+def _local_device_index(
+    local_rank: int,
+    device_count: int,
+    *,
+    device_type: str,
+    visibility: str | None,
+) -> int:
+    """Bind one local rank to a visible accelerator index.
+
+    Node-wide visibility binds ``LOCAL_RANK`` directly. A single visible
+    device is per-process binding (``--gpus-per-task=1`` or a per-rank
+    visibility mask). Fewer visible devices than local ranks are shared
+    round-robin only when the declared node-local process count is an exact
+    multiple of the visible device count; anything else is rejected as a
+    likely launcher misconfiguration.
+    """
+
+    if local_rank < device_count:
+        return local_rank
+    if device_count == 1:
+        return 0
+    local_count = _local_process_count()
+    if (
+        device_count > 1
+        and local_count is not None
+        and local_rank < local_count
+        and local_count % device_count == 0
+    ):
+        return local_rank % device_count
+    raise RuntimeError(
+        f"LOCAL_RANK/device index {local_rank} is outside the {device_count} "
+        f"{device_type.upper()} device(s) visible on this node "
+        f"(visibility mask={visibility!r}), and the node-local process count "
+        f"{local_count!r} is not a multiple of the visible device count. The "
+        "launcher must assign one valid local device index per process or "
+        "expose one device per process. WORLD_SIZE may legitimately exceed "
+        "this node-local device count in a multi-node job."
+    )
+
+
 def _accelerator_candidate(
     candidate: torch.device,
     *,
@@ -293,23 +370,30 @@ def _accelerator_candidate(
     runtime = getattr(torch, device_type, None)
     if runtime is None or not runtime.is_available():
         raise RuntimeError(f"{device_type!r} is not available in this PyTorch runtime")
-    index = local_rank if candidate.index is None else candidate.index
-    if world_size > 1 and index != local_rank:
-        raise RuntimeError(
-            f"device index {index} disagrees with LOCAL_RANK={local_rank}"
-        )
     device_count = runtime.device_count()
     if type(device_count) is not int or device_count < 0:
         raise RuntimeError(
             f"{device_type.upper()} runtime returned invalid device_count "
             f"{device_count!r}"
         )
-    if index >= device_count:
-        visibility = (
-            os.environ.get("CUDA_VISIBLE_DEVICES")
-            if device_type == "cuda"
-            else os.environ.get("ZE_AFFINITY_MASK")
+    visibility = (
+        os.environ.get("CUDA_VISIBLE_DEVICES")
+        if device_type == "cuda"
+        else os.environ.get("ZE_AFFINITY_MASK")
+    )
+    if world_size > 1:
+        bound = _local_device_index(
+            local_rank, device_count, device_type=device_type, visibility=visibility
         )
+        index = bound if candidate.index is None else candidate.index
+        if index != bound:
+            raise RuntimeError(
+                f"device index {index} disagrees with the device index {bound} "
+                f"bound to LOCAL_RANK={local_rank}"
+            )
+    else:
+        index = local_rank if candidate.index is None else candidate.index
+    if index >= device_count:
         raise RuntimeError(
             f"LOCAL_RANK/device index {index} is outside the {device_count} "
             f"{device_type.upper()} device(s) visible on this node "
@@ -439,6 +523,184 @@ def _select_distributed_device(
     )
 
 
+_DEVICE_CONSENSUS_PREFIX = "hydroforge/device_consensus"
+
+
+def _device_identity(device: torch.device) -> str:
+    """Physical identity of one bound accelerator, comparable across ranks."""
+
+    runtime = getattr(torch, device.type)
+    try:
+        uuid = getattr(runtime.get_device_properties(device.index), "uuid", None)
+    except Exception:  # noqa: BLE001
+        # Best effort only: a rank that raised here would skip the consensus
+        # and leave its peers waiting.
+        uuid = None
+    if uuid is not None:
+        return f"{socket.gethostname()}/{device.type}/{uuid}"
+    # Without a UUID, a per-process visibility mask still tells per-task
+    # binding (different masks) apart from sharing (same mask and index).
+    mask = os.environ.get(
+        "CUDA_VISIBLE_DEVICES" if device.type == "cuda" else "ZE_AFFINITY_MASK"
+    )
+    return f"{socket.gethostname()}/{device.type}/mask={mask}/{device.index}"
+
+
+def _device_consensus(
+    device_types: tuple[str, ...],
+    local_failures: dict[str, str],
+    identities: dict[str, str],
+    *,
+    rank: int,
+    world_size: int,
+) -> tuple[str | None, dict[str, tuple[int, str]], tuple[int, str] | None, Any]:
+    """Agree on the first device type that passed preflight on every rank.
+
+    Uses the ``env://`` rendezvous store that the default group will reuse.
+    Every rank publishes its result, including ranks with no usable candidate,
+    so an unusable topology fails on all ranks instead of hanging in
+    ``init_process_group``. Accelerator ranks also publish the physical
+    identity of their bound device; the third result reports how many ranks
+    share one device of the agreed type (NCCL/XCCL need one device per rank).
+    The returned store must stay referenced until the default group exists:
+    rank 0 hosts the shared TCP store server.
+    """
+
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is unavailable")
+    store, store_rank, store_world_size = next(
+        dist.rendezvous("env://", timeout=dist.default_pg_timeout)
+    )
+    if store_rank != rank or store_world_size != world_size:
+        raise RuntimeError(
+            f"env:// rendezvous returned rank={store_rank}, "
+            f"world_size={store_world_size}; expected rank={rank}, "
+            f"world_size={world_size}"
+        )
+    # Repeated setup calls within one launcher attempt share the store.
+    call = store.add(f"{_DEVICE_CONSENSUS_PREFIX}/calls/{rank}", 1)
+    scoped = dist.PrefixStore(f"{_DEVICE_CONSENSUS_PREFIX}/{call}", store)
+    for device_type in device_types:
+        failure = local_failures.get(device_type)
+        scoped.add(f"available/{device_type}", 0 if failure is not None else 1)
+        if failure is not None:
+            scoped.compare_set(
+                f"failure/{device_type}", "", f"rank {rank}: {failure}"
+            )
+    for device_type, identity in identities.items():
+        scoped.add(f"identity/{device_type}/{identity}", 1)
+    if scoped.add("arrived", 1) == world_size:
+        scoped.set("complete", "1")
+    scoped.wait(["complete"])
+    report: dict[str, tuple[int, str]] = {}
+    agreed: str | None = None
+    for device_type in device_types:
+        missing = world_size - scoped.add(f"available/{device_type}", 0)
+        if missing == 0:
+            agreed = agreed or device_type
+            continue
+        first = scoped.get(f"failure/{device_type}").decode(errors="replace")
+        report[device_type] = (missing, first)
+    shared: tuple[int, str] | None = None
+    if agreed in identities:
+        identity = identities[agreed]
+        users = scoped.add(f"identity/{agreed}/{identity}", 0)
+        if users > 1:
+            scoped.add("shared", 1)
+            scoped.compare_set(
+                "shared_example", "", f"{identity} is bound by {users} ranks"
+            )
+        if scoped.add("checked", 1) == world_size:
+            scoped.set("checked_complete", "1")
+        scoped.wait(["checked_complete"])
+        sharing_ranks = scoped.add("shared", 0)
+        if sharing_ranks:
+            shared = (
+                sharing_ranks,
+                scoped.get("shared_example").decode(errors="replace"),
+            )
+    # Rank 0 hosts the server: it must outlive every rank's reads, including
+    # when all ranks are about to raise.
+    if scoped.add("departed", 1) == world_size:
+        scoped.set("released", "1")
+    if rank == 0:
+        scoped.wait(["released"])
+    return agreed, report, shared, store
+
+
+def _select_agreed_device(
+    request: _DistributedSetupRequest,
+    *,
+    local_rank: int,
+    rank: int,
+    world_size: int,
+) -> tuple[torch.device, Any]:
+    """Select the first device type that is usable on every process."""
+
+    device_types = tuple(dict.fromkeys(device.type for device in request.allowed_devices))
+    selected: dict[str, torch.device] = {}
+    failures: dict[str, list[str]] = {}
+    for candidate in request.allowed_devices:
+        if candidate.type in selected:
+            continue
+        try:
+            selected[candidate.type] = _candidate_device(
+                candidate,
+                local_rank=local_rank,
+                world_size=world_size,
+                initialized_backend=None,
+                required_kernel_backend=request.required_kernel_backend,
+            )
+        except Exception as error:  # noqa: BLE001
+            # Any local failure (e.g. a deferred CUDA init error) is published
+            # to the peers instead of leaving them waiting in the consensus.
+            failures.setdefault(candidate.type, []).append(
+                f"{str(candidate)!r}: {error}"
+            )
+    local_failures = {
+        device_type: "; ".join(failures[device_type])
+        for device_type in device_types
+        if device_type not in selected
+    }
+    identities = {
+        device_type: _device_identity(device)
+        for device_type, device in selected.items()
+        if device_type in {"cuda", "xpu"}
+    }
+    agreed, report, shared, store = _device_consensus(
+        device_types,
+        local_failures,
+        identities,
+        rank=rank,
+        world_size=world_size,
+    )
+    if shared is not None:
+        sharing_ranks, example = shared
+        raise RuntimeError(
+            f"{sharing_ranks} of {world_size} ranks share a physical "
+            f"{agreed.upper()} device ({example}); "
+            f"{_COMMUNICATION_BACKENDS[agreed].upper()} requires one device per "
+            "rank. Bind one device per process (e.g. --gpus-per-task=1 or a "
+            "per-rank visibility mask) or start fewer processes per node"
+        )
+    if agreed is not None:
+        return selected[agreed], store
+    if not selected:
+        raise RuntimeError(
+            "none of the allowed distributed devices passed preflight: "
+            + "; ".join(item for items in failures.values() for item in items)
+        )
+    raise RuntimeError(
+        f"no allowed distributed device type passed preflight on all "
+        f"{world_size} ranks; all ranks must select the same communication "
+        "backend: "
+        + "; ".join(
+            f"{device_type!r} failed on {missing} rank(s), first {first}"
+            for device_type, (missing, first) in report.items()
+        )
+    )
+
+
 def _rendezvous_environment(world_size: int) -> int:
     """Validate the complete ``env://`` rendezvous before creating a group."""
 
@@ -515,12 +777,27 @@ def _setup_distributed_trusted(
         # Validate the env:// rendezvous before activating any process-local
         # accelerator. Invalid launcher state must be side-effect free.
         expected_rank = _rendezvous_environment(world_size)
-    device = _select_distributed_device(
-        request,
-        local_rank=local_rank,
-        world_size=world_size,
-        initialized_backend=backend,
-    )
+    consensus_store: Any = None
+    candidate_types = {device.type for device in request.allowed_devices}
+    if expected_rank is not None and (
+        len(candidate_types) > 1 or candidate_types & {"cuda", "xpu"}
+    ):
+        # Independent per-rank fallback could pick different communication
+        # backends, and ranks sharing one accelerator break NCCL/XCCL; both
+        # would otherwise surface only as a hang or failure at init time.
+        device, consensus_store = _select_agreed_device(
+            request,
+            local_rank=local_rank,
+            rank=expected_rank,
+            world_size=world_size,
+        )
+    else:
+        device = _select_distributed_device(
+            request,
+            local_rank=local_rank,
+            world_size=world_size,
+            initialized_backend=backend,
+        )
     if not initialized and world_size > 1:
         assert expected_rank is not None
         backend = _require_communication_backend(device)
@@ -568,6 +845,7 @@ def _setup_distributed_trusted(
 
             with cleanup_on_exit("new process group", (release_owned_group,)):
                 raise
+        del consensus_store
         return context
 
     return DistributedContext(
@@ -588,7 +866,12 @@ def setup_distributed(
 
     ``allowed_devices`` is an explicit, ordered policy: the first candidate
     that is available, communication-compatible, and kernel-compatible is
-    selected. CUDA/ROCm and XPU candidates are bound to ``LOCAL_RANK`` unless
+    selected. When a new multi-process group is created from several device
+    types or from accelerator candidates, the ranks first agree through the
+    ``env://`` store on the first device type that passed preflight on every
+    rank, so all ranks use one communication backend, and reject ranks that
+    share one physical accelerator. CUDA/ROCm and XPU candidates are bound to
+    ``LOCAL_RANK`` (index 0 when each process sees exactly one device) unless
     an explicit matching index is supplied. Multi-process CPU, CUDA/ROCm, and
     XPU execution uses Gloo, NCCL/RCCL, and XCCL respectively; MPS is accepted
     only for a single process. TPU/XLA requires a separate PJRT adapter.
@@ -612,7 +895,7 @@ def setup_distributed(
 
 
 class _BinaryReadRequest(HydroForgeModel):
-    filename: str | Path
+    filename: Path = Field(strict=False)
     shape: tuple[Annotated[int, Field(ge=1)], ...] = Field(min_length=1)
     dtype: Any
 

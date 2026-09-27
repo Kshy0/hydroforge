@@ -19,7 +19,7 @@ from pydantic import (
 )
 
 from hydroforge.contracts.validation import HydroForgeModel
-from hydroforge.data.mapping.grid import RegularGrid
+from hydroforge.data.mapping.grid import RegularGrid, _has_duplicates
 from hydroforge.data.numeric import (
     canonical_float64,
     canonical_ids,
@@ -65,7 +65,7 @@ class TargetSupport(HydroForgeModel):
     @model_validator(mode="after")
     def _validate_target(self) -> Self:
         n_target = self.target_ids.size
-        if np.unique(self.target_ids).size != n_target:
+        if _has_duplicates(self.target_ids):
             raise ValueError("target_ids must be unique")
         if self.bounds is not None:
             object.__setattr__(
@@ -93,7 +93,7 @@ class TargetSupport(HydroForgeModel):
         if self.target_shape is not None:
             if self.flat_indices.size != n_target:
                 raise ValueError("flat_indices size does not match target_ids")
-            if np.unique(self.flat_indices).size != n_target:
+            if _has_duplicates(self.flat_indices):
                 raise ValueError("flat_indices must be unique")
             extent = self.target_shape[0] * self.target_shape[1]
             if self.flat_indices.size and (

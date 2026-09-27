@@ -19,6 +19,7 @@ from hydroforge.data.numeric import (
     positive_finite_float64,
 )
 from hydroforge.serialization.files import atomic_output_path
+from hydroforge.serialization.netcdf import BOOL_LOGICAL_DTYPE
 
 if TYPE_CHECKING:
     import matplotlib.pyplot as plt
@@ -61,7 +62,7 @@ class _SinglePlotRequest(_PlotStyle):
 
 
 class _AnimationRequest(_PlotStyle):
-    out_path: str | Path
+    out_path: Path = Field(strict=False)
     level: int | None = None
     member: int = 0
     fps: int = Field(default=10, gt=0)
@@ -135,6 +136,28 @@ class MultiRankPlotter:
         dtype: Any = None,
     ) -> np.ndarray:
         return self.owner._get_grid(t_index, level, member, fill_value, dtype)
+
+    def _plot_grid(
+        self,
+        t_index: int,
+        level: int | None,
+        member: int,
+    ) -> np.ndarray:
+        """Return one float64 grid with NaN marking unrepresented cells."""
+
+        files = self.owner._rank_files
+        if not files or files[0]["logical_dtype"] != BOOL_LOGICAL_DTYPE:
+            return self.get_grid(
+                t_index, level=level, member=member, dtype=np.float64
+            )
+        values = self.get_grid(
+            t_index, level=level, member=member, fill_value=False, dtype=np.bool_
+        )
+        grid = np.full(values.shape, np.nan)
+        for info in files:
+            if info["saved_points"]:
+                grid[info["x"], info["y"]] = values[info["x"], info["y"]]
+        return grid
 
     def get_series(
         self,
@@ -238,7 +261,7 @@ class MultiRankPlotter:
 
         with _plot_axes(None, figsize) as (fig, ax, _created):
             if self.map_shape is not None:
-                grid = self.get_grid(t_index, level=level, member=member)
+                grid = self._plot_grid(t_index, level, member)
                 im = ax.imshow(grid.T, origin="upper", cmap=cmap, vmin=vmin, vmax=vmax)
                 fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
                 ax.set_title(title_str)
@@ -360,65 +383,56 @@ class MultiRankPlotter:
             label="y_range",
         )
 
-        xmin = 0
-        xmax = nx_ - 1
-        ymin = 0
-        ymax = ny_ - 1
-
-        grid_0 = self.get_grid(t_start, level=level, member=member)
-        if auto_crop:
-            crop_xmin, crop_xmax = nx_, -1
-            crop_ymin, crop_ymax = ny_, -1
+        # One scan over the frames yields both the crop box and the colour
+        # range.  Every finite cell lies inside the padded crop box, so the
+        # range only needs the caller's explicit window.
+        grid_0 = self._plot_grid(t_start, level, member)
+        range_x = (0, nx_ - 1) if strict_x is None else strict_x
+        range_y = (0, ny_ - 1) if strict_y is None else strict_y
+        value_window = (
+            slice(range_x[0], range_x[1] + 1),
+            slice(range_y[0], range_y[1] + 1),
+        )
+        crop_xmin, crop_xmax = nx_, -1
+        crop_ymin, crop_ymax = ny_, -1
+        observed_min = np.inf
+        observed_max = -np.inf
+        if auto_crop or vmin is None or vmax is None:
             for ti in range(t_start, t_end):
                 grid = (
-                    grid_0
-                    if ti == t_start
-                    else self.get_grid(
-                        ti,
-                        level=level,
-                        member=member,
-                    )
+                    grid_0 if ti == t_start else self._plot_grid(ti, level, member)
                 )
-                xs, ys = np.where(np.isfinite(grid))
-                if xs.size:
-                    crop_xmin = min(crop_xmin, int(xs.min()))
-                    crop_xmax = max(crop_xmax, int(xs.max()))
-                    crop_ymin = min(crop_ymin, int(ys.min()))
-                    crop_ymax = max(crop_ymax, int(ys.max()))
-            if crop_xmax >= crop_xmin:
-                xmin = max(0, crop_xmin - crop_pad)
-                xmax = min(nx_ - 1, crop_xmax + crop_pad)
-                ymin = max(0, crop_ymin - crop_pad)
-                ymax = min(ny_ - 1, crop_ymax + crop_pad)
+                finite = np.isfinite(grid)
+                if auto_crop:
+                    xs = np.flatnonzero(finite.any(axis=1))
+                    if xs.size:
+                        ys = np.flatnonzero(finite.any(axis=0))
+                        crop_xmin = min(crop_xmin, int(xs[0]))
+                        crop_xmax = max(crop_xmax, int(xs[-1]))
+                        crop_ymin = min(crop_ymin, int(ys[0]))
+                        crop_ymax = max(crop_ymax, int(ys[-1]))
+                values = grid[value_window][finite[value_window]]
+                if values.size:
+                    observed_min = min(observed_min, float(values.min()))
+                    observed_max = max(observed_max, float(values.max()))
 
+        xmin, xmax = 0, nx_ - 1
+        ymin, ymax = 0, ny_ - 1
+        if auto_crop and crop_xmax >= crop_xmin:
+            xmin = max(0, crop_xmin - crop_pad)
+            xmax = min(nx_ - 1, crop_xmax + crop_pad)
+            ymin = max(0, crop_ymin - crop_pad)
+            ymax = min(ny_ - 1, crop_ymax + crop_pad)
         if strict_x is not None:
             xmin, xmax = strict_x
         if strict_y is not None:
             ymin, ymax = strict_y
 
         window = grid_0[xmin : xmax + 1, ymin : ymax + 1]
-        if vmin is None or vmax is None:
-            observed_min = np.inf
-            observed_max = -np.inf
-            for ti in range(t_start, t_end):
-                grid = (
-                    grid_0
-                    if ti == t_start
-                    else self.get_grid(
-                        ti,
-                        level=level,
-                        member=member,
-                    )
-                )
-                current = grid[xmin : xmax + 1, ymin : ymax + 1]
-                finite = current[np.isfinite(current)]
-                if finite.size:
-                    observed_min = min(observed_min, float(finite.min()))
-                    observed_max = max(observed_max, float(finite.max()))
-            if vmin is None:
-                vmin = 0.0 if observed_min == np.inf else observed_min
-            if vmax is None:
-                vmax = 1.0 if observed_max == -np.inf else observed_max
+        if vmin is None:
+            vmin = 0.0 if observed_min == np.inf else observed_min
+        if vmax is None:
+            vmax = 1.0 if observed_max == -np.inf else observed_max
         if not (vmax > vmin):
             scale = max(abs(vmin), 1.0)
             expanded_max = vmin + scale * 1e-6
@@ -471,7 +485,7 @@ class MultiRankPlotter:
 
             def _update(frame_idx: int):
                 ti = t_start + frame_idx
-                grid = self.get_grid(ti, level=level, member=member)
+                grid = self._plot_grid(ti, level, member)
                 win = grid[xmin : xmax + 1, ymin : ymax + 1]
                 im.set_data(win.T)
 

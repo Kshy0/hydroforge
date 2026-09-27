@@ -83,7 +83,7 @@ class ERA5LandAccumDataset(NetCDFDataset):
     supports_time_aggregation: ClassVar[bool] = False
     reusable_expression_reads: ClassVar[bool] = True
 
-    base_dir: str | Path
+    base_dir: Path = Field(strict=False)
     chunk_len: int | None = Field(default=None, ge=1)
     var_name: str = "ro"
     prefix: str = "runoff_"
@@ -163,11 +163,16 @@ class ERA5LandAccumDataset(NetCDFDataset):
             Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
             for key in sorted(self._timeline.file_times)
         )
-        axes_by_path: dict[Path, tuple[int, int, int]] = {}
+        # Shards already inspected by NetCDFDataset keep their validated axes;
+        # only predecessor shards added above need a coordinate check.
+        axes_by_path = dict(self._variable_axes_by_path)
         for path in source_paths:
+            canonical = self._canonical_source_path(path)
+            if canonical in axes_by_path:
+                continue
             with self._inspect_source_file(path), Dataset(path, "r") as dataset:
-                axes_by_path[self._canonical_source_path(path)] = (
-                    self._validate_shard_coordinates(dataset, path)
+                axes_by_path[canonical] = self._validate_shard_coordinates(
+                    dataset, path
                 )
         self._variable_axes_by_path = axes_by_path
         self._record_source_files(source_paths)

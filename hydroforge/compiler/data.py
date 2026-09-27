@@ -29,10 +29,14 @@ class ModelDataCompiler:
         prepared: dict[str, _ModulePayload] = {}
         for name in model._module_order:
             module_class = module_types[name]
+            schemas = module_class._field_schema_map()
+            # Field names are shared across modules; an inactive declaration
+            # must not receive another module's active value.
             payload = {
                 field_name: value
                 for field_name, value in module_data.items()
                 if field_name in module_class.model_fields
+                and model._is_tensor_field_active(name, schemas[field_name])
             }
             payload.update(
                 {

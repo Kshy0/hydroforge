@@ -67,10 +67,16 @@ class _KernelBindingRequest(HydroForgeModel):
                 self.kernel,
                 self.supplied,
             )
-            buffer_dtypes = self.binder._buffer_dtypes_trusted(
-                self.kernel,
-                arguments,
-            )
+            if self.supplied:
+                buffer_dtypes = self.binder._buffer_dtypes_trusted(
+                    self.kernel,
+                    arguments,
+                )
+            else:
+                buffer_dtypes = self.binder._cached_buffer_dtypes(
+                    self.kernel,
+                    arguments,
+                )
         except (KeyError, TypeError, ValueError, OverflowError) as error:
             raise ValueError(str(error)) from error
         self._arguments = MappingProxyType(arguments)
@@ -91,15 +97,22 @@ class KernelBinder:
 
     def __init__(self, model: AbstractModel) -> None:
         self.model = model
-        # Kernel entries are process-lifetime nominal operator objects.  Keep
-        # the object itself as the key: an integer ``id`` can be reused after
-        # collection and could otherwise return another kernel's ABI binding.
-        self._complete_cache: dict[Any, Mapping[str, Any]] = {}
+        # Kernel entries are nominal operator objects whose pydantic hash is
+        # constant and whose equality is structural, so key by identity. Each
+        # value retains its entry: an ``id`` cannot be reused while cached.
+        self._complete_cache: dict[int, tuple[Any, Mapping[str, Any]]] = {}
+        self._buffer_dtype_cache: dict[int, tuple[Any, Mapping[str, torch.dtype]]] = {}
+        # Eager specialized launches for calls whose ABI is fully model-bound,
+        # as ``(entry, launch, triton_device)``. They capture exactly the
+        # values in ``_complete_cache`` and therefore share its invalidation.
+        self._launch_cache: dict[int, tuple[Any, Any, Any]] = {}
 
     def invalidate(self) -> None:
         """Drop bindings whose scalar specializations may have changed."""
 
         self._complete_cache.clear()
+        self._buffer_dtype_cache.clear()
+        self._launch_cache.clear()
 
     @property
     def _field_index(self):
@@ -126,7 +139,7 @@ class KernelBinder:
         if spec.step_fields:
             self.model._execution.step_fields.bind_many(spec.step_fields.values())
         if not supplied:
-            cached = self._complete_cache.get(kernel)
+            cached = self._complete_cache.get(id(kernel), (None, None))[1]
             if cached is None:
                 metadata = kernel.metadata
                 values = {
@@ -142,7 +155,7 @@ class KernelBinder:
                 }
                 values["BLOCK_SIZE"] = self._block_size(kernel)
                 cached = MappingProxyType(values)
-                self._complete_cache[kernel] = cached
+                self._complete_cache[id(kernel)] = (kernel, cached)
             return dict(cached)
         metadata = kernel.metadata
         for parameter in supplied:
@@ -182,6 +195,19 @@ class KernelBinder:
             f"{resolution.source} {resolution.owner!r}; omit the redundant "
             "call-site value"
         )
+
+    def _cached_buffer_dtypes(
+        self,
+        kernel: Any,
+        arguments: dict[str, Any],
+    ) -> Mapping[str, torch.dtype]:
+        """Resolve dtypes once for the cached fully model-bound arguments."""
+
+        cached = self._buffer_dtype_cache.get(id(kernel), (None, None))[1]
+        if cached is None:
+            cached = self._buffer_dtypes_trusted(kernel, arguments)
+            self._buffer_dtype_cache[id(kernel)] = (kernel, cached)
+        return cached
 
     def _buffer_dtypes_trusted(
         self,

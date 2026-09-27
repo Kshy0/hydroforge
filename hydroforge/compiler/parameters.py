@@ -10,12 +10,12 @@ import cftime
 import numpy as np
 import torch
 
+from hydroforge.compiler.partition import _searchsorted_batch
 from hydroforge.contracts.fields import (
     ModuleFieldSchema,
     concrete_tensor_dtype,
 )
 from hydroforge.contracts.parameters import ParameterChange, ParameterValue
-from hydroforge.data.distributed import _find_indices_in_trusted
 from hydroforge.model.tensors import ModuleTensors
 
 if TYPE_CHECKING:
@@ -50,6 +50,26 @@ class _ResolvedParameterField:
     schema: ModuleFieldSchema
 
 
+@dataclass(frozen=True, slots=True)
+class _TargetIdLookup:
+    """Validated global-to-local lookup shared by changes on one ID field."""
+
+    id_values: np.ndarray
+    order: np.ndarray
+    sorted_ids: np.ndarray
+    local_by_global: np.ndarray
+    local_extent: int
+
+    def global_indices(self, ids: np.ndarray) -> np.ndarray:
+        position = _searchsorted_batch(self.sorted_ids, ids)
+        valid = position < self.sorted_ids.size
+        hit = np.zeros(ids.shape, dtype=bool)
+        hit[valid] = self.sorted_ids[position[valid]] == ids[valid]
+        index = np.full(ids.shape, -1, dtype=np.int64)
+        index[hit] = self.order[position[hit]]
+        return index
+
+
 class ParameterSemanticCompiler:
     """Resolve every parameter declaration before runtime materialization."""
 
@@ -61,6 +81,7 @@ class ParameterSemanticCompiler:
         self.model = model
         self.partition = partition
         self._qualified, self._unqualified = self._field_index()
+        self._target_id_lookups: dict[tuple[str, str | None], _TargetIdLookup] = {}
 
     def _parameter_shape(self, resolved: _ResolvedParameterField) -> tuple[int, ...]:
         view = self.model._data.prepare_modules()[resolved.module_name]
@@ -191,6 +212,7 @@ class ParameterSemanticCompiler:
                 parameter=resolved,
                 local_shape=local_shape,
                 index_axis=index_axis,
+                group=group,
                 local_rows=local_rows,
             )
             requested_shape = list(local_shape)
@@ -253,6 +275,7 @@ class ParameterSemanticCompiler:
         parameter: _ResolvedParameterField,
         local_shape: tuple[int, ...],
         index_axis: int,
+        group: str | None,
         local_rows: np.ndarray | None,
     ) -> tuple[
         tuple[int, ...],
@@ -302,23 +325,21 @@ class ParameterSemanticCompiler:
                 f"{change.variable!r} coordinate {parameter_coordinate!r}"
             )
 
-        local_view = self.model._data.prepare_modules()[resolved_id.module_name]
-        local_id_tensor = getattr(local_view, id_field.name)
-        if not isinstance(local_id_tensor, torch.Tensor):
-            raise ValueError(f"parameter target ID field {id_name!r} must be a tensor")
-        ModuleTensors._validate_key(id_field, local_id_tensor)
-        id_shape = tuple(local_id_tensor.shape)
-        if id_shape != (local_shape[index_axis],):
-            raise ValueError(
-                f"parameter target ID field {id_name!r} shape {id_shape} is "
-                f"not co-indexed with {change.variable!r} axis "
-                f"length {local_shape[index_axis]}"
+        qualified_id = f"{resolved_id.module_name}.{id_field.name}"
+        lookup = self._target_id_lookups.get((qualified_id, group))
+        if lookup is None:
+            lookup = self._target_id_lookup(
+                resolved_id,
+                id_name=id_name,
+                local_rows=local_rows,
             )
-        id_values_tensor = self.model._input[id_field.name]
-        id_values = id_values_tensor.detach().cpu().numpy().reshape(-1)
-        if np.unique(id_values).size != id_values.size:
+            self._target_id_lookups[(qualified_id, group)] = lookup
+        if lookup.local_extent != local_shape[index_axis]:
             raise ValueError(
-                f"parameter target ID field {id_name!r} contains duplicate IDs"
+                f"parameter target ID field {id_name!r} shape "
+                f"({lookup.local_extent},) "
+                f"is not co-indexed with {change.variable!r} axis "
+                f"length {local_shape[index_axis]}"
             )
 
         requested_ids = change._trusted_value("target_ids")
@@ -327,8 +348,8 @@ class ParameterSemanticCompiler:
             if isinstance(requested_ids, tuple)
             else tuple(requested_ids.tolist())
         )
-        target_array = np.asarray(target_ids, dtype=id_values.dtype)
-        global_indices = _find_indices_in_trusted(target_array, id_values)
+        target_array = np.asarray(target_ids, dtype=lookup.id_values.dtype)
+        global_indices = lookup.global_indices(target_array)
         missing = global_indices < 0
         if np.any(missing):
             missing_ids = target_array[missing][:10].tolist()
@@ -337,34 +358,84 @@ class ParameterSemanticCompiler:
                 f"{id_name!r}: {missing_ids}"
             )
 
+        local = lookup.local_by_global[global_indices]
+        present = local >= 0
+        return (
+            target_ids,
+            tuple(local[present].tolist()),
+            tuple(np.flatnonzero(present).tolist()),
+            qualified_id,
+        )
+
+    def _target_id_lookup(
+        self,
+        resolved_id: _ResolvedParameterField,
+        *,
+        id_name: str,
+        local_rows: np.ndarray | None,
+    ) -> _TargetIdLookup:
+        id_field = resolved_id.schema
+        local_view = self.model._data.prepare_modules()[resolved_id.module_name]
+        local_id_tensor = getattr(local_view, id_field.name)
+        if not isinstance(local_id_tensor, torch.Tensor):
+            raise ValueError(f"parameter target ID field {id_name!r} must be a tensor")
+        if local_id_tensor.ndim != 1 or local_id_tensor.dtype not in {
+            torch.int32,
+            torch.int64,
+        }:
+            raise ValueError(
+                f"parameter target ID field {id_name!r} must be a one-dimensional "
+                "integer tensor"
+            )
+        order, sorted_ids, unique = self.partition.sorted_global_key(
+            id_field.name,
+            lambda: self.model._input[id_field.name],
+        )
+        if not unique:
+            raise ValueError(
+                f"parameter target ID field {id_name!r} contains duplicate IDs"
+            )
+        id_values = sorted_ids
+        lookup = _TargetIdLookup(
+            id_values=id_values,
+            order=order,
+            sorted_ids=sorted_ids,
+            local_by_global=np.empty(0, dtype=np.int64),
+            local_extent=0,
+        )
+
         if local_rows is None:
             local_rows = np.arange(id_values.size, dtype=np.int64)
         local_id_values = local_id_tensor.detach().cpu().numpy()
-        prepared_global_indices = _find_indices_in_trusted(local_id_values, id_values)
+        prepared_global_indices = lookup.global_indices(
+            local_id_values.astype(id_values.dtype, copy=False)
+        )
+        owned = np.zeros(id_values.size, dtype=bool)
+        owned[local_rows] = True
         if np.any(prepared_global_indices < 0) or not np.all(
-            np.isin(prepared_global_indices, local_rows)
+            owned[prepared_global_indices]
         ):
             raise ValueError(
                 f"prepared parameter target ID field {id_name!r} contains IDs "
                 "outside its rank-local input partition"
             )
-        local_by_global = {
-            global_index: local_index
-            for local_index, global_index in enumerate(prepared_global_indices.tolist())
-        }
-        local_positions: list[int] = []
-        local_indices: list[int] = []
-        for request_position, global_index in enumerate(global_indices.tolist()):
-            local_index = local_by_global.get(global_index)
-            if local_index is None:
-                continue
-            local_positions.append(request_position)
-            local_indices.append(local_index)
-        return (
-            target_ids,
-            tuple(local_indices),
-            tuple(local_positions),
-            f"{resolved_id.module_name}.{id_field.name}",
+        local_by_global = np.full(id_values.size, -1, dtype=np.int64)
+        local_by_global[prepared_global_indices] = np.arange(
+            prepared_global_indices.size,
+            dtype=np.int64,
+        )
+        # Global IDs are unique, so a collapsed scatter means a local duplicate.
+        if np.count_nonzero(local_by_global >= 0) != prepared_global_indices.size:
+            raise ValueError(
+                f"prepared parameter target ID field {id_name!r} contains "
+                "duplicate IDs"
+            )
+        return _TargetIdLookup(
+            id_values=id_values,
+            order=order,
+            sorted_ids=sorted_ids,
+            local_by_global=local_by_global,
+            local_extent=int(prepared_global_indices.size),
         )
 
     @staticmethod

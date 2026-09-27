@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -121,11 +121,24 @@ class GroupRankLookup(HydroForgeModel):
     def _lookup_trusted(self, values: np.ndarray) -> np.ndarray:
         """Resolve compiled group IDs known to belong to this lookup."""
 
-        positions = np.searchsorted(self.group_ids, values)
+        positions = _searchsorted_batch(self.group_ids, values)
         return self.ranks[positions]
 
     def __len__(self) -> int:
         return len(self.group_ids)
+
+
+def _searchsorted_batch(sorted_values: np.ndarray, queries: np.ndarray) -> np.ndarray:
+    """``np.searchsorted`` that sorts large query batches for memory locality."""
+
+    queries = np.asarray(queries)
+    if queries.size < 65536:
+        return np.searchsorted(sorted_values, queries)
+    flat = queries.reshape(-1)
+    order = np.argsort(flat, kind="stable")
+    positions = np.empty(flat.shape, dtype=np.intp)
+    positions[order] = np.searchsorted(sorted_values, flat[order])
+    return positions.reshape(queries.shape)
 
 
 @njit(cache=True)
@@ -136,9 +149,15 @@ def _compute_group_to_rank(
     """Greedily balance original group IDs over ranks."""
     if world_size <= 0 or group_assignments.size == 0:
         return np.empty(0, np.int64), np.empty(0, np.int64)
-    unique_ids = np.unique(group_assignments)
-    inverse = np.searchsorted(unique_ids, group_assignments)
-    sizes = np.bincount(inverse, minlength=unique_ids.size).astype(np.int64)
+    ordered = np.sort(group_assignments)
+    starts = np.empty(ordered.size, np.bool_)
+    starts[0] = True
+    starts[1:] = ordered[1:] != ordered[:-1]
+    first = np.nonzero(starts)[0]
+    unique_ids = ordered[first]
+    sizes = np.empty(first.size, np.int64)
+    sizes[:-1] = first[1:] - first[:-1]
+    sizes[-1] = ordered.size - first[-1]
     order = np.argsort(sizes)
     loads = np.zeros(world_size, np.int64)
     ranks = np.empty(unique_ids.size, np.int64)
@@ -175,6 +194,8 @@ class _PartitionSemanticCompiler:
         self._variable_groups = variable_groups
         self._coordinate_groups: dict[str, np.ndarray] = {}
         self._reference_indices: dict[str, np.ndarray] = {}
+        self._rank_indices: dict[str, np.ndarray] = {}
+        self._sorted_keys: dict[str, tuple[np.ndarray, np.ndarray, bool]] = {}
         self._group_ranks: GroupRankLookup | None = None
 
     @property
@@ -183,16 +204,26 @@ class _PartitionSemanticCompiler:
         if cached is not None:
             return cached
         model = self.model
-        fields = {
-            field.name: field.tensor
-            for module_name in model.opened_modules
-            for field in model._compiled_schema().fields(module_name)
-            if (
-                not field.computed
-                and field.tensor is not None
-                and model._is_tensor_field_active(module_name, field)
-            )
-        }
+        fields: dict[str, Any] = {}
+        coordinate_owners: dict[str, list[str]] = {}
+        for module_name in model.opened_modules:
+            for field in model._compiled_schema().fields(module_name):
+                if (
+                    field.computed
+                    or field.tensor is None
+                    or not model._is_tensor_field_active(module_name, field)
+                ):
+                    continue
+                fields[field.name] = field.tensor
+                if field.tensor.is_coordinate:
+                    coordinate_owners.setdefault(field.name, []).append(module_name)
+        for name, owners in coordinate_owners.items():
+            if len(owners) > 1:
+                raise ValueError(
+                    f"Coordinate '{name}' is declared by modules {owners}; a "
+                    "coordinate names one model axis, so declare it in one "
+                    "module and reference it from the others."
+                )
         coordinates = {
             name for name, metadata in fields.items() if metadata.is_coordinate
         }
@@ -271,7 +302,12 @@ class _PartitionSemanticCompiler:
                     raise ValueError(
                         f"partition_by is only valid on CoordinateField, got '{name}'."
                     )
-                via = fields[partition_by]
+                via = fields.get(partition_by)
+                if via is None:
+                    raise ValueError(
+                        f"Coordinate '{name}' uses partition_by='{partition_by}', "
+                        "but it is not an active tensor field of the opened modules."
+                    )
                 if self._bare(via.dim_coords) != name:
                     raise ValueError(
                         f"Partition field '{partition_by}' must be aligned to "
@@ -414,6 +450,23 @@ class _PartitionSemanticCompiler:
                 )
         return MappingProxyType(axes)
 
+    def sorted_global_key(
+        self,
+        name: str,
+        load: Callable[[], Any],
+    ) -> tuple[np.ndarray, np.ndarray, bool]:
+        """Return one shared ``(order, sorted, unique)`` view of a global key."""
+
+        cached = self._sorted_keys.get(name)
+        if cached is None:
+            values = self._numpy(load()).reshape(-1)
+            order = np.argsort(values, kind="stable")
+            ordered = values[order]
+            unique = not (ordered.size > 1 and bool(np.any(ordered[1:] == ordered[:-1])))
+            cached = (order, ordered, unique)
+            self._sorted_keys[name] = cached
+        return cached
+
     def validate_global_reference_integrity(self) -> None:
         """Validate external reference values before runtime slicing."""
 
@@ -423,14 +476,19 @@ class _PartitionSemanticCompiler:
             if not target or name not in proxy or target not in proxy:
                 continue
             values = self._numpy(proxy._get_value_trusted(name)).reshape(-1)
-            target_values = self._numpy(proxy._get_value_trusted(target)).reshape(-1)
-            if np.unique(target_values).size != target_values.size:
+            _order, sorted_target, unique = self.sorted_global_key(
+                target,
+                lambda target=target: proxy._get_value_trusted(target),
+            )
+            if not unique:
                 raise ValueError(
                     f"Reference target coordinate '{target}' must contain "
                     "unique values."
                 )
-            index = _find_indices_in_trusted(values, target_values)
-            missing = index < 0
+            position = _searchsorted_batch(sorted_target, values)
+            found = position < sorted_target.size
+            found[found] = sorted_target[position[found]] == values[found]
+            missing = ~found
             if np.any(missing):
                 raise ValueError(
                     f"Reference field '{name}' has {int(missing.sum())} "
@@ -539,9 +597,17 @@ class _PartitionSemanticCompiler:
         return cached
 
     def rank_indices(self, coordinate: str) -> np.ndarray:
+        cached = self._rank_indices.get(coordinate)
+        if cached is not None:
+            return cached
         groups = self.coordinate_group_values(coordinate)
-        ranks = self.group_ranks._lookup_trusted(groups)
-        return np.nonzero(ranks == self.model.spatial_rank)[0]
+        if self.model.spatial_world_size == 1:
+            indices = np.arange(groups.size, dtype=np.int64)
+        else:
+            ranks = self.group_ranks._lookup_trusted(groups)
+            indices = np.nonzero(ranks == self.model.spatial_rank)[0]
+        self._rank_indices[coordinate] = indices
+        return indices
 
     @staticmethod
     def _numpy(value: Any) -> np.ndarray:
@@ -612,9 +678,23 @@ class PartitionCompiler(_PartitionSemanticCompiler):
         *,
         schema: PartitionSchema,
         variable_groups: MappingProxyType,
+        semantic: _PartitionSemanticCompiler | None = None,
     ) -> None:
         super().__init__(
             model,
             schema=schema,
             variable_groups=variable_groups,
         )
+        if semantic is not None:
+            # Both compilers read the same bound input; reuse its derived arrays.
+            self._coordinate_groups = semantic._coordinate_groups
+            self._reference_indices = semantic._reference_indices
+            self._rank_indices = semantic._rank_indices
+            self._sorted_keys = semantic._sorted_keys
+        self._semantic = semantic
+
+    @property
+    def group_ranks(self) -> GroupRankLookup:
+        if self._group_ranks is None and self._semantic is not None:
+            self._group_ranks = self._semantic.group_ranks
+        return super().group_ranks

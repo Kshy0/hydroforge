@@ -20,8 +20,12 @@ declared state before the live launch.
 from __future__ import annotations
 
 import functools
+import importlib.util
+from typing import Any
 
 import torch
+
+from hydroforge.kernels.backends.cuda import rtc
 
 # Categories whose tensors are mutated during a physics step
 _MUTABLE_CATEGORIES = frozenset({"init_state", "state", "shared_state"})
@@ -44,13 +48,11 @@ def _cuda_version_tuple(version: object) -> tuple[int, int] | None:
 def supports_conditional_cuda_graph(
     device: torch.device | str | None = None,
 ) -> bool:
-    """Return whether HydroForge's CUDA conditional-WHILE ABI is available.
+    """Return whether HydroForge's CUDA conditional-WHILE support is available.
 
     PyTorch exposes AMD/ROCm devices through the ``cuda`` device type, but
-    HIP does not provide the CUDA conditional-graph node API used by
-    :data:`_COND_CUDA`.  The CUDA API is available from CUDA 12.4 onward.
-    This check deliberately happens before the inline extension is compiled,
-    so an unsupported HIP compiler never sees CUDA-only graph declarations.
+    HIP does not provide conditional graph nodes. The CUDA API is available
+    from CUDA 12.4 onward; the host side goes through ``cuda.bindings``.
     """
 
     target = torch.device("cuda" if device is None else device)
@@ -59,129 +61,29 @@ def supports_conditional_cuda_graph(
     if getattr(torch.version, "hip", None) is not None:
         return False
     cuda_version = _cuda_version_tuple(getattr(torch.version, "cuda", None))
-    return cuda_version is not None and cuda_version >= (12, 4)
+    if cuda_version is None or cuda_version < (12, 4):
+        return False
+    try:
+        return importlib.util.find_spec("cuda.bindings") is not None
+    except ModuleNotFoundError:
+        return False
 
 
 # ====================================================================== #
-# Device-side conditional-graph (WHILE node) support
+# Device-side loop control
 # ====================================================================== #
 # A CUDA conditional-graph WHILE node folds a variable-length sub-step loop into
 # one graph launch: the body and its continuation predicate run on-device, so
-# the host issues one launch per interval with zero per-iteration sync.
-# Requires a CUDA toolkit/driver with conditional graph nodes (CUDA >= 12.4).
+# the host issues one launch per interval with zero per-iteration sync.  The
+# counter/statistics kernels below are plain device code and also serve fixed
+# CUDA/HIP graphs; only the predicate kernel needs conditional-node support.
 
-_COND_CPP = """
-int64_t cwg_create();
-void cwg_begin_capture(int64_t h, int64_t stream);
-void cwg_end_capture(int64_t h, int64_t stream);
-void cwg_set_conditional(int64_t h, at::Tensor cont, int64_t set_cond, int64_t stream);
-void cwg_fixed_end(at::Tensor count, at::Tensor counter,
-                   at::Tensor cont, int64_t stream);
-void cwg_fixed_stats_end(at::Tensor count, at::Tensor counter,
-                         at::Tensor cont, at::Tensor weight_src,
-                         at::Tensor weight, at::Tensor sub_step,
-                         at::Tensor num_sub_steps, int64_t stream);
-void cwg_stats_control(at::Tensor weight_src, at::Tensor cont, at::Tensor counter,
-                       at::Tensor weight, at::Tensor sub_step, at::Tensor num_sub_steps,
-                       int64_t stream);
-void cwg_instantiate(int64_t h);
-void cwg_launch(int64_t h, int64_t stream);
-void cwg_destroy(int64_t h);
-"""
-
-_COND_CUDA = r"""
-#include <torch/extension.h>
-#include <cuda_runtime.h>
-#include <cstdint>
-#include <memory>
-
-#define CWG_CK(x) do { cudaError_t e=(x); if(e!=cudaSuccess){ \
-  TORCH_CHECK(false, "CUDA ", #x, " -> ", cudaGetErrorString(e)); }}while(0)
-
-struct CondWhileGraph {
-    cudaGraph_t graph = nullptr;
-    cudaGraph_t body = nullptr;
-    cudaGraphConditionalHandle handle = 0;
-    cudaGraphExec_t exec = nullptr;
-
-    ~CondWhileGraph() {
-        if (exec) cudaGraphExecDestroy(exec);
-        if (graph) cudaGraphDestroy(graph);
-    }
-};
-
-struct CapturedGraph {
-    cudaGraph_t graph = nullptr;
-
-    ~CapturedGraph() {
-        if (graph) cudaGraphDestroy(graph);
-    }
-};
-
-// Outer graph holding one WHILE conditional node.  Handle default value 1 makes
-// the body run at least once per launch (the first sub-step always executes).
-int64_t cwg_create() {
-    auto graph_owner = std::make_unique<CondWhileGraph>();
-    auto* g = graph_owner.get();
-    CWG_CK(cudaGraphCreate(&g->graph, 0));
-    CWG_CK(cudaGraphConditionalHandleCreate(&g->handle, g->graph, 1, cudaGraphCondAssignDefault));
-    cudaGraphNodeParams cp = {};
-    cp.type = cudaGraphNodeTypeConditional;
-    cp.conditional.handle = g->handle;
-    cp.conditional.type = cudaGraphCondTypeWhile;
-    cp.conditional.size = 1;
-    cudaGraphNode_t cnode;
-#if CUDART_VERSION >= 13000
-    CWG_CK(cudaGraphAddNode(
-        &cnode, g->graph, nullptr, nullptr, 0, &cp));
-#else
-    CWG_CK(cudaGraphAddNode_v2(
-        &cnode, g->graph, nullptr, nullptr, 0, &cp));
-#endif
-    g->body = cp.conditional.phGraph_out[0];
-    return reinterpret_cast<int64_t>(graph_owner.release());
-}
-
-void cwg_begin_capture(int64_t h, int64_t stream) {
-    (void)h;
-    CWG_CK(cudaStreamBeginCapture((cudaStream_t)stream, cudaStreamCaptureModeThreadLocal));
-}
-
-void cwg_end_capture(int64_t h, int64_t stream) {
-    auto* graph_owner = reinterpret_cast<CondWhileGraph*>(h);
-    CapturedGraph captured;
-    cudaError_t status = cudaStreamEndCapture((cudaStream_t)stream, &captured.graph);
-    if (status != cudaSuccess) cudaGetLastError();
-    CWG_CK(status);
-    cudaGraphNode_t body_node;
-    CWG_CK(cudaGraphAddChildGraphNode(&body_node, graph_owner->body, nullptr, 0, captured.graph));
-}
-
-// Generic continuation predicate: read the model's (1,) int "continue?" flag and
-// feed it to cudaGraphSetConditional.  ``set_cond`` is false during warmup, where
-// the call is illegal outside conditional execution, so the kernel still loads.
-__global__ void k_set_conditional(cudaGraphConditionalHandle handle,
-                                  const int* __restrict__ cont, int set_cond) {
-    if (set_cond) cudaGraphSetConditional(handle, (*cont) ? 1u : 0u);
-}
-
-void cwg_set_conditional(int64_t h, at::Tensor cont, int64_t set_cond, int64_t stream) {
-    auto* g = reinterpret_cast<CondWhileGraph*>(h);
-    k_set_conditional<<<1, 1, 0, (cudaStream_t)stream>>>(
-        g->handle, cont.data_ptr<int>(), (int)set_cond);
-}
-
+_CONTROL_SOURCE = r"""
 __global__ void k_fixed_end(const int* __restrict__ count,
         int* __restrict__ counter, int* __restrict__ cont) {
     int next = *counter + 1;
     *counter = next;
     *cont = next < *count;
-}
-
-void cwg_fixed_end(at::Tensor count, at::Tensor counter,
-                   at::Tensor cont, int64_t stream) {
-    k_fixed_end<<<1, 1, 0, (cudaStream_t)stream>>>(
-        count.data_ptr<int>(), counter.data_ptr<int>(), cont.data_ptr<int>());
 }
 
 template <typename SourceT, typename DestinationT>
@@ -212,22 +114,6 @@ __global__ void k_fixed_stats_end(const int* __restrict__ count,
     write_statistics_control(first, last, weight_src, weight, sub_step, num_sub_steps);
 }
 
-void cwg_fixed_stats_end(at::Tensor count, at::Tensor counter,
-                         at::Tensor cont, at::Tensor weight_src,
-                         at::Tensor weight, at::Tensor sub_step,
-                         at::Tensor num_sub_steps, int64_t stream) {
-    AT_DISPATCH_FLOATING_TYPES(weight_src.scalar_type(), "cwg_fixed_stats_end_source", [&] {
-        using source_t = scalar_t;
-        AT_DISPATCH_FLOATING_TYPES(weight.scalar_type(), "cwg_fixed_stats_end_destination", [&] {
-            using destination_t = scalar_t;
-            k_fixed_stats_end<source_t, destination_t><<<1, 1, 0, (cudaStream_t)stream>>>(
-                count.data_ptr<int>(), counter.data_ptr<int>(), cont.data_ptr<int>(),
-                weight_src.data_ptr<source_t>(), weight.data_ptr<destination_t>(),
-                sub_step.data_ptr<int>(), num_sub_steps.data_ptr<int>());
-        });
-    });
-}
-
 // Statistics-control bridge for the folded aggregator path.  From the 1-based
 // sub-step counter, the continue_flag (0 on the final sub-step) and the
 // per-sub-step weight (e.g. dt), writes the aggregator's __weight / __sub_step /
@@ -244,61 +130,69 @@ __global__ void k_stats_control(const SourceT* __restrict__ weight_src,
     write_statistics_control(*counter == 1, *cont == 0,
                              weight_src, weight, sub_step, num_sub_steps);
 }
+"""
 
-void cwg_stats_control(at::Tensor weight_src, at::Tensor cont, at::Tensor counter,
-                       at::Tensor weight, at::Tensor sub_step, at::Tensor num_sub_steps,
-                       int64_t stream) {
-    AT_DISPATCH_FLOATING_TYPES(weight_src.scalar_type(), "cwg_stats_control_source", [&] {
-        using source_t = scalar_t;
-        AT_DISPATCH_FLOATING_TYPES(weight.scalar_type(), "cwg_stats_control_destination", [&] {
-            using destination_t = scalar_t;
-            k_stats_control<source_t, destination_t><<<1, 1, 0, (cudaStream_t)stream>>>(
-                weight_src.data_ptr<source_t>(), cont.data_ptr<int>(), counter.data_ptr<int>(),
-                weight.data_ptr<destination_t>(), sub_step.data_ptr<int>(),
-                num_sub_steps.data_ptr<int>());
-        });
-    });
-}
+# Generic continuation predicate: read the model's (1,) int "continue?" flag and
+# feed it to cudaGraphSetConditional.  ``set_cond`` is false during warmup, where
+# the call is illegal outside conditional execution, so the kernel still loads.
+_CONDITIONAL_SOURCE = r"""
+#include <cuda_device_runtime_api.h>
 
-void cwg_instantiate(int64_t h) {
-    auto* g = reinterpret_cast<CondWhileGraph*>(h);
-    CWG_CK(cudaGraphInstantiate(&g->exec, g->graph, 0));
-}
-
-void cwg_launch(int64_t h, int64_t stream) {
-    auto* g = reinterpret_cast<CondWhileGraph*>(h);
-    CWG_CK(cudaGraphLaunch(g->exec, (cudaStream_t)stream));
-}
-
-void cwg_destroy(int64_t h) {
-    auto* g = reinterpret_cast<CondWhileGraph*>(h);
-    delete g;
+__global__ void k_set_conditional(cudaGraphConditionalHandle handle,
+                                  const int* __restrict__ cont, int set_cond) {
+    if (set_cond) cudaGraphSetConditional(handle, (*cont) ? 1u : 0u);
 }
 """
 
 
-@functools.lru_cache(maxsize=1)
-def _cond_ext():
-    from hydroforge.kernels.backends.cuda.build import load_inline_cu_module
+@functools.cache
+def _control_program() -> rtc.RtcProgram:
+    return rtc.RtcProgram(_CONTROL_SOURCE, (), "hydroforge_loop_control")
 
-    return load_inline_cu_module(
-        name="hydroforge_conditional_while_graph",
-        cpp_sources=_COND_CPP,
-        cuda_sources=_COND_CUDA,
-        functions=[
-            "cwg_create",
-            "cwg_begin_capture",
-            "cwg_end_capture",
-            "cwg_set_conditional",
-            "cwg_fixed_end",
-            "cwg_fixed_stats_end",
-            "cwg_stats_control",
-            "cwg_instantiate",
-            "cwg_launch",
-            "cwg_destroy",
-        ],
-        extra_cuda_cflags=("-O3",),
+
+@functools.cache
+def _conditional_program() -> rtc.RtcProgram:
+    return rtc.RtcProgram(
+        _CONDITIONAL_SOURCE,
+        rtc.toolkit_include_options(),
+        "hydroforge_conditional_while_graph",
     )
+
+
+@functools.lru_cache(maxsize=256)
+def _launcher(
+    program: rtc.RtcProgram,
+    kernel: str,
+    args: tuple[rtc.KernelArgument, ...],
+    device: int,
+):
+    step = rtc.CudaLaunch(kernel, 1, 1, args)
+    return rtc.prepare(rtc.RtcRequest(program, (kernel,)), (step,), device)
+
+
+def _launch(
+    program: rtc.RtcProgram,
+    kernel: str,
+    args: tuple[rtc.KernelArgument, ...],
+    device: torch.device,
+    stream_ptr: int,
+) -> None:
+    index = torch.cuda.current_device() if device.index is None else device.index
+    _launcher(program, kernel, args, index)(stream_ptr)
+
+
+def _int32(tensor: torch.Tensor) -> rtc.KernelArgument:
+    if tensor.dtype != torch.int32:
+        raise TypeError(f"loop control tensors must be int32, got {tensor.dtype}")
+    return rtc.pointer(tensor)
+
+
+def _real(tensor: torch.Tensor) -> str:
+    if tensor.dtype not in (torch.float32, torch.float64):
+        raise TypeError(
+            f"statistics weights must be float32/float64, got {tensor.dtype}"
+        )
+    return rtc.ctype(tensor)
 
 
 def fixed_control_end(
@@ -307,7 +201,13 @@ def fixed_control_end(
     continue_flag: torch.Tensor,
     stream_ptr: int,
 ) -> None:
-    _cond_ext().cwg_fixed_end(count, counter, continue_flag, stream_ptr)
+    _launch(
+        _control_program(),
+        "k_fixed_end",
+        (_int32(count), _int32(counter), _int32(continue_flag)),
+        counter.device,
+        stream_ptr,
+    )
 
 
 def statistics_control(
@@ -320,13 +220,18 @@ def statistics_control(
     num_sub_steps: torch.Tensor,
     stream_ptr: int,
 ) -> None:
-    _cond_ext().cwg_stats_control(
-        weight_src,
-        continue_flag,
-        counter,
-        weight,
-        sub_step,
-        num_sub_steps,
+    _launch(
+        _control_program(),
+        f"k_stats_control<{_real(weight_src)}, {_real(weight)}>",
+        (
+            rtc.pointer(weight_src),
+            _int32(continue_flag),
+            _int32(counter),
+            rtc.pointer(weight),
+            _int32(sub_step),
+            _int32(num_sub_steps),
+        ),
+        counter.device,
         stream_ptr,
     )
 
@@ -342,16 +247,47 @@ def fixed_statistics_end(
     num_sub_steps: torch.Tensor,
     stream_ptr: int,
 ) -> None:
-    _cond_ext().cwg_fixed_stats_end(
-        count,
-        counter,
-        continue_flag,
-        weight_src,
-        weight,
-        sub_step,
-        num_sub_steps,
+    _launch(
+        _control_program(),
+        f"k_fixed_stats_end<{_real(weight_src)}, {_real(weight)}>",
+        (
+            _int32(count),
+            _int32(counter),
+            _int32(continue_flag),
+            rtc.pointer(weight_src),
+            rtc.pointer(weight),
+            _int32(sub_step),
+            _int32(num_sub_steps),
+        ),
+        counter.device,
         stream_ptr,
     )
+
+
+# ====================================================================== #
+# Host-side conditional graph (driver API)
+# ====================================================================== #
+
+
+def _driver() -> Any:
+    from cuda.bindings import driver
+
+    return driver
+
+
+def _check(result: Any, action: str) -> Any:
+    """Unpack a ``cuda.bindings`` result tuple, raising on a driver error."""
+
+    driver = _driver()
+    error, *values = result if isinstance(result, tuple) else (result,)
+    if error != driver.CUresult.CUDA_SUCCESS:
+        _, name = driver.cuGetErrorName(error)
+        raise RuntimeError(
+            f"CUDA {action} failed: {name.decode() if name else int(error)}"
+        )
+    if not values:
+        return None
+    return values[0] if len(values) == 1 else tuple(values)
 
 
 class ConditionalWhileGraph:
@@ -364,17 +300,71 @@ class ConditionalWhileGraph:
     """
 
     def __init__(self) -> None:
+        driver = _driver()
         self._device = torch.cuda.current_device()
-        self._ext = _cond_ext()
-        self._h = self._ext.cwg_create()
+        self._h = None
+        self._exec = None
+        # The primary context is the one PyTorch launches into; retaining it
+        # keeps the conditional handle's context alive for this graph's life.
+        self._cu_device = _check(driver.cuDeviceGet(self._device), "device lookup")
+        self._context = _check(
+            driver.cuDevicePrimaryCtxRetain(self._cu_device), "primary context retain"
+        )
+        try:
+            self._h = _check(driver.cuGraphCreate(0), "graph creation")
+            # Default value 1 makes the body run at least once per launch
+            # (the first sub-step always executes).
+            self._handle = _check(
+                driver.cuGraphConditionalHandleCreate(
+                    self._h,
+                    self._context,
+                    1,
+                    driver.CU_GRAPH_COND_ASSIGN_DEFAULT,
+                ),
+                "conditional handle creation",
+            )
+            params = driver.CUgraphNodeParams()
+            params.type = driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_CONDITIONAL
+            params.conditional.handle = self._handle
+            params.conditional.type = (
+                driver.CUgraphConditionalNodeType.CU_GRAPH_COND_TYPE_WHILE
+            )
+            params.conditional.size = 1
+            params.conditional.ctx = self._context
+            add_node = getattr(driver, "cuGraphAddNode_v2", driver.cuGraphAddNode)
+            _check(
+                add_node(self._h, None, None, 0, params),
+                "conditional node creation",
+            )
+            self._body = params.conditional.phGraph_out[0]
+        except BaseException:
+            self.destroy()
+            raise
 
     def begin_capture(self, stream_ptr: int) -> None:
+        driver = _driver()
         with torch.cuda.device(self._device):
-            self._ext.cwg_begin_capture(self._h, stream_ptr)
+            _check(
+                driver.cuStreamBeginCapture(
+                    stream_ptr,
+                    driver.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                ),
+                "stream capture begin",
+            )
 
     def end_capture(self, stream_ptr: int) -> None:
+        driver = _driver()
         with torch.cuda.device(self._device):
-            self._ext.cwg_end_capture(self._h, stream_ptr)
+            captured = _check(
+                driver.cuStreamEndCapture(stream_ptr), "stream capture end"
+            )
+            try:
+                _check(
+                    driver.cuGraphAddChildGraphNode(self._body, None, 0, captured),
+                    "loop body insertion",
+                )
+            finally:
+                _check(driver.cuGraphDestroy(captured), "captured graph destruction")
 
     def set_conditional(
         self, continue_flag: torch.Tensor, set_cond: bool, stream_ptr: int
@@ -384,10 +374,17 @@ class ConditionalWhileGraph:
         ``set_cond`` must be ``False`` during warmup (outside graph capture, where
         ``cudaGraphSetConditional`` is invalid) and ``True`` when capturing the body.
         """
-        with torch.cuda.device(self._device):
-            self._ext.cwg_set_conditional(
-                self._h, continue_flag, 1 if set_cond else 0, stream_ptr
-            )
+        _launch(
+            _conditional_program(),
+            "k_set_conditional",
+            (
+                rtc.uint64(int(self._handle)),
+                _int32(continue_flag),
+                rtc.int32(1 if set_cond else 0),
+            ),
+            torch.device("cuda", self._device),
+            stream_ptr,
+        )
 
     def stats_control(
         self,
@@ -413,19 +410,32 @@ class ConditionalWhileGraph:
             )
 
     def instantiate(self) -> None:
+        driver = _driver()
         with torch.cuda.device(self._device):
-            self._ext.cwg_instantiate(self._h)
+            self._exec = _check(
+                driver.cuGraphInstantiate(self._h, 0), "graph instantiation"
+            )
 
     def launch(self, stream_ptr: int) -> None:
-        with torch.cuda.device(self._device):
-            self._ext.cwg_launch(self._h, stream_ptr)
+        _check(_driver().cuGraphLaunch(self._exec, stream_ptr), "graph launch")
 
     def destroy(self) -> None:
-        if getattr(self, "_h", None) is not None:
-            handle = self._h
-            self._h = None
-            with torch.cuda.device(self._device):
-                self._ext.cwg_destroy(handle)
+        context = getattr(self, "_context", None)
+        if context is None:
+            return
+        driver = _driver()
+        executable, graph = self._exec, self._h
+        self._exec = self._h = self._context = None
+        try:
+            if executable is not None:
+                _check(driver.cuGraphExecDestroy(executable), "graph exec destruction")
+            if graph is not None:
+                _check(driver.cuGraphDestroy(graph), "graph destruction")
+        finally:
+            _check(
+                driver.cuDevicePrimaryCtxRelease(self._cu_device),
+                "primary context release",
+            )
 
     def __del__(self) -> None:
         try:

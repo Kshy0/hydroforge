@@ -4,23 +4,29 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
 import numpy as np
-from pydantic import AfterValidator, PrivateAttr, model_validator
+from pydantic import AfterValidator, Field, PrivateAttr, model_validator
 from scipy.sparse import csr_matrix
 
 from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.data.distributed import _find_indices_in_trusted
+from hydroforge.data.mapping.cama import _read_cama_hires_source_cells
 from hydroforge.data.mapping.engine import (
     _aggregate_hires_coo_trusted,
+    _hires_coo_trusted,
     _HiresPixelDeclaration,
+    _normalise_rows_trusted,
+    _raise_hires_oob_hint,
+    _regular_overlap_csr_trusted,
     normalise_row,
-    regular_overlap_rows,
 )
-from hydroforge.data.mapping.grid import RegularGrid
+from hydroforge.data.mapping.grid import RegularGrid, _has_duplicates
 from hydroforge.data.mapping.table import MappingTable
 from hydroforge.data.mapping.target import TargetSupport
-from hydroforge.data.numeric import canonical_floating_array
+from hydroforge.data.numeric import canonical_floating_array, canonical_ids
 
 MappingMethod = Literal["nearest", "overlap"]
 Normalization = Literal["mean", "sum"]
@@ -32,6 +38,7 @@ _MAPPING_METADATA_KEYS = frozenset(
         "source_shape",
         "source_order",
         "source_is_geographic",
+        "source_periodic_x",
         "source_x_name",
         "source_y_name",
         "target_kind",
@@ -77,6 +84,7 @@ def _source_metadata(source: RegularGrid) -> dict[str, Any]:
         "source_shape": list(source._shape),
         "source_order": source.order,
         "source_is_geographic": source.is_geographic,
+        "source_periodic_x": source._periodic_x,
         "source_x_name": source.x_name,
         "source_y_name": source.y_name,
     }
@@ -125,10 +133,8 @@ def _build_regular_grid_mapping_trusted(
 ) -> MappingTable:
     """Materialize a mapping from already validated immutable inputs."""
 
-    rows: list[int] = []
-    cols: list[int] = []
-    values: list[float] = []
-    coverage = np.zeros(target.target_ids.size, dtype=np.float32)
+    n_target = target.target_ids.size
+    coverage = np.zeros(n_target, dtype=np.float32)
 
     if method == "nearest":
         source_idx = source._index_of_points_trusted(
@@ -136,19 +142,26 @@ def _build_regular_grid_mapping_trusted(
             target.y,
             allow_oob=False,
         )
-        target_rows = np.arange(source_idx.size, dtype=np.int64)
-        rows.extend(target_rows.tolist())
-        cols.extend(source_idx.tolist())
-        values.extend(np.ones(target_rows.size, dtype=np.float32).tolist())
+        indptr = np.arange(source_idx.size + 1, dtype=np.int64)
+        cols = source_idx.astype(np.int64, copy=False)
+        values = np.ones(source_idx.size, dtype=np.float64)
         coverage[:] = 1.0
     else:
-        for row, (
-            row_cols,
-            row_values,
-            row_coverage,
-        ) in enumerate(regular_overlap_rows(source, target)):
-            coverage[row] = row_coverage
-            if row_cols.size == 0:
+        overlap = _regular_overlap_csr_trusted(source, target)
+        indptr = overlap.indptr
+        cols = overlap.cols
+        values = overlap.values
+        lengths = np.diff(indptr)
+        rejected = np.zeros(n_target, dtype=bool)
+        if normalization == "mean":
+            values, rejected = _normalise_rows_trusted(overlap)
+        failed = np.flatnonzero(
+            (lengths == 0) | (overlap.coverage < _MIN_FULL_COVERAGE) | rejected
+        )
+        if failed.size:
+            row = int(failed[0])
+            row_coverage = float(overlap.coverage[row])
+            if lengths[row] == 0:
                 raise ValueError(
                     f"target {int(target.target_ids[row])} has no source-grid overlap"
                 )
@@ -157,21 +170,12 @@ def _build_regular_grid_mapping_trusted(
                     f"target {int(target.target_ids[row])} coverage "
                     f"{row_coverage:.4f} < {_MIN_FULL_COVERAGE:.4f}"
                 )
-            if normalization == "mean":
-                row_values = normalise_row(row_values)
-            rows.extend([row] * row_cols.size)
-            cols.extend(row_cols.tolist())
-            values.extend(row_values.tolist())
+            normalise_row(overlap.values[indptr[row] : indptr[row + 1]])
+        coverage[:] = overlap.coverage
 
     matrix = csr_matrix(
-        (
-            np.asarray(values, dtype=np.float64),
-            (
-                np.asarray(rows, dtype=np.int64),
-                np.asarray(cols, dtype=np.int64),
-            ),
-        ),
-        shape=(target.target_ids.size, source._size),
+        (values, cols, indptr),
+        shape=(n_target, source._size),
         dtype=np.float64,
     )
     matrix = _float32_mapping_matrix(
@@ -249,9 +253,114 @@ def build_hires_aggregate_mapping(
         allow_oob_zero=allow_oob_zero,
         metadata=metadata,
     )
-    source = declaration.source
-    target_ids = declaration.target_ids
     rows, cols, data = _aggregate_hires_coo_trusted(declaration)
+    return _hires_mapping_trusted(
+        declaration.source,
+        declaration.target_ids,
+        rows,
+        cols,
+        data,
+        declaration.metadata,
+    )
+
+
+class _CamaHiresMappingDeclaration(HydroForgeModel):
+    """Validated declaration for a CaMa hires aggregate mapping build."""
+
+    source: RegularGrid
+    target_ids: np.ndarray
+    map_dir: Path = Field(strict=False)
+    nx: int = Field(ge=1)
+    ny: int = Field(ge=1)
+    nextxy_data: np.ndarray
+    hires_tag: str | None = "1min"
+    mapinfo_txt: str = "location.txt"
+    hires_idx_precision: str = "<i2"
+    map_precision: str = "<f4"
+    allow_oob_zero: bool = False
+    metadata: _MappingMetadata = None
+
+    @model_validator(mode="after")
+    def _validate_targets(self) -> Self:
+        target_ids = canonical_ids(self.target_ids, label="target_ids")
+        if _has_duplicates(target_ids):
+            raise ValueError("target_ids must be unique")
+        object.__setattr__(self, "target_ids", target_ids)
+        return self
+
+
+def build_cama_hires_aggregate_mapping(
+    source: RegularGrid,
+    target_ids: np.ndarray,
+    map_dir: str | Path,
+    nx: int,
+    ny: int,
+    nextxy_data: np.ndarray,
+    *,
+    hires_tag: str | None = "1min",
+    mapinfo_txt: str = "location.txt",
+    hires_idx_precision: str = "<i2",
+    map_precision: str = "<f4",
+    allow_oob_zero: bool = False,
+    metadata: Mapping[str, Any] | None = None,
+) -> MappingTable:
+    """Build the :func:`build_hires_aggregate_mapping` table straight from a
+    CaMa map directory.
+
+    The result is identical to reading :func:`read_cama_hires_pixels` and
+    aggregating its per-pixel coordinates, but each hires tile's longitude and
+    latitude axes are located on ``source`` once instead of once per pixel.
+    """
+    declaration = _CamaHiresMappingDeclaration(
+        source=source,
+        target_ids=target_ids,
+        map_dir=map_dir,
+        nx=nx,
+        ny=ny,
+        nextxy_data=nextxy_data,
+        hires_tag=hires_tag,
+        mapinfo_txt=mapinfo_txt,
+        hires_idx_precision=hires_idx_precision,
+        map_precision=map_precision,
+        allow_oob_zero=allow_oob_zero,
+        metadata=metadata,
+    )
+    try:
+        pixel_catchment_id, pixel_area, source_idx = _read_cama_hires_source_cells(
+            declaration.map_dir,
+            declaration.nx,
+            declaration.ny,
+            declaration.nextxy_data,
+            declaration.source,
+            allow_oob=declaration.allow_oob_zero,
+            hires_tag=declaration.hires_tag,
+            mapinfo_txt=declaration.mapinfo_txt,
+            hires_idx_precision=declaration.hires_idx_precision,
+            map_precision=declaration.map_precision,
+        )
+    except ValueError as exc:
+        _raise_hires_oob_hint(exc, allow_oob_zero=declaration.allow_oob_zero)
+        raise
+    catchment_idx = _find_indices_in_trusted(pixel_catchment_id, declaration.target_ids)
+    rows, cols, data = _hires_coo_trusted(catchment_idx, source_idx, pixel_area)
+    return _hires_mapping_trusted(
+        declaration.source,
+        declaration.target_ids,
+        rows,
+        cols,
+        data,
+        declaration.metadata,
+    )
+
+
+def _hires_mapping_trusted(
+    source: RegularGrid,
+    target_ids: np.ndarray,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    data: np.ndarray,
+    metadata: Mapping[str, Any] | None,
+) -> MappingTable:
     matrix = csr_matrix(
         (data, (rows, cols)),
         shape=(target_ids.size, source._size),
@@ -266,7 +375,7 @@ def build_hires_aggregate_mapping(
         matrix,
         label="hires mapping weights",
     )
-    out_metadata = dict(declaration.metadata or {})
+    out_metadata = dict(metadata or {})
     out_metadata.update(
         {
             "method": "hires_aggregate",

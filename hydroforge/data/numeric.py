@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Mapping
 from copy import deepcopy
 from numbers import Integral, Real
@@ -158,40 +159,60 @@ def canonical_floating_array(
     label: str,
     allow_nan: bool = False,
 ) -> np.ndarray:
-    """Materialize finite float data without lossy integer conversion."""
+    """Materialize finite float data without lossy integer conversion.
+
+    Float narrowing rejects finite values outside the target range but lets
+    tiny magnitudes round to subnormal values or zero.
+    """
 
     if np.ma.isMaskedArray(value):
         raise ValueError(f"{label} must not be a masked array")
     source = np.asarray(value)
     if source.dtype.kind not in {"f", "i", "u"}:
         raise ValueError(f"{label} must contain real numeric values")
-    finite = np.isfinite(source)
-    if allow_nan:
-        if np.isinf(source).any():
-            raise ValueError(f"{label} contains infinite values")
-    elif not finite.all():
-        raise ValueError(f"{label} contains non-finite values")
     if dtype not in {"float32", "float64"}:
         raise ValueError("dtype must be 'float32' or 'float64'")
     target = np.dtype(dtype)
-    if target == np.dtype(np.float32) and source.size:
-        as_float64 = np.asarray(source[finite], dtype=np.float64)
-        if not np.isfinite(as_float64).all() or np.any(
-            np.abs(as_float64) > np.finfo(np.float32).max
-        ):
-            raise ValueError(f"{label} contains values outside float32 range")
+    if source.dtype.kind in {"i", "u"}:
+        result = np.asarray(source, dtype=target)
+        exact_bits = np.finfo(target).nmant + 1
+        value_bits = 8 * source.dtype.itemsize - (source.dtype.kind == "i")
+        if value_bits > exact_bits and source.size:
+            # Integers up to 2**exact_bits are exact; only larger magnitudes
+            # need the exact (object) comparison.
+            limit = 2**exact_bits
+            large = (source > limit) | (source < -limit)
+            if large.any() and not np.array_equal(
+                source[large].astype(object),
+                result[large].astype(object),
+            ):
+                raise ValueError(
+                    f"{label} contains integers that are not exactly "
+                    f"representable as {dtype}"
+                )
+        return result if result.ndim == 0 else np.ascontiguousarray(result)
+
+    narrowing = source.dtype.itemsize > target.itemsize
+    if source.size:
+        # min/max reductions detect NaN/inf and the narrowing range in one
+        # pass each without allocating boolean masks.
+        if allow_nan:
+            if np.isinf(source).any():
+                raise ValueError(f"{label} contains infinite values")
+            low = high = 0.0
+            if narrowing:
+                with np.errstate(invalid="ignore"), warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    low, high = np.nanmin(source), np.nanmax(source)
+        else:
+            low, high = source.min(), source.max()
+            if not (np.isfinite(low) and np.isfinite(high)):
+                raise ValueError(f"{label} contains non-finite values")
+        if narrowing and max(-low, high) > np.finfo(target).max:
+            if target == np.dtype(np.float32):
+                raise ValueError(f"{label} contains values outside float32 range")
+            raise ValueError(f"{label} overflowed {dtype}")
     result = np.asarray(source, dtype=target)
-    if np.isinf(result).any() or (not allow_nan and np.isnan(result).any()):
-        raise ValueError(f"{label} overflowed {dtype}")
-    if np.any(finite & (source != 0) & (result == 0)):
-        raise ValueError(f"{label} contains nonzero values that underflow in {dtype}")
-    if source.dtype.kind in {"i", "u"} and not np.array_equal(
-        source.astype(object),
-        result.astype(object),
-    ):
-        raise ValueError(
-            f"{label} contains integers that are not exactly representable as {dtype}"
-        )
     return result if result.ndim == 0 else np.ascontiguousarray(result)
 
 

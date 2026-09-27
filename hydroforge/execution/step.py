@@ -17,7 +17,10 @@ import torch
 import torch.distributed as dist
 from pydantic import Field, PrivateAttr, ValidationInfo, model_validator
 
-from hydroforge.contracts.errors import ResourceCleanupError
+from hydroforge.contracts.errors import (
+    ResourceCleanupError,
+    distributed_failure_error,
+)
 from hydroforge.contracts.events import emit
 from hydroforge.contracts.temporal import (
     DateLike,
@@ -82,6 +85,60 @@ class _DistributedStepEvent:
         return sequence, int(self.kind), *self.signature
 
 
+@dataclass(frozen=True, slots=True)
+class _StepPreflight:
+    """Invocation preflight carried by the first handshake of a warm step."""
+
+    sequence: int
+    digest: int
+    phase: str
+    scope: str
+    signature: tuple[Any, ...] | None
+    error: BaseException | None
+
+    @classmethod
+    def stage(
+        cls,
+        model: AbstractModel,
+        error: BaseException | None,
+        *,
+        phase: str,
+        scope: str,
+        signature: tuple[Any, ...] | None,
+    ) -> _StepPreflight:
+        sequence, digest = model._runtime_lifecycle.reserve_public_transaction(
+            phase, signature
+        )
+        return cls(sequence, digest, phase, scope, signature, error)
+
+
+_CONTROL_PLANE: tuple[Any, tuple[Any, bool]] | None = None
+
+
+def distributed_control_plane() -> tuple[Any, bool]:
+    """Return the rank-handshake group and whether it carries CPU tensors.
+
+    Handshakes stay off accelerator streams: a Gloo default group is reused
+    and an NCCL/XCCL default group gets one dedicated Gloo group. Creation is
+    lazy at the first multi-rank control exchange, which every rank reaches
+    in the same order as ``dist.new_group`` requires.
+    """
+
+    global _CONTROL_PLANE
+    world = dist.group.WORLD
+    cached = _CONTROL_PLANE
+    if cached is not None and cached[0] is world:
+        return cached[1]
+    if "gloo" in str(dist.get_backend()).lower():
+        plane: tuple[Any, bool] = (None, True)
+    elif dist.is_gloo_available():
+        plane = (dist.new_group(backend="gloo"), True)
+    else:
+        plane = (None, False)
+    _CONTROL_PLANE = (world, plane)
+    return plane
+
+
 def synchronize_collective(
     kind: int,
     signature: tuple[int, int, int],
@@ -118,18 +175,26 @@ class _StepRuntime:
         )
         self._distributed_sequence = 0
         self._distributed_terminal = False
+        self._distributed_group: Any = None
         self._distributed_input: torch.Tensor | None = None
-        self._distributed_outputs: tuple[torch.Tensor, ...] = ()
+        self._distributed_staging: torch.Tensor | None = None
+        self._distributed_wire: Any = None
+        self._distributed_gathered: torch.Tensor | None = None
+        self._distributed_outputs: list[torch.Tensor] = []
+        self._preflight: _StepPreflight | None = None
+        self._preflight_rejection: BaseException | None = None
         self.stat_is_last = True
         self.stat_is_outer_last = True
         self.scheduled_step: SimulationStep | None = None
         self.requested_sub_steps: int | None = None
 
-    def prepare_invocation(self) -> None:
+    def prepare_invocation(self, preflight: _StepPreflight | None = None) -> None:
         """Reset and validate the rank-synchronous managed-step protocol."""
 
         self._distributed_sequence = 0
         self._distributed_terminal = False
+        self._preflight = preflight
+        self._preflight_rejection = None
         world_size = self.world_size
         if world_size == 1:
             return
@@ -138,24 +203,28 @@ class _StepRuntime:
                 "multi-rank managed steps require an initialized "
                 "torch.distributed process group"
             )
-        backend = str(dist.get_backend()).lower()
-        accelerator_collective = "nccl" in backend or "xccl" in backend
-        sync_device = (
-            self.execution.device if accelerator_collective else torch.device("cpu")
-        )
+        group, host_plane = distributed_control_plane()
+        sync_device = torch.device("cpu") if host_plane else self.execution.device
         if (
             self._distributed_input is None
+            or self._distributed_group is not group
             or not devices_match(self._distributed_input.device, sync_device)
             or len(self._distributed_outputs) != world_size
         ):
-            self._distributed_input = torch.empty(
-                5,
+            staging = torch.empty(7, dtype=torch.int64)
+            gathered = torch.empty(
+                (world_size, 7),
                 dtype=torch.int64,
                 device=sync_device,
             )
-            self._distributed_outputs = tuple(
-                torch.empty_like(self._distributed_input) for _ in range(world_size)
+            self._distributed_input = (
+                staging if host_plane else torch.empty_like(staging, device=sync_device)
             )
+            self._distributed_staging = staging
+            self._distributed_wire = staging.numpy()
+            self._distributed_gathered = gathered
+            self._distributed_outputs = list(gathered.unbind(0))
+            self._distributed_group = group
 
     def synchronize_distributed(
         self,
@@ -166,13 +235,26 @@ class _StepRuntime:
         if self.world_size == 1 or self._distributed_terminal:
             return
         source = self._distributed_input
-        wire = event.wire(self._distributed_sequence)
-        source.copy_(torch.tensor(wire, dtype=torch.int64, device="cpu"))
-        dist.all_gather(list(self._distributed_outputs), source)
-        observed = tuple(
-            map(tuple, torch.stack(self._distributed_outputs).cpu().tolist())
+        wire = self._distributed_wire
+        preflight, self._preflight = self._preflight, None
+        wire[:5] = event.wire(self._distributed_sequence)
+        wire[5:] = (
+            (0, 0)
+            if preflight is None
+            else (preflight.digest, int(preflight.error is not None))
         )
+        if source is not self._distributed_staging:
+            source.copy_(self._distributed_staging)
+        dist.all_gather(
+            self._distributed_outputs, source, group=self._distributed_group
+        )
+        rows = self._distributed_gathered.cpu().tolist()
         self._distributed_sequence += 1
+        if preflight is not None:
+            outcomes = {tuple(row[5:]) for row in rows}
+            if len(outcomes) != 1 or next(iter(outcomes))[1]:
+                self._resolve_preflight(preflight)
+        observed = tuple(tuple(row[:5]) for row in rows)
         failed_ranks = tuple(
             rank for rank, value in enumerate(observed) if value[1] < 0
         )
@@ -199,6 +281,34 @@ class _StepRuntime:
                 f"{observed}"
             )
 
+    def _resolve_preflight(self, preflight: _StepPreflight) -> None:
+        """Exchange full preflight records after a digest or failure differs.
+
+        Every rank reaches this from the same gathered wire. A rejection is
+        raised before any rank enters model code, so it is not a poisoning
+        step failure.
+        """
+
+        self._distributed_terminal = True
+        try:
+            failures, _payloads = (
+                self.model._runtime_lifecycle.complete_public_transaction(
+                    self._distributed_group,
+                    preflight.sequence,
+                    preflight.error,
+                    phase=preflight.phase,
+                    signature=preflight.signature,
+                )
+            )
+            if any(failure is not None for failure in failures):
+                if preflight.error is not None:
+                    raise preflight.error
+                raise distributed_failure_error(preflight.scope, failures)
+        except BaseException as rejection:
+            self._preflight_rejection = rejection
+            raise
+        self._distributed_terminal = False
+
     def abort_distributed(self) -> None:
         """Publish a caught local failure at the next synchronization event."""
 
@@ -216,6 +326,7 @@ class _StepRuntime:
             state.start_time,
             state.pending_outer_first,
             self.model._current_time,
+            self.model._schedule_index,
         )
         controller = (
             None if self.controller is None else self.controller.snapshot_state()
@@ -232,6 +343,7 @@ class _StepRuntime:
             self.state.start_time,
             self.state.pending_outer_first,
             self.model._current_time,
+            self.model._schedule_index,
         ) = local
         if self.controller is not None and controller is not None:
             self.controller.restore_snapshot_state(controller)
@@ -250,7 +362,7 @@ class _StepRuntime:
         self.current_time = current_time
         self.requested_sub_steps = num_sub_steps
         self._substep_scope_claimed = False
-        self._outer_scope_count = 0
+        self._outer_site_occurrences: dict[Any, int] = {}
         self._pending_outer_scopes = 0
         self.completed_substeps = None
         self._substep_program_owner = program_owner
@@ -318,12 +430,9 @@ class _StepRuntime:
         """Publish the next model time only after the full step succeeds."""
 
         if self.scheduled_step is not None:
-            next_time = self.scheduled_step.end
+            self.model._schedule_index = self.scheduled_step.index + 1
         elif self.current_time is not None:
-            next_time = self.current_time + self.duration
-        else:
-            return
-        self.model._set_runtime_current_time(next_time)
+            self.model._current_time = self.current_time + self.duration
 
     def claim_substep_scope(
         self,
@@ -347,15 +456,19 @@ class _StepRuntime:
         specialization: Any,
         site: Any = None,
     ) -> tuple[Any, ...]:
-        """Return the stable cache key for one lexical outer operator scope."""
+        """Return the stable cache key for one outer operator scope execution.
 
-        if site is None:
-            site = self._outer_scope_count
-            self._outer_scope_count += 1
+        A lexical site reached several times in one invocation (a loop or a
+        shared helper) records one program per occurrence, in order.
+        """
+
+        occurrence = self._outer_site_occurrences.get(site, 0)
+        self._outer_site_occurrences[site] = occurrence + 1
         return (
             self._substep_program_owner,
             "outer",
             site,
+            occurrence,
             self.model.options.specialization_key(),
             specialization,
         )
@@ -519,7 +632,11 @@ class ManagedStep(HydroForgeModel):
         from hydroforge.execution.substeps import SubstepRuntime
 
         result = cls.model_construct(
-            current_time=runtime.current_time,
+            current_time=(
+                runtime.scheduled_step.start
+                if runtime.scheduled_step is not None
+                else runtime.current_time
+            ),
             duration=runtime.duration,
             output_enabled=runtime.output_enabled,
             requested_sub_steps=(
@@ -597,27 +714,18 @@ class _ManagedStepEntryRequest(HydroForgeModel):
 
 
 class _ManagedScheduleRequest(HydroForgeModel):
-    """Resolve one driver clock value against the validated schedule."""
+    """Resolve the next execution index against the validated schedule."""
 
     schedule: Any = Field(exclude=True)
-    current_time: Any
+    index: int = Field(strict=True, ge=0)
 
     _step: SimulationStep | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _resolve(self):
-        if self.schedule is None:
-            return self
-        if self.current_time == self.schedule._end:
+        if self.index >= len(self.schedule):
             raise ValueError("simulation schedule is exhausted")
-        try:
-            index = self.schedule._index_at(self.current_time)
-        except KeyError:
-            raise ValueError(
-                f"model current_time {self.current_time!r} is not the start "
-                "of a simulation schedule step"
-            ) from None
-        self._step = self.schedule._step_at_trusted(index)
+        self._step = self.schedule._step_at_trusted(self.index)
         return self
 
     @property
@@ -763,20 +871,18 @@ class _ManagedStepDescriptor:
             framework_values = dict(kwargs)
             framework_values["unexpected_positional_arguments"] = args[1:]
         schedule = model.simulation_schedule
-        current_time = (
-            model._current_time
-            if model._runtime_materialized
-            else schedule.execution_start
-            if schedule is not None
-            else model.initial_time
-        )
         scheduled_step = (
             None
             if schedule is None
             else _ManagedScheduleRequest(
                 schedule=schedule,
-                current_time=current_time,
+                index=model._schedule_index if model._runtime_materialized else 0,
             ).step
+        )
+        current_time = (
+            scheduled_step.start
+            if scheduled_step is not None
+            else model._current_time if model._runtime_materialized else model.initial_time
         )
         conditions = _ManagedStepConditions(
             time_step_supplied="time_step" in framework_values,
@@ -930,16 +1036,25 @@ class _CompiledStepPolicy:
             self.execution.poison(error, phase="managed-step execution")
         return error
 
-    def execute(self, invocation: _ValidatedStepInvocation) -> Any:
+    def execute(
+        self,
+        invocation: _ValidatedStepInvocation,
+        preflight: _StepPreflight | None = None,
+    ) -> Any:
         model = self.model
         context = self.execution.step
-        context.prepare_invocation()
+        context.prepare_invocation(preflight)
+        if preflight is not None and preflight.error is not None:
+            context.abort_distributed()
+            raise preflight.error
         failure = self.execution.failure
         if failure is not None:
             error = self.execution.poisoned_error(failure)
             try:
                 context.abort_distributed()
             except BaseException as coordination_error:
+                if coordination_error is context._preflight_rejection:
+                    raise
                 combined = ResourceCleanupError(
                     "managed-step entry failure propagation",
                     (error, coordination_error),
@@ -1005,16 +1120,22 @@ class _CompiledStepPolicy:
                         # arbitrary failure, so the instance must fail closed.
                         entered_user_step = True
                         self.execution.step_fields.prepare(
-                            current_time, context.time_step
+                            managed.current_time, context.time_step
                         )
                         result = self.descriptor.function(model, managed)
                 finally:
                     _ACTIVE_MANAGED_STEP.reset(token)
-                context.synchronize_distributed(
-                    _DistributedStepEvent(
-                        _DistributedStepKind.USER_STEP_COMPLETE,
+                # Statistics output is the only rank-visible effect of
+                # finish(); without it the final handshake alone rejects a
+                # peer's body failure before the clock commits.
+                if context.world_size == 1 or (
+                    context.run_statistics and context.stat_is_last
+                ):
+                    context.synchronize_distributed(
+                        _DistributedStepEvent(
+                            _DistributedStepKind.USER_STEP_COMPLETE,
+                        )
                     )
-                )
                 context.finish()
                 self.execution.statistics.check_background_failures(current_time)
                 if self._rank == 0:
@@ -1025,7 +1146,8 @@ class _CompiledStepPolicy:
                             "progress",
                             "step.completed",
                             "Processed step",
-                            current_time=current_time,
+                            current_time=managed.current_time,
+                            is_spin_up=managed.is_spin_up,
                             adaptive_time_step=context.completed_substeps,
                             progress=progress,
                         )
@@ -1037,13 +1159,12 @@ class _CompiledStepPolicy:
                 context.commit_clock()
             return result
         except BaseException as error:
+            poison = preparation_failed or entered_user_step or context.world_size > 1
             resolved = self._coordinate_failure(
                 context,
                 snapshot,
                 error,
-                poison=(
-                    preparation_failed or entered_user_step or context.world_size > 1
-                ),
+                poison=poison and error is not context._preflight_rejection,
             )
             if resolved is error:
                 raise
@@ -1054,14 +1175,12 @@ def compile_step_policies(model: AbstractModel) -> None:
     """Compile every managed method after module initialization."""
     execution = model._execution
     execution.step = _StepRuntime(model, execution)
-    seen: set[str] = set()
+    # Shadowed managed steps stay reachable through ``super()`` from a plain
+    # override, so every managed descriptor in the MRO needs its policy.
     for cls in type(model).__mro__:
-        for name, method in vars(cls).items():
-            if name in seen:
-                continue
-            seen.add(name)
+        for method in vars(cls).values():
             descriptor = getattr(method, "__hydroforge_managed_step__", None)
-            if descriptor is not None:
+            if descriptor is not None and descriptor not in execution.step_policies:
                 execution.step_policies[descriptor] = descriptor.compile(model)
 
 
@@ -1079,23 +1198,38 @@ def managed_step(function: _F) -> _F:
             invocation = descriptor.validate_invocation(model, args, kwargs)
         except BaseException as error:
             validation_error = error
-        coordinate_preflight(
-            model,
-            validation_error,
-            phase=f"managed-step.invocation:{descriptor.protocol_name}",
-            scope="distributed managed-step invocation validation",
-            signature=(
-                None
-                if invocation is None or model.world_size == 1
-                else (
-                    model._runtime_materialized,
-                    *invocation.distributed_signature(),
-                )
-            ),
+        phase = f"managed-step.invocation:{descriptor.protocol_name}"
+        scope = "distributed managed-step invocation validation"
+        signature = (
+            None
+            if invocation is None or model.world_size == 1
+            else (
+                model._runtime_materialized,
+                *invocation.distributed_signature(),
+            )
         )
-        model._ensure_runtime_materialized()
+        preflight = None
+        if model.world_size > 1 and model._runtime_materialized:
+            # A warm step publishes its preflight inside the BEGIN handshake.
+            preflight = _StepPreflight.stage(
+                model,
+                validation_error,
+                phase=phase,
+                scope=scope,
+                signature=signature,
+            )
+        else:
+            coordinate_preflight(
+                model,
+                validation_error,
+                phase=phase,
+                scope=scope,
+                signature=signature,
+            )
+            model._ensure_runtime_materialized()
         return model._execution.step_policies[descriptor].execute(
             cast(_ValidatedStepInvocation, invocation),
+            preflight,
         )
 
     authored = inspect.signature(function)

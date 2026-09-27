@@ -18,6 +18,29 @@ if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
 
 
+def distributed_capture_safe(*programs: Any) -> bool:
+    """Return whether recorded loop programs may be device-captured multi-rank.
+
+    Collectives must pass the host rank handshake before every launch, so a
+    program containing any non-capturable operator other than a nested
+    predicate loop (whose body is inspected instead) stays eager.
+    """
+    from hydroforge.execution.operators import PredicateLoopOperator
+
+    pending = [program for program in programs if program is not None]
+    while pending:
+        program = pending.pop()
+        for operator in program.operators:
+            if isinstance(operator, PredicateLoopOperator):
+                body = getattr(operator.program, "body_operators", None)
+                if body is None:
+                    return False
+                pending.append(body)
+            elif not getattr(operator, "cuda_graph_capture_safe", True):
+                return False
+    return True
+
+
 class ModelExecution:
     """The single explicit owner of one model's runtime plans and resources."""
 
@@ -62,21 +85,6 @@ class ModelExecution:
             "model execution is poisoned by a prior mutation failure "
             f"during {phase}: {error_type}: {message}; close this model "
             "and rebuild or restore a fresh instance from checkpoint"
-        )
-
-    def precompile_cuda_catalogs(
-        self,
-        catalogs: Any,
-        opened_modules: Any,
-    ) -> dict[str, Any]:
-        """Materialize CUDA extensions required by the opened model modules."""
-        from hydroforge.kernels.backends.cuda.precompile import (
-            precompile_cuda_modules,
-        )
-
-        return precompile_cuda_modules(
-            catalogs,
-            opened_modules=opened_modules,
         )
 
     def poison(self, error: BaseException, *, phase: str) -> None:

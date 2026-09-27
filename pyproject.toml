@@ -19,7 +19,7 @@ dependencies = [
     "tqdm",
     "cftime",
     "scipy",
-    "ninja",
+    "ninja; sys_platform == 'darwin'",
 ]
 
 [tool.setuptools.packages.find]
@@ -33,9 +33,6 @@ namespaces = false
 
 [tool.setuptools.exclude-package-data]
 "*" = ["__pycache__/*", "*.py[cod]"]
-
-[project.scripts]
-hydroforge-cuda-precompile = "hydroforge.kernels.backends.cuda.precompile:main"
 
 [project.optional-dependencies]
 dev = ["ipykernel", "matplotlib", "ipympl", "pandas", "pytest", "ruff>=0.15"]

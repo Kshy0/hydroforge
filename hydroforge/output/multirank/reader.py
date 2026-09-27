@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 
 _SERIES_READER_CONTEXT = "hydroforge_multirank_reader"
+# Upper bound on persistent read handles, well below common descriptor limits.
+_MAX_READ_HANDLES = 256
 
 
 class _ReaderSeriesQuery(HydroForgeModel):
@@ -167,7 +169,7 @@ class MultiRankStatsReader(HydroForgeModel):
       - Export time-sliced grids to CaMa-Flood-compatible Fortran-order binary
     """
 
-    base_dir: Path
+    base_dir: Path = Field(strict=False)
     var_name: str = Field(min_length=1)
     coord_name: Annotated[str, Field(min_length=1)] | None = None
     map_shape_input: (
@@ -179,7 +181,7 @@ class MultiRankStatsReader(HydroForgeModel):
         repr=False,
         description="Explicit immutable map shape supplied by the caller",
     )
-    map_shape_nc: Path | None = None
+    map_shape_nc: Path | None = Field(default=None, strict=False)
     coord_converter: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None
     time_range: (
         tuple[
@@ -490,6 +492,11 @@ class MultiRankStatsReader(HydroForgeModel):
             )
             self._storage_plan = self._compile_storage_plan(
                 resolved_map_shape,
+            )
+            # A row read touches one file per rank; keep all of them open.
+            self._read_handles.max_open_files = min(
+                _MAX_READ_HANDLES,
+                max(self._read_handles.max_open_files, len(self._rank_files)),
             )
             self._data_access = MultiRankDataAccess(self)
         except (

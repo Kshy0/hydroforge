@@ -836,6 +836,17 @@ class AbstractDataset(HydroForgeModel, ABC):
             label=label,
         )
 
+    @staticmethod
+    def _direct_output_cast_is_exact(data: np.ndarray) -> bool:
+        """Whether casting to out_dtype equals casting through float64.
+
+        Unscaled storage in these dtypes can skip the float64 calculation
+        copy with bit-identical results and identical errors.
+        """
+
+        kind, size = data.dtype.kind, data.dtype.itemsize
+        return (kind == "f" and size <= 8) or (kind in {"i", "u"} and size <= 2)
+
     def _canonical_calculation_data(self, data: Any, *, label: str) -> Any:
         """Own float64 calculation inputs before any arithmetic occurs."""
 
@@ -1087,7 +1098,9 @@ class AbstractDataset(HydroForgeModel, ABC):
         self,
         data: np.ndarray,
     ) -> np.ndarray:
-        data = self._apply_upsampling_policy(data)
+        if self.upsampling == "distribute":
+            # The distributed result is already finalized in out_dtype.
+            return self._apply_upsampling_policy(data)
         return self._finalize_output_data(
             data,
             label="prepared forcing chunk",
@@ -1140,6 +1153,21 @@ class SourceDataset(AbstractDataset, ABC):
     _source_file_identities: dict[Path, _SourceFileIdentity] = PrivateAttr(
         default_factory=dict,
     )
+
+    def _prepare_chunk_array(
+        self,
+        data: np.ndarray,
+    ) -> np.ndarray:
+        # Leaf payloads were validated at the storage boundary
+        # (_accept_read_chunk); an exact out_dtype array needs no second pass.
+        if (
+            type(data) is np.ndarray
+            and data.dtype == np.dtype(self.out_dtype)
+            and data.flags.c_contiguous
+            and self.upsampling != "distribute"
+        ):
+            return data
+        return super()._prepare_chunk_array(data)
 
     def _accept_read_chunk(self, data: Any, chunk: SourceChunk) -> Any:
         """Validate one raw leaf result, or unwrap an already validated read."""

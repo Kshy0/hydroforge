@@ -11,10 +11,11 @@ import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from math import prod
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import torch
@@ -27,8 +28,20 @@ from hydroforge.compiler.generated import (
     compile_generated_module,
     release_generated_module,
 )
+from hydroforge.contracts.errors import cleanup_on_exit
 from hydroforge.contracts.naming import sanitize_symbol
 from hydroforge.serialization.files import atomic_write_text
+
+
+@dataclass(slots=True)
+class HostSamplePhase:
+    """Sample-phase bits published by the host for one uncaptured launch.
+
+    ``bits`` is negative whenever the phase must be read from device control
+    state, e.g. while a launch is captured or replayed from a device loop.
+    """
+
+    bits: int = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,18 +58,19 @@ class StatisticsCompileContext:
     save_kernels: bool
     kernels_dir: Path | None
     variables: frozenset[str]
-    metadata: Mapping[str, Mapping[str, Any]]
     layouts: Mapping[str, StatisticsVariableLayout]
     storage: Mapping[str, torch.Tensor]
     tensors: Mapping[str, torch.Tensor]
     symbol_names: Mapping[str, str]
     control_dtype: torch.dtype
+    host_phase: HostSamplePhase | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class CompiledStatistics:
     """Backend program produced by one statistics emitter."""
 
+    lowering: StatisticsLowering
     function: Callable[..., None]
     module: object | None
     saved_kernel_file: Path | None
@@ -75,7 +89,6 @@ class StatisticsEmitter:
         self.save_kernels = context.save_kernels
         self.kernels_dir = context.kernels_dir
         self._variables = context.variables
-        self._metadata = context.metadata
         self._statistics_layouts = context.layouts
         self._storage = context.storage
         self._tensor_registry = context.tensors
@@ -84,11 +97,13 @@ class StatisticsEmitter:
         self._statistics_ir = lowering.ir
         self._statistics_lowering = lowering
         self._control_dtype = context.control_dtype
+        self._host_phase = context.host_phase
         self._kernel_module = None
         self._saved_kernel_file = None
 
     def result(self) -> CompiledStatistics:
         return CompiledStatistics(
+            lowering=self._statistics_lowering,
             function=self._aggregator_function,
             module=self._kernel_module,
             saved_kernel_file=self._saved_kernel_file,
@@ -98,9 +113,15 @@ class StatisticsEmitter:
     def release_generated_modules(self) -> None:
         """Discard untransferred modules after an unsuccessful compilation."""
 
-        for name, filename in self._generated_modules:
-            release_generated_module(name, filename)
-        self._generated_modules.clear()
+        modules, self._generated_modules = self._generated_modules, []
+        with cleanup_on_exit(
+            "statistics emission modules",
+            (
+                partial(release_generated_module, name, filename)
+                for name, filename in reversed(modules)
+            ),
+        ):
+            pass
 
     def _get_safe_name(self, name: str) -> str:
         if name not in self._safe_name_cache:
@@ -177,6 +198,7 @@ class StatisticsEmitter:
             kernel_code,
             prefix="statistics",
         )
+        module._hydroforge_host_phase = self._host_phase
         self._kernel_module = module
         self._aggregator_function = getattr(
             module,

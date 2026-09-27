@@ -223,6 +223,12 @@ class MultiVariableDataset(AbstractDataset):
         ]
         if read_pools:
             shared_pool = read_pools[0]
+            # Each child can hold two shards open at a file boundary; a pool
+            # smaller than that evicts handles on every aligned chunk read.
+            shared_pool.max_open_files = max(
+                shared_pool.max_open_files,
+                2 * len(read_pools),
+            )
             for dataset in self.datasets.values():
                 if hasattr(dataset, "_read_handles"):
                     dataset._read_handles = shared_pool

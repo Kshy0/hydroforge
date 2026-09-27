@@ -14,13 +14,15 @@ from math import prod
 from typing import TypedDict
 
 from hydroforge.statistics.emitters.common import StatisticsEmitter
-from hydroforge.statistics.ir import (
+from hydroforge.statistics.emitters.expression import (
     ExpressionDialect,
+    render_expression,
+)
+from hydroforge.statistics.ir import (
     ExpressionSource,
     Reduction,
     ScatterSource,
     TensorSource,
-    render_expression,
 )
 
 _FULL_OUTPUT_GROUP = "__full__"
@@ -42,6 +44,7 @@ class _OperationGroups:
     """Rendered statements grouped by the lowering's update conditions."""
 
     unconditional: list[str] = field(default_factory=list)
+    inner_last_loads: list[str] = field(default_factory=list)
     is_inner_first: list[str] = field(default_factory=list)
     not_is_inner_first: list[str] = field(default_factory=list)
     is_inner_last: list[str] = field(default_factory=list)
@@ -49,6 +52,55 @@ class _OperationGroups:
     maxk_ops: list[_TopKOperation] = field(default_factory=list)
     argmaxk_ops: list[_TopKOperation] = field(default_factory=list)
     is_inner_last_not_is_outer_first: list[str] = field(default_factory=list)
+
+
+_GATE_PARAMS = "__hf_sub_step_ptr, __hf_num_sub_steps_ptr, __hf_flags_ptr"
+
+
+def _phase_test(mask: int, *, host: bool) -> str:
+    """Render one launch gate from host phase bits or device controls."""
+    if host:
+        return f"phase < 0 or (phase & {mask}) != 0"
+    terms = []
+    if mask & 1:
+        terms.append("(((flags & 1) != 0) & (sub_step == 0))")
+    if mask & 2:
+        terms.append("((((flags >> 1) & 1) != 0) & (sub_step == num_sub_steps - 1))")
+    return " | ".join(terms) or "False"
+
+
+def _extend_host_gated(lines: list[str], body: list[str], mask: int | None) -> None:
+    """Append launcher statements, skipped by a host phase outside ``mask``."""
+    if mask is None or all(
+        not line.strip() or line.lstrip().startswith("#") for line in body
+    ):
+        lines.extend(body)
+        return
+    lines.append(f"    if {_phase_test(mask, host=True)}:")
+    lines.extend(f"    {line}" if line else line for line in body)
+
+
+def _gate_kernels(lines: list[str], start: int, mask: int | None) -> None:
+    """Make every pre-kernel emitted after ``start`` return early by phase."""
+    if mask is None:
+        return
+    gate = [
+        "    sub_step = tl.load(__hf_sub_step_ptr).to(tl.int32)",
+        "    num_sub_steps = tl.load(__hf_num_sub_steps_ptr).to(tl.int32)",
+        "    flags = tl.load(__hf_flags_ptr).to(tl.int32)",
+        f"    if {_phase_test(mask, host=False)}:",
+    ]
+    result: list[str] = []
+    for line in lines[start:]:
+        if line.startswith("def "):
+            name, parameters = line[:-2].split("(", 1)
+            result.append(f"{name}({parameters}, {_GATE_PARAMS}):")
+            result.extend(gate)
+        elif line.startswith("    "):
+            result.append(f"    {line}")
+        else:
+            result.append(line)
+    lines[start:] = result
 
 
 class TritonStatisticsEmitter(StatisticsEmitter):
@@ -75,6 +127,18 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             names,
             value_type=value_type,
         )
+
+    def _triton_weight(self, name: str) -> str:
+        """Cast the control weight so a variable never promotes past its dtype."""
+        dtype = self._statistics_layouts[name].dtype
+        if dtype == self._control_dtype or not dtype.is_floating_point:
+            return "weight"
+        return f"weight.to({self._triton_dtype(name)})"
+
+    def _triton_dtype(self, name: str) -> str:
+        return {"torch.float32": "tl.float32", "torch.float64": "tl.float64"}[
+            str(self._statistics_layouts[name].dtype)
+        ]
 
     def _generate_triton_aggregator_function(self) -> None:
         groups = self._statistics_lowering.groups
@@ -133,6 +197,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             "import triton",
             "import triton.language as tl",
             "from triton.language.extra import libdevice",
+            "from hydroforge.kernels.backends.triton.dispatcher import launch_triton_kernel",
             "",
             "@triton.jit",
             "def hydroforge_maximum(left, right):",
@@ -146,8 +211,13 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             "",
             "@triton.jit",
             "def hydroforge_weighted_mean(old_value, old_weight, value, weight):",
+            "    # Incremental form bounds FP32 drift; non-finite results keep the",
+            "    # blended form's infinity/NaN propagation.",
             "    new_weight = old_weight + weight",
-            "    return old_value * (old_weight / new_weight) + value * (weight / new_weight)",
+            "    ratio = weight / new_weight",
+            "    incremental = old_value + (value - old_value) * ratio",
+            "    blended = old_value * (old_weight / new_weight) + value * ratio",
+            "    return tl.where(tl.abs(incremental) < float('inf'), incremental, blended)",
             "",
             "# ============================================================================",
             f"# Generated Triton kernels for statistics aggregation - Rank {self.rank}",
@@ -188,154 +258,166 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         kernel_code_lines.append("")
 
         for var_name, scatter in scatter_virtuals.items():
-            safe_var = self._get_safe_name(var_name)
-            buf_safe = self._get_safe_name(f"__scatter_buf_{var_name}")
-            is_mean = scatter.reduction.value == "mean"
+            start = len(kernel_code_lines)
+            self._generate_scatter_kernel(kernel_code_lines, var_name, scatter)
+            _gate_kernels(
+                kernel_code_lines,
+                start,
+                self._statistics_lowering.scatter_phase_mask(var_name),
+            )
+        kernel_code_lines.append("")
 
-            # ── 1. Zero kernel ──
-            kernel_code_lines.append("@triton.jit")
-            if is_mean:
-                cnt_safe = self._get_safe_name(f"__scatter_cnt_{var_name}")
-                kernel_code_lines.append(
-                    f"def scatter_zero_{safe_var}("
-                    f"{buf_safe}_ptr, {cnt_safe}_ptr, "
-                    f"N, BLOCK_SIZE: tl.constexpr, ensemble_size: tl.constexpr):"
+    def _generate_scatter_kernel(
+        self,
+        kernel_code_lines: list[str],
+        var_name: str,
+        scatter: ScatterSource,
+    ) -> None:
+        safe_var = self._get_safe_name(var_name)
+        buf_safe = self._get_safe_name(f"__scatter_buf_{var_name}")
+        is_mean = scatter.reduction.value == "mean"
+
+        # ── 1. Zero kernel ──
+        kernel_code_lines.append("@triton.jit")
+        if is_mean:
+            cnt_safe = self._get_safe_name(f"__scatter_cnt_{var_name}")
+            kernel_code_lines.append(
+                f"def scatter_zero_{safe_var}("
+                f"{buf_safe}_ptr, {cnt_safe}_ptr, "
+                f"N, BLOCK_SIZE: tl.constexpr, ensemble_size: tl.constexpr):"
+            )
+        else:
+            kernel_code_lines.append(
+                f"def scatter_zero_{safe_var}("
+                f"{buf_safe}_ptr, "
+                f"N, BLOCK_SIZE: tl.constexpr, ensemble_size: tl.constexpr):"
+            )
+        kernel_code_lines.extend(
+            [
+                "    pid = tl.program_id(0)",
+                "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
+                "    mask = offs < N",
+                "    for t in tl.static_range(ensemble_size):",
+                f"        tl.store({buf_safe}_ptr + t * N + offs, 0.0, mask=mask)",
+            ]
+        )
+        if is_mean:
+            kernel_code_lines.append(
+                f"        tl.store({cnt_safe}_ptr + t * N + offs, 0, mask=mask)"
+            )
+        kernel_code_lines.append("")
+
+        # ── 2. Scatter-add kernel ──
+        source_ptrs = set(self._statistics_ir.scatter_inputs(var_name))
+        sorted_src = sorted(source_ptrs)
+
+        kernel_code_lines.append("@triton.jit")
+        sig_parts = [f"{buf_safe}_ptr"]
+        if is_mean:
+            sig_parts.append(f"{cnt_safe}_ptr")
+        for tok in sorted_src:
+            sig_parts.append(f"{self._get_safe_name(tok)}_ptr")
+        sig_parts.extend(
+            [
+                "M",
+                "N",
+                "BLOCK_SIZE: tl.constexpr",
+                "ensemble_size: tl.constexpr",
+            ]
+        )
+        # Per-token stride constexprs
+        stride_names = {}
+        for tok in sorted_src:
+            sname = f"stride_{self._get_safe_name(tok)}"
+            sig_parts.append(f"{sname}: tl.constexpr")
+            stride_names[tok] = sname
+
+        kernel_code_lines.append(f"def scatter_add_{safe_var}({', '.join(sig_parts)}):")
+        idx_safe = self._get_safe_name(scatter.index)
+        kernel_code_lines.extend(
+            [
+                "    pid = tl.program_id(0)",
+                "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
+                "    mask = offs < M",
+                f"    idx = tl.load({idx_safe}_ptr + offs, mask=mask, other=0).to(tl.int64)",
+                "    mask = mask & (idx >= 0) & (idx < N)",
+                "    for t in tl.static_range(ensemble_size):",
+            ]
+        )
+        emitted_values: dict[str, str] = {}
+
+        def emit_scatter_value(name: str) -> str:
+            previous = emitted_values.get(name)
+            if previous is not None:
+                return previous
+            source = self._statistics_ir.sources.get(name) or TensorSource(name)
+            safe_name = self._get_safe_name(name)
+            value_name = f"{safe_name}_val"
+            if isinstance(source, ExpressionSource):
+                names = {
+                    dependency: emit_scatter_value(dependency)
+                    for dependency in source.expression.dependencies
+                }
+                expression = self._triton_expression(
+                    name,
+                    source.expression,
+                    names,
                 )
+                kernel_code_lines.append(f"        {value_name} = {expression}")
             else:
-                kernel_code_lines.append(
-                    f"def scatter_zero_{safe_var}("
-                    f"{buf_safe}_ptr, "
-                    f"N, BLOCK_SIZE: tl.constexpr, ensemble_size: tl.constexpr):"
+                key = (
+                    f"__scatter_buf_{name}"
+                    if isinstance(source, ScatterSource)
+                    else source.name
                 )
+                pointer = self._get_safe_name(key)
+                kernel_code_lines.append(
+                    f"        {value_name} = tl.load({pointer}_ptr + t * "
+                    f"{stride_names[key]} + offs, mask=mask, other=0.0)"
+                )
+            emitted_values[name] = value_name
+            return value_name
+
+        value_names = {
+            dependency: emit_scatter_value(dependency)
+            for dependency in scatter.value.dependencies
+        }
+        value_expression = self._triton_expression(
+            var_name,
+            scatter.value,
+            value_names,
+        )
+        kernel_code_lines.append(f"        _val = {value_expression}")
+        kernel_code_lines.append(
+            f"        tl.atomic_add({buf_safe}_ptr + t * N + idx, _val, mask=mask)"
+        )
+        if is_mean:
+            kernel_code_lines.append(
+                f"        tl.atomic_add({cnt_safe}_ptr + t * N + idx, 1, mask=mask)"
+            )
+        kernel_code_lines.append("")
+
+        # ── 3. Divide kernel (scatter_mean only) ──
+        if is_mean:
+            kernel_code_lines.append("@triton.jit")
+            kernel_code_lines.append(
+                f"def scatter_divide_{safe_var}("
+                f"{buf_safe}_ptr, {cnt_safe}_ptr, "
+                f"N, BLOCK_SIZE: tl.constexpr, ensemble_size: tl.constexpr):"
+            )
             kernel_code_lines.extend(
                 [
                     "    pid = tl.program_id(0)",
                     "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
                     "    mask = offs < N",
                     "    for t in tl.static_range(ensemble_size):",
-                    f"        tl.store({buf_safe}_ptr + t * N + offs, 0.0, mask=mask)",
+                    f"        _cnt = tl.load({cnt_safe}_ptr + t * N + offs, mask=mask, other=1)",
+                    f"        _val = tl.load({buf_safe}_ptr + t * N + offs, mask=mask, other=0.0)",
+                    "        _mean = tl.where(_cnt > 0, _val / _cnt, float('nan'))",
+                    f"        tl.store({buf_safe}_ptr + t * N + offs, _mean, mask=mask)",
                 ]
             )
-            if is_mean:
-                kernel_code_lines.append(
-                    f"        tl.store({cnt_safe}_ptr + t * N + offs, 0, mask=mask)"
-                )
             kernel_code_lines.append("")
-
-            # ── 2. Scatter-add kernel ──
-            source_ptrs = set(self._statistics_ir.scatter_inputs(var_name))
-            sorted_src = sorted(source_ptrs)
-
-            kernel_code_lines.append("@triton.jit")
-            sig_parts = [f"{buf_safe}_ptr"]
-            if is_mean:
-                sig_parts.append(f"{cnt_safe}_ptr")
-            for tok in sorted_src:
-                sig_parts.append(f"{self._get_safe_name(tok)}_ptr")
-            sig_parts.extend(
-                [
-                    "M",
-                    "N",
-                    "BLOCK_SIZE: tl.constexpr",
-                    "ensemble_size: tl.constexpr",
-                ]
-            )
-            # Per-token stride constexprs
-            stride_names = {}
-            for tok in sorted_src:
-                sname = f"stride_{self._get_safe_name(tok)}"
-                sig_parts.append(f"{sname}: tl.constexpr")
-                stride_names[tok] = sname
-
-            kernel_code_lines.append(
-                f"def scatter_add_{safe_var}({', '.join(sig_parts)}):"
-            )
-            idx_safe = self._get_safe_name(scatter.index)
-            kernel_code_lines.extend(
-                [
-                    "    pid = tl.program_id(0)",
-                    "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
-                    "    mask = offs < M",
-                    f"    idx = tl.load({idx_safe}_ptr + offs, mask=mask, other=0).to(tl.int64)",
-                    "    mask = mask & (idx >= 0) & (idx < N)",
-                    "    for t in tl.static_range(ensemble_size):",
-                ]
-            )
-            emitted_values: dict[str, str] = {}
-
-            def emit_scatter_value(name: str) -> str:
-                previous = emitted_values.get(name)
-                if previous is not None:
-                    return previous
-                source = self._statistics_ir.sources.get(name) or TensorSource(name)
-                safe_name = self._get_safe_name(name)
-                value_name = f"{safe_name}_val"
-                if isinstance(source, ExpressionSource):
-                    names = {
-                        dependency: emit_scatter_value(dependency)
-                        for dependency in source.expression.dependencies
-                    }
-                    expression = self._triton_expression(
-                        name,
-                        source.expression,
-                        names,
-                    )
-                    kernel_code_lines.append(f"        {value_name} = {expression}")
-                else:
-                    key = (
-                        f"__scatter_buf_{name}"
-                        if isinstance(source, ScatterSource)
-                        else source.name
-                    )
-                    pointer = self._get_safe_name(key)
-                    kernel_code_lines.append(
-                        f"        {value_name} = tl.load({pointer}_ptr + t * "
-                        f"{stride_names[key]} + offs, mask=mask, other=0.0)"
-                    )
-                emitted_values[name] = value_name
-                return value_name
-
-            value_names = {
-                dependency: emit_scatter_value(dependency)
-                for dependency in scatter.value.dependencies
-            }
-            value_expression = self._triton_expression(
-                var_name,
-                scatter.value,
-                value_names,
-            )
-            kernel_code_lines.append(f"        _val = {value_expression}")
-            kernel_code_lines.append(
-                f"        tl.atomic_add({buf_safe}_ptr + t * N + idx, _val, mask=mask)"
-            )
-            if is_mean:
-                kernel_code_lines.append(
-                    f"        tl.atomic_add({cnt_safe}_ptr + t * N + idx, 1, mask=mask)"
-                )
-            kernel_code_lines.append("")
-
-            # ── 3. Divide kernel (scatter_mean only) ──
-            if is_mean:
-                kernel_code_lines.append("@triton.jit")
-                kernel_code_lines.append(
-                    f"def scatter_divide_{safe_var}("
-                    f"{buf_safe}_ptr, {cnt_safe}_ptr, "
-                    f"N, BLOCK_SIZE: tl.constexpr, ensemble_size: tl.constexpr):"
-                )
-                kernel_code_lines.extend(
-                    [
-                        "    pid = tl.program_id(0)",
-                        "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
-                        "    mask = offs < N",
-                        "    for t in tl.static_range(ensemble_size):",
-                        f"        _cnt = tl.load({cnt_safe}_ptr + t * N + offs, mask=mask, other=1)",
-                        f"        _val = tl.load({buf_safe}_ptr + t * N + offs, mask=mask, other=0.0)",
-                        "        _mean = tl.where(_cnt > 0, _val / _cnt, float('nan'))",
-                        f"        tl.store({buf_safe}_ptr + t * N + offs, _mean, mask=mask)",
-                    ]
-                )
-                kernel_code_lines.append("")
-        kernel_code_lines.append("")
 
     def _emit_value(
         self,
@@ -780,8 +862,12 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         """Generate the main python function that calls kernels."""
         kernel_code_lines.extend(
             [
-                "# Main update function",
+                "_hydroforge_host_phase = None",
+                "",
+                "# Main update function; a nonnegative host phase skips launches",
+                "# whose kernels would have no effect at this sample.",
                 "def internal_update_statistics(states, BLOCK_SIZE):",
+                "    phase = -1 if _hydroforge_host_phase is None else _hydroforge_host_phase.bits",
             ]
         )
 
@@ -923,7 +1009,7 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         groups.is_inner_last_not_is_outer_first.extend(
                             [
                                 f"{safe_var}_{op}_old = tl.load({out_ptr}, mask=mask, other=0.0)",
-                                f"{safe_var}_{op}_count = num_macro_steps.to({val_var}.dtype)",
+                                f"{safe_var}_{op}_count = num_macro_steps.to({safe_var}_{op}_old.dtype)",
                                 f"tl.store({out_ptr}, hydroforge_weighted_mean({safe_var}_{op}_old, {safe_var}_{op}_count - 1.0, {val_var}, 1.0), mask=mask)",
                             ]
                         )
@@ -953,39 +1039,26 @@ class TritonStatisticsEmitter(StatisticsEmitter):
 
                 # ===== Simple operations (non-compound) =====
                 if op == "mean":
-                    inner_ops = {
-                        reduction.value
-                        for reduction in self._statistics_lowering.inner_reductions(var)
-                    }
-                    if "mean" in inner_ops:
-                        # Reuse val_for_{safe_var}_mean from inner aggregation
-                        groups.is_inner_last.append(
-                            f"tl.store({out_ptr}, val_for_{safe_var}_mean, mask=mask)"
-                        )
-                    else:
-                        # Standalone mean - needs state (use variable-specific val)
-                        weight_ptr = (
-                            f"{safe_var}_mean_sample_weight_state_ptr + {out_offset}"
-                        )
-                        groups.unconditional.extend(
-                            [
-                                f"# Standalone mean for {safe_var}",
-                                f"{safe_var}_mean_old = tl.where(is_inner_first, tl.zeros_like({safe_var}_val), tl.load({out_ptr}, mask=mask, other=0.0))",
-                                f"{safe_var}_mean_weight_old = tl.where(is_inner_first, 0.0, tl.load({weight_ptr}, mask=mask, other=0.0))",
-                                f"{safe_var}_mean_weight_new = {safe_var}_mean_weight_old + weight",
-                                f"{safe_var}_mean_out = hydroforge_weighted_mean({safe_var}_mean_old, {safe_var}_mean_weight_old, {safe_var}_val, weight)",
-                                f"tl.store({weight_ptr}, tl.where(is_inner_last, 0.0, {safe_var}_mean_weight_new), mask=mask)",
-                            ]
-                        )
-                        groups.unconditional.append(
-                            f"tl.store({out_ptr}, {safe_var}_mean_out, mask=mask)"
-                        )
+                    weight_ptr = (
+                        f"{safe_var}_mean_sample_weight_state_ptr + {out_offset}"
+                    )
+                    groups.unconditional.extend(
+                        [
+                            f"# Standalone mean for {safe_var}",
+                            f"{safe_var}_mean_old = tl.where(is_inner_first, 0.0, tl.load({out_ptr}, mask=mask, other=0.0))",
+                            f"{safe_var}_mean_weight_old = tl.where(is_inner_first, 0.0, tl.load({weight_ptr}, mask=mask, other=0.0))",
+                            f"{safe_var}_mean_weight_new = {safe_var}_mean_weight_old + {self._triton_weight(var)}",
+                            f"{safe_var}_mean_out = hydroforge_weighted_mean({safe_var}_mean_old, {safe_var}_mean_weight_old, {safe_var}_val, {self._triton_weight(var)})",
+                            f"tl.store({weight_ptr}, tl.where(is_inner_last, 0.0, {safe_var}_mean_weight_new), mask=mask)",
+                            f"tl.store({out_ptr}, {safe_var}_mean_out, mask=mask)",
+                        ]
+                    )
 
                 elif op == "sum":
                     groups.unconditional.extend(
                         [
                             f"{safe_var}_sum_old = tl.where(is_inner_first, tl.zeros_like({safe_var}_val), tl.load({out_ptr}, mask=mask, other=0.0))",
-                            f"tl.store({out_ptr}, {safe_var}_sum_old + {safe_var}_val * weight, mask=mask)",
+                            f"tl.store({out_ptr}, {safe_var}_sum_old + {safe_var}_val * {self._triton_weight(var)}, mask=mask)",
                         ]
                     )
 
@@ -1014,9 +1087,15 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         for other in operations
                     )
                     if var in vars_conditional_only and not has_compound:
+                        # Loads memoized in one branch scope must precede
+                        # every statement in that branch that may reuse them.
                         loads: list[str] = []
                         emit_val(var, loads, f"inner_{op}")
-                        updates.extend(line.lstrip() for line in loads)
+                        (
+                            groups.is_inner_first
+                            if op == "first"
+                            else groups.inner_last_loads
+                        ).extend(line.lstrip() for line in loads)
                     updates.append(f"tl.store({out_ptr}, {safe_var}_val, mask=mask)")
 
     def _emit_inner_reduction_updates(
@@ -1050,10 +1129,10 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     )
                     kernel_code_lines.extend(
                         [
-                            f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
-                            f"{indent}{safe_var}_weight_{inner_type}_old = tl.load({weight_ptr}, mask=mask, other=0.0)",
-                            f"{indent}{safe_var}_weight_{inner_type}_new = {safe_var}_weight_{inner_type}_old + weight",
-                            f"{indent}{safe_var}_inner_{inner_type}_new = hydroforge_weighted_mean({safe_var}_inner_{inner_type}_old, {safe_var}_weight_{inner_type}_old, {var_val}, weight)",
+                            f"{indent}{safe_var}_inner_{inner_type}_old = tl.where(is_inner_first, 0.0, tl.load({inner_ptr}, mask=mask, other=0.0))",
+                            f"{indent}{safe_var}_weight_{inner_type}_old = tl.where(is_inner_first, 0.0, tl.load({weight_ptr}, mask=mask, other=0.0))",
+                            f"{indent}{safe_var}_weight_{inner_type}_new = {safe_var}_weight_{inner_type}_old + {self._triton_weight(var)}",
+                            f"{indent}{safe_var}_inner_{inner_type}_new = hydroforge_weighted_mean({safe_var}_inner_{inner_type}_old, {safe_var}_weight_{inner_type}_old, {var_val}, {self._triton_weight(var)})",
                         ]
                     )
                     # Store based on condition - use tl.where for efficiency
@@ -1073,8 +1152,8 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     )
                     kernel_code_lines.extend(
                         [
-                            f"{indent}{safe_var}_inner_{inner_type}_old = tl.load({inner_ptr}, mask=mask, other=0.0)",
-                            f"{indent}{safe_var}_inner_{inner_type}_new = {safe_var}_inner_{inner_type}_old + {var_val} * weight",
+                            f"{indent}{safe_var}_inner_{inner_type}_old = tl.where(is_inner_first, 0.0, tl.load({inner_ptr}, mask=mask, other=0.0))",
+                            f"{indent}{safe_var}_inner_{inner_type}_new = {safe_var}_inner_{inner_type}_old + {var_val} * {self._triton_weight(var)}",
                             f"{indent}tl.store({inner_ptr}, tl.where(is_inner_last, 0.0, {safe_var}_inner_{inner_type}_new), mask=mask)",
                             f"{indent}{val_for_var_inner} = tl.where(is_inner_last, {safe_var}_inner_{inner_type}_new, {val_for_var_inner})",
                         ]
@@ -1139,6 +1218,9 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             )
         ):
             kernel_code_lines.append(f"{indent}if is_inner_last:")
+            kernel_code_lines.extend(
+                f"{indent2}{line}" for line in groups.inner_last_loads
+            )
 
             # Emit deferred loads for conditional-only vars used in compound ops
             # These vars are only needed inside is_inner_last, so we load them here
@@ -1276,132 +1358,101 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         indent3: str,
         kernel_code_lines: list[str],
     ) -> None:
-        if dims_2d:
-
-            def is_last_only(name: str) -> bool:
-                operations = self._statistics_lowering.operations(name)
-                return len(operations) == 1 and operations[0].outer.value == "last"
-
-            non_last_only = [v for v in dims_2d if not is_last_only(v)]
-            last_only_vars = [v for v in dims_2d if is_last_only(v)]
-
-            if non_last_only:
-                for var in non_last_only:
-                    safe_var = self._get_safe_name(var)
-                    n_levels_var = self._statistics_layouts[var].actual_shape[-1]
-                    kernel_code_lines.extend(
+        # Level outputs use a [points, levels] tile whose contiguous level
+        # axis keeps each point's loads and stores coalesced.  Tile names are
+        # unique per variable and operation: Triton rejects branch merges of
+        # one name with differently shaped or typed tiles.
+        del indent3
+        lines = kernel_code_lines
+        for var in dims_2d:
+            safe_var = self._get_safe_name(var)
+            levels = self._statistics_layouts[var].actual_shape[-1]
+            operations = self._statistics_lowering.operations(var)
+            last_only = len(operations) == 1 and operations[0].output is Reduction.LAST
+            body = indent2 if last_only else indent
+            level = f"{safe_var}_level"
+            level_mask = f"{safe_var}_level_mask"
+            val = f"{safe_var}_tile"
+            lines.append(f"{indent}# 2D variable: {var}")
+            if last_only:
+                lines.append(f"{indent}if is_inner_last:")
+            lines.extend(
+                [
+                    f"{body}{level} = tl.arange(0, {1 << (levels - 1).bit_length()})[None, :]",
+                    f"{body}{level_mask} = mask[:, None] & ({level} < {levels})",
+                ]
+            )
+            out_offset = f"(t * n_saved_points + offs)[:, None] * {levels} + {level}"
+            val_name = self._emit_value(
+                var,
+                lines,
+                set(),
+                indent=body,
+                mask=level_mask,
+                offset=lambda key: (
+                    f"(t * {self._source_stride(key, logical_rank=2)} + idx)"
+                    f"[:, None] * {levels} + {level}"
+                ),
+            )
+            lines.append(f"{body}{val} = {val_name}")
+            branch = body + "    "
+            for operation in operations:
+                out_ptr = f"{safe_var}_{operation.spelling}_ptr + {out_offset}"
+                name = f"{safe_var}_{operation.spelling}_tile"
+                if operation.output is Reduction.MEAN:
+                    weight_ptr = (
+                        f"{safe_var}_mean_sample_weight_state_ptr + {out_offset}"
+                    )
+                    lines.extend(
                         [
-                            f"{indent}# 2D variable: {var}",
-                            f"{indent}for level in tl.static_range({n_levels_var}):",
+                            f"{body}{name}_old = tl.where(is_inner_first, 0.0, tl.load({out_ptr}, mask={level_mask}, other=0.0))",
+                            f"{body}{name}_old_weight = tl.where(is_inner_first, 0.0, tl.load({weight_ptr}, mask={level_mask}, other=0.0))",
+                            f"{body}tl.store({out_ptr}, hydroforge_weighted_mean({name}_old, {name}_old_weight, {val}, {self._triton_weight(var)}), mask={level_mask})",
+                            f"{body}tl.store({weight_ptr}, tl.where(is_inner_last, 0.0, {name}_old_weight + {self._triton_weight(var)}), mask={level_mask})",
                         ]
                     )
-                    out_offset = f"(t * n_saved_points + offs) * {n_levels_var} + level"
-
-                    val_name = self._emit_value(
-                        var,
-                        kernel_code_lines,
-                        set(),
-                        indent=indent2,
-                        offset=lambda key: (
-                            f"(t * {self._source_stride(key, logical_rank=2)} + idx) * {n_levels_var} + level"
-                        ),
-                    )
-                    kernel_code_lines.append(f"{indent2}val = {val_name}")
-
-                    for operation in self._statistics_lowering.operations(var):
-                        op = operation.spelling
-                        out_ptr = f"{safe_var}_{op}_ptr + {out_offset}"
-                        if operation.output is Reduction.MEAN:
-                            weight_ptr = (
-                                f"{safe_var}_mean_sample_weight_state_ptr + "
-                                f"{out_offset}"
-                            )
-                            kernel_code_lines.extend(
-                                [
-                                    f"{indent2}if is_inner_first:",
-                                    f"{indent3}old = tl.zeros_like(val)",
-                                    f"{indent3}old_weight = tl.zeros_like(val)",
-                                    f"{indent2}else:",
-                                    f"{indent3}old = tl.load({out_ptr}, mask=mask, other=0.0)",
-                                    f"{indent3}old_weight = tl.load({weight_ptr}, mask=mask, other=0.0)",
-                                    f"{indent2}new_weight = old_weight + weight",
-                                    f"{indent2}new = hydroforge_weighted_mean(old, old_weight, val, weight)",
-                                    f"{indent2}tl.store({out_ptr}, new, mask=mask)",
-                                    f"{indent2}tl.store({weight_ptr}, tl.where(is_inner_last, 0.0, new_weight), mask=mask)",
-                                ]
-                            )
-                        elif operation.output is Reduction.SUM:
-                            kernel_code_lines.extend(
-                                [
-                                    f"{indent2}if is_inner_first:",
-                                    f"{indent3}old = tl.zeros_like(val)",
-                                    f"{indent2}else:",
-                                    f"{indent3}old = tl.load({out_ptr}, mask=mask, other=0.0)",
-                                    f"{indent2}new = old + val * weight",
-                                    f"{indent2}tl.store({out_ptr}, new, mask=mask)",
-                                ]
-                            )
-                        elif operation.output in {Reduction.MAX, Reduction.MIN}:
-                            fn = (
-                                "hydroforge_maximum"
-                                if operation.output is Reduction.MAX
-                                else "hydroforge_minimum"
-                            )
-                            kernel_code_lines.extend(
-                                [
-                                    f"{indent2}if is_inner_first:",
-                                    f"{indent3}tl.store({out_ptr}, val, mask=mask)",
-                                    f"{indent2}else:",
-                                    f"{indent3}old = tl.load({out_ptr}, mask=mask, other=val)",
-                                    f"{indent3}new = {fn}(old, val)",
-                                    f"{indent3}tl.store({out_ptr}, new, mask=mask)",
-                                ]
-                            )
-                        elif operation.output is Reduction.LAST:
-                            kernel_code_lines.extend(
-                                [
-                                    f"{indent2}if is_inner_last:",
-                                    f"{indent3}tl.store({out_ptr}, val, mask=mask)",
-                                ]
-                            )
-                        elif operation.output is Reduction.FIRST:
-                            kernel_code_lines.extend(
-                                [
-                                    f"{indent2}if is_inner_first:",
-                                    f"{indent3}tl.store({out_ptr}, val, mask=mask)",
-                                ]
-                            )
-                kernel_code_lines.append("")
-
-            if last_only_vars:
-                kernel_code_lines.extend(
-                    [
-                        f"{indent}# 2D variables (last-only)",
-                        f"{indent}if is_inner_last:",
-                    ]
-                )
-                for var in last_only_vars:
-                    safe_var = self._get_safe_name(var)
-                    n_levels_var = self._statistics_layouts[var].actual_shape[-1]
-                    kernel_code_lines.append(
-                        f"{indent2}for level in tl.static_range({n_levels_var}):"
-                    )
-                    out_offset = f"(t * n_saved_points + offs) * {n_levels_var} + level"
-                    val_name = self._emit_value(
-                        var,
-                        kernel_code_lines,
-                        set(),
-                        indent=indent3,
-                        offset=lambda key: (
-                            f"(t * {self._source_stride(key, logical_rank=2)} + idx) * {n_levels_var} + level"
-                        ),
-                    )
-                    kernel_code_lines.extend(
+                elif operation.output is Reduction.SUM:
+                    lines.extend(
                         [
-                            f"{indent3}val = {val_name}",
-                            f"{indent3}tl.store({safe_var}_last_ptr + {out_offset}, val, mask=mask)",
+                            f"{body}{name}_old = tl.where(is_inner_first, 0.0, tl.load({out_ptr}, mask={level_mask}, other=0.0))",
+                            f"{body}tl.store({out_ptr}, {name}_old + {val} * {self._triton_weight(var)}, mask={level_mask})",
                         ]
                     )
+                elif operation.output in {Reduction.MAX, Reduction.MIN}:
+                    fn = (
+                        "hydroforge_maximum"
+                        if operation.output is Reduction.MAX
+                        else "hydroforge_minimum"
+                    )
+                    lines.extend(
+                        [
+                            f"{body}if is_inner_first:",
+                            f"{branch}tl.store({out_ptr}, {val}, mask={level_mask})",
+                            f"{body}else:",
+                            f"{branch}{name}_old = tl.load({out_ptr}, mask={level_mask}, other={val})",
+                            f"{branch}tl.store({out_ptr}, {fn}({name}_old, {val}), mask={level_mask})",
+                        ]
+                    )
+                elif operation.output is Reduction.LAST:
+                    if last_only:
+                        lines.append(
+                            f"{body}tl.store({out_ptr}, {val}, mask={level_mask})"
+                        )
+                    else:
+                        lines.extend(
+                            [
+                                f"{body}if is_inner_last:",
+                                f"{branch}tl.store({out_ptr}, {val}, mask={level_mask})",
+                            ]
+                        )
+                elif operation.output is Reduction.FIRST:
+                    lines.extend(
+                        [
+                            f"{body}if is_inner_first:",
+                            f"{branch}tl.store({out_ptr}, {val}, mask={level_mask})",
+                        ]
+                    )
+            lines.append("")
 
     def _emit_full_output_updates(
         self,
@@ -1440,29 +1491,29 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     weight_ptr = f"{safe_var}_{inner}_weight_state_ptr + offs"
                     kernel_code_lines.extend(
                         [
-                            f"{indent}inner_{inner}_old = tl.load({inner_ptr}, mask=var_mask, other=0.0)",
-                            f"{indent}weight_{inner}_old = tl.load({weight_ptr}, mask=var_mask, other=0.0)",
-                            f"{indent}weight_{inner}_new = weight_{inner}_old + weight",
-                            f"{indent}inner_{inner}_new = hydroforge_weighted_mean(inner_{inner}_old, weight_{inner}_old, {safe_var}_val, weight)",
-                            f"{indent}{val_for} = inner_{inner}_new",
+                            f"{indent}{safe_var}_inner_{inner}_old = tl.where(is_inner_first, 0.0, tl.load({inner_ptr}, mask=var_mask, other=0.0))",
+                            f"{indent}{safe_var}_weight_{inner}_old = tl.where(is_inner_first, 0.0, tl.load({weight_ptr}, mask=var_mask, other=0.0))",
+                            f"{indent}{safe_var}_weight_{inner}_new = {safe_var}_weight_{inner}_old + {self._triton_weight(var)}",
+                            f"{indent}{safe_var}_inner_{inner}_new = hydroforge_weighted_mean({safe_var}_inner_{inner}_old, {safe_var}_weight_{inner}_old, {safe_var}_val, {self._triton_weight(var)})",
+                            f"{indent}{val_for} = {safe_var}_inner_{inner}_new",
                             f"{indent}if is_inner_last:",
                             f"{indent2}tl.store({inner_ptr}, 0.0, mask=var_mask)",
                             f"{indent2}tl.store({weight_ptr}, 0.0, mask=var_mask)",
                             f"{indent}else:",
-                            f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=var_mask)",
-                            f"{indent2}tl.store({weight_ptr}, weight_{inner}_new, mask=var_mask)",
+                            f"{indent2}tl.store({inner_ptr}, {safe_var}_inner_{inner}_new, mask=var_mask)",
+                            f"{indent2}tl.store({weight_ptr}, {safe_var}_weight_{inner}_new, mask=var_mask)",
                         ]
                     )
                 elif inner == "sum":
                     kernel_code_lines.extend(
                         [
-                            f"{indent}inner_{inner}_old = tl.load({inner_ptr}, mask=var_mask, other=0.0)",
-                            f"{indent}inner_{inner}_new = inner_{inner}_old + {safe_var}_val * weight",
-                            f"{indent}{val_for} = inner_{inner}_new",
+                            f"{indent}{safe_var}_inner_{inner}_old = tl.where(is_inner_first, 0.0, tl.load({inner_ptr}, mask=var_mask, other=0.0))",
+                            f"{indent}{safe_var}_inner_{inner}_new = {safe_var}_inner_{inner}_old + {safe_var}_val * {self._triton_weight(var)}",
+                            f"{indent}{val_for} = {safe_var}_inner_{inner}_new",
                             f"{indent}if is_inner_last:",
                             f"{indent2}tl.store({inner_ptr}, 0.0, mask=var_mask)",
                             f"{indent}else:",
-                            f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=var_mask)",
+                            f"{indent2}tl.store({inner_ptr}, {safe_var}_inner_{inner}_new, mask=var_mask)",
                         ]
                     )
                 elif inner in {"max", "min"}:
@@ -1472,13 +1523,13 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     sentinel = "-float('inf')" if inner == "max" else "float('inf')"
                     kernel_code_lines.extend(
                         [
-                            f"{indent}inner_{inner}_old = tl.load({inner_ptr}, mask=var_mask, other={safe_var}_val)",
-                            f"{indent}inner_{inner}_new = tl.where(is_inner_first, {safe_var}_val, {function}(inner_{inner}_old, {safe_var}_val))",
-                            f"{indent}{val_for} = inner_{inner}_new",
+                            f"{indent}{safe_var}_inner_{inner}_old = tl.load({inner_ptr}, mask=var_mask, other={safe_var}_val)",
+                            f"{indent}{safe_var}_inner_{inner}_new = tl.where(is_inner_first, {safe_var}_val, {function}({safe_var}_inner_{inner}_old, {safe_var}_val))",
+                            f"{indent}{val_for} = {safe_var}_inner_{inner}_new",
                             f"{indent}if is_inner_last:",
                             f"{indent2}tl.store({inner_ptr}, {sentinel}, mask=var_mask)",
                             f"{indent}else:",
-                            f"{indent2}tl.store({inner_ptr}, inner_{inner}_new, mask=var_mask)",
+                            f"{indent2}tl.store({inner_ptr}, {safe_var}_inner_{inner}_new, mask=var_mask)",
                         ]
                     )
                 elif inner == "first":
@@ -1493,6 +1544,9 @@ class TritonStatisticsEmitter(StatisticsEmitter):
             for operation in self._statistics_lowering.operations(var):
                 op = operation.spelling
                 out_ptr = f"{safe_var}_{op}_ptr + offs"
+                # Branch-local names are unique per operation so Triton never
+                # merges tiles of different accumulator dtypes.
+                name = f"{safe_var}_{op}"
 
                 if operation.compound:
                     outer = operation.outer.value
@@ -1512,26 +1566,26 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                         )
                         kernel_code_lines.extend(
                             [
-                                f"{indent2}old = tl.load({out_ptr}, mask=var_mask, other={val_for})",
-                                f"{indent2}new = tl.where(is_outer_first, {val_for}, {fn}(old, {val_for}))",
-                                f"{indent2}tl.store({out_ptr}, new, mask=var_mask)",
+                                f"{indent2}{name}_old = tl.load({out_ptr}, mask=var_mask, other={val_for})",
+                                f"{indent2}{name}_new = tl.where(is_outer_first, {val_for}, {fn}({name}_old, {val_for}))",
+                                f"{indent2}tl.store({out_ptr}, {name}_new, mask=var_mask)",
                             ]
                         )
                     elif outer == "sum":
                         kernel_code_lines.extend(
                             [
-                                f"{indent2}old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
-                                f"{indent2}new = tl.where(is_outer_first, {val_for}, old + {val_for})",
-                                f"{indent2}tl.store({out_ptr}, new, mask=var_mask)",
+                                f"{indent2}{name}_old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
+                                f"{indent2}{name}_new = tl.where(is_outer_first, {val_for}, {name}_old + {val_for})",
+                                f"{indent2}tl.store({out_ptr}, {name}_new, mask=var_mask)",
                             ]
                         )
                     elif outer == "mean":
                         kernel_code_lines.extend(
                             [
-                                f"{indent2}old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
-                                f"{indent2}count = num_macro_steps.to({val_for}.dtype)",
-                                f"{indent2}new = tl.where(is_outer_first, {val_for}, hydroforge_weighted_mean(old, count - 1.0, {val_for}, 1.0))",
-                                f"{indent2}tl.store({out_ptr}, new, mask=var_mask)",
+                                f"{indent2}{name}_old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
+                                f"{indent2}{name}_count = num_macro_steps.to({name}_old.dtype)",
+                                f"{indent2}{name}_new = tl.where(is_outer_first, {val_for}, hydroforge_weighted_mean({name}_old, {name}_count - 1.0, {val_for}, 1.0))",
+                                f"{indent2}tl.store({out_ptr}, {name}_new, mask=var_mask)",
                             ]
                         )
                     elif outer == "last":
@@ -1549,31 +1603,31 @@ class TritonStatisticsEmitter(StatisticsEmitter):
                     weight_ptr = f"{safe_var}_mean_sample_weight_state_ptr + offs"
                     kernel_code_lines.extend(
                         [
-                            f"{indent}old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
-                            f"{indent}old_weight = tl.load({weight_ptr}, mask=var_mask, other=0.0)",
-                            f"{indent}old = tl.where(is_inner_first, 0.0, old)",
-                            f"{indent}old_weight = tl.where(is_inner_first, 0.0, old_weight)",
-                            f"{indent}new_weight = old_weight + weight",
-                            f"{indent}new = hydroforge_weighted_mean(old, old_weight, {safe_var}_val, weight)",
-                            f"{indent}tl.store({out_ptr}, new, mask=var_mask)",
-                            f"{indent}tl.store({weight_ptr}, tl.where(is_inner_last, 0.0, new_weight), mask=var_mask)",
+                            f"{indent}{name}_old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
+                            f"{indent}{name}_old_weight = tl.load({weight_ptr}, mask=var_mask, other=0.0)",
+                            f"{indent}{name}_old = tl.where(is_inner_first, 0.0, {name}_old)",
+                            f"{indent}{name}_old_weight = tl.where(is_inner_first, 0.0, {name}_old_weight)",
+                            f"{indent}{name}_new_weight = {name}_old_weight + {self._triton_weight(var)}",
+                            f"{indent}{name}_new = hydroforge_weighted_mean({name}_old, {name}_old_weight, {safe_var}_val, {self._triton_weight(var)})",
+                            f"{indent}tl.store({out_ptr}, {name}_new, mask=var_mask)",
+                            f"{indent}tl.store({weight_ptr}, tl.where(is_inner_last, 0.0, {name}_new_weight), mask=var_mask)",
                         ]
                     )
                 elif op == "sum":
                     kernel_code_lines.extend(
                         [
-                            f"{indent}old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
-                            f"{indent}new = tl.where(is_inner_first, 0.0, old) + {safe_var}_val * weight",
-                            f"{indent}tl.store({out_ptr}, new, mask=var_mask)",
+                            f"{indent}{name}_old = tl.load({out_ptr}, mask=var_mask, other=0.0)",
+                            f"{indent}{name}_new = tl.where(is_inner_first, 0.0, {name}_old) + {safe_var}_val * {self._triton_weight(var)}",
+                            f"{indent}tl.store({out_ptr}, {name}_new, mask=var_mask)",
                         ]
                     )
                 elif op in {"max", "min"}:
                     fn = "hydroforge_maximum" if op == "max" else "hydroforge_minimum"
                     kernel_code_lines.extend(
                         [
-                            f"{indent}old = tl.load({out_ptr}, mask=var_mask, other={safe_var}_val)",
-                            f"{indent}new = tl.where(is_inner_first, {safe_var}_val, {fn}(old, {safe_var}_val))",
-                            f"{indent}tl.store({out_ptr}, new, mask=var_mask)",
+                            f"{indent}{name}_old = tl.load({out_ptr}, mask=var_mask, other={safe_var}_val)",
+                            f"{indent}{name}_new = tl.where(is_inner_first, {safe_var}_val, {fn}({name}_old, {safe_var}_val))",
+                            f"{indent}tl.store({out_ptr}, {name}_new, mask=var_mask)",
                         ]
                     )
                 elif op == "last":
@@ -1589,67 +1643,80 @@ class TritonStatisticsEmitter(StatisticsEmitter):
     def _emit_scatter_launchers(
         self, *, kernel_code_lines: list[str], scatters: tuple
     ) -> None:
+        all_lines = kernel_code_lines
         for variable in scatters:
-            var = variable.name
-            scatter = variable.source
-            safe_var = self._get_safe_name(var)
-            buf_key = f"__scatter_buf_{var}"
-            is_mean = scatter.reduction.value == "mean"
-            scatter_ensemble = str(
-                self.ensemble_size if self._statistics_layouts[var].batched else 1
+            kernel_code_lines = []
+            self._emit_scatter_launcher(kernel_code_lines, variable)
+            _extend_host_gated(
+                all_lines,
+                kernel_code_lines,
+                self._statistics_lowering.scatter_phase_mask(variable.name),
             )
+
+    def _emit_scatter_launcher(self, kernel_code_lines: list[str], variable) -> None:
+        var = variable.name
+        scatter = variable.source
+        safe_var = self._get_safe_name(var)
+        buf_key = f"__scatter_buf_{var}"
+        is_mean = scatter.reduction.value == "mean"
+        gate = (
+            ["states['__sub_step']", "states['__num_sub_steps']", "states['__flags']"]
+            if self._statistics_lowering.scatter_phase_mask(var) is not None
+            else []
+        )
+        scatter_ensemble = str(
+            self.ensemble_size if self._statistics_layouts[var].batched else 1
+        )
+        kernel_code_lines.append(f"    _N_{safe_var} = states['{buf_key}'].shape[-1]")
+        kernel_code_lines.append(f"    _M_{safe_var} = len(states['{scatter.index}'])")
+        zero_args = [f"states['{buf_key}']"]
+        if is_mean:
+            cnt_key = f"__scatter_cnt_{var}"
+            zero_args.append(f"states['{cnt_key}']")
+        zero_args.extend([f"_N_{safe_var}", "BLOCK_SIZE", scatter_ensemble, *gate])
+        if self._storage[buf_key].shape[-1] > 0:
             kernel_code_lines.append(
-                f"    _N_{safe_var} = states['{buf_key}'].shape[-1]"
+                f"    launch_triton_kernel(scatter_zero_{safe_var}, "
+                f"(triton.cdiv(_N_{safe_var}, BLOCK_SIZE),), physics=False)"
+                f"({', '.join(zero_args)})"
             )
+        add_args = [f"states['{buf_key}']"]
+        if is_mean:
+            add_args.append(f"states['{cnt_key}']")
+        sorted_src = list(self._statistics_ir.scatter_inputs(var))
+        for token in sorted_src:
+            add_args.append(f"states['{token}']")
+        add_args.extend(
+            [
+                f"_M_{safe_var}",
+                f"_N_{safe_var}",
+                "BLOCK_SIZE",
+                scatter_ensemble,
+            ]
+        )
+        for token in sorted_src:
+            add_args.append(str(self._source_stride(token)))
+        add_args.extend(gate)
+        if self._tensor_registry[scatter.index].numel() > 0:
             kernel_code_lines.append(
-                f"    _M_{safe_var} = len(states['{scatter.index}'])"
+                f"    launch_triton_kernel(scatter_add_{safe_var}, "
+                f"(triton.cdiv(_M_{safe_var}, BLOCK_SIZE),), physics=False)"
+                f"({', '.join(add_args)})"
             )
-            zero_args = [f"states['{buf_key}']"]
-            if is_mean:
-                cnt_key = f"__scatter_cnt_{var}"
-                zero_args.append(f"states['{cnt_key}']")
-            zero_args.extend([f"_N_{safe_var}", "BLOCK_SIZE", scatter_ensemble])
-            if self._storage[buf_key].shape[-1] > 0:
-                kernel_code_lines.append(
-                    f"    scatter_zero_{safe_var}["
-                    f"(triton.cdiv(_N_{safe_var}, BLOCK_SIZE),)]"
-                    f"({', '.join(zero_args)})"
-                )
-            add_args = [f"states['{buf_key}']"]
-            if is_mean:
-                add_args.append(f"states['{cnt_key}']")
-            sorted_src = list(self._statistics_ir.scatter_inputs(var))
-            for token in sorted_src:
-                add_args.append(f"states['{token}']")
-            add_args.extend(
-                [
-                    f"_M_{safe_var}",
-                    f"_N_{safe_var}",
-                    "BLOCK_SIZE",
-                    scatter_ensemble,
-                ]
+        if is_mean and self._storage[buf_key].shape[-1] > 0:
+            div_args = [
+                f"states['{buf_key}']",
+                f"states['{cnt_key}']",
+                f"_N_{safe_var}",
+                "BLOCK_SIZE",
+                scatter_ensemble,
+                *gate,
+            ]
+            kernel_code_lines.append(
+                f"    launch_triton_kernel(scatter_divide_{safe_var}, "
+                f"(triton.cdiv(_N_{safe_var}, BLOCK_SIZE),), physics=False)"
+                f"({', '.join(div_args)})"
             )
-            for token in sorted_src:
-                add_args.append(str(self._source_stride(token)))
-            if self._tensor_registry[scatter.index].numel() > 0:
-                kernel_code_lines.append(
-                    f"    scatter_add_{safe_var}["
-                    f"(triton.cdiv(_M_{safe_var}, BLOCK_SIZE),)]"
-                    f"({', '.join(add_args)})"
-                )
-            if is_mean and self._storage[buf_key].shape[-1] > 0:
-                div_args = [
-                    f"states['{buf_key}']",
-                    f"states['{cnt_key}']",
-                    f"_N_{safe_var}",
-                    "BLOCK_SIZE",
-                    scatter_ensemble,
-                ]
-                kernel_code_lines.append(
-                    f"    scatter_divide_{safe_var}["
-                    f"(triton.cdiv(_N_{safe_var}, BLOCK_SIZE),)]"
-                    f"({', '.join(div_args)})"
-                )
 
     def _emit_group_launchers(
         self,
@@ -1657,50 +1724,62 @@ class TritonStatisticsEmitter(StatisticsEmitter):
         grouped_by_output_index: dict[str, list[str]],
         kernel_code_lines: list[str],
     ) -> None:
+        all_lines = kernel_code_lines
         for output_index, var_list in grouped_by_output_index.items():
-            full_output = output_index == _FULL_OUTPUT_GROUP
-            if full_output:
-                full_len = max(
-                    prod(self._statistics_layouts[var].actual_shape) for var in var_list
-                )
-                if full_len == 0:
-                    kernel_code_lines.append(
-                        "    # Skip empty full-output statistics group"
-                    )
-                    continue
-                extent = "full_len"
-                kernel_name, grid_name = _FULL_OUTPUT_KERNEL, _FULL_OUTPUT_GRID
-                kernel_code_lines.append(f"    full_len = {full_len}")
-            else:
-                if self._tensor_registry[output_index].numel() == 0:
-                    kernel_code_lines.append(
-                        f"    # Skip empty statistics group {output_index}"
-                    )
-                    continue
-                safe_output_index = self._get_safe_name(output_index)
-                extent = "output_index_len"
-                kernel_name, grid_name = (
-                    f"kernel_{safe_output_index}",
-                    f"grid_{safe_output_index}",
-                )
+            kernel_code_lines = []
+            self._emit_group_launcher(kernel_code_lines, output_index, var_list)
+            _extend_host_gated(
+                all_lines,
+                kernel_code_lines,
+                self._statistics_lowering.group_phase_mask(output_index),
+            )
+
+    def _emit_group_launcher(
+        self, kernel_code_lines: list[str], output_index: str, var_list
+    ) -> None:
+        full_output = output_index == _FULL_OUTPUT_GROUP
+        if full_output:
+            full_len = max(
+                prod(self._statistics_layouts[var].actual_shape) for var in var_list
+            )
+            if full_len == 0:
                 kernel_code_lines.append(
-                    f"    output_index_len = len(states['{output_index}'])"
+                    "    # Skip empty full-output statistics group"
                 )
-            kernel_code_lines.extend(
-                [
-                    f"    {grid_name} = lambda meta: (triton.cdiv({extent}, meta['BLOCK_SIZE']),)",
-                    f"    {kernel_name}[{grid_name}](",
-                ]
+                return
+            extent = "full_len"
+            kernel_name, grid_name = _FULL_OUTPUT_KERNEL, _FULL_OUTPUT_GRID
+            kernel_code_lines.append(f"    full_len = {full_len}")
+        else:
+            if self._tensor_registry[output_index].numel() == 0:
+                kernel_code_lines.append(
+                    f"    # Skip empty statistics group {output_index}"
+                )
+                return
+            safe_output_index = self._get_safe_name(output_index)
+            extent = "output_index_len"
+            kernel_name, grid_name = (
+                f"kernel_{safe_output_index}",
+                f"grid_{safe_output_index}",
             )
-            kernel_code_lines.extend(
-                f"        {name}=states['{key}'],"
-                for name, key in self._group_pointer_arguments(
-                    output_index, var_list
-                ).items()
+            kernel_code_lines.append(
+                f"    output_index_len = len(states['{output_index}'])"
             )
-            extent_name = "n_elements" if full_output else "n_saved_points"
-            kernel_code_lines.append(f"        {extent_name}={extent},")
-            kernel_code_lines.append("        BLOCK_SIZE=BLOCK_SIZE,")
-            if not full_output:
-                kernel_code_lines.append("        ensemble_size=ensemble_size,")
-            kernel_code_lines.extend(["    )", ""])
+        kernel_code_lines.extend(
+            [
+                f"    {grid_name} = lambda meta: (triton.cdiv({extent}, meta['BLOCK_SIZE']),)",
+                f"    launch_triton_kernel({kernel_name}, {grid_name}, physics=False)(",
+            ]
+        )
+        kernel_code_lines.extend(
+            f"        {name}=states['{key}'],"
+            for name, key in self._group_pointer_arguments(
+                output_index, var_list
+            ).items()
+        )
+        extent_name = "n_elements" if full_output else "n_saved_points"
+        kernel_code_lines.append(f"        {extent_name}={extent},")
+        kernel_code_lines.append("        BLOCK_SIZE=BLOCK_SIZE,")
+        if not full_output:
+            kernel_code_lines.append("        ensemble_size=ensemble_size,")
+        kernel_code_lines.extend(["    )", ""])

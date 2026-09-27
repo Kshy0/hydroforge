@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
-from pydantic import PrivateAttr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from hydroforge.contracts.naming import validate_safe_path_component
 from hydroforge.contracts.validation import HydroForgeModel
@@ -53,7 +53,7 @@ def _own_source_nan_mask(
 class _BuildLocalMappingRequest(HydroForgeModel):
     """Validated request for installing one local spatial mapping."""
 
-    mapping_file: str | Path
+    mapping_file: Path = Field(strict=False)
     desired_catchment_ids: np.ndarray | None = None
     device: torch.device | None = None
     precision: Literal["float32", "float64"] = "float32"
@@ -83,15 +83,15 @@ class _BuildLocalMappingRequest(HydroForgeModel):
 class _GenerateMappingTableRequest(HydroForgeModel):
     """Complete public declaration for offline Dataset mapping generation."""
 
-    map_dir: str | Path
-    out_dir: str | Path
+    map_dir: Path = Field(strict=False)
+    out_dir: Path = Field(strict=False)
     npz_file: str = "grid_mapping.npz"
     mapinfo_txt: str = "location.txt"
     hires_tag: str | None = "1min"
     lowres_idx_precision: str = "<i4"
     hires_idx_precision: str = "<i2"
     map_precision: str = "<f4"
-    parameter_nc: str | Path | None = None
+    parameter_nc: Path | None = Field(default=None, strict=False)
     allow_oob_zero: bool = False
     source_nan_policy: Literal["keep", "drop", "nearest"] = "keep"
     source_nan_mask: np.ndarray | None = None
@@ -430,10 +430,13 @@ class GriddedDataset(SourceDataset, ABC):
         )
 
         ro_lon, ro_lat = self.get_coordinates()
+        ro_lon_bounds, ro_lat_bounds = self.get_coordinate_bounds()
         mapping = build_cama_mapping(
             ro_lon,
             ro_lat,
             request.map_dir,
+            source_lon_bounds=ro_lon_bounds,
+            source_lat_bounds=ro_lat_bounds,
             hires_tag=request.hires_tag,
             mapinfo_txt=request.mapinfo_txt,
             lowres_idx_precision=request.lowres_idx_precision,
@@ -485,6 +488,13 @@ class GriddedDataset(SourceDataset, ABC):
         To be implemented by subclasses, returns the coordinates of the dataset.
         """
         ...
+
+    def get_coordinate_bounds(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Return optional source-cell bounds for spatial mapping."""
+
+        return None, None
 
     @property
     def data_size(self) -> int:

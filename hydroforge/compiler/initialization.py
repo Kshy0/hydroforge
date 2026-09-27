@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 from hydroforge.compiler.model import FieldNamespaceCompiler
 from hydroforge.compiler.namespace import NamespaceCompiler
 from hydroforge.compiler.statistics_binding import (
-    DisabledStatisticsBinding,
     StatisticsBindingCompiler,
 )
 from hydroforge.contracts.errors import ResourceCleanupError
@@ -17,6 +16,8 @@ from hydroforge.execution.parameters import ParameterPlanRuntime
 from hydroforge.execution.progress import ProgressRuntime
 from hydroforge.execution.runtime import ModelExecution
 from hydroforge.output.checkpoint import CheckpointRuntime
+from hydroforge.statistics.observer import StatisticsObserver
+from hydroforge.statistics.runtime import StatisticsRuntime
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -28,9 +29,7 @@ class ModelInitializer:
     def __init__(self, model: AbstractModel) -> None:
         self.model = model
         self._execution: ModelExecution | None = None
-        self._statistics: (
-            DisabledStatisticsBinding | StatisticsBindingCompiler | None
-        ) = None
+        self._statistics: StatisticsRuntime | None = None
 
     def run(self) -> None:
         model = self.model
@@ -41,7 +40,6 @@ class ModelInitializer:
                 validate_input_contract(model)
             self._runtime_services()
             self._construct_modules()
-            self._precompile_backend()
             self._apply_tensor_modes()
             model.initialize_model_state()
             self._compile_checkpoint()
@@ -134,20 +132,6 @@ class ModelInitializer:
         for name in model.opened_modules:
             model._modules[name]._tensors._apply_modes()
 
-    def _precompile_backend(self) -> None:
-        """Materialize only backend extensions reachable by opened modules."""
-        model = self.model
-        execution = model._execution
-        if execution.backend != "cuda":
-            return
-        catalogs = tuple(getattr(model, "cuda_extension_modules", ()))
-        if not catalogs:
-            return
-        execution.precompile_cuda_catalogs(
-            catalogs,
-            model.opened_modules,
-        )
-
     def _compile_field_namespace(self) -> None:
         namespace = FieldNamespaceCompiler(self.model).compile()
         self.model._field_namespace = namespace
@@ -168,12 +152,14 @@ class ModelInitializer:
         model = self.model
         declaration = model._semantic_plan.statistics
         statistics = (
-            DisabledStatisticsBinding()
+            None
             if declaration is None
-            else StatisticsBindingCompiler(model, declaration)
+            else StatisticsBindingCompiler(model).compile(declaration)
         )
         self._statistics = statistics
         model._statistics = statistics
+        if statistics is not None:
+            model._execution.statistics = StatisticsObserver(model, statistics)
 
     def _compile_execution(self) -> None:
         from hydroforge.execution.step import compile_step_policies
