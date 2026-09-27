@@ -144,17 +144,24 @@ def _evaluate_expression(
     )
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         result = _OPERATIONS[operation](left_array, right_array)
-    if np.isinf(result).any() and not (operation == "div" and np.any(right_array == 0)):
-        if out_dtype == "float32":
+    try:
+        return canonical_floating_array(
+            result,
+            dtype=out_dtype,
+            label="dataset expression result",
+        )
+    except ValueError:
+        if np.isinf(result).any() and not (
+            operation == "div" and np.any(right_array == 0)
+        ):
+            if out_dtype == "float32":
+                raise OverflowError(
+                    "dataset expression result contains values outside float32 range"
+                ) from None
             raise OverflowError(
-                "dataset expression result contains values outside float32 range"
-            )
-        raise OverflowError("dataset expression result overflowed float64")
-    return canonical_floating_array(
-        result,
-        dtype=out_dtype,
-        label="dataset expression result",
-    )
+                "dataset expression result overflowed float64"
+            ) from None
+        raise
 
 
 @dataclass(frozen=True, slots=True)

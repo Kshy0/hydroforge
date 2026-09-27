@@ -8,6 +8,7 @@ from typing import Annotated, Any, NoReturn, TypeAlias, TypeVar
 
 from pydantic import AfterValidator, BaseModel, ConfigDict
 
+
 _PUBLIC_MODEL_CONFIG = ConfigDict(
     arbitrary_types_allowed=True,
     extra="forbid",
@@ -65,7 +66,16 @@ class HydroForgeModel(BaseModel):
         )
 
 
-class _ImmutableDict(dict[Any, Any]):
+class _ImmutableDictType(type):
+    """Populate entries at construction so ``__init__`` can stay closed."""
+
+    def __call__(cls, *args: Any, **kwargs: Any) -> Any:
+        instance = cls.__new__(cls)
+        dict.__init__(instance, *args, **kwargs)
+        return instance
+
+
+class _ImmutableDict(dict[Any, Any], metaclass=_ImmutableDictType):
     """A serializer-friendly immutable mapping for frozen model fields."""
 
     __slots__ = ()
@@ -75,6 +85,7 @@ class _ImmutableDict(dict[Any, Any]):
         del args, kwargs
         raise TypeError("frozen HydroForge model mappings are immutable")
 
+    __init__ = _reject_mutation
     __setitem__ = _reject_mutation
     __delitem__ = _reject_mutation
     __ior__ = _reject_mutation

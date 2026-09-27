@@ -47,6 +47,7 @@ from hydroforge.data.datasets.timeline import DatasetTimeline, ReadOp
 from hydroforge.data.distributed import _find_indices_in_trusted, is_rank_zero
 from hydroforge.data.netcdf import (
     _configure_netcdf_variable_cache,
+    _decoded_element_bytes,
     _NetCDFReadHandlePool,
     _planned_exported_netcdf_chunk_len,
     _read_netcdf_var_sliced_trusted,
@@ -239,7 +240,7 @@ def _quantile_levels(value: Any) -> np.ndarray:
 
 
 class _QuantileExportRequest(HydroForgeModel):
-    out_path: Annotated[Path, BeforeValidator(lambda value: Path(value))]
+    out_path: Path = Field(strict=False)
     quantiles: Annotated[np.ndarray, BeforeValidator(_quantile_levels)]
     var_name: str = Field(min_length=1)
     dtype: Literal["float32", "float64"] = "float32"
@@ -332,7 +333,7 @@ class ExportedDataset(SourceDataset):
     reusable_expression_reads: ClassVar[bool] = True
     _POINT_DIM: ClassVar[str] = "saved_points"
 
-    base_dir: str | Path
+    base_dir: Path = Field(strict=False)
     var_name: str
     prefix: str
     chunk_len: int | None = Field(default=None, strict=True, ge=1)
@@ -449,7 +450,8 @@ class ExportedDataset(SourceDataset):
                 "window_starts and window_length extend beyond the main "
                 f"source axis of {self._temporal_domain.count} steps"
             )
-        if self.chunk_len is None:
+        auto_chunk_len = self.chunk_len is None
+        if auto_chunk_len:
             key = self.time_to_key(self.start_date)
             if type(key) is not str:
                 raise TypeError("time_to_key must return an exact string")
@@ -470,6 +472,8 @@ class ExportedDataset(SourceDataset):
             time_aggregation=self.time_aggregation,
             data_variable=self.var_name,
         )
+        if auto_chunk_len:
+            self._timeline._fit_auto_chunk_len()
         source_paths = tuple(
             Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
             for key in sorted(self._timeline.file_times)
@@ -549,17 +553,6 @@ class ExportedDataset(SourceDataset):
                 result.time_shift_steps,
             )
         return result
-
-    @staticmethod
-    def _detect_chunk_len(base_dir, prefix, suffix, var_name, start_date, time_to_key):
-        """Detect chunk_len from file's NetCDF time chunking."""
-        key = time_to_key(start_date)
-        if type(key) is not str:
-            raise TypeError("time_to_key must return an exact string")
-        path = Path(base_dir) / f"{prefix}{key}{suffix}"
-        if not path.exists():
-            return 24
-        return _planned_exported_netcdf_chunk_len(path, var_name)
 
     @staticmethod
     def _compile_groups(shift: np.ndarray) -> list:
@@ -795,22 +788,10 @@ class ExportedDataset(SourceDataset):
                 Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
             )
             with self._read_handles.acquire(path) as dataset:
-                variable = dataset.variables[self.var_name]
-                read_dtype = np.dtype(variable.dtype)
-                # netCDF4 applies packing attributes while reading. Include
-                # their dtype in the estimate because a packed integer source
-                # can therefore materialize as floating point in memory.
-                for attribute in ("scale_factor", "add_offset"):
-                    if hasattr(variable, attribute):
-                        read_dtype = np.result_type(
-                            read_dtype,
-                            np.asarray(getattr(variable, attribute)).dtype,
-                        )
-                if not np.issubdtype(read_dtype, np.floating):
-                    # Missing integer values are promoted to float64 by the
-                    # source payload boundary.
-                    element_bytes = max(element_bytes, 8)
-                element_bytes = max(element_bytes, read_dtype.itemsize)
+                element_bytes = max(
+                    element_bytes,
+                    _decoded_element_bytes(dataset.variables[self.var_name]),
+                )
             self._verify_source_path(path)
         return element_bytes
 
@@ -1428,7 +1409,7 @@ class ExportedDataset(SourceDataset):
 # Composite multi-variable wrapper
 # ---------------------------------------------------------------------------
 class _OpenMultivariableExportedRequest(HydroForgeModel):
-    base_dir: str | Path
+    base_dir: Path = Field(strict=False)
     var_specs: Any
     start_date: DateLike
     end_date: DateLike
@@ -1512,23 +1493,7 @@ def open_multivariable_exported(
     }
     if request.time_to_key is not None:
         shared["time_to_key"] = request.time_to_key
-    if request.chunk_len is not None:
-        shared["chunk_len"] = request.chunk_len
-    else:
-        first_name, first_spec = request.compiled_specs[0]
-        first_prefix = first_spec.get("prefix", f"{first_name}_")
-        first_suffix = first_spec.get("suffix", "rank0.nc")
-        first_time_to_key = (
-            request.time_to_key if request.time_to_key is not None else single_file_key
-        )
-        shared["chunk_len"] = ExportedDataset._detect_chunk_len(
-            request.base_dir,
-            first_prefix,
-            first_suffix,
-            first_name,
-            request.start_date,
-            first_time_to_key,
-        )
+    shared["chunk_len"] = request.chunk_len
     datasets = {}
     for name, spec in request.compiled_specs:
         options = shared | spec
@@ -1536,5 +1501,8 @@ def open_multivariable_exported(
         if "prefix" not in options:
             options["prefix"] = f"{name}_"
         datasets[name] = ExportedDataset(**options)
+        if shared["chunk_len"] is None:
+            # Later children share the first child's automatic plan.
+            shared["chunk_len"] = datasets[name].chunk_len
 
     return ExportedMultiVariableDataset(datasets=datasets)

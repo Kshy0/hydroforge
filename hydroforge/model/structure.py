@@ -77,7 +77,7 @@ class StructuralUpdateContext:
     ) -> None:
         """Reject growth that would resize an installed output domain."""
 
-        statistics = getattr(self._model._statistics, "aggregator", None)
+        statistics = self._model._statistics
         if statistics is not None:
             statistics.require_output_coordinate_resize_safe(
                 coordinate,
@@ -434,6 +434,89 @@ def _validate_replacements(
     return replacements
 
 
+def _reference_must_resolve_locally(model: AbstractModel, field: Any) -> bool:
+    """Return whether a local lookup miss can only mean a dangling reference."""
+    if model.spatial_world_size == 1 or field.tensor.is_coordinate:
+        return True
+    schema = model._partition.schema.fields
+    target = schema.get(field.tensor.references.rsplit(".", 1)[-1])
+    if target is not None and target.replicated:
+        return True
+    return any(
+        metadata.partition_by and metadata.partition_by.rsplit(".", 1)[-1] == field.name
+        for metadata in schema.values()
+    )
+
+
+def _validate_update_integrity(
+    model: AbstractModel,
+    fields: Mapping[int, list[tuple[Any, str, Any]]],
+    replacements: Mapping[int, torch.Tensor],
+) -> None:
+    """Re-check staged keys and the references that read or target them.
+
+    Commits are rank-local and may run on a subset of ranks, so no collective
+    is used: a miss is rejected whenever it cannot be an off-rank target.
+    """
+    from hydroforge.data.distributed import _find_indices_in_torch_trusted
+    from hydroforge.model.tensors import ModuleTensors
+
+    for identity, matches in fields.items():
+        for _module, _field_name, schema in matches:
+            if schema is not None and schema.tensor is not None:
+                ModuleTensors._validate_key(schema, replacements[identity])
+
+    namespace = model._namespace.build()
+    for module_name in model.opened_modules:
+        module = model._modules[module_name]
+        for field in module.tensor_schema():
+            if (
+                field.computed
+                or not field.tensor.references
+                or not module._is_tensor_field_active(field)
+            ):
+                continue
+            values = getattr(module, field.name)
+            reference = field.tensor.references
+            entry = namespace.get(reference) or namespace.get(
+                f"{module_name}.{reference}"
+            )
+            if entry is None:
+                raise ValueError(
+                    f"reference {module_name}.{field.name} target {reference!r} "
+                    "does not resolve to one opened tensor"
+                )
+            target = getattr(entry.module, entry.field_name)
+            if id(values) not in replacements and id(target) not in replacements:
+                continue
+            if not isinstance(values, torch.Tensor) or not isinstance(
+                target, torch.Tensor
+            ):
+                continue
+            values = replacements.get(id(values), values).reshape(-1)
+            target = replacements.get(id(target), target).reshape(-1)
+            missing = (
+                _find_indices_in_torch_trusted(values, target.to(values.device)) < 0
+            )
+            if bool(missing.any()) and _reference_must_resolve_locally(model, field):
+                raise ValueError(
+                    f"update leaves {int(missing.sum().item())} value(s) of "
+                    f"reference {module_name}.{field.name} absent from "
+                    f"{reference!r}; examples: {values[missing][:5].tolist()}"
+                )
+
+
+def _stale_reference_indices(
+    model: AbstractModel,
+    replacements: Mapping[int, torch.Tensor],
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    """Recompute derived indices whose source or target storage is staged."""
+    stale: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for module_name in model.opened_modules:
+        stale.extend(model._modules[module_name]._stale_reference_indices(replacements))
+    return tuple(stale)
+
+
 def commit_content_update(
     model: AbstractModel,
     bindings: Iterable[tuple[torch.Tensor, torch.Tensor]],
@@ -465,15 +548,27 @@ def _commit_content_update(
                     f"address-stable content update cannot change coordinate "
                     f"{field_name!r}"
                 )
+    _validate_update_integrity(model, fields, replacements)
+    derived = _stale_reference_indices(model, replacements)
+    for current, fresh in derived:
+        if (
+            current.shape != fresh.shape
+            or current.dtype != fresh.dtype
+            or current.device != fresh.device
+        ):
+            raise ValueError(
+                "address-stable content update would change the layout of a "
+                "derived reference index"
+            )
 
     mutated = False
     try:
         _synchronize(torch.device(model.device))
         mutated = True
         with torch.inference_mode():
-            for current, replacement in pairs:
+            for current, replacement in (*pairs, *derived):
                 current.copy_(replacement)
-        statistics = getattr(model._statistics, "aggregator", None)
+        statistics = model._statistics
         if statistics is not None:
             statistics.refresh_address_stable_sources()
         return StructuralUpdateResult(
@@ -512,6 +607,8 @@ def _commit_structural_update(
     fields = _replacement_fields(model, replacements)
     inferred = _infer_dimensions(fields, replacements)
     _validate_dependent_shapes(model, replacements, inferred)
+    _validate_update_integrity(model, fields, replacements)
+    derived = _stale_reference_indices(model, replacements)
     previous_dimensions = {
         key: int(getattr(dimension.owner, dimension.attribute))
         for key, (dimension, _extent) in inferred.items()
@@ -525,10 +622,15 @@ def _commit_structural_update(
         with torch.inference_mode():
             for current, replacement in pairs:
                 current.set_(replacement)
+            for current, fresh in derived:
+                if current.shape == fresh.shape:
+                    current.copy_(fresh)
+                else:
+                    current.set_(fresh)
         changes = _publish_dimensions(inferred, previous_dimensions)
         _verify_dimensions(inferred)
 
-        statistics = getattr(model._statistics, "aggregator", None)
+        statistics = model._statistics
         if statistics is not None:
             statistics.recompile_resized_sources()
 

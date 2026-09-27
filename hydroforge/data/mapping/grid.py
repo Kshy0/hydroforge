@@ -1,4 +1,4 @@
-"""Rectilinear regular-grid geometry for spatial mapping.
+"""Rectilinear grid geometry for spatial mapping.
 
 The :class:`RegularGrid` describes a source or target rectilinear grid with
 C-order ``(y, x)`` flattening, cell bounds, and a single point-to-cell index
@@ -20,7 +20,17 @@ from hydroforge.data.numeric import canonical_float64, immutable_array
 
 _X_NAMES = ("lon", "longitude", "x")
 _Y_NAMES = ("lat", "latitude", "y")
-_GLOBAL_LONGITUDE_ATOL = 2.0e-5
+# Longitude bound span tolerance for a periodic (global) axis: two float32
+# roundings at 360 degrees.  Always capped below a quarter of the narrowest
+# cell so a regional axis missing one cell is never treated as global.
+_GLOBAL_LONGITUDE_ATOL = 2.0 * float(np.finfo(np.float32).eps) * 360.0
+
+
+def _has_duplicates(values: np.ndarray) -> bool:
+    """Exact duplicate test; a sort is much cheaper than ``np.unique`` here."""
+
+    ordered = np.sort(values, axis=None)
+    return bool(np.any(ordered[1:] == ordered[:-1]))
 
 
 def _as_axis_names(names: str | Sequence[str]) -> tuple[str, ...]:
@@ -53,8 +63,8 @@ def _find_variable(ds: NCDataset, names: Sequence[str]) -> str:
 def _regular_axes(
     x_coord: np.ndarray, y_coord: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    # Preserve the source dtype until validation so float32 coordinate
-    # quantisation can be distinguished from a genuinely irregular axis.
+    # Preserve the source dtype until validation so coordinate quantisation is
+    # distinguished from a genuinely non-monotonic axis.
     for name, value in (("x", x_coord), ("y", y_coord)):
         if np.ma.isMaskedArray(value) and np.any(np.ma.getmaskarray(value)):
             raise ValueError(f"{name} coordinates contain missing values")
@@ -93,18 +103,52 @@ def _validate_axis(values: np.ndarray, name: str) -> np.ndarray:
         raise ValueError(f"{name} axis spacing exceeds float64 range")
     if not (np.all(diffs > 0.0) or np.all(diffs < 0.0)):
         raise ValueError(f"{name} axis must be strictly monotonic")
-    step = diffs[0]
-    atol = 1e-12
-    if source.dtype.kind == "f" and source.dtype.itemsize <= 4:
-        # Adjacent differences can contain roughly two float32 rounding
-        # errors.  Scale the absolute tolerance by coordinate magnitude;
-        # using only rtol on the (often small) grid step rejects valid axes at
-        # high latitudes/longitudes.
-        magnitude = max(float(np.max(np.abs(axis))), abs(float(step)), 1.0)
-        atol = 2.0 * np.finfo(np.float32).eps * magnitude
-    if not np.allclose(diffs, step, rtol=1e-6, atol=atol):
-        raise ValueError(f"{name} axis must be regularly spaced")
     return axis
+
+
+def _bound_snap_tolerance(dtype: np.dtype, scale: float) -> float:
+    """Largest seam mismatch treated as quantisation of shared cell edges."""
+
+    if dtype.kind == "f" and dtype.itemsize <= 4:
+        return 2.0 * float(np.finfo(dtype).eps) * scale
+    return 64.0 * float(np.finfo(np.float64).eps) * scale
+
+
+def _wrap_bounds_to_centers(
+    arr: np.ndarray, axis: np.ndarray, period: float
+) -> np.ndarray:
+    return (
+        axis[:, None]
+        + np.mod(arr - axis[:, None] + 0.5 * period, period)
+        - 0.5 * period
+    )
+
+
+def _raw_axis_bounds(
+    bounds: np.ndarray, axis_size: int, name: str
+) -> tuple[np.ndarray, np.dtype]:
+    source_dtype = np.asanyarray(bounds).dtype
+    arr = canonical_float64(bounds, label=f"{name} bounds")
+    if arr.shape == (2,) and axis_size == 1:
+        arr = arr.reshape(1, 2)
+    if arr.shape != (axis_size, 2):
+        raise ValueError(
+            f"{name} bounds must have shape ({axis_size}, 2), got {arr.shape}"
+        )
+    return arr, source_dtype
+
+
+def _bounds_are_periodic(bounds: np.ndarray) -> bool:
+    """Whether ordered cell bounds span exactly one 360-degree period."""
+
+    lower = np.minimum(bounds[:, 0], bounds[:, 1])
+    upper = np.maximum(bounds[:, 0], bounds[:, 1])
+    widths = upper - lower
+    if widths.size == 0 or float(np.min(widths)) <= 0.0:
+        return False
+    span = float(np.max(upper) - np.min(lower))
+    tolerance = min(_GLOBAL_LONGITUDE_ATOL, 0.25 * float(np.min(widths)))
+    return abs(span - 360.0) <= tolerance
 
 
 def _validate_axis_bounds(
@@ -115,41 +159,53 @@ def _validate_axis_bounds(
     period: float | None = None,
 ) -> np.ndarray:
     axis_size = axis.size
-    arr = canonical_float64(bounds, label=f"{name} bounds")
-    if arr.shape == (2,) and axis_size == 1:
-        arr = arr.reshape(1, 2)
-    if arr.shape != (axis_size, 2):
-        raise ValueError(
-            f"{name} bounds must have shape ({axis_size}, 2), got {arr.shape}"
-        )
+    arr, source_dtype = _raw_axis_bounds(bounds, axis_size, name)
     if period is not None:
-        arr = (
-            axis[:, None]
-            + np.mod(
-                arr - axis[:, None] + 0.5 * period,
-                period,
-            )
-            - 0.5 * period
-        )
+        arr = _wrap_bounds_to_centers(arr, axis, period)
     out = np.column_stack(
         (np.minimum(arr[:, 0], arr[:, 1]), np.maximum(arr[:, 0], arr[:, 1]))
     )
     if np.any(out[:, 1] <= out[:, 0]):
         raise ValueError(f"{name} bounds must have positive widths")
+    if axis_size > 1:
+        ascending = axis[1] > axis[0]
+        scale = max(
+            float(np.max(np.abs(axis))),
+            float(np.max(np.abs(out))),
+            1.0 if period is None else period,
+        )
+        tolerance = _bound_snap_tolerance(source_dtype, scale)
+        # Signed seam mismatch between each cell and its successor along the
+        # axis: positive is a gap, negative an overlap.
+        lower_cell, upper_cell = (
+            (slice(None, -1), slice(1, None))
+            if ascending
+            else (slice(1, None), slice(None, -1))
+        )
+        seam = out[upper_cell, 0] - out[lower_cell, 1]
+        if np.any(seam < -tolerance):
+            raise ValueError(f"{name} bounds must not overlap")
+        if np.any(seam > tolerance):
+            index = int(np.argmax(seam))
+            first, second = (index, index + 1) if ascending else (index + 1, index)
+            raise ValueError(
+                f"{name} bounds leave a gap of {float(seam[index]):.6g} between "
+                f"cells {first} and {second} (tolerance {tolerance:.3g}); "
+                "adjacent cell bounds must share their edges"
+            )
+        # Shared edges stored independently (for example float32 CF bounds)
+        # can differ by rounding.  Snap them together so the cells tile the
+        # axis without slivers that no point lookup or overlap can reach.
+        snap = seam != 0.0
+        if np.any(snap):
+            edge = 0.5 * (out[upper_cell, 0] + out[lower_cell, 1])
+            out[upper_cell, 0] = np.where(snap, edge, out[upper_cell, 0])
+            out[lower_cell, 1] = np.where(snap, edge, out[lower_cell, 1])
+            if np.any(out[:, 1] <= out[:, 0]):
+                raise ValueError(f"{name} bounds must have positive widths")
     if np.any((axis < out[:, 0]) | (axis > out[:, 1])):
         raise ValueError(f"{name} bounds must contain their cell centers")
     if axis_size > 1:
-        ascending = axis[1] > axis[0]
-        overlap_depth = (
-            out[:-1, 1] - out[1:, 0] if ascending else out[1:, 1] - out[:-1, 0]
-        )
-        scale = max(
-            float(np.max(np.abs(axis))),
-            1.0 if period is None else period,
-        )
-        overlap_tolerance = 64.0 * np.finfo(np.float64).eps * scale
-        if np.any(overlap_depth > overlap_tolerance):
-            raise ValueError(f"{name} bounds must not overlap")
         ordered = (
             np.all(np.diff(out[:, 0]) > 0.0) and np.all(np.diff(out[:, 1]) > 0.0)
             if ascending
@@ -234,25 +290,6 @@ def _netcdf_axes_are_geographic(x_var, y_var) -> bool:
     }
 
 
-def _axis_is_periodic(axis: np.ndarray, is_geographic: bool) -> bool:
-    if not is_geographic or axis.size < 2:
-        return False
-    # Use the full endpoint span rather than the first gap.  A float32 global
-    # axis can quantize individual gaps differently; multiplying the first one
-    # by thousands of cells magnifies that local error enough to misclassify a
-    # valid global grid.  Conversely, NumPy's default relative tolerance near
-    # 360 degrees is far too loose and classifies regional grids as periodic.
-    mean_step = abs(float(axis[-1] - axis[0])) / (axis.size - 1)
-    return bool(
-        np.isclose(
-            mean_step * axis.size,
-            360.0,
-            rtol=0.0,
-            atol=_GLOBAL_LONGITUDE_ATOL,
-        )
-    )
-
-
 def _wrap_longitude_like(values: np.ndarray, axis: np.ndarray) -> np.ndarray:
     center = 0.5 * (float(np.min(axis)) + float(np.max(axis)))
     return values + 360.0 * np.floor((center - values) / 360.0 + 0.5)
@@ -280,7 +317,7 @@ class _RegularGridCoordinatesDeclaration(HydroForgeModel):
 class _RegularGridNetCDFDeclaration(HydroForgeModel):
     """Validated declaration consumed by ``RegularGrid.from_netcdf``."""
 
-    path: str | Path
+    path: Path = Field(strict=False)
     x_names: str | tuple[str, ...] | list[str] = _X_NAMES
     y_names: str | tuple[str, ...] | list[str] = _Y_NAMES
     is_geographic: bool | None = None
@@ -346,7 +383,6 @@ class RegularGrid(HydroForgeModel):
             raise ValueError(
                 "geographic latitude coordinates must lie within [-90, 90]"
             )
-        periodic_x = _axis_is_periodic(self.x, self.is_geographic)
         if self.x_bounds is None:
             if self.x.size < 2:
                 raise ValueError(
@@ -358,6 +394,20 @@ class RegularGrid(HydroForgeModel):
                 _validate_axis_bounds(_axis_bounds(self.x), self.x, self.x_name),
             )
         else:
+            # Bounds of a global longitude axis may use another convention
+            # than the centers (e.g. [-180, 180) edges for [0, 360) centers);
+            # unwrap them around each center when that spans one period.
+            periodic_x = (
+                bool(self.is_geographic)
+                and self.x.size > 1
+                and _bounds_are_periodic(
+                    _wrap_bounds_to_centers(
+                        _raw_axis_bounds(self.x_bounds, self.x.size, self.x_name)[0],
+                        self.x,
+                        360.0,
+                    )
+                )
+            )
             object.__setattr__(
                 self,
                 "x_bounds",
@@ -467,6 +517,16 @@ class RegularGrid(HydroForgeModel):
             y_var = ds.variables[y_name]
             x_coord = x_var[:]
             y_coord = y_var[:]
+            x_bounds = (
+                declaration.x_bounds
+                if declaration.x_bounds is not None
+                else cls._netcdf_coordinate_bounds(ds, x_var, x_name)
+            )
+            y_bounds = (
+                declaration.y_bounds
+                if declaration.y_bounds is not None
+                else cls._netcdf_coordinate_bounds(ds, y_var, y_name)
+            )
             is_geographic = declaration.is_geographic
             if is_geographic is None:
                 is_geographic = _netcdf_axes_are_geographic(x_var, y_var)
@@ -476,9 +536,42 @@ class RegularGrid(HydroForgeModel):
             x_name=x_name,
             y_name=y_name,
             is_geographic=is_geographic,
-            x_bounds=declaration.x_bounds,
-            y_bounds=declaration.y_bounds,
+            x_bounds=x_bounds,
+            y_bounds=y_bounds,
         )
+
+    @staticmethod
+    def _netcdf_coordinate_bounds(
+        dataset: NCDataset,
+        coordinate,
+        coordinate_name: str,
+    ) -> np.ndarray | None:
+        """Read CF cell bounds declared by a one-dimensional coordinate."""
+
+        if len(coordinate.dimensions) != 1:
+            return None
+        declared = getattr(coordinate, "bounds", None)
+        bounds_name = (
+            declared.strip()
+            if isinstance(declared, str) and declared.strip()
+            else f"{coordinate_name}_bnds"
+        )
+        if bounds_name not in dataset.variables:
+            return None
+        bounds = dataset.variables[bounds_name]
+        raw = bounds[:]
+        if np.ma.isMaskedArray(raw) and np.any(np.ma.getmaskarray(raw)):
+            raise ValueError(
+                f"coordinate bounds {bounds_name!r} contains missing values"
+            )
+        values = np.asarray(raw)
+        expected_shape = (coordinate.shape[0], 2)
+        if values.shape != expected_shape:
+            raise ValueError(
+                f"coordinate bounds {bounds_name!r} must have shape "
+                f"{expected_shape}, got {values.shape}"
+            )
+        return values
 
     @property
     def _shape(self) -> tuple[int, int]:
@@ -490,17 +583,9 @@ class RegularGrid(HydroForgeModel):
 
     @property
     def _periodic_x(self) -> bool:
-        if self.x.size == 1:
-            return bool(
-                self.is_geographic
-                and np.isclose(
-                    float(self.x_bounds[0, 1]) - float(self.x_bounds[0, 0]),
-                    360.0,
-                    rtol=0.0,
-                    atol=_GLOBAL_LONGITUDE_ATOL,
-                )
-            )
-        return _axis_is_periodic(self.x, bool(self.is_geographic))
+        # The contiguous bound span, not the center spacing, decides
+        # periodicity: rectilinear axes need not be uniformly spaced.
+        return bool(self.is_geographic) and _bounds_are_periodic(self.x_bounds)
 
     def _index_of_points(
         self, x_coord: np.ndarray, y_coord: np.ndarray, *, allow_oob: bool = False
@@ -517,13 +602,9 @@ class RegularGrid(HydroForgeModel):
             allow_oob=declaration.allow_oob,
         )
 
-    def _index_of_points_trusted(
-        self, x_raw: np.ndarray, y_raw: np.ndarray, *, allow_oob: bool
-    ) -> np.ndarray:
-        """Locate canonical equal-shaped coordinates from a validated request."""
+    def _x_indices_trusted(self, x_val: np.ndarray) -> np.ndarray:
+        """Elementwise x-cell index of canonical float64 values, or -1."""
 
-        x_val = x_raw.ravel()
-        y_val = y_raw.ravel()
         periodic_x = self._periodic_x
         normalize_longitude = bool(self.is_geographic) and (
             periodic_x or bool(np.min(self.x) < -180.0 or np.max(self.x) > 180.0)
@@ -547,11 +628,24 @@ class RegularGrid(HydroForgeModel):
                     self.x_bounds,
                     ascending=x_ascending,
                 )
-        iy = _index_axis_points(
+        return ix
+
+    def _y_indices_trusted(self, y_val: np.ndarray) -> np.ndarray:
+        """Elementwise y-cell index of canonical float64 values, or -1."""
+
+        return _index_axis_points(
             y_val,
             self.y_bounds,
             ascending=self.y.size == 1 or self.y[1] > self.y[0],
         )
+
+    def _index_of_points_trusted(
+        self, x_raw: np.ndarray, y_raw: np.ndarray, *, allow_oob: bool
+    ) -> np.ndarray:
+        """Locate canonical equal-shaped coordinates from a validated request."""
+
+        ix = self._x_indices_trusted(x_raw.ravel())
+        iy = self._y_indices_trusted(y_raw.ravel())
 
         # Axis lookup returns either a valid cell index or -1.
         valid = (ix >= 0) & (iy >= 0)

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
+import subprocess
 import sys
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -12,6 +14,7 @@ from importlib.metadata import distributions
 from inspect import signature
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import RLock
 from types import MappingProxyType
 from typing import Annotated, Any, TypedDict, Unpack
 
@@ -29,7 +32,7 @@ class _NetCDFDatasetOptions(TypedDict, total=False):
 
 
 class _AtomicNetCDFDeclaration(HydroForgeModel):
-    file_path: str | Path
+    file_path: Path = Field(strict=False)
     dataset_options: FrozenMapping[str, Any]
 
 
@@ -37,6 +40,8 @@ OUTPUT_FORMAT = "hydroforge.statistics"
 OUTPUT_VERSION = 3
 COMMITTED_STEPS_ATTR = "hydroforge_committed_steps"
 RUN_ID_ATTR = "hydroforge_run_id"
+# Name of the ('saved_points',) coordinate variable; empty when none is written.
+COORDINATE_ATTR = "hydroforge_coordinate"
 
 DEFAULT_NETCDF_OPTIONS: Mapping[str, Any] = MappingProxyType(
     {
@@ -221,43 +226,98 @@ def _blosc_chunk_is_too_small(
         return True
     chunks = options.get("chunksizes")
     if chunks is not None:
-        return math.prod(chunks) * np.dtype(dtype).itemsize <= MIN_BLOSC_CHUNK_BYTES
+        return math.prod(chunks) * np.dtype(dtype).itemsize < MIN_BLOSC_CHUNK_BYTES
     resolved = tuple(dataset.dimensions[name] for name in dims)
     if any(dimension.isunlimited() for dimension in resolved):
         return True
     elements = math.prod(len(dimension) for dimension in resolved)
-    return elements * np.dtype(dtype).itemsize <= MIN_BLOSC_CHUNK_BYTES
+    return elements * np.dtype(dtype).itemsize < MIN_BLOSC_CHUNK_BYTES
+
+
+# netCDF-C registers filters as mandatory, and its Blosc plugin fails any chunk
+# whose Blosc output would exceed the input (incompressible data) instead of
+# storing it raw.  Such a failure also leaves the HDF5 file impossible to
+# close, so the probe runs in a child process and writes one incompressible
+# chunk beside a compressible one.
+_BLOSC_PROBE_SCRIPT = """
+import json, sys
+import numpy as np
+from netCDF4 import Dataset
+path, options = sys.argv[1], json.loads(sys.argv[2])
+arrays = (
+    np.arange(1024, dtype=np.float32),
+    np.random.default_rng(0).integers(0, 256, 4096, dtype=np.uint8),
+)
+with Dataset(path, "w", format="NETCDF4") as dataset:
+    for index, values in enumerate(arrays):
+        dataset.createDimension(f"n{index}", values.size)
+        variable = dataset.createVariable(
+            f"v{index}", values.dtype, (f"n{index}",),
+            chunksizes=(values.size,), **options,
+        )
+        if not variable.filters().get("blosc"):
+            raise SystemExit(1)
+        variable[:] = values
+with Dataset(path, "r") as dataset:
+    for index, values in enumerate(arrays):
+        if not np.array_equal(np.asarray(dataset.variables[f"v{index}"][:]), values):
+            raise SystemExit(1)
+print("ok")
+"""
+
+
+_blosc_probe_lock = RLock()
+_blosc_probe: tuple[subprocess.Popen, TemporaryDirectory] | None = None
+
+
+def start_blosc_zstd_probe() -> None:
+    """Start the Blosc probe child early; its verdict is collected on first use."""
+
+    global _blosc_probe
+    with _blosc_probe_lock:
+        if _blosc_probe is not None or _probe_blosc_zstd_filter.cache_info().currsize:
+            return
+        directory = TemporaryDirectory(prefix="hydroforge_netcdf_probe-")
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    _BLOSC_PROBE_SCRIPT,
+                    str(Path(directory.name) / "blosc_zstd.nc"),
+                    json.dumps(dict(DEFAULT_NETCDF_OPTIONS)),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except BaseException:
+            directory.cleanup()
+            raise
+        _blosc_probe = (process, directory)
 
 
 @lru_cache(maxsize=1)
 def _probe_blosc_zstd_filter() -> bool:
-    """Verify that the active NetCDF/HDF5 stack can round-trip Blosc data."""
+    """Verify that the active NetCDF/HDF5 stack can store any Blosc chunk."""
 
-    values = np.arange(64, dtype=np.float32)
+    global _blosc_probe
+    with _blosc_probe_lock:
+        try:
+            start_blosc_zstd_probe()
+        except (OSError, subprocess.SubprocessError):
+            return False
+        process, directory = _blosc_probe
+        _blosc_probe = None
     try:
-        with TemporaryDirectory(prefix="hydroforge_netcdf_probe-") as directory:
-            path = Path(directory) / "blosc_zstd.nc"
-            with Dataset(path, "w", format="NETCDF4") as probe:
-                probe.createDimension("cell", values.size)
-                variable = probe.createVariable(
-                    "value",
-                    values.dtype,
-                    ("cell",),
-                    chunksizes=(values.size,),
-                    compression="blosc_zstd",
-                    complevel=5,
-                    blosc_shuffle=1,
-                )
-                filters = variable.filters()
-                if not isinstance(filters, Mapping) or not filters.get("blosc"):
-                    return False
-                variable[:] = values
-                probe.sync()
-            with Dataset(path, "r") as probe:
-                restored = np.asarray(probe.variables["value"][:])
-            return np.array_equal(restored, values)
-    except Exception:
+        stdout, _stderr = process.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
         return False
+    finally:
+        directory.cleanup()
+    return process.returncode == 0 and stdout.strip() == "ok"
 
 
 def _resolve_netcdf_compression_options_trusted(
@@ -495,6 +555,29 @@ def plan_streaming_netcdf_chunks(
         )
         time_chunk = max(time_chunk, minimum_time)
     normalized["chunksizes"] = (time_chunk, *spatial_chunks)
+    return normalized
+
+
+def plan_fixed_netcdf_chunks(
+    options: Mapping[str, Any],
+    *,
+    dtype: Any,
+    shape: Sequence[int],
+    target_bytes: int = DEFAULT_NETCDF_CHUNK_BYTES,
+) -> dict[str, Any]:
+    """Add a bounded chunk layout for one fixed-shape array unless chosen."""
+
+    normalized = dict(options)
+    if (
+        not shape
+        or "chunksizes" in normalized
+        or normalized.get("contiguous") is True
+    ):
+        return normalized
+    normalized["chunksizes"] = _fit_spatial_chunks(
+        tuple(shape),
+        max_elements=max(1, target_bytes // np.dtype(dtype).itemsize),
+    )
     return normalized
 
 

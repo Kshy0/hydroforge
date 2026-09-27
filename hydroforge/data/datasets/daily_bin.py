@@ -11,7 +11,7 @@ from typing import ClassVar, Literal, Self
 
 import cftime
 import numpy as np
-from pydantic import PrivateAttr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from hydroforge.contracts.temporal import (
     DateLike,
@@ -48,7 +48,7 @@ class DailyBinDataset(GriddedDataset):
 
     reusable_expression_reads: ClassVar[bool] = True
 
-    base_dir: str | Path
+    base_dir: Path = Field(strict=False)
     shape: tuple[int, int]
     prefix: str
     unit_factor: float = 1.0
@@ -96,8 +96,6 @@ class DailyBinDataset(GriddedDataset):
     def _validate_binary_layout(self) -> Self:
         if self.time_interval != timedelta(days=1):
             raise ValueError("DailyBinDataset time_interval must be one day")
-        if self.chunk_len != 1:
-            raise ValueError("DailyBinDataset chunk_len must be 1")
         configured = self.file_start_date
         if isinstance(configured, Mapping):
             invalid = {
@@ -280,61 +278,82 @@ class DailyBinDataset(GriddedDataset):
         return lon, lat
 
     def _read_chunk(self, chunk: SourceChunk) -> _TrustedSourceChunk:
-        """Read one day's data from binary file.
+        """Read the chunk's daily frames from binary storage.
 
         Returns:
-        - If local_indices is set: (1, N) compressed array
-        - If local_indices is None: (1, Y, X) full grid array
+        - If local_indices is set: (T, N) compressed array
+        - If local_indices is None: (T, Y, X) full grid array
 
         Spatial convention: (Y, X) = (lat, lon), C-order flatten (lon varies fastest)
+
+        The spatial selection is applied before any validation or conversion,
+        so cells outside it (for example ocean NaN) never affect the result.
+        Missing (NaN) values inside the selection are zero-filled like
+        ``NetCDFDataset``; infinite values are rejected.
         """
-        ny, nx = self.shape
-        frame_size = ny * nx
-        data = self._read_frame(chunk.source_start)
+        data = self._read_frames(chunk._source_times(), selected=True)
+        if self.local_indices is None:
+            data = data.reshape(chunk.length, *self.shape)
+        if data.dtype.kind == "f":
+            missing = np.isnan(data)
+            if np.any(missing):
+                data[missing] = 0
         data = _trusted_source_chunk_payload(
-            data.reshape(1, ny, nx),
-            expected_rows=1,
+            data,
+            expected_rows=chunk.length,
             clip_negative=self.clip_negative,
         )
+        if self.unit_factor == 1.0 and self._direct_output_cast_is_exact(data):
+            return _TrustedSourceChunk(
+                self._finalize_output_data(data, label="daily binary dataset output")
+            )
         data = self._canonical_calculation_data(
             data,
             label="daily binary dataset input",
         )
         np.divide(data, self.unit_factor, out=data)
-        data = self._finalize_output_data(
-            data,
-            label="daily binary dataset output",
+        return _TrustedSourceChunk(
+            self._finalize_output_data(
+                data,
+                label="daily binary dataset output",
+            )
         )
 
-        if self.local_indices is not None:
-            result = data.reshape(1, frame_size)[:, self.local_indices]
-        else:
-            result = data
-        return _TrustedSourceChunk(result)
+    def _read_frames(self, timestamps, *, selected: bool) -> np.ndarray:
+        """Read frames as one owned ``(T, Y*X)`` or selected ``(T, N)`` block.
 
-    def _read_frame(self, timestamp: DateLike) -> np.ndarray:
-        """Read one frame under the declared file identity."""
-        key, frame_idx = self._dt_to_loc[timestamp]
-        file_path = self._checked_source_path(
-            Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
-        )
-
+        Consecutive frames of one file are read by a single ``np.fromfile``.
+        """
+        runs: list[tuple[str, int, int]] = []
+        for timestamp in timestamps:
+            key, frame_idx = self._dt_to_loc[timestamp]
+            if runs and runs[-1][0] == key and runs[-1][1] + runs[-1][2] == frame_idx:
+                runs[-1] = (key, runs[-1][1], runs[-1][2] + 1)
+            else:
+                runs.append((key, frame_idx, 1))
         ny, nx = self.shape
         frame_size = ny * nx
         element_size = self._storage_dtype.itemsize
-        data = np.fromfile(
-            file_path,
-            dtype=self._storage_dtype,
-            count=frame_size,
-            offset=frame_idx * frame_size * element_size,
-        )
-        self._verify_source_path(file_path)
-        data = data.reshape(ny, nx)
-        return data
+        indices = self.local_indices if selected else None
+        blocks = []
+        for key, first_frame, count in runs:
+            file_path = self._checked_source_path(
+                Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
+            )
+            data = np.fromfile(
+                file_path,
+                dtype=self._storage_dtype,
+                count=count * frame_size,
+                offset=first_frame * frame_size * element_size,
+            )
+            self._verify_source_path(file_path)
+            data = data.reshape(count, frame_size)
+            blocks.append(data if indices is None else data[:, indices])
+        return blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=0)
 
     def _get_first_frame_nan_mask(self) -> np.ndarray | None:
-        data = self._read_frame(self.start_date)
-        return np.isnan(data)
+        data = self._read_frames((self.start_date,), selected=False)
+        return np.isnan(data.reshape(self.shape))
 
     def close(self):
         pass

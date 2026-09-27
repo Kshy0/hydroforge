@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, cached_property
 from types import MappingProxyType
 from typing import Annotated, Any, Literal, Self, TypeAlias, get_args
 
@@ -484,6 +484,17 @@ def _field_schema(
         "annotation",
         getattr(field, "return_type", None),
     )
+    if (
+        computed
+        and tensor is not None
+        and tensor.category != "virtual"
+        and not isinstance(getattr(field, "wrapped_property", None), cached_property)
+    ):
+        raise ValueError(
+            f"{module_name}.{name} is a stored computed tensor and must wrap "
+            "functools.cached_property; a plain property would reallocate "
+            "storage on every access and cannot be deactivated"
+        )
     if tensor is not None and tensor.category != "virtual":
         may_be_inactive = bool(
             tensor.depends_on

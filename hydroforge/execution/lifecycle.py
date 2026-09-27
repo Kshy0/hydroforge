@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 from enum import Enum
@@ -25,6 +26,34 @@ from hydroforge.contracts.validation import HydroForgeModel
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
+
+
+def public_transaction_digest(identity: tuple[Any, ...]) -> int:
+    """Fold one public transaction identity into a non-negative int64."""
+    return int.from_bytes(
+        sha256(pickle.dumps(identity, protocol=pickle.HIGHEST_PROTOCOL)).digest()[:8],
+        byteorder="big",
+    ) & ((1 << 63) - 1)
+
+
+def _public_transaction_agrees(
+    group: Any,
+    world_size: int,
+    digest: int,
+    *,
+    full: bool,
+) -> bool:
+    """Exchange one record digest; any disagreement takes the full exchange.
+
+    Every rank observes the same gathered digests, so all ranks choose the
+    full object exchange together whenever any rank carries a failure or
+    payload, or a difference must be described exactly.
+    """
+    local = torch.tensor((digest, int(full)), dtype=torch.int64)
+    gathered = torch.empty((world_size, 2), dtype=torch.int64)
+    dist.all_gather(list(gathered.unbind(0)), local, group=group)
+    rows = gathered.tolist()
+    return rows[0][1] == 0 and all(row == rows[0] for row in rows)
 
 
 def _distributed_array_signature(value: np.ndarray) -> tuple[Any, ...]:
@@ -89,7 +118,7 @@ def _distributed_schedule_signature(
         "explicit",
         schedule.calendar,
         len(schedule.explicit_steps),
-        _distributed_date_signature(schedule.execution_start),
+        _distributed_date_signature(schedule._start),
         _distributed_date_signature(schedule._end),
         digest.hexdigest(),
     )
@@ -248,7 +277,6 @@ class RuntimeLifecycle:
             ),
             ("module_order", model._module_order),
             ("partition", model.partition_key, model.partition_group),
-            ("cuda_catalogs", model.cuda_extension_modules),
             ("backend", model._backend),
             ("device_type", model.device.type),
             ("precision", model.precision, model.mixed_precision),
@@ -339,9 +367,8 @@ class RuntimeLifecycle:
         from hydroforge.compiler.initialization import ModelInitializer
 
         schedule = model.simulation_schedule
-        model._current_time = (
-            schedule.execution_start if schedule is not None else model.initial_time
-        )
+        model._schedule_index = 0
+        model._current_time = model.initial_time if schedule is None else None
         model._prepare_output_directory()
         ModelInitializer(model).run()
 
@@ -402,9 +429,8 @@ class RuntimeLifecycle:
                 "distributed runtime materialization received output run IDs from nonzero ranks"
             )
         statistics = getattr(model, "_statistics", None)
-        aggregator = getattr(statistics, "aggregator", None)
-        if aggregator is not None:
-            aggregator.run_id = run_id
+        if statistics is not None and statistics._output is not None:
+            statistics._output.run_id = run_id
 
     def gather_distributed_failures(
         self,
@@ -438,8 +464,47 @@ class RuntimeLifecycle:
             raise RuntimeError(
                 "distributed public transaction phase must be a non-empty string"
             )
+        sequence, digest = self.reserve_public_transaction(phase, signature)
+        from hydroforge.execution.step import distributed_control_plane
+
+        group, host_plane = distributed_control_plane()
+        if host_plane and _public_transaction_agrees(
+            group,
+            model.world_size,
+            digest,
+            full=error is not None or payload is not None,
+        ):
+            empty = (None,) * model.world_size
+            return empty, empty
+        return self.complete_public_transaction(
+            group,
+            sequence,
+            error,
+            phase=phase,
+            signature=signature,
+            payload=payload,
+        )
+
+    def reserve_public_transaction(
+        self, phase: str, signature: tuple[Any, ...] | None
+    ) -> tuple[int, int]:
+        """Claim the next public sequence number and its identity digest."""
+        model = self.model
         sequence = model._distributed_public_sequence
         model._distributed_public_sequence = sequence + 1
+        return sequence, public_transaction_digest((sequence, phase, signature))
+
+    def complete_public_transaction(
+        self,
+        group: Any,
+        sequence: int,
+        error: BaseException | None,
+        *,
+        phase: str,
+        signature: tuple[Any, ...] | None,
+        payload: Any = None,
+    ) -> tuple[tuple[dict[str, str] | None, ...], tuple[Any, ...]]:
+        """Exchange full records for one already reserved public transaction."""
         local = (
             sequence,
             phase,
@@ -447,8 +512,8 @@ class RuntimeLifecycle:
             None if error is None else failure_description(error),
             payload,
         )
-        observed: list[Any] = [None] * model.world_size
-        dist.all_gather_object(observed, local)
+        observed: list[Any] = [None] * self.model.world_size
+        dist.all_gather_object(observed, local, group=group)
         if any(
             not isinstance(value, tuple)
             or len(value) != 5

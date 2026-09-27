@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterator
+from collections import OrderedDict
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Final
@@ -22,6 +23,138 @@ _MISSING_PROGRAM = object()
 _MISSING_COUNT = object()
 
 INVALID_SUBSTEP_COUNT: Final[int] = (1 << 31) - 1
+
+# Host-value variants of one lexical scope and the step triggers (duration,
+# count) already matched to one of them.  Both are bounded so a stream of
+# distinct durations or counts re-records instead of growing without limit.
+_HOST_VARIANT: Final[str] = "host values"
+_HOST_VARIANT_LIMIT: Final[int] = 8
+_HOST_TRIGGER_LIMIT: Final[int] = 256
+
+
+@dataclass(frozen=True, slots=True)
+class _Recorded:
+    """One finished recording awaiting either program construction or disposal."""
+
+    signature: tuple[Any, ...]
+    owned: tuple[Any, ...]
+    build: Callable[[], Any]
+
+
+def _close_owned(
+    capture: Any,
+    owned: tuple[Any, ...],
+    primary: BaseException | None,
+    *,
+    scope: str,
+) -> None:
+    """Close recorded programs, preserving ``primary`` and every cleanup error."""
+
+    from hydroforge.contracts.errors import ResourceCleanupError
+
+    failures = [] if primary is None else [primary]
+    for program in owned:
+        if program is None:
+            continue
+        try:
+            program.close(capture)
+        except BaseException as error:
+            failures.append(error)
+    if primary is None and failures:
+        raise ResourceCleanupError(scope, failures) from failures[0]
+    if len(failures) > 1:
+        raise ResourceCleanupError(scope, failures) from primary
+
+
+def _cached_program(
+    execution: Any,
+    key: tuple[Any, ...],
+    trigger: tuple[Any, ...],
+    record: Callable[[], Generator[Any, None, _Recorded]],
+) -> Generator[Any, None, Any]:
+    """Resolve the program whose recorded host values match this invocation.
+
+    Recording freezes every Python scalar a scope body computes (for example
+    ``seconds / count``).  A program is therefore reused for a new duration
+    or count only after re-entering the body once and proving that the
+    recording is identical; otherwise the body gets its own program keyed by
+    those host values.  Other host inputs must be declared through
+    ``specialization=``.
+    """
+
+    programs = execution.programs
+    primary = programs.get(key)
+    if primary is not None:
+        triggers = getattr(primary, "host_triggers", {})
+        if trigger in triggers:
+            signature = triggers[trigger]
+            program = (
+                primary
+                if signature == primary.host_signature
+                else programs.get((*key, (_HOST_VARIANT, signature)))
+            )
+            if program is not None:
+                triggers.move_to_end(trigger)
+                return program
+    recorded = yield from record()
+    signature = recorded.signature
+    if primary is None:
+        variant = key
+    elif signature == getattr(primary, "host_signature", None):
+        variant = key
+    else:
+        variant = (*key, (_HOST_VARIANT, signature))
+    program = programs.get(variant)
+    if program is not None:
+        _close_owned(
+            execution.capture, recorded.owned, None, scope="verified recording"
+        )
+    else:
+        try:
+            program = recorded.build()
+        except BaseException as error:
+            _close_owned(
+                execution.capture,
+                recorded.owned,
+                error,
+                scope="substep program construction",
+            )
+            raise
+        programs[variant] = program
+        if primary is None:
+            program.host_signature = signature
+            program.host_triggers = OrderedDict()
+            primary = program
+        else:
+            _evict_host_variants(programs, key, primary)
+    triggers = getattr(primary, "host_triggers", None)
+    if triggers is not None:
+        triggers[trigger] = signature
+        triggers.move_to_end(trigger)
+        if len(triggers) > _HOST_TRIGGER_LIMIT:
+            triggers.popitem(last=False)
+    return program
+
+
+def _evict_host_variants(programs: dict[Any, Any], key: tuple[Any, ...], primary: Any) -> None:
+    size = len(key) + 1
+    variants = [
+        candidate
+        for candidate in programs
+        if len(candidate) == size
+        and candidate[:-1] == key
+        and isinstance(candidate[-1], tuple)
+        and candidate[-1][:1] == (_HOST_VARIANT,)
+    ]
+    if len(variants) <= _HOST_VARIANT_LIMIT:
+        return
+    oldest = variants[0]
+    evicted = programs.pop(oldest)
+    signature = oldest[-1][1]
+    triggers = getattr(primary, "host_triggers", {})
+    for trigger in [trigger for trigger, value in triggers.items() if value == signature]:
+        del triggers[trigger]
+    evicted.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +258,12 @@ def _plain_fixed_request(count: int | None, requested: int | None):
     )
 
 
+@lru_cache(maxsize=128)
+def _encoded_scalar(value: float, dtype: torch.dtype) -> float:
+    """Round one host scalar exactly as the model dtype stores it."""
+    return torch.tensor(value, dtype=dtype).item()
+
+
 class _AdaptiveSubstepRequest(HydroForgeModel):
     candidate_dt: torch.Tensor
     dt: torch.Tensor
@@ -182,7 +321,7 @@ class _AdaptiveSubstepRequest(HydroForgeModel):
             raise ValueError(
                 "adaptive maximum_dt must be a finite real scalar"
             ) from error
-        encoded = torch.tensor(maximum_dt, dtype=self.model_dtype).item()
+        encoded = _encoded_scalar(maximum_dt, self.model_dtype)
         if not math.isfinite(encoded) or encoded <= 0:
             raise ValueError(
                 "adaptive maximum_dt must remain finite and positive in "
@@ -248,68 +387,57 @@ class _FixedScope:
         self.completed = 0
 
     def __iter__(self) -> Iterator[SubstepFrame]:
+        program = yield from _cached_program(
+            self.runtime.model._execution,
+            self.key,
+            (self.duration, self.count),
+            self._record,
+        )
+        self.completed = self.runtime._execute_program(
+            program, self.count, self.duration
+        )
+
+    def _record(self) -> Generator[SubstepFrame, None, _Recorded]:
         from hydroforge.execution.operators import record_operator_scope
         from hydroforge.execution.program import FixedSubstepProgram
 
-        programs = self.runtime.model._execution.programs
-        program = programs.get(self.key, _MISSING_PROGRAM)
-        if program is _MISSING_PROGRAM:
-            draft = FixedSubstepProgram.recording_draft(self.runtime.model)
-            with record_operator_scope(
-                self.runtime.model,
-                stable_tensors=(
-                    draft.count,
-                    draft.counter,
-                    draft.weight,
-                ),
-                scope_kind="fixed",
-            ) as recording:
-                yield draft.frame
-                if self.runtime._pending_predicate_scopes:
-                    from hydroforge.execution.operators import SubstepCompileError
+        model = self.runtime.model
+        draft = FixedSubstepProgram.recording_draft(model)
+        controls = (draft.count, draft.counter, draft.weight)
+        with record_operator_scope(
+            model,
+            stable_tensors=controls,
+            scope_kind="fixed",
+        ) as recording:
+            yield draft.frame
+            if self.runtime._pending_predicate_scopes:
+                from hydroforge.execution.operators import SubstepCompileError
 
-                    raise SubstepCompileError(
-                        "predicate loop scope was exited before recording "
-                        "completed; do not break or return from a "
-                        "step.predicate() loop"
-                    )
-            final_program = None
+                raise SubstepCompileError(
+                    "predicate loop scope was exited before recording "
+                    "completed; do not break or return from a "
+                    "step.predicate() loop"
+                )
+        owned = [recording.program]
+        try:
             if self.final is not None:
-                final = _FixedFinalRecorder(
-                    self.runtime.model,
-                    stable_tensors=(
-                        draft.count,
-                        draft.counter,
-                        draft.weight,
-                    ),
-                )
-                final_program = final.record(self.final)
-            try:
-                program = FixedSubstepProgram(
-                    self.runtime.model,
-                    draft,
-                    recording.program,
-                    final_program,
-                )
-            except BaseException as primary:
-                from hydroforge.contracts.errors import ResourceCleanupError
-
-                failures = [primary]
-                for owned in (recording.program, final_program):
-                    if owned is not None:
-                        try:
-                            owned.close(self.runtime.model._execution.capture)
-                        except BaseException as cleanup_error:
-                            failures.append(cleanup_error)
-                if len(failures) > 1:
-                    raise ResourceCleanupError(
-                        "fixed substep strategy construction",
-                        failures,
-                    ) from primary
-                raise
-            programs[self.key] = program
-        self.completed = self.runtime._execute_program(
-            program, self.count, self.duration
+                final = _FixedFinalRecorder(model, stable_tensors=controls)
+                owned.append(final.record(self.final))
+            aliases = dict(zip(map(id, controls), ("count", "index", "dt")))
+            signature = tuple(program.fingerprint(aliases) for program in owned)
+        except BaseException as primary:
+            _close_owned(
+                model._execution.capture,
+                tuple(owned),
+                primary,
+                scope="fixed substep recording",
+            )
+            raise
+        final_program = owned[1] if len(owned) > 1 else None
+        return _Recorded(
+            signature,
+            tuple(owned),
+            lambda: FixedSubstepProgram(model, draft, owned[0], final_program),
         )
 
 
@@ -337,44 +465,58 @@ class _AdaptiveScope:
         self.completed = 0
 
     def __iter__(self) -> Iterator[SubstepFrame]:
+        program = yield from _cached_program(
+            self.runtime.model._execution,
+            self.key,
+            (self.duration,),
+            self._record,
+        )
+        self.completed = self.runtime._execute_program(program, self.duration)
+
+    def _record(self) -> Generator[SubstepFrame, None, _Recorded]:
         from hydroforge.execution.operators import record_operator_scope
         from hydroforge.execution.program import AdaptiveSubstepProgram
 
-        programs = self.runtime.model._execution.programs
-        program = programs.get(self.key, _MISSING_PROGRAM)
-        new_program = program is _MISSING_PROGRAM
-        if new_program:
-            draft = AdaptiveSubstepProgram.recording_draft(
-                candidate_dt=self.candidate_dt,
-                dt=self.dt,
-                maximum_dt=self.maximum_dt,
-                maximum_steps=self.maximum_steps,
-            )
-            proposal = record_operator_scope(
-                self.runtime.model,
-                stable_tensors=(draft.candidate,),
-                scope_kind="adaptive proposal",
-            )
-            physics = record_operator_scope(
-                self.runtime.model,
-                stable_tensors=(
-                    draft.counter,
-                    draft.time_step,
-                ),
-                scope_kind="adaptive physics",
-            )
-            with proposal:
-                self.proposal()
+        model = self.runtime.model
+        draft = AdaptiveSubstepProgram.recording_draft(
+            candidate_dt=self.candidate_dt,
+            dt=self.dt,
+            maximum_dt=self.maximum_dt,
+            maximum_steps=self.maximum_steps,
+        )
+        proposal = record_operator_scope(
+            model,
+            stable_tensors=(draft.candidate,),
+            scope_kind="adaptive proposal",
+        )
+        physics = record_operator_scope(
+            model,
+            stable_tensors=(draft.counter, draft.time_step),
+            scope_kind="adaptive physics",
+        )
+        with proposal:
+            self.proposal()
+        try:
             with physics:
                 yield draft.frame
-            program = AdaptiveSubstepProgram(
-                self.runtime.model,
-                draft=draft,
-                proposal=proposal.program,
-                body=physics.program,
+            owned = (proposal.program, physics.program)
+            aliases = {id(draft.counter): "index"}
+            signature = tuple(program.fingerprint(aliases) for program in owned)
+        except BaseException as primary:
+            _close_owned(
+                model._execution.capture,
+                (proposal.program, physics.program),
+                primary,
+                scope="adaptive substep recording",
             )
-            programs[self.key] = program
-        self.completed = self.runtime._execute_program(program, self.duration)
+            raise
+        return _Recorded(
+            signature,
+            owned,
+            lambda: AdaptiveSubstepProgram(
+                model, draft=draft, proposal=owned[0], body=owned[1]
+            ),
+        )
 
 
 class _PredicateScope:
@@ -520,6 +662,14 @@ class SubstepRuntime:
             model_device=self.model.device,
             scope_available=not self.step._substep_scope_claimed,
         )
+        # Tensor identity keys the cached program, so the controls must be
+        # address-stable model state rather than a fresh tensor per step.
+        for label, tensor in (("candidate_dt", request.candidate_dt), ("dt", request.dt)):
+            if not self.model._execution.is_model_tensor(tensor):
+                raise ValueError(
+                    f"adaptive {label} must be a declared model tensor; a new "
+                    "tensor per step would compile a new program every step"
+                )
         duration, key = self.step.claim_substep_scope(
             kind="adaptive",
             specialization=(

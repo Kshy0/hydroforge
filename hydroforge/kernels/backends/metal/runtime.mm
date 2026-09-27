@@ -32,11 +32,59 @@ struct Pipeline {
 };
 std::vector<std::shared_ptr<Pipeline>> pipelines;
 
+using at::mps::MPSStream;
+
+// Metal retains neither argument-buffer contents nor resources declared with
+// useResource:.  A released binding or ICB therefore stays alive until every
+// stream that encoded it has completed its current command buffer.
+struct EncodedOn {
+  std::vector<MPSStream*> streams;
+  void note(MPSStream* stream) {
+    for (MPSStream* seen : streams) {
+      if (seen == stream) return;
+    }
+    streams.push_back(stream);
+  }
+};
+
+// Intentionally leaked: a completion handler may still run at process exit.
+std::mutex* const retired_mutex = new std::mutex();
+auto* const retired_resources = new std::vector<std::shared_ptr<void>>();
+
+// Completion handlers only hand ownership back; Objective-C and Torch
+// releases run here, on a host thread calling into this extension.
+void drain_retired_resources() {
+  std::vector<std::shared_ptr<void>> completed;
+  {
+    std::lock_guard<std::mutex> guard(*retired_mutex);
+    completed.swap(*retired_resources);
+  }
+}
+
+void release_after_completion(std::shared_ptr<void> resource,
+                              const EncodedOn& encoded_on) {
+  for (MPSStream* stream : encoded_on.streams) {
+    auto* holder = new std::shared_ptr<void>(resource);
+    try {
+      stream->addCompletedHandler(^(id<MTLCommandBuffer> completed) {
+        (void)completed;
+        std::lock_guard<std::mutex> guard(*retired_mutex);
+        retired_resources->push_back(std::move(*holder));
+        delete holder;
+      });
+    } catch (...) {
+      delete holder;
+      throw;
+    }
+  }
+}
+
 struct ArgumentBinding {
   id<MTLBuffer> encoded;
   std::vector<std::pair<id<MTLBuffer>, MTLResourceUsage>> resources;
   std::vector<id<MTLBuffer>> owned_scalar_buffers;
   std::vector<torch::Tensor> retained_tensors;
+  EncodedOn encoded_on;
   ~ArgumentBinding() {
     [encoded release];
     for (id<MTLBuffer> buffer : owned_scalar_buffers) [buffer release];
@@ -51,6 +99,7 @@ struct ICBGraph {
   std::vector<std::pair<id<MTLBuffer>, MTLResourceUsage>> resources;
   std::vector<std::shared_ptr<ArgumentBinding>> retained_bindings;
   NSUInteger command_count;
+  EncodedOn encoded_on;
   ~ICBGraph() {
     [commands release];
   }
@@ -105,7 +154,8 @@ int64_t compile_pipeline(
     const std::string& kernel_name,
     const std::vector<std::tuple<uint32_t, std::string, double>>& function_constants,
     const std::vector<std::string>& argument_types,
-    const std::vector<std::string>& argument_access) {
+    const std::vector<std::string>& argument_access,
+    bool fast_math) {
   @autoreleasepool {
     id<MTLDevice> device = at::mps::getCurrentMPSStream()->device();
     NSString* metal_source = [NSString stringWithUTF8String:source.c_str()];
@@ -115,6 +165,16 @@ int64_t compile_pipeline(
     // Avoid the unreliable implicit default in a Torch JIT extension.  The
     // kernels require at least MSL 3.0 for atomic_float.
     compile_options.languageVersion = latest_stable_msl_version();
+    // Metal compiles with fast math unless told otherwise; physics kernels
+    // follow HydroForge's math mode instead.
+    if (@available(macOS 15.0, *)) {
+      compile_options.mathMode = fast_math ? MTLMathModeFast : MTLMathModeSafe;
+      compile_options.mathFloatingPointFunctions =
+          fast_math ? MTLMathFloatingPointFunctionsFast
+                    : MTLMathFloatingPointFunctionsPrecise;
+    } else {
+      compile_options.fastMathEnabled = fast_math;
+    }
     id<MTLLibrary> library = [device newLibraryWithSource:metal_source
                                                   options:compile_options
                                                     error:&error];
@@ -221,11 +281,15 @@ void release_argument_binding(int64_t binding_id) {
     binding = std::move(slot);
     free_binding_ids.push_back(binding_id);
   }
-  binding.reset();
+  drain_retired_resources();
+  // An ICB keeps its own reference; only direct encodes need a GPU fence.
+  const EncodedOn encoded_on = binding->encoded_on;
+  release_after_completion(std::move(binding), encoded_on);
 }
 
 int64_t create_argument_binding(
     int64_t pipeline_id, const pybind11::list& arguments) {
+  drain_retired_resources();
   auto pipeline = get_pipeline(pipeline_id);
   TORCH_CHECK(arguments.size() == pipeline->argument_types.size(),
               "Metal argument/type count mismatch");
@@ -306,6 +370,7 @@ void dispatch(
   if (threads == 0) return;
 
   auto* stream = at::mps::getCurrentMPSStream();
+  binding->encoded_on.note(stream);
   at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
     id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
     [encoder setComputePipelineState:pipeline->state];
@@ -331,6 +396,9 @@ void dispatch_sequence(
               "Metal sequence arrays must have equal length");
   for (uint64_t extent : threads) validate_grid_extent(extent);
   auto* stream = at::mps::getCurrentMPSStream();
+  for (size_t i = 0; i < count; ++i) {
+    if (threads[i] != 0) get_binding(binding_ids[i])->encoded_on.note(stream);
+  }
   at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
     id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
     for (size_t i = 0; i < count; ++i) {
@@ -445,6 +513,7 @@ void replay_icb(int64_t graph_id, uint64_t replays) {
     TORCH_CHECK(graph != nullptr, "Metal ICB graph has been released: ", graph_id);
   }
   auto* stream = at::mps::getCurrentMPSStream();
+  graph->encoded_on.note(stream);
   at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
     id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
     for (const auto& [resource, usage] : graph->resources) {
@@ -468,7 +537,9 @@ void release_icb(int64_t graph_id) {
     free_graph_ids.push_back(graph_id);
   }
   // Destroy buffers outside the registry lock. Releasing the same id is safe.
-  graph.reset();
+  drain_retired_resources();
+  const EncodedOn encoded_on = graph->encoded_on;
+  release_after_completion(std::move(graph), encoded_on);
 }
 
 }  // namespace

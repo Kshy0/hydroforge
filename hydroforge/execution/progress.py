@@ -100,6 +100,13 @@ class ProgressRuntime:
         step = None if runtime is None else runtime.scheduled_step
         return self.owner.simulation_schedule, step
 
+    @staticmethod
+    def _fraction(schedule: Any, step: Any, *, completed: bool) -> float:
+        if schedule._is_regular:
+            return (step.index + int(completed)) / len(schedule)
+        date = step.end if completed else step.start
+        return (date - schedule._start) / (schedule._end - schedule._start)
+
     def begin_step(self) -> None:
         schedule, step = self._schedule_position()
         phase = "unbounded" if schedule is None or step is None else step.phase
@@ -111,9 +118,7 @@ class ProgressRuntime:
                 phase != self.state.phase or self.state._schedule_start_fraction is None
             )
         ):
-            elapsed = (step.start - schedule.execution_start).total_seconds()
-            duration = (schedule._end - schedule.execution_start).total_seconds()
-            fraction = elapsed / duration
+            fraction = self._fraction(schedule, step, completed=False)
         self.state.begin_step(
             phase,
             schedule_fraction=fraction,
@@ -123,7 +128,7 @@ class ProgressRuntime:
         schedule, step = self._schedule_position()
         phase = "unbounded" if schedule is None or step is None else step.phase
         final_step = (
-            schedule is not None and step is not None and step.end == schedule._end
+            schedule is not None and step is not None and step.index + 1 == len(schedule)
         )
         return self.state.tick(phase, force_emit=final_step)
 
@@ -131,9 +136,7 @@ class ProgressRuntime:
         schedule, step = self._schedule_position()
         if schedule is None or step is None:
             return self.state.format_unbounded()
-        elapsed = (step.end - schedule.execution_start).total_seconds()
-        duration = (schedule._end - schedule.execution_start).total_seconds()
         return self.state.format_schedule(
-            fraction=elapsed / duration,
+            fraction=self._fraction(schedule, step, completed=True),
             total_steps=len(schedule),
         )

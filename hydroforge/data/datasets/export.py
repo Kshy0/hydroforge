@@ -95,7 +95,7 @@ class _ExportRequest(HydroForgeModel):
 
 
 class _ClimatologyExportRequest(_ExportRequest):
-    out_path: Annotated[Path, BeforeValidator(lambda value: Path(value))]
+    out_path: Path = Field(strict=False)
     units: str = "m3/s"
     description: str | None = None
 
@@ -119,7 +119,7 @@ class _ClimatologyExportRequest(_ExportRequest):
 
 
 class _CatchmentExportRequest(_ExportRequest):
-    out_dir: Annotated[Path, BeforeValidator(lambda value: Path(value))]
+    out_dir: Path = Field(strict=False)
     var_name: str = "var"
     filename: str | Mapping[str, str] | None = None
     normalized: bool = False
@@ -136,7 +136,8 @@ class _CatchmentExportRequest(_ExportRequest):
 
     @model_validator(mode="after")
     def _compile(self):
-        active = self.owner.time_aggregation
+        # Only aggregating sources (NetCDF) declare time_aggregation.
+        active = getattr(self.owner, "time_aggregation", None)
         if isinstance(active, Mapping):
             output_methods = dict(active)
             returns_mapping = True

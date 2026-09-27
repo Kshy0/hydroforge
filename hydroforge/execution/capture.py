@@ -126,7 +126,8 @@ class CaptureRuntime:
                 with torch.cuda.stream(side):
                     for _ in range(self.warmup_iterations):
                         body()
-                    restore()
+                    # Capture binds addresses, not values: one rollback after
+                    # capture undoes the warmups (and any capture-time effect).
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph, pool=self.graph_pool, stream=side):
                         body()
@@ -246,8 +247,8 @@ class CaptureRuntime:
                     reset()
                     body(graph, False, stream)
                     graph.set_conditional(continue_flag, False, stream)
-                    restore()
-                reset()
+                # Capture binds addresses, not values: one rollback after
+                # instantiation undoes every warmup.
                 torch._C._cuda_beginAllocateToPool(
                     device_index,
                     self.graph_pool,

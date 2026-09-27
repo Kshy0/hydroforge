@@ -135,6 +135,26 @@ class _NetCDFReadHandlePool:
             pass
 
 
+def _decoded_element_bytes(variable: Any) -> int:
+    """Return a conservative in-memory element width for one variable read.
+
+    netCDF4 applies packing attributes while reading, so a packed integer
+    source materializes with the promoted attribute dtype.  Unpacked integer
+    sources are promoted to float64 at the source payload boundary.
+    """
+
+    read_dtype = np.dtype(variable.dtype)
+    for attribute in ("scale_factor", "add_offset"):
+        if hasattr(variable, attribute):
+            read_dtype = np.result_type(
+                read_dtype,
+                np.asarray(getattr(variable, attribute)).dtype,
+            )
+    if not np.issubdtype(read_dtype, np.floating):
+        return max(8, read_dtype.itemsize)
+    return read_dtype.itemsize
+
+
 def _planned_netcdf_chunk_len(
     path: str | Path,
     var_name: str,
@@ -164,7 +184,7 @@ def _planned_netcdf_chunk_len(
         if len(time_axes) != 1:
             return fallback
         time_axis = time_axes[0]
-        element_bytes = np.dtype(variable.dtype).itemsize
+        element_bytes = _decoded_element_bytes(variable)
         bytes_per_step = element_bytes * math.prod(
             size for index, size in enumerate(variable.shape) if index != time_axis
         )

@@ -36,7 +36,7 @@ from hydroforge.compiler.namespace import NamespaceEntry
 from hydroforge.contracts.events import ConsoleEventSink, EventSink, emit
 from hydroforge.contracts.fields import FieldDemandPlan, tensor_is_active
 from hydroforge.contracts.kernel_field import _KernelField
-from hydroforge.contracts.naming import DottedPath, Identifier
+from hydroforge.contracts.naming import Identifier
 from hydroforge.contracts.options import OptionsConfig
 from hydroforge.contracts.parameters import ParameterChange
 from hydroforge.contracts.runtime import (
@@ -73,10 +73,6 @@ if TYPE_CHECKING:
         GroupRankLookup,
         PartitionCompiler,
     )
-    from hydroforge.compiler.statistics_binding import (
-        DisabledStatisticsBinding,
-        StatisticsBindingCompiler,
-    )
     from hydroforge.contracts.fields import PartitionSchema
     from hydroforge.data.model_input import ModelInput
     from hydroforge.execution.lifecycle import RuntimeLifecycle
@@ -87,6 +83,7 @@ if TYPE_CHECKING:
     from hydroforge.execution.progress import ProgressRuntime
     from hydroforge.execution.runtime import ModelExecution
     from hydroforge.output.checkpoint import CheckpointRuntime
+    from hydroforge.statistics.runtime import StatisticsRuntime
 
 
 _STATISTICS_QUERY_CONTEXT = "hydroforge_statistics_model"
@@ -104,7 +101,6 @@ class _ModelClassDeclaration(HydroForgeModel):
     module_names: frozenset[str]
     partition_key: Identifier | None
     partition_group: Identifier
-    cuda_extension_modules: tuple[DottedPath, ...]
 
     @model_validator(mode="after")
     def _validate_declaration(self) -> Self:
@@ -115,8 +111,6 @@ class _ModelClassDeclaration(HydroForgeModel):
             raise ValueError(
                 f"module_requirements names unknown modules: {sorted(unknown_modules)}"
             )
-        if len(self.cuda_extension_modules) != len(set(self.cuda_extension_modules)):
-            raise ValueError("cuda_extension_modules must not contain duplicates")
         return self
 
 
@@ -231,7 +225,6 @@ class AbstractModel(HydroForgeModel, ABC):
     )
     partition_key: ClassVar[str | None] = None
     partition_group: ClassVar[str] = "group_id"
-    cuda_extension_modules: ClassVar[tuple[str, ...]] = ()
     step_field_providers: ClassVar[Mapping[str, StepFieldProvider]] = MappingProxyType(
         {}
     )
@@ -246,6 +239,7 @@ class AbstractModel(HydroForgeModel, ABC):
         description="InputProxy object containing model data",
     )
     output_dir: Path = Field(
+        strict=False,
         default_factory=lambda: Path("./out"),
         description="Path to the output directory",
     )
@@ -429,7 +423,7 @@ class AbstractModel(HydroForgeModel, ABC):
     # runtime dependencies on its compiler and execution consumers.
     _execution: ModelExecution = PrivateAttr()
     _namespace: NamespaceCompiler = PrivateAttr()
-    _statistics: DisabledStatisticsBinding | StatisticsBindingCompiler = PrivateAttr()
+    _statistics: StatisticsRuntime | None = PrivateAttr(default=None)
     _checkpoint: CheckpointRuntime = PrivateAttr()
     _data: ModelDataCompiler = PrivateAttr()
     _input: ModelInput = PrivateAttr()
@@ -437,6 +431,7 @@ class AbstractModel(HydroForgeModel, ABC):
     _field_namespace: Mapping[str, tuple[FieldOwner, ...]] = PrivateAttr()
     _parameters: ParameterPlanRuntime = PrivateAttr()
     _progress_service: ProgressRuntime = PrivateAttr()
+    _schedule_index: int = PrivateAttr(default=0)
     _current_time: datetime | cftime.datetime | None = PrivateAttr(
         default=None,
     )
@@ -518,18 +513,21 @@ class AbstractModel(HydroForgeModel, ABC):
 
     @property
     def current_time(self) -> datetime | cftime.datetime | None:
-        """Return the private clock of the next managed model step."""
+        """Physical date of the next step, or the end of a completed schedule."""
 
         self._ensure_runtime_materialized()
+        schedule = self.simulation_schedule
+        if schedule is not None:
+            if self._schedule_index == len(schedule):
+                return schedule._end
+            return schedule._step_at_trusted(self._schedule_index).start
         return self._current_time
 
-    def _set_runtime_current_time(
-        self,
-        value: datetime | cftime.datetime,
-    ) -> None:
-        """Advance the private clock from the managed-step runtime."""
-
-        self._current_time = value
+    @property
+    def schedule_index(self) -> int | None:
+        """Next execution index, or None for a model without a schedule."""
+        self._ensure_runtime_materialized()
+        return self._schedule_index if self.simulation_schedule is not None else None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -540,13 +538,11 @@ class AbstractModel(HydroForgeModel, ABC):
             module_names=frozenset(module_types),
             partition_key=cls.partition_key,
             partition_group=cls.partition_group,
-            cuda_extension_modules=cls.cuda_extension_modules,
         )
         cls.backend_requirements = declaration.backend_requirements
         cls.module_requirements = declaration.module_requirements
         cls.partition_key = declaration.partition_key
         cls.partition_group = declaration.partition_group
-        cls.cuda_extension_modules = declaration.cuda_extension_modules
 
     @classmethod
     def _module_reference_fields(cls) -> Mapping[str, ModuleReference]:
@@ -579,14 +575,12 @@ class AbstractModel(HydroForgeModel, ABC):
 
     @field_validator("output_dir", mode="before")
     @classmethod
-    def _validate_output_dir(cls, value: Any) -> Path:
-        """Normalize the two explicitly supported path representations."""
+    def _reject_empty_output_dir(cls, value: Any) -> Any:
+        """Keep lax path coercion without mapping ``""`` to the cwd."""
 
-        if isinstance(value, Path):
-            return value
-        if type(value) is str and value:
-            return Path(value)
-        raise ValueError("output_dir must be a non-empty exact string or Path")
+        if isinstance(value, str) and not value:
+            raise ValueError("output_dir must not be an empty string")
+        return value
 
     @field_validator("experiment_name", mode="before")
     @classmethod
@@ -875,13 +869,13 @@ class AbstractModel(HydroForgeModel, ABC):
         """
 
     def _update_module_structures(self):
-        """Call every module in declared order and commit one staged update."""
+        """Call every module in dependency order and commit one staged update."""
 
         from hydroforge.model.structure import StructuralUpdateContext
 
         hooks = tuple(
             hook
-            for module_name in self.opened_modules
+            for module_name in self._module_order
             if getattr(
                 hook := self._modules[module_name].update_structure, "__func__", None
             )
@@ -954,7 +948,9 @@ class AbstractModel(HydroForgeModel, ABC):
             module_memory[module_name] = module_bytes / (1024 * 1024)
 
         # Add StatisticsRuntime memory usage
-        aggregator_mem = self._statistics.memory_usage()
+        aggregator_mem = (
+            0 if self._statistics is None else self._statistics.get_memory_usage()
+        )
         total_memory += aggregator_mem
         if aggregator_mem:
             module_memory["StatisticsAggregator"] = aggregator_mem / (1024 * 1024)
@@ -997,6 +993,16 @@ class AbstractModel(HydroForgeModel, ABC):
     def close(self) -> None:
         return self._runtime_lifecycle.close()
 
+    @property
+    def parameter_dependencies(self) -> Mapping[str, tuple[str, ...]]:
+        """Observed derived-field inputs; empty until the first parameter event.
+
+        Inspection does not initialize the runtime or discover dependencies.
+        The immutable graph applies to the structure at its last discovery.
+        """
+        runtime = getattr(self, "_parameters", None)
+        return MappingProxyType({}) if runtime is None else runtime.dependencies
+
     def _execute_parameter_changes(
         self,
         current_time: datetime | cftime.datetime,
@@ -1038,9 +1044,9 @@ class AbstractModel(HydroForgeModel, ABC):
             context={_STATISTICS_QUERY_CONTEXT: self},
         )
         self._ensure_healthy_runtime()
-        statistics = cast("StatisticsBindingCompiler", self._statistics)
-        return statistics.results(
-            stacked=query.as_stacked, start=query.start, stop=query.stop
+        statistics = cast("StatisticsRuntime", self._statistics)
+        return statistics.get_results(
+            as_stacked=query.as_stacked, start=query.start, stop=query.stop
         )
 
     def get_output_result(
@@ -1079,11 +1085,11 @@ class AbstractModel(HydroForgeModel, ABC):
             context={_STATISTICS_QUERY_CONTEXT: self},
         )
         self._ensure_healthy_runtime()
-        statistics = cast("StatisticsBindingCompiler", self._statistics)
-        return statistics.result(
+        statistics = cast("StatisticsRuntime", self._statistics)
+        return statistics.get_result(
             query.variable_name,
             query.operation,
-            stacked=query.as_stacked,
+            as_stacked=query.as_stacked,
             start=query.start,
             stop=query.stop,
         )
@@ -1098,7 +1104,7 @@ class AbstractModel(HydroForgeModel, ABC):
             context={_STATISTICS_QUERY_CONTEXT: self},
         )
         self._ensure_healthy_runtime()
-        return self._statistics.aggregator.drain_results(
+        return self._statistics.drain_results(
             query.max_steps, as_stacked=query.as_stacked
         )
 
@@ -1109,12 +1115,12 @@ class AbstractModel(HydroForgeModel, ABC):
             {"batch_size": batch_size}, context={_STATISTICS_QUERY_CONTEXT: self}
         )
         self._ensure_healthy_runtime()
-        return self._statistics.aggregator.iter_results(query.batch_size)
+        return self._statistics.iter_results(query.batch_size)
 
     def get_output_time_index(self) -> int:
         """Get the current output time index (number of finalized time steps)."""
         self._ensure_healthy_runtime()
-        return self._statistics.time_index()
+        return 0 if self._statistics is None else self._statistics.get_time_index()
 
     def get_output_accumulator(
         self,
@@ -1132,7 +1138,7 @@ class AbstractModel(HydroForgeModel, ABC):
             context={_STATISTICS_QUERY_CONTEXT: self},
         )
         self._ensure_healthy_runtime()
-        statistics = cast("StatisticsBindingCompiler", self._statistics)
+        statistics = cast("StatisticsRuntime", self._statistics)
         return statistics.accumulator(
             query.variable_name,
             query.operation,
@@ -1154,7 +1160,7 @@ class AbstractModel(HydroForgeModel, ABC):
             context={_STATISTICS_QUERY_CONTEXT: self},
         )
         self._ensure_healthy_runtime()
-        statistics = cast("StatisticsBindingCompiler", self._statistics)
+        statistics = cast("StatisticsRuntime", self._statistics)
         return statistics.pop_result(
             query.variable_name,
             query.operation,
@@ -1163,7 +1169,8 @@ class AbstractModel(HydroForgeModel, ABC):
     def reset_output_time_index(self) -> None:
         """Reset the output time index to 0 for a new simulation run (in-memory mode only)."""
         self._ensure_healthy_runtime()
-        self._statistics.reset_time_index()
+        if self._statistics is not None:
+            self._statistics.reset_time_index()
 
     def shard_param(self) -> dict[str, Any]:
         """Load and rank-slice parameters through the internal data service."""

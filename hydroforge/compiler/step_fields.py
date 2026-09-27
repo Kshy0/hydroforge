@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -14,7 +13,11 @@ from hydroforge.compiler.generated import (
     compile_generated_module,
     release_generated_module,
 )
-from hydroforge.statistics.ir import Expression, ExpressionDialect, render_expression
+from hydroforge.statistics.emitters.expression import (
+    ExpressionDialect,
+    render_expression,
+)
+from hydroforge.statistics.ir import Expression
 
 if TYPE_CHECKING:
     from hydroforge.execution.capture import CaptureRuntime
@@ -354,59 +357,51 @@ class CompiledStepFields:
         self.source = source
         kernel = module.aggregate_time
         if self.dialect is ExpressionDialect.TRITON:
-            self.launch = lambda advance: kernel[(1,)](
+            from hydroforge.kernels.backends.triton.dispatcher import (
+                launch_triton_kernel,
+            )
+
+            launch = launch_triton_kernel(kernel, (1,), physics=False)
+            self.launch = lambda advance: launch(
                 *self.tensors, advance, num_warps=1, enable_fp_fusion=False
             )
         else:
             self.launch = lambda advance: kernel(*self.tensors, advance)
 
     def _compile_cuda(self) -> None:
-        from hydroforge.kernels.backends.cuda.build import load_inline_cu_module
+        from hydroforge.kernels.backends.cuda import rtc
 
-        types = {
-            torch.int32: "int32_t",
-            torch.int64: "int64_t",
-            torch.float32: "float",
-            torch.float64: "double",
-        }
         parameters = ["int64_t* clock", "const int64_t* duration"]
         parameters.extend(
-            f"{types[dtype]}* slab_{index}" for index, dtype in enumerate(self.dtypes)
-        )
-        parameters.append("bool advance")
-        declaration = (
-            "void aggregate_time(std::vector<at::Tensor> tensors, bool advance);"
-        )
-        arguments = ["tensors[0].data_ptr<int64_t>()", "tensors[1].data_ptr<int64_t>()"]
-        arguments.extend(
-            f"tensors[{index + 2}].data_ptr<{types[dtype]}>()"
+            f"{rtc.ctype(dtype)}* slab_{index}"
             for index, dtype in enumerate(self.dtypes)
         )
+        parameters.append("bool advance")
+        body = self.source.replace("hf_max(", "fmax(").replace("hf_min(", "fmin(")
         source = (
-            "#include <torch/extension.h>\n#include <c10/cuda/CUDAStream.h>\n"
-            "#include <c10/cuda/CUDAGuard.h>\n#include <c10/cuda/CUDAException.h>\n"
-            "#include <cmath>\n"
-            f"__global__ void time_kernel({', '.join(parameters)}) {{\n{self.source.replace('hf_max(', 'fmax(').replace('hf_min(', 'fmin(')}\n}}\n"
-            "void aggregate_time(std::vector<at::Tensor> tensors, bool advance) {\n"
-            "    const c10::cuda::CUDAGuard guard(tensors[0].device());\n"
-            f"    time_kernel<<<1, 1, 0, c10::cuda::getCurrentCUDAStream()>>>({', '.join(arguments)}, advance);\n"
-            "    C10_CUDA_KERNEL_LAUNCH_CHECK();\n}\n"
+            f"__global__ void time_kernel({', '.join(parameters)}) {{\n{body}\n}}\n"
         )
-        digest = hashlib.sha256(source.encode()).hexdigest()[:16]
-        self.module = load_inline_cu_module(
-            "hydroforge_step_time_" + digest,
-            cpp_sources=declaration,
-            cuda_sources=source,
-            functions=["aggregate_time"],
-            extra_cuda_cflags=(
-                "-O3",
-                "-ffp-contract=off" if torch.version.hip else "--fmad=false",
-            ),
+        program = rtc.RtcProgram(
+            source,
+            ("--fmad=false",),
+            "hydroforge_step_time",
         )
+        device = self.tensors[0].device.index
+        launches = {}
+        for advance in (False, True):
+            steps = (
+                rtc.CudaLaunch(
+                    "time_kernel",
+                    1,
+                    1,
+                    (*map(rtc.pointer, self.tensors), rtc.boolean(advance)),
+                ),
+            )
+            launches[advance] = rtc.prepare(
+                rtc.request_for(program, steps), steps, device
+            )
         self.source = source
-        self.launch = lambda advance: self.module.aggregate_time(
-            list(self.tensors), advance
-        )
+        self.launch = lambda advance: launches[bool(advance)]()
 
     def _compile_metal(self) -> None:
         from hydroforge.kernels.backends.metal.online import (
@@ -447,12 +442,15 @@ class CompiledStepFields:
 
     def run(self, *, advance: bool) -> None:
         if advance and self.capture is not None:
-            if self.graph is None:
-                self.graph = self.capture.capture_cuda(
-                    lambda: self.launch(True),
-                    mutated_state=self.tensors,
-                )
-            self.graph.replay()
+            # Clock updates are non-differentiable. Capture and replay also
+            # touch generator state that earlier inference captures may own.
+            with torch.inference_mode():
+                if self.graph is None:
+                    self.graph = self.capture.capture_cuda(
+                        lambda: self.launch(True),
+                        mutated_state=self.tensors,
+                    )
+                self.graph.replay()
         else:
             self.launch(advance)
 

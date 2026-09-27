@@ -50,7 +50,7 @@ from hydroforge.contracts.naming import Identifier
 from hydroforge.contracts.runtime import MODEL_OWNED_MODULE_FIELDS
 from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.data.distributed import _find_indices_in_torch_trusted
-from hydroforge.model.tensors import ModuleTensors
+from hydroforge.model.tensors import _PARAMETER_TENSOR_READS, ModuleTensors
 
 _NO_FIELD_DEFAULT = object()
 _MODULE_INITIALIZATION_CONTEXT = "hydroforge_model_initialization"
@@ -391,23 +391,36 @@ class _ReferenceIndexDescriptor:
     def __set_name__(self, owner, name: str) -> None:
         self.name = name
 
+    @property
+    def cache_name(self) -> str:
+        return f"__derived_reference_index_{self.name}"
+
     def __get__(self, instance, owner=None):
         if instance is None:
             return self
-        cache_name = f"__derived_reference_index_{self.name}"
-        cached = instance.__dict__.get(cache_name)
+        cached = instance.__dict__.get(self.cache_name)
         if cached is None:
             source = type(instance)._tensor_schema_map().get(self.reference)
             if source is not None and not instance._is_tensor_field_active(source):
                 return None
-            if self.inverse:
-                cached = instance._inverse_reference_index(self.reference)
-            else:
-                cached = instance._reference_index(self.reference)
-            if self.device:
-                cached = cached.to(instance.device)
-            instance.__dict__[cache_name] = cached
+            cached = self.derive(instance)
+            instance.__dict__[self.cache_name] = cached
         return cached
+
+    def derive(
+        self,
+        instance,
+        values: torch.Tensor | None = None,
+        target: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute the index from explicit or live source and target tensors."""
+        if self.inverse:
+            index = instance._inverse_reference_index(
+                self.reference, target, values=values
+            )
+        else:
+            index = instance._reference_index(self.reference, target, values=values)
+        return index.to(instance.device if self.device else torch.device("cpu"))
 
 
 class _ReferenceIndexDeclaration(HydroForgeModel):
@@ -708,6 +721,23 @@ class AbstractModule(HydroForgeModel, ABC):
     _field_demand: FieldDemandPlan = PrivateAttr(default_factory=FieldDemandPlan.empty)
     _output_required_fields: frozenset[str] = PrivateAttr(default_factory=frozenset)
     _observed_output_fields: frozenset[str] = PrivateAttr(default_factory=frozenset)
+
+    def __getattribute__(self, name: str) -> Any:
+        recording = _PARAMETER_TENSOR_READS.get()
+        if recording is not None:
+            fields, reads = recording
+            qualified = fields.get((id(self), name))
+            if qualified is not None:
+                reads.add(qualified)
+        return super().__getattribute__(name)
+
+    def validate_parameters(self) -> Self:
+        """Check live physical parameters after a scheduled refresh.
+
+        Override with a read-only ``@model_validator(mode="after")`` to reuse
+        the same checks at construction. Keep initial-state validation separate.
+        """
+        return self
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -1148,37 +1178,94 @@ class AbstractModule(HydroForgeModel, ABC):
         self,
         field_name: str,
         target: torch.Tensor | None = None,
+        *,
+        values: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Resolve a validated ReferenceField to rank-local indices."""
-        values = getattr(self, field_name)
-
+        if values is None:
+            values = getattr(self, field_name)
         if target is None:
             _, target = self._reference_target(field_name)
-        return _find_indices_in_torch_trusted(values, target)
+        # Source and target residencies are declared independently.
+        return _find_indices_in_torch_trusted(values, target.to(values.device))
 
     def _inverse_reference_index(
         self,
         field_name: str,
         target: torch.Tensor | None = None,
         *,
+        values: torch.Tensor | None = None,
         fill_value: int = -1,
     ) -> torch.Tensor:
-        """Return referencing-row indices aligned to the target coordinate."""
+        """Return referencing-row indices aligned to the target coordinate.
+
+        Relation rows whose target is not local (for example replicated
+        relations over a partitioned target) leave no inverse entry.
+        """
         if target is None:
             _, target = self._reference_target(field_name)
-        indices = self._reference_index(field_name, target)
+        indices = self._reference_index(field_name, target, values=values).reshape(-1)
+        rows = torch.arange(indices.numel(), dtype=torch.int32, device=indices.device)
+        hits = indices >= 0
+        local = indices[hits].to(torch.int64)
+        if local.numel() and torch.unique(local).numel() != local.numel():
+            raise ValueError(
+                f"Inverse reference field {self.module_name}.{field_name} must "
+                "contain unique target references"
+            )
         inverse = torch.full(
             (target.shape[0],),
             fill_value,
             dtype=torch.int32,
             device=indices.device,
         )
-        inverse[indices.to(torch.int64)] = torch.arange(
-            indices.numel(),
-            dtype=torch.int32,
-            device=indices.device,
-        )
+        inverse[local] = rows[hits]
         return inverse
+
+    def _stale_reference_indices(
+        self,
+        replacements: Mapping[int, torch.Tensor],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Return materialized derived indices invalidated by staged storage.
+
+        A derived index staged explicitly must equal its derived value; one
+        whose source or target is replaced is returned with fresh contents.
+        """
+        stale: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for name, descriptor in type(self)._reference_index_fields().items():
+            cached = self.__dict__.get(descriptor.cache_name)
+            if cached is None:
+                continue
+            values = getattr(self, descriptor.reference)
+            _, target = self._reference_target(descriptor.reference)
+            staged = replacements.get(id(cached))
+            if (
+                staged is None
+                and id(values) not in replacements
+                and id(target) not in replacements
+            ):
+                continue
+            if not isinstance(values, torch.Tensor) or not isinstance(
+                target, torch.Tensor
+            ):
+                raise ValueError(
+                    f"derived reference index {self.module_name}.{name} cannot "
+                    "be refreshed because its source or target was discarded"
+                )
+            fresh = descriptor.derive(
+                self,
+                replacements.get(id(values), values),
+                replacements.get(id(target), target),
+            )
+            if staged is None:
+                stale.append((cached, fresh))
+            elif not torch.equal(staged, fresh.to(staged.device)):
+                raise ValueError(
+                    f"staged derived reference index {self.module_name}.{name} "
+                    f"does not match {descriptor.reference!r} resolved against "
+                    "its target coordinate"
+                )
+        return stale
 
     def get_expected_dtype(self, field_name: str) -> torch.dtype:
         query = _ModuleTensorQuery(
@@ -1304,9 +1391,14 @@ class AbstractModule(HydroForgeModel, ABC):
             opened_modules=self.opened_modules,
             field_demand=self._field_demand,
         )
+        if schema is None:
+            raise ValueError(f"unknown tensor field {self.module_name}.{field_name}")
         if schema.tensor.category == "topology":
             return False
         if schema.tensor.category == "forcing":
             return field_name in self._tensors.batched_fields
         tensor = getattr(self, field_name)
+        # An inactive field has no storage and therefore no member axis.
+        if not isinstance(tensor, torch.Tensor):
+            return False
         return tensor.ndim == len(schema.tensor.shape) + 1

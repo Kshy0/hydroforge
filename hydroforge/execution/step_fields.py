@@ -23,6 +23,17 @@ from hydroforge.contracts.step_fields import (
 )
 
 
+def _upload(destination: torch.Tensor, source: torch.Tensor) -> None:
+    """Stream-order a host update without waiting for queued device work."""
+
+    if destination.device.type == "cuda":
+        # Caching-host-allocator staging is not reused until this copy has
+        # completed, so later host edits of ``source`` cannot race it.
+        destination.copy_(source.pin_memory(), non_blocking=True)
+    else:
+        destination.copy_(source)
+
+
 @dataclass
 class _StepFieldStorage:
     host: torch.Tensor
@@ -111,7 +122,7 @@ class StepFieldRuntime:
         first = len(self.slots) - len(self.providers)
         for dtype in dtypes:
             storage = self.storage[dtype]
-            storage.device[first:].copy_(storage.host[first:])
+            _upload(storage.device[first:], storage.host[first:])
 
     def _date_key(self) -> tuple[str, bool]:
         date = self.time.current_time
@@ -155,7 +166,7 @@ class StepFieldRuntime:
         if self.clock is None:
             self.clock = values.to(self.device)
         else:
-            self.clock.copy_(values)
+            _upload(self.clock, values)
 
     def _update_duration(self) -> None:
         delta = timedelta(seconds=self.time.step_seconds)
@@ -166,7 +177,7 @@ class StepFieldRuntime:
         if self.duration is None:
             self.duration = host.to(self.device)
         else:
-            self.duration.copy_(host)
+            _upload(self.duration, host)
         self._duration_value = value
 
     def _ensure_program(self, *, anchor: bool = False) -> CompiledStepFields | None:

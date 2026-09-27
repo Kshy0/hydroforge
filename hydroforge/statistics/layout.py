@@ -5,11 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
 
 import torch
 
-from hydroforge.contracts.fields import concrete_tensor_dtype
+from hydroforge.contracts.fields import RuntimeTensorMetadata, concrete_tensor_dtype
 from hydroforge.statistics.ir import (
     Expression,
     ExpressionSource,
@@ -63,10 +62,22 @@ class _SourceLayout:
 
 
 class _StatisticsLayoutCompiler:
-    def __init__(self, aggregator: Any, program: StatisticsProgram) -> None:
-        self.aggregator = aggregator
+    def __init__(
+        self,
+        program: StatisticsProgram,
+        *,
+        tensors: Mapping[str, torch.Tensor],
+        fields: Mapping[str, RuntimeTensorMetadata],
+        ensemble_size: int,
+        base_dtype: torch.dtype,
+        mixed_precision: bool,
+    ) -> None:
         self.program = program
-        self.ensemble_size = aggregator.ensemble_size
+        self.tensors = tensors
+        self.fields = fields
+        self.ensemble_size = ensemble_size
+        self.base_dtype = base_dtype
+        self.mixed_precision = mixed_precision
         self.sources: dict[str, _SourceLayout] = {}
 
     def compile(
@@ -94,8 +105,8 @@ class _StatisticsLayoutCompiler:
         return MappingProxyType(layouts)
 
     def _tensor_layout(self, name: str) -> _SourceLayout:
-        tensor = self.aggregator._tensor_registry[name]
-        metadata = self.aggregator._field_registry[name].tensor
+        tensor = self.tensors[name]
+        metadata = self.fields[name].tensor
         logical_rank = len(metadata.shape)
         shape = tuple(int(value) for value in tensor.shape)
         batched = tensor.ndim == logical_rank + 1
@@ -107,11 +118,11 @@ class _StatisticsLayoutCompiler:
         )
 
     def _declared_dtype(self, name: str) -> torch.dtype:
-        metadata = self.aggregator._field_registry[name].tensor
+        metadata = self.fields[name].tensor
         return concrete_tensor_dtype(
             metadata.dtype,
-            self.aggregator.base_dtype,
-            self.aggregator.mixed_precision,
+            self.base_dtype,
+            self.mixed_precision,
         )
 
     def _source_layout(self, name: str) -> _SourceLayout:
@@ -152,7 +163,7 @@ class _StatisticsLayoutCompiler:
         name: str,
         source: ScatterSource,
     ) -> _SourceLayout:
-        index = self.aggregator._tensor_registry[source.index]
+        index = self.tensors[source.index]
         value = self._expression_layout(
             name,
             source.value,
@@ -165,9 +176,9 @@ class _StatisticsLayoutCompiler:
             extent = max(0, upper + 1)
         # The scatter index only describes contributors, not the full target
         # domain.
-        output_index = self.aggregator._field_registry[name].output_index
+        output_index = self.fields[name].output_index
         if output_index is not None:
-            selection = self.aggregator._tensor_registry.get(output_index)
+            selection = self.tensors.get(output_index)
             if selection is not None and selection.numel():
                 extent = max(extent, int(selection.max().item()) + 1)
         shape = (self.ensemble_size, extent) if value.batched else (extent,)
@@ -181,10 +192,10 @@ class _StatisticsLayoutCompiler:
         )
 
     def _selection(self, name: str) -> torch.Tensor | None:
-        output_index = self.aggregator._field_registry[name].output_index
+        output_index = self.fields[name].output_index
         if output_index is None:
             return None
-        return self.aggregator._tensor_registry[output_index]
+        return self.tensors[output_index]
 
     def _selected_layout(self, name: str) -> StatisticsVariableLayout:
         source = self._source_layout(name)
@@ -206,9 +217,14 @@ class _StatisticsLayoutCompiler:
 
 
 def compile_statistics(
-    aggregator: Any,
     variable_ops: Mapping[str, list[str] | tuple[str, ...]],
     program: StatisticsProgram,
+    *,
+    tensors: Mapping[str, torch.Tensor],
+    fields: Mapping[str, RuntimeTensorMetadata],
+    ensemble_size: int,
+    base_dtype: torch.dtype,
+    mixed_precision: bool,
 ) -> StatisticsCompilation:
     """Compile exact layouts from construction-time validated semantics."""
 
@@ -218,8 +234,12 @@ def compile_statistics(
     }
     immutable_ops = MappingProxyType(normalized)
     layouts = _StatisticsLayoutCompiler(
-        aggregator,
         program,
+        tensors=tensors,
+        fields=fields,
+        ensemble_size=ensemble_size,
+        base_dtype=base_dtype,
+        mixed_precision=mixed_precision,
     ).compile(immutable_ops)
     return StatisticsCompilation(immutable_ops, program, layouts)
 

@@ -1,6 +1,6 @@
 """Stable physical-kernel authoring API."""
 
-from hydroforge.kernels.dispatcher import launch_triton_kernel
+from hydroforge.kernels.backends.triton.dispatcher import launch_triton_kernel
 from hydroforge.kernels.registry import (
     BackendRegistry,
     make_spec_cuda_dispatcher,

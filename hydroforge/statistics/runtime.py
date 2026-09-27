@@ -8,43 +8,33 @@ from __future__ import annotations
 
 import atexit
 import math
-import os
 import weakref
 from collections.abc import Mapping
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
-from functools import lru_cache
-from multiprocessing import get_context
+from functools import lru_cache, partial
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
-from uuid import uuid4
 
+import cftime
 import numpy as np
 import torch
 
 from hydroforge.compiler.generated import release_generated_module
-from hydroforge.contracts.errors import ResourceCleanupError
+from hydroforge.contracts.errors import ResourceCleanupError, cleanup_on_exit
 from hydroforge.contracts.events import ConsoleEventSink, emit
 from hydroforge.contracts.fields import RuntimeTensorMetadata
 from hydroforge.contracts.naming import sanitize_symbol
 from hydroforge.contracts.runtime import DEFAULT_BLOCK_SIZE
-from hydroforge.data.distributed import torch_to_numpy_dtype
-from hydroforge.output.netcdf.writer import (
-    PendingNetCDFWrite,
-    _close_worker_netcdf_files,
-    _initialize_netcdf_worker,
-    _NetCDFOutputStream,
-    _NetCDFWriteBuffer,
-    _NetCDFWriter,
-    compute_write_batch_size,
-    constrain_write_batch_sizes,
+from hydroforge.kernels.backends.triton.dispatcher import TRITON_INT32_MAX_EXTENT
+from hydroforge.output.conversion import _checked_output_tensor_copy
+from hydroforge.output.netcdf.writer import _NetCDFWriter
+from hydroforge.statistics.compiler import compile_statistics_program
+from hydroforge.statistics.emitters.common import (
+    HostSamplePhase,
+    StatisticsCompileContext,
 )
-from hydroforge.serialization.files import atomic_write_text
-from hydroforge.serialization.netcdf import (
-    default_netcdf_options,
-)
-from hydroforge.statistics.compiler import StatisticsCompiler
 from hydroforge.statistics.ir import (
     Reduction,
     ScatterSource,
@@ -52,9 +42,14 @@ from hydroforge.statistics.ir import (
     StorageDType,
     StorageInitialization,
     TensorSource,
+    build_statistics_ir,
     build_variable_storage_plan,
 )
-from hydroforge.statistics.layout import StatisticsCompilation, compile_statistics
+from hydroforge.statistics.layout import (
+    StatisticsCompilation,
+    StatisticsVariableLayout,
+    compile_statistics,
+)
 
 
 @lru_cache(maxsize=128)
@@ -70,7 +65,7 @@ def _weak_shutdown_callback(runtime: Any):
     def shutdown() -> None:
         instance = runtime_ref()
         if instance is not None:
-            instance._shutdown()
+            instance.close()
 
     return shutdown
 
@@ -96,6 +91,7 @@ class StatisticsInstallation:
     fields: Mapping[str, RuntimeTensorMetadata]
     statics: tuple[StatisticsStaticBinding, ...]
     netcdf_options: Mapping[str, Mapping[str, Any]]
+    source_copies: tuple[tuple[str, torch.Tensor, torch.Tensor], ...] = ()
 
 
 @dataclass
@@ -126,40 +122,23 @@ class StatisticsRuntime:
         default_factory=lambda: torch.device("cpu"),
     )
     save_precision: torch.dtype | None = None
-    output_netcdf_options: Mapping[str, Any] = field(
-        default_factory=default_netcdf_options,
-    )
     event_sink: Any = field(default_factory=ConsoleEventSink)
-    run_id: str | None = None
 
-    _kernels_dir: Path | None = field(init=False, default=None, repr=False)
-    _static_vars: dict[str, dict[str, Any]] = field(
+    kernels_dir: Path | None = field(init=False, default=None, repr=False)
+    static_vars: dict[str, dict[str, Any]] = field(
         init=False,
         default_factory=dict,
         repr=False,
     )
 
-    @property
-    def in_memory_mode(self) -> bool:
-        return self.in_memory
-
-    @property
-    def kernels_dir(self) -> Path | None:
-        return self._kernels_dir
-
-    @property
-    def static_vars(self) -> dict[str, dict[str, Any]]:
-        return self._static_vars
-
     def __post_init__(self) -> None:
         self._closed = False
-        self._current_year = None
 
         # Create kernels directory if saving is enabled (must precede any
         # codegen step so the generated .py files have a destination).
         if self.save_kernels:
-            self._kernels_dir = self.output_dir / "generated_kernels"
-            self._kernels_dir.mkdir(parents=True, exist_ok=True)
+            self.kernels_dir = self.output_dir / "generated_kernels"
+            self.kernels_dir.mkdir(parents=True, exist_ok=True)
 
         self._macro_step_index = 0  # Current macro step index (outer loop counter)
         self._macro_mean_count_limit: int | None = None
@@ -170,7 +149,8 @@ class StatisticsRuntime:
         self._variable_ops: dict[str, list[str]] = {}  # var -> list[ops]
         self._storage: dict[str, torch.Tensor] = {}  # out_name -> tensor
         self._output_keys: list[str] = []  # list of keys in storage that are outputs
-        self._metadata: dict[str, dict[str, Any]] = {}  # out_name -> meta
+        self._host_phase = HostSamplePhase()
+        self._output_metadata: dict[str, dict[str, Any]] = {}  # out_name -> meta
         self._coord_cache: dict[str, np.ndarray] = {}
 
         self._tensor_registry: dict[str, torch.Tensor] = {}
@@ -180,29 +160,16 @@ class StatisticsRuntime:
         # Cache for sanitized names
         self._safe_name_cache: dict[str, str] = {}
 
-        # Streaming mode support
-        # Compatibility view for callers that inspect the created paths.
-        self._netcdf_files: dict[str, Path | list[Path]] = {}
-        self._output_streams: dict[str, tuple[_NetCDFOutputStream, ...]] = {}
-
-        self._all_created_files: set[Path] = set()
-        self._files_created: bool = False
-
-        # Thread pool for background writing
-        self._write_executors: list[ProcessPoolExecutor] = []
-        self._pending_writes: list = []
-        self._write_buffers: dict[str, _NetCDFWriteBuffer] = {}
-
         # Kernel state (mean fast-path)
         self._kernel_module = None
         self._generated_modules: list[tuple[str, str]] = []
         self._saved_kernel_file = None
         self._dirty_outputs: set[str] = set()
-        self._compiler = StatisticsCompiler(self)
-        self._output = _NetCDFWriter(self)
+        self._output: _NetCDFWriter | None = None
+        self._last_time_number: float | None = None
 
         # In-memory result tensors: out_name -> list of tensors (one per time step)
-        # Only used when in_memory_mode=True
+        # Only used when in_memory=True
         self._result_tensors: dict[str, list[torch.Tensor]] = {}
         self._current_time_index: int = 0
 
@@ -232,7 +199,11 @@ class StatisticsRuntime:
             )
         self._atexit_callback = _weak_shutdown_callback(self)
         atexit.register(self._atexit_callback)
-        self._materialize_installation(self.installation)
+        try:
+            self._materialize_installation(self.installation)
+        except BaseException:
+            with cleanup_on_exit("statistics initialization", (self.close,)):
+                raise
 
     def _prepare_kernel_states(self) -> None:
         """Pre-compute and cache all tensors required for kernel execution."""
@@ -306,6 +277,8 @@ class StatisticsRuntime:
         # Scalar parameters as 1-element device tensors for CUDA Graph compatibility.
         # Kernel code loads these via tl.load (Triton) or reads from states dict,
         # so CUDA Graphs can replay without recapture when values change.
+        if self.backend == "triton" and self.device.type == "cuda":
+            self._check_triton_offsets(required_tensors)
         control_dtype = self._statistics_control_dtype()
         layout = (
             ("__weight", control_dtype),
@@ -317,6 +290,8 @@ class StatisticsRuntime:
             ("__flags", torch.int32),
         )
         if self.device.type == "mps":
+            # An unpinned host copy to MPS waits for the whole queue; queued
+            # fills keep sampling asynchronous.
             required_tensors.update(
                 {
                     name: torch.zeros(1, dtype=dtype, device=self.device)
@@ -331,7 +306,8 @@ class StatisticsRuntime:
             control_bytes, dtype=torch.uint8, device=self.device
         )
         host_slots = []
-        for _slot in range(3 if self.device.type == "cuda" else 1):
+        # Pinned slots let the host run ahead of queued statistics launches.
+        for _slot in range(16 if self.device.type == "cuda" else 1):
             host = torch.zeros(
                 control_bytes,
                 dtype=torch.uint8,
@@ -355,6 +331,23 @@ class StatisticsRuntime:
         self._control_host_slots = host_slots
         self._control_slot_index = 0
         self._control_host, self._control_host_values, _event = host_slots[0]
+
+    def _check_triton_offsets(self, tensors: Mapping[str, torch.Tensor]) -> None:
+        """Reject bindings whose int32 Triton element offsets would wrap."""
+
+        for name, tensor in tensors.items():
+            # Masked tail lanes of the last block address up to one block
+            # of rows (times the trailing level/top-k axis) past the end.
+            trailing = int(tensor.shape[-1]) if tensor.ndim > 1 else 1
+            limit = TRITON_INT32_MAX_EXTENT - self.block_size * trailing
+            if tensor.numel() > limit:
+                raise OverflowError(
+                    f"statistics buffer {name!r} has {tensor.numel()} elements "
+                    "(including ensemble members); Triton statistics kernels "
+                    f"use int32 offsets, so it must hold <= {limit} for "
+                    f"BLOCK_SIZE={self.block_size}; use the cuda backend or "
+                    "split the domain or ensemble"
+                )
 
     def _statistics_control_dtype(self) -> torch.dtype:
         """Return the precision shared by aggregation control scalars."""
@@ -422,11 +415,6 @@ class StatisticsRuntime:
 
         for var_name in self._variable_ops:
             operation_nodes = self._statistics_program.operations[var_name]
-            source = self._statistics_program.sources.get(
-                var_name,
-                TensorSource(var_name),
-            )
-
             field_info = self._field_registry[var_name]
             metadata = field_info.tensor
             layout = self._statistics_layouts[var_name]
@@ -504,87 +492,24 @@ class StatisticsRuntime:
                     coordinate.setflags(write=False)
                     self._coord_cache[output_coord] = coordinate
 
-                # Downcast to save_precision if specified (e.g. float64 -> float32)
-                save_dtype = target_dtype
-                if self.save_precision is not None and target_dtype.is_floating_point:
-                    save_dtype = self.save_precision
-                out_dtype = torch_to_numpy_dtype(save_dtype)
-
-                is_arg_op = operation.stores_index
-
-                # Determine stride_input and scatter metadata
-                scatter_info = None
-                stride_input = layout.stride_input
-                if isinstance(source, ScatterSource):
-                    scatter_info = {
-                        "mode": source.reduction.value,
-                        "value_expr": source.value.source,
-                        "index_var": source.index,
-                        "source_size": layout.scatter_source_size,
-                    }
-
                 meta = {
-                    "original_variable": var_name,
-                    "op": op,
-                    "output_index": output_index,
                     "full_output": full_output,
                     "tensor_shape": tensor_shape,
-                    "dtype": "i8" if is_arg_op else out_dtype,
+                    "dtype": self._storage[out_name].dtype,
                     "actual_shape": tuple(self._storage[out_name].shape),
-                    "actual_ndim": self._storage[out_name].ndim,
                     "batched": layout.batched,
                     "output_coord": output_coord,
-                    "nc_coord_name": dim_coords.split(".")[-1] if dim_coords else None,
+                    "dim_coords": dim_coords,
                     "description": f"{description} ({op})",
-                    "stride_input": stride_input,
                     "k": operation.k,
-                    "scatter": scatter_info,  # None for non-scatter, dict for scatter virtuals
                 }
-                self._metadata[out_name] = meta
+                self._output_metadata[out_name] = meta
 
                 # Classify as outer if it is a compound op (e.g. max_mean)
                 self._output_is_outer[out_name] = operation.compound
 
-        from hydroforge.output.netcdf.schema import NetCDFSchema
-
-        desired_batches: dict[str, int] = {}
-        row_bytes: dict[str, int] = {}
-        stream_counts: dict[str, int] = {}
-        for name, metadata in self._metadata.items():
-            order = metadata["k"]
-            row_shape = (
-                metadata["actual_shape"][:-1] if order > 1 else metadata["actual_shape"]
-            )
-            storage_dtype = np.dtype(metadata["dtype"])
-            row_bytes[name] = max(
-                1,
-                math.prod(row_shape) * storage_dtype.itemsize,
-            )
-            stream_counts[name] = order
-            desired_batches[name] = compute_write_batch_size(
-                max(1, math.prod(row_shape)),
-                storage_dtype.itemsize,
-                max_batch=min(30, self.max_pending_steps),
-            )
-        write_batches = constrain_write_batch_sizes(
-            desired_batches,
-            row_bytes=row_bytes,
-            stream_counts=stream_counts,
-            max_pending_bytes=self.max_pending_output_bytes,
-        )
-        self._netcdf_schemas = {
-            name: NetCDFSchema.compile(
-                metadata,
-                variable=name,
-                ensemble_size=self.ensemble_size,
-                netcdf_options=self.installation.netcdf_options[name],
-                write_batch_size=write_batches[name],
-            )
-            for name, metadata in self._metadata.items()
-        }
-
         # Generate kernels and prepare states for all requested variables/ops
-        self._compiler.compile()
+        self._compile_program(self._statistics_layouts)
         self._prepare_kernel_states()
 
     def _claim_macro_step(
@@ -653,6 +578,7 @@ class StatisticsRuntime:
             total_weight,
         )
 
+        is_inner_first = bool(flags & 1) and sub_step == 0
         is_inner_last = bool(flags & 2) and (sub_step == num_sub_steps - 1)
         is_outer_first = bool(flags & 4) and is_inner_last
         is_outer_last = bool(flags & 8) and is_inner_last
@@ -676,7 +602,8 @@ class StatisticsRuntime:
                 self._kernel_states[name].fill_(value)
             self._execute_statistics_kernel()
             return
-        host, host_values, event = self._control_host_slots[self._control_slot_index]
+        slots = self._control_host_slots
+        host, host_values, event = slots[self._control_slot_index]
         if event is not None and not event.query():
             event.synchronize()
         self._control_host = host
@@ -691,11 +618,20 @@ class StatisticsRuntime:
         self._control_buffer.copy_(host, non_blocking=event is not None)
         if event is not None:
             event.record(torch.cuda.current_stream(self.device))
-        self._control_slot_index = (self._control_slot_index + 1) % len(
-            self._control_host_slots
-        )
+        self._control_slot_index = (self._control_slot_index + 1) % len(slots)
 
-        self._execute_statistics_kernel()
+        # Captured launches must keep reading the device control state.
+        if getattr(self.execution, "capture_mode", None) != "cuda_graph":
+            self._host_phase.bits = (
+                is_inner_first
+                | is_inner_last << 1
+                | is_outer_first << 2
+                | is_outer_last << 3
+            )
+        try:
+            self._execute_statistics_kernel()
+        finally:
+            self._host_phase.bits = -1
 
     def _execute_statistics_kernel(self) -> None:
         """Run the generated aggregator through its cached backend executor."""
@@ -775,22 +711,70 @@ class StatisticsRuntime:
             del values[:max_steps]
         return result
 
+    def accumulator(self, variable: str, operation: str) -> torch.Tensor:
+        """Return an ownership-isolated differentiable accumulator snapshot."""
+        return self._storage[f"{variable}_{operation}"].clone(
+            memory_format=torch.preserve_format,
+        )
+
+    def pop_result(self, variable: str, operation: str) -> torch.Tensor | None:
+        """Remove and return the newest finalized in-memory result."""
+        values = self._result_tensors[f"{variable}_{operation}"]
+        return values.pop() if values else None
+
     def get_time_index(self) -> int:
         return self._current_time_index
 
     def reset_time_index(self) -> None:
+        if self._output is not None:
+            self._output.reset_staging()
         self._current_time_index = 0
-        self._output.reset_timeline()
+        self._last_time_number = None
         for out_name in self._result_tensors:
             self._result_tensors[out_name] = []
 
+    def _validate_next_time(
+        self,
+        dt: datetime | cftime.datetime,
+    ) -> float:
+        value = float(
+            cftime.date2num(
+                dt,
+                units=self.time_unit,
+                calendar=self.calendar,
+            )
+        )
+        if not np.isfinite(value):
+            raise ValueError("statistics output time must be finite")
+        if self._last_time_number is not None and value <= self._last_time_number:
+            raise ValueError("statistics output times must be strictly increasing")
+        return value
+
     def finalize_time_step(self, dt: Any) -> None:
-        self._output.finalize_time_step(dt)
+        time_number = self._validate_next_time(dt)
+        keys = [key for key in self._output_keys if key in self._dirty_outputs]
+        if self._output is None:
+            copies = {
+                key: _checked_output_tensor_copy(
+                    self._storage[key],
+                    target_device=self.result_device,
+                    target_dtype=self._result_dtype(key),
+                    name=key,
+                )
+                for key in keys
+            }
+            for key, value in copies.items():
+                self._result_tensors[key].append(value)
+        else:
+            self._output.append(dt, {key: self._storage[key] for key in keys})
+        self._dirty_outputs.difference_update(keys)
+        self._current_time_index += 1
+        self._last_time_number = time_number
 
     def check_background_failures(self, current_time: Any = None) -> None:
         """Raise completed asynchronous output failures without waiting."""
 
-        if not self.in_memory_mode:
+        if self._output is not None:
             self._output.check_completed_writes(dt=current_time)
 
     def require_output_coordinate_resize_safe(
@@ -850,9 +834,13 @@ class StatisticsRuntime:
         """
 
         compilation = compile_statistics(
-            self,
             self.installation.variable_ops,
             self.installation.program,
+            tensors=self._tensor_registry,
+            fields=self._field_registry,
+            ensemble_size=self.ensemble_size,
+            base_dtype=self.base_dtype,
+            mixed_precision=self.mixed_precision,
         )
         for name in self._variable_ops:
             previous = self._statistics_layouts[name]
@@ -868,15 +856,7 @@ class StatisticsRuntime:
                     f"{name!r}: {previous!r} -> {updated!r}"
                 )
 
-        self._cleanup_generated_modules()
-        self._statistics_layouts = compilation.layouts
-        for name, metadata in self._metadata.items():
-            scatter = metadata.get("scatter")
-            if scatter is None:
-                continue
-            variable = metadata["original_variable"]
-            scatter["source_size"] = compilation.layouts[variable].scatter_source_size
-        self._compiler.compile()
+        self._compile_program(compilation.layouts)
         self._prepare_kernel_states()
         self._structural_tensor_versions = {}
         self.execution.statistics.invalidate()
@@ -884,22 +864,8 @@ class StatisticsRuntime:
     def refresh_address_stable_sources(self) -> None:
         """Refresh compiler-owned index copies without replacing graph storage."""
 
-        variable_map = self.execution.model._namespace.build()
         with torch.inference_mode():
-            for name, installed in self._tensor_registry.items():
-                entry = variable_map.get(name)
-                if entry is None:
-                    continue
-                live = getattr(entry.module, entry.field_name)
-                if not isinstance(live, torch.Tensor) or installed is live:
-                    continue
-                schema = entry.module._get_tensor_schema(
-                    entry.field_name,
-                    opened_modules=self.execution.model.opened_modules,
-                    field_demand=self.execution.model._field_demand,
-                )
-                if schema.tensor.is_coordinate:
-                    continue
+            for name, live, installed in self.installation.source_copies:
                 if (
                     installed.shape != live.shape
                     or installed.dtype != live.dtype
@@ -911,83 +877,63 @@ class StatisticsRuntime:
                     )
                 installed.copy_(live)
 
+    def _compile_program(
+        self,
+        layouts: Mapping[str, StatisticsVariableLayout],
+    ) -> None:
+        """Compile a candidate before replacing the installed statistics program."""
+        ir = build_statistics_ir(
+            self._statistics_program,
+            fields=self._field_registry,
+            layouts=layouts,
+            symbol_names=self._safe_name_cache,
+        )
+        context = StatisticsCompileContext(
+            device=self.device,
+            rank=self.rank,
+            ensemble_size=self.ensemble_size,
+            save_kernels=self.save_kernels,
+            kernels_dir=self.kernels_dir,
+            variables=frozenset(self._variables),
+            layouts=MappingProxyType(dict(layouts)),
+            storage=MappingProxyType(dict(self._storage)),
+            tensors=MappingProxyType(dict(self._tensor_registry)),
+            symbol_names=MappingProxyType(dict(self._safe_name_cache)),
+            control_dtype=self._statistics_control_dtype(),
+            host_phase=self._host_phase,
+        )
+        backend = {"cpu": "torch", "mps": "metal"}.get(self.device.type, self.backend)
+        result = compile_statistics_program(context, ir, backend=backend)
+        try:
+            self._cleanup_generated_modules()
+        except BaseException:
+            with cleanup_on_exit(
+                "uninstalled statistics program",
+                (
+                    partial(release_generated_module, name, filename)
+                    for name, filename in result.generated_modules
+                ),
+            ):
+                raise
+        self._statistics_layouts = layouts
+        self._statistics_ir = result.lowering.ir
+        self._statistics_lowering = result.lowering
+        self._generated_modules = list(result.generated_modules)
+        self._aggregator_function = result.function
+        self._kernel_module = result.module
+        self._saved_kernel_file = result.saved_kernel_file
+
     def _cleanup_generated_modules(self) -> None:
-        for module_name, filename in reversed(self._generated_modules):
-            release_generated_module(module_name, filename)
-        self._generated_modules.clear()
+        modules, self._generated_modules = self._generated_modules, []
         self._kernel_module = None
-
-    def _cleanup_lock_files(self) -> None:
-        for output_path in self._all_created_files:
-            lock_path = output_path.with_suffix(output_path.suffix + ".lock")
-            lock_path.unlink(missing_ok=True)
-
-    def _cleanup_executor(self) -> None:
-        failures: list[BaseException] = []
-        try:
-            self._output._flush_all_write_buffers()
-        except BaseException as error:
-            failures.append(error)
-        pending, self._pending_writes = self._pending_writes, []
-        for item in pending:
-            try:
-                item.future.result()
-            except BaseException as error:
-                failures.append(error)
-        executors, self._write_executors = self._write_executors, []
-        for executor in executors:
-            try:
-                executor.submit(_close_worker_netcdf_files).result()
-            except BaseException as error:
-                failures.append(error)
-            try:
-                executor.shutdown(wait=True)
-            except BaseException as error:
-                failures.append(error)
-        self._write_buffers.clear()
-        self._output_streams.clear()
-        self._output._cpu_stager.clear()
-        if len(failures) == 1:
-            raise failures[0]
-        if failures:
-            raise ResourceCleanupError("statistics output workers", failures)
-
-    def _start_write_executors(self) -> None:
-        """Start output workers while model initialization continues."""
-
-        created = []
-        ready = []
-        try:
-            for _ in range(self.num_workers):
-                executor = ProcessPoolExecutor(
-                    max_workers=1,
-                    mp_context=get_context("spawn"),
-                    initializer=_initialize_netcdf_worker,
-                )
-                created.append(executor)
-                ready.append(
-                    PendingNetCDFWrite(
-                        step_counts=(),
-                        payload_bytes=0,
-                        future=executor.submit(os.getpid),
-                    )
-                )
-        except BaseException as primary:
-            failures: list[BaseException] = [primary]
-            for executor in reversed(created):
-                try:
-                    executor.shutdown(wait=True)
-                except BaseException as cleanup_error:
-                    failures.append(cleanup_error)
-            if len(failures) > 1:
-                error = ResourceCleanupError(
-                    "statistics output worker startup",
-                    failures,
-                )
-                raise error from primary
-            raise
-        self._write_executors = created
-        self._pending_writes.extend(ready)
+        with cleanup_on_exit(
+            "statistics generated modules",
+            (
+                partial(release_generated_module, name, filename)
+                for name, filename in reversed(modules)
+            ),
+        ):
+            pass
 
     def _unregister_atexit(self) -> None:
         callback = getattr(self, "_atexit_callback", None)
@@ -995,7 +941,7 @@ class StatisticsRuntime:
             atexit.unregister(callback)
             self._atexit_callback = None
 
-    def _shutdown(self) -> None:
+    def close(self) -> None:
         if self._closed:
             return
         self._closed = True
@@ -1003,8 +949,7 @@ class StatisticsRuntime:
         for cleanup in (
             self._unregister_atexit,
             self._cleanup_generated_modules,
-            self._cleanup_executor,
-            self._cleanup_lock_files,
+            *((self._output.close,) if self._output is not None else ()),
         ):
             try:
                 cleanup()
@@ -1029,13 +974,9 @@ class StatisticsRuntime:
             self._safe_name_cache[name] = sanitize_symbol(name)
         return self._safe_name_cache[name]
 
-    def _generate_unique_name(self) -> str:
-        timestamp = datetime.now().strftime("%H%M%S")
-        return f"{timestamp}_r{self.rank}_{uuid4().hex}"
-
     def __del__(self) -> None:
         try:
-            self._shutdown()
+            self.close()
         except Exception:
             pass
 
@@ -1052,7 +993,6 @@ class StatisticsRuntime:
             "values": values,
             "dim": binding.dim,
             "coordinate": binding.coordinate,
-            "dtype": values.dtype.str.lstrip("<>|"),
             "attrs": {},
         }
 
@@ -1064,22 +1004,18 @@ class StatisticsRuntime:
 
         self._tensor_registry = dict(installation.tensors)
         self._field_registry = dict(installation.fields)
-        if self.save_kernels and installation.statics:
-            path = self.kernels_dir / (f"kern_static_{self._generate_unique_name()}.py")
-            atomic_write_text(
-                path,
-                "def gather_static_var(tensor, output_index):\n"
-                "    return tensor if output_index is None else "
-                "tensor[output_index]\n",
-            )
         for name in self._tensor_registry.keys() | self._field_registry.keys():
             self._get_safe_name(name)
         for binding in installation.statics:
             self._materialize_static(binding)
         compilation = compile_statistics(
-            self,
             installation.variable_ops,
             installation.program,
+            tensors=self._tensor_registry,
+            fields=self._field_registry,
+            ensemble_size=self.ensemble_size,
+            base_dtype=self.base_dtype,
+            mixed_precision=self.mixed_precision,
         )
         self._activate_compilation(compilation)
 
@@ -1103,15 +1039,15 @@ class StatisticsRuntime:
         )
 
         # Enable streaming mode
-        self._files_created = False
-        self._current_year = None
-        self._output.reset_timeline()
+        if self._output is not None:
+            self._output.reset_staging()
+        self._last_time_number = None
 
         # Initialize single time step aggregation (generic)
         self._materialize_compilation(compilation)
 
         # If in-memory mode, initialize result storage lists instead of starting file writers
-        if self.in_memory_mode:
+        if self.in_memory:
             self._init_result_storage()
             emit(
                 self,
@@ -1121,13 +1057,33 @@ class StatisticsRuntime:
                 outputs=len(self._result_tensors),
             )
         else:
-            # Start the write executors (one per worker to guarantee serialization per variable)
-            self._start_write_executors()
-            self._pending_writes = []
+            self._output = _NetCDFWriter(
+                metadata=self._output_metadata,
+                coordinates=self._coord_cache,
+                static_vars=self.static_vars,
+                variable_options=self.installation.netcdf_options,
+                output_dir=self.output_dir,
+                rank=self.rank,
+                world_size=self.world_size,
+                ensemble_size=self.ensemble_size,
+                ensemble_member_ids=self.ensemble_member_ids,
+                calendar=self.calendar,
+                time_unit=self.time_unit,
+                num_workers=self.num_workers,
+                output_split_by_year=self.output_split_by_year,
+                max_pending_steps=self.max_pending_steps,
+                max_pending_output_bytes=self.max_pending_output_bytes,
+                save_precision=self.save_precision,
+                event_sink=self.event_sink,
+                on_failure=partial(
+                    self.execution.poison, phase="statistics background write"
+                ),
+            )
+            self._output.start()
             emit(
                 self,
                 "info",
                 "statistics.streaming_ready",
                 "Streaming statistics aggregation initialized",
-                executors=len(self._write_executors),
+                executors=self.num_workers,
             )

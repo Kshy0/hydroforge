@@ -154,6 +154,7 @@ def _adaptive_end_dispatcher():
             MetalBuffer("counter_ptr", torch.int32, "read_write"),
             MetalBuffer("continue_ptr", torch.int32, "write"),
             MetalBuffer("error_ptr", torch.int32, "read_write"),
+            MetalBuffer("status_ptr", torch.float32, "write"),
         ),
         scalars=(
             MetalScalar("maximum_steps", "index"),
@@ -167,8 +168,12 @@ def _adaptive_end_dispatcher():
         bool exhausted = args.counter_ptr[0] >= *args.maximum_steps &&
             elapsed < args.duration_ptr[0];
         if (exhausted) args.error_ptr[0] = 1;
-        args.continue_ptr[0] =
-            elapsed < args.duration_ptr[0] && args.error_ptr[0] == 0;
+        int error = args.error_ptr[0];
+        int next = elapsed < args.duration_ptr[0] && error == 0;
+        args.continue_ptr[0] = next;
+        args.status_ptr[0] = (float)error;
+        args.status_ptr[1] = (float)next;
+        args.status_ptr[2] = args.dt_ptr[0];
     }""",
     )
 
@@ -183,8 +188,10 @@ def adaptive_control_commands(
     counter: torch.Tensor,
     continue_flag: torch.Tensor,
     error_flag: torch.Tensor,
+    status: torch.Tensor,
     maximum_steps: int,
 ) -> tuple[MetalCommand, MetalCommand, MetalCommand]:
+    """``status`` receives ``(error, continue, dt)`` for one host read."""
     begin = MetalCommand(
         _adaptive_begin_dispatcher(),
         {"candidate_ptr": candidate, "maximum": maximum, "n": 1},
@@ -209,6 +216,7 @@ def adaptive_control_commands(
             "counter_ptr": counter,
             "continue_ptr": continue_flag,
             "error_ptr": error_flag,
+            "status_ptr": status,
             "n": 1,
             "maximum_steps": maximum_steps,
         },

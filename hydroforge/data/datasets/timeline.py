@@ -81,6 +81,7 @@ class DatasetTimeline:
         self.aggregation_factor: int | None = None
         self.plan: tuple[TimelineRead, ...] = ()
         self._data_units: object | str | None = _UNSET
+        self._source_calendar: str | None = None
 
         required_times = self._required_output_times()
         if self._bind_source_calendar(required_times):
@@ -116,8 +117,13 @@ class DatasetTimeline:
 
         candidates = {self._storage_key(timestamp) for timestamp in required_times}
         probe = sorted(key for key in candidates if self._path(key).exists())
-        if not probe:
-            probe = sorted(self._discover_keys())
+        if not probe and self.time_aggregation is not None:
+            supports = self._support_ranges(required_times, self.owner.time_interval)
+            probe = sorted(
+                key
+                for key in self._support_keys(supports, required_times)
+                if self._path(key).exists()
+            )
         if not probe:
             return False
         changed = self.owner._adopt_source_calendar(
@@ -126,27 +132,6 @@ class DatasetTimeline:
         if changed:
             self._key_cache.clear()
         return changed
-
-    def _discover_keys(self) -> set[str]:
-        """Discover every flat source shard matching this prefix/suffix."""
-
-        directory = Path(self.base_dir)
-        if not directory.is_dir():
-            return set()
-        keys: set[str] = set()
-        for path in directory.iterdir():
-            if not path.is_file():
-                continue
-            name = path.name
-            if not name.startswith(self.prefix) or not name.endswith(self.suffix):
-                continue
-            stop = len(name) - len(self.suffix) if self.suffix else len(name)
-            if stop < len(self.prefix):
-                continue
-            key = name[len(self.prefix) : stop]
-            if self._path(key) == path:
-                keys.add(key)
-        return keys
 
     def _required_output_times(self) -> list[DateTime]:
         """Return distinct I/O timestamps required by the shared chunk plan."""
@@ -190,58 +175,18 @@ class DatasetTimeline:
         required_set = set(required_times)
         supports = self._support_ranges(required_times, owner.time_interval)
         candidates = {self._storage_key(timestamp) for timestamp in required_times}
-
-        if aggregate:
-            # An output interval can span multiple file partitions. Deriving
-            # keys only at output boundaries would skip every interior shard
-            # (for example a monthly file inside a 70-day aggregation step).
-            keys = self._discover_keys()
-            if not keys:
-                keys = candidates
-        else:
-            keys = candidates
-
-        source_times: list[DateTime] = []
-        source_calendar: str | None = None
         seen_times: dict[DateTime, Path] = {}
-        for key in sorted(keys):
-            path = self._path(key)
-            with owner._inspect_source_file(path), Dataset(path, "r") as dataset:
-                time_var = self._time_variable(dataset, path)
-                self._validate_data_units(dataset, path)
-                file_calendar = canonical_calendar(
-                    getattr(time_var, "calendar", "standard"),
-                )
-                if source_calendar is None:
-                    source_calendar = file_calendar
-                elif file_calendar != source_calendar:
-                    raise ValueError(
-                        "forcing files use inconsistent calendars: "
-                        f"{source_calendar!r} and {file_calendar!r} in {path.name}"
-                    )
-                owner._validate_source_calendar(file_calendar)
-                dates = self._validated_dates(time_var, path, key)
-                self._require_unique(dates, seen_times, path)
-                seen_times.update((dt, path) for dt in dates)
-                self.file_times[key] = list(dates)
-                for index, dt in enumerate(dates):
-                    in_range = (
-                        self._inside_supports(dt, supports)
-                        if aggregate
-                        else dt in required_set
-                    )
-                    if in_range:
-                        self.dt_to_loc[dt] = (key, index)
-                        if aggregate:
-                            source_times.append(dt)
 
-        if aggregate:
-            self.source_time_interval = self._infer_source_interval(source_times)
-            self.aggregation_factor = owner._get_time_aggregation_factor(
-                self.source_time_interval
-            )
-            self._validate_aggregation_times(required_times)
-        else:
+        def scan(keys: set[str]) -> None:
+            for key in sorted(keys.difference(self.file_times)):
+                self._scan_file(key, seen_times)
+
+        if not aggregate:
+            scan(candidates)
+            for key in sorted(candidates):
+                for index, dt in enumerate(self.file_times[key]):
+                    if dt in required_set:
+                        self.dt_to_loc[dt] = (key, index)
             missing = [dt for dt in required_times if dt not in self.dt_to_loc]
             if missing:
                 preview = ", ".join(str(dt) for dt in missing[:10])
@@ -250,6 +195,108 @@ class DatasetTimeline:
                     f"First missing: {preview} (total {len(missing)}). "
                     "Check start_date alignment and dataset temporal resolution."
                 )
+            return
+
+        # An output interval can span multiple file partitions, so keys at
+        # output boundaries alone would skip interior shards (for example a
+        # monthly file inside a 70-day aggregation step).  Keys are derived
+        # from time_to_key over the support windows; files outside the needed
+        # range are never listed or opened.
+        keys = {
+            key
+            for key in self._support_keys(supports, required_times)
+            if self._path(key).exists()
+        } or candidates
+        scan(keys)
+        source_times: list[DateTime] = []
+        for key in sorted(keys):
+            for index, dt in enumerate(self.file_times[key]):
+                if self._inside_supports(dt, supports):
+                    self.dt_to_loc[dt] = (key, index)
+                    source_times.append(dt)
+        self.source_time_interval = self._infer_source_interval(source_times)
+        self.aggregation_factor = owner._get_time_aggregation_factor(
+            self.source_time_interval
+        )
+        self._validate_aggregation_times(required_times)
+
+    def _support_keys(
+        self,
+        supports: tuple[tuple[DateTime, DateTime], ...],
+        anchors: list[DateTime],
+    ) -> set[str]:
+        """Return the storage keys of every partition meeting the supports.
+
+        ``time_to_key`` is sampled at each anchor and window edge; any interval
+        whose end keys differ is bisected down to one microsecond, so every
+        contiguous key partition inside a window is found.  A key that
+        reappears without showing at a sample fails the later completeness
+        check instead of being guessed.
+        """
+
+        resolution = timedelta(microseconds=1)
+
+        def key_at(timestamp: DateTime) -> str:
+            key = self.time_to_key(timestamp)
+            if type(key) is not str:
+                raise TypeError(
+                    "dataset time_to_key must return an exact string; got "
+                    f"{type(key).__name__} for {timestamp}"
+                )
+            return key
+
+        ordered = sorted(set(anchors))
+        keys: set[str] = set()
+        pending = []
+        for start, end in supports:
+            points = sorted(
+                {start, end - resolution}.union(
+                    anchor for anchor in ordered if start <= anchor < end
+                )
+            )
+            sampled = [(point, key_at(point)) for point in points]
+            keys.update(key for _point, key in sampled)
+            pending.extend(
+                (left, right)
+                for left, right in zip(sampled, sampled[1:])
+                if left[1] != right[1]
+            )
+        while pending:
+            (left, left_key), (right, right_key) = pending.pop()
+            if right - left <= resolution:
+                continue
+            middle = left + (right - left) // 2
+            middle_key = key_at(middle)
+            keys.add(middle_key)
+            if middle_key != left_key:
+                pending.append(((left, left_key), (middle, middle_key)))
+            if middle_key != right_key:
+                pending.append(((middle, middle_key), (right, right_key)))
+        return keys
+
+    def _scan_file(self, key: str, seen_times: dict[DateTime, Path]) -> None:
+        """Validate one shard's time metadata and record its timestamps."""
+
+        owner = self.owner
+        path = self._path(key)
+        with owner._inspect_source_file(path), Dataset(path, "r") as dataset:
+            time_var = self._time_variable(dataset, path)
+            self._validate_data_units(dataset, path)
+            file_calendar = canonical_calendar(
+                getattr(time_var, "calendar", "standard"),
+            )
+            if self._source_calendar is None:
+                self._source_calendar = file_calendar
+            elif file_calendar != self._source_calendar:
+                raise ValueError(
+                    "forcing files use inconsistent calendars: "
+                    f"{self._source_calendar!r} and {file_calendar!r} in {path.name}"
+                )
+            owner._validate_source_calendar(file_calendar)
+            dates = self._validated_dates(time_var, path, key)
+        self._require_unique(dates, seen_times, path)
+        seen_times.update((dt, path) for dt in dates)
+        self.file_times[key] = list(dates)
 
     def _storage_key(self, timestamp: DateTime) -> str:
         key = self.time_to_key(timestamp)
@@ -564,6 +611,24 @@ class DatasetTimeline:
         if mapper is None:
             return list(logical_times)
         return [mapper(timestamp) for timestamp in logical_times]
+
+    def _fit_auto_chunk_len(self) -> None:
+        """Convert an automatically planned chunk length to output steps.
+
+        Storage planners size chunks in source records; each aggregated
+        output step reads ``aggregation_factor`` of them.
+        """
+
+        factor = self.aggregation_factor
+        owner = self.owner
+        if factor is None or factor <= 1:
+            return
+        chunk_len = max(1, owner.chunk_len // factor)
+        if chunk_len == owner.chunk_len:
+            return
+        object.__setattr__(owner, "chunk_len", chunk_len)
+        owner._install_temporal_domain(owner._temporal_domain)
+        self._build_plan()
 
     def _build_plan(self) -> None:
         """Compile I/O operations from the owner's shared source chunks."""

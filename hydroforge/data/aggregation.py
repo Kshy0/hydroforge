@@ -33,12 +33,9 @@ from hydroforge.contracts.validation import HydroForgeModel
 from hydroforge.data.distributed import _find_indices_in_trusted
 from hydroforge.data.mapping.build import (
     _build_regular_grid_mapping_trusted,
-    build_hires_aggregate_mapping,
+    build_cama_hires_aggregate_mapping,
 )
-from hydroforge.data.mapping.cama import (
-    read_cama_catchments,
-    read_cama_hires_pixels,
-)
+from hydroforge.data.mapping.cama import read_cama_catchments
 from hydroforge.data.mapping.grid import RegularGrid
 from hydroforge.data.mapping.table import MappingTable
 from hydroforge.data.mapping.target import TargetSupport
@@ -59,28 +56,29 @@ from hydroforge.serialization.netcdf import (
 class _BuildCamaMappingRequest(HydroForgeModel):
     source_lon: np.ndarray
     source_lat: np.ndarray
-    map_dir: str | Path
+    source_lon_bounds: np.ndarray | None = None
+    source_lat_bounds: np.ndarray | None = None
+    map_dir: Path = Field(strict=False)
     hires_tag: str | None = "1min"
     mapinfo_txt: str = "location.txt"
     lowres_idx_precision: str = "<i4"
     hires_idx_precision: str = "<i2"
     map_precision: str = "<f4"
-    parameter_nc: str | Path | None = None
+    parameter_nc: Path | None = Field(default=None, strict=False)
     allow_oob_zero: bool = False
     producer: str = Field(default="build_cama_mapping", min_length=1)
 
     _source: RegularGrid = PrivateAttr()
     _target_ids: np.ndarray = PrivateAttr()
-    _pixel_catchment_id: np.ndarray = PrivateAttr()
-    _pixel_area: np.ndarray = PrivateAttr()
-    _pixel_lon: np.ndarray = PrivateAttr()
-    _pixel_lat: np.ndarray = PrivateAttr()
+    _catchment_grid: tuple[int, int, np.ndarray] = PrivateAttr()
 
     @model_validator(mode="after")
     def _validate_declaration(self):
         self._source = RegularGrid.from_coordinates(
             self.source_lon,
             self.source_lat,
+            x_bounds=self.source_lon_bounds,
+            y_bounds=self.source_lat_bounds,
         )
         catchment_id, nx, ny, nextxy_data = read_cama_catchments(
             self.map_dir,
@@ -94,21 +92,6 @@ class _BuildCamaMappingRequest(HydroForgeModel):
                     raw_ids,
                     label="parameter catchment_id",
                 )
-        (
-            pixel_catchment_id,
-            pixel_area,
-            pixel_lon,
-            pixel_lat,
-        ) = read_cama_hires_pixels(
-            self.map_dir,
-            nx,
-            ny,
-            nextxy_data,
-            hires_tag=self.hires_tag,
-            mapinfo_txt=self.mapinfo_txt,
-            hires_idx_precision=self.hires_idx_precision,
-            map_precision=self.map_precision,
-        )
         if desired_ids is None:
             target_ids = canonical_ids(
                 catchment_id,
@@ -124,33 +107,31 @@ class _BuildCamaMappingRequest(HydroForgeModel):
                 )
             target_ids = desired_ids
         self._target_ids = target_ids
-        self._pixel_catchment_id = pixel_catchment_id
-        self._pixel_area = pixel_area
-        self._pixel_lon = pixel_lon
-        self._pixel_lat = pixel_lat
+        self._catchment_grid = (nx, ny, nextxy_data)
         return self
 
-    @property
-    def source(self) -> RegularGrid:
-        return self._source
-
-    @property
-    def mapping_inputs(
-        self,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        return (
+    def build(self) -> MappingTable:
+        nx, ny, nextxy_data = self._catchment_grid
+        return build_cama_hires_aggregate_mapping(
+            self._source,
             self._target_ids,
-            self._pixel_catchment_id,
-            self._pixel_area,
-            self._pixel_lon,
-            self._pixel_lat,
+            self.map_dir,
+            nx,
+            ny,
+            nextxy_data,
+            hires_tag=self.hires_tag,
+            mapinfo_txt=self.mapinfo_txt,
+            hires_idx_precision=self.hires_idx_precision,
+            map_precision=self.map_precision,
+            allow_oob_zero=self.allow_oob_zero,
+            metadata={"producer": self.producer},
         )
 
 
 class _BuildPointMappingRequest(HydroForgeModel):
     source_lon: np.ndarray
     source_lat: np.ndarray
-    parameter_nc: str | Path
+    parameter_nc: Path = Field(strict=False)
     method: Literal["nearest", "overlap"] = "overlap"
     lon_name: str = "longitude"
     lat_name: str = "latitude"
@@ -217,10 +198,10 @@ class _BuildPointMappingRequest(HydroForgeModel):
 
 
 class _AggregateFieldRequest(HydroForgeModel):
-    field_nc: str | Path
+    field_nc: Path = Field(strict=False)
     var_name: str
-    mapping_npz: str | Path
-    out_dir: str | Path
+    mapping_npz: Path = Field(strict=False)
+    out_dir: Path = Field(strict=False)
     out_name: str | None = None
     dtype: Literal["float32", "float64"] = "float32"
     netcdf_options: Mapping[str, Any] = DEFAULT_NETCDF_OPTIONS
@@ -377,6 +358,8 @@ def build_cama_mapping(
     source_lat: np.ndarray,
     map_dir: str | Path,
     *,
+    source_lon_bounds: np.ndarray | None = None,
+    source_lat_bounds: np.ndarray | None = None,
     hires_tag: str | None = "1min",
     mapinfo_txt: str = "location.txt",
     lowres_idx_precision: str = "<i4",
@@ -395,6 +378,8 @@ def build_cama_mapping(
     request = _BuildCamaMappingRequest(
         source_lon=source_lon,
         source_lat=source_lat,
+        source_lon_bounds=source_lon_bounds,
+        source_lat_bounds=source_lat_bounds,
         map_dir=map_dir,
         hires_tag=hires_tag,
         mapinfo_txt=mapinfo_txt,
@@ -405,27 +390,7 @@ def build_cama_mapping(
         allow_oob_zero=allow_oob_zero,
         producer=producer,
     )
-    allow_oob_zero = request.allow_oob_zero
-    producer = request.producer
-    source = request.source
-    (
-        target_ids,
-        catchment_id_hires,
-        valid_areas,
-        valid_lon,
-        valid_lat,
-    ) = request.mapping_inputs
-
-    mapping = build_hires_aggregate_mapping(
-        source,
-        target_ids,
-        catchment_id_hires,
-        valid_areas,
-        valid_lon,
-        valid_lat,
-        allow_oob_zero=allow_oob_zero,
-        metadata={"producer": producer},
-    )
+    mapping = request.build()
 
     empty_rows = int(np.sum(np.diff(mapping.matrix.indptr) == 0))
     if empty_rows > 0:
@@ -479,6 +444,38 @@ def build_point_mapping(
     )
 
 
+def _aggregate_masked_field(
+    mapping: MappingTable,
+    field: np.ndarray,
+    *,
+    normalized: bool,
+) -> np.ndarray:
+    """Aggregate a field whose masked source cells are NaN.
+
+    Masked cells never poison a target that has valid sources.  Normalized
+    output is the weighted mean over valid sources, ``M @ x / M @ valid``;
+    unnormalized sums treat masked cells as zero.  A target is NaN only when
+    it has weights but none of its sources is valid; empty rows stay zero.
+    """
+
+    missing = np.isnan(field)
+    if not missing.any():
+        return mapping._apply_trusted(field, layout="grid")
+    totals = mapping._apply_trusted(np.where(missing, 0.0, field), layout="grid")
+    valid_weight = mapping._apply_trusted(
+        (~missing).astype(np.float64),
+        layout="grid",
+    )
+    row_weight = np.asarray(mapping.matrix.sum(axis=1), dtype=np.float64).ravel()
+    if normalized:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            totals = totals / valid_weight
+        totals[..., row_weight == 0] = 0.0
+    else:
+        totals[(valid_weight == 0) & (row_weight != 0)] = np.nan
+    return totals
+
+
 def aggregate_field_to_nc(
     field_nc: str | Path,
     var_name: str,
@@ -499,6 +496,10 @@ def aggregate_field_to_nc(
     named ``out_name`` (default ``var_name``).  Output dims are
     ``(saved_points,)`` or ``(time, saved_points)`` with a ``catchment_id``
     coordinate, readable by ``MultiRankStatsReader``.
+
+    Masked source cells are excluded: with ``normalized=True`` each target is
+    the weighted mean of its valid sources; unnormalized sums treat masked
+    cells as zero.  A target is NaN only when all of its sources are masked.
     """
     request = _AggregateFieldRequest(
         field_nc=field_nc,
@@ -526,7 +527,7 @@ def aggregate_field_to_nc(
     time_attributes = plan.time_attributes
 
     aggregated = canonical_floating_array(
-        mapping._apply_trusted(field, layout="grid"),
+        _aggregate_masked_field(mapping, field, normalized=request.normalized),
         dtype=dtype,
         label="aggregated values",
         allow_nan=True,

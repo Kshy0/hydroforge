@@ -21,7 +21,6 @@ from hydroforge.statistics.ir import (
     TensorSource,
     _StatisticsDeclaration,
 )
-from hydroforge.statistics.observer import StatisticsObserver
 from hydroforge.statistics.runtime import (
     StatisticsInstallation,
     StatisticsRuntime,
@@ -32,31 +31,14 @@ if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
 
 
-class DisabledStatisticsBinding:
-    """Resource-free statistics binding for a model without a declaration."""
-
-    def close(self) -> None:
-        pass
-
-    def memory_usage(self) -> int:
-        return 0
-
-    def time_index(self) -> int:
-        return 0
-
-    def reset_time_index(self) -> None:
-        pass
-
-
 class StatisticsBindingCompiler:
-    """Compile and own one complete statistics runtime."""
+    """Resolve model fields and construct one statistics runtime."""
 
-    def __init__(
-        self,
-        model: AbstractModel,
-        declaration: _StatisticsDeclaration,
-    ) -> None:
+    def __init__(self, model: AbstractModel) -> None:
         self.model = model
+        self.variable_map = model._namespace.build()
+
+    def compile(self, declaration: _StatisticsDeclaration) -> StatisticsRuntime:
         adhoc = self.prepare_virtuals(declaration.program)
         installation = self._compile_installation(
             declaration.variable_ops,
@@ -65,26 +47,8 @@ class StatisticsBindingCompiler:
             declaration.static_names,
             declaration.netcdf_options,
         )
-        self._aggregator = self._create(installation)
-        model._execution.statistics = StatisticsObserver(
-            model,
-            self._aggregator,
-        )
-
-    @property
-    def variable_map(self):
-        return self.model._namespace.build()
-
-    @property
-    def aggregator(self) -> StatisticsRuntime:
-        return self._aggregator
-
-    def _create(
-        self,
-        installation: StatisticsInstallation,
-    ) -> StatisticsRuntime:
         model = self.model
-        aggregator = StatisticsRuntime(
+        return StatisticsRuntime(
             device=model.device,
             backend=model._execution.backend,
             installation=installation,
@@ -121,10 +85,8 @@ class StatisticsBindingCompiler:
                     "float64": torch.float64,
                 }[model.statistics_save_precision]
             ),
-            output_netcdf_options=model.output_netcdf_options,
             event_sink=model.event_sink,
         )
-        return aggregator
 
     def _compile_static(
         self,
@@ -242,6 +204,7 @@ class StatisticsBindingCompiler:
         tensors: dict[str, torch.Tensor] = {}
         fields: dict[str, RuntimeTensorMetadata] = {}
         pending_bindings: list[tuple[str, torch.Tensor, bool]] = []
+        source_copies: list[tuple[str, torch.Tensor, torch.Tensor]] = []
 
         def install_tensor(
             name: str,
@@ -261,6 +224,8 @@ class StatisticsBindingCompiler:
                 )
             else:
                 installed = tensor
+            if output_index:
+                source_copies.append((name, tensor, installed))
             tensors[name] = installed
             if info is not None:
                 fields[name] = info
@@ -334,6 +299,7 @@ class StatisticsBindingCompiler:
             fields=MappingProxyType(fields),
             statics=self._compile_static(static_names),
             netcdf_options=netcdf_options,
+            source_copies=tuple(source_copies),
         )
 
     def _field_metadata(
@@ -348,55 +314,3 @@ class StatisticsBindingCompiler:
         )
         metadata, _bindings = self.model._partition.bind_output(field)
         return metadata
-
-    def close(self) -> None:
-        self._aggregator._shutdown()
-
-    def memory_usage(self) -> int:
-        return self._aggregator.get_memory_usage()
-
-    def results(
-        self, *, stacked: bool, start: int | None = None, stop: int | None = None
-    ) -> dict[str, torch.Tensor]:
-        return self._aggregator.get_results(as_stacked=stacked, start=start, stop=stop)
-
-    def result(
-        self,
-        variable: str,
-        operation: str,
-        *,
-        stacked: bool,
-        start: int | None = None,
-        stop: int | None = None,
-    ) -> torch.Tensor:
-        return self._aggregator.get_result(
-            variable,
-            operation,
-            as_stacked=stacked,
-            start=start,
-            stop=stop,
-        )
-
-    def time_index(self) -> int:
-        return self._aggregator.get_time_index()
-
-    def reset_time_index(self) -> None:
-        self._aggregator.reset_time_index()
-
-    def accumulator(self, variable: str, operation: str) -> torch.Tensor:
-        """Return an ownership-isolated differentiable accumulator snapshot."""
-
-        key = f"{variable}_{operation}"
-        accumulator = self._aggregator._storage[key]
-        return accumulator.clone(memory_format=torch.preserve_format)
-
-    def pop_result(
-        self,
-        variable: str,
-        operation: str,
-    ) -> torch.Tensor | None:
-        """Remove and return the newest finalized in-memory result."""
-
-        key = f"{variable}_{operation}"
-        values = self._aggregator._result_tensors[key]
-        return values.pop() if values else None

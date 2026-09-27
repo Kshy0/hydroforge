@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
-from collections.abc import Callable, Mapping
+import inspect
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from functools import cached_property
 from typing import Annotated, Any, Self
 
+import torch
 from pydantic import (
     AfterValidator,
     Field,
@@ -23,44 +23,41 @@ from hydroforge.contracts.kernels import (
     KernelSpec,
     _host_scalar_is_valid,
 )
-from hydroforge.contracts.naming import DottedPath, Identifier
+from hydroforge.contracts.naming import Identifier
 from hydroforge.contracts.validation import (
     FrozenMapping,
     HydroForgeModel,
     _immutable_dict,
 )
-from hydroforge.kernels.backends.cuda.spec import (
-    CudaExtensionSpec,
-    _CompiledCudaExtension,
-    cuda_declarations,
-    cuda_function_signature,
-    cuda_narrowed_index_parameters,
+from hydroforge.kernels.backends.cuda import rtc
+from hydroforge.kernels.backends.cuda.launch import (
+    CudaKernel,
+    CudaStep,
+    CudaWorkspace,
+    allocate_workspace,
+    compile_steps,
+    render_steps,
 )
+from hydroforge.kernels.backends.cuda.spec import CudaExtensionSpec
 from hydroforge.kernels.context import (
     active_kernel_spec,
     registry_factory,
 )
 
-
-@dataclass(frozen=True, slots=True)
-class _CudaTensorVector:
-    """The sole inferred private CUDA argument form."""
-
-    target: str
-    sources: tuple[str, ...]
-
-    def resolve(self, values: Mapping[str, Any]) -> list[Any]:
-        return [values[name] for name in self.sources]
-
-
 CudaProjectionValue = bool | int | FiniteFloat | None
-_ExtensionNames = Annotated[
-    set[Identifier] | frozenset[Identifier], AfterValidator(frozenset)
-]
+LaunchPlan = Callable[..., Sequence[rtc.LaunchStep]]
+
+
+def _named_callable(value: Any) -> Callable | None:
+    if value is None:
+        return None
+    if not callable(value) or not getattr(value, "__name__", "").isidentifier():
+        raise ValueError("CUDA route launch/check must be a named callable")
+    return value
 
 
 class CudaNativeProjection(HydroForgeModel):
-    """Semantic preconditions for canonical values absent from a launcher."""
+    """Semantic preconditions for canonical values a launch plan omits."""
 
     fixed: FrozenMapping[Identifier, CudaProjectionValue] = Field(default_factory=dict)
 
@@ -85,72 +82,88 @@ class CudaNativeProjection(HydroForgeModel):
 
 
 class CudaRoute(HydroForgeModel):
-    """One declarative extension launcher owned by a CUDA extension group."""
+    """One kernel entry over a device source owned by a CUDA extension group.
+
+    A route declares its launches or supplies a ``launch`` plan:
+
+    - ``kernel="k_step<{h_ptr}>"`` declares one hand-written kernel that takes
+      the canonical values over a 1-D grid of ``size_key``; it is shorthand for
+      ``steps=(CudaKernel(kernel=...),)``.
+    - ``steps`` lists :class:`CudaKernel` launches (hand-written kernels or
+      device functions with generated entries) and :class:`CudaFill`
+      operations, run in stream order over the named ``workspace`` buffers.
+    - ``launch`` is a plan that receives the canonical values it names (plus
+      ``BLOCK_SIZE``) and returns the launches and stream-ordered tensor
+      operations of one call. It runs once per specialization.
+
+    ``ignore`` lists canonical values no declared launch takes. ``check`` is an
+    optional callable, named like a plan's parameters, that raises on canonical
+    inputs the kernels cannot serve; it runs once per specialization.
+    """
 
     extension: Identifier
-    launch: Identifier
     spec: KernelSpec
+    launch: Annotated[Any, AfterValidator(_named_callable)] = None
+    kernel: str | None = Field(default=None, min_length=1)
+    steps: tuple[CudaStep, ...] = ()
+    workspace: FrozenMapping[Identifier, CudaWorkspace] = Field(default_factory=dict)
+    ignore: tuple[Identifier, ...] = ()
+    check: Annotated[Any, AfterValidator(_named_callable)] = None
     projection: CudaNativeProjection | None = None
+
+    @model_validator(mode="after")
+    def _one_entry(self) -> Self:
+        if (
+            sum((self.launch is not None, self.kernel is not None, bool(self.steps)))
+            != 1
+        ):
+            raise ValueError(
+                "CUDA route requires exactly one of kernel, steps or launch"
+            )
+        if self.launch is not None and (self.workspace or self.ignore):
+            raise ValueError(
+                "workspace and ignore describe declared launches; a launch "
+                "plan builds its own"
+            )
+        return self
+
+    @property
+    def declared_steps(self) -> tuple[CudaStep, ...]:
+        if self.kernel is not None:
+            return (CudaKernel(kernel=self.kernel),)
+        return self.steps
+
+    @property
+    def name(self) -> str:
+        """Route name: the plan's name, the kernel's unqualified name, or the
+        KernelSpec name for declared steps."""
+        if self.launch is not None:
+            return self.launch.__name__
+        if self.kernel is not None:
+            return self.declared_steps[0].name
+        return self.spec.name
 
     @property
     def _key(self) -> tuple[str, str]:
-        return self.extension, self.launch
+        return self.extension, self.name
 
 
 @dataclass(frozen=True, slots=True)
 class _CompiledCudaRoute:
-    """Complete construction-time CUDA ABI consumed by trusted dispatch."""
+    """Complete construction-time launch ABI consumed by trusted dispatch."""
 
     extension: str
-    launch: str
+    name: str
+    launch: LaunchPlan | None
+    steps: tuple | None
+    workspace: Mapping[str, CudaWorkspace]
+    check: Callable | None
+    check_args: tuple[str, ...]
     spec: KernelSpec
-    native_signature: tuple[tuple[str, str], ...]
     launch_args: tuple[str, ...]
-    tensor_vector: _CudaTensorVector | None
     projection: CudaNativeProjection
     omitted: frozenset[str]
     resolved_specs: tuple[KernelSpec, ...]
-
-
-def _normalized_native_type(native_type: str) -> str:
-    return " ".join(
-        token for token in native_type.replace("&", "").split() if token != "const"
-    )
-
-
-def _native_kind(native_type: str) -> str:
-    normalized = _normalized_native_type(native_type)
-    if normalized in {
-        "at::Tensor",
-        "std::optional<at::Tensor>",
-        "c10::optional<at::Tensor>",
-    }:
-        return "buffer"
-    if normalized == "bool":
-        return "bool"
-    if normalized in {"int", "int32_t"}:
-        return "int32"
-    if normalized in {"uint32_t", "std::uint32_t", "unsigned int"}:
-        return "uint32"
-    if normalized in {"long", "int64_t"}:
-        return "index"
-    if normalized == "float":
-        return "float32"
-    if normalized == "double":
-        return "float64"
-    raise ValueError(f"unsupported CUDA launcher parameter type {native_type!r}")
-
-
-def _native_buffer_optional(native_type: str) -> bool:
-    normalized = _normalized_native_type(native_type)
-    if normalized == "at::Tensor":
-        return False
-    if normalized in {
-        "std::optional<at::Tensor>",
-        "c10::optional<at::Tensor>",
-    }:
-        return True
-    raise ValueError(f"unsupported CUDA tensor launcher type {native_type!r}")
 
 
 def _validate_projection_values(
@@ -165,7 +178,7 @@ def _validate_projection_values(
         if name in spec.buffers:
             if name not in spec.optional_buffers:
                 raise ValueError(
-                    f"{spec.name}: CUDA launcher omits required canonical "
+                    f"{spec.name}: CUDA launch plan omits required canonical "
                     f"buffer {name!r}"
                 )
             if value is not None:
@@ -188,166 +201,117 @@ def _validate_projection_values(
             )
 
 
-def _compile_cuda_route(
-    route: CudaRoute,
-    source: str,
-) -> _CompiledCudaRoute:
-    """Parse and validate one route exactly once during group construction."""
+def _plan_parameters(spec: KernelSpec, plan: LaunchPlan) -> tuple[str, ...]:
+    """Canonical names a plan receives; ``**values`` receives all of them."""
+
+    parameters = inspect.signature(plan).parameters.values()
+    unsupported = [
+        parameter.name
+        for parameter in parameters
+        if parameter.kind
+        not in (
+            parameter.KEYWORD_ONLY,
+            parameter.POSITIONAL_OR_KEYWORD,
+            parameter.VAR_KEYWORD,
+        )
+        or parameter.default is not parameter.empty
+    ]
+    if unsupported:
+        raise ValueError(
+            f"{spec.name}: CUDA launch plan {plan.__name__} parameters must be "
+            f"plain keyword parameters without defaults: {unsupported}"
+        )
+    names = tuple(
+        parameter.name
+        for parameter in parameters
+        if parameter.kind is not parameter.VAR_KEYWORD
+    )
+    if any(parameter.kind is parameter.VAR_KEYWORD for parameter in parameters):
+        names += tuple(
+            name for name in (*spec.parameters, "BLOCK_SIZE") if name not in names
+        )
+    return names
+
+
+def _compile_cuda_route(route: CudaRoute) -> _CompiledCudaRoute:
+    """Validate one route's canonical ABI exactly once during construction."""
 
     spec = route.spec
-    native_signature = cuda_function_signature(source, route.launch)
-    narrowed = cuda_narrowed_index_parameters(
-        source,
-        route.launch,
-        tuple(name for name, kind in spec.runtime_scalars.items() if kind == "index"),
-    )
-    if narrowed:
-        raise ValueError(
-            f"{spec.name}: CUDA launcher narrows canonical int64 index "
-            f"parameter(s) to int32: {list(narrowed)}; declare an int32 "
-            "runtime scalar when the device algorithm is truly 32-bit"
-        )
-
-    parameters = spec.parameters
-    launch_args = tuple(name for name, _kind in native_signature)
-    native_names = set(launch_args)
-    canonical_names = set(parameters)
-    vector_arguments = tuple(
-        name
-        for name, native_type in native_signature
-        if _normalized_native_type(native_type) == "std::vector<at::Tensor>"
-    )
-    if len(vector_arguments) > 1:
-        raise ValueError(
-            f"{spec.name}: CUDA launcher has multiple private tensor vectors; "
-            "their canonical partition cannot be inferred"
-        )
-    tensor_vector = None
-    if vector_arguments:
-        target = vector_arguments[0]
-        if target in canonical_names:
-            raise ValueError(
-                f"{spec.name}: CUDA tensor vector {target!r} must be a private "
-                "physical projection, not a canonical parameter"
-            )
-        sources = tuple(
-            name
-            for name in parameters
-            if name in spec.buffers and name not in native_names
-        )
-        if not sources:
-            raise ValueError(
-                f"{spec.name}: CUDA tensor vector {target!r} has no canonical "
-                "buffer sources to pack"
-            )
-        optional_sources = set(sources).intersection(spec.optional_buffers)
-        if optional_sources:
-            raise ValueError(
-                f"{spec.name}: CUDA tensor vectors cannot pack optional "
-                f"buffers: {sorted(optional_sources)}"
-            )
-        tensor_vector = _CudaTensorVector(target, sources)
-
     projection = route.projection or CudaNativeProjection()
-    consumed_canonical = native_names.intersection(canonical_names) | {
-        source_name
-        for source_name in (() if tensor_vector is None else tensor_vector.sources)
-    }
-    omitted_canonical = canonical_names.difference(consumed_canonical)
-    unknown_fixed = set(projection.fixed).difference(omitted_canonical)
-    if unknown_fixed:
-        raise ValueError(
-            f"{spec.name}: CUDA native projection fixes values that are still "
-            "consumed by the launcher/derived ABI or absent from KernelSpec: "
-            f"{sorted(unknown_fixed)}"
-        )
-    # Mask members are supplied by source specialization, not launcher inputs.
+    # Mask members are supplied by source specialization, not plan inputs.
     grouped_features = (
         set().union(*spec.compile_time_masks.values())
         if spec.compile_time_masks
         else set()
     )
-    missing_fixed = omitted_canonical.difference(
-        projection.fixed,
-        grouped_features,
-    )
-    if missing_fixed:
+    ignored = set(route.ignore)
+    canonical = set(spec.parameters)
+    unknown_ignored = ignored.difference(canonical)
+    if unknown_ignored:
         raise ValueError(
-            f"{spec.name}: CUDA launcher omits canonical inputs "
-            f"{sorted(missing_fixed)}; define every omitted value in "
-            "CudaNativeProjection.fixed instead of inferring semantics from "
-            "an absent native parameter"
+            f"{spec.name}: CUDA route ignores non-canonical values "
+            f"{sorted(unknown_ignored)}"
         )
-    _validate_projection_values(
-        spec,
-        projection,
-        omitted_canonical.difference(grouped_features),
-    )
-    if "BLOCK_SIZE" not in native_names:
+    steps = None
+    if route.launch is None:
+        steps = compile_steps(
+            spec,
+            route.declared_steps,
+            route.workspace,
+            grouped_features | ignored | set(projection.fixed),
+        )
+        launch_args = (
+            *(
+                name
+                for name in spec.parameters
+                if name not in ignored and name not in projection.fixed
+            ),
+            "BLOCK_SIZE",
+        )
+    else:
+        launch_args = _plan_parameters(spec, route.launch)
+    check_args = () if route.check is None else _plan_parameters(spec, route.check)
+    names = set(launch_args)
+    if "BLOCK_SIZE" not in names:
         raise ValueError(
-            f"{spec.name}: CUDA launcher must expose compiler-owned "
-            "BLOCK_SIZE explicitly"
+            f"{spec.name}: CUDA launch plan must take compiler-owned BLOCK_SIZE"
         )
-    unknown = set(launch_args).difference(
-        parameters,
-        (() if tensor_vector is None else {tensor_vector.target}),
-        {"BLOCK_SIZE"},
-    )
+    unknown = names.union(check_args).difference(canonical, {"BLOCK_SIZE"})
     if unknown:
         raise ValueError(
-            f"CUDA launch arguments are outside canonical ABI: {sorted(unknown)}"
+            f"CUDA launch plan arguments are outside canonical ABI: {sorted(unknown)}"
         )
-
-    canonical_native_kinds = {
-        **{name: "buffer" for name in spec.buffers},
-        **{name: kind for name, kind in spec.runtime_scalars.items()},
-        **{name: kind for name, kind in spec.compile_time.items()},
-    }
-    for name, native_type in native_signature:
-        if tensor_vector is not None and name == tensor_vector.target:
-            # The private vector target was already identified by its exact
-            # native type and its canonical buffer sources were validated
-            # above. It has no scalar/buffer kind in the canonical ABI.
-            continue
-        observed = _native_kind(native_type)
-        if name == "BLOCK_SIZE":
-            if observed != "index":
-                raise ValueError(
-                    f"{spec.name}: CUDA launcher BLOCK_SIZE uses "
-                    f"{native_type!r} ({observed}), requires int64 index"
-                )
-            continue
-        expected = canonical_native_kinds.get(name)
-        if expected is None:
-            continue
-        compatible = expected == observed or (
-            expected == "precision" and observed in {"float32", "float64"}
+    omitted = canonical.difference(names)
+    unknown_fixed = set(projection.fixed).difference(omitted)
+    if unknown_fixed:
+        raise ValueError(
+            f"{spec.name}: CUDA native projection fixes values that are still "
+            "consumed by the launch plan or absent from KernelSpec: "
+            f"{sorted(unknown_fixed)}"
         )
-        if not compatible:
-            raise ValueError(
-                f"{spec.name}: CUDA launcher parameter {name!r} uses "
-                f"{native_type!r} ({observed}), KernelSpec requires "
-                f"{expected}"
-            )
-        if expected == "buffer":
-            expected_optional = name in spec.optional_buffers
-            observed_optional = _native_buffer_optional(native_type)
-            if observed_optional != expected_optional:
-                required = "optional" if expected_optional else "required"
-                native = "optional" if observed_optional else "required"
-                raise ValueError(
-                    f"{spec.name}: CUDA launcher buffer {name!r} is {native}, "
-                    f"KernelSpec declares it {required}"
-                )
+    missing_fixed = omitted.difference(projection.fixed, grouped_features, ignored)
+    if missing_fixed:
+        raise ValueError(
+            f"{spec.name}: CUDA launch plan omits canonical inputs "
+            f"{sorted(missing_fixed)}; define every omitted value in "
+            "CudaNativeProjection.fixed instead of inferring semantics from "
+            "an absent plan parameter"
+        )
+    _validate_projection_values(
+        spec, projection, omitted.difference(grouped_features, ignored)
+    )
     return _CompiledCudaRoute(
         extension=route.extension,
+        name=route.name,
         launch=route.launch,
+        steps=steps,
+        workspace=_immutable_dict(dict(route.workspace)),
+        check=route.check,
+        check_args=check_args,
         spec=spec,
-        native_signature=native_signature,
         launch_args=launch_args,
-        tensor_vector=tensor_vector,
         projection=projection,
-        omitted=frozenset(omitted_canonical),
+        omitted=frozenset(omitted),
         resolved_specs=(
             (
                 spec._resolve_precision("float32"),
@@ -400,104 +364,51 @@ class _CudaDispatcherDeclaration(HydroForgeModel):
     def _validate_spec(self):
         if self.spec not in self.route.resolved_specs:
             raise ValueError(
-                f"CUDA route {self.route.extension!r}/{self.route.launch!r} "
-                f"declares KernelSpec {self.route.spec.name!r}, not "
-                f"{self.spec.name!r}"
+                f"CUDA route {self.route.extension!r}/"
+                f"{self.route.name!r} declares KernelSpec "
+                f"{self.route.spec.name!r}, not {self.spec.name!r}"
             )
         return self
 
 
 class CudaExtensionGroup(HydroForgeModel):
-    """Lazily build a named namespace of declarative CUDA extensions."""
+    """A named namespace of device sources and their launch plans."""
 
-    owner_module: DottedPath
     specs: FrozenMapping[Identifier, CudaExtensionSpec] = Field(min_length=1)
     routes: tuple[CudaRoute, ...] = Field(min_length=1)
-    binary_prefix: Identifier | None = None
-    env_prefix: Identifier = "HYDROFORGE"
-    module_extensions: FrozenMapping[Identifier, _ExtensionNames] = Field(
-        default_factory=dict
-    )
 
     _route_index: Mapping[tuple[str, str], _CompiledCudaRoute] = PrivateAttr(
         default_factory=dict,
     )
-    _compiled_specs: Mapping[str, _CompiledCudaExtension] = PrivateAttr(
-        default_factory=dict,
-    )
-    _loaded: dict[str, Any] = PrivateAttr(default_factory=dict)
-    _variant_loaded: dict[tuple[str, tuple[tuple[str, int], ...]], Any] = PrivateAttr(
-        default_factory=dict
-    )
-    _precompiled: set[str] = PrivateAttr(default_factory=set)
+    _programs: Mapping[str, rtc.RtcProgram] = PrivateAttr(default_factory=dict)
 
     @model_validator(mode="after")
     def _validate_group(self) -> Self:
-        if self.binary_prefix is None:
-            object.__setattr__(
-                self, "binary_prefix", self.owner_module.replace(".", "_")
-            )
-        unknown_demands = {
-            module: sorted(unknown)
-            for module, extensions in self.module_extensions.items()
-            if (unknown := extensions.difference(self.specs))
-        }
-        if unknown_demands:
-            raise ValueError(
-                f"CUDA module demands reference unknown extensions: {unknown_demands}"
-            )
-        route_index: dict[tuple[str, str], CudaRoute] = {}
-        exports: dict[str, list[str]] = {name: [] for name in self.specs}
+        routes: dict[tuple[str, str], _CompiledCudaRoute] = {}
         for route in self.routes:
             if route.extension not in self.specs:
                 raise ValueError(
-                    f"CUDA route {route.extension!r}/{route.launch!r} "
+                    f"CUDA route {route.extension!r}/{route.name!r} "
                     "references an unknown extension"
                 )
-            key = route._key
-            if key in route_index:
+            if route._key in routes:
                 raise ValueError(
-                    f"CUDA route {route.extension!r}/{route.launch!r} "
+                    f"CUDA route {route.extension!r}/{route.name!r} "
                     "is declared more than once"
                 )
-            route_index[key] = route
-            exports[route.extension].append(route.launch)
-        missing_routes = sorted(
-            name for name, launches in exports.items() if not launches
-        )
-        if missing_routes:
-            raise ValueError(
-                "CUDA extension specs must each declare at least one route: "
-                f"{missing_routes}"
-            )
-        immutable_exports = {
-            name: tuple(launches) for name, launches in exports.items()
-        }
-        compiled_specs: dict[str, _CompiledCudaExtension] = {}
-        compiled_routes: dict[tuple[str, str], _CompiledCudaRoute] = {}
-        for name, spec in self.specs.items():
-            source = spec._materialize_source()
-            functions = immutable_exports[name]
-            declarations = cuda_declarations(source, functions)
-            compiled_specs[name] = _CompiledCudaExtension(
-                source=source,
-                functions=functions,
-                declarations=declarations,
-                cflags=spec.cflags,
-                cpp_headers=spec.cpp_headers,
-                include_paths=spec.include_paths,
-                ldflags=spec.ldflags,
-            )
-        for key, route in route_index.items():
             try:
-                compiled_routes[key] = _compile_cuda_route(
-                    route,
-                    compiled_specs[route.extension].source,
-                )
+                routes[route._key] = _compile_cuda_route(route)
             except (TypeError, ValueError, OverflowError) as error:
                 raise ValueError(str(error)) from error
-        self._route_index = _immutable_dict(compiled_routes)
-        self._compiled_specs = _immutable_dict(compiled_specs)
+        unused = sorted(set(self.specs).difference(key[0] for key in routes))
+        if unused:
+            raise ValueError(
+                f"CUDA extension specs must each declare at least one route: {unused}"
+            )
+        self._route_index = _immutable_dict(routes)
+        self._programs = _immutable_dict(
+            {name: spec.program(name) for name, spec in self.specs.items()}
+        )
         return self
 
     def factory(
@@ -505,142 +416,47 @@ class CudaExtensionGroup(HydroForgeModel):
         extension: str,
         launch: str,
     ) -> Callable[[], CudaDispatcher]:
-        """Return the registry factory for one already-declared route."""
+        """Return the registry factory for one route, named as ``CudaRoute.name``."""
 
         request = _CudaFactoryRequest.model_validate(
             {"extension": extension, "launch": launch},
             context={_CUDA_FACTORY_CONTEXT: self},
         )
         route = request.route
+        program = self._programs[extension]
 
         @registry_factory
         def factory() -> CudaDispatcher:
-            return self._dispatcher(route)
+            declaration = _CudaDispatcherDeclaration(
+                route=route,
+                spec=active_kernel_spec(),
+            )
+            return CudaDispatcher(route, program, spec=declaration.spec)
 
         return factory
 
-    def _load(self, name: str) -> Any:
-        if name in self._loaded:
-            return self._loaded[name]
-        from hydroforge.kernels.backends.cuda.build import load_inline_cu_module
 
-        module = load_inline_cu_module(
-            **self._precompile_arguments(name),
-        )
-        self._loaded[name] = module
-        return module
-
-    def _load_variant(
-        self,
-        name: str,
-        masks: tuple[tuple[str, int], ...],
-    ) -> Any:
-        """Compile a CUDA source variant for one grouped-mask tuple."""
-
-        key = (name, masks)
-        cached = self._variant_loaded.get(key)
-        if cached is not None:
-            return cached
-        if not masks:
-            return self._load(name)
-        from hydroforge.kernels.backends.cuda.build import load_inline_cu_module
-
-        module = load_inline_cu_module(**self._precompile_arguments(name, masks))
-        self._variant_loaded[key] = module
-        return module
-
-    def _precompile_arguments(
-        self,
-        name: str,
-        masks: tuple[tuple[str, int], ...] = (),
-    ) -> dict[str, Any] | None:
-        if not masks:
-            if name in self._loaded:
-                return None
-            return self._compiled_specs[name].loader_arguments(
-                f"{self.binary_prefix}_{name}", self.env_prefix,
-            )
-        if (name, masks) in self._variant_loaded:
-            return None
-        spec = self._compiled_specs[name]
-        prefix = "".join(
-            f"#define HYDROFORGE_{mask} {value}u\n" for mask, value in masks
-        )
-        source = prefix + spec.source
-        digest = hashlib.sha256(source.encode()).hexdigest()[:16]
-        arguments = spec.loader_arguments(
-            f"{self.binary_prefix}_{name}_mask_{digest}", self.env_prefix
-        )
-        arguments["cuda_sources"] = source
-        return arguments
-
-    def _ensure_precompiled(
-        self,
-        extensions: Any = None,
-    ) -> dict[str, Any]:
-        """Build and load the requested subset of this extension catalog.
-
-        Repeated calls are cumulative.  Omitting ``extensions`` preserves the
-        public whole-catalog precompile behavior used by the CLI.
-        """
-        requested = set(self.specs) if extensions is None else set(extensions)
-        pending = requested.difference(self._precompiled)
-        if not pending:
-            return {name: self._loaded[name] for name in requested}
-        from hydroforge.kernels.backends.cuda.precompile import (
-            precompile_extension_specs,
-        )
-
-        effective = {
-            name: spec for name, spec in self._compiled_specs.items() if name in pending
-        }
-        precompile_extension_specs(
-            self.binary_prefix,
-            effective,
-            env_prefix=self.env_prefix,
-        )
-        for name in pending:
-            self._load(name)
-        self._precompiled.update(pending)
-        return {name: self._loaded[name] for name in requested}
-
-    def _ensure_precompiled_for_modules(
-        self,
-        opened_modules: Any,
-    ) -> dict[str, Any]:
-        """Precompile the exact catalog subset required by model modules."""
-        if not self.module_extensions:
-            return self._ensure_precompiled()
-        opened = set(opened_modules)
-        required = set().union(*(self.module_extensions[module] for module in opened))
-        return self._ensure_precompiled(required)
-
-    def _dispatcher(self, route: _CompiledCudaRoute) -> CudaDispatcher:
-        declaration = _CudaDispatcherDeclaration(
-            route=route,
-            spec=active_kernel_spec(),
-        )
-        return CudaDispatcher(self, route, spec=declaration.spec)
+def _launch_device(values: Mapping[str, Any]) -> int:
+    for value in values.values():
+        if isinstance(value, torch.Tensor) and value.is_cuda:
+            return value.device.index
+    return torch.cuda.current_device()
 
 
 class CudaDispatcher:
-    """Trusted adapter over one construction-time compiled CUDA route."""
+    """Trusted adapter from canonical values to one runtime-compiled launch."""
 
     def __init__(
         self,
-        group: CudaExtensionGroup,
         route: _CompiledCudaRoute,
+        program: rtc.RtcProgram,
         *,
         spec: KernelSpec,
     ) -> None:
-        self.group = group
         self.route = route
-        self.extension = route.extension
-        self.launch = route.launch
+        self.program = program
         self.parameters = spec.parameters
         self.launch_args = route.launch_args
-        self.native_signature = route.native_signature
-        self.tensor_vector = route.tensor_vector
         self.projection = route.projection
         self.omitted = route.omitted
         self.spec = spec
@@ -665,66 +481,97 @@ class CudaDispatcher:
                 f"[1, 1024], got {block_size!r}"
             )
         self.projection._validate(values, kernel=self.spec.name)
+        if self.route.check is not None:
+            self.route.check(**{name: values[name] for name in self.route.check_args})
 
-    @cached_property
-    def _launcher(self):
-        return getattr(self.group._load(self.extension), self.launch)
-
-    def _precompile_arguments(self, arguments: dict[str, Any]):
+    def _is_empty(self, values: Mapping[str, Any]) -> bool:
         size_keys = (
             (self.spec.size_key,)
             if isinstance(self.spec.size_key, str)
             else self.spec.size_key
         )
-        if any(arguments[name] == 0 for name in size_keys):
-            return None
-        masks = tuple(
-            (name, self.spec.compile_time_mask(name, arguments))
+        extent = 1
+        for name in size_keys:
+            extent *= values[name]
+        return extent == 0
+
+    def _program_for(self, values: Mapping[str, Any], entries: str) -> rtc.RtcProgram:
+        """Specialize grouped masks as definitions and append generated entries."""
+
+        if not self.spec.compile_time_masks and not entries:
+            return self.program
+        prefix = "".join(
+            f"#define HYDROFORGE_{name} {self.spec.compile_time_mask(name, values)}u\n"
             for name in self.spec.compile_time_masks
         )
-        return self.group._precompile_arguments(self.extension, masks)
+        return rtc.RtcProgram(
+            prefix + self.program.source + entries,
+            self.program.options,
+            self.program.name,
+        )
+
+    def _plan(
+        self, values: Mapping[str, Any], buffer_dtypes: BufferDTypeABI | None
+    ) -> tuple[rtc.RtcRequest | None, tuple, int, dict[str, torch.Tensor]]:
+        device = _launch_device(values)
+        workspace = {}
+        entries = ""
+        if self.route.steps is not None:
+            workspace = allocate_workspace(self.route.workspace, values, device)
+            steps, entries = render_steps(
+                self.spec, self.route.steps, values, workspace, buffer_dtypes
+            )
+        else:
+            steps = tuple(
+                self.route.launch(**{name: values[name] for name in self.launch_args})
+            )
+        request = (
+            rtc.request_for(self._program_for(values, entries), steps)
+            if any(isinstance(step, rtc.CudaLaunch) for step in steps)
+            else None
+        )
+        return request, steps, device, workspace
+
+    def _precompile_arguments(
+        self,
+        arguments: dict[str, Any],
+        *,
+        buffer_dtypes: BufferDTypeABI | None = None,
+    ) -> tuple[rtc.RtcRequest, int] | None:
+        if self._is_empty(arguments):
+            return None
+        request, _steps, device, _workspace = self._plan(arguments, buffer_dtypes)
+        return None if request is None else (request, device)
 
     def specialize(
         self,
         arguments: dict[str, Any],
         *,
         buffer_dtypes: BufferDTypeABI,
-    ) -> Any:
-        del buffer_dtypes
-        values = dict(arguments)
-        if self.tensor_vector is not None:
-            values[self.tensor_vector.target] = self.tensor_vector.resolve(values)
-        size_keys = (
-            (self.spec.size_key,)
-            if isinstance(self.spec.size_key, str)
-            else self.spec.size_key
-        )
-        static_extent = 1
-        for name in size_keys:
-            static_extent *= values[name]
-        if static_extent == 0:
+    ) -> Callable[[], None]:
+        if self._is_empty(arguments):
 
             def no_op() -> None:
                 return None
 
             return no_op
-        if self.spec.compile_time_masks:
-            masks = tuple(
-                (
-                    name,
-                    self.spec.compile_time_mask(name, values),
-                )
-                for name in self.spec.compile_time_masks
-            )
-            launcher = getattr(
-                self.group._load_variant(self.extension, masks),
-                self.launch,
-            )
-        else:
-            launcher = self._launcher
-        static_launch = tuple(values[name] for name in self.launch_args)
+        request, steps, device, workspace = self._plan(arguments, buffer_dtypes)
+        if request is None:
 
-        def launch():
-            return launcher(*static_launch)
+            def run() -> None:
+                for step in steps:
+                    step()
 
+            return run
+        launch = rtc.prepare(request, steps, device)
+        # The prepared arguments hold raw addresses; keep the scratch alive.
+        launch.workspace = workspace
         return launch
+
+
+__all__ = [
+    "CudaDispatcher",
+    "CudaExtensionGroup",
+    "CudaNativeProjection",
+    "CudaRoute",
+]

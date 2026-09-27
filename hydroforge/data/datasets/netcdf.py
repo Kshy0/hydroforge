@@ -55,7 +55,7 @@ class NetCDFDataset(GriddedDataset):
     supports_time_aggregation: ClassVar[bool] = True
     reusable_expression_reads: ClassVar[bool] = True
 
-    base_dir: str | Path
+    base_dir: Path = Field(strict=False)
     var_name: str
     prefix: str
     chunk_len: int | None = Field(default=None, ge=1)
@@ -74,6 +74,9 @@ class NetCDFDataset(GriddedDataset):
     _source_dtype: np.dtype | None = PrivateAttr(default=None)
     _coordinate_units_cache: tuple[str | None, str | None] | None = PrivateAttr(
         default=None,
+    )
+    _coordinate_bounds_cache: tuple[np.ndarray | None, np.ndarray | None] | None = (
+        PrivateAttr(default=None)
     )
     _variable_axes_by_path: Mapping[Path, tuple[int, int, int]] = PrivateAttr(
         default_factory=dict
@@ -103,7 +106,8 @@ class NetCDFDataset(GriddedDataset):
 
     @model_validator(mode="after")
     def _inspect_netcdf_storage(self):
-        if self.chunk_len is None:
+        auto_chunk_len = self.chunk_len is None
+        if auto_chunk_len:
             storage_start = self._storage_time(self.start_date)
             key = self.time_to_key(storage_start)
             if type(key) is not str:
@@ -125,6 +129,8 @@ class NetCDFDataset(GriddedDataset):
             time_aggregation=self.time_aggregation,
             data_variable=self.var_name,
         )
+        if auto_chunk_len:
+            self._timeline._fit_auto_chunk_len()
         axes_by_path: dict[Path, tuple[int, int, int]] = {}
         for key in sorted(self._timeline.file_times):
             path = Path(
@@ -245,6 +251,37 @@ class NetCDFDataset(GriddedDataset):
                 )
         return canonical, units
 
+    @staticmethod
+    def _coordinate_bounds(
+        coordinate,
+        *,
+        size: int,
+        label: str,
+        path: Path,
+    ) -> np.ndarray | None:
+        """Read optional CF bounds for one coordinate axis."""
+
+        declared = getattr(coordinate, "bounds", None)
+        name = (
+            declared.strip()
+            if isinstance(declared, str) and declared.strip()
+            else f"{coordinate.name}_bnds"
+        )
+        group = coordinate.group()
+        if name not in group.variables:
+            return None
+        raw = group.variables[name][:]
+        if np.ma.isMaskedArray(raw) and np.any(np.ma.getmaskarray(raw)):
+            raise ValueError(f"{label} bounds in {path.name} contain missing values")
+        values = np.asarray(raw)
+        expected = (size, 2)
+        if values.shape != expected:
+            raise ValueError(
+                f"{label} bounds in {path.name} must have shape {expected}, "
+                f"got {values.shape}"
+            )
+        return canonical_float64(values, label=f"{label} bounds in {path.name}")
+
     def _validate_shard_coordinates(
         self,
         dataset: Dataset,
@@ -284,12 +321,41 @@ class NetCDFDataset(GriddedDataset):
             path=path,
         )
         observed_units = (longitude_units, latitude_units)
+        latitude_candidates = [
+            dataset.variables[name]
+            for name in (dimensions[y_idx], "lat", "latitude", "y")
+            if name in dataset.variables
+            and dataset.variables[name].dimensions == (dimensions[y_idx],)
+        ]
+        longitude_candidates = [
+            dataset.variables[name]
+            for name in (dimensions[x_idx], "lon", "longitude", "long", "x")
+            if name in dataset.variables
+            and dataset.variables[name].dimensions == (dimensions[x_idx],)
+        ]
+        latitude_variable = list(dict.fromkeys(latitude_candidates))[0]
+        longitude_variable = list(dict.fromkeys(longitude_candidates))[0]
+        observed_bounds = (
+            self._coordinate_bounds(
+                longitude_variable,
+                size=longitude.size,
+                label="longitude",
+                path=path,
+            ),
+            self._coordinate_bounds(
+                latitude_variable,
+                size=latitude.size,
+                label="latitude",
+                path=path,
+            ),
+        )
         if self._coordinates_cache is None:
             self._coordinates_cache = (
                 immutable_array(longitude, order="C"),
                 immutable_array(latitude, order="C"),
             )
             self._coordinate_units_cache = observed_units
+            self._coordinate_bounds_cache = observed_bounds
             self._grid_shape_cache = grid_shape
         else:
             expected_longitude, expected_latitude = self._coordinates_cache
@@ -306,6 +372,24 @@ class NetCDFDataset(GriddedDataset):
             if observed_units != self._coordinate_units_cache:
                 raise ValueError(
                     f"spatial coordinate units in shard {path.name} do not "
+                    "match the canonical shard"
+                )
+            expected_bounds = self._coordinate_bounds_cache
+            bounds_match = expected_bounds is not None
+            if bounds_match:
+                bounds_match = all(
+                    (left is None and right is None)
+                    or (
+                        left is not None
+                        and right is not None
+                        and left.shape == right.shape
+                        and np.array_equal(left, right)
+                    )
+                    for left, right in zip(expected_bounds, observed_bounds, strict=True)
+                )
+            if not bounds_match:
+                raise ValueError(
+                    f"spatial coordinate bounds in shard {path.name} do not "
                     "match the canonical shard"
                 )
             if grid_shape != self._grid_shape_cache:
@@ -588,6 +672,12 @@ class NetCDFDataset(GriddedDataset):
         return np.isnan(arr[0])
 
     def _finish_read(self, data: np.ndarray) -> np.ndarray | dict[str, np.ndarray]:
+        if (
+            self.time_aggregation is None
+            and self.unit_factor == 1.0
+            and self._direct_output_cast_is_exact(data)
+        ):
+            return self._finalize_output_data(data, label="NetCDF dataset output")
         calculation = self._canonical_calculation_data(
             data,
             label="NetCDF dataset input",
@@ -632,9 +722,19 @@ class NetCDFDataset(GriddedDataset):
 
         return cast(tuple[np.ndarray, np.ndarray], self._coordinates_cache)
 
+    def get_coordinate_bounds(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Return canonical CF cell bounds when the source declares them."""
+
+        bounds = self._coordinate_bounds_cache
+        if bounds is None:
+            return None, None
+        return bounds
+
 
 class _OpenMultivariableNetCDFRequest(HydroForgeModel):
-    base_dir: str | Path
+    base_dir: Path = Field(strict=False)
     var_specs: Any
     start_date: DateLike
     end_date: DateLike
@@ -722,19 +822,6 @@ def open_multivariable_netcdf(
         "clip_negative": request.clip_negative,
         "time_to_key": request.time_to_key,
     }
-    if request.chunk_len is None:
-        first_name, first_spec = request.compiled_specs[0]
-        first_prefix = first_spec.get("prefix", f"{first_name}_")
-        first_suffix = first_spec.get("suffix", request.suffix)
-        first_key = request.time_to_key(request.start_date)
-        first_path = Path(
-            request.base_dir,
-            f"{first_prefix}{first_key}{first_suffix}",
-        )
-        shared["chunk_len"] = _planned_netcdf_chunk_len(
-            first_path,
-            first_name,
-        )
     datasets = {}
     for name, spec in request.compiled_specs:
         options = shared | spec
@@ -742,5 +829,8 @@ def open_multivariable_netcdf(
         if "prefix" not in options:
             options["prefix"] = f"{name}_"
         datasets[name] = NetCDFDataset(**options)
+        if shared["chunk_len"] is None:
+            # Later children share the first child's automatic plan.
+            shared["chunk_len"] = datasets[name].chunk_len
 
     return GriddedMultiVariableDataset(datasets=datasets)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import struct
+import weakref
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,7 @@ from hydroforge.kernels.backends.metal.limits import (
 )
 from hydroforge.kernels.backends.metal.types import NATIVE_BUFFER_DTYPES
 from hydroforge.kernels.context import resolve_factory_spec
+from hydroforge.kernels.math_mode import fast_math
 
 _MSL_SCALARS = {
     "bool": "bool",
@@ -680,14 +682,7 @@ class MetalDispatcher:
             threads *= values[name]
         return threads, values["BLOCK_SIZE"]
 
-    def _prepare_values(
-        self,
-        values: dict[str, Any],
-        *,
-        threads: int,
-        group_size: int,
-    ):
-        arguments = [values[name] for name in self.args]
+    def _pipeline(self, values: dict[str, Any]) -> tuple[Any, int]:
         constant_values, constants = self._constants(values)
         template_values = self._templates(values)
         cache_key = tuple(
@@ -710,9 +705,23 @@ class MetalDispatcher:
                 constants,
                 self.native_types,
                 [self.buffer_access.get(name, "none") for name in self.args],
+                fast_math(),
             )
             self._pipeline_cache[cache_key] = pipeline
-        binding = native.create_argument_binding(pipeline, arguments)
+        return native, pipeline
+
+    def _prepare_values(
+        self,
+        values: dict[str, Any],
+        *,
+        threads: int,
+        group_size: int,
+    ):
+        native, pipeline = self._pipeline(values)
+        binding = native.create_argument_binding(
+            pipeline,
+            [values[name] for name in self.args],
+        )
         return native, pipeline, binding, threads, group_size
 
     def _submit(self, prepared, values: dict[str, Any]) -> None:
@@ -770,17 +779,82 @@ class MetalDispatcher:
 
             return no_op
         packed = self._packed_values(values)
-        static = values | packed
+        return _MetalLaunch(self, values | packed, threads, group_size)
 
-        def launch() -> None:
-            prepared = self._prepare_values(
-                static,
-                threads=threads,
-                group_size=group_size,
+
+class _MetalLaunch:
+    """One specialized Metal launch owning a reusable argument binding.
+
+    Recording hands each command sequence a fresh binding it owns. Direct
+    dispatch reuses one binding, released natively after GPU completion once
+    this launch is closed or collected.
+    """
+
+    __slots__ = (
+        "_dispatcher",
+        "_values",
+        "_threads",
+        "_group_size",
+        "_native",
+        "_pipeline",
+        "_binding",
+        "_release",
+        "__weakref__",
+    )
+
+    def __init__(
+        self,
+        dispatcher: MetalDispatcher,
+        values: dict[str, Any],
+        threads: int,
+        group_size: int,
+    ) -> None:
+        self._dispatcher = dispatcher
+        self._values = values
+        self._threads = threads
+        self._group_size = group_size
+        self._native = None
+        self._pipeline = None
+        self._binding = None
+        self._release = None
+
+    def __call__(self) -> None:
+        from hydroforge.kernels.backends.metal.runtime import recording_metal_sequence
+
+        dispatcher = self._dispatcher
+        if recording_metal_sequence() is not None:
+            prepared = dispatcher._prepare_values(
+                self._values,
+                threads=self._threads,
+                group_size=self._group_size,
             )
-            self._submit(prepared, static)
+            dispatcher._submit(prepared, self._values)
+            return
+        if self._binding is None:
+            native, pipeline = dispatcher._pipeline(self._values)
+            binding = native.create_argument_binding(
+                pipeline,
+                [self._values[name] for name in dispatcher.args],
+            )
+            self._native, self._pipeline, self._binding = native, pipeline, binding
+            self._release = weakref.finalize(
+                self,
+                native.release_argument_binding,
+                binding,
+            )
+            self._release.atexit = False
+        self._native.dispatch(
+            self._pipeline,
+            self._binding,
+            self._threads,
+            self._group_size,
+        )
 
-        return launch
+    def close(self) -> None:
+        release, self._release = self._release, None
+        self._binding = None
+        if release is not None:
+            release()
 
 
 class _MetalDispatcherDeclaration(HydroForgeModel):

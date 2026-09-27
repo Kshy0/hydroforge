@@ -63,11 +63,6 @@ storage only for directly requested fields. Inactive tensors are `None`, and
 virtual expressions do not allocate storage. Use `materialized_outputs` to
 request resident fields without writing them.
 
-Among state categories, only `init_state` tensors are checkpointed;
-reconstruction also retains parameters and topology. Distributed checkpoints
-support unequal or empty spatial partitions. Ensemble checkpoint saving is
-unsupported.
-
 Models stage forcing and declare physical execution order directly:
 
 ```python
@@ -232,10 +227,6 @@ export HYDROFORGE_BACKEND=cuda
 export HYDROFORGE_BACKEND=metal
 export HYDROFORGE_BACKEND=torch
 ```
-
-Backend availability depends on the model and device. Native CUDA compilation
-uses `HYDROFORGE_PRECOMPILE_JOBS` for build processes and `MAX_JOBS` for Ninja
-jobs within each process.
 
 ## License
 

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
+from itertools import groupby
 from typing import Any
 
 import torch
@@ -202,6 +205,85 @@ class _MetalKernelSegment:
         self.icb.replay(count)
 
 
+def _launch_operator_run(operators: tuple[Any, ...], values: dict[int, Any]) -> None:
+    for operator in operators:
+        if isinstance(
+            operator,
+            (
+                CompiledKernelCall,
+                CollectiveOperator,
+                PredicateLoopOperator,
+                _MetalKernelSegment,
+            ),
+        ):
+            operator.launch()
+        else:
+            operator.launch(values)
+
+
+def _fingerprint(value: Any, aliases: dict[int, Any]) -> Any:
+    """Hashable identity of recorded host values and tensor bindings."""
+
+    if isinstance(value, torch.Tensor):
+        return aliases.get(id(value), ("tensor", id(value)))
+    if isinstance(value, _StableRef):
+        return aliases.get(id(value.tensor), ("tensor", id(value.tensor)))
+    if isinstance(value, _ValueRef):
+        return ("value", value.index)
+    if isinstance(value, float):
+        return ("float", float(value).hex())
+    if value is None or isinstance(value, (bool, int, str)):
+        return (type(value).__name__, value)
+    if isinstance(value, (tuple, list)):
+        return tuple(_fingerprint(item, aliases) for item in value)
+    if isinstance(value, dict):
+        return tuple(
+            (name, _fingerprint(item, aliases)) for name, item in sorted(value.items())
+        )
+    try:
+        hash(value)
+    except TypeError:
+        return ("object", type(value).__qualname__)
+    return ("object", value)
+
+
+def _unique_metal_error_flags(programs: tuple[Any, ...]) -> tuple[torch.Tensor, ...]:
+    return tuple(
+        {
+            id(flag): flag
+            for program in programs
+            if program is not None
+            for flag in program._metal_error_flags
+        }.values()
+    )
+
+
+def lower_metal_programs(*programs: Any) -> None:
+    """Lower jointly launched programs so scatter bounds share one error flag."""
+
+    flag = None
+    for program in programs:
+        if program is None:
+            continue
+        if program._metal_commands is None:
+            program._metal_error_seed = flag
+        program.metal_commands()
+        if flag is None and program._metal_error_flags:
+            flag = program._metal_error_flags[0]
+
+
+def reset_metal_errors(*programs: Any) -> None:
+    for flag in _unique_metal_error_flags(programs):
+        flag.zero_()
+
+
+def check_metal_errors(*programs: Any) -> None:
+    """Read every distinct scatter bounds flag once for one launch sequence."""
+
+    if any(int(flag.item()) != 0 for flag in _unique_metal_error_flags(programs)):
+        raise IndexError("Metal scatter_add index is outside the output extent")
+
+
 def capture_metal_commands(
     capture: Any,
     commands: tuple[Any, ...],
@@ -244,6 +326,7 @@ class OperatorProgram:
         self._metal_prepared = False
         self._metal_commands: tuple[Any, ...] | None = None
         self._metal_error_flags: tuple[torch.Tensor, ...] = ()
+        self._metal_error_seed: torch.Tensor | None = None
         self.mutated_tensors = tuple(
             dict.fromkeys(
                 tensor for operator in self.operators for tensor in operator.writes
@@ -269,10 +352,101 @@ class OperatorProgram:
             for operator in self.operators
         )
 
+    def fingerprint(self, aliases: dict[int, Any]) -> tuple[Any, ...]:
+        """Identify everything recording froze into this program.
+
+        ``aliases`` names per-recording draft controls, so two recordings of
+        the same body compare equal exactly when their operator sequence,
+        bindings and host scalars (for example values derived from the step
+        duration) agree.
+        """
+
+        aliases = {
+            **aliases,
+            **{
+                id(reference.tensor): ("value", reference.index)
+                for operator in self.operators
+                if isinstance(operator, TorchOperator)
+                for reference in _refs(operator.outputs)
+                if isinstance(reference, _ValueRef)
+            },
+        }
+        identity = []
+        for operator in self.operators:
+            if isinstance(operator, TorchOperator):
+                identity.append(
+                    (
+                        operator.function,
+                        _fingerprint(operator.arguments, aliases),
+                        _fingerprint(operator.keywords, aliases),
+                    )
+                )
+            elif isinstance(operator, (CompiledKernelCall, _BoundKernelCall)):
+                arguments = (
+                    operator.request.arguments
+                    if isinstance(operator, _BoundKernelCall)
+                    else operator.arguments
+                )
+                identity.append(
+                    (
+                        "kernel",
+                        id(operator.entry),
+                        _fingerprint(dict(arguments), aliases),
+                    )
+                )
+            elif isinstance(operator, PredicateLoopOperator):
+                nested = operator.program
+                identity.append(
+                    (
+                        "predicate",
+                        nested.maximum_steps,
+                        nested.body_operators.fingerprint(
+                            {
+                                **aliases,
+                                id(nested.predicate): "predicate",
+                                id(nested.counter): "predicate index",
+                            }
+                        ),
+                    )
+                )
+            elif isinstance(operator, CollectiveOperator):
+                identity.append(
+                    (
+                        "collective",
+                        _fingerprint(operator.tensors, aliases),
+                        operator.abis,
+                        operator.operation,
+                        operator.reduction,
+                        operator.destination,
+                        operator.scope,
+                    )
+                )
+            else:
+                identity.append(("operator", type(operator).__qualname__))
+        return tuple(identity)
+
     def references_tensor(self, tensor: torch.Tensor) -> bool:
         """Return whether this compiled program reads or writes ``tensor``."""
 
         return id(tensor) in self._referenced_tensor_ids
+
+    def precompile_triton(self) -> None:
+        """Compile every Triton launch of this scope and nested bodies in parallel."""
+        from hydroforge.kernels.backends.triton.compile import precompile
+
+        warmups = []
+
+        def collect(program: OperatorProgram) -> None:
+            for operator in program.operators:
+                if isinstance(operator, PredicateLoopOperator):
+                    collect(operator.program.body_operators)
+                elif isinstance(operator, CompiledKernelCall):
+                    warmup = getattr(operator.launch, "warmup", None)
+                    if warmup is not None:
+                        warmups.append(warmup)
+
+        collect(self)
+        precompile(warmups)
 
     def materialize_cuda(self) -> None:
         """Build exact variants across this scope and nested predicate bodies."""
@@ -293,7 +467,10 @@ class OperatorProgram:
                     provider = request.implementation._implementation
                     prepare = getattr(provider, "_precompile_arguments", None)
                     if prepare is not None:
-                        arguments = prepare(dict(request.arguments))
+                        arguments = prepare(
+                            dict(request.arguments),
+                            buffer_dtypes=request.buffer_dtypes,
+                        )
                         if arguments is not None:
                             requests.append(arguments)
 
@@ -359,20 +536,50 @@ class OperatorProgram:
                     )
 
     def launch(self) -> None:
-        values: dict[int, torch.Tensor] = {}
-        for operator in self._launch_operators:
-            if isinstance(
-                operator,
-                (
-                    CompiledKernelCall,
-                    CollectiveOperator,
-                    PredicateLoopOperator,
-                    _MetalKernelSegment,
-                ),
-            ):
-                operator.launch()
+        _launch_operator_run(self._launch_operators, {})
+
+    def capture_runs(
+        self,
+    ) -> tuple[tuple[bool, Callable[[], None], tuple[torch.Tensor, ...]], ...]:
+        """Split launch order into CUDA-capturable runs and host-only operators.
+
+        Every value reference resolves to its address-stable ``out=`` tensor,
+        so a run launched in its own graph observes exactly the values the
+        whole-program launch would pass between operators.
+        """
+
+        values = {
+            reference.index: reference.tensor
+            for operator in self._launch_operators
+            if isinstance(operator, TorchOperator)
+            for reference in _refs(operator.outputs)
+            if isinstance(reference, _ValueRef)
+        }
+        runs = []
+        for safe, group in groupby(
+            self._launch_operators,
+            key=lambda operator: getattr(operator, "cuda_graph_capture_safe", True),
+        ):
+            group = tuple(group)
+            if safe:
+                runs.append(
+                    (
+                        True,
+                        partial(_launch_operator_run, group, values),
+                        tuple(
+                            dict.fromkeys(
+                                tensor
+                                for operator in group
+                                for tensor in operator.writes
+                            )
+                        ),
+                    )
+                )
             else:
-                operator.launch(values)
+                runs.extend(
+                    (False, operator.launch, operator.writes) for operator in group
+                )
+        return tuple(runs)
 
     def prepare_metal(self, capture: Any) -> None:
         """Online-lower the complete operator program into one native ICB."""
@@ -394,22 +601,23 @@ class OperatorProgram:
         if self._metal_commands is not None:
             return self._metal_commands
 
-        from hydroforge.execution.metal_aten import lower_metal_aten
+        from hydroforge.execution import metal_aten
 
         commands: list[Any] = []
-        for operator in self.operators:
-            if isinstance(operator, CompiledKernelCall):
-                commands.append(operator)
-            elif isinstance(operator, CollectiveOperator):
-                raise SubstepCompileError(
-                    "Metal ICB substeps do not support distributed collectives"
-                )
-            elif isinstance(operator, PredicateLoopOperator):
-                raise SubstepCompileError(
-                    "Metal ICB substeps do not support predicate loops"
-                )
-            else:
-                commands.extend(lower_metal_aten(operator))
+        with metal_aten.scatter_error_scope(self._metal_error_seed):
+            for operator in self.operators:
+                if isinstance(operator, CompiledKernelCall):
+                    commands.append(operator)
+                elif isinstance(operator, CollectiveOperator):
+                    raise SubstepCompileError(
+                        "Metal ICB substeps do not support distributed collectives"
+                    )
+                elif isinstance(operator, PredicateLoopOperator):
+                    raise SubstepCompileError(
+                        "Metal ICB substeps do not support predicate loops"
+                    )
+                else:
+                    commands.extend(metal_aten.lower_metal_aten(operator))
         self._metal_error_flags = tuple(
             dict.fromkeys(
                 flag for command in commands for flag in getattr(command, "errors", ())
@@ -419,12 +627,10 @@ class OperatorProgram:
         return self._metal_commands
 
     def reset_metal_errors(self) -> None:
-        for flag in self._metal_error_flags:
-            flag.zero_()
+        reset_metal_errors(self)
 
     def check_metal_errors(self) -> None:
-        if any(int(flag.item()) != 0 for flag in self._metal_error_flags):
-            raise IndexError("Metal scatter_add index is outside the output extent")
+        check_metal_errors(self)
 
     def close(self, capture: Any) -> None:
         segments, self._metal_segments = self._metal_segments, ()
@@ -449,6 +655,7 @@ class OperatorProgram:
         self._metal_prepared = False
         self._metal_commands = None
         self._metal_error_flags = ()
+        self._metal_error_seed = None
         self.mutated_tensors = ()
         self.referenced_tensors = ()
         self._referenced_tensor_ids = frozenset()
@@ -823,15 +1030,19 @@ class OperatorRecording:
         if exc_type is None:
             program = OperatorProgram(self.recorder.operators)
             try:
-                if self.parent is None and self.recorder.execution.backend == "cuda":
+                backend = self.recorder.execution.backend
+                if self.parent is None and backend == "cuda":
                     with _disable_current_modes():
                         program.materialize_cuda()
+                elif self.parent is None and backend == "triton":
+                    with _disable_current_modes():
+                        program.precompile_triton()
             except BaseException as primary:
                 try:
                     program.close(self.recorder.execution.capture)
                 except BaseException as cleanup:
                     raise ResourceCleanupError(
-                        "CUDA operator compilation", (primary, cleanup),
+                        "native operator compilation", (primary, cleanup),
                     ) from primary
                 raise
             self.program = program

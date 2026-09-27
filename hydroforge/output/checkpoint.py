@@ -1,4 +1,8 @@
-"""Internal checkpoint persistence service for :class:`AbstractModel`."""
+"""Construction-input snapshots, equivalent to parameter files.
+
+Persist parameters, topology and initializable physical state, never calendar,
+spin-up progress or execution metadata. A new model owns its own run schedule.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +35,7 @@ from hydroforge.serialization.netcdf import (
     decode_netcdf_logical_array,
     netcdf_dtype_encoding,
     normalize_netcdf_variable_options,
+    plan_fixed_netcdf_chunks,
 )
 
 
@@ -58,7 +63,6 @@ class _CheckpointPlan:
 
 @dataclass(frozen=True, slots=True)
 class _CheckpointSaveStage:
-    timestamp: str
     path: Path
     data: dict[str, Any]
     distributed: tuple[str, ...]
@@ -66,14 +70,11 @@ class _CheckpointSaveStage:
     groups: dict[str, str]
 
 
-_CheckpointPath = Annotated[Path, BeforeValidator(lambda value: Path(value))]
-
-
 class _CheckpointMergeDeclaration(HydroForgeModel):
     """Complete validated input for one distributed checkpoint merge."""
 
-    output_path: _CheckpointPath
-    rank_paths: tuple[_CheckpointPath, ...] = Field(min_length=1)
+    output_path: Path = Field(strict=False)
+    rank_paths: tuple[Annotated[Path, Field(strict=False)], ...] = Field(min_length=1)
     variable_group_mapping: FrozenMapping[str, str]
     netcdf_options: Annotated[
         FrozenMapping[str, Any], BeforeValidator(normalize_netcdf_variable_options)
@@ -123,6 +124,15 @@ def _merge_rank_checkpoints(
     coordinate_parts: dict[str, list[np.ndarray]] = {
         name: [] for name in coordinate_groups
     }
+    # Size partitioned dimensions up front: fixed extents keep explicit chunk
+    # layouts and Blosc eligibility that unlimited dimensions would lose.
+    totals = dict.fromkeys(distributed_names, 0)
+    for rank_path in rank_paths:
+        with Dataset(rank_path, "r") as rank_ds:
+            for variable in distributed_names.intersection(rank_ds.variables):
+                shape = rank_ds.variables[variable].shape
+                if shape:
+                    totals[variable] += shape[0]
 
     with _atomic_netcdf_dataset_trusted(
         output_path,
@@ -216,12 +226,19 @@ def _merge_rank_checkpoints(
                             )
                             if dimension not in merged_ds.dimensions:
                                 merged_ds.createDimension(
-                                    dimension, None if partitioned else size
+                                    dimension,
+                                    totals[var_name] if partitioned else size,
                                 )
                             dims.append(dimension)
 
                         variable_options = _prepare_netcdf_variable_options_trusted(
-                            create_options,
+                            plan_fixed_netcdf_chunks(
+                                create_options,
+                                dtype=storage_dtype,
+                                shape=tuple(
+                                    len(merged_ds.dimensions[name]) for name in dims
+                                ),
+                            ),
                             dtype=storage_dtype,
                             dimensions=tuple(dims),
                             name=var_name,
@@ -277,6 +294,13 @@ def _merge_rank_checkpoints(
                         merged_var.assignValue(stored)
                     else:
                         merged_var[:] = stored
+        for variable, total in totals.items():
+            if offsets.get(variable, 0) != total:
+                raise RuntimeError(
+                    f"Rank checkpoint variable {variable!r} changed length "
+                    f"during merge: expected {total}, wrote "
+                    f"{offsets.get(variable, 0)}"
+                )
         for coordinate, parts in coordinate_parts.items():
             combined = np.concatenate(parts)
             if np.unique(combined).size != combined.size:
@@ -347,7 +371,6 @@ class CheckpointRuntime:
             None
             if stage is None
             else (
-                stage.timestamp,
                 self.plan.layout_signature,
                 stage.distributed,
                 tuple(sorted(stage.groups.items())),
@@ -441,14 +464,23 @@ class CheckpointRuntime:
             )
         return tuple(fields[name] for name in sorted(fields))
 
+    def _flush_statistics_output(self) -> None:
+        """Make streamed statistics rows durable before a checkpoint commits."""
+
+        statistics = self.model._statistics
+        if statistics is not None and statistics._output is not None:
+            statistics._output.flush_and_wait(dt=self.model.current_time)
+
     def _stage_save(self) -> _CheckpointSaveStage:
         """Snapshot complete current construction input without publishing."""
 
         model = self.model
         variable_map = model._namespace.build()
         fields = self.plan.fields
-        current_time = model.current_time
-        timestamp = current_time.strftime("%Y%m%d_%H%M%S") if current_time else "latest"
+        date = model.current_time
+        timestamp = date.strftime("%Y%m%d_%H%M%S") if date is not None else "latest"
+        if model.simulation_schedule is not None:
+            timestamp += f"_step{model.schedule_index}"
         name = (
             f"model_state_rank{model.rank}_{timestamp}.nc"
             if model.world_size > 1
@@ -494,7 +526,6 @@ class CheckpointRuntime:
             distributed.append(coordinate)
 
         return _CheckpointSaveStage(
-            timestamp=timestamp,
             path=path,
             data=data,
             distributed=tuple(distributed),
@@ -614,7 +645,6 @@ class CheckpointRuntime:
 
         model = self.model
         path = stage.path
-        timestamp = stage.timestamp
         transaction = atomic_output_path(path, preserve_suffix=True)
         staging_path: Path | None = None
         write_error: BaseException | None = None
@@ -638,7 +668,7 @@ class CheckpointRuntime:
         write_failures = self._coordinate_phase(
             write_error,
             phase="checkpoint.save.write",
-            signature=(checkpoint_id, timestamp),
+            signature=(checkpoint_id,),
         )
         if any(failure is not None for failure in write_failures):
             failure = cast(BaseException, write_error)
@@ -661,7 +691,7 @@ class CheckpointRuntime:
         event_failures = self._coordinate_phase(
             event_error,
             phase="checkpoint.save.events.precommit",
-            signature=(checkpoint_id, timestamp),
+            signature=(checkpoint_id,),
         )
         if any(failure is not None for failure in event_failures):
             self._rollback_single_rank_save(
@@ -680,7 +710,7 @@ class CheckpointRuntime:
         commit_failures = self._coordinate_phase(
             commit_error,
             phase="checkpoint.save.commit",
-            signature=(checkpoint_id, timestamp, str(path)),
+            signature=(checkpoint_id, str(path)),
         )
         if any(failure is not None for failure in commit_failures):
             failure = cast(BaseException, commit_error)
@@ -697,6 +727,7 @@ class CheckpointRuntime:
         stage_error: BaseException | None = None
         try:
             model._ensure_healthy_runtime()
+            self._flush_statistics_output()
             stage = self._stage_save()
             proxy = InputProxy(data=stage.data)
         except BaseException as error:
@@ -716,7 +747,6 @@ class CheckpointRuntime:
         proxy = cast(InputProxy, proxy)
         checkpoint_id = cast(str, checkpoint_id)
         path = stage.path
-        timestamp = stage.timestamp
         distributed = stage.distributed
         global_fields = stage.global_fields
         groups = stage.groups
@@ -747,7 +777,7 @@ class CheckpointRuntime:
         write_failures = self._coordinate_phase(
             write_error,
             phase="checkpoint.save.write",
-            signature=(checkpoint_id, timestamp),
+            signature=(checkpoint_id,),
         )
         if any(failure is not None for failure in write_failures):
             failure = (
@@ -774,7 +804,7 @@ class CheckpointRuntime:
         event_failures = self._coordinate_phase(
             event_error,
             phase="checkpoint.save.events.precommit",
-            signature=(checkpoint_id, timestamp),
+            signature=(checkpoint_id,),
         )
         if any(failure is not None for failure in event_failures):
             failure = (
@@ -793,10 +823,11 @@ class CheckpointRuntime:
 
         merge_error: BaseException | None = None
         rank_paths = ()
-        merged = model.output_full_dir / f"model_state_{timestamp}.nc"
+        suffix = path.name.removeprefix(f"model_state_rank{model.rank}_")
+        merged = path.with_name(f"model_state_{suffix}")
         if model.rank == 0:
             rank_paths = tuple(
-                model.output_full_dir / f"model_state_rank{rank}_{timestamp}.nc"
+                path.with_name(f"model_state_rank{rank}_{suffix}")
                 for rank in range(model.world_size)
             )
             try:
@@ -811,7 +842,7 @@ class CheckpointRuntime:
         merge_failures = self._coordinate_phase(
             merge_error,
             phase="checkpoint.save.merge",
-            signature=(checkpoint_id, timestamp, str(merged)),
+            signature=(checkpoint_id, str(merged)),
         )
         if any(failure is not None for failure in merge_failures):
             failure = (
@@ -835,7 +866,7 @@ class CheckpointRuntime:
         commit_failures = self._coordinate_phase(
             commit_error,
             phase="checkpoint.save.commit",
-            signature=(checkpoint_id, timestamp, str(merged)),
+            signature=(checkpoint_id, str(merged)),
         )
         if any(failure is not None for failure in commit_failures):
             failure = (
@@ -903,7 +934,7 @@ class CheckpointRuntime:
         post_commit_failures = self._coordinate_phase(
             post_commit_error,
             phase="checkpoint.save.events.postcommit",
-            signature=(checkpoint_id, timestamp),
+            signature=(checkpoint_id,),
         )
         if any(failure is not None for failure in post_commit_failures):
             error = (
@@ -928,7 +959,7 @@ class CheckpointRuntime:
         reopen_failures = self._coordinate_phase(
             reopen_error,
             phase="checkpoint.save.reopen",
-            signature=(checkpoint_id, timestamp, str(merged)),
+            signature=(checkpoint_id, str(merged)),
         )
         if any(failure is not None for failure in reopen_failures):
             failure = (
