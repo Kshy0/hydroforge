@@ -2,62 +2,47 @@
 
 from __future__ import annotations
 
-from types import MappingProxyType
 from typing import Literal, Self
 
 from pydantic import Field, model_validator
 
-from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.core.validation import HydroForgeModel
 
-DEFAULT_BLOCK_SIZE = 256
 MODEL_OWNED_MODULE_FIELDS = (
     "opened_modules",
     "rank",
     "device",
     "precision",
     "mixed_precision",
+    "metal_emulation",
     "ensemble_size",
 )
 
 
-def validate_runtime_block_size(value: int, *, backend: str) -> None:
-    """Validate launch-width constraints intrinsic to one backend runtime."""
-
-    if type(value) is not int or not 1 <= value <= 1024:
-        raise ValueError(
-            f"backend {backend!r} BLOCK_SIZE must be an exact int in "
-            f"[1, 1024], got {value!r}"
-        )
-    if backend == "triton" and value & (value - 1):
-        raise ValueError(
-            f"backend 'triton' BLOCK_SIZE must be a power of two, got {value}"
-        )
-
-
-def _effective_block_size(
-    configured: int | None,
-    *,
-    backend: str,
-    default: int = DEFAULT_BLOCK_SIZE,
-) -> int:
-    """Resolve the launch width actually used by one backend."""
-
-    if backend == "metal":
-        return DEFAULT_BLOCK_SIZE
-    return default if configured is None else configured
-
-
 class BackendRequirement(HydroForgeModel):
-    """Model-wide restrictions not already defined by the backend runtime."""
+    """Model-wide restrictions not already defined by the backend runtime.
+
+    Block-size limits bind every launch width the model resolves, including
+    framework statistics kernels, which use the backend's default width unless
+    a model-wide block size is configured.  ``default_block_size`` is that
+    model-wide width when ``model.block_size`` is omitted, and
+    ``capture=False`` keeps ``execution_mode="auto"`` eager on this
+    backend. ``default_mixed_precision`` overrides the backend default when
+    the caller leaves ``mixed_precision`` unset. The runtime limits of each
+    backend remain facts of :class:`hydroforge.platform.Backend`.
+    """
 
     precision: frozenset[Literal["float32", "float64"]] | None = Field(
         default=None, min_length=1
     )
     mixed_precision: bool = True
+    default_mixed_precision: bool | None = None
     ensemble: bool = True
     min_block_size: int | None = Field(default=None, ge=1)
     max_block_size: int | None = Field(default=None, ge=1)
     block_size: int | None = Field(default=None, ge=1)
+    default_block_size: int | None = Field(default=None, ge=1)
+    capture: bool = True
 
     @model_validator(mode="after")
     def _validate_requirement(self) -> Self:
@@ -67,34 +52,18 @@ class BackendRequirement(HydroForgeModel):
             and self.min_block_size > self.max_block_size
         ):
             raise ValueError("backend block-size range is empty")
-        if self.block_size is not None and (
-            self.min_block_size is not None
-            and self.block_size < self.min_block_size
-            or self.max_block_size is not None
-            and self.block_size > self.max_block_size
+        for label, value in (
+            ("fixed", self.block_size),
+            ("default", self.default_block_size),
         ):
-            raise ValueError("fixed backend block size is outside its range")
+            if value is not None and (
+                self.min_block_size is not None
+                and value < self.min_block_size
+                or self.max_block_size is not None
+                and value > self.max_block_size
+            ):
+                raise ValueError(f"{label} backend block size is outside its range")
         return self
-
-    def _validate_block_size(self, value: int, *, backend: str) -> None:
-        """Validate one resolved model or per-kernel launch width."""
-
-        validate_runtime_block_size(value, backend=backend)
-        if self.min_block_size is not None and value < self.min_block_size:
-            raise ValueError(
-                f"backend {backend!r} requires BLOCK_SIZE >= "
-                f"{self.min_block_size}, got {value}"
-            )
-        if self.max_block_size is not None and value > self.max_block_size:
-            raise ValueError(
-                f"backend {backend!r} requires BLOCK_SIZE <= "
-                f"{self.max_block_size}, got {value}"
-            )
-        if self.block_size is not None and value != self.block_size:
-            raise ValueError(
-                f"backend {backend!r} requires BLOCK_SIZE={self.block_size}, "
-                f"got {value}"
-            )
 
     def _validate_precision(
         self,
@@ -115,23 +84,15 @@ class BackendRequirement(HydroForgeModel):
 
 
 class ModuleRequirement(HydroForgeModel):
-    """Restrictions introduced only when one optional module is open."""
+    """Restrictions introduced only when one optional module is open.
+
+    ``clock`` marks a module that records absolute times and therefore needs
+    a ``simulation_schedule`` or an ``initial_time``.
+    """
 
     ensemble: bool = True
+    clock: bool = False
 
 
 DEFAULT_BACKEND_REQUIREMENT = BackendRequirement()
 DEFAULT_MODULE_REQUIREMENT = ModuleRequirement()
-
-# Intrinsic runtime limits belong to HydroForge, not to every downstream
-# model. Launch-width rules are enforced by ``validate_runtime_block_size``;
-# these declarative requirements capture the remaining backend capabilities.
-# Model ``backend_requirements`` may only add stricter constraints.
-RUNTIME_BACKEND_REQUIREMENTS = MappingProxyType(
-    {
-        "metal": BackendRequirement(
-            precision=frozenset({"float32"}),
-            mixed_precision=False,
-        ),
-    }
-)

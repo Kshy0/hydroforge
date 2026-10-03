@@ -4,35 +4,433 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-"""Trusted execution of construction-time compiled parameter changes."""
+"""Rank-local compilation and transactional execution of parameter changes."""
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from functools import cached_property
 from graphlib import CycleError, TopologicalSorter
-from types import MappingProxyType
+from types import FunctionType, MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import cftime
+import numpy as np
 import torch
 
-from hydroforge.contracts.errors import ResourceCleanupError
-from hydroforge.contracts.parameters import ParameterValue
-from hydroforge.model.tensors import _PARAMETER_TENSOR_READS
+from hydroforge.contracts.fields import concrete_tensor_dtype
+from hydroforge.contracts.parameters import ParameterValue, validate_parameter_scalar
+from hydroforge.core.errors import ResourceCleanupError
+from hydroforge.declare.module import AbstractModule
+from hydroforge.declare.tensors import ModulePayload, ModuleTensors
+from hydroforge.execution.partition import _searchsorted_batch
 
 if TYPE_CHECKING:
-    from hydroforge.compiler.parameters import _ParameterChangePlan
+    from hydroforge.compiler.fields import FieldEntry
+    from hydroforge.compiler.parameters import ParameterTarget
+    from hydroforge.execution.session import ModelRuntime
+
+
+_FRAMEWORK_ATTRIBUTES = frozenset(dir(AbstractModule))
+
+
+class _ReadRecorder:
+    """Stand-in ``self`` that records the declared tensor reads of one formula.
+
+    Declared tensor and reference-index reads are recorded by qualified name.
+    Sibling modules resolve to their own recorders, and methods or properties
+    authored by the module class run against the recorder so that helper
+    reads are recorded as well. Scalars, framework methods and private state
+    are read from the module itself.
+    """
+
+    __slots__ = ("_recorded_module", "_recorded_fields", "_recorded_reads")
+
+    def __init__(
+        self,
+        module: Any,
+        fields: Mapping[int, Mapping[str, str]],
+        reads: set[str],
+    ) -> None:
+        self._recorded_module = module
+        self._recorded_fields = fields
+        self._recorded_reads = reads
+
+    @property
+    def __class__(self) -> type:
+        # isinstance() and zero-argument super() see the real module class.
+        return type(self._recorded_module)
+
+    def __getattr__(self, name: str) -> Any:
+        module = self._recorded_module
+        qualified = self._recorded_fields.get(id(module), {}).get(name)
+        if qualified is not None:
+            self._recorded_reads.add(qualified)
+            return getattr(module, name)
+        if name in module.spec().references:
+            sibling = getattr(module, name)
+            if sibling is None:
+                return None
+            return _ReadRecorder(sibling, self._recorded_fields, self._recorded_reads)
+        attribute = inspect.getattr_static(type(module), name, None)
+        if (
+            isinstance(attribute, (FunctionType, property))
+            and name not in _FRAMEWORK_ATTRIBUTES
+        ):
+            return attribute.__get__(self, type(module))
+        return getattr(module, name)
+
+
+@dataclass(frozen=True, slots=True)
+class _ParameterChangePlan:
+    """One complete rank-local instruction compiled from public input."""
+
+    target: ParameterTarget
+    variable_name: str
+    module_name: str
+    field_name: str
+    start_time: datetime | cftime.datetime
+    active_steps: int
+    delta: ParameterValue
+    target_value: ParameterValue | None
+    local_indices: tuple[int, ...] | None
+    index_axis: int
+
+
+@dataclass(frozen=True, slots=True)
+class _TargetIdLookup:
+    """Validated global-to-local lookup shared by changes on one ID field."""
+
+    id_values: np.ndarray
+    order: np.ndarray
+    sorted_ids: np.ndarray
+    local_by_global: np.ndarray
+    local_extent: int
+
+    def global_indices(self, ids: np.ndarray) -> np.ndarray:
+        position = _searchsorted_batch(self.sorted_ids, ids)
+        valid = position < self.sorted_ids.size
+        hit = np.zeros(ids.shape, dtype=bool)
+        hit[valid] = self.sorted_ids[position[valid]] == ids[valid]
+        index = np.full(ids.shape, -1, dtype=np.int64)
+        index[hit] = self.order[position[hit]]
+        return index
+
+
+class LocalParameterCompiler:
+    """Resolve compiled parameter targets against rank-local module payloads."""
+
+    def __init__(
+        self,
+        runtime: ModelRuntime,
+        payloads: Mapping[str, ModulePayload],
+    ) -> None:
+        self.runtime = runtime
+        self.payloads = payloads
+        self._target_id_lookups: dict[tuple[str, str | None], _TargetIdLookup] = {}
+
+    def compile(
+        self, targets: tuple[ParameterTarget, ...]
+    ) -> tuple[_ParameterChangePlan, ...]:
+        return tuple(
+            self._compile_change(target)
+            for target in sorted(targets, key=lambda target: target.start)
+        )
+
+    def _parameter_shape(self, field: FieldEntry) -> tuple[int, ...]:
+        view = self.payloads[field.module]
+        tensors = ModuleTensors(view)
+        shape = tensors._expected_shape(field.name)
+        if shape is None:
+            raise ValueError(f"Inactive parameter {field.name!r}")
+        if field.name in view.model_fields_set:
+            value = getattr(view, field.name)
+            if isinstance(value, torch.Tensor):
+                if tuple(value.shape) != shape:
+                    tensors._resolve_batch_shape(field.spec, value, shape)
+                return tuple(value.shape)
+        return shape
+
+    def _compile_change(self, target: ParameterTarget) -> _ParameterChangePlan:
+        plan = self.runtime.plan
+        change = target.change
+        field = target.field
+        tensor = field.tensor
+        local_shape = self._parameter_shape(field)
+        index_axis = len(local_shape) - len(tensor.shape)
+        group = plan.fields.variable_groups.get(field.name)
+        local_rows = (
+            None if group is None else self.runtime.partition.rank_indices(group)
+        )
+        local_indices: tuple[int, ...] | None = None
+        local_positions: tuple[int, ...] | None = None
+        update_shape = local_shape
+        if target.target_ids is not None:
+            local_indices, local_positions = self._compile_target_ids(
+                target,
+                local_shape=local_shape,
+                index_axis=index_axis,
+                group=group,
+                local_rows=local_rows,
+            )
+            requested_shape = list(local_shape)
+            requested_shape[index_axis] = len(target.target_ids)
+            update_shape = tuple(requested_shape)
+
+        value = self.bind_update_value(
+            plan, target, update_shape, index_axis, local_positions
+        )
+        is_set = target.is_set_value
+        return _ParameterChangePlan(
+            target=target,
+            variable_name=change.variable,
+            module_name=field.module,
+            field_name=field.name,
+            start_time=target.start,
+            active_steps=change.active_steps,
+            delta=change._trusted_value("delta") if is_set else value,
+            target_value=value if is_set else None,
+            local_indices=local_indices,
+            index_axis=index_axis,
+        )
+
+    @staticmethod
+    def bind_update_value(
+        plan: Any,
+        target: ParameterTarget,
+        update_shape: tuple[int, ...],
+        index_axis: int,
+        local_positions: tuple[int, ...] | None,
+    ) -> ParameterValue:
+        """Bind the owned declaration to one shape and member/ID selection."""
+
+        change = target.change
+        tensor = target.field.tensor
+        is_set = target.is_set_value
+        raw_value = change._trusted_value("target_value" if is_set else "delta")
+        if (
+            plan.parallel is not None
+            and index_axis == 1
+            and isinstance(raw_value, torch.Tensor)
+            and raw_value.ndim == len(update_shape)
+        ):
+            if raw_value.shape[0] != plan.ensemble_size:
+                raise ValueError(
+                    "ensemble parameter changes require the global member axis"
+                )
+            raw_value = raw_value[plan.parallel.member_slice]
+        value = LocalParameterCompiler._validate_update_value(
+            raw_value,
+            expected_shape=update_shape,
+            expected_dtype=concrete_tensor_dtype(
+                tensor.dtype, plan.dtype, plan.mixed_precision
+            ),
+            expected_device=torch.device("cpu")
+            if tensor.mode == "cpu"
+            else plan.device,
+            variable_name=change.variable,
+            is_set=is_set,
+        )
+        if (
+            isinstance(value, torch.Tensor)
+            and value.ndim != 0
+            and local_positions is not None
+        ):
+            positions = torch.tensor(
+                local_positions,
+                dtype=torch.int64,
+                device=value.device,
+            )
+            value = value.index_select(index_axis, positions).contiguous()
+
+        return value
+
+    def _compile_target_ids(
+        self,
+        target: ParameterTarget,
+        *,
+        local_shape: tuple[int, ...],
+        index_axis: int,
+        group: str | None,
+        local_rows: np.ndarray | None,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        change = target.change
+        id_field = target.id_field
+        id_name = change.target_id_field or target.field.tensor.dim_coords
+        lookup = self._target_id_lookups.get((id_field.qualified, group))
+        if lookup is None:
+            lookup = self._target_id_lookup(
+                id_field, id_name=id_name, local_rows=local_rows
+            )
+            self._target_id_lookups[(id_field.qualified, group)] = lookup
+        if lookup.local_extent != local_shape[index_axis]:
+            raise ValueError(
+                f"parameter target ID field {id_name!r} shape "
+                f"({lookup.local_extent},) "
+                f"is not co-indexed with {change.variable!r} axis "
+                f"length {local_shape[index_axis]}"
+            )
+        target_ids = target.target_ids
+        limits = np.iinfo(lookup.id_values.dtype)
+        outside = [
+            value for value in target_ids if not limits.min <= value <= limits.max
+        ]
+        if outside:
+            raise ValueError(
+                f"target_ids for {change.variable!r} are outside the "
+                f"{lookup.id_values.dtype} range of {id_name!r}: {outside[:10]}"
+            )
+        target_array = np.asarray(target_ids, dtype=lookup.id_values.dtype)
+        global_indices = lookup.global_indices(target_array)
+        missing = global_indices < 0
+        if np.any(missing):
+            missing_ids = target_array[missing][:10].tolist()
+            raise ValueError(
+                f"target_ids for {change.variable!r} were not found in "
+                f"{id_name!r}: {missing_ids}"
+            )
+
+        local = lookup.local_by_global[global_indices]
+        present = local >= 0
+        return (
+            tuple(local[present].tolist()),
+            tuple(np.flatnonzero(present).tolist()),
+        )
+
+    def _target_id_lookup(
+        self,
+        id_field: FieldEntry,
+        *,
+        id_name: str,
+        local_rows: np.ndarray | None,
+    ) -> _TargetIdLookup:
+        runtime = self.runtime
+        local_id_tensor = getattr(self.payloads[id_field.module], id_field.name)
+        if not isinstance(local_id_tensor, torch.Tensor):
+            raise ValueError(f"parameter target ID field {id_name!r} must be a tensor")
+        if local_id_tensor.ndim != 1 or local_id_tensor.dtype not in {
+            torch.int32,
+            torch.int64,
+        }:
+            raise ValueError(
+                f"parameter target ID field {id_name!r} must be a one-dimensional "
+                "integer tensor"
+            )
+        order, sorted_ids, unique = runtime.partition.sorted_global_key(
+            id_field.name,
+            lambda: runtime.input[id_field.name],
+        )
+        if not unique:
+            raise ValueError(
+                f"parameter target ID field {id_name!r} contains duplicate IDs"
+            )
+        id_values = sorted_ids
+        lookup = _TargetIdLookup(
+            id_values=id_values,
+            order=order,
+            sorted_ids=sorted_ids,
+            local_by_global=np.empty(0, dtype=np.int64),
+            local_extent=0,
+        )
+
+        if local_rows is None:
+            local_rows = np.arange(id_values.size, dtype=np.int64)
+        local_id_values = local_id_tensor.detach().cpu().numpy()
+        prepared_global_indices = lookup.global_indices(
+            local_id_values.astype(id_values.dtype, copy=False)
+        )
+        owned = np.zeros(id_values.size, dtype=bool)
+        owned[local_rows] = True
+        if np.any(prepared_global_indices < 0) or not np.all(
+            owned[prepared_global_indices]
+        ):
+            raise ValueError(
+                f"prepared parameter target ID field {id_name!r} contains IDs "
+                "outside its rank-local input partition"
+            )
+        local_by_global = np.full(id_values.size, -1, dtype=np.int64)
+        local_by_global[prepared_global_indices] = np.arange(
+            prepared_global_indices.size,
+            dtype=np.int64,
+        )
+        # Global IDs are unique, so a collapsed scatter means a local duplicate.
+        if np.count_nonzero(local_by_global >= 0) != prepared_global_indices.size:
+            raise ValueError(
+                f"prepared parameter target ID field {id_name!r} contains duplicate IDs"
+            )
+        return _TargetIdLookup(
+            id_values=id_values,
+            order=order,
+            sorted_ids=sorted_ids,
+            local_by_global=local_by_global,
+            local_extent=int(prepared_global_indices.size),
+        )
+
+    @staticmethod
+    def _validate_update_value(
+        value: ParameterValue,
+        *,
+        expected_shape: tuple[int, ...],
+        expected_dtype: torch.dtype,
+        expected_device: torch.device,
+        variable_name: str,
+        is_set: bool,
+    ) -> ParameterValue:
+        if isinstance(value, torch.Tensor):
+            if expected_dtype is torch.bool and not is_set:
+                raise ValueError(
+                    f"boolean parameter {variable_name!r} supports SET only"
+                )
+            if value.layout is not torch.strided:
+                raise ValueError(
+                    f"parameter {variable_name!r} update tensor must use "
+                    "torch.strided layout"
+                )
+            if not value.is_contiguous():
+                raise ValueError(
+                    f"parameter {variable_name!r} update tensor must be contiguous"
+                )
+            if value.ndim != 0 and tuple(value.shape) != expected_shape:
+                raise ValueError(
+                    f"parameter {variable_name!r} update tensor must be "
+                    f"scalar or have shape {expected_shape}; got "
+                    f"{tuple(value.shape)}"
+                )
+            if value.dtype != expected_dtype:
+                raise ValueError(
+                    f"parameter {variable_name!r} update tensor must use "
+                    f"dtype {expected_dtype}; got {value.dtype}"
+                )
+            device_matches = bool(
+                value.device.type == expected_device.type
+                and (
+                    value.device.index is None
+                    or expected_device.index is None
+                    or value.device.index == expected_device.index
+                )
+            )
+            if not device_matches:
+                raise ValueError(
+                    f"parameter {variable_name!r} update tensor must be on "
+                    f"device {expected_device}; got {value.device}"
+                )
+            return value
+
+        return validate_parameter_scalar(
+            value, dtype=expected_dtype, variable_name=variable_name, is_set=is_set
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class PlanItem:
     """One runtime binding of an already compiled parameter instruction."""
 
+    target: ParameterTarget
     variable_name: str
     start_time: datetime | cftime.datetime
     active_steps: int
@@ -58,7 +456,6 @@ class ActivePlan:
 
     item: PlanItem
     steps_executed: int = 0
-    executed_once: bool = False
 
 
 class ParameterChangeEffect(Enum):
@@ -76,14 +473,14 @@ class _TensorSnapshot:
 
 
 class ParameterPlanRuntime:
-    """Apply rank-local plans compiled by ``ParameterSemanticCompiler``."""
+    """Apply rank-local plans compiled by ``LocalParameterCompiler``."""
 
     def __init__(
         self,
-        owner: Any,
+        runtime: ModelRuntime,
         plans: tuple[_ParameterChangePlan, ...],
     ) -> None:
-        self.owner = owner
+        self.runtime = runtime
         self._plans = tuple(self._bind(item) for item in plans)
         self.dependencies: Mapping[str, tuple[str, ...]] = MappingProxyType({})
         self._derived: dict[str, tuple[Any, str, cached_property]] = {}
@@ -93,7 +490,7 @@ class ParameterPlanRuntime:
         self._step_transaction_snapshots: list[tuple[Any, str, Any]] = []
 
     def _bind(self, item: _ParameterChangePlan) -> PlanItem:
-        module = self.owner._modules[item.module_name]
+        module = self.runtime.modules[item.module_name]
         target = getattr(module, item.field_name)
         indices = (
             None
@@ -105,6 +502,7 @@ class ParameterPlanRuntime:
             )
         )
         return PlanItem(
+            target=item.target,
             variable_name=item.variable_name,
             start_time=item.start_time,
             active_steps=item.active_steps,
@@ -115,6 +513,92 @@ class ParameterPlanRuntime:
             indices=indices,
             index_axis=item.index_axis,
         )
+
+    def prepare_rebind(
+        self, replacements: Mapping[int, torch.Tensor]
+    ) -> tuple[tuple[PlanItem, ...], list[ActivePlan]] | None:
+        """Prepare live ID/value bindings before a structural mutation.
+
+        Completed instructions do not constrain later layouts. Source values
+        come from the declaration so an ID returning to this rank recovers its
+        original update, while active-step counters keep their current values.
+        """
+
+        pending = self._plans[self._next_plan_idx :]
+        active = [
+            p for p in self._active_plans if p.steps_executed < p.item.active_steps
+        ]
+        items = {id(item): item for item in (*pending, *(p.item for p in active))}
+        updated: dict[int, PlanItem] = {}
+        lookups: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for identity, item in items.items():
+            target = item.target
+            current = getattr(item.module, item.attr_name)
+            id_field = target.id_field
+            ids = (
+                None
+                if id_field is None
+                else getattr(self.runtime.modules[id_field.module], id_field.name)
+            )
+            if id(current) not in replacements and (
+                ids is None or id(ids) not in replacements
+            ):
+                continue
+            candidate = replacements.get(id(current), current)
+            shape = list(candidate.shape)
+            positions = None
+            indices = None
+            if target.target_ids is not None:
+                if ids is None:
+                    raise ValueError(
+                        f"cannot rebind {item.variable_name!r}: target ID field was discarded"
+                    )
+                candidate_ids = replacements.get(id(ids), ids)
+                if candidate_ids.numel() != shape[item.index_axis]:
+                    raise ValueError(
+                        f"target IDs for {item.variable_name!r} no longer align to its parameter axis"
+                    )
+                lookup = lookups.get(id(candidate_ids))
+                if lookup is None:
+                    values = candidate_ids.detach().cpu().numpy()
+                    order = np.argsort(values, kind="stable")
+                    lookup = lookups[id(candidate_ids)] = (order, values[order])
+                order, ordered = lookup
+                requested = np.asarray(target.target_ids, dtype=ordered.dtype)
+                found = _searchsorted_batch(ordered, requested)
+                present = found < ordered.size
+                present[present] &= ordered[found[present]] == requested[present]
+                positions = tuple(np.flatnonzero(present).tolist())
+                indices = torch.tensor(
+                    order[found[present]], dtype=torch.int64, device=candidate.device
+                )
+                shape[item.index_axis] = len(target.target_ids)
+            value = LocalParameterCompiler.bind_update_value(
+                self.runtime.plan, target, tuple(shape), item.index_axis, positions
+            )
+            updated[identity] = replace(
+                item,
+                indices=indices,
+                delta=item.delta if item.is_set_value else value,
+                target_value=value if item.is_set_value else None,
+            )
+        if not updated:
+            return None
+        return (
+            tuple(updated.get(id(item), item) for item in self._plans),
+            [
+                ActivePlan(updated.get(id(p.item), p.item), p.steps_executed)
+                for p in self._active_plans
+            ],
+        )
+
+    def install_rebind(
+        self, candidate: tuple[tuple[PlanItem, ...], list[ActivePlan]] | None
+    ) -> None:
+        """Publish already prepared bindings without changing the plan cursor."""
+
+        if candidate is not None:
+            self._plans, self._active_plans = candidate
 
     @staticmethod
     def _evaluate_derived(
@@ -146,22 +630,23 @@ class ParameterPlanRuntime:
         configuration remain fixed; this is not a Python control-flow tracer.
         A structural revision requires a fresh graph at the next parameter event.
         """
-        revision = self.owner._execution.structural_revision
+        revision = self.runtime.execution.structural_revision
         if self._dependency_revision == revision:
             return
-        fields = {}
-        schemas = {}
+        fields: dict[int, dict[str, str]] = {}
+        declared: dict[str, tuple[Any, str, Any]] = {}
         candidates = {}
-        for module_name in self.owner.opened_modules:
-            module = self.owner._modules[module_name]
-            for field in module.tensor_schema():
+        for module_name in self.runtime.plan.modules:
+            module = self.runtime.modules[module_name]
+            module_fields = fields.setdefault(id(module), {})
+            for field in module.spec().tensor_fields.values():
                 qualified = f"{module_name}.{field.name}"
-                fields[id(module), field.name] = qualified
-                schemas[qualified] = (module, field)
+                module_fields[field.name] = qualified
+                declared[qualified] = (module, field.name, field.tensor)
                 if (
                     field.computed
                     and field.tensor.category == "derived_param"
-                    and module._is_tensor_field_active(field)
+                    and module._is_tensor_field_active(field.name)
                 ):
                     descriptor = getattr(type(module), field.name)
                     if not isinstance(descriptor, cached_property):
@@ -170,38 +655,25 @@ class ParameterPlanRuntime:
                         )
                     if isinstance(module.__dict__.get(field.name), torch.Tensor):
                         candidates[qualified] = (module, field.name, descriptor)
-            for name in module._reference_index_fields(
-                opened_modules=module.opened_modules,
-                field_demand=module._field_demand,
-            ):
+            for name, metadata in module._binding.plan.reference_indices.items():
                 qualified = f"{module_name}.{name}"
-                fields[id(module), name] = qualified
-                schemas[qualified] = (
-                    module,
-                    module._get_tensor_schema(
-                        name,
-                        opened_modules=module.opened_modules,
-                        field_demand=module._field_demand,
-                    ),
-                )
+                module_fields[name] = qualified
+                declared[qualified] = (module, name, metadata)
         dependencies = {}
         with torch.inference_mode():
             for qualified, (module, name, descriptor) in candidates.items():
                 reads: set[str] = set()
-                token = _PARAMETER_TENSOR_READS.set((fields, reads))
                 try:
                     # Invoke only the formula: reading the result buffer here
                     # would falsely record a self-dependency.
-                    descriptor.func(module)
+                    descriptor.func(_ReadRecorder(module, fields, reads))
                 except Exception as error:
                     raise ValueError(
                         f"cannot record parameter dependencies for {qualified}: {error}"
                     ) from error
-                finally:
-                    _PARAMETER_TENSOR_READS.reset(token)
                 for dependency in reads:
-                    source, schema = schemas[dependency]
-                    if schema.tensor.category not in {
+                    source, source_name, metadata = declared[dependency]
+                    if metadata.category not in {
                         "param",
                         "derived_param",
                         "topology",
@@ -209,12 +681,12 @@ class ParameterPlanRuntime:
                         raise ValueError(
                             f"{qualified}: derived parameters cannot depend on runtime field {dependency}"
                         )
-                    if not isinstance(getattr(source, schema.name), torch.Tensor):
+                    if not isinstance(getattr(source, source_name), torch.Tensor):
                         raise ValueError(
                             f"{qualified}: dependency {dependency} must remain resident"
                         )
                     if (
-                        schema.tensor.category == "derived_param"
+                        metadata.category == "derived_param"
                         and dependency not in candidates
                     ):
                         raise ValueError(
@@ -248,8 +720,8 @@ class ParameterPlanRuntime:
                 )
                 current.copy_(fresh)
                 changed.add(qualified)
-            for module_name in self.owner.opened_modules:
-                self.owner._modules[module_name].validate_parameters()
+            for module_name in self.runtime.plan.modules:
+                self.runtime.modules[module_name].validate_parameters()
 
     @staticmethod
     def _apply_tensor_value(
@@ -303,9 +775,7 @@ class ParameterPlanRuntime:
         indexed = [active.item.indices for active in plans]
         if all(indices is not None for indices in indexed):
             index_axis = plans[0].item.index_axis
-            indices = torch.unique(
-                torch.cat([item for item in indexed if item is not None])
-            )
+            indices = torch.unique(torch.cat(indexed))
             values = value.detach().index_select(index_axis, indices)
             return _TensorSnapshot(values, indices, index_axis)
         return _TensorSnapshot(
@@ -351,11 +821,7 @@ class ParameterPlanRuntime:
         cursor = (
             self._next_plan_idx,
             tuple(
-                ActivePlan(
-                    active.item,
-                    active.steps_executed,
-                    active.executed_once,
-                )
+                ActivePlan(active.item, active.steps_executed)
                 for active in self._active_plans
             ),
         )
@@ -442,7 +908,6 @@ class ParameterPlanRuntime:
             raise
         for active in active_plans:
             active.steps_executed += 1
-            active.executed_once = True
         self._next_plan_idx = next_plan_idx
         self._active_plans = active_plans
         return ParameterChangeEffect.UPDATED

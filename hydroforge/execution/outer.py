@@ -2,118 +2,72 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator
+from collections.abc import Generator
 from typing import TYPE_CHECKING, Any
 
-from pydantic import PrivateAttr, model_validator
-
-from hydroforge.contracts.validation import HydroForgeModel
-from hydroforge.execution.program import _close_program_resources
+from hydroforge.execution.context import (
+    InvocationScope,
+    close_runner,
+    specialization_key,
+)
+from hydroforge.execution.operators import record_operator_scope
+from hydroforge.execution.substeps import Recorded, cached_program
 
 if TYPE_CHECKING:
-    from hydroforge.model.model import AbstractModel
-
-
-class _OuterScopeRequest(HydroForgeModel):
-    specialization: Any = None
-
-    _key: Any = PrivateAttr()
-
-    @model_validator(mode="after")
-    def _validate_specialization(self):
-        from hydroforge.execution.substeps import _specialization_key
-
-        self._key = _specialization_key(self.specialization)
-        return self
-
-    @property
-    def specialization_key(self) -> Any:
-        return self._key
+    from hydroforge.execution.runtime import ModelExecution
 
 
 class _OuterProgram:
-    def __init__(self, model: AbstractModel, operators: Any) -> None:
+    def __init__(self, execution: ModelExecution, operators: Any) -> None:
         if operators is None or not operators.operators:
             raise RuntimeError("outer operator scope produced an empty program")
-        self.capture = model._execution.capture
-        self.capture_mode = model._execution.capture_mode
+        self.executor = execution.executor
         self.operators = operators
-        self.graph = None
-        if self.capture_mode == "metal_icb":
-            self.operators.prepare_metal(self.capture)
+        self.runner = self.executor.outer(operators)
 
     def launch(self) -> None:
-        if self.capture_mode == "cuda_graph" and self.operators.cuda_graph_capture_safe:
-            if self.graph is None:
-                self.graph = self.capture.capture_cuda(
-                    self.operators.launch,
-                    mutated_state=self.operators.mutated_tensors,
-                )
-            self.graph.replay()
-            return
-        if self.capture_mode == "metal_icb":
-            self.operators.reset_metal_errors()
-        self.operators.launch()
-        self.operators.check_metal_errors()
+        self.runner.run()
 
     def close(self) -> None:
-        graph, self.graph = self.graph, None
+        runner, self.runner = self.runner, None
         operators, self.operators = self.operators, None
-        _close_program_resources(
-            self.capture, (graph,), (operators,), scope="outer operator program"
+        close_runner(
+            self.executor, runner, (operators,), scope="outer operator program"
         )
 
 
-class _OnceScope:
-    def __init__(self, runtime: OuterRuntime, *, key: tuple[Any, ...]) -> None:
-        self.runtime = runtime
+class _OnceScope(InvocationScope):
+    def __init__(self, context: Any, *, key: tuple[Any, ...]) -> None:
+        super().__init__(context)
         self.key = key
 
-    def __iter__(self) -> Iterator[None]:
-        from hydroforge.execution.substeps import _cached_program
-
-        step = self.runtime.step
-        step.begin_outer_scope_execution()
-        program = yield from _cached_program(
-            self.runtime.model._execution,
+    def _iterate(self) -> Generator[None, None, None]:
+        context = self.context
+        program = yield from cached_program(
+            context.execution,
             self.key,
-            (step.time_step, step.requested_sub_steps),
+            (context.time_step, context.requested_sub_steps),
             self._record,
         )
         program.launch()
-        step.complete_outer_scope_execution()
+        context.scopes.pop()
 
     def _record(self) -> Generator[None, None, Any]:
-        from hydroforge.execution.operators import record_operator_scope
-        from hydroforge.execution.substeps import _Recorded
-
-        model = self.runtime.model
-        with record_operator_scope(model, scope_kind="outer") as recording:
+        execution = self.context.execution
+        with record_operator_scope(execution, scope_kind="outer") as recording:
             yield None
         program = recording.program
-        return _Recorded(
+        return Recorded(
             (program.fingerprint({}),),
             (program,),
-            lambda: _OuterProgram(model, program),
+            lambda: _OuterProgram(execution, program),
         )
 
 
-class OuterRuntime:
-    """Declare cached once-per-outer-step operator sequences."""
+def outer_scope(
+    context: Any, *, site: tuple[Any, int], specialization: Any
+) -> _OnceScope:
+    """Declare one cached once-per-outer-step operator sequence."""
 
-    def __init__(self, model: Any, step: Any) -> None:
-        self.model = model
-        self.step = step
-
-    def once(
-        self,
-        *,
-        site: tuple[Any, int],
-        specialization: Any = None,
-    ) -> _OnceScope:
-        request = _OuterScopeRequest(specialization=specialization)
-        key = self.step.claim_outer_scope(
-            site=site,
-            specialization=request.specialization_key,
-        )
-        return _OnceScope(self, key=key)
+    key = context.claim_outer_scope(site, specialization_key(specialization))
+    return _OnceScope(context, key=key)

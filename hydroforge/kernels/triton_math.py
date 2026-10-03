@@ -15,7 +15,7 @@ from the CUDA implementations of the same formulas:
   CPU models and CUDA use IEEE division and square root and libm-accurate
   functions. :func:`divide`, :func:`sqrt`, :func:`exp`, :func:`log`,
   :func:`pow` and :func:`cbrt` use the IEEE and libdevice forms (the
-  functions CUDA calls), unless :func:`hydroforge.kernels.math_mode.fast_math`
+  functions CUDA calls), unless ``HYDROFORGE_FAST_MATH``
   selects fast math.
 
 :func:`to_compute` and :func:`to_index` mark the precision and index
@@ -35,9 +35,9 @@ import triton.language as tl
 from triton.language import core
 from triton.language.extra import libdevice
 
-from hydroforge.kernels.math_mode import fast_math
+from hydroforge.platform.backend import TRITON
 
-FAST_MATH = tl.constexpr(fast_math())
+FAST_MATH = tl.constexpr(TRITON.math.physics_fast_math)
 _HIP = tl.constexpr(torch.version.hip is not None)
 
 
@@ -120,12 +120,15 @@ def pow(base, exponent):
 @core.extern
 def _ocml_cbrt(arg0, _semantic=None):
     return core.extern_elementwise(
-        "", "", [arg0],
+        "",
+        "",
+        [arg0],
         {
             (core.dtype("fp32"),): ("__ocml_cbrt_f32", core.dtype("fp32")),
             (core.dtype("fp64"),): ("__ocml_cbrt_f64", core.dtype("fp64")),
         },
-        is_pure=True, _semantic=_semantic,
+        is_pure=True,
+        _semantic=_semantic,
     )
 
 

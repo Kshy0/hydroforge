@@ -29,7 +29,8 @@ exclude = ["hydroforge.validation*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-"hydroforge.kernels.backends.metal" = ["*.mm"]
+"hydroforge.kernels.toolchain" = ["*.mm"]
+"hydroforge.kernels" = ["float32x2.metal", "emulated.metal"]
 
 [tool.setuptools.exclude-package-data]
 "*" = ["__pycache__/*", "*.py[cod]"]

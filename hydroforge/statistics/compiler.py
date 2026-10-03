@@ -1,22 +1,20 @@
 """Compile explicit statistics inputs into an uninstalled backend program."""
 
-from hydroforge.contracts.errors import cleanup_on_exit
-from hydroforge.statistics.emitters.common import (
-    CompiledStatistics,
-    StatisticsCompileContext,
-)
-from hydroforge.statistics.emitters.cuda import CudaStatisticsEmitter
-from hydroforge.statistics.emitters.metal import MetalStatisticsEmitter
-from hydroforge.statistics.emitters.torch import TorchStatisticsEmitter
-from hydroforge.statistics.emitters.triton import TritonStatisticsEmitter
+from dataclasses import replace
+from functools import partial
+
+from hydroforge.core.errors import cleanup_on_exit
+from hydroforge.kernels.toolchain.python import release_generated_module
 from hydroforge.statistics.ir import StatisticsIR
+from hydroforge.statistics.kernel_plan import StatisticsCompileContext, plan_statistics
+from hydroforge.statistics.launch import CompiledStatistics, cuda, metal, torch, triton
 from hydroforge.statistics.lowering import lower_statistics
 
-_EMITTERS = {
-    "torch": TorchStatisticsEmitter,
-    "triton": TritonStatisticsEmitter,
-    "cuda": CudaStatisticsEmitter,
-    "metal": MetalStatisticsEmitter,
+_LAUNCHERS = {
+    "cuda": cuda.compile_statistics,
+    "msl": metal.compile_statistics,
+    "torch": torch.compile_statistics,
+    "triton": triton.compile_statistics,
 }
 
 
@@ -24,13 +22,30 @@ def compile_statistics_program(
     context: StatisticsCompileContext,
     ir: StatisticsIR,
     *,
-    backend: str,
+    dialect: str,
 ) -> CompiledStatistics:
-    emitter = _EMITTERS[backend](context, lower_statistics(ir))
+    """Emit the statistics program in the backend's framework dialect."""
+
+    lowering = lower_statistics(ir)
+    plan = plan_statistics(context, lowering)
+    compiled = _LAUNCHERS[dialect](context, plan)
+    if compiled.settle is not None or not lowering.compound:
+        return compiled
+    # Other backends fold a close without a sample through the PyTorch
+    # settle kernels over the same storage.
     try:
-        return emitter.emit()
+        settle, generated = torch.compile_settle(context, plan)
     except BaseException:
         with cleanup_on_exit(
-            "statistics compilation", (emitter.release_generated_modules,)
+            "statistics settle compilation",
+            (
+                partial(release_generated_module, name, filename)
+                for name, filename in compiled.generated_modules
+            ),
         ):
             raise
+    return replace(
+        compiled,
+        settle=settle,
+        generated_modules=(*compiled.generated_modules, generated),
+    )

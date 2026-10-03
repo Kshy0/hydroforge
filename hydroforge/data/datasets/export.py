@@ -1,4 +1,11 @@
-"""NetCDF export workflows shared by forcing datasets."""
+"""NetCDF exports of forcing datasets and the CaMa mapping-table generator.
+
+Time-series exports are single-rank files of the rank-output schema
+(:mod:`hydroforge.io.rank_output.schema`), readable by
+:class:`~hydroforge.data.datasets.ExportedDataset` and
+:class:`~hydroforge.io.MultiRankStatsReader`.  Every export reads at the source
+cadence and excludes spin-up chunks.
+"""
 
 from __future__ import annotations
 
@@ -6,701 +13,805 @@ import logging
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from functools import partial
+from itertools import chain
 from pathlib import Path
-from types import MappingProxyType
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 import netCDF4 as nc
 import numpy as np
 import torch
-from pydantic import (
-    BeforeValidator,
-    Field,
-    PrivateAttr,
-    field_validator,
-    model_validator,
-)
+from pydantic import AfterValidator, BeforeValidator, Field, InstanceOf, validate_call
 from tqdm import tqdm
 
-from hydroforge.contracts.errors import cleanup_on_exit
-from hydroforge.contracts.naming import sanitize_symbol
-from hydroforge.contracts.validation import (
-    FrozenMapping,
-    HydroForgeModel,
-    _immutable_dict,
-)
-from hydroforge.data.numeric import canonical_floating_array
-from hydroforge.serialization.netcdf import (
-    COMMITTED_STEPS_ATTR,
-    DEFAULT_NETCDF_OPTIONS,
-    OUTPUT_FORMAT,
-    OUTPUT_VERSION,
-    RUN_ID_ATTR,
-    _atomic_netcdf_dataset_trusted,
-    _create_netcdf_variable_trusted,
-    _prepare_netcdf_variable_options_trusted,
+from hydroforge.core.arrays import canonical_float64, canonical_floating_array
+from hydroforge.core.errors import cleanup_on_exit
+from hydroforge.core.naming import sanitize_symbol, validate_netcdf_name
+from hydroforge.core.validation import HydroForgeModel
+from hydroforge.data.datasets.base import ForcingDataset, TorchDevice
+from hydroforge.data.datasets.exported import ExportedDataset
+from hydroforge.data.datasets.space import GridSpace
+from hydroforge.io.netcdf.options import (
+    NetCDFOptions,
+    create_netcdf_variable,
     default_netcdf_options,
-    normalize_netcdf_variable_options,
+    prepare_netcdf_variable_options,
 )
+from hydroforge.io.netcdf.write import atomic_netcdf_dataset
+from hydroforge.io.rank_output.schema import (
+    COMMITTED_STEPS_ATTR,
+    POINT_DIM,
+    TIME_DIM,
+    RankFileHeader,
+    create_time_axis,
+    rank_file_name,
+    write_point_coordinate,
+)
+from hydroforge.mapping.aggregation import build_cama_mapping
+from hydroforge.mapping.table import normalize_target_weights
+from hydroforge.parallel.distributed import is_rank_zero
 
 logger = logging.getLogger(__name__)
 
-if TYPE_CHECKING:
-    from hydroforge.data.datasets.gridded import GriddedDataset
+_EXPORT = validate_call(config=HydroForgeModel.model_config)
+_COORDINATE = "catchment_id"
 
 
-def _output_name(value: Any, *, label: str) -> str:
-    if type(value) is not str or not value:
-        raise ValueError(f"{label} must be a non-empty exact string")
-    if sanitize_symbol(value) != value:
+def _output_name(value: str, *, label: str) -> str:
+    if not value or sanitize_symbol(value) != value:
         raise ValueError(f"{label} must be one safe NetCDF/file component")
+    if value in {_COORDINATE, TIME_DIM, "quantile"}:
+        raise ValueError(f"{label} conflicts with a reserved export coordinate")
     return value
 
 
-def _metadata_values(
+_SafeName = Annotated[str, AfterValidator(partial(_output_name, label="name"))]
+
+
+def _quantile_levels(value: np.ndarray) -> np.ndarray:
+    if np.ma.isMaskedArray(value):
+        raise TypeError("quantiles must not be a masked array")
+    array = np.asarray(value)
+    if array.ndim != 1 or array.size == 0:
+        raise ValueError("quantiles must be a non-empty one-dimensional array")
+    if array.dtype.kind not in {"f", "i", "u"}:
+        raise TypeError("quantiles must contain real numeric values")
+    if not np.isfinite(array).all() or np.any((array < 0) | (array > 1)):
+        raise ValueError("quantiles must lie within [0, 1]")
+    result = canonical_float64(array, label="quantiles")
+    if np.any(np.diff(result) <= 0):
+        raise ValueError("quantiles must be strictly increasing")
+    return result
+
+
+def _source_nan_mask(value: np.ndarray) -> np.ndarray:
+    if np.ma.isMaskedArray(value) or value.dtype != np.dtype(np.bool_):
+        raise ValueError("source_nan_mask must be an unmasked boolean array")
+    return value
+
+
+def _metadata(
     value: str | Mapping[str, str] | None,
     *,
     label: str,
     names: tuple[str, ...],
     default: Callable[[str], str],
 ) -> Mapping[str, str]:
+    """One value per output name from a string, a complete mapping or ``None``."""
+
     if value is None:
-        return MappingProxyType({name: default(name) for name in names})
-    if type(value) is str:
-        return MappingProxyType(dict.fromkeys(names, value))
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{label} must be a string, mapping, or None")
+        return {name: default(name) for name in names}
+    if isinstance(value, str):
+        return dict.fromkeys(names, value)
     if set(value) != set(names):
         raise ValueError(f"{label} mapping keys must be exactly {list(names)}")
-    if any(type(item) is not str for item in value.values()):
-        raise ValueError(f"{label} mapping values must be exact strings")
-    return MappingProxyType({name: value[name] for name in names})
+    return {name: value[name] for name in names}
 
 
-class _ExportRequest(HydroForgeModel):
-    owner: Any = Field(exclude=True)
-    local_mapping: torch.Tensor = Field(exclude=True, repr=False)
-    var_name: str
-    dtype: Literal["float32", "float64"] = "float32"
-    netcdf_options: Annotated[
-        FrozenMapping[str, Any], BeforeValidator(normalize_netcdf_variable_options)
-    ] = Field(default_factory=default_netcdf_options)
-    device: Annotated[torch.device, BeforeValidator(torch.device)] = torch.device("cpu")
+def _float64_weights(mapping: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """The ``(targets, sources)`` mapping as coalesced float64 COO on ``device``."""
 
-    @field_validator("var_name")
-    @classmethod
-    def _validate_name(cls, value: str) -> str:
-        return _output_name(value, label="var_name")
+    return mapping.to_sparse_coo().to(device=device, dtype=torch.float64).coalesce()
 
 
-class _ClimatologyExportRequest(_ExportRequest):
-    out_path: Path = Field(strict=False)
-    units: str = "m3/s"
-    description: str | None = None
+def _main_blocks(dataset: ForcingDataset):
+    """Source-cadence values of each main-period chunk."""
 
-    _create_options: Mapping[str, Any] = PrivateAttr()
-
-    @model_validator(mode="after")
-    def _compile(self):
-        dtype_nc = "f4" if self.dtype == "float32" else "f8"
-        options = _prepare_netcdf_variable_options_trusted(
-            self.netcdf_options,
-            dtype=dtype_nc,
-            dimensions=("saved_points",),
-            name=self.var_name,
-        )
-        self._create_options = _immutable_dict(options)
-        return self
-
-    @property
-    def create_options(self) -> Mapping[str, Any]:
-        return self._create_options
+    plan = dataset.chunk_plan
+    for index in range(plan.num_spinup_chunks, len(plan)):
+        yield plan.chunks[index], dataset._read_source(index)
 
 
-class _CatchmentExportRequest(_ExportRequest):
-    out_dir: Path = Field(strict=False)
-    var_name: str = "var"
-    filename: str | Mapping[str, str] | None = None
-    normalized: bool = False
-    split_by_year: bool = False
-    units: str | Mapping[str, str] = "m3/s"
-    description: str | Mapping[str, str] | None = None
+def _named_blocks(read: Any, fallback: str) -> dict[str, np.ndarray]:
+    """Flatten actual output keys; a single array keeps the caller's name."""
 
-    _output_methods: Mapping[str, str | None] = PrivateAttr()
-    _returns_mapping: bool = PrivateAttr()
-    _filenames: Mapping[str, str] = PrivateAttr()
-    _units: Mapping[str, str] = PrivateAttr()
-    _descriptions: Mapping[str, str] = PrivateAttr()
-    _create_options: Mapping[str, Mapping[str, Any]] = PrivateAttr()
+    blocks = {}
 
-    @model_validator(mode="after")
-    def _compile(self):
-        # Only aggregating sources (NetCDF) declare time_aggregation.
-        active = getattr(self.owner, "time_aggregation", None)
-        if isinstance(active, Mapping):
-            output_methods = dict(active)
-            returns_mapping = True
+    pending = [((), read)]
+    while pending:
+        path, value = pending.pop()
+        if isinstance(value, Mapping):
+            pending.extend(
+                ((*path, key), child) for key, child in reversed(tuple(value.items()))
+            )
         else:
-            output_methods = {self.var_name: active}
-            returns_mapping = False
-        output_names = tuple(output_methods)
-        for name in output_names:
-            _output_name(name, label="time_aggregation output name")
+            name = "_".join(path) if path else fallback
+            if name in blocks:
+                raise ValueError(f"export output paths collide at {name!r}")
+            blocks[name] = value
 
-        filenames = _metadata_values(
-            self.filename,
-            label="filename",
-            names=output_names,
-            default=lambda name: name,
+    return blocks
+
+
+def _declared_names(dataset: ForcingDataset, fallback: str) -> tuple[str, ...] | None:
+    """Flatten builtin output declarations without reading source payloads."""
+    from hydroforge.data.datasets.base import DatasetExpression
+    from hydroforge.data.datasets.composite import MultiVariableDataset
+    from hydroforge.data.datasets.netcdf import NetCDFDataset
+
+    def paths(source):
+        if isinstance(source, MultiVariableDataset):
+            result = []
+            for name, child in source.datasets.items():
+                nested = paths(child)
+                if nested is None:
+                    return None
+                result.extend((name, *path) for path in nested)
+            return tuple(result)
+        if isinstance(source, DatasetExpression):
+            schemas = [paths(child) for _label, child in source._children()]
+            if any(schema is None for schema in schemas):
+                return None
+            named = [schema for schema in schemas if schema != ((),)]
+            if named and any(set(schema) != set(named[0]) for schema in named[1:]):
+                raise ValueError(
+                    "dataset expression operands have different output names"
+                )
+            return named[0] if named else ((),)
+        if isinstance(source, (NetCDFDataset, ExportedDataset)):
+            aggregation = source.time_aggregation
+            return (
+                tuple((name,) for name in aggregation)
+                if isinstance(aggregation, Mapping)
+                else ((),)
+            )
+        return None
+
+    schema = paths(dataset)
+    if schema is None:
+        return None
+    names = tuple("_".join(path) if path else fallback for path in schema)
+    _validate_names(names)
+    return names
+
+
+def _validate_names(names: tuple[str, ...]) -> None:
+    if len(set(names)) != len(names):
+        raise ValueError("export output paths collide")
+    for name in names:
+        validate_netcdf_name(name)
+        _output_name(name, label="export variable name")
+
+
+@_EXPORT
+def export_climatology(
+    dataset: InstanceOf[ForcingDataset],
+    mapping: InstanceOf[torch.Tensor],
+    out_path: Annotated[Path, Field(strict=False)],
+    *,
+    var_name: _SafeName,
+    dtype: Literal["float32", "float64"] = "float32",
+    netcdf_options: NetCDFOptions = Field(default_factory=default_netcdf_options),
+    device: TorchDevice = torch.device("cpu"),
+    units: str | Mapping[str, str] = "m3/s",
+    description: str | Mapping[str, str] | None = None,
+) -> Path:
+    """Write the main-period time mean of a mapped view per target.
+
+    Like the Fortran routing models, every source step is mapped and summed,
+    then divided by the step count.  The file has one ``saved_points``
+    dimension with a ``catchment_id`` coordinate.
+    """
+
+    catchment_ids = dataset._require_mapping(mapping, caller="export")
+    declared = _declared_names(dataset, var_name)
+    if declared is not None:
+        _metadata(units, label="units", names=declared, default=lambda _: "")
+        _metadata(description, label="description", names=declared, default=str)
+    prepare_netcdf_variable_options(
+        netcdf_options,
+        dtype="f4" if dtype == "float32" else "f8",
+        dimensions=(POINT_DIM,),
+        name=var_name,
+        shape=(catchment_ids.size,),
+    )
+    progress = tqdm(
+        _main_blocks(dataset),
+        total=len(dataset.chunk_plan) - dataset.chunk_plan.num_spinup_chunks,
+        desc="Computing climatology",
+        unit="chunk",
+    )
+    with cleanup_on_exit("climatology progress", (progress.close,)):
+        chunks = iter(progress)
+        first = next(chunks, None)
+        if first is None:
+            raise RuntimeError("No valid timesteps found — cannot compute climatology.")
+        names = tuple(_named_blocks(first[1], var_name))
+        _validate_names(names)
+        descriptions = _metadata(
+            description,
+            label="description",
+            names=names,
+            default=lambda name: f"Time-averaged {name}",
         )
-        filenames = MappingProxyType(
-            {
-                name: _output_name(value, label=f"filename[{name!r}]")
-                for name, value in filenames.items()
-            }
+        units_by_name = _metadata(
+            units, label="units", names=names, default=lambda _: ""
         )
+        dtype_nc = "f4" if dtype == "float32" else "f8"
+        create_options = {
+            name: prepare_netcdf_variable_options(
+                netcdf_options, dtype=dtype_nc, dimensions=(POINT_DIM,), name=name
+            )
+            for name in names
+        }
+        weights = _float64_weights(mapping, device)
+        total_steps = 0
+        accumulators = {
+            name: torch.zeros(catchment_ids.size, dtype=torch.float64, device=device)
+            for name in names
+        }
+        stream = chain(iter((first,)), chunks)
+        first = None
+        for chunk, read in stream:
+            blocks = _named_blocks(read, var_name)
+            if set(blocks) != set(names):
+                raise ValueError("export source output names changed between chunks")
+            for name, block in blocks.items():
+                values = torch.as_tensor(
+                    np.ascontiguousarray(block, dtype=np.float64),
+                    dtype=torch.float64,
+                    device=device,
+                )
+                accumulators[name] += torch.sparse.mm(weights, values.T).sum(dim=1)
+            total_steps += chunk.length
+    if total_steps == 0:
+        raise RuntimeError("No valid timesteps found — cannot compute climatology.")
+    means = {
+        name: canonical_floating_array(
+            (value / total_steps).cpu().numpy(),
+            dtype=dtype,
+            label=f"climatology {name!r}",
+        )
+        for name, value in accumulators.items()
+    }
+    logger.info("Climatology averaged over %d timesteps", total_steps)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with atomic_netcdf_dataset(out_path, format="NETCDF4") as output:
+        output.setncattr("title", f"Climatology ({var_name})")
+        output.setncattr("total_timesteps", total_steps)
+        output.createDimension(POINT_DIM, catchment_ids.size)
+        write_point_coordinate(output, _COORDINATE, catchment_ids)
+        for name in names:
+            variable = create_netcdf_variable(
+                output, name, dtype_nc, (POINT_DIM,), options=create_options[name]
+            )
+            variable[:] = means[name]
+            variable.setncattr(
+                "description",
+                f"{descriptions[name]} over {total_steps} steps"
+                if description is None
+                else descriptions[name],
+            )
+            variable.setncattr("units", units_by_name[name])
+    logger.info("Saved climatology to %s", out_path)
+    return out_path
+
+
+@_EXPORT
+def export_catchment_data(
+    dataset: InstanceOf[ForcingDataset],
+    mapping: InstanceOf[torch.Tensor],
+    out_dir: Annotated[Path, Field(strict=False)],
+    *,
+    var_name: _SafeName = "var",
+    filename: _SafeName | Mapping[str, _SafeName] | None = None,
+    dtype: Literal["float32", "float64"] = "float32",
+    netcdf_options: NetCDFOptions = Field(default_factory=default_netcdf_options),
+    normalized: bool = False,
+    device: TorchDevice = torch.device("cpu"),
+    split_by_year: bool = False,
+    units: str | Mapping[str, str] = "m3/s",
+    description: str | Mapping[str, str] | None = None,
+) -> Path | list[Path] | dict[str, Path] | dict[str, list[Path]]:
+    """Map a view onto its targets and write ``{filename}_rank0[_{year}].nc``.
+
+    The files hold an unlimited ``time`` axis in days, the ``catchment_id``
+    coordinate on ``saved_points`` and one ``(time, saved_points)`` variable
+    per output; a ``time_aggregation`` mapping writes one file set per
+    aggregation.  ``normalized`` scales each target's weights to sum to one.
+    Use a CUDA ``device`` for the sparse products of large mappings.
+    """
+
+    if netcdf_options.get("contiguous") is True:
+        raise ValueError(
+            "streaming catchment output has unlimited time and cannot use contiguous=True"
+        )
+    catchment_ids = dataset._require_mapping(mapping, caller="export")
+    declared = _declared_names(dataset, var_name)
+    if declared is not None:
+        _metadata(units, label="units", names=declared, default=lambda _: "")
+        _metadata(description, label="description", names=declared, default=str)
+        filenames = _metadata(filename, label="filename", names=declared, default=str)
         if len(set(filenames.values())) != len(filenames):
             raise ValueError("output filenames must be unique across variables")
-        descriptions = _metadata_values(
-            self.description,
-            label="description",
-            names=output_names,
-            default=lambda name: (
-                f"Catchment-aggregated {name} ({output_methods[name]})"
-                if output_methods[name] is not None
-                else f"Catchment-aggregated {name} (area-weighted mean)"
-            ),
-        )
-        units = _metadata_values(
-            self.units,
-            label="units",
-            names=output_names,
-            default=lambda _name: "",
-        )
-        dtype_nc = "f4" if self.dtype == "float32" else "f8"
-        create_options = {
-            name: _immutable_dict(
-                _prepare_netcdf_variable_options_trusted(
-                    self.netcdf_options,
+    prepare_netcdf_variable_options(
+        netcdf_options,
+        dtype="f4" if dtype == "float32" else "f8",
+        dimensions=(TIME_DIM, POINT_DIM),
+        name=var_name,
+        shape=(None, catchment_ids.size),
+    )
+    writers: dict[str, tuple[Any, Any, Any]] = {}
+    writer_stack: ExitStack | None = None
+    write_index = 0
+
+    def close_writers(error: BaseException | None = None) -> None:
+        nonlocal writers, writer_stack
+        closing, stack = writers, writer_stack
+        writers, writer_stack = {}, None
+        if stack is None:
+            return
+        if error is not None:
+            stack.__exit__(type(error), error, error.__traceback__)
+            return
+        try:
+            for output, time_variable, _variable in closing.values():
+                output.setncattr(COMMITTED_STEPS_ATTR, len(time_variable))
+                output.sync()
+        except BaseException as commit_error:
+            with cleanup_on_exit(
+                "export commit",
+                (
+                    partial(
+                        stack.__exit__,
+                        type(commit_error),
+                        commit_error,
+                        commit_error.__traceback__,
+                    ),
+                ),
+            ):
+                raise
+        else:
+            stack.close()
+
+    progress = tqdm(total=dataset.num_main_source_steps, desc="Exporting", unit="step")
+    failure = None
+
+    def close_progress() -> None:
+        nonlocal failure
+        try:
+            progress.close()
+        except BaseException as error:
+            if failure is None:
+                failure = error
+            raise
+
+    with (
+        cleanup_on_exit("export writers", (lambda: close_writers(failure),)),
+        cleanup_on_exit("export progress", (close_progress,)),
+    ):
+        try:
+            chunks = iter(_main_blocks(dataset))
+            first = next(chunks)
+            named = isinstance(first[1], Mapping)
+            names = tuple(_named_blocks(first[1], var_name))
+            _validate_names(names)
+            aggregation = getattr(dataset, "time_aggregation", None)
+            if isinstance(aggregation, Mapping):
+                methods = dict(aggregation)
+            else:
+                methods = dict.fromkeys(names, aggregation)
+            for name in names:
+                _output_name(name, label="time_aggregation output name")
+            filenames = _metadata(filename, label="filename", names=names, default=str)
+            if len(set(filenames.values())) != len(filenames):
+                raise ValueError("output filenames must be unique across variables")
+            descriptions = _metadata(
+                description,
+                label="description",
+                names=names,
+                default=lambda name: (
+                    f"Catchment-aggregated {name} ({methods[name]})"
+                    if methods[name] is not None
+                    else f"Catchment-aggregated {name}"
+                ),
+            )
+            units_by_name = _metadata(
+                units, label="units", names=names, default=lambda _: ""
+            )
+            dtype_nc = "f4" if dtype == "float32" else "f8"
+            create_options = {
+                name: prepare_netcdf_variable_options(
+                    netcdf_options,
                     dtype=dtype_nc,
-                    dimensions=("time", "saved_points"),
+                    dimensions=(TIME_DIM, POINT_DIM),
                     name=name,
                 )
-            )
-            for name in output_names
-        }
-
-        self._output_methods = MappingProxyType(output_methods)
-        self._returns_mapping = returns_mapping
-        self._filenames = filenames
-        self._descriptions = descriptions
-        self._units = units
-        self._create_options = MappingProxyType(create_options)
-        return self
-
-    @property
-    def output_methods(self) -> Mapping[str, str | None]:
-        return self._output_methods
-
-    @property
-    def returns_mapping(self) -> bool:
-        return self._returns_mapping
-
-    @property
-    def filenames(self) -> Mapping[str, str]:
-        return self._filenames
-
-    @property
-    def units_by_name(self) -> Mapping[str, str]:
-        return self._units
-
-    @property
-    def descriptions(self) -> Mapping[str, str]:
-        return self._descriptions
-
-    @property
-    def create_options(self) -> Mapping[str, Mapping[str, Any]]:
-        return self._create_options
-
-
-class DatasetExporter:
-    """Explicit NetCDF export service for one gridded dataset."""
-
-    def __init__(self, owner: GriddedDataset) -> None:
-        self.owner = owner
-
-    @staticmethod
-    def _prepare_mapping(
-        local_mapping: torch.Tensor,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Move the caller-owned sparse mapping for this export call."""
-
-        return local_mapping.to(device=device, dtype=dtype).coalesce()
-
-    def export_climatology(
-        self,
-        out_path: str | Path,
-        local_mapping: torch.Tensor,
-        var_name: str,
-        dtype: Literal["float32", "float64"] = "float32",
-        netcdf_options: Mapping[str, Any] = DEFAULT_NETCDF_OPTIONS,
-        device: str | torch.device = "cpu",
-        units: str = "m3/s",
-        description: str | None = None,
-    ) -> Path:
-        """Validate one export request before reading or creating files."""
-
-        request = _ClimatologyExportRequest.model_validate(
-            {
-                "owner": self.owner,
-                "out_path": out_path,
-                "local_mapping": local_mapping,
-                "var_name": var_name,
-                "dtype": dtype,
-                "netcdf_options": netcdf_options,
-                "device": device,
-                "units": units,
-                "description": description,
+                for name in names
             }
-        )
-        return self._export_climatology_trusted(request)
 
-    def _export_climatology_trusted(
-        self,
-        request: _ClimatologyExportRequest,
-    ) -> Path:
-        """
-        Compute the temporal-mean (climatological average) and export to NetCDF.
-
-        This mirrors the logic of Fortran-based routing models: iterate over
-        every timestep in the dataset, accumulate the sum, and divide by the number
-        of steps to obtain the daily-mean climatology mapped to catchments.
-
-        The mapped Dataset's active grid data is aggregated via sparse matmul and
-        time-averaged.  Output NetCDF has dimension ``(saved_points,)`` with a
-        ``catchment_id`` coordinate variable.
-
-        Args:
-            out_path: Full path (including filename) for the output NetCDF file.
-            local_mapping: Sparse tensor returned by ``build_local_mapping()``.
-            var_name: Variable name written into the NetCDF file.
-            dtype: Output data type (``"float32"`` or ``"float64"``).
-            netcdf_options: Validated NetCDF variable-creation options.
-            device: Device for computation (``"cpu"`` or ``"cuda:X"``).
-            units: Units attribute written to the output variable.
-            description: Optional long description attribute.
-
-        Returns:
-            Path to the created NetCDF file.
-        """
-        out_path = request.out_path
-        var_name = request.var_name
-        dtype = request.dtype
-        dev = request.device
-        units = request.units
-        description = request.description
-        catchment_ids = self.owner.desired_catchment_ids
-        n_catch = len(catchment_ids)
-
-        # Prepare transposed mapping matrix: (n_catch, n_grids)
-        t_mapping = self._prepare_mapping(
-            request.local_mapping,
-            device=dev,
-            dtype=torch.float64,
-        )
-        t_mapping_T = t_mapping.t().coalesce()
-
-        # ----- Accumulate mean over all chunks -----
-        first_chunk = self.owner._num_spin_up_chunks
-        n_chunks = len(self.owner)
-        total_steps = 0
-        accumulator = torch.zeros(n_catch, dtype=torch.float64, device=dev)
-
-        pbar = tqdm(
-            range(first_chunk, n_chunks), desc="Computing climatology", unit="chunk"
-        )
-        with cleanup_on_exit("climatology progress", (pbar.close,)):
-            for ci in pbar:
-                chunk = self.owner.chunk_plan._at_trusted(ci)
-                block = self.owner._read_chunk_trusted(chunk)
-                valid_T = chunk.length
-                block = np.ascontiguousarray(
-                    block,
-                    dtype=np.float64,
+            weights = _float64_weights(mapping, device)
+            if normalized:
+                # Each target (mapping row) sums to one.
+                indices = weights.indices()
+                normalized_values = normalize_target_weights(
+                    indices[0].cpu().numpy(),
+                    weights.values().cpu().numpy(),
+                    catchment_ids.size,
                 )
-                block_t = torch.as_tensor(block, dtype=torch.float64, device=dev)
-                agg = torch.sparse.mm(t_mapping_T, block_t.T)
-                accumulator += agg.sum(dim=1)
+                weights = torch.sparse_coo_tensor(
+                    indices,
+                    torch.from_numpy(normalized_values).to(device),
+                    weights.size(),
+                    dtype=torch.float64,
+                    device=device,
+                ).coalesce()
 
-                total_steps += valid_T
+            out_dir.mkdir(parents=True, exist_ok=True)
+            calendar = dataset.simulation_schedule.calendar
+            header = RankFileHeader(rank=0, world_size=1, run_id=str(uuid4()))
 
-        if total_steps == 0:
-            raise RuntimeError("No valid timesteps found — cannot compute climatology.")
+            def create(stack: ExitStack, path: Path, name: str) -> tuple[Any, Any, Any]:
+                output = stack.enter_context(
+                    atomic_netcdf_dataset(path, format="NETCDF4")
+                )
+                output.setncattr("title", f"Aggregated catchment data ({name})")
+                header.write(output)
+                if methods[name] is not None:
+                    output.setncattr("time_aggregation", methods[name])
+                output.createDimension(TIME_DIM, None)
+                output.createDimension(POINT_DIM, catchment_ids.size)
+                time_variable = create_time_axis(output, calendar=calendar)
+                write_point_coordinate(output, _COORDINATE, catchment_ids)
+                variable = create_netcdf_variable(
+                    output,
+                    name,
+                    dtype_nc,
+                    (TIME_DIM, POINT_DIM),
+                    options=create_options[name],
+                )
+                variable.setncattr("description", descriptions[name])
+                variable.setncattr("units", units_by_name[name])
+                return output, time_variable, variable
 
-        mean_data = canonical_floating_array(
-            (accumulator / total_steps).cpu().numpy(),
-            dtype=dtype,
-            label="climatology result",
-        )
-        logger.info("Climatology averaged over %d timesteps", total_steps)
-
-        # ----- Write NetCDF -----
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        dtype_nc = "f4" if dtype == "float32" else "f8"
-        create_options = request.create_options
-        desc = (
-            f"Time-averaged {var_name} over {total_steps} steps"
-            if description is None
-            else description
-        )
-
-        with _atomic_netcdf_dataset_trusted(
-            out_path,
-            format="NETCDF4",
-        ) as ds:
-            ds.setncattr("title", f"Climatology ({var_name})")
-            ds.setncattr("total_timesteps", total_steps)
-
-            ds.createDimension("saved_points", n_catch)
-
-            cid_var = ds.createVariable("catchment_id", "i8", ("saved_points",))
-            cid_var[:] = catchment_ids
-
-            out_var = _create_netcdf_variable_trusted(
-                ds,
-                var_name,
-                dtype_nc,
-                ("saved_points",),
-                options=create_options,
-            )
-            out_var[:] = mean_data
-            out_var.setncattr("description", desc)
-            out_var.setncattr("units", units)
-
-        logger.info("Saved climatology to %s", out_path)
-        return out_path
-
-    def export_catchment_data(
-        self,
-        out_dir: str | Path,
-        local_mapping: torch.Tensor,
-        var_name: str = "var",
-        dtype: Literal["float32", "float64"] = "float32",
-        netcdf_options: Mapping[str, Any] = DEFAULT_NETCDF_OPTIONS,
-        normalized: bool = False,
-        device: str | torch.device = "cpu",
-        split_by_year: bool = False,
-        units: str | Mapping[str, str] = "m3/s",
-        description: str | Mapping[str, str] | None = None,
-        filename: str | Mapping[str, str] | None = None,
-    ) -> Path | list[Path] | dict[str, Path] | dict[str, list[Path]]:
-        """Validate one export request before reading or creating files."""
-
-        request = _CatchmentExportRequest.model_validate(
-            {
-                "owner": self.owner,
-                "out_dir": out_dir,
-                "local_mapping": local_mapping,
-                "var_name": var_name,
-                "dtype": dtype,
-                "netcdf_options": netcdf_options,
-                "normalized": normalized,
-                "device": device,
-                "split_by_year": split_by_year,
-                "units": units,
-                "description": description,
-                "filename": filename,
-            }
-        )
-        return self._export_catchment_data_trusted(request)
-
-    def _export_catchment_data_trusted(
-        self,
-        request: _CatchmentExportRequest,
-    ) -> Path | list[Path] | dict[str, Path] | dict[str, list[Path]]:
-        """
-        Export catchment-aggregated data to a NetCDF file readable by MultiRankStatsReader.
-
-        Requires ``build_local_mapping()`` to have been called on the dataset.
-
-        - Output filename: {var_name}_rank0.nc
-          (or {var_name}_rank0_{year}.nc if split_by_year)
-        - Dimensions: time (unlimited), saved_points
-        - Variables:
-            * time: numeric with units and calendar
-            * catchment_id: (saved_points,) catchment IDs
-            * {var_name}: (time, saved_points) aggregated data
-
-        GPU acceleration:
-        - Set `device="cuda:0"` (or any CUDA device) to enable GPU-accelerated sparse matmul.
-        - A requested CUDA device must be available; device selection is explicit.
-
-        Args:
-            out_dir: Output directory for NetCDF files
-            local_mapping: Sparse tensor returned by ``build_local_mapping()``.
-            var_name: Variable name in output NetCDF
-            dtype: Output data type
-            netcdf_options: Validated NetCDF variable-creation options.
-            normalized: If True, normalize mapping weights to sum to 1 per catchment
-            device: Device for computation ("cpu" or "cuda:X")
-            split_by_year: If True, create separate files per year
-            units: Units string for the output variable
-            description: Optional description for the output variable
-        """
-        out_dir = request.out_dir
-        dtype = request.dtype
-        normalized = request.normalized
-        dev = request.device
-        split_by_year = request.split_by_year
-        output_methods = request.output_methods
-        returns_mapping = request.returns_mapping
-        filename_values = request.filenames
-        description_values = request.descriptions
-        units_values = request.units_by_name
-        catchment_ids = self.owner.desired_catchment_ids
-
-        n_catch = len(catchment_ids)
-
-        # Use the provided local mapping matrix
-        # Shape: (n_cols, n_catch) - maps compressed source grids to catchments
-        t_mapping = self._prepare_mapping(
-            request.local_mapping,
-            device=dev,
-            dtype=torch.float64,
-        )
-
-        if normalized:
-            # Normalize by row sums (each catchment's total area)
-            # t_mapping shape: (n_cols, n_catch)
-            # We need to normalize columns (each catchment)
-            col_sums = torch.sparse.sum(t_mapping, dim=0).to_dense()  # (n_catch,)
-            # Create a diagonal scaling matrix or normalize in-place
-            # For COO tensor, we need to work with the values
-            indices = t_mapping.indices()  # (2, nnz)
-            values = t_mapping.values()  # (nnz,)
-            col_indices = indices[1]  # column index for each value
-            col_sums_expanded = col_sums[col_indices]
-            nz_mask = col_sums_expanded > 0
-            new_values = torch.zeros_like(values)
-            new_values[nz_mask] = values[nz_mask] / col_sums_expanded[nz_mask]
-            t_mapping = torch.sparse_coo_tensor(
-                indices,
-                new_values,
-                t_mapping.size(),
-                dtype=torch.float64,
-                device=dev,
-            ).coalesce()
-
-        # Pre-compute transposed mapping matrix for efficient batch multiplication
-        # t_mapping shape: (n_cols, n_catch)
-        # t_mapping_T shape: (n_catch, n_cols) for sparse.mm(sparse, dense)
-        t_mapping_T = t_mapping.t().coalesce()
-
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        dtype_nc = "f4" if dtype == "float32" else "f8"
-        run_id = str(uuid4())
-
-        def _init_nc(stack, path, name, method):
-            create_options = request.create_options[name]
-            ds = stack.enter_context(
-                _atomic_netcdf_dataset_trusted(path, format="NETCDF4"),
-            )
-            ds.setncattr("title", f"Aggregated catchment data ({name})")
-            ds.setncattr("hydroforge_output_format", OUTPUT_FORMAT)
-            ds.setncattr("hydroforge_output_version", OUTPUT_VERSION)
-            ds.setncattr("hydroforge_rank", 0)
-            ds.setncattr("hydroforge_world_size", 1)
-            ds.setncattr(RUN_ID_ATTR, run_id)
-            ds.setncattr(COMMITTED_STEPS_ATTR, 0)
-            if method is not None:
-                ds.setncattr("time_aggregation", method)
-            ds.createDimension("time", None)
-            ds.createDimension("saved_points", n_catch)
-
-            time_var = ds.createVariable("time", "f8", ("time",))
-            time_var.setncattr("units", "seconds since 1900-01-01 00:00:00")
-            time_var.setncattr(
-                "calendar",
-                getattr(self.owner, "calendar", "standard"),
-            )
-
-            output_coord = ds.createVariable("catchment_id", "i8", ("saved_points",))
-            output_coord[:] = catchment_ids
-
-            out_var = _create_netcdf_variable_trusted(
-                ds,
-                name,
-                dtype_nc,
-                ("time", "saved_points"),
-                options=create_options,
-            )
-            out_var.setncattr("description", description_values[name])
-            out_var.setncattr("units", units_values[name])
-            return ds, time_var, out_var
-
-        writers = {}
-        writer_stack = None
-        created_files = {name: [] for name in output_methods}
-        current_year = None
-        write_idx = 0
-        total_steps = self.owner.num_main_source_steps
-
-        def _close_writers(error=None):
-            nonlocal writers, writer_stack
-            closing_writers, stack = writers, writer_stack
-            writers, writer_stack = {}, None
-            if stack is None:
-                return
-            if error is not None:
-                stack.__exit__(type(error), error, error.__traceback__)
-                return
-            try:
-                for dataset, time_variable, _variable in closing_writers.values():
-                    dataset.setncattr(COMMITTED_STEPS_ATTR, len(time_variable))
-                    dataset.sync()
-            except BaseException as commit_error:
-                with cleanup_on_exit(
-                    "export commit",
-                    (
-                        partial(
-                            stack.__exit__,
-                            type(commit_error),
-                            commit_error,
-                            commit_error.__traceback__,
-                        ),
-                    ),
-                ):
-                    raise
-            else:
-                stack.close()
-
-        def _open_writers(year=None):
-            nonlocal write_idx, writer_stack
-            _close_writers()
-            writer_stack = ExitStack()
-            try:
-                for name, method in output_methods.items():
-                    filename = filename_values[name]
-                    if year is None:
-                        nc_path = out_dir / f"{filename}_rank0.nc"
-                    else:
-                        nc_path = out_dir / f"{filename}_rank0_{year}.nc"
-                    writers[name] = _init_nc(
-                        writer_stack,
-                        nc_path,
-                        name,
-                        method,
-                    )
-                    created_files[name].append(nc_path)
-            except BaseException as error:
-                with cleanup_on_exit("export setup", (partial(_close_writers, error),)):
-                    raise
-            write_idx = 0
-
-        pbar = None
-        failure = None
-
-        def _close_progress():
-            nonlocal failure
-            if pbar is not None:
+            def open_writers(year: int | None = None) -> None:
+                nonlocal write_index, writer_stack
+                close_writers()
+                writer_stack = ExitStack()
                 try:
-                    pbar.close()
+                    for name in names:
+                        path = out_dir / rank_file_name(filenames[name], 0, year)
+                        writers[name] = create(writer_stack, path, name)
+                        created[name].append(path)
                 except BaseException as error:
-                    if failure is None:
-                        failure = error
-                    raise
+                    with cleanup_on_exit(
+                        "export setup", (partial(close_writers, error),)
+                    ):
+                        raise
+                write_index = 0
 
-        with (
-            cleanup_on_exit("export writers", (lambda: _close_writers(failure),)),
-            cleanup_on_exit("export progress", (_close_progress,)),
-        ):
-            try:
-                if not split_by_year:
-                    _open_writers()
+            created: dict[str, list[Path]] = {name: [] for name in names}
+            if not split_by_year:
+                open_writers()
+            current_year = None
+            stream = chain(iter((first,)), chunks)
+            first = None
+            for chunk, read in stream:
+                blocks = _named_blocks(read, var_name)
+                if set(blocks) != set(names):
+                    raise ValueError(
+                        "export source output names changed between chunks"
+                    )
+                mapped = {}
+                for name, block in blocks.items():
+                    values = torch.as_tensor(
+                        np.ascontiguousarray(block, dtype=np.float64),
+                        dtype=torch.float64,
+                        device=device,
+                    )
+                    mapped[name] = canonical_floating_array(
+                        torch.sparse.mm(weights, values.T).T.contiguous().cpu().numpy(),
+                        dtype=dtype,
+                        label=f"aggregated variable {name!r} at chunk {chunk.index}",
+                    )
+                # Write maximal same-file runs as blocks.
+                times = chunk.source_times()
+                start = 0
+                while start < chunk.length:
+                    stop = chunk.length
+                    if split_by_year:
+                        if times[start].year != current_year:
+                            current_year = times[start].year
+                            open_writers(current_year)
+                        stop = start + 1
+                        while stop < chunk.length and times[stop].year == current_year:
+                            stop += 1
+                    _output, first_time, _variable = next(iter(writers.values()))
+                    time_values = nc.date2num(
+                        times[start:stop],
+                        units=first_time.getncattr("units"),
+                        calendar=first_time.getncattr("calendar"),
+                    )
+                    end = write_index + stop - start
+                    for name in names:
+                        _output, time_variable, variable = writers[name]
+                        variable[write_index:end, :] = mapped[name][start:stop, :]
+                        time_variable[write_index:end] = time_values
+                    progress.update(stop - start)
+                    write_index = end
+                    start = stop
+        except BaseException as error:
+            failure = error
+            raise
 
-                first_chunk = self.owner._num_spin_up_chunks
-                n_chunks = len(self.owner)
-                pbar = tqdm(total=total_steps, desc="Exporting", unit="step")
-                for ci in range(first_chunk, n_chunks):
-                    chunk = self.owner.chunk_plan._at_trusted(ci)
-                    read_data = self.owner._read_chunk_trusted(chunk)
-                    if isinstance(read_data, dict):
-                        blocks = read_data
-                    else:
-                        name = next(iter(output_methods))
-                        blocks = {name: read_data}
+    if named:
+        if split_by_year:
+            return created
+        return {name: paths[0] for name, paths in created.items()}
+    paths = created[names[0]]
+    return paths if split_by_year else paths[0]
 
-                    T = chunk.length
-                    mapped_blocks = {}
-                    for name, block in blocks.items():
-                        # t_mapping_T @ block.T = (n_catch, n_cols) @ (n_cols, T)
-                        block = np.ascontiguousarray(
-                            block,
-                            dtype=np.float64,
-                        )
-                        block_tensor = torch.as_tensor(
-                            block,
-                            dtype=torch.float64,
-                            device=dev,
-                        )
-                        agg_block = torch.sparse.mm(t_mapping_T, block_tensor.T)
-                        mapped_blocks[name] = canonical_floating_array(
-                            agg_block.T.contiguous().to("cpu").numpy(),
-                            dtype=dtype,
-                            label=(f"aggregated variable {name!r} at chunk {ci}"),
-                        )
 
-                    # Write maximal same-file runs as blocks.  Chunk data is
-                    # already resident, so row-at-a-time writes only add HDF5
-                    # extension, chunk lookup and compression overhead.
-                    chunk_times = chunk._source_times()
-                    run_start = 0
-                    while run_start < T:
-                        if split_by_year:
-                            year = chunk_times[run_start].year
-                            if year != current_year:
-                                current_year = year
-                                _open_writers(current_year)
-                            run_end = run_start + 1
-                            while (
-                                run_end < T
-                                and chunk_times[run_end].year == current_year
-                            ):
-                                run_end += 1
-                        else:
-                            run_end = T
+@_EXPORT
+def export_quantiles(
+    dataset: InstanceOf[ExportedDataset],
+    out_path: Annotated[Path, Field(strict=False)],
+    *,
+    quantiles: Annotated[np.ndarray, BeforeValidator(_quantile_levels)] = (
+        0.0,
+        0.1,
+        0.25,
+        0.5,
+        0.75,
+        0.9,
+        1.0,
+    ),
+    var_name: Annotated[str, Field(min_length=1)] | None = None,
+    dtype: Literal["float32", "float64"] = "float32",
+    netcdf_options: NetCDFOptions = Field(default_factory=default_netcdf_options),
+    max_buffer_mb: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 4096.0,
+) -> Path:
+    """Write per-point temporal quantiles of the main period.
 
-                        _ds, first_time_var, _out_var = next(iter(writers.values()))
-                        time_values = nc.date2num(
-                            chunk_times[run_start:run_end],
-                            units=first_time_var.getncattr("units"),
-                            calendar=first_time_var.getncattr("calendar"),
-                        )
-                        write_end = write_idx + run_end - run_start
-                        for name in output_methods:
-                            _ds, time_var, out_var = writers[name]
-                            out_var[write_idx:write_end, :] = mapped_blocks[name][
-                                run_start:run_end, :
-                            ]
-                            time_var[write_idx:write_end] = time_values
-                        pbar.update(run_end - run_start)
-                        write_idx = write_end
-                        run_start = run_end
-            except BaseException as error:
-                failure = error
-                raise
+    The file has dimensions ``quantile`` and ``saved_points`` with the
+    ``catchment_id`` coordinate in the dataset's (selected) order.  Exact
+    quantiles need each point's full series: when the estimated source
+    working set (three arrays on the expanded source time axis, at the
+    widest source or output width) exceeds ``max_buffer_mb``, points are
+    processed in column batches.  A budget below one column is rejected
+    before reading.  Resident values are reused without new reads.
+    Quantiles describe the unshifted source-time population, not model-step
+    resampling. Shifted views must be selected again without time shifts.
+    """
 
-        if returns_mapping:
-            if split_by_year:
-                return created_files
-            return {name: paths[0] for name, paths in created_files.items()}
-
-        only_name = next(iter(output_methods))
-        return (
-            created_files[only_name] if split_by_year else created_files[only_name][0]
+    if dataset._shift is not None:
+        raise ValueError("export_quantiles requires an unshifted source-time view")
+    name = dataset.var_name if var_name is None else var_name
+    dtype_nc = "f4" if dtype == "float32" else "f8"
+    space = dataset.space
+    point_ids = space.selected_ids
+    columns = point_ids.size
+    steps = dataset.num_main_source_steps
+    _declared_names(dataset, name)
+    prepare_netcdf_variable_options(
+        netcdf_options,
+        dtype=dtype_nc,
+        dimensions=("quantile", POINT_DIM),
+        name=name,
+        shape=(quantiles.size, columns),
+    )
+    budget = max_buffer_mb * 1024 * 1024
+    main_ops = None
+    resident = dataset._resident
+    if resident is not None:
+        full_size = dataset._cache_nbytes(resident.main)
+        fits = True
+    else:
+        # The peak read is on the expanded source axis, before aggregation.
+        # Reading, concatenation and exact selection can briefly hold three
+        # arrays of the widest element.
+        main_ops = dataset._store.timeline.operations(dataset._plan.domain.times())
+        source_rows = sum(len(rows) for _key, rows in main_ops)
+        element_bytes = 3 * dataset._source_element_bytes(main_ops)
+        outputs = (
+            len(dataset.time_aggregation)
+            if isinstance(dataset.time_aggregation, Mapping)
+            else 1
         )
+        column_bytes = source_rows * element_bytes
+        if outputs > 1:
+            column_bytes += steps * outputs * (8 + np.dtype(dataset.out_dtype).itemsize)
+        full_size = columns * column_bytes
+        fits = full_size <= budget
+    if not fits:
+        if budget < column_bytes:
+            raise ValueError(
+                "max_buffer_mb is too small for one quantile source column; "
+                f"requires at least {column_bytes} bytes "
+                f"({column_bytes / 1024**2:g} MiB)"
+            )
+        batch = int(budget / column_bytes)
+        if is_rank_zero():
+            logger.info(
+                "Exported dataset %.1f GB exceeds %.0f MiB buffer; "
+                "processing %d catchments in %d batches of %d",
+                full_size / 1e9,
+                max_buffer_mb,
+                columns,
+                (columns + batch - 1) // batch,
+                batch,
+            )
+
+    if fits:
+        dataset.load_to_memory()
+        first = dataset._resident.main
+    else:
+        positions = (
+            np.arange(columns, dtype=np.int64)
+            if space.selection is None
+            else space.selection
+        )
+        first = dataset._read_values(main_ops, positions[:batch], None)
+    blocks = _named_blocks(first, name)
+    names = tuple(blocks)
+    _validate_names(names)
+    create_options = {
+        key: prepare_netcdf_variable_options(
+            netcdf_options, dtype=dtype_nc, dimensions=("quantile", POINT_DIM), name=key
+        )
+        for key in names
+    }
+
+    def write_quantiles(variables, values_by_name, start, stop, *, owned):
+        if set(values_by_name) != set(names):
+            raise ValueError("export source output names changed between batches")
+        for key, values in values_by_name.items():
+            values = values[:steps]
+            if not np.isfinite(values).all():
+                raise ValueError("quantile source contains non-finite values")
+            variables[key][:, start:stop] = canonical_floating_array(
+                np.quantile(values, quantiles, axis=0, overwrite_input=owned),
+                dtype=dtype,
+                label=f"quantile result {key!r}",
+            )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with atomic_netcdf_dataset(out_path, format="NETCDF4") as output:
+        output.createDimension("quantile", quantiles.size)
+        output.createDimension(POINT_DIM, columns)
+        levels = output.createVariable("quantile", "f8", ("quantile",))
+        levels[:] = quantiles
+        levels.long_name = "quantile level"
+        write_point_coordinate(output, _COORDINATE, point_ids)
+        variables = {}
+        for key in names:
+            variable = create_netcdf_variable(
+                output,
+                key,
+                dtype_nc,
+                ("quantile", POINT_DIM),
+                options=create_options[key],
+            )
+            variable.long_name = f"{key} quantile values"
+            variables[key] = variable
+        if fits:
+            write_quantiles(variables, blocks, 0, columns, owned=False)
+        else:
+            # Exact quantiles need every time step of each batch of points.
+            for start in range(0, columns, batch):
+                stop = min(start + batch, columns)
+                if start:
+                    blocks = _named_blocks(
+                        dataset._read_values(main_ops, positions[start:stop], None),
+                        name,
+                    )
+                write_quantiles(variables, blocks, start, stop, owned=True)
+                # Release this batch before the next read so the working-set
+                # estimate stays conservative across batch boundaries.
+                blocks.clear()
+                first = None
+    if is_rank_zero():
+        logger.info(
+            "Saved quantiles to %s: levels=%s, shape=(%d, %d)",
+            out_path,
+            quantiles.tolist(),
+            quantiles.size,
+            columns,
+        )
+    return out_path
+
+
+@_EXPORT
+def generate_mapping_table(
+    dataset: InstanceOf[ForcingDataset],
+    map_dir: Annotated[Path, Field(strict=False)],
+    out_path: Annotated[Path, Field(strict=False)],
+    *,
+    mapinfo_txt: str = "location.txt",
+    hires_tag: str | None = "1min",
+    lowres_idx_precision: str = "<i4",
+    hires_idx_precision: str = "<i2",
+    map_precision: str = "<f4",
+    parameter_nc: Annotated[Path, Field(strict=False)] | None = None,
+    allow_oob_zero: bool = False,
+    source_nan_policy: Literal["keep", "drop", "nearest"] = "keep",
+    source_nan_mask: Annotated[np.ndarray, AfterValidator(_source_nan_mask)]
+    | None = None,
+) -> Path:
+    """Build the CaMa mapping of the dataset's source grid and save it.
+
+    With ``parameter_nc``, rows follow its ``catchment_id`` order.
+    ``source_nan_policy="drop"`` removes source cells missing in the first
+    frame (or ``source_nan_mask``) while preserving each catchment's row sum;
+    ``"nearest"`` additionally repairs catchments left empty with their
+    nearest valid source cell.
+    """
+
+    space = dataset.space
+    if not isinstance(space, GridSpace):
+        raise TypeError(f"{type(dataset).__name__} has no source grid to map")
+    if source_nan_policy != "keep":
+        nan_mask = (
+            dataset._first_frame_missing()
+            if source_nan_mask is None
+            else source_nan_mask
+        )
+        if nan_mask is None:
+            raise ValueError(
+                "dataset cannot infer a source NaN mask; pass "
+                "source_nan_mask explicitly or use source_nan_policy='keep'"
+            )
+        if nan_mask.shape != space.shape:
+            raise ValueError(
+                f"source_nan_mask must have full grid shape {space.shape}, got {nan_mask.shape}"
+            )
+    mapping = build_cama_mapping(
+        space.longitude,
+        space.latitude,
+        map_dir,
+        source_lon_bounds=space.longitude_bounds,
+        source_lat_bounds=space.latitude_bounds,
+        hires_tag=hires_tag,
+        mapinfo_txt=mapinfo_txt,
+        lowres_idx_precision=lowres_idx_precision,
+        hires_idx_precision=hires_idx_precision,
+        map_precision=map_precision,
+        parameter_nc=parameter_nc,
+        allow_oob_zero=allow_oob_zero,
+        producer=f"{type(dataset).__name__}.generate_mapping_table",
+    )
+    if source_nan_policy != "keep":
+        mapping = mapping.with_source_mask(
+            np.logical_not(nan_mask),
+            empty_row_policy="nearest" if source_nan_policy == "nearest" else "zero",
+            preserve_row_sum=True,
+        )
+        if is_rank_zero():
+            logger.info(
+                "source_nan_policy=%r removed %d NaN source cells and "
+                "repaired %d empty targets",
+                source_nan_policy,
+                int(nan_mask.sum()),
+                mapping.metadata.get("source_mask_repaired_rows", 0),
+            )
+    mapping.save(out_path)
+    logger.info(
+        "Saved grid mapping to %s: shape=%s, nnz=%d, source=%dx%d",
+        out_path,
+        mapping.matrix.shape,
+        mapping.matrix.nnz,
+        space.longitude.size,
+        space.latitude.size,
+    )
+    return out_path

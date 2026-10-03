@@ -7,14 +7,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from types import MappingProxyType
-from typing import Literal, Self
+from typing import Literal
 
-from pydantic import Field, FiniteFloat, PrivateAttr, field_validator, model_validator
+from pydantic import ConfigDict, FiniteFloat, field_validator, validate_call
 
-from hydroforge.contracts.naming import Identifier
-from hydroforge.contracts.temporal import DateLike
-from hydroforge.contracts.validation import HydroForgeModel
-from hydroforge.statistics.ir import Expression
+from hydroforge.core.expr import Expression, ExpressionSource, parse_value_source
+from hydroforge.core.naming import Identifier
+from hydroforge.core.time import DateLike
+from hydroforge.core.validation import HydroForgeModel
 
 
 @dataclass(frozen=True)
@@ -83,22 +83,22 @@ def step_field(source: str, *, dtype: StepFieldDType = "precision") -> StepField
     return StepField(source=source, dtype=dtype)
 
 
-class _StepFieldProviders(HydroForgeModel):
-    providers: Mapping[str, StepFieldProvider]
+@validate_call(config=ConfigDict(strict=True))
+def validate_step_field_providers(
+    providers: Mapping[str, StepFieldProvider],
+) -> Mapping[str, StepFieldProvider]:
+    """Check host step-field providers once; return a frozen copy."""
 
-    @model_validator(mode="after")
-    def _validate_providers(self) -> Self:
-        for name, provider in self.providers.items():
-            if not name.isidentifier() or name in _BUILTIN_STEP_FIELDS:
-                raise ValueError(f"invalid or reserved step field provider: {name!r}")
-            try:
-                inspect.signature(provider).bind(None)
-            except (TypeError, ValueError) as error:
-                raise ValueError(
-                    f"step field provider {name!r} must accept StepTime"
-                ) from error
-        object.__setattr__(self, "providers", MappingProxyType(dict(self.providers)))
-        return self
+    for name, provider in providers.items():
+        if not name.isidentifier() or name in _BUILTIN_STEP_FIELDS:
+            raise ValueError(f"invalid or reserved step field provider: {name!r}")
+        try:
+            inspect.signature(provider).bind(None)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"step field provider {name!r} must accept StepTime"
+            ) from error
+    return MappingProxyType(dict(providers))
 
 
 class _StepFieldValues(HydroForgeModel):
@@ -117,51 +117,42 @@ class _StepFieldValues(HydroForgeModel):
         return values
 
 
-class _StepFieldExpressions(HydroForgeModel):
-    """Compile custom device expressions once at the declaration boundary."""
+@validate_call(config=ConfigDict(strict=True))
+def compile_step_field_expressions(
+    expressions: Mapping[str, str], *, host_sources: frozenset[str] = frozenset()
+) -> Mapping[str, Expression]:
+    """Compile custom device expressions once, in dependency order."""
 
-    expressions: Mapping[str, str]
-    host_sources: frozenset[str] = Field(default=frozenset(), exclude=True)
-    _compiled: Mapping[str, Expression] = PrivateAttr()
+    known = set(_BUILTIN_STEP_FIELDS) | set(expressions)
+    compiled = {}
+    for name, expression in expressions.items():
+        if (
+            not name.isidentifier()
+            or name in _BUILTIN_STEP_FIELDS
+            or name in host_sources
+        ):
+            raise ValueError(f"invalid or reserved device step field: {name!r}")
+        try:
+            source = parse_value_source(expression, known)
+        except ValueError as error:
+            raise ValueError(f"device step field {name!r}: {error}") from error
+        if not isinstance(source, ExpressionSource):
+            raise ValueError("device step fields require scalar expressions")
+        compiled[name] = source.expression
+    ordered = {}
+    visiting = set()
 
-    @model_validator(mode="after")
-    def _compile(self) -> Self:
-        from hydroforge.statistics.ir import ExpressionSource, parse_value_source
+    def visit(name: str) -> None:
+        if name in ordered or name not in compiled:
+            return
+        if name in visiting:
+            raise ValueError(f"cyclic device step field expression: {name!r}")
+        visiting.add(name)
+        for dependency in compiled[name].dependencies:
+            visit(dependency)
+        visiting.remove(name)
+        ordered[name] = compiled[name]
 
-        known = set(_BUILTIN_STEP_FIELDS) | set(self.expressions)
-        compiled = {}
-        for name, expression in self.expressions.items():
-            if (
-                not name.isidentifier()
-                or name in _BUILTIN_STEP_FIELDS
-                or name in self.host_sources
-            ):
-                raise ValueError(f"invalid or reserved device step field: {name!r}")
-            try:
-                source = parse_value_source(expression, known)
-            except ValueError as error:
-                raise ValueError(f"device step field {name!r}: {error}") from error
-            if not isinstance(source, ExpressionSource):
-                raise ValueError("device step fields require scalar expressions")
-            compiled[name] = source.expression
-        ordered = {}
-        visiting = set()
-
-        def visit(name: str) -> None:
-            if name in ordered or name not in compiled:
-                return
-            if name in visiting:
-                raise ValueError(f"cyclic device step field expression: {name!r}")
-            visiting.add(name)
-            for dependency in compiled[name].dependencies:
-                visit(dependency)
-            visiting.remove(name)
-            ordered[name] = compiled[name]
-
-        for name in compiled:
-            visit(name)
-        self._compiled = MappingProxyType(ordered)
-        object.__setattr__(
-            self, "expressions", MappingProxyType(dict(self.expressions))
-        )
-        return self
+    for name in compiled:
+        visit(name)
+    return MappingProxyType(ordered)

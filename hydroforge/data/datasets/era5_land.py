@@ -4,27 +4,31 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import ClassVar, Self
 
-import cftime
 import numpy as np
-from netCDF4 import Dataset
-from pydantic import Field, model_validator
 
-from hydroforge.contracts.temporal import _timedelta_quotient_trusted
-from hydroforge.data.datasets.base import _TrustedSourceChunk
-from hydroforge.data.datasets.chunking import SourceChunk
+from hydroforge.core.time import DateLike, timedelta_quotient
+from hydroforge.data.datasets.keys import monthly_time_to_key
 from hydroforge.data.datasets.netcdf import NetCDFDataset
-from hydroforge.data.netcdf import (
-    _planned_netcdf_chunk_len,
-    monthly_time_to_key,
-)
+from hydroforge.data.datasets.plan import DatasetPlan, SourceChunk, TemporalDomain
+from hydroforge.data.datasets.timeline import TimelineScan
+from hydroforge.data.datasets.values import as_float64, finalize, ingest
+from hydroforge.io.netcdf.read import plan_read_chunk_len
 
 _ERA5_LOGICAL_CHUNK_BYTES = 4 * 1024**3
 _ERA5_PHYSICAL_CHUNK_MULTIPLIER = 2
+
+
+def _is_day_start(time: DateLike) -> bool:
+    return (
+        time.hour == 0
+        and time.minute == 0
+        and time.second == 0
+        and time.microsecond == 0
+    )
 
 
 class ERA5LandAccumDataset(NetCDFDataset):
@@ -74,135 +78,58 @@ class ERA5LandAccumDataset(NetCDFDataset):
       2) At every other timestamp, subtract the preceding cumulative record.
          If a read starts away from midnight, that predecessor is loaded as a
          support frame even when it lives in the preceding monthly file.
-      3) Optionally clip negative finite differences to zero.
+      3) Clip negative increments to zero when ``clip_incremental_negative``
+         (the default) or ``clip_negative`` is set.  Cumulative records are
+         never clipped before differencing, so both options bound the
+         reported increments rather than the stored accumulations.
 
     This keeps the output aligned with the physical interval [t, t+Δt) and avoids
     off-by-one mistakes caused by end-of-period time stamps and the 00:00 daily total.
     """
 
-    supports_time_aggregation: ClassVar[bool] = False
-    reusable_expression_reads: ClassVar[bool] = True
-
-    base_dir: Path = Field(strict=False)
-    chunk_len: int | None = Field(default=None, ge=1)
     var_name: str = "ro"
     prefix: str = "runoff_"
-    suffix: str = ".nc"
     time_to_key: Callable[[datetime], str] = monthly_time_to_key
     clip_incremental_negative: bool = True
-    time_aggregation: str | Mapping[str, str] | None = None
 
-    def _planned_storage_chunk_len(self, path: Path) -> int:
-        """Batch physical slabs while retaining midnight chunk boundaries."""
-
-        daily_steps = _timedelta_quotient_trusted(
-            timedelta(days=1),
-            self.time_interval,
-            duration_label="one day",
-            interval_label="ERA5 time_interval",
-        )
-        return _planned_netcdf_chunk_len(
-            path,
-            self.var_name,
-            fallback=daily_steps,
-            max_bytes=_ERA5_LOGICAL_CHUNK_BYTES,
-            physical_chunk_multiplier=_ERA5_PHYSICAL_CHUNK_MULTIPLIER,
-            step_alignment=daily_steps,
-        )
-
-    @model_validator(mode="after")
-    def _validate_era5_domain(self) -> Self:
+    def _compile_plan(self, domain: TemporalDomain) -> DatasetPlan:
         if self.time_aggregation is not None:
             raise ValueError(
                 "ERA5LandAccumDataset does not support time_aggregation: "
                 "cumulative records must be differenced before aggregation"
             )
+        # Daily cumulative resets are only representable when the interval
+        # divides one day and the time grid is anchored at midnight.
+        self._daily_steps()
+        for label, start in (
+            ("start_date", self.start_date),
+            ("spin_up_start_date", self.spin_up_start_date),
+        ):
+            if start is not None:
+                self._require_midnight_grid(start, label)
+        return super()._compile_plan(domain)
 
-        # Configure time resolution first.  Daily cumulative resets can only be
-        # represented exactly when the requested interval divides one day.
-        _timedelta_quotient_trusted(
+    def _daily_steps(self) -> int:
+        return timedelta_quotient(
             timedelta(days=1),
             self.time_interval,
             duration_label="one day",
             interval_label="ERA5 time_interval",
         )
-        self._validate_daily_grid_alignment(
-            self.start_date,
-            self.time_interval,
-            "start_date",
-        )
-        if self.spin_up_start_date is not None:
-            self._validate_daily_grid_alignment(
-                self.spin_up_start_date,
-                self.time_interval,
-                "spin_up_start_date",
-            )
-        return self
 
-    @model_validator(mode="after")
-    def _compile_cumulative_predecessors(self) -> Self:
-        """Freeze every predecessor required by non-midnight chunk reads."""
-
-        for chunk in self.chunk_plan:
-            if self._is_day_start(chunk.source_start):
-                continue
-            source_times = self._timeline.storage_times_for_chunk(chunk)
-            predecessor = source_times[0] - self.time_interval
-            try:
-                self._timeline.ensure_support_time(predecessor)
-            except ValueError as error:
-                if str(error).startswith("Missing support timestamp"):
-                    raise ValueError(
-                        "Missing cumulative predecessor timestamp "
-                        f"{predecessor}; it is required for a non-midnight "
-                        "ERA5 interval"
-                    ) from error
-                raise
-
-        source_paths = tuple(
-            Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
-            for key in sorted(self._timeline.file_times)
-        )
-        # Shards already inspected by NetCDFDataset keep their validated axes;
-        # only predecessor shards added above need a coordinate check.
-        axes_by_path = dict(self._variable_axes_by_path)
-        for path in source_paths:
-            canonical = self._canonical_source_path(path)
-            if canonical in axes_by_path:
-                continue
-            with self._inspect_source_file(path), Dataset(path, "r") as dataset:
-                axes_by_path[canonical] = self._validate_shard_coordinates(
-                    dataset, path
-                )
-        self._variable_axes_by_path = axes_by_path
-        self._record_source_files(source_paths)
-        return self
-
-    def _storage_time(
-        self,
-        logical_time: datetime | cftime.datetime,
-    ) -> datetime | cftime.datetime:
-        """Map interval-start time to ERA5's interval-end timestamp."""
-
-        return logical_time + self.time_interval
-
-    @staticmethod
-    def _validate_daily_grid_alignment(
-        dt: datetime | cftime.datetime,
-        interval: timedelta,
-        label: str,
-    ) -> None:
+    def _require_midnight_grid(self, time: DateLike, label: str) -> None:
         """Reject a time grid that skips over the known midnight reset."""
+
         since_midnight = timedelta(
-            hours=dt.hour,
-            minutes=dt.minute,
-            seconds=dt.second,
-            microseconds=dt.microsecond,
+            hours=time.hour,
+            minutes=time.minute,
+            seconds=time.second,
+            microseconds=time.microsecond,
         )
         try:
-            _timedelta_quotient_trusted(
+            timedelta_quotient(
                 since_midnight,
-                interval,
+                self.time_interval,
                 duration_label=f"{label} time-of-day",
                 interval_label="ERA5 time_interval",
             )
@@ -212,21 +139,55 @@ class ERA5LandAccumDataset(NetCDFDataset):
                 "daily ERA5 cumulative resets are observable"
             ) from error
 
-    @staticmethod
-    def _is_day_start(dt: datetime | cftime.datetime) -> bool:
-        return (
-            dt.hour == 0 and dt.minute == 0 and dt.second == 0 and dt.microsecond == 0
+    def _storage_offset(self) -> timedelta:
+        """Records are stamped at the end of their interval."""
+
+        return self.time_interval
+
+    def _planned_chunk_len(self, path: Path) -> int:
+        """Batch physical slabs while retaining midnight chunk boundaries."""
+
+        daily_steps = self._daily_steps()
+        return plan_read_chunk_len(
+            path,
+            self.var_name,
+            fallback=daily_steps,
+            max_bytes=_ERA5_LOGICAL_CHUNK_BYTES,
+            physical_chunk_multiplier=_ERA5_PHYSICAL_CHUNK_MULTIPLIER,
+            step_alignment=daily_steps,
         )
+
+    def _read_times(self, chunk: SourceChunk) -> Sequence[DateLike]:
+        """A non-midnight chunk also reads the cumulative record before it."""
+
+        storage = [time + self.time_interval for time in chunk.source_times()]
+        if _is_day_start(chunk.source_start):
+            return storage
+        return [chunk.source_start, *storage]
+
+    def _locate_support(self, scan: TimelineScan, plan: DatasetPlan) -> None:
+        for chunk in plan.chunk_plan:
+            if _is_day_start(chunk.source_start):
+                continue
+            try:
+                scan.locate(chunk.source_start)
+            except LookupError as error:
+                raise ValueError(
+                    "Missing cumulative predecessor timestamp "
+                    f"{chunk.source_start}; it is required for a non-midnight "
+                    "ERA5 interval"
+                ) from error
 
     def _transform_cumulative_to_incremental(
         self,
         arr: np.ndarray,
-        physical_times: list[datetime | cftime.datetime],
+        physical_times: Sequence[DateLike],
         previous: np.ndarray | None = None,
+        missing: np.ndarray | None = None,
     ) -> np.ndarray:
         """Convert daily cumulative records using their physical interval times."""
         reset = np.fromiter(
-            (self._is_day_start(dt) for dt in physical_times),
+            (_is_day_start(time) for time in physical_times),
             dtype=bool,
             count=len(physical_times),
         )
@@ -240,39 +201,45 @@ class ERA5LandAccumDataset(NetCDFDataset):
             diff = arr[1:] - arr[:-1]
             increments[1:] = diff
             increments[reset] = arr[reset]
-        if self.clip_incremental_negative:
+        if missing is not None:
+            offset = int(previous is not None)
+            invalid = missing[offset:].copy()
+            if offset:
+                invalid[0] |= missing[0]
+            invalid[1:] |= missing[offset:-1]
+            invalid[reset] = missing[offset:][reset]
+            increments[invalid] = 0
+        if self.clip_incremental_negative or self.clip_negative:
             np.maximum(increments, 0, out=increments)
         return increments
 
-    def _read_chunk(self, chunk: SourceChunk) -> _TrustedSourceChunk:
-        physical_times = list(chunk._source_times())
-        source_times = self._timeline.storage_times_for_chunk(chunk)
-
-        needs_previous = not self._is_day_start(physical_times[0])
-        read_times = source_times
-        if needs_previous:
-            predecessor = source_times[0] - self.time_interval
-            read_times = [predecessor, *source_times]
-
-        ops = self._timeline.operations_for_times(read_times)
-        data = (
-            self._canonical_calculation_data(
-                self._read_ops(ops),
-                label="ERA5 cumulative input",
-            )
-            / self.unit_factor
+    def _read_source(self, index: int) -> np.ndarray:
+        chunk = self.chunk_plan.chunks[index]
+        needs_previous = not _is_day_start(chunk.source_start)
+        raw = self._read_operations(self._store.timeline.reads[index])
+        # Keep observation validity until after differencing. A missing
+        # predecessor makes the following increment missing too; midnight
+        # resets depend only on the current observation.
+        missing = np.ma.getmaskarray(raw) | np.isnan(np.ma.getdata(raw))
+        has_missing = missing.any()
+        # Accumulations are never clipped: clipping bounds the increments.
+        values = ingest(
+            raw,
+            rows=chunk.length + needs_previous,
+            missing=self.missing,
+            clip_negative=False,
+            label="source chunk",
         )
-
-        previous = data[0] if needs_previous else None
-        arr = data[1:] if needs_previous else data
+        data = as_float64(values, label="ERA5 cumulative input") / self.unit_factor
         increments = self._transform_cumulative_to_incremental(
-            arr,
-            physical_times,
-            previous,
+            data[1:] if needs_previous else data,
+            chunk.source_times(),
+            data[0] if needs_previous else None,
+            missing=missing if has_missing else None,
         )
-        return _TrustedSourceChunk(
-            self._finalize_output_data(
-                increments,
-                label="ERA5 cumulative increment output",
-            )
+        return finalize(
+            increments,
+            out_dtype=self.out_dtype,
+            checked=True,
+            label="ERA5 cumulative increment output",
         )

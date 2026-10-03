@@ -91,14 +91,15 @@ class ProgressState:
 
 
 class ProgressRuntime:
-    def __init__(self, owner: Any) -> None:
-        self.owner = owner
-        self.state = ProgressState()
+    """Progress of one runtime along its schedule position.
 
-    def _schedule_position(self) -> tuple[Any, Any]:
-        runtime = self.owner._execution.step
-        step = None if runtime is None else runtime.scheduled_step
-        return self.owner.simulation_schedule, step
+    Each call receives the executing scheduled step (``None`` without a
+    schedule); the runtime clock remains the only committed position.
+    """
+
+    def __init__(self, runtime: Any) -> None:
+        self.schedule = runtime.plan.schedule
+        self.state = ProgressState()
 
     @staticmethod
     def _fraction(schedule: Any, step: Any, *, completed: bool) -> float:
@@ -107,9 +108,12 @@ class ProgressRuntime:
         date = step.end if completed else step.start
         return (date - schedule._start) / (schedule._end - schedule._start)
 
-    def begin_step(self) -> None:
-        schedule, step = self._schedule_position()
-        phase = "unbounded" if schedule is None or step is None else step.phase
+    def _phase(self, step: Any) -> str:
+        return "unbounded" if self.schedule is None or step is None else step.phase
+
+    def begin_step(self, step: Any) -> None:
+        schedule = self.schedule
+        phase = self._phase(step)
         fraction = None
         if (
             schedule is not None
@@ -124,16 +128,17 @@ class ProgressRuntime:
             schedule_fraction=fraction,
         )
 
-    def progress_tick(self) -> bool:
-        schedule, step = self._schedule_position()
-        phase = "unbounded" if schedule is None or step is None else step.phase
+    def progress_tick(self, step: Any) -> bool:
+        schedule = self.schedule
         final_step = (
-            schedule is not None and step is not None and step.index + 1 == len(schedule)
+            schedule is not None
+            and step is not None
+            and step.index + 1 == len(schedule)
         )
-        return self.state.tick(phase, force_emit=final_step)
+        return self.state.tick(self._phase(step), force_emit=final_step)
 
-    def format_progress(self) -> str:
-        schedule, step = self._schedule_position()
+    def format_progress(self, step: Any) -> str:
+        schedule = self.schedule
         if schedule is None or step is None:
             return self.state.format_unbounded()
         return self.state.format_schedule(

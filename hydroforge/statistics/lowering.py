@@ -5,18 +5,16 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum, StrEnum
-from functools import cache
 from types import MappingProxyType
 
-from hydroforge.statistics.ir import (
+from hydroforge.core.expr import (
     ExpressionSource,
     Reduction,
     ScatterSource,
     StatisticOperation,
-    StatisticsIR,
-    StatisticVariable,
-    storage_initialization,
 )
+from hydroforge.statistics.ir import StatisticsIR, StatisticVariable
+from hydroforge.statistics.phases import SampleFlags
 
 
 class OutputLayout(StrEnum):
@@ -39,38 +37,14 @@ class SamplePhase(StrEnum):
     EVERY_SUBSTEP = "every_substep"
     INNER_FIRST = "inner_first"
     INNER_LAST = "inner_last"
+    STEP_LAST = "step_last"
 
 
-class ReductionAction(StrEnum):
-    """Backend-independent mutation performed for one reduction."""
-
-    __str__ = Enum.__str__
-    __format__ = Enum.__format__
-
-    WEIGHTED_MEAN = "weighted_mean"
-    WEIGHTED_SUM = "weighted_sum"
-    MAXIMUM = "maximum"
-    MINIMUM = "minimum"
-    TAKE_FIRST = "take_first"
-    TAKE_LAST = "take_last"
-
-
-@dataclass(frozen=True, slots=True)
-class ReductionPlan:
-    """Fully lowered reduction behavior consumed by syntax emitters."""
-
-    reduction: Reduction
-    action: ReductionAction
-    initialization: str
-
-    @property
-    def value(self) -> str:
-        return self.reduction.value
-
-
-# Host/device sample-phase bits shared by generated launch gates.
-INNER_FIRST_BIT = 1
-INNER_LAST_BIT = 2
+_PHASE_BITS = {
+    SamplePhase.INNER_FIRST: int(SampleFlags.INNER_FIRST),
+    SamplePhase.INNER_LAST: int(SampleFlags.INNER_LAST),
+    SamplePhase.STEP_LAST: int(SampleFlags.STEP_LAST),
+}
 
 
 def sample_phase_mask(phases: Iterable[SamplePhase]) -> int | None:
@@ -79,7 +53,7 @@ def sample_phase_mask(phases: Iterable[SamplePhase]) -> int | None:
     for phase in phases:
         if phase is SamplePhase.EVERY_SUBSTEP:
             return None
-        mask |= INNER_FIRST_BIT if phase is SamplePhase.INNER_FIRST else INNER_LAST_BIT
+        mask |= _PHASE_BITS[phase]
     return mask
 
 
@@ -90,22 +64,14 @@ class LoweredOperation:
     spelling: str
     phase: SamplePhase
     value_phase: SamplePhase
-    outer: ReductionPlan
-    inner: ReductionPlan | None
+    outer: Reduction
+    inner: Reduction | None
     k: int
     stores_index: bool
 
     @property
-    def output(self) -> Reduction:
-        return self.outer.reduction
-
-    @property
     def compound(self) -> bool:
         return self.inner is not None
-
-    @property
-    def value_reduction(self) -> Reduction | None:
-        return None if self.inner is None else self.inner.reduction
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,8 +81,6 @@ class LoweredVariable:
     variable: StatisticVariable
     layout: OutputLayout
     operations: tuple[LoweredOperation, ...]
-    inner_reductions: tuple[Reduction, ...]
-    needs_unconditional_value: bool
 
     @property
     def value_phases(self) -> frozenset[SamplePhase]:
@@ -131,13 +95,19 @@ class LoweredVariable:
 
 @dataclass(frozen=True, slots=True)
 class StatisticsLowering:
-    """The sole semantic input consumed by backend syntax emitters."""
+    """The sole semantic input consumed by backend syntax emitters.
+
+    ``per_substep`` says whether any operation needs samples before the last
+    substep of a step, so a device loop must fold statistics into every
+    iteration; ``compound`` whether a window close can require a settle fold.
+    """
 
     ir: StatisticsIR
     variables: tuple[LoweredVariable, ...]
     by_name: Mapping[str, LoweredVariable]
     grouped_variables: Mapping[str, tuple[LoweredVariable, ...]]
-    required_flags: frozenset[str]
+    per_substep: bool
+    compound: bool
 
     def operations(self, name: str) -> tuple[LoweredOperation, ...]:
         """Return the only backend-visible operation schedule for ``name``."""
@@ -151,22 +121,6 @@ class StatisticsLowering:
                 group: tuple(item.variable.name for item in variables)
                 for group, variables in self.grouped_variables.items()
             }
-        )
-
-    def inner_reductions(self, name: str) -> tuple[Reduction, ...]:
-        return self.by_name[name].inner_reductions
-
-    def variables_by_inner(
-        self,
-        names: Iterable[str],
-    ) -> Mapping[Reduction, tuple[str, ...]]:
-        """Group variables by compiled inner schedule in stable order."""
-        grouped: dict[Reduction, list[str]] = {}
-        for name in names:
-            for reduction in self.by_name[name].inner_reductions:
-                grouped.setdefault(reduction, []).append(name)
-        return MappingProxyType(
-            {reduction: tuple(variables) for reduction, variables in grouped.items()}
         )
 
     def group_phase_mask(self, group: str) -> int | None:
@@ -185,21 +139,6 @@ class StatisticsLowering:
                 phases.update(variable.value_phases)
         return sample_phase_mask(phases)
 
-    def split_indexed(
-        self,
-        names: Iterable[str],
-    ) -> tuple[list[str], list[str]]:
-        """Partition an indexed launch group by normalized output layout."""
-        vectors: list[str] = []
-        levels: list[str] = []
-        for name in names:
-            layout = self.by_name[name].layout
-            if layout is OutputLayout.INDEXED_VECTOR:
-                vectors.append(name)
-            else:
-                levels.append(name)
-        return vectors, levels
-
 
 def _layout(variable: StatisticVariable) -> OutputLayout:
     if variable.output_group == "__full__":
@@ -216,17 +155,22 @@ def _phase(operation: StatisticOperation) -> SamplePhase:
         case Reduction.FIRST:
             return SamplePhase.INNER_FIRST
         case Reduction.LAST:
-            return SamplePhase.INNER_LAST
+            return SamplePhase.STEP_LAST
         case _:
             return SamplePhase.EVERY_SUBSTEP
 
 
 def _value_phase(operation: StatisticOperation) -> SamplePhase:
+    """``last`` values are recorded at every step's last sample.
+
+    A window whose closing step collects no output is folded from recorded
+    state, so its last sampled value must already be stored.
+    """
     match operation.inner:
         case None:
             return _phase(operation)
         case Reduction.LAST:
-            return SamplePhase.INNER_LAST
+            return SamplePhase.STEP_LAST
         case Reduction.FIRST:
             return SamplePhase.INNER_FIRST
         case _:
@@ -249,19 +193,6 @@ def _source_closure(ir: StatisticsIR, name: str) -> frozenset[str]:
     return frozenset(names)
 
 
-@cache
-def _reduction_plan(reduction: Reduction) -> ReductionPlan:
-    action = {
-        Reduction.MEAN: ReductionAction.WEIGHTED_MEAN,
-        Reduction.SUM: ReductionAction.WEIGHTED_SUM,
-        Reduction.MAX: ReductionAction.MAXIMUM,
-        Reduction.MIN: ReductionAction.MINIMUM,
-        Reduction.FIRST: ReductionAction.TAKE_FIRST,
-        Reduction.LAST: ReductionAction.TAKE_LAST,
-    }[reduction]
-    return ReductionPlan(reduction, action, storage_initialization(reduction).value)
-
-
 def lower_statistics(ir: StatisticsIR) -> StatisticsLowering:
     """Resolve layouts and sample phases once before backend generation."""
     variables: list[LoweredVariable] = []
@@ -273,67 +204,18 @@ def lower_statistics(ir: StatisticsIR) -> StatisticsLowering:
                 spelling=operation.spelling,
                 phase=_phase(operation),
                 value_phase=_value_phase(operation),
-                outer=_reduction_plan(operation.outer),
-                inner=(
-                    None
-                    if operation.inner is None
-                    else _reduction_plan(operation.inner)
-                ),
+                outer=operation.outer,
+                inner=operation.inner,
                 k=operation.k,
                 stores_index=operation.stores_index,
             )
             for operation in variable.operations
         )
         lowered = LoweredVariable(
-            variable=variable,
-            layout=layout,
-            operations=operations,
-            inner_reductions=tuple(
-                dict.fromkeys(
-                    operation.inner
-                    for operation in variable.operations
-                    if operation.inner is not None
-                )
-            ),
-            needs_unconditional_value=any(
-                operation.phase is SamplePhase.EVERY_SUBSTEP
-                or (
-                    operation.value_reduction is not None
-                    and operation.value_reduction is not Reduction.LAST
-                )
-                for operation in operations
-            )
-            or len({operation.phase for operation in operations}) > 1,
+            variable=variable, layout=layout, operations=operations
         )
         variables.append(lowered)
         groups.setdefault(variable.output_group, []).append(lowered)
-    flags: set[str] = set()
-    for variable in variables:
-        for operation in variable.operations:
-            if operation.compound:
-                flags.update(
-                    {
-                        "is_inner_last",
-                        "is_outer_first",
-                        "is_outer_last",
-                    }
-                )
-                if operation.value_reduction is not Reduction.LAST:
-                    flags.add("is_inner_first")
-                continue
-            match operation.output:
-                case Reduction.FIRST | Reduction.MAX | Reduction.MIN | Reduction.SUM:
-                    flags.update({"is_inner_first", "is_inner_last"})
-                case Reduction.LAST:
-                    flags.add("is_inner_last")
-                case Reduction.MEAN:
-                    flags.update(
-                        {
-                            "is_inner_first",
-                            "is_inner_last",
-                            "is_outer_last",
-                        }
-                    )
     return StatisticsLowering(
         ir=ir,
         variables=tuple(variables),
@@ -343,5 +225,14 @@ def lower_statistics(ir: StatisticsIR) -> StatisticsLowering:
         grouped_variables=MappingProxyType(
             {name: tuple(group) for name, group in groups.items()}
         ),
-        required_flags=frozenset(flags),
+        per_substep=any(
+            phase in {SamplePhase.EVERY_SUBSTEP, SamplePhase.INNER_FIRST}
+            for variable in variables
+            for phase in variable.launch_phases
+        ),
+        compound=any(
+            operation.compound
+            for variable in variables
+            for operation in variable.operations
+        ),
     )

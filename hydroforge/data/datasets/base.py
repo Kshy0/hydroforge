@@ -4,443 +4,157 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator, Mapping
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any, ClassVar, Literal, Self
+"""The forcing-dataset contract and the composites its arithmetic builds.
 
-import cftime
+A :class:`ForcingDataset` declares a timeline and compiles it once into a
+:class:`~hydroforge.data.datasets.plan.DatasetPlan`.  Declared fields keep the
+caller's values; resolved values (calendar, chunk length, normalized dates)
+live only in the plan.  Reads run one value pipeline in the reading process,
+normally a DataLoader worker.  Spatial selection never changes a dataset:
+:meth:`ForcingDataset.build_local_mapping` returns a view that shares the plan and
+files and reads only the mapped source cells.
+"""
+
+from __future__ import annotations
+
+import math
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Mapping
+from datetime import timedelta
+from operator import add, mul, sub, truediv
+from pathlib import Path
+from typing import Annotated, Any, ClassVar, Literal, Self
+
 import numpy as np
 import torch
 from pydantic import (
+    AfterValidator,
+    BeforeValidator,
     Field,
     PrivateAttr,
-    ValidationInfo,
-    field_validator,
     model_validator,
+    validate_call,
 )
 
-from hydroforge.contracts.errors import ResourceCleanupError
-from hydroforge.contracts.temporal import (
-    DateLike,
-    SimulationSchedule,
+from hydroforge.core.arrays import UniqueIds, canonical_floating_array
+from hydroforge.core.devices import devices_match
+from hydroforge.core.errors import cleanup_on_exit
+from hydroforge.core.time import DateLike
+from hydroforge.core.validation import HydroForgeModel
+from hydroforge.data.datasets.plan import (
+    DatasetPlan,
+    SourceChunk,
+    SourceChunkPlan,
+    TemporalDomain,
     UpsamplingMethod,
-    _DatasetTemporalDomain,
-    _require_date,
-    _timedelta_quotient_trusted,
-    canonical_calendar,
-    require_calendar,
-    timedelta_microseconds,
+    compile_cadence,
+    plan_index,
 )
-from hydroforge.contracts.validation import HydroForgeModel, _immutable_dict
-from hydroforge.data.datasets.chunking import SourceChunk, SourceChunkPlan
-from hydroforge.data.numeric import (
-    canonical_floating_array,
-    canonical_ids,
-    immutable_array,
+from hydroforge.data.datasets.space import GridSpace, PointSpace
+from hydroforge.data.datasets.values import (
+    MissingPolicy,
+    bounded,
+    finalize,
+    ingest,
+    ingest_integer,
 )
-from hydroforge.data.numeric import (
-    positive_finite_float64 as positive_finite_real,  # noqa: F401 - storage adapter scalar contract
-)
-from hydroforge.kernels.devices import devices_match
+from hydroforge.mapping.table import MappingTable
 
-_DatasetOperand = Any
-_DATASET_INDEX_LENGTH_CONTEXT = "hydroforge_dataset_index_length"
-_FORCING_SHARD_CONTEXT = "hydroforge_forcing_shard_context"
-_DEFERRED_FORCING_CHECKS: ContextVar[dict | None] = ContextVar(
-    "hydroforge_deferred_forcing_checks",
-    default=None,
-)
-
-
-def _spatial_selection_refs(datasets) -> tuple[object, ...]:
-    references = []
-    for dataset in datasets:
-        dataset._refresh_spatial_selection()
-        references.extend((dataset.local_indices, dataset.desired_catchment_ids))
-    return tuple(references)
+# Source identities are absolute paths captured at construction, so the
+# storage directory is bound then as well; a later working-directory change
+# must not redirect a relative declaration.
+SourceDirectory = Annotated[
+    Path,
+    Field(strict=False),
+    AfterValidator(Path.absolute),
+]
+TorchDevice = Annotated[torch.device, BeforeValidator(torch.device)]
+_TORCH_DTYPES = {"float32": torch.float32, "float64": torch.float64}
 
 
-def _check_forcing_finite(checks_by_device) -> None:
-    for values in checks_by_device.values():
-        checks = [torch.isfinite(value).all() for _label, value in values]
-        flags = torch.stack(checks) if len(checks) > 1 else checks[0].reshape(1)
-        if not bool(flags.all().item()):
-            invalid = (~flags).nonzero().flatten().cpu().tolist()
-            label = values[invalid[0]][0]
-            raise ValueError(f"{label} contains non-finite values")
-
-
-@contextmanager
-def _batch_forcing_validation():
-    """Aggregate standard child validators for exactly one public request."""
-
-    if _DEFERRED_FORCING_CHECKS.get() is not None:
-        yield
-        return
-    checks: dict[torch.device, list[tuple[str, torch.Tensor]]] = {}
-    token = _DEFERRED_FORCING_CHECKS.set(checks)
-    try:
-        try:
-            yield
-        except Exception:
-            _check_forcing_finite(checks)
-            raise
-        else:
-            _check_forcing_finite(checks)
-    finally:
-        _DEFERRED_FORCING_CHECKS.reset(token)
-
-
-class _DatasetIndexQuery(HydroForgeModel):
-    """One bounded public Dataset protocol lookup."""
-
-    index: int
-
-    _resolved_index: int = PrivateAttr()
-
-    @model_validator(mode="after")
-    def _resolve(self, info: ValidationInfo) -> Self:
-        length = (
-            info.context.get(_DATASET_INDEX_LENGTH_CONTEXT)
-            if isinstance(info.context, Mapping)
-            else None
-        )
-        if type(length) is not int or length < 0:
-            raise ValueError("dataset index query requires dataset context")
-        index = self.index
-        if index < 0:
-            index += length
-        if not 0 <= index < length:
-            raise ValueError(
-                f"dataset index must satisfy -{length} <= index < "
-                f"{length}; got {self.index}"
-            )
-        self._resolved_index = index
-        return self
-
-    @property
-    def resolved_index(self) -> int:
-        return self._resolved_index
-
-
-def _validated_dataset_index(dataset: object, index: int) -> int:
-    """Validate one public Dataset index before trusted plan lookup."""
-
-    return _DatasetIndexQuery.model_validate(
-        {"index": index},
-        context={_DATASET_INDEX_LENGTH_CONTEXT: len(dataset)},
-    ).resolved_index
-
-
-class _ForcingShardRequest(HydroForgeModel):
-    """Canonical tensor batch entering a public Dataset sharding method."""
-
-    data: Any
-
-    @model_validator(mode="after")
-    def _validate_batch(self, info: ValidationInfo) -> Self:
-        context = (
-            info.context.get(_FORCING_SHARD_CONTEXT)
-            if isinstance(info.context, Mapping)
-            else None
-        )
-        if not isinstance(context, Mapping):
-            raise ValueError("forcing shard request requires dataset context")
-        allow_sequence = context.get("allow_sequence", False)
-        if type(allow_sequence) is not bool:
-            raise ValueError("forcing shard sequence context is invalid")
-        columns = context.get("columns")
-        if type(columns) is not int or columns < 0:
-            raise ValueError("forcing shard columns context is invalid")
-        dtype = context.get("dtype")
-        if dtype is not None and not isinstance(dtype, torch.dtype):
-            raise ValueError("forcing shard dtype context is invalid")
-        device = context.get("device")
-        if device is not None and not isinstance(device, torch.device):
-            raise ValueError("forcing shard device context is invalid")
-
-        finite_checks: dict[torch.device, list[tuple[str, torch.Tensor]]] = {}
-
-        def canonical(
-            value: Any,
-            checks_by_device: dict[torch.device, list[tuple[str, torch.Tensor]]],
-            *,
-            label: str,
-        ) -> Any:
-            if isinstance(value, Mapping):
-                if not value:
-                    raise ValueError(f"{label} mapping must not be empty")
-                if any(type(name) is not str or not name for name in value):
-                    raise ValueError(
-                        f"{label} mapping keys must be non-empty exact strings"
-                    )
-                return {
-                    name: canonical(block, checks_by_device, label=f"{label}.{name}")
-                    for name, block in value.items()
-                }
-            if isinstance(value, (tuple, list)):
-                if not allow_sequence:
-                    raise ValueError(f"{label} does not accept a sequence")
-                if not value:
-                    raise ValueError(f"{label} sequence must not be empty")
-                return tuple(
-                    canonical(block, checks_by_device, label=f"{label}[{index}]")
-                    for index, block in enumerate(value)
-                )
-            if not isinstance(value, torch.Tensor):
-                raise ValueError(f"{label} must be a dense torch.Tensor")
-            if value.layout != torch.strided:
-                raise ValueError(f"{label} must be a dense torch.Tensor")
-            if value.ndim not in {2, 3}:
-                raise ValueError(
-                    f"{label} must have rank 2 or 3; got rank {value.ndim}"
-                )
-            if value.shape[-1] != columns:
-                raise ValueError(
-                    f"{label} has {value.shape[-1]} columns; expected {columns}"
-                )
-            if dtype is not None and value.dtype != dtype:
-                raise ValueError(f"{label} has dtype {value.dtype}; expected {dtype}")
-            if device is not None and not devices_match(value.device, device):
-                raise ValueError(
-                    f"{label} is on device {value.device}; expected {device}"
-                )
-            if value.is_floating_point() or value.is_complex():
-                checks_by_device.setdefault(value.device, []).append((label, value))
-            return value
-
-        object.__setattr__(
-            self, "data", canonical(self.data, finite_checks, label="forcing")
-        )
-        deferred = _DEFERRED_FORCING_CHECKS.get()
-        if deferred is None:
-            _check_forcing_finite(finite_checks)
-        else:
-            for device, values in finite_checks.items():
-                deferred.setdefault(device, []).extend(values)
-        return self
-
-
-def _validated_forcing_shard(
-    data: Any,
+def _check_forcing_tensors(
+    value: Any,
     *,
     columns: int,
-    dtype: torch.dtype | None,
+    dtype: torch.dtype,
     device: torch.device | None,
-    allow_sequence: bool = False,
-) -> Any:
-    """Validate a new public forcing batch before trusted transformation."""
+    sequence: bool,
+    label: str,
+) -> None:
+    """Check the structure, shape, dtype and device of one forcing batch."""
 
-    return _ForcingShardRequest.model_validate(
-        {"data": data},
-        context={
-            _FORCING_SHARD_CONTEXT: {
-                "allow_sequence": allow_sequence,
-                "columns": columns,
-                "dtype": dtype,
-                "device": device,
-            },
-        },
-    ).data
-
-
-def _as_nan_array(data: np.ndarray) -> np.ndarray:
-    """Convert NetCDF masked values to NaN while preserving normal values."""
-    if isinstance(data, np.ma.MaskedArray):
-        mask = np.ma.getmaskarray(data)
-        if np.any(mask):
-            if np.issubdtype(data.dtype, np.floating):
-                return np.asarray(data.filled(np.nan))
-            return np.asarray(data.astype(np.float64).filled(np.nan))
-        return np.asarray(data.data)
-    return np.asarray(data)
-
-
-class _SourceChunkPayload(HydroForgeModel):
-    """Canonical external arrays returned by one storage read."""
-
-    data: Any
-    expected_rows: int = Field(ge=1, exclude=True)
-    clip_negative: bool = Field(exclude=True)
-
-    @model_validator(mode="after")
-    def _canonicalize(self) -> Self:
-        object.__setattr__(
-            self,
-            "data",
-            _trusted_source_chunk_payload(
-                self.data,
-                expected_rows=self.expected_rows,
-                clip_negative=self.clip_negative,
-                copy_storage=True,
-            ),
-        )
-        return self
-
-
-def _trusted_source_chunk_payload(
-    data: Any,
-    *,
-    expected_rows: int,
-    clip_negative: bool,
-    copy_storage: bool = False,
-) -> Any:
-    """Normalize leaf arrays, copying storage returned by extension readers."""
-
-    def canonical(value: Any, *, label: str) -> Any:
-        if isinstance(value, Mapping):
-            if copy_storage:
-                if not value:
-                    raise ValueError(f"{label} mapping must not be empty")
-                if any(type(name) is not str or not name for name in value):
-                    raise ValueError(f"{label} keys must be non-empty exact strings")
-            return {
-                name: canonical(block, label=f"{label}.{name}")
-                for name, block in value.items()
-            }
-        array = _as_nan_array(value)
-        if array.ndim < 1 or array.shape[0] != expected_rows:
-            raise ValueError(f"{label} must have {expected_rows} rows on its time axis")
-        if array.dtype.kind not in {"f", "i", "u"}:
-            raise ValueError(f"{label} must contain real numeric values")
-        if np.issubdtype(array.dtype, np.inexact) and not np.isfinite(array).all():
-            raise ValueError(f"{label} contains missing or non-finite values")
-        if copy_storage or not array.flags.c_contiguous or not array.flags.writeable:
-            array = np.array(array, order="C", copy=True)
-        if clip_negative:
-            np.maximum(array, 0, out=array)
-        return array
-
-    return canonical(data, label="source chunk")
-
-
-@dataclass(frozen=True, slots=True)
-class _TrustedSourceChunk:
-    """Leaf-reader result whose external payload was already validated."""
-
-    data: Any
-
-
-class _SourceChunkReadRequest(HydroForgeModel):
-    """Bind one public chunk identity to the Dataset that owns its plan."""
-
-    chunk: SourceChunk
-    chunk_plan: SourceChunkPlan = Field(exclude=True)
-
-    @model_validator(mode="after")
-    def _validate_owner(self) -> Self:
-        if self.chunk.temporal_domain != self.chunk_plan.temporal_domain:
-            raise ValueError("source chunk belongs to a different Dataset timeline")
-        if self.chunk.index >= len(
-            self.chunk_plan
-        ) or self.chunk != self.chunk_plan._at_trusted(self.chunk.index):
-            raise ValueError("source chunk does not match the Dataset chunk plan")
-        return self
-
-
-@dataclass(frozen=True, slots=True)
-class _SourceFileIdentity:
-    """External file identity captured before Dataset schema inspection."""
-
-    device: int
-    inode: int
-    size: int
-    mtime_ns: int
-
-    @classmethod
-    def capture(cls, path: Path) -> Self:
-        status = path.stat()
-        return cls(
-            device=status.st_dev,
-            inode=status.st_ino,
-            size=status.st_size,
-            mtime_ns=status.st_mtime_ns,
-        )
-
-    def verify(self, path: Path) -> None:
-        try:
-            observed = type(self).capture(path)
-        except OSError as error:
-            raise RuntimeError(
-                f"Dataset source file {str(path)!r} changed after validation"
-            ) from error
-        if observed != self:
-            raise RuntimeError(
-                f"Dataset source file {str(path)!r} changed after validation"
+    if isinstance(value, Mapping):
+        if not value or any(type(name) is not str or not name for name in value):
+            raise ValueError(f"{label} keys must be non-empty exact strings")
+        for name, block in value.items():
+            _check_forcing_tensors(
+                block,
+                columns=columns,
+                dtype=dtype,
+                device=device,
+                sequence=sequence,
+                label=f"{label}.{name}",
             )
-
-
-def _close_dataset_tree(root: object, *, scope: str) -> None:
-    """Close each unique leaf in one composite dataset ownership tree."""
-
-    pending = [root]
-    visited: set[int] = set()
-    leaves: list[object] = []
-    failures: list[BaseException] = []
-    while pending:
-        item = pending.pop()
-        identity = id(item)
-        if identity in visited:
-            continue
-        visited.add(identity)
-        children = getattr(item, "_close_children", None)
-        if children is None:
-            leaves.append(item)
-            continue
-        try:
-            owned = children()
-        except BaseException as error:
-            failures.append(error)
-            continue
-        if owned:
-            pending.extend(reversed(owned))
-        else:
-            leaves.append(item)
-
-    for leaf in leaves:
-        try:
-            leaf.close()
-        except BaseException as error:
-            failures.append(error)
-    if len(failures) == 1:
-        raise failures[0]
-    if failures:
-        raise ResourceCleanupError(scope, failures)
-
-
-class _DatasetClassDeclaration(HydroForgeModel):
-    """Validated subclass capabilities for physical storage adapters."""
-
-    supports_time_aggregation: bool
-    precompressed_source: bool
-    integer_output_fields: frozenset[str]
-
-    @field_validator("integer_output_fields", mode="before")
-    @classmethod
-    def _validate_integer_output_fields(cls, value: Any) -> frozenset[str]:
-        if type(value) is not frozenset:
-            raise ValueError("integer_output_fields must be an exact frozenset")
-        if any(type(name) is not str or not name for name in value):
-            raise ValueError(
-                "integer_output_fields entries must be non-empty exact strings"
+        return
+    if isinstance(value, (tuple, list)):
+        if not sequence:
+            raise ValueError(f"{label} does not accept a sequence")
+        if not value:
+            raise ValueError(f"{label} sequence must not be empty")
+        for index, block in enumerate(value):
+            _check_forcing_tensors(
+                block,
+                columns=columns,
+                dtype=dtype,
+                device=device,
+                sequence=sequence,
+                label=f"{label}[{index}]",
             )
-        return value
+        return
+    if not isinstance(value, torch.Tensor) or value.layout != torch.strided:
+        raise ValueError(f"{label} must be a dense torch.Tensor")
+    if value.ndim not in {2, 3}:
+        raise ValueError(f"{label} must have rank 2 or 3; got rank {value.ndim}")
+    if value.shape[-1] != columns:
+        raise ValueError(f"{label} has {value.shape[-1]} columns; expected {columns}")
+    if value.dtype != dtype:
+        raise ValueError(f"{label} has dtype {value.dtype}; expected {dtype}")
+    if device is not None and not devices_match(value.device, device):
+        raise ValueError(f"{label} is on device {value.device}; expected {device}")
 
 
-class AbstractDataset(HydroForgeModel, ABC):
-    """
-    Custom abstract class that inherits from PyTorch Dataset.
-    Defines a common interface for accessing data with distributed support.
+def _mapping_layout(device: torch.device) -> torch.layout:
+    """Sparse layout of :meth:`ForcingDataset.build_local_mapping` tensors on ``device``.
+
+    CUDA uses CSR, which cuSPARSE multiplies without per-call conversion.
+    Other devices use coalesced COO, whose product sums each target's
+    sources in index order; the CPU CSR kernel sums in a different order.
     """
 
-    supports_time_aggregation: ClassVar[bool] = False
-    precompressed_source: ClassVar[bool] = False
-    reusable_expression_reads: ClassVar[bool] = False
+    return torch.sparse_csr if device.type == "cuda" else torch.sparse_coo
+
+
+def _mapped_forcing(value: Any, mapping: torch.Tensor) -> Any:
+    """Project ``(..., sources)`` batches onto ``(..., targets)``."""
+
+    if isinstance(value, Mapping):
+        return {name: _mapped_forcing(block, mapping) for name, block in value.items()}
+    leading = value.shape[:-1]
+    flat = value.reshape(math.prod(leading), value.shape[-1])
+    return (mapping @ flat.T).T.contiguous().view(*leading, mapping.shape[0])
+
+
+class ForcingDataset(HydroForgeModel, ABC):
+    """A declared forcing source read chunk by chunk on one compiled timeline.
+
+    Subclasses provide :attr:`space` and either :meth:`read_storage` (raw
+    arrays that the base class checks and converts) or their own read
+    pipeline.  ``missing`` decides whether masked and NaN values are zeroed
+    or rejected; infinities are always rejected.  :meth:`shard_forcing` checks
+    only structure, shape, dtype and device: values were checked when read.
+    """
+
+    integer_output_fields: ClassVar[frozenset[str]] = frozenset()
 
     start_date: DateLike
     end_date: DateLike
@@ -453,805 +167,733 @@ class AbstractDataset(HydroForgeModel, ABC):
     out_dtype: Literal["float32", "float64"] = "float32"
     chunk_len: int = Field(default=1, ge=1)
     clip_negative: bool = False
+    missing: MissingPolicy = "error"
     upsampling: UpsamplingMethod | None = None
 
-    local_indices: np.ndarray | None = Field(
-        default=None,
-        exclude=True,
-        repr=False,
-        description="Immutable source positions selected by this dataset view",
-    )
-    desired_catchment_ids: np.ndarray | None = Field(
-        default=None,
-        exclude=True,
-        repr=False,
-        description="Immutable target IDs owned by this dataset view",
-    )
-    _chunk_plan: SourceChunkPlan = PrivateAttr()
-    _simulation_schedule: SimulationSchedule = PrivateAttr()
-    _temporal_domain: _DatasetTemporalDomain = PrivateAttr()
-    _calendar_from_storage_allowed: bool = PrivateAttr(default=False)
+    _plan: DatasetPlan = PrivateAttr()
+    _target_ids: np.ndarray | None = PrivateAttr(default=None)
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
+        super().__pydantic_init_subclass__(**kwargs)
+        fields = cls.integer_output_fields
+        if type(fields) is not frozenset or any(
+            type(name) is not str or not name for name in fields
+        ):
+            raise TypeError(
+                "integer_output_fields must be a frozenset of non-empty strings"
+            )
 
     @model_validator(mode="after")
-    def _compile_dataset_identity(self) -> Self:
-        """Compile runtime plans from the one canonical temporal identity."""
+    def _compile(self) -> Self:
+        # Pydantic re-runs after-validators on an instance embedded in another
+        # model; the plan of a constructed dataset is final.
+        if "_plan" not in self.__pydantic_private__:
+            compile_cadence(self.time_interval, self.model_step, self.upsampling)
+            self._plan = self._compile_plan(self._declared_domain())
+        return self
 
-        temporal_domain = _DatasetTemporalDomain(
+    def _declared_domain(self, calendar: str | None = None) -> TemporalDomain:
+        """The domain of the declared dates, optionally in a storage calendar."""
+
+        return TemporalDomain.declare(
             start_date=self.start_date,
             end_date=self.end_date,
             time_interval=self.time_interval,
-            calendar=self.calendar,
+            calendar=self.calendar if calendar is None else calendar,
             spin_up_cycles=self.spin_up_cycles,
             spin_up_start_date=self.spin_up_start_date,
             spin_up_end_date=self.spin_up_end_date,
         )
-        self._calendar_from_storage_allowed = temporal_domain.calendar_defaulted
-        self._install_temporal_domain(temporal_domain)
-        return self
 
-    def _install_temporal_domain(
-        self,
-        temporal_domain: _DatasetTemporalDomain,
-    ) -> None:
-        """Install one canonical domain and its derived runtime plans."""
+    def _compile_plan(self, domain: TemporalDomain) -> DatasetPlan:
+        """Bind storage to the declared domain; storage leaves override this."""
 
-        object.__setattr__(self, "start_date", temporal_domain.start_date)
-        object.__setattr__(self, "end_date", temporal_domain.end_date)
-        object.__setattr__(self, "calendar", temporal_domain.calendar)
-        object.__setattr__(
-            self,
-            "spin_up_start_date",
-            temporal_domain.spin_up_start_date,
-        )
-        object.__setattr__(
-            self,
-            "spin_up_end_date",
-            temporal_domain.spin_up_end_date,
-        )
-        self._temporal_domain = temporal_domain
+        return self._planned(domain, self.chunk_len)
 
-        interval_us = timedelta_microseconds(
-            self.time_interval,
-            label="dataset time_interval",
-        )
-        model_step_us = timedelta_microseconds(
-            self.model_step,
-            label="model_step",
-        )
-        if model_step_us <= 0:
-            raise ValueError("model_step must be positive")
-        if model_step_us > interval_us:
-            raise ValueError("model_step must not exceed dataset time_interval")
-        reuse_count = _timedelta_quotient_trusted(
-            self.time_interval,
-            self.model_step,
-            duration_label="dataset time_interval",
-            interval_label="model_step",
-        )
-        if reuse_count > 1 and self.upsampling not in {"repeat", "distribute"}:
-            raise ValueError(
-                "upsampling must be explicitly 'repeat' or 'distribute' "
-                "when model_step is shorter than dataset time_interval"
-            )
-        if reuse_count == 1 and self.upsampling is not None:
-            raise ValueError(
-                "upsampling must be None when model_step equals time_interval"
-            )
-        self._chunk_plan = SourceChunkPlan(
-            temporal_domain=temporal_domain,
-            chunk_len=1 if self.chunk_len is None else self.chunk_len,
-        )
-        self._simulation_schedule = SimulationSchedule._from_domain(
-            temporal_domain,
-            step=self.model_step,
-            reuse_count=reuse_count,
+    def _planned(self, domain: TemporalDomain, chunk_len: int) -> DatasetPlan:
+        return DatasetPlan.compile(
+            domain,
+            chunk_len=chunk_len,
+            model_step=self.model_step,
+            upsampling=self.upsampling,
         )
 
-    def _adopt_source_calendar(self, calendar: str) -> bool:
-        """Bind an omitted calendar to inspected storage metadata once."""
-
-        source = canonical_calendar(calendar)
-        if source == self.calendar:
-            return False
-        if not self._calendar_from_storage_allowed:
-            raise ValueError(
-                f"forcing files use calendar {source!r}, but the dataset "
-                f"declares or implies calendar {self.calendar!r}"
-            )
-        temporal_domain = _DatasetTemporalDomain(
-            start_date=self.start_date,
-            end_date=self.end_date,
-            time_interval=self.time_interval,
-            calendar=source,
-            spin_up_cycles=self.spin_up_cycles,
-            spin_up_start_date=self.spin_up_start_date,
-            spin_up_end_date=self.spin_up_end_date,
-        )
-        self._calendar_from_storage_allowed = False
-        self._install_temporal_domain(temporal_domain)
-        return True
-
-    @field_validator("local_indices")
-    @classmethod
-    def _validate_local_indices(
-        cls,
-        indices: np.ndarray | None,
-    ) -> np.ndarray | None:
-        if indices is None:
-            return None
-        if np.ma.isMaskedArray(indices):
-            raise ValueError("dataset local_indices must not be a masked array")
-        owned_indices = canonical_ids(
-            indices,
-            label="dataset local_indices",
-        )
-        if np.any(owned_indices < 0):
-            raise ValueError("dataset local_indices must be nonnegative")
-        return immutable_array(owned_indices, order="C")
-
-    @field_validator("desired_catchment_ids")
-    @classmethod
-    def _validate_desired_catchment_ids(
-        cls,
-        target_ids: np.ndarray | None,
-    ) -> np.ndarray | None:
-        if target_ids is None:
-            return None
-        if np.ma.isMaskedArray(target_ids):
-            raise ValueError("dataset desired_catchment_ids must not be a masked array")
-        owned_ids = canonical_ids(
-            target_ids,
-            label="dataset desired_catchment_ids",
-        )
-        if np.unique(owned_ids).size != owned_ids.size:
-            raise ValueError("dataset desired_catchment_ids must be unique")
-        return immutable_array(owned_ids, order="C")
-
-    @model_validator(mode="after")
-    def _validate_spatial_selection_identity(self) -> Self:
-        indices = self.local_indices
-        target_ids = self.desired_catchment_ids
-        if (indices is None) != (target_ids is None):
-            raise ValueError(
-                "dataset local_indices and desired_catchment_ids must be "
-                "declared together"
-            )
-        return self
-
-    def _rebuild(self, **updates: Any) -> Self:
-        """Construct and validate a new dataset identity from public fields."""
-
-        payload = {name: getattr(self, name) for name in type(self).model_fields}
-        payload.update(updates)
-        return type(self).model_validate(payload)
-
-    def _dataset_identity_arguments(self) -> dict[str, Any]:
-        """Return canonical public fields for an internally created view."""
-
-        return {
-            "start_date": self.start_date,
-            "end_date": self.end_date,
-            "time_interval": self.time_interval,
-            "model_step": self.model_step,
-            "calendar": self.calendar,
-            "spin_up_cycles": self.spin_up_cycles,
-            "spin_up_start_date": self.spin_up_start_date,
-            "spin_up_end_date": self.spin_up_end_date,
-            "out_dtype": self.out_dtype,
-            "chunk_len": self.chunk_len,
-            "clip_negative": self.clip_negative,
-            "upsampling": self.upsampling,
-        }
-
-    def _refresh_spatial_selection(self) -> None:
-        """Validate mutable dependencies before consuming a composite selection."""
-
-    def _inherit_spatial_selection(self, reference, *, validate: bool) -> None:
-        selection = {
-            name: getattr(reference, name)
-            for name in ("local_indices", "desired_catchment_ids")
-        }
-        if validate:
-            for name, expected in selection.items():
-                current = getattr(self, name)
-                if current is expected:
-                    continue
-                if (
-                    current is None
-                    or expected is None
-                    or not np.array_equal(current, expected)
-                ):
-                    raise ValueError(
-                        f"composite spatial selection {name} must match its reference"
-                    )
-        for name, value in selection.items():
-            object.__setattr__(self, name, value)
-
-    @property
-    def _main_start_time(self):
-        """Physical start of the main source support exposed to drivers."""
-        return self.start_date
-
-    @property
-    def _main_end_time(self):
-        """Physical inclusive end of the main source support."""
-        return self.end_date
-
-    @property
-    def _spin_up_start_time(self):
-        """Physical start of the source interval replayed for spin-up."""
-        return self.spin_up_start_date
-
-    @property
-    def _spin_up_end_time(self):
-        """Physical inclusive end of the source interval replayed for spin-up."""
-        return self.spin_up_end_date
-
+    # ------------------------------------------------------------------
+    # Compiled identity
+    # ------------------------------------------------------------------
     @property
     def chunk_plan(self) -> SourceChunkPlan:
-        """Return the immutable real-length source-chunk plan."""
+        """The real-length source chunks, spin-up cycles first."""
 
-        return self._chunk_plan
-
-    @property
-    def simulation_schedule(self) -> SimulationSchedule:
-        """Return the immutable schedule compiled during initialization."""
-
-        return self._simulation_schedule
+        return self._plan.chunk_plan
 
     @property
-    def _reuse_count(self) -> int:
-        """Return the schedule-owned number of model calls per source row."""
+    def simulation_schedule(self):
+        """The model schedule, including the resolved calendar."""
 
-        return self._simulation_schedule._reuse_count
+        return self._plan.schedule
 
-    @staticmethod
-    def _validate_time_aggregation(method: str | None) -> str | None:
-        if method is None:
-            return None
-        if type(method) is not str:
-            raise ValueError("time_aggregation method must be an exact string")
-        if method not in ("mean", "max", "min", "sum"):
-            raise ValueError(
-                f"Unsupported time_aggregation={method!r}; "
-                "expected one of: mean, max, min, sum"
-            )
-        return method
+    @property
+    def num_main_source_steps(self) -> int:
+        return self._plan.domain.count
 
-    @classmethod
-    def _normalize_time_aggregation(
-        cls,
-        time_aggregation: str | Mapping[str, str] | None,
-    ) -> str | Mapping[str, str] | None:
-        if time_aggregation is None:
-            return None
-        if type(time_aggregation) is str:
-            return cls._validate_time_aggregation(time_aggregation)
-        if isinstance(time_aggregation, Mapping):
-            if not time_aggregation:
-                raise ValueError("time_aggregation mapping must not be empty")
-            invalid_names = [
-                name for name in time_aggregation if type(name) is not str or not name
-            ]
-            if invalid_names:
-                raise ValueError(
-                    "time_aggregation names must be non-empty strings; "
-                    f"got {invalid_names!r}"
-                )
-            return _immutable_dict(
-                {
-                    name: cls._validate_time_aggregation(method)
-                    for name, method in time_aggregation.items()
-                }
-            )
-        raise ValueError("time_aggregation must be None, a string, or a dict")
+    @property
+    @abstractmethod
+    def space(self) -> GridSpace | PointSpace:
+        """The spatial identity of each value row (with this view's selection)."""
 
-    def _get_time_aggregation_factor(self, source_time_interval: timedelta) -> int:
-        if (
-            timedelta_microseconds(
-                source_time_interval,
-                label="source_time_interval",
-            )
-            <= 0
-        ):
-            raise ValueError("source_time_interval must be positive")
-        try:
-            factor = _timedelta_quotient_trusted(
-                self.time_interval,
-                source_time_interval,
-                duration_label="time_interval",
-                interval_label="source_time_interval",
-            )
-        except ValueError as exc:
-            raise ValueError(
-                "time_interval must be an exact integer multiple of "
-                "source_time_interval for time aggregation"
-            ) from exc
-        if factor <= 0:
-            raise ValueError(
-                "time_interval must not be shorter than source_time_interval "
-                "for time aggregation"
-            )
-        return factor
+    @property
+    def data_size(self) -> int:
+        """Number of values in each source row."""
 
-    def _aggregate_time_axis(
-        self,
-        data: np.ndarray,
-        source_time_interval: timedelta,
-        method: str,
-    ) -> np.ndarray:
-        method = self._validate_time_aggregation(method)
-        factor = self._get_time_aggregation_factor(source_time_interval)
-        if data.shape[0] % factor != 0:
-            raise ValueError(
-                f"Cannot aggregate {data.shape[0]} source frames into "
-                f"windows of {factor} frames"
-            )
-        grouped = data.reshape((data.shape[0] // factor, factor) + data.shape[1:])
-        if method == "mean":
-            out = grouped.mean(axis=1, dtype=np.float64)
-        elif method == "max":
-            out = grouped.max(axis=1)
-        elif method == "min":
-            out = grouped.min(axis=1)
-        elif method == "sum":
-            out = grouped.sum(axis=1, dtype=np.float64)
-        else:
-            raise ValueError(f"Unsupported time_aggregation={method!r}")
-        return out
+        return self.space.size
 
-    def _apply_time_aggregation(
-        self,
-        data: np.ndarray,
-        source_time_interval: timedelta,
-        time_aggregation: str | Mapping[str, str],
-    ) -> np.ndarray | dict[str, np.ndarray]:
-        time_aggregation = self._normalize_time_aggregation(time_aggregation)
-        if type(time_aggregation) is str:
-            return self._aggregate_time_axis(
-                data, source_time_interval, time_aggregation
-            )
-        return {
-            name: self._aggregate_time_axis(data, source_time_interval, method)
-            for name, method in time_aggregation.items()
-        }
+    @property
+    def target_ids(self) -> np.ndarray | None:
+        """Mapping targets of a :meth:`build_local_mapping` view, else ``None``."""
 
-    def _finalize_output_data(self, data: Any, *, label: str) -> Any:
-        """Cast dataset results only after all numerical transformations."""
+        return self._target_ids
 
-        if isinstance(data, Mapping):
-            finalized = {
-                name: self._finalize_output_data(
-                    block,
-                    label=f"{label} variable {name!r}",
-                )
-                for name, block in data.items()
-            }
-            if all(finalized[name] is block for name, block in data.items()):
-                return data
-            return finalized
-        return canonical_floating_array(
-            data,
-            dtype=self.out_dtype,
-            label=label,
-        )
+    # ------------------------------------------------------------------
+    # Reads
+    # ------------------------------------------------------------------
+    def read(self, chunk: SourceChunk) -> np.ndarray | dict[str, np.ndarray]:
+        """Read one chunk of this dataset's plan at model cadence.
 
-    @staticmethod
-    def _direct_output_cast_is_exact(data: np.ndarray) -> bool:
-        """Whether casting to out_dtype equals casting through float64.
-
-        Unscaled storage in these dtypes can skip the float64 calculation
-        copy with bit-identical results and identical errors.
+        Views share their source's plan, so its chunks are accepted by both;
+        any other chunk object is rejected.
         """
 
-        kind, size = data.dtype.kind, data.dtype.itemsize
-        return (kind == "f" and size <= 8) or (kind in {"i", "u"} and size <= 2)
+        if not isinstance(chunk, SourceChunk):
+            raise TypeError("read() requires a SourceChunk of this chunk_plan")
+        chunks = self._plan.chunk_plan.chunks
+        if not (0 <= chunk.index < len(chunks)) or chunks[chunk.index] is not chunk:
+            raise ValueError(
+                "source chunk does not belong to this dataset's chunk plan"
+            )
+        return self._read_at(chunk.index)
 
-    def _canonical_calculation_data(self, data: Any, *, label: str) -> Any:
-        """Own float64 calculation inputs before any arithmetic occurs."""
+    def __getitem__(self, index: int) -> np.ndarray | dict[str, np.ndarray]:
+        """Read chunk ``index`` (the DataLoader entry point)."""
 
-        if isinstance(data, Mapping):
-            return {
-                name: self._canonical_calculation_data(
-                    block,
-                    label=f"{label} variable {name!r}",
+        return self._read_at(plan_index(index, len(self), label="dataset"))
+
+    def __len__(self) -> int:
+        return len(self._plan.chunk_plan)
+
+    def _read_at(self, index: int) -> np.ndarray | dict[str, np.ndarray]:
+        """Chunk ``index`` at model cadence (``distribute`` applied)."""
+
+        return self._distributed(self._read_source(index))
+
+    def _read_source(self, index: int) -> np.ndarray | dict[str, np.ndarray]:
+        """Chunk ``index`` at source cadence, checked and in ``out_dtype``."""
+
+        chunk = self._plan.chunk_plan.chunks[index]
+        return self._converted(self.read_storage(chunk), chunk.length)
+
+    def read_storage(self, chunk: SourceChunk) -> Any:
+        """Return the raw values of ``chunk``: an array or a name→array mapping.
+
+        Arrays have ``chunk.length`` rows.  The caller receives them, so return
+        a copy of any array the dataset keeps.
+        """
+
+        raise NotImplementedError(f"{type(self).__name__} does not read storage")
+
+    def _converted(self, raw: Any, rows: int) -> np.ndarray | dict[str, np.ndarray]:
+        fields = type(self).integer_output_fields
+        if not isinstance(raw, Mapping):
+            if fields:
+                raise ValueError(
+                    "integer_output_fields require source chunks to be mappings"
                 )
-                for name, block in data.items()
-            }
-        return canonical_floating_array(
-            data,
-            dtype="float64",
+            return self._convert(self._ingest(raw, rows, label="source chunk"))
+        if not raw or any(type(name) is not str or not name for name in raw):
+            raise ValueError(
+                "source chunk mapping keys must be non-empty exact strings"
+            )
+        absent = fields.difference(raw)
+        if absent:
+            raise ValueError(
+                "integer_output_fields are absent from the source chunk: "
+                f"{sorted(absent)!r}"
+            )
+        return {
+            name: (
+                ingest_integer(block, rows=rows, label=f"source chunk {name!r}")
+                if name in fields
+                else self._convert(
+                    self._ingest(block, rows, label=f"source chunk {name!r}")
+                )
+            )
+            for name, block in raw.items()
+        }
+
+    def _ingest(self, raw: Any, rows: int, *, label: str) -> np.ndarray:
+        return ingest(
+            raw,
+            rows=rows,
+            missing=self.missing,
+            clip_negative=self.clip_negative,
             label=label,
         )
 
-    def _require_calendar_datetime(
-        self,
-        value: datetime | cftime.datetime,
-        *,
-        label: str,
-    ) -> datetime | cftime.datetime:
-        """Validate one storage timestamp without changing its calendar."""
+    def _convert(self, values: np.ndarray) -> np.ndarray | dict[str, np.ndarray]:
+        """Narrow one ingested read to ``out_dtype``; storage leaves override."""
 
-        _require_date(value, label=label)
-        require_calendar(value, self.calendar, label=label)
-        if type(value) is not type(self.start_date):
-            raise ValueError(
-                f"{label} must use the same datetime representation as "
-                "dataset start_date"
-            )
-        return value
+        return finalize(
+            values,
+            out_dtype=self.out_dtype,
+            checked=not (
+                values.dtype.kind == "f" and bounded(values.dtype, self.out_dtype)
+            ),
+            label="prepared forcing chunk",
+        )
 
-    def _apply_upsampling_policy(self, data: Any) -> Any:
+    def _distributed(self, data: Any) -> Any:
+        """Split each source value evenly over its model steps if requested."""
+
         if self.upsampling != "distribute":
             return data
         if isinstance(data, Mapping):
             return {
-                name: self._apply_upsampling_policy(value)
-                for name, value in data.items()
+                name: (
+                    block
+                    if name in type(self).integer_output_fields
+                    else self._distributed(block)
+                )
+                for name, block in data.items()
             }
-        calculation = self._canonical_calculation_data(
-            data,
-            label="distributed upsampling input",
-        )
-        distributed = calculation / self._reuse_count
-        return self._finalize_output_data(
-            distributed,
+        return finalize(
+            np.asarray(data, dtype=np.float64) / self._plan.reuse_count,
+            out_dtype=self.out_dtype,
+            checked=False,
             label="distributed upsampling output",
         )
 
-    def _validate_source_calendar(self, calendar: str) -> None:
-        """Accept inferred storage metadata or reject a real conflict."""
-
-        source = canonical_calendar(calendar)
-        if source != self.calendar:
-            self._adopt_source_calendar(source)
-
-    def _forcing_blocks(self, chunk: Any) -> Iterator[tuple[Any, int]]:
-        """Yield each source item once with its exact model-call reuse count."""
-
-        if isinstance(chunk, Mapping):
-            length = len(next(iter(chunk.values())))
-            for index in range(length):
-                yield (
-                    {name: value[index] for name, value in chunk.items()},
-                    self._reuse_count,
-                )
-            return
-        for item in chunk:
-            yield item, self._reuse_count
-
-    @property
-    def _num_spin_up_chunks(self) -> int:
-        return self._chunk_plan.num_spinup_chunks
-
-    def read_chunk(
-        self,
-        chunk: SourceChunk,
-    ) -> np.ndarray | dict[str, np.ndarray]:
-        """Read exactly one immutable request from this dataset's source plan."""
-
-        request = _SourceChunkReadRequest(
-            chunk=chunk,
-            chunk_plan=self._chunk_plan,
-        )
-        return self._read_chunk_trusted(request.chunk)
-
-    def _read_chunk_trusted(
-        self,
-        chunk: SourceChunk,
-    ) -> np.ndarray | dict[str, np.ndarray]:
-        """Read one framework-produced chunk without revalidating identity."""
-
-        return self._accept_read_chunk(
-            self._read_chunk(chunk),
-            chunk,
-        )
-
-    def _accept_read_chunk(self, data: Any, chunk: SourceChunk) -> Any:
-        """Accept a trusted composite result without validating it again."""
-
-        del chunk
-        return data
-
-    def get_chunk(
-        self,
-        chunk: SourceChunk,
-    ) -> np.ndarray | dict[str, np.ndarray]:
-        """Read and normalize one exact source request for consumption."""
-
-        request = _SourceChunkReadRequest(
-            chunk=chunk,
-            chunk_plan=self._chunk_plan,
-        )
-        return self._get_chunk_trusted(request.chunk)
-
-    def _get_chunk_trusted(
-        self,
-        chunk: SourceChunk,
-    ) -> np.ndarray | dict[str, np.ndarray]:
-        """Prepare one framework-produced chunk without revalidation."""
-
-        data = self._read_chunk_trusted(chunk)
-        integer_fields = getattr(
-            type(self),
-            "integer_output_fields",
-            frozenset(),
-        )
-        if isinstance(data, dict):
-            missing_integer_fields = integer_fields.difference(data)
-            if missing_integer_fields:
-                raise ValueError(
-                    "integer_output_fields are absent from the source chunk: "
-                    f"{sorted(missing_integer_fields)!r}"
-                )
-            return {
-                name: (
-                    self._prepare_integer_output_array(block, label=name)
-                    if name in integer_fields
-                    else self._prepare_chunk_array(block)
-                )
-                for name, block in data.items()
-            }
-        if integer_fields:
-            raise ValueError(
-                "integer_output_fields require source chunks to be mappings"
-            )
-        return self._prepare_chunk_array(data)
-
-    @staticmethod
-    def _prepare_integer_output_array(
-        data: Any,
-        *,
-        label: str,
-    ) -> np.ndarray:
-        """Canonicalize one declared integer output without float conversion."""
-
-        if np.ma.isMaskedArray(data):
-            raise ValueError(
-                f"prepared integer forcing field {label!r} must not be masked"
-            )
-        array = np.asarray(data)
-        if array.ndim < 1:
-            raise ValueError(
-                f"prepared integer forcing field {label!r} must include a time axis"
-            )
-        if array.dtype.kind not in {"i", "u"}:
-            raise ValueError(
-                f"prepared integer forcing field {label!r} must contain integers"
-            )
-        if (
-            array.dtype.kind == "u"
-            and array.size
-            and int(array.max()) > np.iinfo(np.int64).max
-        ):
-            raise ValueError(
-                f"prepared integer forcing field {label!r} contains a value "
-                "outside int64 range"
-            )
-        return np.array(array, dtype=np.int64, order="C", copy=True)
-
-    @abstractmethod
-    def _read_chunk(
-        self,
-        chunk: SourceChunk,
-    ) -> np.ndarray | dict[str, np.ndarray]:
-        """Interpret one validated temporal request through source storage.
-
-        Implementations interpret the same temporal request through their own
-        storage layout. Returned arrays retain ``chunk.length`` real rows and
-        are never padded.
-        """
-
-        ...
-
-    @property
-    def num_main_source_steps(self) -> int:
-        return self._temporal_domain.count
-
-    @property
-    def _num_spin_up_source_steps_per_cycle(self) -> int:
-        return self._chunk_plan.spinup_source_count_per_cycle
-
-    @abstractmethod
     def close(self) -> None:
-        """
-        Close any open resources or files. Implementations must be idempotent.
-        """
+        """Close process-local resources; idempotent (later reads reopen)."""
 
-    def _close_children(self) -> tuple[object, ...]:
-        """Return directly owned datasets; leaves own no child datasets."""
+    def _first_frame_missing(self) -> np.ndarray | None:
+        """``(Y, X)`` missing-value mask of the first source frame, if readable."""
 
-        return ()
+        return None
 
-    def _combine(self, other, operation, reverse=False):
-        from hydroforge.data.datasets.expression import DatasetExpression
+    # ------------------------------------------------------------------
+    # Views and sharding
+    # ------------------------------------------------------------------
+    def _view(self, fields: Mapping[str, Any] | None = None, /, **private: Any) -> Self:
+        """A dataset sharing this plan and storage with updated view state."""
 
-        is_dataset = isinstance(other, (AbstractDataset, DatasetExpression))
-        is_scalar = (
-            isinstance(other, (int, float, np.integer, np.floating))
-            and not isinstance(other, (bool, np.bool_))
-            and np.isfinite(other)
+        view = type(self).model_construct(**(self.__dict__ | dict(fields or {})))
+        object.__setattr__(
+            view, "__pydantic_private__", self.__pydantic_private__ | private
         )
+        return view
 
-        if not (is_dataset or is_scalar):
-            return NotImplemented
+    def replaced(self, **fields: Any) -> Self:
+        """Return a newly validated dataset declaring ``fields`` instead."""
 
-        left, right = (other, self) if reverse else (self, other)
-        return DatasetExpression(
-            left=left,
-            operation=operation,
-            right=right,
-        )
+        return type(self).model_validate(self.__dict__ | fields)
 
-    def __getitem__(self, idx: int) -> np.ndarray | dict[str, np.ndarray]:
-        """
-        Fetch one chunk (T <= chunk_len) starting at chunk index `idx`.
-
-        The final chunk retains its real time length instead of being padded.
-        """
-        chunk = self._chunk_plan._at_trusted(
-            _validated_dataset_index(self, idx),
-        )
-        return self._get_chunk_trusted(chunk)
-
-    def _prepare_chunk_array(
+    @validate_call(config=HydroForgeModel.model_config)
+    def build_local_mapping(
         self,
-        data: np.ndarray,
-    ) -> np.ndarray:
-        if self.upsampling == "distribute":
-            # The distributed result is already finalized in out_dtype.
-            return self._apply_upsampling_policy(data)
-        return self._finalize_output_data(
-            data,
-            label="prepared forcing chunk",
+        mapping_file: Annotated[Path, Field(strict=False)],
+        target_ids: UniqueIds | None = None,
+        *,
+        device: TorchDevice = torch.device("cpu"),
+        precision: Literal["float32", "float64"] = "float32",
+    ) -> tuple[Self, torch.Tensor]:
+        """Return a view reading the mapped source cells, and its mapping.
+
+        The mapping tensor is the sparse ``(targets, active sources)`` matrix
+        of the saved table restricted to ``target_ids`` (all targets when
+        ``None``): CSR on CUDA, coalesced COO on other devices.  This dataset
+        is not changed; mapping a view again selects from the full source
+        grid.
+        """
+
+        space = self.space
+        if not isinstance(space, GridSpace):
+            raise TypeError(f"{type(self).__name__} has no source grid to map")
+        table = MappingTable.load(mapping_file)
+        table.require_source_grid(space.longitude, space.latitude)
+        local = table.local(target_ids)
+        tensor = local.to_torch(
+            device=device,
+            dtype=_TORCH_DTYPES[precision],
+            layout=_mapping_layout(device),
+        )
+        return self._mapped(local.source_indices, local.target_ids), tensor
+
+    def _mapped(self, source_indices: np.ndarray, target_ids: np.ndarray) -> Self:
+        return self._view(
+            _space=self.space.select(source_indices),
+            _target_ids=target_ids,
         )
 
-    def __len__(self) -> int:
-        return len(self._chunk_plan)
+    def shard_forcing(self, chunk: Any, mapping: torch.Tensor | None = None) -> Any:
+        """Put one device batch of this dataset's reads on its targets.
 
-    def __add__(self, other: _DatasetOperand):
+        Mapped grid views multiply by the tensor from :meth:`build_local_mapping`;
+        point datasets take no mapping and return the batch.  Only structure,
+        shape, dtype and device are checked, without device synchronization.
+        """
+
+        self._check_forcing(chunk, mapping, label="forcing")
+        return chunk if mapping is None else _mapped_forcing(chunk, mapping)
+
+    def _check_forcing(
+        self, chunk: Any, mapping: torch.Tensor | None, *, label: str
+    ) -> None:
+        space = self.space
+        if isinstance(space, PointSpace):
+            if mapping is not None:
+                raise ValueError("point datasets are sharded without a mapping")
+            _check_forcing_tensors(
+                chunk,
+                columns=space.size,
+                dtype=_TORCH_DTYPES[self.out_dtype],
+                device=None,
+                sequence=True,
+                label=label,
+            )
+            return
+        self._require_mapping(mapping, caller="shard_forcing()")
+        _check_forcing_tensors(
+            chunk,
+            columns=space.size,
+            dtype=mapping.dtype,
+            device=mapping.device,
+            sequence=False,
+            label=label,
+        )
+
+    def _require_mapping(self, mapping: Any, *, caller: str) -> np.ndarray:
+        """Target IDs of this grid view once ``mapping`` is its mapping tensor."""
+
+        targets = self.target_ids
+        if not isinstance(self.space, GridSpace) or targets is None:
+            raise ValueError(
+                f"{caller} requires a grid dataset view returned by build_local_mapping()"
+            )
+        expected = (targets.size, self.data_size)
+        if (
+            not isinstance(mapping, torch.Tensor)
+            or mapping.layout != _mapping_layout(mapping.device)
+            or tuple(mapping.shape) != expected
+        ):
+            observed = (
+                f"{mapping.layout} with shape {tuple(mapping.shape)}"
+                if isinstance(mapping, torch.Tensor)
+                else type(mapping).__name__
+            )
+            raise ValueError(
+                "mapping must be the sparse tensor build_local_mapping() returns on its "
+                f"device, with shape {expected}; got {observed}"
+            )
+        return targets
+
+    # ------------------------------------------------------------------
+    # Arithmetic
+    # ------------------------------------------------------------------
+    def _combine(self, other: Any, operation: str, *, reverse: bool = False) -> Any:
+        if not (isinstance(other, ForcingDataset) or _is_scalar(other)):
+            return NotImplemented
+        left, right = (other, self) if reverse else (self, other)
+        return DatasetExpression(left=left, operation=operation, right=right)
+
+    def __add__(self, other: Any):
         return self._combine(other, "add")
 
-    def __radd__(self, other: _DatasetOperand):
+    def __radd__(self, other: Any):
         return self._combine(other, "add", reverse=True)
 
-    def __sub__(self, other: _DatasetOperand):
+    def __sub__(self, other: Any):
         return self._combine(other, "sub")
 
-    def __rsub__(self, other: _DatasetOperand):
+    def __rsub__(self, other: Any):
         return self._combine(other, "sub", reverse=True)
 
-    def __mul__(self, other: _DatasetOperand):
+    def __mul__(self, other: Any):
         return self._combine(other, "mul")
 
-    def __rmul__(self, other: _DatasetOperand):
+    def __rmul__(self, other: Any):
         return self._combine(other, "mul", reverse=True)
 
-    def __truediv__(self, other: _DatasetOperand):
+    def __truediv__(self, other: Any):
         return self._combine(other, "div")
 
-    def __rtruediv__(self, other: _DatasetOperand):
+    def __rtruediv__(self, other: Any):
         return self._combine(other, "div", reverse=True)
 
 
-class SourceDataset(AbstractDataset, ABC):
-    """Validated declarative fields shared by physical storage adapters."""
+class CompositeDataset(ForcingDataset, ABC):
+    """A dataset computed from children that share one plan and one space.
 
-    integer_output_fields: ClassVar[frozenset[str]] = frozenset()
+    The declaration mirrors the first child; the plan is that child's plan
+    object, not a recompilation.  Children keep their own storage and
+    missing-value policies.
+    """
 
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        declaration = _DatasetClassDeclaration(
-            supports_time_aggregation=cls.supports_time_aggregation,
-            precompressed_source=cls.precompressed_source,
-            integer_output_fields=cls.integer_output_fields,
-        )
-        cls.supports_time_aggregation = declaration.supports_time_aggregation
-        cls.precompressed_source = declaration.precompressed_source
-        cls.integer_output_fields = declaration.integer_output_fields
+    # Declarations mirror the reference child, whose chunk length may be
+    # planned from storage.
+    chunk_len: int | None = Field(default=None, ge=1)
 
-    _source_file_identities: dict[Path, _SourceFileIdentity] = PrivateAttr(
-        default_factory=dict,
-    )
+    _reference: ForcingDataset = PrivateAttr()
 
-    def _prepare_chunk_array(
-        self,
-        data: np.ndarray,
-    ) -> np.ndarray:
-        # Leaf payloads were validated at the storage boundary
-        # (_accept_read_chunk); an exact out_dtype array needs no second pass.
-        if (
-            type(data) is np.ndarray
-            and data.dtype == np.dtype(self.out_dtype)
-            and data.flags.c_contiguous
-            and self.upsampling != "distribute"
-        ):
-            return data
-        return super()._prepare_chunk_array(data)
+    @classmethod
+    @abstractmethod
+    def _declared_reference(cls, value: Mapping[str, Any]) -> Any:
+        """The first child in a raw declaration, if it is a dataset."""
 
-    def _accept_read_chunk(self, data: Any, chunk: SourceChunk) -> Any:
-        """Validate one raw leaf result, or unwrap an already validated read."""
+    @abstractmethod
+    def _children(self) -> tuple[tuple[str, ForcingDataset], ...]:
+        """Labelled child datasets, reference first."""
 
-        if isinstance(data, _TrustedSourceChunk):
-            return data.data
-        if isinstance(data, Mapping) and self.integer_output_fields:
-            if not data:
-                raise ValueError("source chunk mapping must not be empty")
-            if any(type(name) is not str or not name for name in data):
-                raise ValueError(
-                    "source chunk mapping keys must be non-empty exact strings"
+    @model_validator(mode="before")
+    @classmethod
+    def _mirror_declaration(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        reference = cls._declared_reference(value)
+        if not isinstance(reference, ForcingDataset):
+            return value
+        payload = dict(value)
+        for name in ForcingDataset.model_fields:
+            expected = getattr(reference, name)
+            if name in payload and payload[name] != expected:
+                raise ValueError(f"{cls.__name__} {name} must match its children")
+            payload[name] = expected
+        return payload
+
+    @model_validator(mode="after")
+    def _compile(self) -> Self:
+        if "_plan" in self.__pydantic_private__:
+            return self
+        (_name, reference), *others = self._children()
+        for label, child in others:
+            self._require_compatible(reference, child, label=label)
+        self._reference = reference
+        self._plan = reference._plan
+        return self
+
+    def _require_compatible(
+        self, reference: ForcingDataset, child: ForcingDataset, *, label: str
+    ) -> None:
+        reference._plan.require_equivalent(child._plan, label=label)
+        space, other = reference.space, child.space
+        if type(space) is not type(other):
+            raise ValueError(f"{label} cannot mix grid and point sources")
+        space.require_compatible(other, label=label)
+        windows = []
+        for dataset in (reference, child):
+            while isinstance(dataset, CompositeDataset):
+                dataset = dataset._reference
+            starts = getattr(dataset, "window_starts", None)
+            windows.append(
+                (
+                    getattr(dataset, "window_length", None)
+                    if starts is not None
+                    else None,
+                    starts,
                 )
-            return {
-                name: _SourceChunkPayload(
-                    data=block,
-                    expected_rows=chunk.length,
-                    clip_negative=(
-                        False
-                        if name in self.integer_output_fields
-                        else self.clip_negative
-                    ),
-                ).data
-                for name, block in data.items()
-            }
-        return _SourceChunkPayload(
-            data=data,
-            expected_rows=chunk.length,
-            clip_negative=self.clip_negative,
-        ).data
-
-    @staticmethod
-    def _canonical_source_path(path: str | Path) -> Path:
-        return Path(path).absolute()
-
-    @contextmanager
-    def _inspect_source_file(self, path: str | Path) -> Iterator[Path]:
-        """Bind schema reads to the same file identity used by runtime reads."""
-
-        canonical = self._canonical_source_path(path)
-        identity = self._source_file_identities.get(canonical)
-        if identity is None:
-            identity = _SourceFileIdentity.capture(canonical)
-            self._source_file_identities[canonical] = identity
-        else:
-            identity.verify(canonical)
-        yield canonical
-        identity.verify(canonical)
-
-    def _record_source_files(self, paths: Iterable[str | Path]) -> None:
-        """Finalize inspected identities without recapturing validated files."""
-
-        for path in paths:
-            with self._inspect_source_file(path):
-                pass
-
-    def _checked_source_path(self, path: str | Path) -> Path:
-        """Verify external identity immediately before one runtime read."""
-
-        canonical = self._canonical_source_path(path)
-        self._source_file_identities[canonical].verify(canonical)
-        return canonical
-
-    def _verify_source_path(self, path: str | Path) -> None:
-        """Verify external identity immediately after one runtime read."""
-
-        canonical = self._canonical_source_path(path)
-        self._source_file_identities[canonical].verify(canonical)
-
-    def _validate_local_index_extent(self, size: int, *, label: str) -> None:
-        """Validate this immutable spatial view against source storage."""
-
-        if (
-            self.local_indices is not None
-            and self.local_indices.size
-            and int(self.local_indices.max()) >= size
+            )
+        if windows[0][0] != windows[1][0] or not np.array_equal(
+            windows[0][1], windows[1][1]
         ):
-            raise ValueError(f"dataset local_indices exceed {label} size {size}")
+            raise ValueError(f"{label} must share the same sampling windows")
+
+    def __len__(self) -> int:
+        return len(self._reference)
+
+    def __getitem__(self, index: int) -> Any:
+        return self._read_item(plan_index(index, len(self), label="dataset"))
+
+    @abstractmethod
+    def _read_item(self, index: int) -> Any:
+        """Read children through their public chunk or window item protocol."""
 
     @property
-    @abstractmethod
-    def data_size(self) -> int:
-        """Number of spatial values produced by each source step."""
+    def space(self) -> GridSpace | PointSpace:
+        return self._reference.space
 
-    @abstractmethod
-    def get_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return the coordinate identity associated with ``data_size``."""
+    @property
+    def target_ids(self) -> np.ndarray | None:
+        return self._reference.target_ids
+
+    def _unique_children(self) -> tuple[ForcingDataset, ...]:
+        return tuple({id(child): child for _name, child in self._children()}.values())
+
+    def close(self) -> None:
+        with cleanup_on_exit(
+            f"{type(self).__name__} resources",
+            [child.close for child in self._unique_children()],
+        ):
+            pass
+
+
+_OPERATIONS: dict[str, Callable[[Any, Any], Any]] = {
+    "add": add,
+    "sub": sub,
+    "mul": mul,
+    "div": truediv,
+}
+
+
+def _is_scalar(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float, np.integer, np.floating))
+        and not isinstance(value, (bool, np.bool_))
+        and bool(np.isfinite(value))
+    )
+
+
+def _operand(value: Any) -> Any:
+    if isinstance(value, ForcingDataset) or _is_scalar(value):
+        return value
+    raise ValueError(
+        "dataset expression operands must be datasets or finite real numbers"
+    )
+
+
+_Operand = Annotated[Any, AfterValidator(_operand)]
+
+
+def _evaluate_expression(
+    operation: str,
+    left: Any,
+    right: Any,
+    *,
+    left_is_scalar: bool,
+    right_is_scalar: bool,
+    out_dtype: str,
+) -> Any:
+    left_mapping = isinstance(left, Mapping)
+    right_mapping = isinstance(right, Mapping)
+    if left_mapping or right_mapping:
+        if left_mapping and right_mapping:
+            if set(left) != set(right):
+                raise ValueError(
+                    "dataset expression mappings must have identical variable names"
+                )
+            pairs = {name: (left[name], right[name]) for name in left}
+        elif left_mapping and right_is_scalar:
+            pairs = {name: (block, right) for name, block in left.items()}
+        elif right_mapping and left_is_scalar:
+            pairs = {name: (left, block) for name, block in right.items()}
+        else:
+            raise TypeError(
+                "dataset expression operands must return matching mappings or "
+                "numeric arrays"
+            )
+        return {
+            name: _evaluate_expression(
+                operation,
+                first,
+                second,
+                left_is_scalar=left_is_scalar and not left_mapping,
+                right_is_scalar=right_is_scalar and not right_mapping,
+                out_dtype=out_dtype,
+            )
+            for name, (first, second) in pairs.items()
+        }
+
+    left_array = np.asarray(left)
+    right_array = np.asarray(right)
+    if (
+        not left_is_scalar
+        and not right_is_scalar
+        and left_array.shape != right_array.shape
+    ):
+        raise ValueError(
+            "dataset expression operands must return identical shapes; got "
+            f"{left_array.shape} and {right_array.shape}"
+        )
+    # Evaluate in the declared output dtype: arithmetic in an operand's own
+    # integer or narrower dtype could overflow before the result is checked.
+    left_array = canonical_floating_array(
+        left_array,
+        dtype=out_dtype,
+        label="left dataset expression operand",
+    )
+    right_array = canonical_floating_array(
+        right_array,
+        dtype=out_dtype,
+        label="right dataset expression operand",
+    )
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        result = _OPERATIONS[operation](left_array, right_array)
+    try:
+        return canonical_floating_array(
+            result,
+            dtype=out_dtype,
+            label="dataset expression result",
+        )
+    except ValueError:
+        if np.isinf(result).any() and not (
+            operation == "div" and np.any(right_array == 0)
+        ):
+            if out_dtype == "float32":
+                raise OverflowError(
+                    "dataset expression result contains values outside float32 range"
+                ) from None
+            raise OverflowError(
+                "dataset expression result overflowed float64"
+            ) from None
+        raise
+
+
+class DatasetExpression(CompositeDataset):
+    """A lazy arithmetic expression of compatible datasets and scalars.
+
+    Each dataset operand is read once per chunk and applies its own upsampling
+    before the arithmetic, evaluated in the reference ``out_dtype``.
+    """
+
+    left: _Operand
+    operation: Literal["add", "sub", "mul", "div"]
+    right: _Operand
+
+    _left: Any = PrivateAttr()
+    _right: Any = PrivateAttr()
+
+    @classmethod
+    def _declared_reference(cls, value: Mapping[str, Any]) -> Any:
+        return next(
+            (
+                operand
+                for operand in (value.get("left"), value.get("right"))
+                if isinstance(operand, ForcingDataset)
+            ),
+            None,
+        )
+
+    def _children(self) -> tuple[tuple[str, ForcingDataset], ...]:
+        children = tuple(
+            operand
+            for operand in (self.left, self.right)
+            if isinstance(operand, ForcingDataset)
+        )
+        return tuple(
+            (f"dataset operand {position}", child)
+            for position, child in enumerate(children)
+        )
+
+    @model_validator(mode="after")
+    def _compile(self) -> Self:
+        if "_plan" in self.__pydantic_private__:
+            return self
+        if not self._children():
+            raise ValueError("a dataset expression requires at least one dataset")
+        super()._compile()
+        self._left, self._right = (
+            operand
+            if isinstance(operand, ForcingDataset)
+            else float(
+                canonical_floating_array(
+                    operand, dtype=self.out_dtype, label=f"{side} expression scalar"
+                ).item()
+            )
+            for side, operand in (("left", self.left), ("right", self.right))
+        )
+        if (
+            self.operation == "div"
+            and not isinstance(self._right, ForcingDataset)
+            and self._right == 0
+        ):
+            raise ZeroDivisionError(
+                "dataset expression scalar denominator must be nonzero"
+            )
+        return self
+
+    def _require_compatible(
+        self, reference: ForcingDataset, child: ForcingDataset, *, label: str
+    ) -> None:
+        if child.out_dtype != reference.out_dtype:
+            raise ValueError(
+                f"{label} has out_dtype {child.out_dtype!r}, expected "
+                f"{reference.out_dtype!r}"
+            )
+        super()._require_compatible(reference, child, label=label)
+
+    def _read_at(self, index: int) -> Any:
+        return self._evaluate(index, {}, mode="chunk")
+
+    def _read_source(self, index: int) -> Any:
+        return self._evaluate(index, {}, mode="source")
+
+    def _read_item(self, index: int) -> Any:
+        return self._evaluate(index, {}, mode="item")
+
+    def _evaluate(
+        self,
+        index: int,
+        reads: dict[int, Any],
+        *,
+        mode: Literal["chunk", "source", "item"],
+    ) -> Any:
+        return _evaluate_expression(
+            self.operation,
+            self._value(self._left, index, reads, mode=mode),
+            self._value(self._right, index, reads, mode=mode),
+            left_is_scalar=not isinstance(self._left, ForcingDataset),
+            right_is_scalar=not isinstance(self._right, ForcingDataset),
+            out_dtype=self.out_dtype,
+        )
+
+    @staticmethod
+    def _value(
+        operand: Any,
+        index: int,
+        reads: dict[int, Any],
+        *,
+        mode: Literal["chunk", "source", "item"],
+    ):
+        if not isinstance(operand, ForcingDataset):
+            return operand
+        if isinstance(operand, DatasetExpression):
+            return operand._evaluate(index, reads, mode=mode)
+        # Reads are deterministic: an operand used twice is read once.
+        if id(operand) not in reads:
+            reads[id(operand)] = (
+                operand[index]
+                if mode == "item"
+                else operand._read_source(index)
+                if mode == "source"
+                else operand._read_at(index)
+            )
+        return reads[id(operand)]
+
+    def _derived(self, derive: Callable[[ForcingDataset], ForcingDataset]) -> Self:
+        views: dict[int, ForcingDataset] = {}
+
+        def mapped(operand: Any) -> Any:
+            if not isinstance(operand, ForcingDataset):
+                return operand
+            if id(operand) not in views:
+                views[id(operand)] = derive(operand)
+            return views[id(operand)]
+
+        left, right = mapped(self.left), mapped(self.right)
+        reference = left if isinstance(left, ForcingDataset) else right
+        return self._view(
+            {"left": left, "right": right},
+            _left=mapped(self._left),
+            _right=mapped(self._right),
+            _reference=reference,
+        )
+
+    def _mapped(self, source_indices: np.ndarray, target_ids: np.ndarray) -> Self:
+        return self._derived(lambda child: child._mapped(source_indices, target_ids))
+
+    @validate_call(config=HydroForgeModel.model_config)
+    def selected(self, target_ids: UniqueIds) -> Self:
+        """Select every point operand together, preserving the expression."""
+
+        if not isinstance(self.space, PointSpace):
+            raise TypeError("selected() requires point datasets")
+        return self._derived(lambda child: child.selected(target_ids))

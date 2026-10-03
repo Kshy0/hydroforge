@@ -3,56 +3,25 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from functools import wraps
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from pydantic import model_validator
 
-from hydroforge.contracts.errors import (
+from hydroforge.core.errors import (
     ResourceCleanupError,
     distributed_failure_error,
 )
-from hydroforge.contracts.validation import HydroForgeModel
-
-if TYPE_CHECKING:
-    from hydroforge.model.model import AbstractModel
+from hydroforge.core.validation import HydroForgeModel
+from hydroforge.execution.context import (
+    managed_step_active,
+    validate_synchronous_function,
+)
+from hydroforge.execution.session import ModelRuntime
 
 _F = TypeVar("_F", bound=Callable[..., Any])
-
-
-def coordinate_preflight(
-    model: AbstractModel,
-    error: BaseException | None,
-    *,
-    phase: str,
-    scope: str,
-    signature: tuple[Any, ...] | None = None,
-) -> None:
-    """Coordinate an entry check before its guarded side effects begin."""
-
-    if model.world_size > 1:
-        failures = model._gather_distributed_failures(
-            error, phase=phase, signature=signature
-        )
-        if any(failure is not None for failure in failures):
-            if error is not None:
-                raise error
-            raise distributed_failure_error(scope, failures)
-    elif error is not None:
-        raise error
-
-
-def _validate_synchronous_function(function: Callable, *, decorator: str) -> None:
-    def is_deferred(implementation: Callable) -> bool:
-        return (
-            inspect.iscoroutinefunction(implementation)
-            or inspect.isgeneratorfunction(implementation)
-            or inspect.isasyncgenfunction(implementation)
-        )
-
-    if is_deferred(inspect.unwrap(function, stop=is_deferred)):
-        raise ValueError(f"{decorator} requires a synchronous non-generator function")
 
 
 class _BetweenStepsDeclaration(HydroForgeModel):
@@ -64,7 +33,7 @@ class _BetweenStepsDeclaration(HydroForgeModel):
     def _validate_function(self) -> _BetweenStepsDeclaration:
         if getattr(self.function, "__hydroforge_managed_step__", None) is not None:
             raise ValueError("@between_steps cannot decorate a @managed_step method")
-        _validate_synchronous_function(self.function, decorator="@between_steps")
+        validate_synchronous_function(self.function, decorator="@between_steps")
         parameters = tuple(inspect.signature(self.function).parameters.values())
         if (
             not parameters
@@ -88,12 +57,18 @@ def between_steps(function: _F) -> _F:
     body runs. Once the body is entered, any local failure makes mutation
     atomicity unprovable: every rank is notified and the model is permanently
     poisoned so it cannot be stepped again.
+
+    In a distributed run every rank must call the same between-step APIs in
+    the same order. Arguments are this rank's own data (for example its
+    spatial shard of new inputs): the framework compares only the method
+    identity and call order across ranks, never the argument values.
     """
 
     declaration = _BetweenStepsDeclaration(function=function)
     function = declaration.function
     signature = inspect.signature(function)
-    protocol_name = f"{function.__module__}.{function.__qualname__}"
+    method_name = function.__qualname__
+    protocol_name = f"{function.__module__}.{method_name}"
     parameter_names = set(signature.parameters).difference({"self"})
     parameters = tuple(signature.parameters.values())[1:]
     simple_binding = all(
@@ -126,13 +101,13 @@ def between_steps(function: _F) -> _F:
 
     @wraps(function)
     def guarded(self, *args, **kwargs):
-        from hydroforge.execution.step import _managed_step_active
-
-        if _managed_step_active():
+        if managed_step_active():
             raise RuntimeError(
                 "@between_steps APIs cannot be called from an active @managed_step"
             )
 
+        runtime = ModelRuntime.of(self)
+        channel = runtime.channel
         invocation_error: BaseException | None = None
         try:
             if (
@@ -146,31 +121,26 @@ def between_steps(function: _F) -> _F:
                 bound = signature.bind(self, *args, **kwargs)
                 bound.apply_defaults()
                 arguments = bound.arguments
-            from hydroforge.contracts.options import OptionsConfig
 
-            options = getattr(self, "options", None)
-            if isinstance(options, OptionsConfig):
-                options.validate_forcing_arguments(
-                    parameter_names,
-                    arguments,
-                )
+            runtime.plan.options.validate_forcing_arguments(
+                parameter_names,
+                arguments,
+            )
         except BaseException as error:
             invocation_error = error
-        coordinate_preflight(
-            self,
+        channel.preflight(
             invocation_error,
             phase=f"between-steps.invocation:{protocol_name}",
             scope="distributed between-steps invocation validation",
-            signature=(self._runtime_materialized,) if self.world_size > 1 else None,
+            signature=(runtime.state == "materialized",),
         )
 
         health_error: BaseException | None = None
         try:
-            self._ensure_healthy_runtime()
+            runtime.require_healthy(method_name)
         except BaseException as error:
             health_error = error
-        coordinate_preflight(
-            self,
+        channel.preflight(
             health_error,
             phase=f"between-steps.health:{protocol_name}",
             scope="distributed between-steps runtime health validation",
@@ -184,53 +154,64 @@ def between_steps(function: _F) -> _F:
             body_error = error
 
         poison_phase = f"between-steps body:{protocol_name}"
-        if self.world_size > 1:
-            try:
-                body_failures = self._gather_distributed_failures(
-                    body_error,
-                    phase=f"between-steps.body:{protocol_name}",
+        try:
+            body_failures = channel.gather(
+                body_error,
+                phase=f"between-steps.body:{protocol_name}",
+            )
+        except BaseException as coordination_error:
+            failure = (
+                coordination_error
+                if body_error is None
+                else ResourceCleanupError(
+                    "between-steps body failure coordination",
+                    (body_error, coordination_error),
                 )
-            except BaseException as coordination_error:
-                failure = (
-                    coordination_error
-                    if body_error is None
-                    else ResourceCleanupError(
-                        "between-steps body failure coordination",
-                        (body_error, coordination_error),
-                    )
+            )
+            runtime.execution.poison(failure, phase=poison_phase)
+            if failure is coordination_error:
+                raise
+            raise failure from coordination_error
+        if any(failure is not None for failure in body_failures):
+            failure = (
+                body_error
+                if body_error is not None
+                else distributed_failure_error(
+                    "distributed between-steps body",
+                    body_failures,
                 )
-                self._execution.poison(failure, phase=poison_phase)
-                if failure is coordination_error:
-                    raise
-                raise failure from coordination_error
-            if any(failure is not None for failure in body_failures):
-                failure = (
-                    body_error
-                    if body_error is not None
-                    else distributed_failure_error(
-                        "distributed between-steps body",
-                        body_failures,
-                    )
-                )
-                self._execution.poison(failure, phase=poison_phase)
-                raise failure
-        elif body_error is not None:
-            self._execution.poison(body_error, phase=poison_phase)
-            raise body_error
+            )
+            runtime.execution.poison(failure, phase=poison_phase)
+            raise failure
         return result
 
     guarded.__hydroforge_between_steps__ = True
     return cast(_F, guarded)
 
 
-def is_between_steps_api(value: Any) -> bool:
-    """Read the nominal marker without invoking descriptors or user code."""
+@contextmanager
+def specialization_update(model: Any, *, phase: str) -> Iterator[None]:
+    """Publish between-step changes to values compiled kernels specialize on.
 
-    try:
-        marker = inspect.getattr_static(
-            value,
-            "__hydroforge_between_steps__",
+    Kernel bindings, compiled programs and captures of the materialized
+    ``model`` are released before the body assigns new non-tensor values
+    (for example module scalars bound as kernel arguments). A failure of the
+    release or of the body poisons the model instead of letting a stale
+    specialization run. Tensor storage changes use ``update_structure``.
+    """
+
+    if managed_step_active():
+        raise RuntimeError(
+            "specialization updates cannot run inside an active @managed_step"
         )
-    except AttributeError:
-        return False
-    return marker is True
+    runtime = ModelRuntime.of(model)
+    what = f"{type(model).__name__}.specialization_update"
+    runtime.require_materialized(what)
+    runtime.require_healthy(what)
+    execution = runtime.execution
+    try:
+        execution.invalidate()
+        yield
+    except BaseException as error:
+        execution.poison(error, phase=phase)
+        raise

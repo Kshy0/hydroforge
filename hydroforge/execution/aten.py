@@ -9,6 +9,8 @@ from typing import Any
 
 import torch
 
+from hydroforge.core.errors import SubstepCompileError
+
 FORBIDDEN_SUBSTEP_CONVERSIONS = frozenset(
     {
         "bfloat16",
@@ -166,8 +168,6 @@ def preallocated_replay_overload(function: Any) -> Any | None:
 
 
 def _error(message: str) -> None:
-    from hydroforge.execution.operators import SubstepCompileError
-
     raise SubstepCompileError(message)
 
 
@@ -310,6 +310,7 @@ def _validate_scatter(
     target = destination if name.endswith("_") else result
     if not isinstance(target, torch.Tensor) or target.dtype != torch.float32:
         _error(f"Compiled ATen {name} output must be an address-stable float32 tensor")
+    _require_contiguous(name, target)
     _require_same_shape(f"{name} destination/output", destination, target)
     if name == "index_add_":
         alpha = kwargs.get("alpha", args[4] if len(args) > 4 else 1)
@@ -366,6 +367,14 @@ def validate_compiled_aten(
     contract = COMPILED_ATEN_CONTRACTS.get(schema_name)
     if contract is None or overload not in contract.overloads:
         _error(f"Torch operator {schema_name}.{overload} is not compiled")
+    if contract.semantics != "copy":
+        tensors = [
+            value
+            for value in (*args, *kwargs.values(), result)
+            if isinstance(value, torch.Tensor)
+        ]
+        if tensors and any(value.device != tensors[0].device for value in tensors[1:]):
+            _error("Compiled ATen tensor operands and output must share one device")
     name = schema_name.removeprefix("aten::").removesuffix("_")
     if contract.semantics == "copy":
         _validate_copy(args)
@@ -391,13 +400,3 @@ def validate_compiled_aten(
         _validate_binary(name, schema_name, args, kwargs, result)
     else:
         raise RuntimeError(f"unhandled compiled ATen semantics {contract.semantics!r}")
-
-
-def supports_aten(execution: Any, name: str, overload: str) -> bool:
-    """Query the selected substep compiler's explicit operator contract."""
-
-    if execution.capture_mode == "metal_icb":
-        from hydroforge.execution.metal_aten import supports_metal_aten
-
-        return supports_metal_aten(name, overload)
-    return (name, overload) in COMPILED_ATEN

@@ -18,52 +18,41 @@ from netCDF4 import Dataset
 from pydantic import (
     BeforeValidator,
     Field,
+    InstanceOf,
     PrivateAttr,
-    ValidationInfo,
     field_serializer,
     model_validator,
+    validate_call,
 )
 
-from hydroforge.contracts.validation import (
-    FrozenMapping,
-    HydroForgeModel,
-    _immutable_dict,
-)
-from hydroforge.data.netcdf import (
-    _as_integer_array,
-    _is_scalar_integer,
-    _NetCDFReadHandlePool,
-    _normalize_integer_slice,
-    _normalize_netcdf_index,
-    _output_axis,
-    _prefer_sparse_axis,
-    _read_netcdf_var_sliced_trusted,
-    read_netcdf_var_sliced,
-)
-from hydroforge.data.numeric import immutable_array, immutable_metadata
-from hydroforge.serialization.netcdf import (
+from hydroforge.core.arrays import immutable_array, immutable_metadata
+from hydroforge.core.errors import cleanup_on_exit
+from hydroforge.core.validation import FrozenMapping, HydroForgeModel, frozen_dict
+from hydroforge.io.files import FileIdentity, SourceFiles
+from hydroforge.io.netcdf.encoding import (
     LOGICAL_DTYPE_ATTR,
-    _atomic_netcdf_dataset_trusted,
-    _create_netcdf_variable_trusted,
-    _prepare_netcdf_variable_options_trusted,
     decode_netcdf_logical_array,
-    netcdf_dtype_encoding,
+)
+from hydroforge.io.netcdf.options import ensure_hdf5_plugins
+from hydroforge.io.netcdf.read import (
+    decoded_dtype,
+    decodes_strings,
+    normalize_selection,
+    output_axis,
+    prefer_sparse_axis,
+    read_variable,
 )
 
 
-def _name_set(value: Any, *, label: str) -> frozenset[str]:
-    if type(value) not in {list, set, frozenset}:
-        raise ValueError(f"{label} must be a list or set of strings")
-    items = list(value)
-    if any(type(name) is not str or not name for name in items):
-        raise ValueError(f"{label} entries must be non-empty exact strings")
-    if len(items) != len(set(items)):
+def _name_set(values: _InputNames, *, label: str) -> frozenset[str]:
+    names = frozenset(values)
+    if len(names) != len(values):
         raise ValueError(f"{label} must not contain duplicate names")
-    return frozenset(items)
+    return names
 
 
-def _preserve_input_value(value: Any) -> Any:
-    """Take ownership of resident values without invoking union coercion."""
+def _require_input_value(value: Any) -> Any:
+    """Check one value against the InputProxy value contract."""
 
     if np.ma.isMaskedArray(value):
         raise ValueError("InputProxy values must not be masked arrays")
@@ -77,25 +66,36 @@ def _preserve_input_value(value: Any) -> Any:
         )
     if isinstance(value, np.ndarray) and value.dtype.hasobject:
         raise ValueError("InputProxy arrays must not use object dtype")
-    return _clone_input_value_trusted(value)
+    return value
 
 
-def _clone_input_value_trusted(value: Any) -> Any:
-    """Detach storage whose type and semantics were already validated."""
+def _resident(value: Any) -> Any:
+    """Seal one NumPy array this proxy owns; resident values are only read."""
 
     if isinstance(value, np.ndarray):
-        return np.array(value, order="K", copy=True, subok=False)
+        value.setflags(write=False)
+    return value
+
+
+def _preserve_input_value(value: Any) -> Any:
+    """Take ownership of one caller value without invoking union coercion."""
+
+    value = _require_input_value(value)
+    if isinstance(value, np.ndarray):
+        return _resident(np.array(value, order="K", copy=True, subok=False))
     if isinstance(value, torch.Tensor):
         return value.detach().clone(memory_format=torch.preserve_format)
     return value
 
 
 def _snapshot_input_value(value: Any) -> Any:
-    """Return public storage detached from one trusted resident value."""
+    """Return public storage detached from one resident value."""
 
     if isinstance(value, np.ndarray):
         return immutable_array(value, order="K")
-    return _clone_input_value_trusted(value)
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone(memory_format=torch.preserve_format)
+    return value
 
 
 InputValue = Annotated[
@@ -105,11 +105,10 @@ InputValue = Annotated[
 
 
 class _ResidentInputData(Mapping[str, InputValue]):
-    """Expose resident values without exposing trusted Tensor storage.
+    """Expose resident values without exposing their storage.
 
     Ordinary mapping access returns an independent snapshot: immutable NumPy
-    storage or a detached Tensor clone. Trusted HydroForge paths use the
-    private accessor below.
+    storage or a detached Tensor clone.  ``InputProxy`` reads ``_values``.
     """
 
     __slots__ = ("_values",)
@@ -120,17 +119,14 @@ class _ResidentInputData(Mapping[str, InputValue]):
     def __getitem__(self, name: str) -> InputValue:
         return _snapshot_input_value(self._values[name])
 
+    def __contains__(self, name: object) -> bool:
+        return name in self._values
+
     def __iter__(self):
         return iter(self._values)
 
     def __len__(self) -> int:
         return len(self._values)
-
-    def _trusted_value(self, name: str) -> InputValue:
-        return self._values[name]
-
-    def _trusted_items(self):
-        return self._values.items()
 
 
 def _netcdf_attribute_equal(left: Any, right: Any) -> bool:
@@ -163,11 +159,7 @@ def _read_netcdf_input_var(
     """Read one variable according to HydroForge's logical NetCDF contract."""
 
     variable = ds.variables[var_name]
-    value = (
-        read_netcdf_var_sliced(variable)
-        if indices is None
-        else read_netcdf_var_sliced(variable, indices)
-    )
+    value = read_variable(variable, normalize_selection(indices, variable.shape))
     return _decode_netcdf_input_array(variable, value, name=var_name)
 
 
@@ -178,40 +170,18 @@ def _decode_netcdf_input_array(variable: Any, value: Any, *, name: str) -> np.nd
     return np.asarray(value)
 
 
+_INPUT_FILE_LABEL = "NetCDF input file"
 _InputName = Annotated[str, Field(min_length=1)]
 _InputExtent = Annotated[int, Field(ge=0)]
-
-
-class _NetCDFFileIdentity(HydroForgeModel):
-    """Filesystem identity captured with one validated NetCDF schema."""
-
-    device: int = Field(ge=0, strict=True)
-    inode: int = Field(ge=0, strict=True)
-    size: int = Field(ge=0, strict=True)
-    mtime_ns: int = Field(ge=0, strict=True)
-
-    @classmethod
-    def _capture(cls, path: Path) -> Self:
-        stat = path.stat()
-        return cls.model_construct(
-            device=stat.st_dev,
-            inode=stat.st_ino,
-            size=stat.st_size,
-            mtime_ns=stat.st_mtime_ns,
-        )
-
-    def _verify(self, path: Path) -> None:
-        if type(self)._capture(path) != self:
-            raise RuntimeError(
-                f"NetCDF input file {str(path)!r} changed after validation"
-            )
+_InputPath = Annotated[Path, Field(strict=False)]
+_InputNames = list[_InputName] | set[_InputName] | frozenset[_InputName]
 
 
 class NetCDFInputSource(HydroForgeModel):
     """One complete lazy-storage binding for an input variable."""
 
     path: Path = Field(strict=False)
-    file_identity: _NetCDFFileIdentity
+    file_identity: InstanceOf[FileIdentity]
     dimensions: tuple[_InputName, ...]
     shape: tuple[_InputExtent, ...]
     dtype: str
@@ -220,6 +190,7 @@ class NetCDFInputSource(HydroForgeModel):
 
     @model_validator(mode="after")
     def _validate_source(self) -> Self:
+        object.__setattr__(self, "dtype", str(np.dtype(self.dtype)))
         if len(self.dimensions) != len(self.shape):
             raise ValueError(
                 "NetCDF variable source dimensions and shape must have equal lengths"
@@ -232,6 +203,11 @@ class NetCDFInputSource(HydroForgeModel):
             )
         if not aligned:
             return self
+        if self.dimensions.count(self.alignment_dim) != 1:
+            raise ValueError(
+                "alignment dimension must occur exactly once in dimensions"
+            )
+        axis = self.dimensions.index(self.alignment_dim)
         indices = self.alignment_indices
         if np.ma.isMaskedArray(indices):
             if np.any(np.ma.getmaskarray(indices)):
@@ -249,7 +225,6 @@ class NetCDFInputSource(HydroForgeModel):
             raise ValueError("NetCDF alignment indices must be read-only")
         if np.any(indices < 0):
             raise ValueError("NetCDF alignment indices must be nonnegative")
-        axis = self.dimensions.index(self.alignment_dim)
         if indices.size != self.shape[axis]:
             raise ValueError(
                 "NetCDF alignment indices must cover the aligned dimension"
@@ -291,45 +266,44 @@ class NetCDFInputSource(HydroForgeModel):
         return tuple(selectors)
 
 
-class _NetCDFChunkRequest(HydroForgeModel):
-    """Validate one newly decoded lazy NetCDF chunk at the I/O boundary."""
+def _source_identities(
+    sources: Mapping[str, NetCDFInputSource],
+) -> dict[Path, FileIdentity]:
+    identities: dict[Path, FileIdentity] = {}
+    for source in sources.values():
+        path = source.path.absolute()
+        previous = identities.setdefault(path, source.file_identity)
+        if previous != source.file_identity:
+            raise ValueError(
+                f"NetCDF input sources for {str(path)!r} have conflicting file identities"
+            )
+    return identities
 
-    name: str
-    dataset: Any = Field(exclude=True)
-    selector: Any = Field(exclude=True)
 
-    _array: np.ndarray = PrivateAttr()
+def _read_netcdf_selection(variable: Any, selector: tuple[Any, ...], name: str) -> Any:
+    """Read and decode one normalized orthogonal selection of a lazy variable."""
 
-    @model_validator(mode="after")
-    def _read_and_validate(self) -> Self:
-        variable = self.dataset.variables[self.name]
-        selectors = list(self.selector)
-        gathers: list[tuple[int, np.ndarray]] = []
-        for axis, index in enumerate(selectors):
-            # A dense selection reads its covering range once; one HDF5 read
-            # per index gap is far slower than an in-memory take.
-            if (
-                isinstance(index, np.ndarray)
-                and index.size
-                and index.dtype.kind in "iu"
-                and not _prefer_sparse_axis(variable, axis, index)
-            ):
-                low = int(index.min())
-                selectors[axis] = slice(low, int(index.max()) + 1)
-                gathers.append((axis, index - low))
-        raw = _read_netcdf_var_sliced_trusted(variable, tuple(selectors))
-        # Gather before decoding: values outside the selection must not be
-        # validated (e.g. missing values between selected cells).
-        for axis, positions in gathers:
-            raw = raw.take(positions, axis=_output_axis(selectors, axis))
-        self._array = _preserve_input_value(
-            _decode_netcdf_input_array(variable, raw, name=self.name)
-        )
-        return self
-
-    @property
-    def array(self) -> np.ndarray:
-        return self._array
+    selectors = list(selector)
+    gathers: list[tuple[int, np.ndarray]] = []
+    for axis, index in enumerate(selectors):
+        # A dense selection reads its covering range once; one HDF5 read
+        # per index gap is far slower than an in-memory take.
+        if (
+            isinstance(index, np.ndarray)
+            and index.size
+            and index.dtype.kind in "iu"
+            and not prefer_sparse_axis(variable, axis, index)
+        ):
+            low = int(index.min())
+            selectors[axis] = slice(low, int(index.max()) + 1)
+            gathers.append((axis, index - low))
+    raw = read_variable(variable, tuple(selectors))
+    # Gather before decoding: values outside the selection must not be
+    # validated (e.g. missing values between selected cells).
+    for axis, positions in gathers:
+        raw = raw.take(positions, axis=output_axis(selectors, axis))
+    # A fresh read is owned by the caller; it needs no defensive copy.
+    return _require_input_value(_decode_netcdf_input_array(variable, raw, name=name))
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,22 +338,33 @@ def _compile_input_proxy_netcdf_plan(
     alignment_dims: set[str] = set()
     keyless_variables: list[tuple[Path, str, tuple[str, ...]]] = []
 
+    ensure_hdf5_plugins()
     for path in paths:
         try:
-            file_identity = _NetCDFFileIdentity._capture(path)
+            file_identity = FileIdentity.capture(path)
             with Dataset(path, "r") as ds:
                 alignment_idx: np.ndarray | None = None
                 alignment_dim: str | None = None
                 if align_on is not None and align_on in ds.variables:
                     align_variable = ds.variables[align_on]
-                    raw_keys = read_netcdf_var_sliced(align_variable)
+                    if (
+                        len(align_variable.shape) - int(decodes_strings(align_variable))
+                        != 1
+                    ):
+                        raise ValueError(
+                            f"align_on variable {align_on!r} in {str(path)!r} must be one-dimensional"
+                        )
+                    raw_keys = read_variable(
+                        align_variable,
+                        normalize_selection(None, align_variable.shape),
+                    )
                     if ma.isMaskedArray(raw_keys) and np.any(ma.getmaskarray(raw_keys)):
                         raise ValueError(
                             f"align_on variable {align_on!r} in "
                             f"{str(path)!r} contains missing keys"
                         )
                     current_keys = np.asarray(raw_keys)
-                    if current_keys.ndim != 1 or len(align_variable.dimensions) != 1:
+                    if current_keys.ndim != 1:
                         raise ValueError(
                             f"align_on variable {align_on!r} in "
                             f"{str(path)!r} must be one-dimensional"
@@ -486,14 +471,36 @@ def _compile_input_proxy_netcdf_plan(
 
                     found_vars.add(var_name)
                     variable = ds.variables[var_name]
-                    if align_on is not None and align_on not in ds.variables:
-                        keyless_variables.append(
-                            (path, var_name, tuple(variable.dimensions))
-                        )
-                    aligned_variable = (
-                        alignment_idx is not None
-                        and alignment_dim in variable.dimensions
+                    dimensions, shape = (
+                        tuple(variable.dimensions),
+                        tuple(variable.shape),
                     )
+                    dtype = decoded_dtype(variable)
+                    if decodes_strings(variable):
+                        dimensions, shape = dimensions[:-1], shape[:-1]
+                    if align_on is not None and align_on not in ds.variables:
+                        keyless_variables.append((path, var_name, dimensions))
+                    aligned_variable = (
+                        alignment_idx is not None and alignment_dim in dimensions
+                    )
+                    # An anonymous axis (no coordinate variable) of the key
+                    # length likely lost the alignment dimension's name.
+                    if (
+                        alignment_idx is not None
+                        and not aligned_variable
+                        and any(
+                            size == alignment_idx.size and dim not in ds.variables
+                            for dim, size in zip(dimensions, shape, strict=True)
+                        )
+                    ):
+                        raise ValueError(
+                            f"Variable {var_name!r} in {str(path)!r} has an "
+                            f"anonymous axis of the alignment key length "
+                            f"{alignment_idx.size} but not alignment dimension "
+                            f"{alignment_dim!r}, so its order cannot be "
+                            "aligned; name that axis after the alignment "
+                            "dimension or list the variable in skip_fields"
+                        )
                     logical_dtype = getattr(
                         variable,
                         LOGICAL_DTYPE_ATTR,
@@ -502,21 +509,18 @@ def _compile_input_proxy_netcdf_plan(
                     source = NetCDFInputSource(
                         path=path,
                         file_identity=file_identity,
-                        dimensions=tuple(variable.dimensions),
-                        shape=tuple(variable.shape),
+                        dimensions=dimensions,
+                        shape=shape,
                         dtype=(
                             str(np.dtype(np.bool_))
                             if logical_dtype == "bool"
-                            else str(np.dtype(variable.dtype))
+                            else str(dtype)
                         ),
                         alignment_dim=(alignment_dim if aligned_variable else None),
                         alignment_indices=(alignment_idx if aligned_variable else None),
                     )
                     sources[var_name] = source
-                    if not lazy:
-                        value = _read_netcdf_input_var(ds, var_name)
-                        data[var_name] = source.align_loaded(value)
-            file_identity._verify(path)
+            file_identity.verify(path, label=_INPUT_FILE_LABEL)
         except (OSError, RuntimeError) as error:
             error.add_note(f"while inspecting InputProxy data from {str(path)}")
             raise
@@ -547,187 +551,29 @@ def _compile_input_proxy_netcdf_plan(
             f"requested skipped variable(s) were not found: {sorted(missing_skip)}"
         )
 
+    if not lazy:
+        files = SourceFiles(_source_identities(sources), label=_INPUT_FILE_LABEL)
+        with cleanup_on_exit("eager input reads", (files.close,)):
+            for name, source in sources.items():
+                with files.open_netcdf(source.path) as ds:
+                    value = _read_netcdf_input_var(ds, name)
+                    data[name] = _resident(source.align_loaded(value))
+
     return _InputProxyNetCDFPlan(
-        data=_immutable_dict(data),
-        attrs=_immutable_dict(attrs),
-        dims=_immutable_dict(dims),
+        data=frozen_dict(data),
+        attrs=frozen_dict(attrs),
+        dims=frozen_dict(dims),
         visible_vars=frozenset(found_vars),
-        sources=_immutable_dict(sources),
+        sources=frozen_dict(sources),
     )
 
 
-class _InputProxyNetCDFDeclaration(HydroForgeModel):
-    """Validated declaration consumed by ``InputProxy.from_nc``."""
+def select_values(value: Any, selector: tuple[Any, ...]) -> Any:
+    """Apply one normalized orthogonal selection to an in-memory value.
 
-    file_path: Annotated[Path, Field(strict=False)] | list[Annotated[Path, Field(strict=False)]]
-    lazy: bool = False
-    visible_vars: list[str] | set[str] | frozenset[str] | None = None
-    align_on: _InputName | None = None
-    skip_fields: list[str] | set[str] | frozenset[str] | None = None
-    _plan: _InputProxyNetCDFPlan = PrivateAttr()
-
-    @model_validator(mode="after")
-    def _validate_open(self) -> Self:
-        raw_paths = (
-            [self.file_path]
-            if isinstance(self.file_path, (str, Path))
-            else list(self.file_path)
-        )
-        if not raw_paths:
-            raise ValueError("InputProxy.from_nc requires at least one file")
-        paths = tuple(Path(path) for path in raw_paths)
-        normalized = tuple(str(path) for path in paths)
-        if len(normalized) != len(set(normalized)):
-            raise ValueError("InputProxy.from_nc received duplicate file paths")
-        visible = (
-            None
-            if self.visible_vars is None
-            else _name_set(self.visible_vars, label="visible_vars")
-        )
-        skipped = (
-            set()
-            if self.skip_fields is None
-            else _name_set(self.skip_fields, label="skip_fields")
-        )
-        if visible is not None:
-            overlap = visible.intersection(skipped)
-            if overlap:
-                raise ValueError(
-                    "visible_vars and skip_fields must be disjoint; "
-                    f"overlap={sorted(overlap)}"
-                )
-        if self.align_on is not None and self.align_on in skipped:
-            raise ValueError(
-                f"align_on={self.align_on!r} may not be listed in skip_fields"
-            )
-        object.__setattr__(self, "file_path", paths)
-        object.__setattr__(self, "visible_vars", visible)
-        object.__setattr__(self, "skip_fields", skipped)
-        self._plan = _compile_input_proxy_netcdf_plan(
-            paths=paths,
-            lazy=self.lazy,
-            visible_vars=visible,
-            align_on=self.align_on,
-            skip_fields=skipped,
-        )
-        return self
-
-    @property
-    def plan(self) -> _InputProxyNetCDFPlan:
-        return self._plan
-
-
-class _InputProxyUpdate(HydroForgeModel):
-    """Validated functional update accepted by :meth:`InputProxy.updated`."""
-
-    values: FrozenMapping[_InputName, InputValue] = Field(default_factory=dict)
-    dimensions: FrozenMapping[_InputName, _InputExtent] = Field(default_factory=dict)
-
-
-_INPUT_PROXY_CONTEXT = "hydroforge_input_proxy"
-
-
-class _InputProxyRemoval(HydroForgeModel):
-    """Validated functional removal accepted by :meth:`InputProxy.without`."""
-
-    names: tuple[_InputName, ...] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def _validate_removal(self, info: ValidationInfo) -> Self:
-        if len(self.names) != len(set(self.names)):
-            raise ValueError("InputProxy.without names must be unique")
-        context = info.context
-        proxy = (
-            context.get(_INPUT_PROXY_CONTEXT) if isinstance(context, Mapping) else None
-        )
-        if proxy is None:
-            raise ValueError("InputProxy removal requires proxy context")
-        known = proxy.keys().union(proxy.sources)
-        missing = set(self.names).difference(known)
-        if missing:
-            raise ValueError(f"InputProxy variable(s) not found: {sorted(missing)}")
-        return self
-
-
-class _InputReadRequest(HydroForgeModel):
-    """One orthogonal selection interpreted by resident or lazy storage."""
-
-    name: _InputName
-    selector: Any = Field(default_factory=lambda: Ellipsis)
-    allow_missing: bool = False
-
-    @model_validator(mode="after")
-    def _validate_read(self, info: ValidationInfo):
-        context = info.context
-        proxy = (
-            context.get(_INPUT_PROXY_CONTEXT) if isinstance(context, Mapping) else None
-        )
-        if proxy is None:
-            raise ValueError("input read validation requires proxy context")
-        known = self.name in proxy.visible_vars or self.name in proxy.data
-        if not known:
-            if self.allow_missing:
-                return self
-            raise ValueError(f"InputProxy variable {self.name!r} does not exist")
-
-        raw = self.selector
-        selectors = raw if isinstance(raw, tuple) else (raw,)
-        if any(value is None for value in selectors):
-            raise ValueError("input subset selection does not support new axes")
-        for selector in selectors:
-            if selector is Ellipsis:
-                continue
-            if isinstance(selector, slice):
-                _normalize_integer_slice(selector)
-                continue
-            if isinstance(selector, (bool, np.bool_)):
-                raise ValueError("input subset scalar boolean selectors are invalid")
-            if isinstance(selector, (int, np.integer)):
-                continue
-            array = np.asarray(selector)
-            if array.ndim == 0 and array.dtype.kind in "iu":
-                continue
-            if array.ndim == 1 and array.size == 0:
-                continue
-            if array.ndim != 1 or array.dtype.kind not in "iub":
-                raise ValueError(
-                    "input subset sequence selectors must be one-dimensional "
-                    "integer or boolean arrays"
-                )
-
-        shape = proxy._shape_for_trusted(self.name)
-        normalized = list(_normalize_netcdf_index(raw, len(shape)))
-        for axis, selector in enumerate(normalized):
-            if isinstance(selector, slice):
-                normalized[axis] = _normalize_integer_slice(selector)
-                continue
-            index = _as_integer_array(selector, shape[axis])
-            if index is not None:
-                normalized[axis] = index
-                continue
-            if _is_scalar_integer(selector):
-                integer = int(selector)
-                if not -shape[axis] <= integer < shape[axis]:
-                    raise ValueError(
-                        "input subset integer index exceeds dimension size"
-                    )
-                normalized[axis] = integer
-                continue
-            raise ValueError(
-                "input subset selectors must be integer scalars, "
-                "integer/boolean vectors, or slices"
-            )
-        object.__setattr__(self, "selector", tuple(normalized))
-        return self
-
-    def select_resident(self, value: Any) -> Any:
-        """Apply the same per-axis orthogonal contract as NetCDF."""
-
-        return _select_resident_trusted(value, self.selector)
-
-
-def _select_resident_trusted(value: Any, selector: Any) -> Any:
-    """Apply one already normalized orthogonal resident selection."""
+    ``selector`` is the output of :func:`normalize_selection`; the result
+    follows the per-axis contract of NetCDF reads.
+    """
 
     if not hasattr(value, "shape"):
         value = np.asarray(value)
@@ -755,23 +601,28 @@ def _select_resident_trusted(value: Any, selector: Any) -> Any:
             selectors[axis] = slice(None)
     selected = value[tuple(selectors)]
     for axis, index in sequence_indices:
-        output_axis = _output_axis(selectors, axis)
+        axis_out = output_axis(selectors, axis)
         if isinstance(selected, torch.Tensor):
             indices = torch.as_tensor(
                 index,
                 dtype=torch.int64,
                 device=selected.device,
             )
-            selected = torch.index_select(selected, output_axis, indices)
+            selected = torch.index_select(selected, axis_out, indices)
         else:
-            selected = selected.take(index, axis=output_axis)
+            selected = selected.take(index, axis=axis_out)
     return selected
 
 
 class InputProxy(HydroForgeModel):
-    """
-    A proxy class for NetCDF input/output.
-    Owns resident NumPy values or tensors and reads declared NetCDF sources lazily.
+    """Construction input of a model: resident values and lazy NetCDF sources.
+
+    Public construction copies every caller value once; ``from_nc`` and the
+    functional updates own their values without a second copy, and derived
+    proxies share every unchanged value.  Resident NumPy values are read-only,
+    and every public read returns an independent snapshot.  Lazy variables
+    are read from their file on each use; ``close()`` releases the read
+    handles, which later reads reopen.
     """
 
     data: Mapping[_InputName, InputValue]
@@ -782,10 +633,7 @@ class InputProxy(HydroForgeModel):
     injected_vars: frozenset[_InputName] = Field(default_factory=frozenset)
     sources: FrozenMapping[_InputName, NetCDFInputSource] = Field(default_factory=dict)
 
-    _cache: dict[str, InputValue] = PrivateAttr(default_factory=dict)
-    _read_handles: _NetCDFReadHandlePool = PrivateAttr(
-        default_factory=_NetCDFReadHandlePool,
-    )
+    _files: SourceFiles | None = PrivateAttr(default=None)
 
     @field_serializer("data")
     def _serialize_data(
@@ -810,6 +658,7 @@ class InputProxy(HydroForgeModel):
 
     @model_validator(mode="after")
     def _validate_proxy(self) -> Self:
+        _source_identities(self.sources)
         visible_vars = self.visible_vars
         unresolved = visible_vars.difference(self.data).difference(
             self.sources,
@@ -819,6 +668,11 @@ class InputProxy(HydroForgeModel):
                 "InputProxy visible variables have no resident or lazy source: "
                 f"{sorted(unresolved)}"
             )
+        hidden = frozenset(self.data).difference(visible_vars)
+        if hidden:
+            raise ValueError(
+                f"InputProxy resident variables must be visible: {sorted(hidden)}"
+            )
         lazy_only = visible_vars.difference(self.data)
         if not self.lazy and lazy_only:
             raise ValueError(
@@ -826,9 +680,7 @@ class InputProxy(HydroForgeModel):
                 f"variables: {sorted(lazy_only)}"
             )
         injected_vars = self.injected_vars
-        invalid_injected = injected_vars.difference(self.data).union(
-            injected_vars.difference(visible_vars),
-        )
+        invalid_injected = injected_vars.difference(self.data)
         if invalid_injected:
             raise ValueError(
                 "InputProxy injected_vars must identify resident visible "
@@ -842,116 +694,93 @@ class InputProxy(HydroForgeModel):
         )
         return self
 
-    @property
-    def _source_paths(self) -> tuple[Path, ...]:
-        """Return distinct physical paths behind lazy variable sources."""
+    @classmethod
+    def _owned(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        attrs: Mapping[str, Any],
+        dims: Mapping[str, int],
+        lazy: bool,
+        visible_vars: frozenset[str],
+        injected_vars: frozenset[str],
+        sources: Mapping[str, NetCDFInputSource],
+    ) -> Self:
+        """Assemble values this proxy already owns, without copies or revalidation."""
 
-        return tuple(dict.fromkeys(source.path for source in self.sources.values()))
-
-    def _resident_value(self, name: str) -> InputValue:
-        """Return resident storage to an already validated internal path."""
-
-        data = cast(_ResidentInputData, self.data)
-        return data._trusted_value(name)
+        return cls.model_construct(
+            data=_ResidentInputData(data),
+            attrs=attrs,
+            dims=frozen_dict(dims),
+            lazy=lazy,
+            visible_vars=visible_vars,
+            injected_vars=injected_vars,
+            sources=frozen_dict(sources),
+        )
 
     def _resident_items(self):
-        """Iterate resident storage without creating public Tensor copies."""
+        """Iterate resident storage without creating public copies."""
 
-        data = cast(_ResidentInputData, self.data)
-        return data._trusted_items()
+        return cast(_ResidentInputData, self.data)._values.items()
 
     @property
     def file_path(self) -> str | list[str] | None:
         """Return the source filename or filenames for downstream diagnostics."""
 
-        paths = tuple(str(path) for path in self._source_paths)
+        paths = tuple(
+            dict.fromkeys(str(source.path) for source in self.sources.values())
+        )
         if not paths:
             return None
         return paths[0] if len(paths) == 1 else list(paths)
 
-    def copy(self) -> InputProxy:
-        """Return the same validated identity with an independent lazy cache."""
-
-        return self._rebuild()
-
-    def _rebuild(
-        self,
-        *,
-        _owned_data_names: frozenset[str] = frozenset(),
-        **updates: Any,
-    ) -> Self:
-        """Build a derived proxy from validated fields with a fresh cache."""
-
-        payload = {
-            name: (self.data if name == "data" else getattr(self, name))
-            for name in type(self).model_fields
-        }
-        payload.update(updates)
-        source_data = (
-            payload["data"]._trusted_items()
-            if isinstance(payload["data"], _ResidentInputData)
-            else payload["data"].items()
-        )
-        payload["data"] = _ResidentInputData(
-            {
-                name: (
-                    value
-                    if name in _owned_data_names
-                    else _clone_input_value_trusted(value)
-                )
-                for name, value in source_data
-            }
-        )
-        payload["attrs"] = self.attrs
-        payload["dims"] = _immutable_dict(payload["dims"])
-        payload["visible_vars"] = frozenset(payload["visible_vars"])
-        payload["injected_vars"] = frozenset(payload["injected_vars"])
-        payload["sources"] = _immutable_dict(payload["sources"])
-        return type(self).model_construct(**payload)
-
+    @validate_call(config=HydroForgeModel.model_config)
     def updated(
         self,
         *,
-        values: Mapping[str, InputValue] | None = None,
-        dimensions: Mapping[str, int] | None = None,
+        values: FrozenMapping[_InputName, InputValue] | None = None,
+        dimensions: FrozenMapping[_InputName, _InputExtent] | None = None,
     ) -> Self:
-        """Return a validated proxy with atomic value/dimension updates."""
+        """Return a proxy with added or replaced values and dimension sizes.
 
-        request = _InputProxyUpdate(
-            values={} if values is None else values,
-            dimensions={} if dimensions is None else dimensions,
-        )
+        Only the new values are copied; every other value is shared.
+        """
+
+        values = {} if values is None else values
         data = dict(self._resident_items())
-        data.update(request.values)
-        visible = self.visible_vars.union(request.values)
-        known = set(self.data).union(self.visible_vars).union(self.sources)
-        injected = self.injected_vars.union(
-            set(request.values).difference(known),
-        )
-        dims = dict(self.dims)
-        dims.update(request.dimensions)
-        return self._rebuild(
-            _owned_data_names=frozenset(request.values),
-            data=data,
-            dims=dims,
-            visible_vars=frozenset(visible),
-            injected_vars=frozenset(injected),
+        data.update(values)
+        known = self.visible_vars.union(self.sources)
+        return self._owned(
+            data,
+            attrs=self.attrs,
+            dims={**self.dims, **({} if dimensions is None else dimensions)},
+            lazy=self.lazy,
+            visible_vars=self.visible_vars.union(values),
+            injected_vars=self.injected_vars.union(set(values).difference(known)),
+            sources=self.sources,
         )
 
-    def without(self, *names: str) -> Self:
-        """Return a validated proxy without the named variables."""
+    @validate_call(config=HydroForgeModel.model_config)
+    def without(self, *names: _InputName) -> Self:
+        """Return a proxy without the named variables, sharing the others."""
 
-        request = _InputProxyRemoval.model_validate(
-            {"names": names},
-            context={_INPUT_PROXY_CONTEXT: self},
-        )
-        removed = set(request.names)
-        return self._rebuild(
-            data={
+        removed = set(names)
+        if not removed:
+            raise ValueError("InputProxy.without requires at least one name")
+        if len(removed) != len(names):
+            raise ValueError("InputProxy.without names must be unique")
+        missing = removed.difference(self.visible_vars).difference(self.sources)
+        if missing:
+            raise ValueError(f"InputProxy variable(s) not found: {sorted(missing)}")
+        return self._owned(
+            {
                 name: value
                 for name, value in self._resident_items()
                 if name not in removed
             },
+            attrs=self.attrs,
+            dims=self.dims,
+            lazy=self.lazy,
             visible_vars=self.visible_vars.difference(removed),
             injected_vars=self.injected_vars.difference(removed),
             sources={
@@ -962,13 +791,14 @@ class InputProxy(HydroForgeModel):
         )
 
     @classmethod
+    @validate_call(config=HydroForgeModel.model_config)
     def from_nc(
         cls,
-        file_path: str | Path | list[str | Path],
+        file_path: _InputPath | list[_InputPath],
         lazy: bool = False,
-        visible_vars: list[str] | set[str] | frozenset[str] | None = None,
-        align_on: str | None = None,
-        skip_fields: list[str] | set[str] | frozenset[str] | None = None,
+        visible_vars: _InputNames | None = None,
+        align_on: _InputName | None = None,
+        skip_fields: _InputNames | None = None,
     ) -> Self:
         """
         Create an InputProxy from one or multiple NetCDF files.
@@ -990,214 +820,152 @@ class InputProxy(HydroForgeModel):
                       uniqueness check on ``inflow_catchment_id`` when the field is
                       allowed to repeat in HydroNet).
         """
-        declaration = _InputProxyNetCDFDeclaration(
-            file_path=file_path,
-            lazy=lazy,
-            visible_vars=visible_vars,
-            align_on=align_on,
-            skip_fields=skip_fields,
+        paths = tuple(
+            path.absolute()
+            for path in ((file_path,) if isinstance(file_path, Path) else file_path)
         )
-        plan = declaration.plan
-        return cls(
-            data=plan.data,
+        if not paths:
+            raise ValueError("InputProxy.from_nc requires at least one file")
+        if len({str(path) for path in paths}) != len(paths):
+            raise ValueError("InputProxy.from_nc received duplicate file paths")
+        visible = (
+            None
+            if visible_vars is None
+            else _name_set(visible_vars, label="visible_vars")
+        )
+        skipped = (
+            frozenset()
+            if skip_fields is None
+            else _name_set(skip_fields, label="skip_fields")
+        )
+        if visible is not None:
+            overlap = visible.intersection(skipped)
+            if overlap:
+                raise ValueError(
+                    "visible_vars and skip_fields must be disjoint; "
+                    f"overlap={sorted(overlap)}"
+                )
+        if align_on is not None and align_on in skipped:
+            raise ValueError(f"align_on={align_on!r} may not be listed in skip_fields")
+        plan = _compile_input_proxy_netcdf_plan(
+            paths=paths,
+            lazy=lazy,
+            visible_vars=visible,
+            align_on=align_on,
+            skip_fields=skipped,
+        )
+        return cls._owned(
+            plan.data,
             attrs=plan.attrs,
             dims=plan.dims,
-            lazy=declaration.lazy,
+            lazy=lazy,
             visible_vars=plan.visible_vars,
+            injected_vars=frozenset(),
             sources=plan.sources,
         )
 
-    def _shape_for_trusted(self, key: str) -> tuple[int, ...]:
-        if key in self.data:
-            value = self._resident_value(key)
+    def _require(self, key: str) -> None:
+        if key not in self.visible_vars:
+            raise ValueError(f"InputProxy variable {key!r} does not exist")
+
+    def _shape(self, key: str) -> tuple[int, ...]:
+        data = cast(_ResidentInputData, self.data)._values
+        if key in data:
+            value = data[key]
             return tuple(value.shape) if hasattr(value, "shape") else ()
-        if key in self._cache:
-            return tuple(self._cache[key].shape)
         return self.sources[key].shape
 
-    def _read_request(
-        self,
-        name: str,
-        selector: Any = Ellipsis,
-        *,
-        allow_missing: bool = False,
-    ) -> _InputReadRequest:
-        return _InputReadRequest.model_validate(
-            {
-                "name": name,
-                "selector": selector,
-                "allow_missing": allow_missing,
-            },
-            context={_INPUT_PROXY_CONTEXT: self},
-        )
-
-    def _read_lazy(self, request: _InputReadRequest) -> np.ndarray:
-        return _snapshot_input_value(
-            self._read_lazy_trusted(request.name, request.selector),
-        )
-
-    def _read_lazy_trusted(
-        self,
-        name: str,
-        selector: Any,
-    ) -> np.ndarray:
-        source = self.sources[name]
-        target_path = source.path
-
-        try:
-            source.file_identity._verify(target_path)
-            with self._read_handles.acquire(target_path) as ds:
-                final_indices = source.selectors(selector)
-                value = _NetCDFChunkRequest(
-                    name=name,
-                    dataset=ds,
-                    selector=final_indices,
-                ).array
-            source.file_identity._verify(target_path)
-            return value
-        except (OSError, RuntimeError) as exc:
-            exc.add_note(f"while lazily loading {name!r} from {target_path}")
-            raise
-
-    def get_subset(self, key: str, indices: Any) -> Any:
-        """
-        Get a subset of a variable.
-        If the variable is in memory, slices it.
-        If lazy, reads only the requested indices from the file.
-        """
-        request = self._read_request(key, indices)
-        key = request.name
-        if key in self.data:
-            return _snapshot_input_value(
-                request.select_resident(self._resident_value(key)),
-            )
-        if key in self._cache:
-            return _snapshot_input_value(
-                request.select_resident(self._cache[key]),
-            )
-
-        return self._read_lazy(request)
-
-    def _get_subset_trusted(self, key: str, selector: Any) -> Any:
-        """Read a compiler-produced bounded selector without revalidation."""
-
-        shape = self._shape_for_trusted(key)
-        normalized = tuple(_normalize_netcdf_index(selector, len(shape)))
-        if key in self.data:
-            return _select_resident_trusted(
-                self._resident_value(key),
-                normalized,
-            )
-        if key in self._cache:
-            return _select_resident_trusted(self._cache[key], normalized)
-        return self._read_lazy_trusted(key, normalized)
-
-    def get_var_shape(self, key: str) -> tuple[int, ...]:
-        """
-        Get the shape of a variable without loading it fully if possible.
-        """
-        request = self._read_request(key)
-        return self._shape_for_trusted(request.name)
-
-    def _get_var_dtype(self, key: str) -> np.dtype | torch.dtype:
+    def _dtype(self, key: str) -> np.dtype | torch.dtype:
         """Return logical storage dtype without loading a lazy variable."""
 
-        if key in self.data or key in self._cache:
-            value = self._resident_value(key) if key in self.data else self._cache[key]
+        data = cast(_ResidentInputData, self.data)._values
+        if key in data:
+            value = data[key]
             if isinstance(value, torch.Tensor):
                 return value.dtype
             return np.asarray(value).dtype
-
         return self.sources[key].numpy_dtype
 
-    def _to_nc(
-        self,
-        file_path: str | Path,
-        *,
-        netcdf_options: Mapping[str, Any],
-    ) -> None:
-        """
-        Write the stored data to a NetCDF file.
-        """
-        create_options = netcdf_options
-        with _atomic_netcdf_dataset_trusted(file_path) as ds:
-            # Write global attributes
-            ds.setncatts(self.attrs)
+    def _read(self, key: str, selector: tuple[Any, ...]) -> np.ndarray:
+        """Read one normalized selection of a lazy variable from its file."""
 
-            # Helper to infer and write variable
-            def _infer_and_write_var(name: str, data: Any) -> None:
-                # Convert to numpy if tensor
-                if isinstance(data, torch.Tensor):
-                    arr = data.detach().cpu().numpy()
-                else:
-                    arr = np.asarray(data)
-
-                vtype, logical_dtype = netcdf_dtype_encoding(arr.dtype)
-                arr_to_write = arr.astype(vtype, copy=False)
-
-                dims = tuple(f"{name}_dim{axis}" for axis in range(arr.ndim))
-                for dim_name, size in zip(dims, arr.shape, strict=True):
-                    if dim_name not in ds.dimensions:
-                        ds.createDimension(dim_name, size)
-
-                # Create variable
-                variable_options = _prepare_netcdf_variable_options_trusted(
-                    create_options,
-                    dtype=vtype,
-                    dimensions=dims,
-                    name=name,
-                    logical_dtype=logical_dtype,
+        source = self.sources[key]
+        try:
+            with self._source_files().open_netcdf(source.path) as ds:
+                return _read_netcdf_selection(
+                    ds.variables[key], source.selectors(selector), key
                 )
-                var = _create_netcdf_variable_trusted(
-                    ds,
-                    name,
-                    vtype,
-                    dims,
-                    options=variable_options,
-                )
-                if logical_dtype is not None:
-                    var.setncattr(LOGICAL_DTYPE_ATTR, logical_dtype)
-                var[:] = arr_to_write
+        except (OSError, RuntimeError) as exc:
+            exc.add_note(f"while lazily loading {key!r} from {source.path}")
+            raise
 
-            # Write variables
-            for name in self.keys():
-                val = self._get_value_trusted(name)
-                _infer_and_write_var(name, val)
+    def _value(self, key: str) -> Any:
+        """Return resident storage, or read a lazy variable completely."""
 
-    def get(self, key: str, default: Any = None) -> Any:
-        request = self._read_request(key, allow_missing=True)
-        if key not in self.visible_vars and key not in self.data:
-            return default
-        return self._get_trusted(request)
-
-    def keys(self) -> set[str]:
-        return set(self.visible_vars).union(self.data)
-
-    def __getitem__(self, key: str) -> Any:
-        return self._get_trusted(self._read_request(key))
-
-    def _get_trusted(self, request: _InputReadRequest) -> Any:
-        return _snapshot_input_value(
-            self._get_value_trusted(request.name),
+        data = cast(_ResidentInputData, self.data)._values
+        if key in data:
+            return data[key]
+        return self._read(
+            key, tuple(slice(None) for _ in range(len(self.sources[key].shape)))
         )
 
-    def _get_value_trusted(self, key: str) -> Any:
-        """Return one schema-owned variable without rebuilding a read query."""
+    def _subset(self, key: str, selector: tuple[Any, ...]) -> Any:
+        """Apply one normalized selection to resident storage or its file."""
 
-        if key in self.data:
-            return self._resident_value(key)
-        if key in self._cache:
-            return self._cache[key]
+        data = cast(_ResidentInputData, self.data)._values
+        if key in data:
+            return select_values(data[key], selector)
+        return self._read(key, selector)
 
-        selector = tuple(slice(None) for _ in range(len(self.sources[key].shape)))
-        loaded_data = self._read_lazy_trusted(key, selector)
-        self._cache[key] = loaded_data
-        return loaded_data
+    def get_var_shape(self, key: str) -> tuple[int, ...]:
+        """Return the shape of a variable without loading it."""
+
+        self._require(key)
+        return self._shape(key)
+
+    def get_subset(self, key: str, indices: Any) -> Any:
+        """Return a snapshot of one orthogonal selection of a variable.
+
+        Resident variables are sliced in memory; lazy variables read only the
+        selection from their file.
+        """
+
+        self._require(key)
+        selectors = indices if isinstance(indices, tuple) else (indices,)
+        if any(item is None for item in selectors):
+            raise ValueError("input subset selection does not support new axes")
+        try:
+            selector = normalize_selection(indices, self._shape(key))
+        except (TypeError, IndexError) as error:
+            raise ValueError(f"invalid input subset selection: {error}") from error
+        return _snapshot_input_value(self._subset(key, selector))
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key not in self.visible_vars:
+            return default
+        return _snapshot_input_value(self._value(key))
+
+    def keys(self) -> set[str]:
+        return set(self.visible_vars)
+
+    def __getitem__(self, key: str) -> Any:
+        self._require(key)
+        return _snapshot_input_value(self._value(key))
 
     def __contains__(self, key: str) -> bool:
         return key in self.visible_vars
 
-    def close(self) -> None:
-        """Close process-local handles used by lazy NetCDF reads."""
+    def _source_files(self) -> SourceFiles:
+        """The identities of every lazy source file with process-local handles."""
 
-        self._read_handles.close()
+        if self._files is None:
+            self._files = SourceFiles(
+                _source_identities(self.sources), label=_INPUT_FILE_LABEL
+            )
+        return self._files
+
+    def close(self) -> None:
+        """Close process-local lazy read handles; later reads reopen them."""
+
+        if self._files is not None:
+            self._files.close()

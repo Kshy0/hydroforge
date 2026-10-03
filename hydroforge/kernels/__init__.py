@@ -1,27 +1,53 @@
 """Stable physical-kernel authoring API."""
 
-from hydroforge.kernels.backends.triton.dispatcher import launch_triton_kernel
-from hydroforge.kernels.registry import (
-    BackendRegistry,
-    make_spec_cuda_dispatcher,
-    make_spec_metal_dispatcher,
-    make_torch_dispatcher,
-    make_triton_dispatcher,
-    make_triton_program_dispatcher,
-    make_triton_sequence_dispatcher,
-    registry_factory,
-    resolve_model_backend,
+from hydroforge.kernels.cuda import (
+    CudaCall,
+    CudaFill,
+    CudaKernel,
+    CudaSource,
+    CudaWorkspace,
+)
+from hydroforge.kernels.metal import MetalKernel
+from hydroforge.kernels.registry import BackendRegistry
+from hydroforge.kernels.spec import (
+    KernelSpec,
+    KernelWorkspace,
+    config_value,
+    constant,
+    literal_value,
+    module_enabled,
+    module_flag,
+    option_code,
+    output_requested,
+)
+from hydroforge.kernels.torch import TorchKernel
+from hydroforge.kernels.triton import (
+    TritonKernel,
+    TritonProgram,
+    TritonSequence,
+    launch_triton_kernel,
 )
 
 __all__ = [
     "BackendRegistry",
-    "make_spec_cuda_dispatcher",
-    "make_spec_metal_dispatcher",
-    "make_torch_dispatcher",
-    "make_triton_dispatcher",
-    "make_triton_program_dispatcher",
-    "make_triton_sequence_dispatcher",
+    "CudaCall",
+    "CudaFill",
+    "CudaKernel",
+    "CudaSource",
+    "CudaWorkspace",
+    "KernelSpec",
+    "KernelWorkspace",
+    "MetalKernel",
+    "TorchKernel",
+    "TritonKernel",
+    "TritonProgram",
+    "TritonSequence",
+    "config_value",
+    "constant",
     "launch_triton_kernel",
-    "registry_factory",
-    "resolve_model_backend",
+    "literal_value",
+    "module_enabled",
+    "module_flag",
+    "option_code",
+    "output_requested",
 ]

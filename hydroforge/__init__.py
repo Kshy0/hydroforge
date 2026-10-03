@@ -7,17 +7,24 @@
 """
 hydroforge: Generic framework for GPU-accelerated hydrological modelling.
 
-Subpackages
------------
+Subpackages, from the lowest layer to the highest
+-------------------------------------------------
+core        Dependency-free validation, errors, calendars, arrays, and expressions.
 contracts   Immutable field, input, and kernel contracts.
-model       Declarative AbstractModule/AbstractModel API.
-compiler    Cold-path model specialization and immutable plans.
-data        Datasets, distributed loading, and spatial mappings.
-serialization Shared file-format contracts and atomic serialization primitives.
-output      Checkpoint, NetCDF, and multi-rank output facilities.
-statistics  Statistics IR, emitters, and runtime.
-kernels     Kernel registration and Torch/Triton/CUDA/Metal backends.
-execution   Compiled step orchestration, input staging, and backend capture.
+io          Atomic files, NetCDF and binary formats, and rank-partitioned output.
+parallel    Launcher environment, device selection, process meshes.
+platform    Kernel backend facts and selection, environment variables.
+kernels     Kernel registration, toolchains, code generation and Torch/Triton/CUDA/
+            Metal backends.
+declare     Module and model declarations, tensor fields, and their frozen specs.
+data        Model inputs, forcing datasets, and input-pipeline utilities.
+mapping     Sparse spatial mapping tables and offline mapping builders.
+statistics  Statistics IR, windows, kernel plans, backend programs, and runtime.
+compiler    Pure compilation of a model declaration into its frozen plan.
+execution   Model runtime: input binding, materialization, step orchestration,
+            structural updates, checkpoints, and backend capture.
+model       AbstractModel and the public declarative-model API.
+testing     Module construction helpers for tests (same layer as model).
 """
 
 __all__: list[str] = []
