@@ -1,28 +1,47 @@
-"""Demand-driven scalar time aggregation, lowered to each execution backend."""
+"""Demand-driven scalar time aggregation as one-lane kernel IR."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-from uuid import uuid4
 
 import torch
 
-from hydroforge.compiler.generated import (
-    compile_generated_module,
-    release_generated_module,
+from hydroforge.core.expr import Expression
+from hydroforge.kernels.codegen.expr import lower_expression
+from hydroforge.kernels.codegen.ir import (
+    Assign,
+    Binary,
+    Cast,
+    Compare,
+    Const,
+    Expr,
+    If,
+    KernelFunction,
+    Let,
+    Load,
+    Logical,
+    Param,
+    Select,
+    Stmt,
+    Store,
+    Var,
+    While,
+    cast,
+    type_of,
 )
-from hydroforge.statistics.emitters.expression import (
-    ExpressionDialect,
-    render_expression,
-)
-from hydroforge.statistics.ir import Expression
-
-if TYPE_CHECKING:
-    from hydroforge.execution.capture import CaptureRuntime
 
 DAY_MICROSECONDS = 86_400_000_000
+
+# ``(years, days)`` of each calendar's repeating cycle.
+_CYCLES = {
+    "proleptic_gregorian": (400, 146097),
+    "julian": (4, 1461),
+    "noleap": (1, 365),
+    "all_leap": (1, 366),
+    "360_day": (1, 360),
+}
+_MONTH_OFFSETS = (31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
 
 
 @dataclass(frozen=True)
@@ -62,407 +81,224 @@ class StepFieldCompileContext:
             for source in self.dependencies()
         )
 
+    @property
+    def dtypes(self) -> tuple[torch.dtype, ...]:
+        """Output dtypes in slab order: ``slab_<i>`` holds ``dtypes[i]``."""
 
-class _TimeEmitter:
-    def __init__(
-        self, context: StepFieldCompileContext, dialect: ExpressionDialect
-    ) -> None:
-        self.context = context
-        self.dialect = dialect
-        self.python = dialect in {ExpressionDialect.TORCH, ExpressionDialect.TRITON}
-        self.floating = "float32" if dialect is ExpressionDialect.METAL else "float64"
-        self.lines: list[str] = []
-        self.indent = 1
-        self.declared: set[str] = set()
+        return tuple(dict.fromkeys(output.dtype for output in self.outputs))
 
-    def append(self, line: str) -> None:
-        self.lines.append("    " * self.indent + line)
 
-    def cast(self, value: str, dtype: str) -> str:
-        if self.dialect is ExpressionDialect.TRITON:
-            return f"tl.cast({value}, tl.{dtype})"
-        if self.dialect is ExpressionDialect.TORCH:
-            return f"torch.as_tensor({value}, dtype=torch.{dtype}, device=clock.device)"
-        native = {
-            "int64": "long" if self.dialect is ExpressionDialect.METAL else "int64_t",
-            "float32": "float",
-            "float64": "double",
-        }[dtype]
-        return f"{native}({value})"
+_I64 = torch.int64
+_CLOCK = Param("clock", _I64, "read_write")
+_DURATION = Param("duration", _I64, "read")
+_ADVANCE = Var("advance", torch.bool)
 
-    def assign(self, name: str, value: str, dtype: str = "int64") -> None:
-        prefix = "auto " if not self.python and name not in self.declared else ""
-        suffix = "" if self.python else ";"
-        self.append(f"{prefix}{name} = {self.cast(value, dtype)}{suffix}")
-        self.declared.add(name)
 
-    def begin(self, kind: str, condition: str) -> None:
-        self.append(
-            f"{kind} {condition}:" if self.python else f"{kind} ({condition}) {{"
+def _integer(value: int) -> Expr:
+    # A converted literal stays an int64 value in every dialect, also where
+    # a bare literal would be a compile-time constant (Triton).
+    return Cast(Const(value), _I64)
+
+
+def _load(param: Param, index: int) -> Load:
+    return Load(param.name, Const(index), param.type)
+
+
+class _Calendar:
+    """Year rules of one calendar over int64 years."""
+
+    def __init__(self, calendar: str) -> None:
+        self.calendar = calendar
+
+    def leap(self, year: Var) -> Expr:
+        """The leap days of ``year`` (0 or 1)."""
+
+        def divisible(divisor: int, holds: bool = True) -> Expr:
+            remainder = Binary("%", year, Const(divisor))
+            return Compare("==" if holds else "!=", remainder, Const(0))
+
+        if self.calendar == "all_leap":
+            return _integer(1)
+        if self.calendar in {"noleap", "360_day"}:
+            return _integer(0)
+        julian = divisible(4)
+        gregorian = Logical(
+            "and",
+            (julian, Logical("or", (divisible(100, False), divisible(400)))),
         )
-        self.indent += 1
+        if self.calendar == "julian":
+            return Cast(julian, _I64)
+        if self.calendar == "standard":
+            before = Compare("<", year, Const(1582))
+            return Cast(Select(before, julian, gregorian), _I64)
+        return Cast(gregorian, _I64)
 
-    def end(self) -> None:
-        self.indent -= 1
-        if not self.python:
-            self.append("}")
+    def year_length(self, year: Var) -> Expr:
+        if self.calendar == "360_day":
+            return _integer(360)
+        length = Binary("+", Const(365), self.leap(year))
+        if self.calendar == "standard":
+            # 1582 skips ten days of October.
+            switch = Compare("==", year, Const(1582))
+            skipped = Select(switch, Const(10), Const(0))
+            length = Binary("-", length, skipped)
+        return length
 
-    def select(self, condition: str, positive: str, negative: str) -> str:
-        if self.dialect is ExpressionDialect.TRITON:
-            return f"tl.where({condition}, {positive}, {negative})"
-        if self.dialect is ExpressionDialect.TORCH:
-            return f"torch.where({condition}, {positive}, {negative})"
-        return f"(({condition}) ? ({positive}) : ({negative}))"
 
-    def load(self, buffer: str, index: int) -> str:
-        if self.dialect is ExpressionDialect.TRITON:
-            return f"tl.load({buffer} + {index})"
-        prefix = "args." if self.dialect is ExpressionDialect.METAL else ""
-        return f"{prefix}{buffer}[{index}]"
+def step_field_program(
+    context: StepFieldCompileContext, real: torch.dtype
+) -> KernelFunction:
+    """One aggregator of the demanded fields, with floating values in
+    ``real``; ``advance`` moves the clock one step first.
 
-    def store(self, buffer: str, index: int, value: str) -> None:
-        if self.dialect is ExpressionDialect.TRITON:
-            self.append(f"tl.store({buffer} + {index}, {value})")
-        else:
-            suffix = "" if self.python else ";"
-            self.append(f"{self.load(buffer, index)} = {value}{suffix}")
+    Buffers: ``clock`` holds ``(year, ordinal day, microseconds of the day,
+    step days, step microseconds)``, ``duration`` the step's ``(days,
+    microseconds)``, and ``slab_<i>`` the outputs of ``context.dtypes[i]``.
+    """
 
-    def leap(self) -> str:
-        calendar = self.context.calendar
-        if calendar == "all_leap":
-            return "1"
-        if calendar in {"noleap", "360_day"}:
-            return "0"
-        julian = "(clock_year % 4 == 0)"
-        gregorian = "((clock_year % 4 == 0) & ((clock_year % 100 != 0) | (clock_year % 400 == 0)))"
-        if calendar == "julian":
-            return julian
-        if calendar == "standard":
-            return self.select("clock_year < 1582", julian, gregorian)
-        return gregorian
+    body: list[Stmt] = []
 
-    def year_length(self) -> str:
-        if self.context.calendar == "360_day":
-            return "360"
-        result = f"365 + {self.cast(self.leap(), 'int64')}"
-        if self.context.calendar == "standard":
-            result += f" - {self.select('clock_year == 1582', '10', '0')}"
-        return result
+    def let(name: str, value: Expr) -> Var:
+        var = Var(name, _I64)
+        body.append(Let(var, value))
+        return var
 
-    def body(self) -> str:
-        dependencies = self.context.dependencies()
-        self.assign("duration_days", self.load("duration", 0))
-        self.assign("duration_micros", self.load("duration", 1))
-        if self.context.requires_calendar:
-            self.assign("clock_year", self.load("clock", 0))
-            self.assign("ordinal", self.load("clock", 1))
-            self.assign("micros", self.load("clock", 2))
-            self.assign("year_length", self.year_length())
-            condition = (
-                "*args.advance"
-                if self.dialect is ExpressionDialect.METAL
-                else "advance"
-            )
-            self.begin("if", condition)
-            self.assign("micros", f"micros + {self.load('clock', 4)}")
-            division = "//" if self.python else "/"
-            self.assign(
-                "ordinal",
-                f"ordinal + {self.load('clock', 3)} + micros {division} {DAY_MICROSECONDS}",
-            )
-            self.assign("micros", f"micros % {DAY_MICROSECONDS}")
-            cycle = {
-                "proleptic_gregorian": (400, 146097),
-                "julian": (4, 1461),
-                "noleap": (1, 365),
-                "all_leap": (1, 366),
-                "360_day": (1, 360),
-            }.get(self.context.calendar)
-            if cycle is not None:
-                cycle_years, cycle_days = cycle
-                self.assign("cycles", f"ordinal {division} {cycle_days}")
-                self.assign("ordinal", f"ordinal - cycles * {cycle_days}")
-                self.assign("clock_year", f"clock_year + cycles * {cycle_years}")
-            self.assign("year_length", self.year_length())
-            self.begin("while", "ordinal >= year_length")
-            self.assign("ordinal", "ordinal - year_length")
-            self.assign("clock_year", "clock_year + 1")
-            self.assign("year_length", self.year_length())
-            self.end()
-            self.end()
-            self.assign("year_length", self.year_length())
-            self.assign("nominal_day", "ordinal")
-            if self.context.calendar == "standard":
-                self.assign(
-                    "nominal_day",
-                    "ordinal + "
-                    + self.select("(clock_year == 1582) & (ordinal >= 277)", "10", "0"),
-                )
-            self.assign("leap_day", self.leap())
-            self.assign("calendar_month", "0")
-            self.assign("month_start", "0")
-            for month, offset in enumerate(
-                (31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334), 1
-            ):
-                start = (
-                    str(month * 30)
-                    if self.context.calendar == "360_day"
-                    else str(offset)
-                    if month == 1
-                    else f"({offset} + leap_day)"
-                )
-                condition = f"nominal_day >= {start}"
-                self.assign(
-                    "calendar_month",
-                    self.select(condition, str(month), "calendar_month"),
-                )
-                self.assign("month_start", self.select(condition, start, "month_start"))
-            for index, value in enumerate(
-                ("clock_year", "ordinal", "micros", "duration_days", "duration_micros")
-            ):
-                self.store("clock", index, value)
-        values = {
-            "doy": ("nominal_day + 1", "int64"),
-            "month_idx": ("calendar_month", "int64"),
-            "days_in_year": ("year_length", "int64"),
-            "day_seconds": (
-                f"{self.cast('micros', self.floating)} / 1000000.0",
-                self.floating,
+    duration_days = let("duration_days", _load(_DURATION, 0))
+    duration_micros = let("duration_micros", _load(_DURATION, 1))
+    values: dict[str, Expr] = {
+        "step_seconds": Binary(
+            "+",
+            Binary("*", Cast(duration_days, real), Const(86400.0)),
+            Binary("/", Cast(duration_micros, real), Const(1000000.0)),
+        )
+    }
+    if context.requires_calendar:
+        calendar = _Calendar(context.calendar)
+        year = let("clock_year", _load(_CLOCK, 0))
+        ordinal = let("ordinal", _load(_CLOCK, 1))
+        micros = let("micros", _load(_CLOCK, 2))
+        year_length = let("year_length", calendar.year_length(year))
+        advance: list[Stmt] = [
+            Assign(micros, Binary("+", micros, _load(_CLOCK, 4))),
+            Assign(
+                ordinal,
+                Binary(
+                    "+",
+                    Binary("+", ordinal, _load(_CLOCK, 3)),
+                    Binary("/", micros, Const(DAY_MICROSECONDS)),
+                ),
             ),
-            "julian": (
-                f"{self.cast('nominal_day', self.floating)} + {self.cast('micros', self.floating)} / 1000000.0 / 86400.0",
-                self.floating,
-            ),
-            "step_seconds": (
-                f"{self.cast('duration_days', self.floating)} * 86400.0 + {self.cast('duration_micros', self.floating)} / 1000000.0",
-                self.floating,
-            ),
-            "year": (
-                "clock_year"
-                if self.context.has_year_zero
-                else "clock_year - " + self.select("clock_year <= 0", "1", "0"),
-                "int64",
-            ),
-            "month": ("calendar_month + 1", "int64"),
-            "day": ("nominal_day - month_start + 1", "int64"),
-        }
-        names = {}
-        for index, source in enumerate(dependencies):
-            symbol = f"field_{index}"
-            if source in self.context.expressions:
-                expression = render_expression(
-                    self.context.expressions[source],
-                    self.dialect,
-                    names,
-                    value_type=self.floating,
-                )
-                self.assign(symbol, expression, self.floating)
-            else:
-                expression, dtype = values[source]
-                self.assign(symbol, expression, dtype)
-            names[source] = symbol
-        dtypes = tuple(dict.fromkeys(output.dtype for output in self.context.outputs))
-        for output in self.context.outputs:
-            self.store(
-                f"slab_{dtypes.index(output.dtype)}", output.slot, names[output.source]
-            )
-        return "\n".join(self.lines)
-
-
-def generate_step_field_source(
-    context: StepFieldCompileContext, dialect: ExpressionDialect
-) -> str:
-    """Emit one scalar aggregator; advancing and refresh share the same body."""
-    return _TimeEmitter(context, dialect).body()
-
-
-class CompiledStepFields:
-    """Execution-owned generated kernel and optional single-node replay graph."""
-
-    def __init__(
-        self,
-        context: StepFieldCompileContext,
-        *,
-        backend: str,
-        clock: torch.Tensor,
-        duration: torch.Tensor,
-        storage: Mapping[torch.dtype, torch.Tensor],
-        capture: CaptureRuntime | None = None,
-    ) -> None:
-        self.context = context
-        self.clock = clock
-        self.duration = duration
-        self.dtypes = tuple(dict.fromkeys(output.dtype for output in context.outputs))
-        self.tensors = (clock, duration, *(storage[dtype] for dtype in self.dtypes))
-        self.capture = capture
-        self.graph = None
-        self.module = None
-        self.filename = None
-        if clock.device.type == "cpu":
-            dialect = ExpressionDialect.TORCH
-        elif backend == "triton" or clock.device.type == "xpu":
-            dialect = ExpressionDialect.TRITON
-        elif clock.device.type == "mps":
-            dialect = ExpressionDialect.METAL
-        elif clock.device.type == "cuda":
-            dialect = ExpressionDialect.CUDA
-        else:
-            raise ValueError(
-                f"compiled step fields do not support device {clock.device}"
-            )
-        self.dialect = dialect
-        self.source = generate_step_field_source(context, dialect)
-        if dialect in {ExpressionDialect.TORCH, ExpressionDialect.TRITON}:
-            self._compile_python()
-        elif dialect is ExpressionDialect.CUDA:
-            self._compile_cuda()
-        else:
-            self._compile_metal()
-
-    def _compile_python(self) -> None:
-        parameters = [
-            "clock",
-            "duration",
-            *(f"slab_{index}" for index in range(len(self.dtypes))),
+            Assign(micros, Binary("%", micros, Const(DAY_MICROSECONDS))),
         ]
-        if self.dialect is ExpressionDialect.TRITON:
-            header = (
-                "import triton\nimport triton.language as tl\nfrom triton.language.extra import libdevice\n"
-                "@triton.jit\ndef hydroforge_maximum(left, right):\n"
-                "    return tl.where(left != left, right, tl.where(right != right, left, tl.maximum(left, right)))\n"
-                "@triton.jit\ndef hydroforge_minimum(left, right):\n"
-                "    return tl.where(left != left, right, tl.where(right != right, left, tl.minimum(left, right)))\n"
-                "@triton.jit\n"
-            )
-            parameters.append("advance: tl.constexpr")
-        else:
-            header = (
-                "import torch\n"
-                "hydroforge_where = torch.where\n"
-                "hydroforge_maximum = torch.fmax\n"
-                "hydroforge_minimum = torch.fmin\n"
-                "hydroforge_remainder = torch.remainder\n"
-            )
-            parameters.append("advance")
-        source = (
-            header
-            + f"def aggregate_time({', '.join(parameters)}):\n"
-            + self.source
-            + "\n"
-        )
-        name = "hydroforge_step_time_" + uuid4().hex
-        module = compile_generated_module(source, name=name)
-        self.module = module
-        self.filename = module.__file__
-        self.source = source
-        kernel = module.aggregate_time
-        if self.dialect is ExpressionDialect.TRITON:
-            from hydroforge.kernels.backends.triton.dispatcher import (
-                launch_triton_kernel,
-            )
-
-            launch = launch_triton_kernel(kernel, (1,), physics=False)
-            self.launch = lambda advance: launch(
-                *self.tensors, advance, num_warps=1, enable_fp_fusion=False
-            )
-        else:
-            self.launch = lambda advance: kernel(*self.tensors, advance)
-
-    def _compile_cuda(self) -> None:
-        from hydroforge.kernels.backends.cuda import rtc
-
-        parameters = ["int64_t* clock", "const int64_t* duration"]
-        parameters.extend(
-            f"{rtc.ctype(dtype)}* slab_{index}"
-            for index, dtype in enumerate(self.dtypes)
-        )
-        parameters.append("bool advance")
-        body = self.source.replace("hf_max(", "fmax(").replace("hf_min(", "fmin(")
-        source = (
-            f"__global__ void time_kernel({', '.join(parameters)}) {{\n{body}\n}}\n"
-        )
-        program = rtc.RtcProgram(
-            source,
-            ("--fmad=false",),
-            "hydroforge_step_time",
-        )
-        device = self.tensors[0].device.index
-        launches = {}
-        for advance in (False, True):
-            steps = (
-                rtc.CudaLaunch(
-                    "time_kernel",
-                    1,
-                    1,
-                    (*map(rtc.pointer, self.tensors), rtc.boolean(advance)),
+        cycle = _CYCLES.get(context.calendar)
+        if cycle is not None:
+            cycle_years, cycle_days = cycle
+            cycles = Var("cycles", _I64)
+            advance += [
+                Let(cycles, Binary("/", ordinal, Const(cycle_days))),
+                Assign(
+                    ordinal,
+                    Binary("-", ordinal, Binary("*", cycles, Const(cycle_days))),
+                ),
+                Assign(
+                    year,
+                    Binary("+", year, Binary("*", cycles, Const(cycle_years))),
+                ),
+            ]
+        advance += [
+            Assign(year_length, calendar.year_length(year)),
+            While(
+                Compare(">=", ordinal, year_length),
+                (
+                    Assign(ordinal, Binary("-", ordinal, year_length)),
+                    Assign(year, Binary("+", year, Const(1))),
+                    Assign(year_length, calendar.year_length(year)),
+                ),
+            ),
+        ]
+        body.append(If(_ADVANCE, tuple(advance)))
+        body.append(Assign(year_length, calendar.year_length(year)))
+        nominal = ordinal
+        if context.calendar == "standard":
+            late = Logical(
+                "and",
+                (
+                    Compare("==", year, Const(1582)),
+                    Compare(">=", ordinal, Const(277)),
                 ),
             )
-            launches[advance] = rtc.prepare(
-                rtc.request_for(program, steps), steps, device
+            nominal = Binary("+", ordinal, Select(late, Const(10), Const(0)))
+        nominal_day = let("nominal_day", nominal)
+        leap_day = let("leap_day", calendar.leap(year))
+        month = let("calendar_month", _integer(0))
+        month_start = let("month_start", _integer(0))
+        for number, offset in enumerate(_MONTH_OFFSETS, 1):
+            if context.calendar == "360_day":
+                start = Const(number * 30)
+            elif number == 1:
+                start = Const(offset)
+            else:
+                start = Binary("+", Const(offset), leap_day)
+            reached = Compare(">=", nominal_day, start)
+            body.append(Assign(month, Select(reached, Const(number), month)))
+            body.append(Assign(month_start, Select(reached, start, month_start)))
+        for index, value in enumerate(
+            (year, ordinal, micros, duration_days, duration_micros)
+        ):
+            body.append(Store(_CLOCK.name, Const(index), value))
+        one = Const(1)
+        values |= {
+            "doy": Binary("+", nominal_day, one),
+            "month_idx": month,
+            "days_in_year": year_length,
+            "day_seconds": Binary("/", Cast(micros, real), Const(1000000.0)),
+            "julian": Binary(
+                "+",
+                Cast(nominal_day, real),
+                Binary(
+                    "/",
+                    Binary("/", Cast(micros, real), Const(1000000.0)),
+                    Const(86400.0),
+                ),
+            ),
+            "year": year
+            if context.has_year_zero
+            else Binary(
+                "-",
+                year,
+                Select(
+                    Compare("<=", year, Const(0)),
+                    Const(1),
+                    Const(0),
+                ),
+            ),
+            "month": Binary("+", month, one),
+            "day": Binary("+", Binary("-", nominal_day, month_start), one),
+        }
+    fields: dict[str, Var] = {}
+    for index, source in enumerate(context.dependencies()):
+        expression = context.expressions.get(source)
+        value = (
+            values[source]
+            if expression is None
+            else lower_expression(expression, fields, real)
+        )
+        field = fields[source] = Var(f"field_{index}", type_of(value))
+        body.append(Let(field, value))
+    dtypes = context.dtypes
+    for output in context.outputs:
+        body.append(
+            Store(
+                f"slab_{dtypes.index(output.dtype)}",
+                Const(output.slot),
+                cast(fields[output.source], output.dtype),
             )
-        self.source = source
-        self.launch = lambda advance: launches[bool(advance)]()
-
-    def _compile_metal(self) -> None:
-        from hydroforge.kernels.backends.metal.online import (
-            MetalBuffer,
-            MetalScalar,
-            make_online_metal_dispatcher,
         )
-
-        buffers = (
-            MetalBuffer("clock", torch.int64, "read_write"),
-            MetalBuffer("duration", torch.int64, "read"),
-        )
-        buffers += tuple(
-            MetalBuffer(f"slab_{index}", dtype, "write")
-            for index, dtype in enumerate(self.dtypes)
-        )
-        dispatcher = make_online_metal_dispatcher(
-            "hf_aggregate_time",
-            buffers=buffers,
-            scalars=(MetalScalar("advance", "bool"), MetalScalar("count", "index")),
-            size_key="count",
-            body="if (i == 0) {\n"
-            + self.source.replace("hydroforge_maximum(", "fmax(").replace(
-                "hydroforge_minimum(", "fmin("
-            )
-            + "\n}",
-        )
-        launches = {}
-        for advance in (False, True):
-            arguments = dict(
-                zip((buffer.name for buffer in buffers), self.tensors, strict=True)
-            )
-            arguments.update(advance=advance, count=1, BLOCK_SIZE=1)
-            dtypes = {buffer.name: buffer.dtype for buffer in buffers}
-            dispatcher._validate_specialization_input(arguments, buffer_dtypes=dtypes)
-            launches[advance] = dispatcher.specialize(arguments, buffer_dtypes=dtypes)
-        self.launch = lambda advance: launches[advance]()
-
-    def run(self, *, advance: bool) -> None:
-        if advance and self.capture is not None:
-            # Clock updates are non-differentiable. Capture and replay also
-            # touch generator state that earlier inference captures may own.
-            with torch.inference_mode():
-                if self.graph is None:
-                    self.graph = self.capture.capture_cuda(
-                        lambda: self.launch(True),
-                        mutated_state=self.tensors,
-                    )
-                self.graph.replay()
-        else:
-            self.launch(advance)
-
-    def close(self) -> None:
-        try:
-            if self.graph is not None:
-                graph, self.graph = self.graph, None
-                self.capture.release(graph)
-        finally:
-            if self.filename is not None:
-                release_generated_module(self.module.__name__, self.filename)
-                self.filename = None
-            self.module = None
-            self.launch = None
-            self.tensors = ()
+    slabs = tuple(
+        Param(f"slab_{index}", dtype, "write") for index, dtype in enumerate(dtypes)
+    )
+    return KernelFunction(
+        "aggregate_time",
+        (_CLOCK, _DURATION, *slabs, Param(_ADVANCE.name, torch.bool)),
+        tuple(body),
+    )

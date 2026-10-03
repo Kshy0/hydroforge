@@ -4,585 +4,414 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-"""
-Kernel backend selection and registry for hydroforge.
+"""Kernel registries, implementation declarations and validated calls.
 
-Set ``HYDROFORGE_BACKEND`` to choose the backend explicitly::
-
-    export HYDROFORGE_BACKEND=metal    # Metal shaders (Apple Silicon)
-    export HYDROFORGE_BACKEND=triton   # Triton JIT kernels (NVIDIA/AMD/Intel)
-    export HYDROFORGE_BACKEND=cuda     # NVRTC / HIPRTC device kernels
-    export HYDROFORGE_BACKEND=torch    # Formal pure-PyTorch backend
-
-When unset, the model device selects Triton for CUDA/ROCm and XPU, Metal for
-MPS, and Torch for CPU. Triton selection requires a usable matching driver
-and compiler; another backend must be selected explicitly if it is unavailable.
-The ``cuda`` backend also supports AMD/ROCm when explicitly selected.
-
-Torch is an optional but formal backend: projects that register it must expose
-the same exact :class:`KernelSpec` ABI as native backends.
+A :class:`BackendRegistry` pairs one :class:`KernelSpec` with a declaration
+per execution backend.  The registry resolves the spec's precision, checks its
+scalar kinds against the backend once, and builds the declaration into a
+:class:`KernelImplementation`.  An implementation validates one complete call
+into a :class:`KernelCall`, which compiles to a zero-argument launch.
 """
 
-import os
-from collections.abc import Callable, Mapping
+from __future__ import annotations
+
+import inspect
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from functools import cached_property
-from typing import Any, Self
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Annotated, Any, ClassVar
 
 import torch
-from pydantic import PrivateAttr, model_validator
+from pydantic import AfterValidator, Field, InstanceOf, PrivateAttr, model_validator
 
-from hydroforge.contracts.kernels import (
-    BackendLoweringSpec,
-    BufferDTypeABI,
-    KernelMetadata,
-    KernelSpec,
-)
-from hydroforge.contracts.naming import Identifier
-from hydroforge.contracts.validation import FrozenMapping, HydroForgeModel
-from hydroforge.kernels.backends.cuda.template import make_spec_cuda_dispatcher
-from hydroforge.kernels.backends.metal.dispatcher import make_metal_dispatcher
-from hydroforge.kernels.backends.metal.template import make_spec_metal_dispatcher
-from hydroforge.kernels.backends.torch.dispatcher import make_torch_dispatcher
-from hydroforge.kernels.backends.triton.dispatcher import (
-    make_triton_dispatcher,
-    make_triton_program_dispatcher,
-    make_triton_sequence_dispatcher,
-)
-from hydroforge.kernels.backends.triton.runtime import (
-    _require_proven_triton_device,
-    _require_triton_device_backend,
-)
-from hydroforge.kernels.context import (
-    active_operator_recorder,
-    kernel_factory_contract,
-    registry_factory,
-)
-from hydroforge.kernels.devices import devices_match
+from hydroforge.core.devices import devices_match
+from hydroforge.core.validation import FrozenMapping, HydroForgeModel
+from hydroforge.kernels.calls import current_sink
+from hydroforge.kernels.spec import KernelSpec
+from hydroforge.kernels.toolchain import CompileRequest
+from hydroforge.platform.backend import Backend, BackendName, Toolchain, backend_named
 
-__all__ = [
-    "BackendRegistry",
-    "devices_match",
-    "make_metal_dispatcher",
-    "make_torch_dispatcher",
-    "registry_factory",
-    "make_spec_metal_dispatcher",
-    "make_spec_cuda_dispatcher",
-    "make_triton_dispatcher",
-    "make_triton_program_dispatcher",
-    "make_triton_sequence_dispatcher",
-    "resolve_model_backend",
-]
+Launch = Callable[[], Any]
 
 
-_ACTIVE_AUTO_BINDER: ContextVar[Any | None] = ContextVar(
-    "hydroforge_automatic_kernel_binder",
-    default=None,
-)
-
-_BACKEND_DEVICE_TYPES: Mapping[str, tuple[str, ...]] = {
-    "cuda": ("cuda",),
-    "triton": ("cuda", "xpu"),
-    "metal": ("mps",),
-}
+def empty_launch() -> None:
+    return None
 
 
-def _backend_device_types(backend: str) -> tuple[str, ...] | None:
-    """Return the physical device types accepted by one native backend."""
-
-    return _BACKEND_DEVICE_TYPES.get(backend)
-
-
-@contextmanager
-def automatic_kernel_binding(binder: Any):
-    """Complete omitted kernel arguments inside a compiled orchestration body."""
-
-    token = _ACTIVE_AUTO_BINDER.set(binder)
-    try:
-        yield
-    finally:
-        _ACTIVE_AUTO_BINDER.reset(token)
+def _named_callable(value: Any) -> Any:
+    if value is not None and (
+        not callable(value) or not getattr(value, "__name__", "").isidentifier()
+    ):
+        raise ValueError("launch plans and checks must be named callables")
+    return value
 
 
-def _configured_backend() -> str | None:
-    """Return and validate the explicitly configured model backend."""
-
-    env = os.environ.get("HYDROFORGE_BACKEND", "").strip().lower()
-    supported = {"torch", "triton", "cuda", "metal"}
-    if env and env not in supported:
-        raise ValueError(
-            f"HYDROFORGE_BACKEND must be one of {sorted(supported)}, got {env!r}"
-        )
-    return env or None
+NamedCallable = Annotated[Any, AfterValidator(_named_callable)]
 
 
-class _ModelBackendRequest(HydroForgeModel):
-    device: torch.device
+def named_parameters(spec: KernelSpec, function: Callable) -> tuple[str, ...]:
+    """Canonical names ``function`` receives; ``**values`` receives all of them.
 
-    _backend: str = PrivateAttr()
-
-    @model_validator(mode="after")
-    def _resolve(self):
-        self._backend = _resolve_model_backend_trusted(self.device)
-        return self
-
-    @property
-    def backend(self) -> str:
-        return self._backend
-
-
-def resolve_model_backend(device: torch.device) -> str:
-    """Resolve one model's backend from its declared device.
-
-    An explicit ``HYDROFORGE_BACKEND`` remains authoritative.  In automatic
-    mode the model device, rather than accelerator visibility elsewhere in the
-    process, selects the backend.  This permits CPU and accelerator models to
-    coexist without silently assigning a native GPU backend to CPU state.
+    ``BLOCK_SIZE`` counts as a canonical name.  Parameters must be plain
+    keywords without defaults and must name parameters of ``spec``.
     """
 
-    return _ModelBackendRequest(device=device).backend
-
-
-def _resolve_model_backend_trusted(device: torch.device) -> str:
-    """Resolve a backend from an already validated torch device."""
-
-    device_type = device.type
-    if device_type in {"xla", "lazy"}:
-        _require_triton_device_backend(device)
-    configured = _configured_backend()
-    if configured is not None:
-        if configured == "triton":
-            _require_triton_device_backend(device)
-        required_devices = _backend_device_types(configured)
-        if required_devices is not None and device_type not in required_devices:
-            required_label = " or ".join(repr(item) for item in required_devices)
-            raise ValueError(
-                f"HydroForge backend {configured!r} requires a "
-                f"{required_label} model device, got {str(device)!r}"
-            )
-        return configured
-    if device_type in {"cuda", "xpu"}:
-        _require_triton_device_backend(device)
-        return "triton"
-    if device_type == "mps":
-        return "metal"
-    return "torch"
-
-
-class _KernelInvocationRequest(HydroForgeModel):
-    """Validate the caller-supplied portion of one canonical kernel ABI."""
-
-    spec: KernelSpec
-    arguments: FrozenMapping[Identifier, Any]
-
-    @model_validator(mode="after")
-    def _validate_arguments(self) -> Self:
-        supplied = self.arguments
-        unknown = set(supplied).difference(self.spec.parameters)
-        if unknown:
-            raise ValueError(
-                f"{self.spec.name} received arguments outside its KernelSpec: "
-                f"{sorted(unknown)}"
-            )
-        if "BLOCK_SIZE" in supplied:
-            raise ValueError(
-                f"{self.spec.name}.BLOCK_SIZE is compiler-owned; configure "
-                "model.BLOCK_SIZE instead"
-            )
-        if active_operator_recorder() is None and _ACTIVE_AUTO_BINDER.get() is None:
-            raise ValueError(
-                f"{self.spec.name} may be called only while HydroForge records "
-                "or executes a validated model step"
-            )
-        return self
-
-
-def _invocation_arguments(spec: KernelSpec, kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Validate call-site arguments; an empty call inside a step is trivially valid."""
-
-    if not kwargs and (
-        active_operator_recorder() is not None or _ACTIVE_AUTO_BINDER.get() is not None
-    ):
-        return {}
-    request = _KernelInvocationRequest(spec=spec, arguments=kwargs)
-    return dict(request.arguments)
-
-
-class BackendRegistry(HydroForgeModel):
-    """Explicit lazy implementations of one logical kernel by backend."""
-
-    implementations: FrozenMapping[str, Callable[[], Any]]
-    name: str = "kernel"
-    spec: KernelSpec
-
-    @model_validator(mode="after")
-    def _validate_registry(self) -> Self:
-        if self.spec.name != self.name:
-            raise ValueError(
-                f"registry name {self.name!r} differs from KernelSpec "
-                f"name {self.spec.name!r}"
-            )
-        return self
-
-    @cached_property
-    def selected(self) -> Callable:
-        return KernelEntry(self)
-
-    @property
-    def _available(self) -> tuple[str, ...]:
-        return tuple(self.implementations)
-
-    def resolve(self, backend: str, *, precision: str | None = None) -> Any:
-        """Build the implementation for one explicit model backend."""
-        request = _BackendResolutionRequest(
-            registry=self,
-            backend=backend,
-            precision=precision,
+    parameters = inspect.signature(function).parameters.values()
+    unsupported = [
+        parameter.name
+        for parameter in parameters
+        if parameter.kind
+        not in (
+            parameter.KEYWORD_ONLY,
+            parameter.POSITIONAL_OR_KEYWORD,
+            parameter.VAR_KEYWORD,
         )
-        return request.materialize()
-
-    def __call__(self, **kwargs: Any):
-        return self.selected._invoke_trusted(_invocation_arguments(self.spec, kwargs))
-
-
-class KernelEntry(HydroForgeModel):
-    """A lazy registered operator recorded by an active compiled substep."""
-
-    _registry: BackendRegistry = PrivateAttr()
-    _implementations: dict[tuple[str, str | None], Any] = PrivateAttr(
-        default_factory=dict,
+        or parameter.default is not parameter.empty
+    ]
+    if unsupported:
+        raise ValueError(
+            f"{spec.name}: {function.__name__} parameters must be plain "
+            f"keyword parameters without defaults: {unsupported}"
+        )
+    names = tuple(
+        parameter.name
+        for parameter in parameters
+        if parameter.kind is not parameter.VAR_KEYWORD
     )
+    if any(parameter.kind is parameter.VAR_KEYWORD for parameter in parameters):
+        names += tuple(
+            name for name in (*spec.parameter_names, "BLOCK_SIZE") if name not in names
+        )
+    unknown = set(names).difference(spec.parameters, {"BLOCK_SIZE"})
+    if unknown:
+        raise ValueError(
+            f"{spec.name}: {function.__name__} takes names outside its "
+            f"KernelSpec: {sorted(unknown)}"
+        )
+    return names
 
-    def __init__(self, registry: BackendRegistry):
-        super().__init__()
-        self._registry = registry
 
-    def _implementation(
+class KernelImplementation(ABC):
+    """One declaration built for a resolved spec on one backend.
+
+    Subclasses validate their native requirements in ``_validate``, describe
+    their compilation in ``_requests`` and build the launch in ``_compile``;
+    calls with an empty launch extent never reach ``_compile``.
+    """
+
+    def __init__(self, spec: KernelSpec, backend: Backend) -> None:
+        self.spec = spec
+        self.backend = backend
+
+    def call(
         self,
-        backend: str,
+        arguments: Mapping[str, Any],
         *,
-        precision: str | None = None,
-    ) -> Any:
-        """Return one backend implementation, constructed and checked once."""
-        precision_key = precision if self._registry.spec._uses_precision else None
-        key = (backend, precision_key)
-        implementation = self._implementations.get(key)
-        if implementation is None:
-            implementation = self._registry.resolve(
-                backend,
-                precision=precision_key,
+        buffer_dtypes: Mapping[str, torch.dtype | None] | None = None,
+    ) -> KernelCall:
+        """Validate one complete call; ``BLOCK_SIZE`` defaults to the backend's."""
+
+        spec = self.spec
+        backend = self.backend
+        arguments = dict(arguments)
+        if "BLOCK_SIZE" not in arguments:
+            arguments["BLOCK_SIZE"] = backend.block.resolve(
+                None, kernel=spec.block_sizes.get(backend.name), backend=backend.name
             )
-            self._implementations[key] = implementation
-        return implementation
-
-    @property
-    def _spec(self) -> KernelSpec:
-        return self._registry.spec
-
-    @property
-    def metadata(self) -> KernelMetadata:
-        # KernelSpec is the canonical public ABI. Merely inspecting or binding
-        # an entry must not construct whichever backend happens to be active.
-        return self._registry.spec._canonical_metadata
-
-    def __call__(self, **kwargs: Any):
-        return self._invoke_trusted(_invocation_arguments(self._registry.spec, kwargs))
-
-    def _invoke_trusted(self, kwargs: dict[str, Any]):
-        recorder = active_operator_recorder()
-        if recorder is not None:
-            return recorder.record(self, kwargs)
-        binder = _ACTIVE_AUTO_BINDER.get()
-        if not kwargs:
-            cached = binder._launch_cache.get(id(self))
-            if cached is not None:
-                _entry, launch, triton_device = cached
-                # The slow path proves the Triton runtime device on every
-                # specialization; the cached launch must keep that guarantee.
-                if triton_device is not None:
-                    _require_proven_triton_device(triton_device)
-                return launch()
-        binding = binder.bind(self, kwargs)
-        backend = binder.model._execution.backend
-        implementation = self._implementation(
-            backend,
-            precision=getattr(binder.model, "precision", None),
-        )
-        arguments = dict(binding.arguments)
-        launch = implementation.specialize(
-            arguments,
-            buffer_dtypes=binding.buffer_dtypes,
-        )
-        if not kwargs:
-            triton_device = None
-            if backend == "triton":
-                triton_device = next(
-                    (
-                        arguments[name].device
-                        for name in self._spec.buffers
-                        if isinstance(arguments[name], torch.Tensor)
-                    ),
-                    None,
+        supplied = set(arguments).difference({"BLOCK_SIZE"})
+        if supplied != set(spec.parameters):
+            raise ValueError(
+                f"{spec.name} call ABI mismatch: "
+                f"missing={sorted(set(spec.parameters) - supplied)}, "
+                f"extra={sorted(supplied - set(spec.parameters))}"
+            )
+        backend.block.validate(arguments["BLOCK_SIZE"], backend=backend.name)
+        spec.validate_host_values(arguments)
+        tensors: list[tuple[str, torch.Tensor]] = []
+        for name in spec.buffers:
+            value = arguments[name]
+            if value is None and name in spec.optional:
+                continue
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(
+                    f"{spec.name}.{name} must be a tensor, got {type(value).__name__}"
                 )
-            binder._launch_cache[id(self)] = (self, launch, triton_device)
-        return launch()
-
-
-class StrictImplementation(HydroForgeModel):
-    """Trusted backend implementation built by a validated adapter factory."""
-
-    spec: KernelSpec
-    backend: str
-
-    _implementation: Any = PrivateAttr()
-    _specializer: Callable = PrivateAttr()
-
-    @classmethod
-    def _from_validated(
-        cls,
-        request: "_ResolvedImplementationRequest",
-    ) -> "StrictImplementation":
-        result = cls(spec=request.spec, backend=request.backend)
-        result._implementation = request.implementation
-        result._specializer = request.specializer
-        result.__hydroforge_kernel__ = request.spec._canonical_metadata
-        return result
-
-    def __call__(self, **arguments: Any):
-        """Validate, compile and execute one explicit backend invocation."""
-
-        buffer_dtypes = {
-            name: getattr(arguments.get(name), "dtype", None)
-            for name in self.spec.buffers
-        }
-        return self.specialize(
-            arguments,
-            buffer_dtypes=buffer_dtypes,
-        )()
-
-    def _compile_trusted(
-        self,
-        arguments: dict[str, Any],
-        *,
-        buffer_dtypes: BufferDTypeABI,
-    ) -> Callable:
-        return self._specializer(
-            arguments,
-            buffer_dtypes=buffer_dtypes,
+            if value.layout is not torch.strided or not value.is_contiguous():
+                raise ValueError(
+                    f"{spec.name}.{name} must be a contiguous strided tensor"
+                )
+            tensors.append((name, value))
+        wrong = [
+            f"{name}={tensor.device}"
+            for name, tensor in tensors
+            if not backend.accepts(tensor.device)
+        ]
+        if wrong:
+            required = " or ".join(sorted(backend.devices))
+            raise ValueError(
+                f"{spec.name}: {backend.name} buffers must be on {required}; "
+                f"got {', '.join(wrong)}"
+            )
+        if tensors:
+            reference = tensors[0][1].device
+            mismatched = [
+                f"{name}={tensor.device}"
+                for name, tensor in tensors[1:]
+                if not devices_match(tensor.device, reference)
+            ]
+            if mismatched:
+                raise ValueError(
+                    f"{spec.name}: buffers must share one device; expected "
+                    f"{reference}, got {', '.join(mismatched)}"
+                )
+        if buffer_dtypes is None:
+            buffer_dtypes = {
+                name: getattr(arguments[name], "dtype", None) for name in spec.buffers
+            }
+        elif set(buffer_dtypes) != set(spec.buffers):
+            raise ValueError(
+                f"{spec.name}: buffer dtype ABI mismatch: "
+                f"missing={sorted(set(spec.buffers) - set(buffer_dtypes))}, "
+                f"extra={sorted(set(buffer_dtypes) - set(spec.buffers))}"
+            )
+        for name, dtype in buffer_dtypes.items():
+            value = arguments[name]
+            if dtype is None:
+                if value is None and name in spec.optional:
+                    continue
+                raise ValueError(f"{spec.name}.{name} buffer dtype must be torch.dtype")
+            if value is not None and value.dtype != dtype:
+                raise ValueError(
+                    f"{spec.name}.{name} call declares {dtype}, but the tensor "
+                    f"has dtype {value.dtype}"
+                )
+        call = KernelCall(
+            self, MappingProxyType(arguments), MappingProxyType(dict(buffer_dtypes))
         )
+        self._validate(call)
+        return call
 
     def specialize(
         self,
-        arguments: dict[str, Any],
+        arguments: Mapping[str, Any],
         *,
-        buffer_dtypes: BufferDTypeABI,
-    ) -> Callable:
-        """Validate one public kernel call and return its compiled launch."""
+        buffer_dtypes: Mapping[str, torch.dtype | None] | None = None,
+    ) -> Launch:
+        """Validate and compile one call into a zero-argument launch."""
 
-        request = _KernelSpecializationRequest(
-            implementation=self,
-            arguments=arguments,
-            buffer_dtypes=buffer_dtypes,
-        )
-        return request.materialize()
+        return self.call(arguments, buffer_dtypes=buffer_dtypes).compile()
+
+    def __call__(self, **arguments: Any) -> None:
+        """Validate, compile and execute one call."""
+
+        self.specialize(arguments)()
+
+    def _validate(self, call: KernelCall) -> None:
+        """Reject a call the native implementation cannot serve."""
+
+    def _requests(self, call: KernelCall) -> tuple[CompileRequest, ...]:
+        return ()
+
+    @abstractmethod
+    def _compile(self, call: KernelCall) -> Launch: ...
 
 
-class _ResolvedImplementationRequest(HydroForgeModel):
-    """Validate one lazy backend factory result before it becomes trusted."""
+@dataclass(frozen=True, slots=True)
+class KernelCall:
+    """One complete, validated and not yet compiled kernel call.
 
-    implementation: Any
-    spec: KernelSpec
-    backend: str
+    Recording keeps calls uncompiled so that
+    :func:`hydroforge.kernels.toolchain.compile_calls` can compile a whole
+    program's kernels in one batch per toolchain.
+    """
 
-    _specializer: Callable = PrivateAttr()
-
-    @model_validator(mode="after")
-    def _validate_implementation(self) -> Self:
-        metadata = getattr(
-            self.implementation,
-            "__hydroforge_kernel__",
-            None,
-        )
-        lowering = getattr(
-            self.implementation,
-            "__hydroforge_lowering__",
-            None,
-        )
-        specializer = getattr(self.implementation, "specialize", None)
-        if not isinstance(metadata, KernelMetadata):
-            raise ValueError(
-                f"{self.spec.name}: {self.backend} factory must return a "
-                "validated HydroForge dispatcher with KernelMetadata"
-            )
-        if not isinstance(lowering, BackendLoweringSpec):
-            raise ValueError(
-                f"{self.spec.name}: {self.backend} factory must return a "
-                "dispatcher with BackendLoweringSpec"
-            )
-        if not callable(specializer):
-            raise ValueError(
-                f"{self.spec.name}: {self.backend} dispatcher must define "
-                "a callable specialize()"
-            )
-        try:
-            self.spec._validate_native(self.backend, metadata, lowering)
-        except (TypeError, ValueError, OverflowError) as error:
-            raise ValueError(str(error)) from error
-        self._specializer = specializer
-        return self
+    implementation: KernelImplementation
+    arguments: Mapping[str, Any]
+    buffer_dtypes: Mapping[str, torch.dtype | None]
 
     @property
-    def specializer(self) -> Callable:
-        return self._specializer
+    def empty(self) -> bool:
+        return self.implementation.spec.launch_extent(self.arguments) == 0
 
-    def materialize(self) -> StrictImplementation:
-        return StrictImplementation._from_validated(self)
+    def requests(self) -> tuple[CompileRequest, ...]:
+        """The compilations this call needs before :meth:`compile`."""
+
+        return () if self.empty else self.implementation._requests(self)
+
+    def compile(self) -> Launch:
+        """Compile (or reuse) the launch of this call."""
+
+        launch = empty_launch if self.empty else self.implementation._compile(self)
+        for wrap in _INTERCEPTS.get():
+            launch = wrap(self, launch)
+        return launch
 
 
-class _BackendResolutionRequest(HydroForgeModel):
-    """One validated public backend-selection request."""
+_INTERCEPTS: ContextVar[tuple[Callable[[KernelCall, Launch], Launch], ...]] = (
+    ContextVar("hydroforge_kernel_intercepts", default=())
+)
 
-    registry: BackendRegistry
-    backend: str
-    precision: str | None = None
 
-    _spec: KernelSpec = PrivateAttr()
+@contextmanager
+def intercepting(wrap: Callable[[KernelCall, Launch], Launch]) -> Iterator[None]:
+    """Wrap every launch compiled inside the block."""
 
-    @model_validator(mode="after")
-    def _validate_resolution(self):
-        if self.backend not in self.registry.implementations:
+    token = _INTERCEPTS.set((*_INTERCEPTS.get(), wrap))
+    try:
+        yield
+    finally:
+        _INTERCEPTS.reset(token)
+
+
+class KernelDeclaration(HydroForgeModel, ABC):
+    """How one backend implements a kernel, independent of its spec.
+
+    ``toolchain`` is the backend toolchain a native declaration requires;
+    ``None`` runs under any backend.
+    """
+
+    toolchain: ClassVar[Toolchain | None] = None
+
+    def build(self, spec: KernelSpec, backend: Backend) -> KernelImplementation:
+        """Check this declaration against ``spec`` and ``backend`` once.
+
+        Scalar kinds the backend cannot represent are rejected here; an
+        unresolved ``precision`` kind is left to the implementation.
+        """
+
+        if self.toolchain is not None and backend.toolchain != self.toolchain:
             raise ValueError(
-                f"Backend {self.backend!r} is not registered for "
-                f"{self.registry.name}; available={self.registry._available}"
+                f"{spec.name}: {type(self).__name__} requires a "
+                f"{self.toolchain!r} backend, got {backend.name!r}"
             )
-        self._spec = self.registry.spec._resolve_precision(self.precision)
-        return self
+        backend.validate_scalars(
+            spec.name,
+            {
+                name: kind
+                for name, kind in (
+                    *spec.compile_time.items(),
+                    *spec.runtime_scalars.items(),
+                )
+                if kind != "precision"
+            },
+        )
+        return self._build(spec, backend)
 
-    def materialize(self) -> StrictImplementation:
-        """Build one implementation after semantic request validation."""
-
-        factory = self.registry.implementations[self.backend]
-        with kernel_factory_contract(self._spec):
-            implementation = factory()
-        return _ResolvedImplementationRequest(
-            implementation=implementation,
-            spec=self._spec,
-            backend=self.backend,
-        ).materialize()
+    @abstractmethod
+    def _build(self, spec: KernelSpec, backend: Backend) -> KernelImplementation: ...
 
 
-class _KernelSpecializationRequest(HydroForgeModel):
-    """One complete canonical kernel call validated before compilation."""
+class BackendRegistry(HydroForgeModel):
+    """One logical kernel and its implementation per execution backend.
 
-    implementation: StrictImplementation
-    arguments: FrozenMapping[str, Any]
-    buffer_dtypes: FrozenMapping[str, torch.dtype | None]
+    A value is a declaration or a zero-argument factory returning one; a
+    factory defers imports a backend may lack.  Calling the registry inside a
+    managed step records or launches the kernel. ``backend_specs`` explicitly
+    declares backend workspace bindings; model calls keep the shared interface.
+    """
+
+    spec: KernelSpec
+    implementations: FrozenMapping[
+        BackendName, InstanceOf[KernelDeclaration] | Callable[[], KernelDeclaration]
+    ]
+    backend_specs: FrozenMapping[BackendName, KernelSpec] = Field(default_factory=dict)
+    _built: dict[tuple[str, str | None], KernelImplementation] = PrivateAttr(
+        default_factory=dict
+    )
+
+    def __init__(
+        self,
+        spec: KernelSpec,
+        implementations: Mapping[str, KernelDeclaration | Callable[[], Any]],
+        /,
+        *,
+        backend_specs: Mapping[str, KernelSpec] | None = None,
+    ) -> None:
+        super().__init__(
+            spec=spec,
+            implementations=implementations,
+            backend_specs={} if backend_specs is None else backend_specs,
+        )
 
     @model_validator(mode="after")
-    def _validate_specialization_request(self):
-        implementation = self.implementation
-        spec = implementation.spec
-        arguments = dict(self.arguments)
-        buffer_dtypes = self.buffer_dtypes
-        try:
-            supplied = set(arguments).difference({"BLOCK_SIZE"})
-            expected = set(spec.parameters)
-            if supplied != expected:
+    def _validate_backend_specs(self) -> BackendRegistry:
+        for backend, spec in self.backend_specs.items():
+            if backend not in self.implementations:
                 raise ValueError(
-                    f"{spec.name} specialization ABI mismatch: "
-                    f"missing={sorted(expected - supplied)}, "
-                    f"extra={sorted(supplied - expected)}"
+                    f"{self.name}: spec for unregistered backend {backend!r}"
                 )
-            spec._validate_host_arguments(arguments)
-
-            tensors: list[tuple[str, torch.Tensor]] = []
-            for name in spec.buffers:
-                value = arguments[name]
-                if value is None and name in spec.optional_buffers:
-                    continue
-                if not isinstance(value, torch.Tensor):
-                    raise ValueError(
-                        f"{spec.name}.{name} must be a tensor, got "
-                        f"{type(value).__name__}"
-                    )
-                if value.layout is not torch.strided or not value.is_contiguous():
-                    raise ValueError(
-                        f"{spec.name}.{name} must be a contiguous strided tensor"
-                    )
-                tensors.append((name, value))
-
-            required_devices = _backend_device_types(implementation.backend)
-            if required_devices is not None:
-                wrong = [
-                    f"{name}={tensor.device}"
-                    for name, tensor in tensors
-                    if tensor.device.type not in required_devices
-                ]
-                if wrong:
-                    required_label = (
-                        required_devices[0]
-                        if len(required_devices) == 1
-                        else "one of " + "/".join(required_devices)
-                    )
-                    raise ValueError(
-                        f"{spec.name}: {implementation.backend} buffers must "
-                        f"be on {required_label}; got {', '.join(wrong)}"
-                    )
-            if tensors:
-                reference = tensors[0][1].device
-                mismatched = [
-                    f"{name}={tensor.device}"
-                    for name, tensor in tensors[1:]
-                    if not devices_match(tensor.device, reference)
-                ]
-                if mismatched:
-                    raise ValueError(
-                        f"{spec.name}: buffers must share one device; expected "
-                        f"{reference}, got {', '.join(mismatched)}"
-                    )
-                if implementation.backend == "triton":
-                    _require_proven_triton_device(reference)
-
-            expected_buffers = set(spec.buffers)
-            supplied_buffers = set(buffer_dtypes)
-            if supplied_buffers != expected_buffers:
+            if spec.name != self.spec.name or spec.size != self.spec.size:
                 raise ValueError(
-                    f"{spec.name}: specialization buffer ABI mismatch: "
-                    f"missing={sorted(expected_buffers - supplied_buffers)}, "
-                    f"extra={sorted(supplied_buffers - expected_buffers)}"
+                    "backend specs must preserve the kernel name and launch size"
                 )
-            for name, dtype in buffer_dtypes.items():
-                value = arguments[name]
-                if dtype is None:
-                    if value is None and name in spec.optional_buffers:
-                        continue
-                    raise ValueError(
-                        f"{spec.name}.{name} buffer dtype must be torch.dtype"
-                    )
-                if value is not None and value.dtype != dtype:
-                    raise ValueError(
-                        f"{spec.name}.{name} specialization declares {dtype}, "
-                        f"but the tensor has dtype {value.dtype}"
-                    )
-            backend_validator = getattr(
-                implementation._implementation,
-                "_validate_specialization_input",
-                None,
-            )
-            if backend_validator is not None:
-                backend_validator(
-                    arguments,
-                    buffer_dtypes=buffer_dtypes,
-                )
-        except (TypeError, ValueError, OverflowError) as error:
-            raise ValueError(str(error)) from error
         return self
 
-    def materialize(self) -> Callable:
-        """Compile a zero-argument launch after semantic validation."""
+    def spec_for(self, backend: Backend | str) -> KernelSpec:
+        """Explicit backend ABI, or the shared spec when no override is declared."""
 
-        return self.implementation._compile_trusted(
-            dict(self.arguments),
-            buffer_dtypes=self.buffer_dtypes,
-        )
+        name = backend.name if isinstance(backend, Backend) else backend
+        return self.backend_specs.get(name, self.spec)
+
+    @property
+    def name(self) -> str:
+        return self.spec.name
+
+    def __call__(self, **arguments: Any) -> None:
+        sink = current_sink()
+        if arguments:
+            if "BLOCK_SIZE" in arguments:
+                raise ValueError(
+                    f"{self.name}.BLOCK_SIZE is compiler-owned; configure the "
+                    "model block size instead"
+                )
+            unknown = set(arguments).difference(self.spec.parameters)
+            if unknown:
+                raise ValueError(
+                    f"{self.name} received arguments outside its KernelSpec: "
+                    f"{sorted(unknown)}"
+                )
+        if sink is None:
+            raise ValueError(
+                f"{self.name} may be called only while HydroForge records or "
+                "executes a validated model step"
+            )
+        sink.call(self, arguments)
+
+    def implementation(
+        self, backend: Backend | str, *, precision: str | None = None
+    ) -> KernelImplementation:
+        """Build the implementation for one backend, once per precision."""
+
+        if not isinstance(backend, Backend):
+            backend = backend_named(backend)
+        selected_spec = self.spec_for(backend)
+        key = (backend.name, precision if selected_spec.uses_precision else None)
+        built = self._built.get(key)
+        if built is None:
+            declaration = self.implementations.get(backend.name)
+            if declaration is None:
+                raise ValueError(
+                    f"Backend {backend.name!r} is not registered for {self.name}; "
+                    f"available={tuple(self.implementations)}"
+                )
+            spec = selected_spec.resolved(key[1])
+            if not isinstance(declaration, KernelDeclaration):
+                declaration = declaration()
+                if not isinstance(declaration, KernelDeclaration):
+                    raise TypeError(
+                        f"{self.name}: the {backend.name} factory must return a "
+                        f"kernel declaration, got {type(declaration).__name__}"
+                    )
+            built = self._built[key] = declaration.build(spec, backend)
+        return built
+
+
+__all__ = [
+    "BackendRegistry",
+    "KernelCall",
+    "KernelDeclaration",
+    "KernelImplementation",
+]

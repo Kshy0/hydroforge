@@ -4,833 +4,456 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
-from datetime import datetime, timedelta
+"""Gridded forcing stored as ``(time, lat, lon)`` NetCDF shards."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
-from typing import (
-    Any,
-    ClassVar,
-    cast,
-)
+from typing import Any
 
-import cftime
 import numpy as np
-from netCDF4 import Dataset
-from pydantic import Field, PrivateAttr, field_validator, model_validator
+from pydantic import Field, PrivateAttr
 
-from hydroforge.contracts.temporal import DateLike
-from hydroforge.contracts.validation import HydroForgeModel
-from hydroforge.data.datasets.base import (
-    _as_nan_array,
-    _trusted_source_chunk_payload,
-    _TrustedSourceChunk,
-    positive_finite_real,
+from hydroforge.core.arrays import canonical_float64, immutable_array
+from hydroforge.core.time import DateLike
+from hydroforge.data.datasets.base import ForcingDataset, SourceDirectory
+from hydroforge.data.datasets.keys import yearly_time_to_key
+from hydroforge.data.datasets.plan import DatasetPlan, SourceChunk, TemporalDomain
+from hydroforge.data.datasets.space import GridSpace
+from hydroforge.data.datasets.storage import (
+    SOURCE_FILE_LABEL,
+    NetCDFStore,
+    TimeAggregation,
+    UnitFactor,
+    concatenate_reads,
+    scan_storage,
+    storage_chunk_len,
 )
-from hydroforge.data.datasets.chunking import SourceChunk
-from hydroforge.data.datasets.gridded import GriddedDataset
-from hydroforge.data.datasets.timeline import DatasetTimeline, ReadOp
-from hydroforge.data.netcdf import (
-    _configure_netcdf_variable_cache,
-    _NetCDFReadHandlePool,
-    _planned_netcdf_chunk_len,
-    _read_netcdf_var_sliced_trusted,
-    yearly_time_to_key,
+from hydroforge.data.datasets.timeline import ReadOp, StorageLayout, TimelineScan
+from hydroforge.data.datasets.values import MissingPolicy
+from hydroforge.io.files import SourceFiles
+from hydroforge.io.netcdf.coordinates import LATITUDE_NAMES, LONGITUDE_NAMES, read_axis
+from hydroforge.io.netcdf.read import (
+    configure_variable_cache,
+    plan_read_chunk_len,
+    read_variable,
 )
-from hydroforge.data.numeric import canonical_float64, immutable_array
 
 
-class NetCDFDataset(GriddedDataset):
-    """NetCDF-backed dataset with minimal I/O and a compact design.
+@dataclass(frozen=True, slots=True)
+class _Shard:
+    """Axis positions ``(t, y, x)`` and read-tile shape of one file's variable."""
 
-    Key ideas:
-    - Scan only time variables to build a global timeline and a dt->(file_key, local_index)
-      map. No heavy data read during initialization.
-    - Group requested timestamps into contiguous slices per file so each chunk is read with
-      as few NetCDF reads as possible (often 1-2 reads per chunk).
-    - Normalize variable dimensions to (T, Y, X) once per read; precompute a spatial mask
-      and use a linear index list to quickly collapse (Y, X) -> N.
+    axes: tuple[int, int, int]
+    tile: tuple[int, int, bool]
+
+
+@dataclass(frozen=True, slots=True)
+class _SelectionRead:
+    """How a selection reads its bounding box, possibly as sparse tiles."""
+
+    y: slice
+    x: slice
+    positions: np.ndarray
+    tiles: Mapping[tuple[int, int, bool], tuple | None]
+
+
+def _pick_dimension(dimensions: tuple[str, ...], *names: str) -> int | None:
+    matches = [(name, dimensions.index(name)) for name in names if name in dimensions]
+    if len(matches) > 1:
+        raise ValueError(
+            f"Ambiguous dimensions {[name for name, _ in matches]} in {dimensions}"
+        )
+    return None if not matches else matches[0][1]
+
+
+class _GridShards:
+    """Validate that every shard stores one variable on one exact grid."""
+
+    def __init__(self, variable: str) -> None:
+        self._variable = variable
+        self._dtype: np.dtype | None = None
+        self._grid: tuple[Any, ...] | None = None
+        self.shards: dict[Path, _Shard] = {}
+
+    def inspect(self, dataset: Any, path: Path) -> None:
+        variable = dataset.variables[self._variable]
+        dtype = np.dtype(variable.dtype)
+        if dtype.kind not in {"i", "u", "f"}:
+            raise ValueError(
+                f"NetCDF forcing variable {self._variable!r} in {path.name} "
+                f"must use a real numeric dtype; got {dtype}"
+            )
+        if self._dtype is None:
+            self._dtype = dtype
+        elif dtype != self._dtype:
+            raise ValueError(
+                f"NetCDF forcing dtype in shard {path.name} does not match "
+                f"the canonical dtype {self._dtype}"
+            )
+        dimensions = tuple(variable.dimensions)
+        axes = (
+            _pick_dimension(dimensions, "time", "valid_time"),
+            _pick_dimension(dimensions, *LATITUDE_NAMES),
+            _pick_dimension(dimensions, *LONGITUDE_NAMES),
+        )
+        if len(dimensions) != 3 or None in axes:
+            raise ValueError(
+                "NetCDF forcing variable must have exactly one time, one "
+                f"latitude, and one longitude dimension; got {dimensions}"
+            )
+        _time, y_axis, x_axis = axes
+        coordinates = []
+        for label, names, axis in (
+            ("longitude", LONGITUDE_NAMES, x_axis),
+            ("latitude", LATITUDE_NAMES, y_axis),
+        ):
+            coordinate = read_axis(
+                dataset, names, dimension=dimensions[axis], path=path, label=label
+            )
+            values = canonical_float64(
+                coordinate.values, label=f"{label} coordinate in {path.name}"
+            )
+            if np.unique(values).size != values.size:
+                raise ValueError(
+                    f"{label} coordinate in {path.name} contains duplicate values"
+                )
+            bounds = coordinate.bounds
+            if bounds is not None:
+                bounds = canonical_float64(
+                    bounds, label=f"{label} bounds in {path.name}"
+                )
+            coordinates.append((values, coordinate.units, bounds))
+        grid = (
+            tuple(values for values, _units, _bounds in coordinates),
+            tuple(units for _values, units, _bounds in coordinates),
+            tuple(bounds for _values, _units, bounds in coordinates),
+            (variable.shape[y_axis], variable.shape[x_axis]),
+        )
+        if self._grid is None:
+            self._grid = grid
+        else:
+            self._require_same_grid(grid, path)
+        chunking = variable.chunking()
+        chunked = chunking != "contiguous" and bool(chunking)
+        self.shards[path] = _Shard(
+            axes=axes,
+            tile=(
+                int(chunking[y_axis]) if chunked else 1,
+                int(chunking[x_axis]) if chunked else variable.shape[x_axis],
+                chunked,
+            ),
+        )
+
+    def _require_same_grid(self, grid: tuple[Any, ...], path: Path) -> None:
+        axes, units, bounds, shape = grid
+        expected_axes, expected_units, expected_bounds, expected_shape = self._grid
+        if not all(
+            left.shape == right.shape and np.array_equal(left, right)
+            for left, right in zip(expected_axes, axes, strict=True)
+        ):
+            raise ValueError(
+                f"spatial coordinates in shard {path.name} do not match "
+                "the canonical shard in content and order"
+            )
+        if units != expected_units:
+            raise ValueError(
+                f"spatial coordinate units in shard {path.name} do not "
+                "match the canonical shard"
+            )
+        if not all(
+            (left is None and right is None)
+            or (
+                left is not None
+                and right is not None
+                and left.shape == right.shape
+                and np.array_equal(left, right)
+            )
+            for left, right in zip(expected_bounds, bounds, strict=True)
+        ):
+            raise ValueError(
+                f"spatial coordinate bounds in shard {path.name} do not "
+                "match the canonical shard"
+            )
+        if shape != expected_shape:
+            raise ValueError(
+                f"spatial shape in shard {path.name} does not match the canonical shard"
+            )
+
+    def space(self) -> GridSpace:
+        (longitude, latitude), units, (lon_bounds, lat_bounds), _shape = self._grid
+        return GridSpace(
+            longitude_units=units[0],
+            latitude_units=units[1],
+            longitude=immutable_array(longitude, order="C"),
+            latitude=immutable_array(latitude, order="C"),
+            longitude_bounds=(
+                None if lon_bounds is None else immutable_array(lon_bounds, order="C")
+            ),
+            latitude_bounds=(
+                None if lat_bounds is None else immutable_array(lat_bounds, order="C")
+            ),
+        )
+
+
+def _tile_plan(
+    rows: np.ndarray,
+    columns: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    tile: tuple[int, int, bool],
+    grid_width: int,
+) -> tuple | None:
+    """Read tiles when they cover much less than the selection bounding box."""
+
+    tile_height, tile_width, chunked = tile
+    minimum_y, maximum_y, minimum_x, maximum_x = bbox
+    bbox_area = (maximum_y - minimum_y + 1) * (maximum_x - minimum_x + 1)
+    if rows.size * 4 >= bbox_area:
+        return None
+    tile_ids = (rows // tile_height) * (
+        (grid_width + tile_width - 1) // tile_width
+    ) + columns // tile_width
+    order = np.argsort(tile_ids, kind="stable")
+    boundaries = np.flatnonzero(np.diff(tile_ids[order]) != 0) + 1
+    if boundaries.size >= 128:
+        return None
+    tiles = []
+    covered = 0
+    for positions in np.split(order, boundaries):
+        start_y, stop_y = int(rows[positions].min()), int(rows[positions].max()) + 1
+        start_x = int(columns[positions].min())
+        stop_x = int(columns[positions].max()) + 1
+        local = (rows[positions] - start_y) * (stop_x - start_x) + (
+            columns[positions] - start_x
+        )
+        tiles.append((slice(start_y, stop_y), slice(start_x, stop_x), positions, local))
+        covered += (stop_y - start_y) * (stop_x - start_x)
+    physical_bbox = (maximum_y // tile_height - minimum_y // tile_height + 1) * (
+        maximum_x // tile_width - minimum_x // tile_width + 1
+    )
+    if covered * 2 < bbox_area and (not chunked or len(tiles) * 2 < physical_bbox):
+        return tuple(tiles)
+    return None
+
+
+def _selection_read(
+    space: GridSpace, tiles: set[tuple[int, int, bool]]
+) -> _SelectionRead | None:
+    """Compile the bounding box and tile reads of one non-empty selection."""
+
+    selection = space.selection
+    if selection is None or selection.size == 0:
+        return None
+    grid_width = space.shape[1]
+    rows, columns = np.divmod(selection, grid_width)
+    bbox = (int(rows.min()), int(rows.max()), int(columns.min()), int(columns.max()))
+    minimum_y, maximum_y, minimum_x, maximum_x = bbox
+    positions = (rows - minimum_y) * (maximum_x - minimum_x + 1) + (columns - minimum_x)
+    return _SelectionRead(
+        y=slice(minimum_y, maximum_y + 1),
+        x=slice(minimum_x, maximum_x + 1),
+        positions=immutable_array(positions, dtype=np.int64),
+        tiles={
+            tile: _tile_plan(rows, columns, bbox, tile, grid_width) for tile in tiles
+        },
+    )
+
+
+class NetCDFDataset(ForcingDataset):
+    """Gridded ``(time, lat, lon)`` NetCDF forcing, one variable per dataset.
+
+    Only the time variables of the files the plan needs are scanned at
+    construction; each chunk's reads are compiled once and group consecutive
+    times of one file into a single read.  A mapped view reads only the
+    bounding box of its source cells, or sparse tiles of it.  Missing values
+    become zero unless ``missing="error"``.
     """
 
-    supports_time_aggregation: ClassVar[bool] = True
-    reusable_expression_reads: ClassVar[bool] = True
-
-    base_dir: Path = Field(strict=False)
+    base_dir: SourceDirectory
     var_name: str
     prefix: str
     chunk_len: int | None = Field(default=None, ge=1)
-    unit_factor: float = 1.0
+    unit_factor: UnitFactor = 1.0
     suffix: str = ".nc"
     time_to_key: Callable[[DateLike], str] = yearly_time_to_key
-    time_aggregation: str | Mapping[str, str] | None = None
+    time_aggregation: TimeAggregation = None
+    missing: MissingPolicy = "zero"
 
-    _bbox: tuple[int, int, int, int] | None = PrivateAttr(default=None)
-    _bbox_local_indices: np.ndarray | None = PrivateAttr(default=None)
-    _spatial_read_plans: dict = PrivateAttr(default_factory=dict)
-    _coordinates_cache: tuple[np.ndarray, np.ndarray] | None = PrivateAttr(
-        default=None,
-    )
-    _grid_shape_cache: tuple[int, int] | None = PrivateAttr(default=None)
-    _source_dtype: np.dtype | None = PrivateAttr(default=None)
-    _coordinate_units_cache: tuple[str | None, str | None] | None = PrivateAttr(
-        default=None,
-    )
-    _coordinate_bounds_cache: tuple[np.ndarray | None, np.ndarray | None] | None = (
-        PrivateAttr(default=None)
-    )
-    _variable_axes_by_path: Mapping[Path, tuple[int, int, int]] = PrivateAttr(
-        default_factory=dict
-    )
-    _timeline: DatasetTimeline = PrivateAttr()
-    _read_handles: _NetCDFReadHandlePool = PrivateAttr(
-        default_factory=_NetCDFReadHandlePool,
-    )
+    _store: NetCDFStore = PrivateAttr()
+    _shards: Mapping[Path, _Shard] = PrivateAttr()
+    _space: GridSpace = PrivateAttr()
+    _selection_read: _SelectionRead | None = PrivateAttr(default=None)
 
-    @field_validator("unit_factor")
-    @classmethod
-    def _validate_unit_factor(cls, value: float) -> float:
-        return positive_finite_real(value, label="unit_factor")
-
-    @field_validator("time_aggregation")
-    @classmethod
-    def _validate_aggregation(
-        cls,
-        value: str | Mapping[str, str] | None,
-    ) -> str | Mapping[str, str] | None:
-        return cls._normalize_time_aggregation(value)
-
-    def _planned_storage_chunk_len(self, path: Path) -> int:
-        """Return this dataset type's automatic logical read length."""
-
-        return _planned_netcdf_chunk_len(path, self.var_name)
-
-    @model_validator(mode="after")
-    def _inspect_netcdf_storage(self):
-        auto_chunk_len = self.chunk_len is None
-        if auto_chunk_len:
-            storage_start = self._storage_time(self.start_date)
-            key = self.time_to_key(storage_start)
-            if type(key) is not str:
-                raise TypeError("time_to_key must return an exact string")
-            path = Path(self.base_dir, f"{self.prefix}{key}{self.suffix}")
-            with self._inspect_source_file(path):
-                object.__setattr__(
-                    self,
-                    "chunk_len",
-                    self._planned_storage_chunk_len(path),
-                )
-            self._install_temporal_domain(self._temporal_domain)
-        self._timeline = DatasetTimeline(
-            self,
-            base_dir=self.base_dir,
+    def _compile_plan(self, domain: TemporalDomain) -> DatasetPlan:
+        layout = StorageLayout(
+            base_dir=Path(self.base_dir),
             prefix=self.prefix,
             suffix=self.suffix,
             time_to_key=self.time_to_key,
-            time_aggregation=self.time_aggregation,
-            data_variable=self.var_name,
         )
-        if auto_chunk_len:
-            self._timeline._fit_auto_chunk_len()
-        axes_by_path: dict[Path, tuple[int, int, int]] = {}
-        for key in sorted(self._timeline.file_times):
-            path = Path(
-                self.base_dir,
-                f"{self.prefix}{key}{self.suffix}",
-            )
-            with self._inspect_source_file(path), Dataset(path, "r") as dataset:
-                axes_by_path[self._canonical_source_path(path)] = (
-                    self._validate_shard_coordinates(dataset, path)
-                )
-        self._variable_axes_by_path = axes_by_path
-        self._validate_local_index_extent(
-            self._grid_shape[0] * self._grid_shape[1],
-            label="NetCDF grid",
+        inspection = SourceFiles.inspect(label=SOURCE_FILE_LABEL)
+        grid = _GridShards(self.var_name)
+        offset = self._storage_offset()
+        scan, domain = scan_storage(
+            self,
+            domain,
+            layout,
+            inspection,
+            storage_offset=offset,
+            inspect_variable=grid.inspect,
         )
-        self._compute_bbox_from_indices()
-        self._record_source_files(
-            Path(self.base_dir, f"{self.prefix}{key}{self.suffix}")
-            for key in sorted(self._timeline.file_times)
-        )
-        return self
-
-    @staticmethod
-    def _storage_time(
-        logical_time: datetime | cftime.datetime,
-    ) -> datetime | cftime.datetime:
-        """Map public logical time to the timestamp stored on disk."""
-
-        return logical_time
-
-    # -------------------------
-    # Variable shape helpers
-    # -------------------------
-    @staticmethod
-    def _pick_dim(dim_names: tuple[str, ...], *candidates: str) -> int | None:
-        m = {name: index for index, name in enumerate(dim_names)}
-        matches = [(name, m[name]) for name in candidates if name in m]
-        if len(matches) > 1:
-            raise ValueError(
-                f"Ambiguous dimensions {[name for name, _ in matches]} in {dim_names}"
-            )
-        return None if not matches else matches[0][1]
-
-    @classmethod
-    def _tyx_axes(cls, dim_names: tuple[str, ...]) -> tuple[int, int, int]:
-        t_idx = cls._pick_dim(dim_names, "time", "valid_time")
-        y_idx = cls._pick_dim(dim_names, "lat", "latitude", "y")
-        x_idx = cls._pick_dim(dim_names, "lon", "longitude", "long", "x")
-        if len(dim_names) != 3 or t_idx is None or y_idx is None or x_idx is None:
-            raise ValueError(
-                "NetCDF forcing variable must have exactly one time, one "
-                f"latitude, and one longitude dimension; got {dim_names}"
-            )
-        return t_idx, y_idx, x_idx
-
-    @staticmethod
-    def _ensure_tyx(data: np.ndarray, t_idx: int, y_idx: int, x_idx: int) -> np.ndarray:
-        """Transpose one exact rank-three variable to ``(T, Y, X)``."""
-        return np.transpose(data, axes=(t_idx, y_idx, x_idx))
-
-    @staticmethod
-    def _coordinate_axis(
-        dataset: Dataset,
-        *,
-        axis_dim: str,
-        names: tuple[str, ...],
-        label: str,
-        path: Path,
-    ) -> tuple[np.ndarray, str | None]:
-        candidates = [
-            dataset.variables[name]
-            for name in names
-            if (
-                name in dataset.variables
-                and dataset.variables[name].dimensions == (axis_dim,)
-            )
-        ]
-        candidates = list(dict.fromkeys(candidates))
-        if not candidates:
-            raise ValueError(
-                f"Unable to find a one-dimensional {label} coordinate for "
-                f"dimension {axis_dim!r} in {path.name}"
-            )
-        if len(candidates) > 1:
-            raise ValueError(
-                f"Ambiguous {label} coordinates for dimension {axis_dim!r} "
-                f"in {path.name}: {[item.name for item in candidates]}"
-            )
-        raw = candidates[0][:]
-        if np.ma.isMaskedArray(raw) and np.any(np.ma.getmaskarray(raw)):
-            raise ValueError(
-                f"{label} coordinate {candidates[0].name!r} in {path.name} "
-                "contains missing values"
-            )
-        values = np.asarray(raw)
-        if values.ndim != 1:
-            raise TypeError(
-                f"{label} coordinate in {path.name} must be a "
-                "one-dimensional real numeric array"
-            )
-        canonical = canonical_float64(
-            raw,
-            label=f"{label} coordinate in {path.name}",
-        )
-        if np.unique(canonical).size != canonical.size:
-            raise ValueError(
-                f"{label} coordinate in {path.name} contains duplicate values"
-            )
-        coordinate = candidates[0]
-        if "units" not in coordinate.ncattrs():
-            units = None
-        else:
-            units = coordinate.getncattr("units")
-            if not isinstance(units, str) or not units.strip():
-                raise ValueError(
-                    f"{label} coordinate {coordinate.name!r} in {path.name} "
-                    "must define units as a non-empty string when present"
-                )
-        return canonical, units
-
-    @staticmethod
-    def _coordinate_bounds(
-        coordinate,
-        *,
-        size: int,
-        label: str,
-        path: Path,
-    ) -> np.ndarray | None:
-        """Read optional CF bounds for one coordinate axis."""
-
-        declared = getattr(coordinate, "bounds", None)
-        name = (
-            declared.strip()
-            if isinstance(declared, str) and declared.strip()
-            else f"{coordinate.name}_bnds"
-        )
-        group = coordinate.group()
-        if name not in group.variables:
-            return None
-        raw = group.variables[name][:]
-        if np.ma.isMaskedArray(raw) and np.any(np.ma.getmaskarray(raw)):
-            raise ValueError(f"{label} bounds in {path.name} contain missing values")
-        values = np.asarray(raw)
-        expected = (size, 2)
-        if values.shape != expected:
-            raise ValueError(
-                f"{label} bounds in {path.name} must have shape {expected}, "
-                f"got {values.shape}"
-            )
-        return canonical_float64(values, label=f"{label} bounds in {path.name}")
-
-    def _validate_shard_coordinates(
-        self,
-        dataset: Dataset,
-        path: Path,
-    ) -> tuple[int, int, int]:
-        """Require every time shard to use one exact spatial grid and order."""
-
-        variable = dataset.variables[self.var_name]
-        source_dtype = np.dtype(variable.dtype)
-        if source_dtype.kind not in {"i", "u", "f"}:
-            raise ValueError(
-                f"NetCDF forcing variable {self.var_name!r} in {path.name} "
-                f"must use a real numeric dtype; got {source_dtype}"
-            )
-        if self._source_dtype is None:
-            self._source_dtype = source_dtype
-        elif source_dtype != self._source_dtype:
-            raise ValueError(
-                f"NetCDF forcing dtype in shard {path.name} does not match "
-                f"the canonical dtype {self._source_dtype}"
-            )
-        dimensions = tuple(variable.dimensions)
-        _t_idx, y_idx, x_idx = self._tyx_axes(dimensions)
-        grid_shape = (variable.shape[y_idx], variable.shape[x_idx])
-        latitude, latitude_units = self._coordinate_axis(
-            dataset,
-            axis_dim=dimensions[y_idx],
-            names=(dimensions[y_idx], "lat", "latitude", "y"),
-            label="latitude",
-            path=path,
-        )
-        longitude, longitude_units = self._coordinate_axis(
-            dataset,
-            axis_dim=dimensions[x_idx],
-            names=(dimensions[x_idx], "lon", "longitude", "long", "x"),
-            label="longitude",
-            path=path,
-        )
-        observed_units = (longitude_units, latitude_units)
-        latitude_candidates = [
-            dataset.variables[name]
-            for name in (dimensions[y_idx], "lat", "latitude", "y")
-            if name in dataset.variables
-            and dataset.variables[name].dimensions == (dimensions[y_idx],)
-        ]
-        longitude_candidates = [
-            dataset.variables[name]
-            for name in (dimensions[x_idx], "lon", "longitude", "long", "x")
-            if name in dataset.variables
-            and dataset.variables[name].dimensions == (dimensions[x_idx],)
-        ]
-        latitude_variable = list(dict.fromkeys(latitude_candidates))[0]
-        longitude_variable = list(dict.fromkeys(longitude_candidates))[0]
-        observed_bounds = (
-            self._coordinate_bounds(
-                longitude_variable,
-                size=longitude.size,
-                label="longitude",
-                path=path,
-            ),
-            self._coordinate_bounds(
-                latitude_variable,
-                size=latitude.size,
-                label="latitude",
-                path=path,
+        plan = self._planned(
+            domain,
+            storage_chunk_len(
+                self.chunk_len,
+                domain,
+                layout,
+                inspection,
+                scan,
+                storage_offset=offset,
+                plan=self._planned_chunk_len,
             ),
         )
-        if self._coordinates_cache is None:
-            self._coordinates_cache = (
-                immutable_array(longitude, order="C"),
-                immutable_array(latitude, order="C"),
-            )
-            self._coordinate_units_cache = observed_units
-            self._coordinate_bounds_cache = observed_bounds
-            self._grid_shape_cache = grid_shape
-        else:
-            expected_longitude, expected_latitude = self._coordinates_cache
-            if (
-                longitude.shape != expected_longitude.shape
-                or latitude.shape != expected_latitude.shape
-                or not np.array_equal(longitude, expected_longitude)
-                or not np.array_equal(latitude, expected_latitude)
-            ):
-                raise ValueError(
-                    f"spatial coordinates in shard {path.name} do not match "
-                    "the canonical shard in content and order"
-                )
-            if observed_units != self._coordinate_units_cache:
-                raise ValueError(
-                    f"spatial coordinate units in shard {path.name} do not "
-                    "match the canonical shard"
-                )
-            expected_bounds = self._coordinate_bounds_cache
-            bounds_match = expected_bounds is not None
-            if bounds_match:
-                bounds_match = all(
-                    (left is None and right is None)
-                    or (
-                        left is not None
-                        and right is not None
-                        and left.shape == right.shape
-                        and np.array_equal(left, right)
-                    )
-                    for left, right in zip(expected_bounds, observed_bounds, strict=True)
-                )
-            if not bounds_match:
-                raise ValueError(
-                    f"spatial coordinate bounds in shard {path.name} do not "
-                    "match the canonical shard"
-                )
-            if grid_shape != self._grid_shape_cache:
-                raise ValueError(
-                    f"spatial shape in shard {path.name} does not match "
-                    "the canonical shard"
-                )
-        return _t_idx, y_idx, x_idx
-
-    @property
-    def _grid_shape(self) -> tuple[int, int]:
-        """Return the spatial shape validated for every source shard."""
-
-        return cast(tuple[int, int], self._grid_shape_cache)
-
-    @contextmanager
-    def _mapping_transaction(self) -> Iterator[None]:
-        """Keep bounding boxes and cached read plans in the selection transaction."""
-
-        previous_bbox = self._bbox
-        previous_indices = self._bbox_local_indices
-        previous_plans = self._spatial_read_plans.copy()
-        with super()._mapping_transaction():
-            try:
-                yield
-            except BaseException:
-                self._bbox = previous_bbox
-                self._bbox_local_indices = previous_indices
-                self._spatial_read_plans.clear()
-                self._spatial_read_plans.update(previous_plans)
-                raise
-
-    def _compute_bbox_from_indices(self) -> None:
-        """Compute 2D bounding box from local_indices for optimized reading.
-
-        This method converts the 1D flattened indices to 2D (y, x) coordinates,
-        finds the minimal bounding box, and creates a mapping from the original
-        indices to indices relative to the bounding box.
-
-        After calling this method:
-        - self._bbox: (y_min, y_max, x_min, x_max) - inclusive bounds
-        - self._bbox_local_indices: indices relative to the bounding box flatten
-        """
-        self._spatial_read_plans.clear()
-        if self.local_indices is None or self.local_indices.size == 0:
-            self._bbox = None
-            self._bbox_local_indices = None
-            return
-
-        ny, nx = self._grid_shape
-
-        # Convert 1D indices to 2D coordinates
-        # index = y * nx + x (C-order, row-major)
-        y_coords = self.local_indices // nx
-        x_coords = self.local_indices % nx
-
-        # Compute bounding box
-        y_min, y_max = int(y_coords.min()), int(y_coords.max())
-        x_min, x_max = int(x_coords.min()), int(x_coords.max())
-
-        self._bbox = (y_min, y_max, x_min, x_max)
-
-        # Compute new width of the bounding box
-        bbox_nx = x_max - x_min + 1
-
-        # Convert global indices to bbox-local indices
-        # new_index = (y - y_min) * bbox_nx + (x - x_min)
-        local_y = y_coords - y_min
-        local_x = x_coords - x_min
-        self._bbox_local_indices = (local_y * bbox_nx + local_x).astype(np.int64)
-
-    def _spatial_tiles(self, variable, y_axis: int, x_axis: int):
-        """Choose bounded tile reads only when they reduce spatial coverage."""
-
-        if self._bbox is None or self.local_indices is None:
-            return None
-        _grid_height, grid_width = self._grid_shape
-        chunking = variable.chunking()
-        chunked = chunking != "contiguous" and bool(chunking)
-        tile_height = int(chunking[y_axis]) if chunked else 1
-        tile_width = int(chunking[x_axis]) if chunked else grid_width
-        key = (tile_height, tile_width, chunked)
-        if key in self._spatial_read_plans:
-            return self._spatial_read_plans[key]
-        rows, columns = np.divmod(self.local_indices, grid_width)
-        minimum_y, maximum_y, minimum_x, maximum_x = self._bbox
-        bbox_area = (maximum_y - minimum_y + 1) * (maximum_x - minimum_x + 1)
-        plan = None
-        if self.local_indices.size * 4 < bbox_area:
-            tile_ids = (rows // tile_height) * (
-                (grid_width + tile_width - 1) // tile_width
-            ) + columns // tile_width
-            order = np.argsort(tile_ids, kind="stable")
-            boundaries = np.flatnonzero(np.diff(tile_ids[order]) != 0) + 1
-            if boundaries.size < 128:
-                parts = np.split(order, boundaries)
-                tiles = []
-                covered = 0
-                for positions in parts:
-                    start_y, stop_y = (
-                        int(rows[positions].min()),
-                        int(rows[positions].max()) + 1,
-                    )
-                    start_x, stop_x = (
-                        int(columns[positions].min()),
-                        int(columns[positions].max()) + 1,
-                    )
-                    local = (
-                        (rows[positions] - start_y) * (stop_x - start_x)
-                        + columns[positions]
-                        - start_x
-                    )
-                    tiles.append(
-                        (
-                            slice(start_y, stop_y),
-                            slice(start_x, stop_x),
-                            positions,
-                            local,
-                        )
-                    )
-                    covered += (stop_y - start_y) * (stop_x - start_x)
-                physical_bbox = (
-                    maximum_y // tile_height - minimum_y // tile_height + 1
-                ) * (maximum_x // tile_width - minimum_x // tile_width + 1)
-                if covered * 2 < bbox_area and (
-                    not chunked or len(tiles) * 2 < physical_bbox
-                ):
-                    plan = tuple(tiles)
-        if len(self._spatial_read_plans) >= 8:
-            self._spatial_read_plans.clear()
-        self._spatial_read_plans[key] = plan
+        self._locate_support(scan, plan)
+        self._store = NetCDFStore(
+            files=inspection.files(),
+            layout=layout,
+            timeline=scan.freeze(plan, self._read_times),
+            unit_factor=self.unit_factor,
+            aggregation=self.time_aggregation,
+        )
+        self._shards = grid.shards
+        self._space = grid.space()
         return plan
 
-    def _read_spatial_tiles(self, variable, selectors, axes, tiles):
+    def _storage_offset(self) -> timedelta:
+        """Storage time minus logical time of each record."""
+
+        return timedelta(0)
+
+    def _planned_chunk_len(self, path: Path) -> int:
+        """Automatic source records per read for this storage kind."""
+
+        return plan_read_chunk_len(path, self.var_name)
+
+    def _read_times(self, chunk: SourceChunk) -> Sequence[DateLike]:
+        """Storage times that one chunk reads."""
+
+        return chunk.source_times()
+
+    def _locate_support(self, scan: TimelineScan, plan: DatasetPlan) -> None:
+        """Locate storage times read beyond the plan's own samples."""
+
+    @property
+    def space(self) -> GridSpace:
+        return self._space
+
+    def _mapped(self, source_indices: np.ndarray, target_ids: np.ndarray):
+        space = self._space.select(source_indices)
+        return self._view(
+            _space=space,
+            _target_ids=target_ids,
+            _selection_read=_selection_read(
+                space, {shard.tile for shard in self._shards.values()}
+            ),
+        )
+
+    def _read_source(self, index: int) -> np.ndarray | dict[str, np.ndarray]:
+        # An aggregated chunk reads ``aggregation_factor`` records per row.
+        operations = self._store.timeline.reads[index]
+        return self._converted(
+            self._read_operations(operations),
+            sum(len(rows) for _key, rows in operations),
+        )
+
+    def _read_operations(self, operations: Sequence[ReadOp]) -> np.ndarray:
+        """Read ``(T, Y, X)``, or ``(T, N)`` for a selection, without conversion."""
+
+        selection = self._space.selection
+        if selection is not None and selection.size == 0:
+            rows = sum(len(indices) for _key, indices in operations)
+            return np.empty((rows, 0), dtype=self.out_dtype)
+        return concatenate_reads(
+            [self._read_file(key, rows) for key, rows in operations if rows]
+        )
+
+    def _read_file(self, key: str, rows: tuple[int, ...]) -> np.ndarray:
+        path = self._store.path(key)
+        shard = self._shards[path]
+        axes = shard.axes
         time_axis, y_axis, x_axis = axes
-        result = None
+        read = self._selection_read
+        with self._store.files.open_netcdf(path) as dataset:
+            variable = dataset.variables[self.var_name]
+            selectors: list[Any] = [slice(None)] * 3
+            selectors[time_axis] = np.asarray(rows, dtype=np.int64)
+            if read is None:
+                configure_variable_cache(
+                    variable, tuple(selectors), time_axis=time_axis
+                )
+                return np.transpose(read_variable(variable, tuple(selectors)), axes)
+            selectors[y_axis], selectors[x_axis] = read.y, read.x
+            tiles = read.tiles[shard.tile]
+            if tiles is not None:
+                return self._read_tiles(variable, selectors, axes, tiles)
+            configure_variable_cache(variable, tuple(selectors), time_axis=time_axis)
+            values = np.transpose(read_variable(variable, tuple(selectors)), axes)
+            return values.reshape(values.shape[0], -1)[:, read.positions]
+
+    def _read_tiles(
+        self,
+        variable: Any,
+        selectors: list[Any],
+        axes: tuple[int, int, int],
+        tiles: tuple,
+    ) -> np.ndarray:
+        time_axis, y_axis, x_axis = axes
+        values = mask = None
         for y_slice, x_slice, positions, local in tiles:
             tile_selectors = list(selectors)
             tile_selectors[y_axis], tile_selectors[x_axis] = y_slice, x_slice
-            _configure_netcdf_variable_cache(
+            configure_variable_cache(
                 variable, tuple(tile_selectors), time_axis=time_axis
             )
-            tile = _read_netcdf_var_sliced_trusted(variable, tuple(tile_selectors))
-            tile = _as_nan_array(self._ensure_tyx(tile, time_axis, y_axis, x_axis))
-            if result is None:
-                result = np.empty(
-                    (tile.shape[0], self.local_indices.size), dtype=tile.dtype
-                )
-            elif result.dtype != np.result_type(result.dtype, tile.dtype):
-                result = result.astype(np.result_type(result.dtype, tile.dtype))
-            result[:, positions] = tile.reshape(tile.shape[0], -1)[:, local]
-        return result
+            tile = np.transpose(read_variable(variable, tuple(tile_selectors)), axes)
+            block = tile.reshape(tile.shape[0], -1)[:, local]
+            if values is None:
+                values = np.empty((block.shape[0], self._space.size), dtype=block.dtype)
+            values[:, positions] = np.ma.getdata(block)
+            if np.ma.is_masked(block):
+                if mask is None:
+                    mask = np.zeros(values.shape, dtype=bool)
+                mask[:, positions] = np.ma.getmaskarray(block)
+        return values if mask is None else np.ma.MaskedArray(values, mask)
 
-    def _read_ops(self, ops: Sequence[ReadOp]) -> np.ndarray:
-        """Execute per-file reads using absolute time indices.
-
-        Each op is (file_key, abs_indices). Sequence indices are converted to
-        contiguous NetCDF slices, then restored to the requested order in memory.
-
-        When local_indices is set and a bounding box has been computed,
-        this method reads only the bounding box region instead of the full grid,
-        significantly reducing I/O for spatially concentrated catchments.
-
-        Returns:
-        - If local_indices is set: (T, N) compressed array
-        - If local_indices is None: (T, Y, X) full grid array
-
-        Spatial convention: (Y, X) = (lat, lon), C-order flatten (lon varies fastest)
-        """
-        ny, nx = self._grid_shape
-        compressed = self.local_indices is not None
-
-        if compressed and len(self.local_indices) == 0:
-            total_len = sum(len(abs_indices) for _key, abs_indices in ops)
-            return np.empty((total_len, 0), dtype=self.out_dtype)
-
-        use_bbox = (
-            compressed
-            and self._bbox is not None
-            and self._bbox_local_indices is not None
+    def _convert(self, values: np.ndarray) -> np.ndarray | dict[str, np.ndarray]:
+        return self._store.finish(
+            values, out_dtype=self.out_dtype, label="NetCDF dataset"
         )
 
-        if not ops:
-            if compressed:
-                return np.empty((0, len(self.local_indices)), dtype=self.out_dtype)
-            else:
-                return np.empty((0, ny, nx), dtype=self.out_dtype)
+    def _first_frame_missing(self) -> np.ndarray:
+        """``(Y, X)`` mask of missing values in the first read source frame."""
 
-        chunks: list[np.ndarray] = []
-
-        for key, abs_indices in ops:
-            path = self._checked_source_path(
-                Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
-            )
-            with self._read_handles.acquire(path) as ds:
-                var = ds.variables[self.var_name]
-                t_idx, y_idx, x_idx = self._variable_axes_by_path[path]
-
-                if not abs_indices:
-                    continue
-
-                abs_idx = np.asarray(abs_indices, dtype=np.int64)
-                sel = [slice(None)] * var.ndim
-                sel[t_idx] = abs_idx
-
-                if use_bbox:
-                    # Read only the bounding box region
-                    y_min, y_max, x_min, x_max = self._bbox
-                    sel[y_idx] = slice(y_min, y_max + 1)
-                    sel[x_idx] = slice(x_min, x_max + 1)
-
-                selectors = tuple(sel)
-                tiles = self._spatial_tiles(var, y_idx, x_idx) if use_bbox else None
-                if tiles is not None:
-                    out = self._read_spatial_tiles(
-                        var, selectors, (t_idx, y_idx, x_idx), tiles
-                    )
-                else:
-                    _configure_netcdf_variable_cache(var, selectors, time_axis=t_idx)
-                    arr = _read_netcdf_var_sliced_trusted(var, selectors)
-                    arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
-                    if compressed:
-                        out = arr.reshape(arr.shape[0], -1)[:, self._bbox_local_indices]
-                    else:
-                        out = arr
-
-                out = _as_nan_array(out)
-                if np.issubdtype(out.dtype, np.floating):
-                    missing = np.isnan(out)
-                    if np.any(missing):
-                        out = np.array(out, order="C", copy=True)
-                        out[missing] = 0.0
-                out = _trusted_source_chunk_payload(
-                    out,
-                    expected_rows=len(abs_indices),
-                    clip_negative=self.clip_negative,
-                )
-
-            chunks.append(out)
-            self._verify_source_path(path)
-
-        return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
-
-    def _get_first_frame_nan_mask(self) -> np.ndarray | None:
-        """Read the first planned source frame and return a flat NaN/mask bitmap."""
-        if not self._timeline.plan:
-            return None
-
-        first_op = None
-        for entry in self._timeline.plan:
-            for key, abs_indices in entry.operations:
-                if abs_indices:
-                    first_op = (key, int(abs_indices[0]))
-                    break
-            if first_op is not None:
-                break
-
-        if first_op is None:
-            return None
-
-        key, abs_index = first_op
-        path = self._checked_source_path(
-            Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
-        )
-        with self._read_handles.acquire(path) as ds:
-            var = ds.variables[self.var_name]
-            t_idx, y_idx, x_idx = self._variable_axes_by_path[path]
-
-            sel = [slice(None)] * var.ndim
-            sel[t_idx] = np.asarray([abs_index], dtype=np.int64)
-            selectors = tuple(sel)
-            _configure_netcdf_variable_cache(var, selectors, time_axis=t_idx)
-            arr = _read_netcdf_var_sliced_trusted(var, selectors)
-            arr = _as_nan_array(arr)
-            arr = self._ensure_tyx(arr, t_idx, y_idx, x_idx)
-        self._verify_source_path(path)
-
-        if not np.issubdtype(arr.dtype, np.floating):
-            return np.zeros(arr.shape[1:], dtype=bool)
-        return np.isnan(arr[0])
-
-    def _finish_read(self, data: np.ndarray) -> np.ndarray | dict[str, np.ndarray]:
-        if (
-            self.time_aggregation is None
-            and self.unit_factor == 1.0
-            and self._direct_output_cast_is_exact(data)
-        ):
-            return self._finalize_output_data(data, label="NetCDF dataset output")
-        calculation = self._canonical_calculation_data(
-            data,
-            label="NetCDF dataset input",
-        )
-        converted = (
-            calculation
-            if self.time_aggregation is None
-            else self._apply_time_aggregation(
-                calculation,
-                self._timeline.source_time_interval,
-                self.time_aggregation,
-            )
-        )
-        blocks = converted.values() if isinstance(converted, dict) else (converted,)
-        for block in blocks:
-            np.divide(block, self.unit_factor, out=block)
-        return self._finalize_output_data(
-            converted,
-            label="NetCDF dataset output",
-        )
-
-    def _read_chunk(
-        self,
-        chunk: SourceChunk,
-    ) -> _TrustedSourceChunk:
-        """Read one validated source request through the compiled I/O plan."""
-
-        ops = self._timeline.read_for_chunk(chunk).operations
-        data = self._read_ops(ops)
-        return _TrustedSourceChunk(self._finish_read(data))
+        first = self.chunk_plan[0].source_start + self._storage_offset()
+        key, rows = self._store.timeline.operations([first])[0]
+        path = self._store.path(key)
+        axes = self._shards[path].axes
+        with self._store.files.open_netcdf(path) as dataset:
+            variable = dataset.variables[self.var_name]
+            selectors: list[Any] = [slice(None)] * 3
+            selectors[axes[0]] = np.asarray(rows[:1], dtype=np.int64)
+            configure_variable_cache(variable, tuple(selectors), time_axis=axes[0])
+            frame = np.transpose(read_variable(variable, tuple(selectors)), axes)[0]
+        if np.ma.isMaskedArray(frame):
+            return np.ma.getmaskarray(frame) | np.isnan(np.ma.getdata(frame))
+        if frame.dtype.kind != "f":
+            return np.zeros(frame.shape, dtype=bool)
+        return np.isnan(frame)
 
     def close(self) -> None:
         """Close this process's persistent NetCDF read handles."""
 
-        self._read_handles.close()
-
-    # -------------------------
-    # Public API
-    # -------------------------
-    def get_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return the canonical grid validated at Dataset construction."""
-
-        return cast(tuple[np.ndarray, np.ndarray], self._coordinates_cache)
-
-    def get_coordinate_bounds(
-        self,
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Return canonical CF cell bounds when the source declares them."""
-
-        bounds = self._coordinate_bounds_cache
-        if bounds is None:
-            return None, None
-        return bounds
-
-
-class _OpenMultivariableNetCDFRequest(HydroForgeModel):
-    base_dir: Path = Field(strict=False)
-    var_specs: Any
-    start_date: DateLike
-    end_date: DateLike
-    model_step: timedelta
-    time_interval: timedelta = timedelta(days=1)
-    calendar: str | None = None
-    spin_up_cycles: int = Field(default=0, ge=0)
-    spin_up_start_date: DateLike | None = None
-    spin_up_end_date: DateLike | None = None
-    chunk_len: int | None = Field(default=None, ge=1)
-    unit_factor: float = 1.0
-    suffix: str = ".nc"
-    clip_negative: bool = False
-    time_to_key: Callable[[DateLike], str] = yearly_time_to_key
-
-    _compiled_specs: tuple[tuple[str, dict[str, Any]], ...] = PrivateAttr()
-
-    @model_validator(mode="after")
-    def _validate_factory(self):
-        from hydroforge.data.datasets.multivariable import (
-            compile_variable_specs,
-        )
-
-        self._compiled_specs = compile_variable_specs(self.var_specs)
-        return self
-
-    @property
-    def compiled_specs(self) -> tuple[tuple[str, dict[str, Any]], ...]:
-        return self._compiled_specs
-
-
-def open_multivariable_netcdf(
-    base_dir: str | Path,
-    var_specs: Mapping[str, Mapping[str, Any]],
-    *,
-    start_date: DateLike,
-    end_date: DateLike,
-    model_step: timedelta,
-    time_interval: timedelta = timedelta(days=1),
-    calendar: str | None = None,
-    spin_up_cycles: int = 0,
-    spin_up_start_date: DateLike | None = None,
-    spin_up_end_date: DateLike | None = None,
-    chunk_len: int | None = None,
-    unit_factor: float = 1.0,
-    suffix: str = ".nc",
-    clip_negative: bool = False,
-    time_to_key: Callable[[datetime | cftime.datetime], str] = yearly_time_to_key,
-):
-    """Open aligned gridded variables as one generic composite."""
-    from hydroforge.data.datasets.multivariable import (
-        GriddedMultiVariableDataset,
-    )
-
-    request = _OpenMultivariableNetCDFRequest(
-        base_dir=base_dir,
-        var_specs=var_specs,
-        start_date=start_date,
-        end_date=end_date,
-        model_step=model_step,
-        time_interval=time_interval,
-        calendar=calendar,
-        spin_up_cycles=spin_up_cycles,
-        spin_up_start_date=spin_up_start_date,
-        spin_up_end_date=spin_up_end_date,
-        chunk_len=chunk_len,
-        unit_factor=unit_factor,
-        suffix=suffix,
-        clip_negative=clip_negative,
-        time_to_key=time_to_key,
-    )
-    shared = {
-        "base_dir": request.base_dir,
-        "start_date": request.start_date,
-        "end_date": request.end_date,
-        "model_step": request.model_step,
-        "time_interval": request.time_interval,
-        "calendar": request.calendar,
-        "spin_up_cycles": request.spin_up_cycles,
-        "spin_up_start_date": request.spin_up_start_date,
-        "spin_up_end_date": request.spin_up_end_date,
-        "chunk_len": request.chunk_len,
-        "unit_factor": request.unit_factor,
-        "suffix": request.suffix,
-        "clip_negative": request.clip_negative,
-        "time_to_key": request.time_to_key,
-    }
-    datasets = {}
-    for name, spec in request.compiled_specs:
-        options = shared | spec
-        options["var_name"] = name
-        if "prefix" not in options:
-            options["prefix"] = f"{name}_"
-        datasets[name] = NetCDFDataset(**options)
-        if shared["chunk_len"] is None:
-            # Later children share the first child's automatic plan.
-            shared["chunk_len"] = datasets[name].chunk_len
-
-    return GriddedMultiVariableDataset(datasets=datasets)
+        self._store.files.close()

@@ -2,75 +2,61 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from hydroforge.contracts.errors import ResourceCleanupError, failure_description
-from hydroforge.execution.capture import CaptureRuntime
-from hydroforge.execution.cuda_graph import supports_conditional_cuda_graph
+from hydroforge.core.errors import (
+    cleanup_on_exit,
+    failure_description,
+)
+from hydroforge.execution.binding import KernelBinder
+from hydroforge.execution.executors import select_executor
 from hydroforge.execution.step_fields import StepFieldRuntime
-from hydroforge.kernels.binding import KernelBinder
-from hydroforge.statistics.observer import DisabledStatisticsObserver
+from hydroforge.kernels.toolchain import CompileRequest
 
 if TYPE_CHECKING:
-    from hydroforge.model.model import AbstractModel
-
-
-def distributed_capture_safe(*programs: Any) -> bool:
-    """Return whether recorded loop programs may be device-captured multi-rank.
-
-    Collectives must pass the host rank handshake before every launch, so a
-    program containing any non-capturable operator other than a nested
-    predicate loop (whose body is inspected instead) stays eager.
-    """
-    from hydroforge.execution.operators import PredicateLoopOperator
-
-    pending = [program for program in programs if program is not None]
-    while pending:
-        program = pending.pop()
-        for operator in program.operators:
-            if isinstance(operator, PredicateLoopOperator):
-                body = getattr(operator.program, "body_operators", None)
-                if body is None:
-                    return False
-                pending.append(body)
-            elif not getattr(operator, "cuda_graph_capture_safe", True):
-                return False
-    return True
+    from hydroforge.execution.session import ModelRuntime
 
 
 class ModelExecution:
     """The single explicit owner of one model's runtime plans and resources."""
 
-    def __init__(self, model: AbstractModel) -> None:
-        self.model = model
-        self.device = torch.device(model.device)
-        self.backend = model._backend
-        if model.execution_mode == "eager":
-            self.capture_mode = "eager"
-        elif (
-            self.backend in {"cuda", "triton"}
-            and supports_conditional_cuda_graph(self.device)
-        ):
-            self.capture_mode = "cuda_graph"
-        elif self.backend == "metal" and self.device.type == "mps":
-            self.capture_mode = "metal_icb"
-        else:
-            self.capture_mode = "eager"
-        self.capture = CaptureRuntime(model)
-        self.statistics = DisabledStatisticsObserver(model)
-        self.kernel_binding = KernelBinder(model)
-        self.step_fields = StepFieldRuntime(model, execution=self)
+    def __init__(self, runtime: ModelRuntime) -> None:
+        plan = runtime.plan
+        self.runtime = runtime
+        self.device = plan.device
+        self.backend = plan.backend
+        self.dtype = plan.dtype
+        self.executor = select_executor(plan)
+        self.kernel_binding = KernelBinder(runtime)
+        self.step_fields = StepFieldRuntime(plan, executor=self.executor)
         self.step_policies: dict[Any, Any] = {}
         self.programs: dict[Any, Any] = {}
+        self.host_variants: dict[Any, Any] = {}
+        # Validated adaptive-scope limits keyed by their exact inputs.
+        self.adaptive_requests: dict[Any, Any] = {}
         self._model_tensor_ids: frozenset[int] = frozenset()
         self._tensor_index_valid = False
         self.structural_revision = 0
         self.step: Any = None
         self._failure: tuple[str, str, str] | None = None
         self.closed = False
+
+    def take_pending(self) -> list[CompileRequest]:
+        """Programs the model will launch that no compile batch has taken.
+
+        A recording hands them to the batch that compiles its kernel calls,
+        so statistics, step-field and loop-control programs compile together
+        with the physics.
+        """
+
+        statistics = getattr(self.runtime, "statistics", None)
+        return [
+            *self.executor.compile_requests(statistics is not None),
+            *self.step_fields.take_requests(),
+            *(() if statistics is None else statistics.take_requests()),
+        ]
 
     @property
     def failure(self) -> tuple[str, str, str] | None:
@@ -103,9 +89,9 @@ class ModelExecution:
         """Return whether ``tensor`` is address-stable declared model state.
 
         The ownership index is a cold-path validation aid for compiled
-        substeps.  It is derived from the compiler namespace directly, so
-        recording never walks modules through ``get_module`` and never caches
-        module handles that the model body did not reference.
+        substeps.  It is derived from the bound field owners directly, so
+        recording never walks modules and never caches module handles that
+        the model body did not reference.
         """
 
         if id(tensor) in self.step_fields.identities:
@@ -115,24 +101,17 @@ class ModelExecution:
         return id(tensor) in self._model_tensor_ids
 
     def _refresh_model_tensor_index(self) -> None:
-        fields = self.model._field_namespace
+        fields = self.runtime.field_owners
         identities: set[int] = set()
         for field_name, owners in fields.items():
             for owner in owners:
-                schema_getter = getattr(owner.owner, "_get_tensor_schema", None)
-                schema = (
-                    None
-                    if schema_getter is None
-                    else schema_getter(
-                        field_name,
-                        opened_modules=self.model.opened_modules,
-                        field_demand=self.model._field_demand,
-                    )
+                metadata_getter = getattr(owner.owner, "_tensor_metadata", None)
+                metadata = (
+                    None if metadata_getter is None else metadata_getter(field_name)
                 )
                 if (
-                    schema is not None
-                    and schema.tensor is not None
-                    and schema.tensor.category == "virtual"
+                    metadata is not None
+                    and metadata.category == "virtual"
                     and field_name not in owner.owner.__dict__
                 ):
                     # Optional buffer virtuals stay descriptors until an
@@ -146,111 +125,41 @@ class ModelExecution:
         self._model_tensor_ids = frozenset(identities)
         self._tensor_index_valid = True
 
-    def loop_mode(
-        self,
-        *,
-        world_size: int,
-        allow_distributed: bool,
-    ) -> str:
-        supported = self.capture_mode == "cuda_graph" and (
-            world_size == 1 or allow_distributed
-        )
-        return "conditional" if supported else "eager"
-
-    def launch_conditional(self, graph: Any) -> None:
-        graph.launch(torch.cuda.current_stream(self.device).cuda_stream)
-
-    def run_statistics(self, statistics: Any, block_size: int) -> None:
-        """Execute cached statistics without leaking backend policy outward."""
-
-        scope = (
-            torch.cuda.device(self.device)
-            if self.device.type == "cuda"
-            else nullcontext()
-        )
-        with scope:
-            if self.capture_mode == "cuda_graph":
-                self.capture.run_statistics(statistics, block_size)
-            else:
-                statistics._aggregator_function(
-                    statistics._kernel_states,
-                    block_size,
-                )
-
-    def invalidate_statistics(self, aggregator: Any) -> None:
-        """Release every cache that retains a statistics specialization."""
-        failures: list[BaseException] = []
-        try:
-            self.statistics.invalidate()
-        except BaseException as error:
-            failures.append(error)
-        seen_programs: set[int] = set()
-        for program in tuple(self.programs.values()):
-            identity = id(program)
-            if identity in seen_programs:
-                continue
-            seen_programs.add(identity)
-            invalidate = getattr(program, "invalidate_statistics", None)
-            if invalidate is None:
-                continue
-            try:
-                invalidate(aggregator)
-            except BaseException as error:
-                failures.append(error)
-        try:
-            self.capture.invalidate_statistics(aggregator)
-        except BaseException as error:
-            failures.append(error)
-        if failures:
-            error = ResourceCleanupError(
-                "statistics execution caches",
-                failures,
-            )
-            self.poison(error, phase="statistics invalidation")
-            raise error from failures[0]
-
     def invalidate(self) -> None:
         if self.closed:
             return
         self.kernel_binding.invalidate()
+        for name in self.runtime.plan.spec.kernel_fields:
+            self.runtime.owner.__dict__.pop(name, None)
+        for module in self.runtime.modules.values():
+            for name in module.spec().kernel_fields:
+                module.__dict__.pop(name, None)
         self._tensor_index_valid = False
         programs, self.programs = self.programs, {}
-        failures: list[BaseException] = []
-        for program in programs.values():
-            try:
-                program.close()
-            except BaseException as error:
-                failures.append(error)
+        self.host_variants = {}
+        self.adaptive_requests = {}
         try:
-            self.step_fields.invalidate_program()
+            with cleanup_on_exit(
+                "model execution resources",
+                (
+                    *(program.close for program in programs.values()),
+                    self.step_fields.invalidate_program,
+                    self.executor.invalidate,
+                ),
+            ):
+                pass
         except BaseException as error:
-            failures.append(error)
-        try:
-            self.capture.invalidate()
-        except BaseException as error:
-            failures.append(error)
-        if failures:
-            error = ResourceCleanupError("model execution resources", failures)
             self.poison(error, phase="execution-plan invalidation")
-            raise error from failures[0]
+            raise
 
     def close(self) -> None:
         if self.closed:
             return
-        failures: list[BaseException] = []
         try:
-            self.invalidate()
-        except BaseException as error:
-            failures.append(error)
-        try:
-            self.capture.close()
-        except BaseException as error:
-            failures.append(error)
-        self.step_policies.clear()
-        self.step_fields.close()
-        self.closed = True
-        if len(failures) == 1:
-            raise failures[0]
-        if failures:
-            error = ResourceCleanupError("model execution close", failures)
-            raise error from failures[0]
+            with cleanup_on_exit(
+                "model execution close",
+                (self.executor.close, self.step_policies.clear, self.step_fields.close),
+            ):
+                self.invalidate()
+        finally:
+            self.closed = True

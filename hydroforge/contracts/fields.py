@@ -2,31 +2,37 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from functools import cache, cached_property
 from types import MappingProxyType
-from typing import Annotated, Any, Literal, Self, TypeAlias, get_args
+from typing import Annotated, Any, Literal, Self, TypeAlias
 
 import torch
 from pydantic import (
     AfterValidator,
+    ConfigDict,
     Field,
-    PrivateAttr,
     ValidationInfo,
     field_validator,
     model_validator,
 )
+from pydantic.dataclasses import dataclass as pydantic_dataclass
 
-from hydroforge.contracts.validation import (
+from hydroforge.core.expr import parse_value_source
+from hydroforge.core.naming import DottedPath, Identifier
+from hydroforge.core.validation import (
     FrozenMapping,
     HydroForgeModel,
 )
 
-ModuleType: TypeAlias = type[Any]
-DimensionToken: TypeAlias = str | int
 
-TensorName: TypeAlias = Annotated[str, Field(min_length=1)]
+def _tensor_name(value: str) -> str:
+    if len(value.split(".")) > 2:
+        raise ValueError("tensor references must be identifier or module.identifier")
+    return value
+
+
+TensorName: TypeAlias = Annotated[DottedPath, AfterValidator(_tensor_name)]
 TensorShape: TypeAlias = tuple[TensorName | Annotated[int, Field(ge=0)], ...]
 TensorDType = Literal["float", "hpfloat", "int", "idx", "bool"]
 TensorOutput = Literal["auto", "full", "disabled"]
@@ -39,7 +45,7 @@ def _unique_module_names(values: tuple[str, ...]) -> tuple[str, ...]:
 
 
 _ModuleNames: TypeAlias = Annotated[
-    tuple[TensorName, ...], AfterValidator(_unique_module_names)
+    tuple[Identifier, ...], AfterValidator(_unique_module_names)
 ]
 TensorDependencies: TypeAlias = TensorName | _ModuleNames | None
 
@@ -280,24 +286,13 @@ def cast_declared_tensor(
     return converted
 
 
-def _resolve_dimension(
-    dimensions: Mapping[DimensionToken, Any],
-    dimension: DimensionToken,
-) -> Any:
-    """Resolve a logical dimension, including ``module.attribute`` tokens."""
-    try:
-        return dimensions[dimension]
-    except KeyError:
-        if isinstance(dimension, str) and "." in dimension:
-            try:
-                return dimensions[dimension.rsplit(".", 1)[1]]
-            except KeyError:
-                raise KeyError(dimension) from None
-        raise
+@pydantic_dataclass(frozen=True, slots=True, config=ConfigDict(strict=True))
+class TensorMetadata:
+    """Canonical tensor-field metadata, validated once by its field factory.
 
-
-class TensorMetadata(HydroForgeModel):
-    """Canonical field metadata validated once when class metadata is read."""
+    A validated dataclass rather than a model: field factories append it to
+    ``FieldInfo.metadata``, where Pydantic ignores it for core schemas.
+    """
 
     shape: TensorShape
     dtype: TensorDType = "float"
@@ -325,304 +320,73 @@ class TensorMetadata(HydroForgeModel):
     expression: str = ""
     output_only: bool = False
 
-    @field_validator("shape", mode="before")
-    @classmethod
-    def _canonical_shape(cls, value: Any, info: ValidationInfo):
-        # Raw FieldInfo metadata must already contain canonical Python types.
-        # A before validator receives JSON arrays as Python lists. Restore the
-        # tuple representation before strict Python validation resumes.
-        if info.mode == "json" and type(value) is list:
-            return tuple(value)
-        if info.mode == "python" and (
-            type(value) is not tuple
-            or any(type(dimension) not in (str, int) for dimension in value)
-        ):
-            raise ValueError("tensor_shape must be an exact tuple of strings or ints")
-        return value
-
     @field_validator("depends_on", "required_by", mode="before")
     @classmethod
-    def _canonical_dependencies(cls, value: Any, info: ValidationInfo):
+    def _canonical_dependencies(cls, value: Any, info: ValidationInfo) -> Any:
         if value is None:
             return ()
         if type(value) is str:
             return (value,)
+        # A before validator hands JSON arrays on as Python lists.
         if info.mode == "json" and type(value) is list:
             return tuple(value)
-        if info.mode == "python" and (
-            type(value) is not tuple or any(type(name) is not str for name in value)
-        ):
-            raise ValueError("dependencies must be a module name, exact tuple, or None")
         return value
-
-    @field_validator(
-        "dtype",
-        "category",
-        "mode",
-        "dim_coords",
-        "partition_by",
-        "references",
-        "selects",
-        "output",
-        "expression",
-        mode="before",
-    )
-    @classmethod
-    def _canonical_string(cls, value: Any, info: ValidationInfo):
-        if value is None and info.field_name == "expression":
-            return ""
-        if value is not None and type(value) is not str:
-            raise ValueError("metadata strings must use exact str values")
-        return value
-
-    @classmethod
-    def compile(cls, raw: Mapping[str, Any]) -> Self:
-        # Class FieldInfo remains externally mutable, so validate its current
-        # metadata here. Unrelated JSON schema annotations are intentionally ignored.
-        aliases = {
-            "shape": "tensor_shape",
-            "dtype": "tensor_dtype",
-            "expression": "expr",
-        }
-        values = {
-            name: raw[source]
-            for name in cls.model_fields
-            if (source := aliases.get(name, name)) in raw
-        }
-        return cls(**values)
-
-
-class ModuleFieldSchema(HydroForgeModel):
-    """Framework-neutral description of one declared tensor field."""
-
-    module_name: str
-    name: str
-    shape: tuple[DimensionToken, ...]
-    dtype: str
-    required: bool
-    computed: bool
-    tensor: TensorMetadata | None
-    excluded: bool
-    annotation: Any = None
-    description: str = ""
-
-    @property
-    def category(self) -> str | None:
-        return None if self.tensor is None else self.tensor.category
-
-    @property
-    def output(self) -> str | None:
-        return None if self.tensor is None else self.tensor.output
-
-    @property
-    def selects(self) -> str | None:
-        return None if self.tensor is None else self.tensor.selects
-
-
-class ModuleSchema(HydroForgeModel):
-    """Tensor fields grouped by their owning module."""
-
-    modules: FrozenMapping[str, tuple[ModuleFieldSchema, ...]]
-
-    def resolve_dimensions(
-        self,
-        dimensions: Mapping[DimensionToken, str],
-        *,
-        include: Callable[[ModuleFieldSchema], bool] | None = None,
-    ) -> dict[str, dict[str, tuple[str, ...]]]:
-        """Translate logical tensor shapes into consumer-specific dimensions."""
-        resolved: dict[str, dict[str, tuple[str, ...]]] = {}
-        for module_name, fields in self.modules.items():
-            module_fields: dict[str, tuple[str, ...]] = {}
-            for field in fields:
-                if field.tensor is None:
-                    continue
-                if include is not None and not include(field):
-                    continue
-                try:
-                    module_fields[field.name] = tuple(
-                        str(dimension)
-                        if isinstance(dimension, int)
-                        else _resolve_dimension(dimensions, dimension)
-                        for dimension in field.shape
-                    )
-                except KeyError as exc:
-                    raise ValueError(
-                        f"{module_name}.{field.name} uses unresolved dimension "
-                        f"{exc.args[0]!r}"
-                    ) from exc
-            resolved[module_name] = module_fields
-        return resolved
-
-    def fields(self, module_name: str) -> tuple[ModuleFieldSchema, ...]:
-        """Return fields owned by ``module_name``."""
-        try:
-            return self.modules[module_name]
-        except KeyError as exc:
-            raise KeyError(f"Module {module_name!r} is absent from schema") from exc
-
-
-def _field_schema(
-    module_name: str,
-    name: str,
-    field: Any,
-    *,
-    computed: bool,
-) -> ModuleFieldSchema:
-    raw_metadata = getattr(field, "json_schema_extra", None)
-    if raw_metadata is None:
-        metadata: Mapping[str, Any] = {}
-    elif not isinstance(raw_metadata, Mapping):
-        raise ValueError(
-            f"{module_name}.{name} json_schema_extra must be a mapping or None"
-        )
-    else:
-        metadata = raw_metadata
-    tensor = TensorMetadata.compile(metadata) if "tensor_shape" in metadata else None
-    annotation = getattr(
-        field,
-        "annotation",
-        getattr(field, "return_type", None),
-    )
-    if (
-        computed
-        and tensor is not None
-        and tensor.category != "virtual"
-        and not isinstance(getattr(field, "wrapped_property", None), cached_property)
-    ):
-        raise ValueError(
-            f"{module_name}.{name} is a stored computed tensor and must wrap "
-            "functools.cached_property; a plain property would reallocate "
-            "storage on every access and cannot be deactivated"
-        )
-    if tensor is not None and tensor.category != "virtual":
-        may_be_inactive = bool(
-            tensor.depends_on
-            or tensor.required_by
-            or tensor.output_only
-            or tensor.mode == "discard"
-        )
-        if (
-            may_be_inactive
-            and annotation is not Any
-            and annotation is not None
-            and annotation is not type(None)
-            and type(None) not in get_args(annotation)
-        ):
-            raise ValueError(
-                f"{module_name}.{name} may be None because of its tensor "
-                "lifecycle metadata; annotate it as torch.Tensor | None"
-            )
-    excluded = getattr(field, "exclude", None)
-    if excluded is None:
-        excluded = False
-    elif type(excluded) is not bool:
-        raise ValueError(f"{module_name}.{name} exclude must be an exact bool or None")
-    description = getattr(field, "description", None)
-    if description is None:
-        description = ""
-    elif type(description) is not str:
-        raise ValueError(
-            f"{module_name}.{name} description must be an exact string or None"
-        )
-    return ModuleFieldSchema(
-        module_name=module_name,
-        name=name,
-        shape=() if tensor is None else tensor.shape,
-        dtype="" if tensor is None else tensor.dtype,
-        required=not computed and field.is_required(),
-        computed=computed,
-        tensor=tensor,
-        excluded=excluded,
-        annotation=annotation,
-        description=description,
-    )
-
-
-@cache
-def _parse_module_schema_cached(
-    modules: tuple[ModuleType, ...],
-    *,
-    include_computed: bool = False,
-) -> ModuleSchema:
-    """Parse tensor declarations without instantiating any module.
-
-    The parser preserves logical dimension names and module metadata. File
-    formats or applications can subsequently map those dimensions and apply
-    their own required/optional policy with :meth:`ModuleSchema.resolve_dimensions`.
-    """
-    parsed: dict[str, tuple[ModuleFieldSchema, ...]] = {}
-    for module in modules:
-        module_name = module.module_name
-        if module_name in parsed:
-            raise ValueError(f"Duplicate module name {module_name!r}")
-
-        fields: list[ModuleFieldSchema] = []
-        for name, field in module.model_fields.items():
-            schema = _field_schema(
-                module_name,
-                name,
-                field,
-                computed=False,
-            )
-            fields.append(schema)
-        if include_computed:
-            for name, field in module.model_computed_fields.items():
-                schema = _field_schema(
-                    module_name,
-                    name,
-                    field,
-                    computed=True,
-                )
-                fields.append(schema)
-        parsed[module_name] = tuple(fields)
-
-    return ModuleSchema(modules=parsed)
-
-
-class _ModuleSchemaDeclaration(HydroForgeModel):
-    modules: tuple[ModuleType, ...]
-    include_computed: bool = False
-
-    _schema: ModuleSchema = PrivateAttr()
 
     @model_validator(mode="after")
-    def _compile_schema(self) -> Self:
-        from hydroforge.model.module import AbstractModule
-
-        if not self.modules:
-            raise ValueError("module schema requires at least one module type")
-        invalid = [
-            getattr(module, "__name__", type(module).__name__)
-            for module in self.modules
-            if not isinstance(module, type) or not issubclass(module, AbstractModule)
-        ]
-        if invalid:
+    def _validate_contract(self) -> Self:
+        if self.expression:
+            parse_value_source(self.expression)
+        if self.is_key and (len(self.shape) != 1 or self.dtype not in {"int", "idx"}):
+            raise ValueError("key fields require one-dimensional integer metadata")
+        if self.is_coordinate and not self.is_key:
+            raise ValueError("coordinate fields require key semantics")
+        if (
+            self.selects or self.replicated or self.partition_by
+        ) and not self.is_coordinate:
             raise ValueError(
-                f"module schema entries must be AbstractModule classes: {invalid}"
+                "selects, replicated and partition_by require a coordinate field"
             )
-        self._schema = _parse_module_schema_cached(
-            self.modules,
-            include_computed=self.include_computed,
-        )
+        if self.selects and self.references != self.selects:
+            raise ValueError("selection references must name its selects target")
+        if self.replicated and (self.partition_by or self.references):
+            raise ValueError("replicated coordinates cannot declare partition lineage")
+        if self.dim_coords is not None and not self.shape:
+            raise ValueError(
+                "dim_coords names the coordinate of dimension 0 and requires "
+                "a non-scalar shape"
+            )
+        if self.mode == "discard":
+            if self.is_coordinate:
+                raise ValueError(
+                    "coordinate fields cannot use mode='discard'; outputs and "
+                    "checkpoints read their runtime values"
+                )
+            if self.category not in {"topology", "param"}:
+                raise ValueError(
+                    "mode='discard' is only valid for construction-time "
+                    "topology or parameter fields"
+                )
+            if self.output != "disabled":
+                raise ValueError("mode='discard' fields must use output='disabled'")
+        if self.category == "forcing":
+            if self.mode != "device":
+                raise ValueError("forcing fields must use mode='device'")
+            if self.output != "disabled":
+                raise ValueError("forcing fields must use output='disabled'")
+            if self.is_key or self.is_coordinate or self.references or self.selects:
+                raise ValueError(
+                    "forcing fields cannot define topology/key relationships"
+                )
+        if self.expression and self.category != "virtual":
+            raise ValueError("expr can only be provided when category is 'virtual'")
+        if self.output_only:
+            if self.category == "virtual":
+                raise ValueError("output_only is invalid for virtual fields")
+            if self.output == "disabled":
+                raise ValueError(
+                    "output_only fields must permit explicit statistics output"
+                )
         return self
-
-    @property
-    def schema(self) -> ModuleSchema:
-        return self._schema
-
-
-def parse_module_schema(
-    modules: tuple[ModuleType, ...],
-    *,
-    include_computed: bool = False,
-) -> ModuleSchema:
-    """Return one immutable schema shared by all instances of these modules."""
-    declaration = _ModuleSchemaDeclaration(
-        modules=modules,
-        include_computed=include_computed,
-    )
-    return declaration.schema
 
 
 class PartitionSchema(HydroForgeModel):
@@ -640,3 +404,4 @@ class RuntimeTensorMetadata(HydroForgeModel):
     description: str
     output_index: str | None = None
     output_coord: str | None = None
+    resolved_shape: tuple[int, ...] | None = None

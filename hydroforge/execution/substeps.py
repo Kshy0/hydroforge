@@ -1,26 +1,40 @@
-"""Explicit model-authored compiled sub-step scopes."""
+"""Explicit model-authored compiled sub-step scopes.
+
+A scope body is entered once for each managed-method specialization to build
+the operator IR.  Later outer steps skip the Python body and replay the
+cached device program.  Registered-kernel identity and intercepted ATen
+operators define the IR; Python function names have no execution meaning.
+"""
 
 from __future__ import annotations
 
 import math
 from collections import OrderedDict
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Final
+from typing import Any, Final
 
 import torch
 from pydantic import Field, FiniteFloat, PrivateAttr, field_validator, model_validator
+from torch.utils._python_dispatch import _disable_current_modes
 
-from hydroforge.contracts.validation import HydroForgeModel
-from hydroforge.kernels.devices import devices_match
-
-if TYPE_CHECKING:
-    from hydroforge.model.model import AbstractModel
-
+from hydroforge.core.devices import devices_match
+from hydroforge.core.errors import SubstepCompileError, cleanup_on_exit
+from hydroforge.core.validation import HydroForgeModel
+from hydroforge.execution.channel import StepEvent
+from hydroforge.execution.context import (
+    InvocationScope,
+    PredicateLoopFrame,
+    SubstepFrame,
+    specialization_key,
+    validate_callback,
+)
+from hydroforge.execution.loops import AdaptiveLoop, FixedLoop, PredicateLoop
+from hydroforge.execution.operators import record_operator_scope
+from hydroforge.kernels.calls import recording_sink
 
 _MISSING_PROGRAM = object()
-_MISSING_COUNT = object()
 
 INVALID_SUBSTEP_COUNT: Final[int] = (1 << 31) - 1
 
@@ -33,7 +47,7 @@ _HOST_TRIGGER_LIMIT: Final[int] = 256
 
 
 @dataclass(frozen=True, slots=True)
-class _Recorded:
+class Recorded:
     """One finished recording awaiting either program construction or disposal."""
 
     signature: tuple[Any, ...]
@@ -41,36 +55,36 @@ class _Recorded:
     build: Callable[[], Any]
 
 
-def _close_owned(
-    capture: Any,
-    owned: tuple[Any, ...],
-    primary: BaseException | None,
-    *,
-    scope: str,
-) -> None:
-    """Close recorded programs, preserving ``primary`` and every cleanup error."""
+def close_owned(executor: Any, owned: tuple[Any, ...], *, scope: str) -> None:
+    """Close recorded programs, retaining every cleanup error."""
 
-    from hydroforge.contracts.errors import ResourceCleanupError
-
-    failures = [] if primary is None else [primary]
-    for program in owned:
-        if program is None:
-            continue
-        try:
-            program.close(capture)
-        except BaseException as error:
-            failures.append(error)
-    if primary is None and failures:
-        raise ResourceCleanupError(scope, failures) from failures[0]
-    if len(failures) > 1:
-        raise ResourceCleanupError(scope, failures) from primary
+    with cleanup_on_exit(
+        scope,
+        (
+            (lambda program=program: program.close(executor))
+            for program in owned
+            if program is not None
+        ),
+    ):
+        pass
 
 
-def _cached_program(
+class HostVariants:
+    """Recorded host values of one scope's primary program and the step
+    triggers (duration, count) already matched to a variant."""
+
+    __slots__ = ("signature", "triggers")
+
+    def __init__(self, signature: tuple[Any, ...]) -> None:
+        self.signature = signature
+        self.triggers: OrderedDict[tuple[Any, ...], tuple[Any, ...]] = OrderedDict()
+
+
+def cached_program(
     execution: Any,
     key: tuple[Any, ...],
     trigger: tuple[Any, ...],
-    record: Callable[[], Generator[Any, None, _Recorded]],
+    record: Callable[[], Generator[Any, None, Recorded]],
 ) -> Generator[Any, None, Any]:
     """Resolve the program whose recorded host values match this invocation.
 
@@ -83,62 +97,57 @@ def _cached_program(
     """
 
     programs = execution.programs
-    primary = programs.get(key)
-    if primary is not None:
-        triggers = getattr(primary, "host_triggers", {})
-        if trigger in triggers:
-            signature = triggers[trigger]
-            program = (
-                primary
-                if signature == primary.host_signature
-                else programs.get((*key, (_HOST_VARIANT, signature)))
+    variants = execution.host_variants.get(key)
+    if variants is not None:
+        signature = variants.triggers.get(trigger, _MISSING_PROGRAM)
+        if signature is not _MISSING_PROGRAM:
+            program = programs.get(
+                key
+                if signature == variants.signature
+                else (*key, (_HOST_VARIANT, signature))
             )
             if program is not None:
-                triggers.move_to_end(trigger)
+                variants.triggers.move_to_end(trigger)
                 return program
     recorded = yield from record()
     signature = recorded.signature
-    if primary is None:
-        variant = key
-    elif signature == getattr(primary, "host_signature", None):
+    if variants is None or signature == variants.signature:
         variant = key
     else:
         variant = (*key, (_HOST_VARIANT, signature))
     program = programs.get(variant)
     if program is not None:
-        _close_owned(
-            execution.capture, recorded.owned, None, scope="verified recording"
-        )
+        close_owned(execution.executor, recorded.owned, scope="verified recording")
     else:
         try:
             program = recorded.build()
-        except BaseException as error:
-            _close_owned(
-                execution.capture,
-                recorded.owned,
-                error,
-                scope="substep program construction",
-            )
-            raise
+        except BaseException:
+            with cleanup_on_exit(
+                "substep program construction",
+                (
+                    lambda: close_owned(
+                        execution.executor, recorded.owned, scope="substep recording"
+                    ),
+                ),
+            ):
+                raise
         programs[variant] = program
-        if primary is None:
-            program.host_signature = signature
-            program.host_triggers = OrderedDict()
-            primary = program
+        if variants is None:
+            variants = execution.host_variants[key] = HostVariants(signature)
         else:
-            _evict_host_variants(programs, key, primary)
-    triggers = getattr(primary, "host_triggers", None)
-    if triggers is not None:
-        triggers[trigger] = signature
-        triggers.move_to_end(trigger)
-        if len(triggers) > _HOST_TRIGGER_LIMIT:
-            triggers.popitem(last=False)
+            _evict_host_variants(programs, key, variants)
+    variants.triggers[trigger] = signature
+    variants.triggers.move_to_end(trigger)
+    if len(variants.triggers) > _HOST_TRIGGER_LIMIT:
+        variants.triggers.popitem(last=False)
     return program
 
 
-def _evict_host_variants(programs: dict[Any, Any], key: tuple[Any, ...], primary: Any) -> None:
+def _evict_host_variants(
+    programs: dict[Any, Any], key: tuple[Any, ...], variants: HostVariants
+) -> None:
     size = len(key) + 1
-    variants = [
+    candidates = [
         candidate
         for candidate in programs
         if len(candidate) == size
@@ -146,88 +155,32 @@ def _evict_host_variants(programs: dict[Any, Any], key: tuple[Any, ...], primary
         and isinstance(candidate[-1], tuple)
         and candidate[-1][:1] == (_HOST_VARIANT,)
     ]
-    if len(variants) <= _HOST_VARIANT_LIMIT:
+    if len(candidates) <= _HOST_VARIANT_LIMIT:
         return
-    oldest = variants[0]
+    oldest = candidates[0]
     evicted = programs.pop(oldest)
     signature = oldest[-1][1]
-    triggers = getattr(primary, "host_triggers", {})
-    for trigger in [trigger for trigger, value in triggers.items() if value == signature]:
+    triggers = variants.triggers
+    for trigger in [
+        trigger for trigger, value in triggers.items() if value == signature
+    ]:
         del triggers[trigger]
     evicted.close()
-
-
-@dataclass(frozen=True, slots=True)
-class SubstepFrame:
-    """Compiler-owned scalar tensors visible only inside a sub-step body."""
-
-    index: torch.Tensor
-    dt: torch.Tensor
-
-
-class _FixedFinalRecorder:
-    def __init__(self, model: AbstractModel, *, stable_tensors) -> None:
-        self.model = model
-        self.stable_tensors = stable_tensors
-
-    def record(self, callback: Callable[[], None]) -> Any:
-        from hydroforge.execution.operators import record_operator_scope
-
-        recording = record_operator_scope(
-            self.model,
-            stable_tensors=self.stable_tensors,
-            scope_kind="fixed final",
-        )
-        with recording:
-            callback()
-        if not recording.program.operators:
-            from hydroforge.execution.operators import SubstepCompileError
-
-            raise SubstepCompileError(
-                "fixed final callback produced an empty operator IR"
-            )
-        return recording.program
-
-
-@dataclass(frozen=True, slots=True)
-class PredicateLoopFrame:
-    """Device state exposed to one nested predicate-loop body."""
-
-    index: torch.Tensor
-    continue_flag: torch.Tensor
-
-
-def _specialization_key(value: Any) -> Any:
-    """Make an explicit host specialization unambiguous and hashable."""
-    if value is None:
-        return None
-    if type(value) is float:
-        if not math.isfinite(value):
-            raise ValueError("substep float specialization must be finite")
-        return float, value.hex()
-    if type(value) in {bool, int, str}:
-        return type(value), value
-    if isinstance(value, tuple):
-        return tuple(_specialization_key(item) for item in value)
-    raise ValueError(
-        "substep specialization must be None, bool, int, float, str, or a "
-        "tuple composed from those exact scalar types"
-    )
 
 
 class _FixedSubstepRequest(HydroForgeModel):
     count: int | None = Field(default=None, ge=1, lt=INVALID_SUBSTEP_COUNT)
     requested_sub_steps: int | None = Field(
         default=None,
-        strict=True,
         ge=1,
         lt=INVALID_SUBSTEP_COUNT,
         exclude=True,
     )
     final: Callable[[], None] | None = None
     specialization: Any = None
-    scope_available: bool = Field(strict=True, exclude=True)
+    scope_available: bool = Field(exclude=True)
 
+    _count: int = PrivateAttr()
     _specialization: Any = PrivateAttr()
 
     @model_validator(mode="after")
@@ -241,10 +194,13 @@ class _FixedSubstepRequest(HydroForgeModel):
                 "computed fixed substep count conflicts with explicit "
                 "num_sub_steps request"
             )
-        count = self.count or self.requested_sub_steps or 1
-        object.__setattr__(self, "count", count)
-        self._specialization = _specialization_key(self.specialization)
+        self._count = self.count or self.requested_sub_steps or 1
+        self._specialization = specialization_key(self.specialization)
         return self
+
+    @property
+    def resolved_count(self) -> int:
+        return self._count
 
     @property
     def specialization_key(self) -> Any:
@@ -252,10 +208,11 @@ class _FixedSubstepRequest(HydroForgeModel):
 
 
 @lru_cache(maxsize=128)
-def _plain_fixed_request(count: int | None, requested: int | None):
+def _fixed_count(count: int | None, requested: int | None) -> int:
+    """Validate an exact-int fixed count once per distinct request."""
     return _FixedSubstepRequest(
         count=count, requested_sub_steps=requested, scope_available=True
-    )
+    ).resolved_count
 
 
 @lru_cache(maxsize=128)
@@ -268,13 +225,13 @@ class _AdaptiveSubstepRequest(HydroForgeModel):
     candidate_dt: torch.Tensor
     dt: torch.Tensor
     maximum_dt: int | FiniteFloat = Field(gt=0)
-    maximum_steps: int = Field(strict=True, ge=1, lt=INVALID_SUBSTEP_COUNT)
+    maximum_steps: int = Field(ge=1, lt=INVALID_SUBSTEP_COUNT)
     proposal: Callable[[], None]
     specialization: Any = None
     requested_sub_steps: int | None = Field(default=None, exclude=True)
     model_dtype: torch.dtype = Field(exclude=True)
     model_device: torch.device = Field(exclude=True)
-    scope_available: bool = Field(strict=True, exclude=True)
+    scope_available: bool = Field(exclude=True)
 
     _maximum_dt: float = PrivateAttr()
     _specialization: Any = PrivateAttr()
@@ -333,7 +290,7 @@ class _AdaptiveSubstepRequest(HydroForgeModel):
                 f"in model dtype {self.model_dtype}"
             )
         self._maximum_dt = maximum_dt
-        self._specialization = _specialization_key(self.specialization)
+        self._specialization = specialization_key(self.specialization)
         return self
 
     @property
@@ -346,117 +303,106 @@ class _AdaptiveSubstepRequest(HydroForgeModel):
 
 
 class _PredicateLoopRequest(HydroForgeModel):
-    maximum_steps: int = Field(strict=True, ge=1, lt=INVALID_SUBSTEP_COUNT)
+    maximum_steps: int = Field(ge=1, lt=INVALID_SUBSTEP_COUNT)
 
 
-class _PredicateIterationRequest(HydroForgeModel):
-    """Validate the lexical compiler context at the iterator boundary."""
+def _execute(context: Any, program: Any, *arguments: int | float) -> int:
+    """Run one fixed or adaptive program and close its scope."""
 
-    parent: Any
-
-    @model_validator(mode="after")
-    def _validate_parent(self):
-        if self.parent is None:
-            raise ValueError(
-                "predicate loops must be nested directly inside a compiled "
-                "fixed substep scope"
-            )
-        if self.parent.scope_kind != "fixed":
-            raise ValueError(
-                "predicate loops are supported only directly inside a fixed "
-                f"substep; found {self.parent.scope_kind!r} operator scope"
-            )
-        return self
+    context.channel.event(StepEvent.SUBSTEP)
+    completed = program.execute(*arguments, context)
+    context.completed_substeps = completed
+    context.scopes.pop()
+    return completed
 
 
-class _FixedScope:
+class _FixedScope(InvocationScope):
     def __init__(
         self,
-        runtime: SubstepRuntime,
+        context: Any,
         *,
         key: tuple[Any, ...],
         count: int,
-        duration: float,
         final: Callable[[], None] | None,
     ) -> None:
-        self.runtime = runtime
+        super().__init__(context)
         self.key = key
         self.count = count
-        self.duration = duration
         self.final = final
         self.completed = 0
 
-    def __iter__(self) -> Iterator[SubstepFrame]:
-        program = yield from _cached_program(
-            self.runtime.model._execution,
+    def _iterate(self) -> Generator[SubstepFrame, None, None]:
+        context = self.context
+        program = yield from cached_program(
+            context.execution,
             self.key,
-            (self.duration, self.count),
+            (context.time_step, self.count),
             self._record,
         )
-        self.completed = self.runtime._execute_program(
-            program, self.count, self.duration
-        )
+        self.completed = _execute(context, program, self.count, context.time_step)
 
-    def _record(self) -> Generator[SubstepFrame, None, _Recorded]:
-        from hydroforge.execution.operators import record_operator_scope
-        from hydroforge.execution.program import FixedSubstepProgram
-
-        model = self.runtime.model
-        draft = FixedSubstepProgram.recording_draft(model)
-        controls = (draft.count, draft.counter, draft.weight)
+    def _record(self) -> Generator[SubstepFrame, None, Recorded]:
+        context = self.context
+        execution = context.execution
+        loop = FixedLoop(execution)
+        controls = (loop.count, loop.counter, loop.weight)
+        depth = len(context.scopes)
         with record_operator_scope(
-            model,
+            execution,
             stable_tensors=controls,
             scope_kind="fixed",
         ) as recording:
-            yield draft.frame
-            if self.runtime._pending_predicate_scopes:
-                from hydroforge.execution.operators import SubstepCompileError
-
-                raise SubstepCompileError(
-                    "predicate loop scope was exited before recording "
-                    "completed; do not break or return from a "
-                    "step.predicate() loop"
-                )
+            yield loop.frame
+            context.require_scopes_closed(depth)
         owned = [recording.program]
         try:
             if self.final is not None:
-                final = _FixedFinalRecorder(model, stable_tensors=controls)
-                owned.append(final.record(self.final))
+                final = record_operator_scope(
+                    execution, stable_tensors=controls, scope_kind="fixed final"
+                )
+                with final:
+                    self.final()
+                if not final.program.operators:
+                    raise SubstepCompileError(
+                        "fixed final callback produced an empty operator IR"
+                    )
+                owned.append(final.program)
             aliases = dict(zip(map(id, controls), ("count", "index", "dt")))
             signature = tuple(program.fingerprint(aliases) for program in owned)
-        except BaseException as primary:
-            _close_owned(
-                model._execution.capture,
-                tuple(owned),
-                primary,
-                scope="fixed substep recording",
-            )
-            raise
+        except BaseException:
+            with cleanup_on_exit(
+                "fixed substep recording",
+                (
+                    lambda: close_owned(
+                        execution.executor,
+                        tuple(owned),
+                        scope="fixed substep recording",
+                    ),
+                ),
+            ):
+                raise
         final_program = owned[1] if len(owned) > 1 else None
-        return _Recorded(
+        return Recorded(
             signature,
             tuple(owned),
-            lambda: FixedSubstepProgram(model, draft, owned[0], final_program),
+            lambda: loop.bind(owned[0], final_program),
         )
 
 
-class _AdaptiveScope:
+class _AdaptiveScope(InvocationScope):
     def __init__(
         self,
-        runtime: SubstepRuntime,
+        context: Any,
         *,
         key: tuple[Any, ...],
-        duration: float,
         candidate_dt: torch.Tensor,
         dt: torch.Tensor,
         maximum_dt: float,
         maximum_steps: int,
         proposal: Callable[[], None],
     ) -> None:
-        self.runtime = runtime
+        super().__init__(context)
         self.key = key
-        self.duration = duration
         self.candidate_dt = candidate_dt
         self.dt = dt
         self.maximum_dt = maximum_dt
@@ -464,192 +410,195 @@ class _AdaptiveScope:
         self.proposal = proposal
         self.completed = 0
 
-    def __iter__(self) -> Iterator[SubstepFrame]:
-        program = yield from _cached_program(
-            self.runtime.model._execution,
+    def _iterate(self) -> Generator[SubstepFrame, None, None]:
+        context = self.context
+        program = yield from cached_program(
+            context.execution,
             self.key,
-            (self.duration,),
+            (context.time_step,),
             self._record,
         )
-        self.completed = self.runtime._execute_program(program, self.duration)
+        self.completed = _execute(context, program, context.time_step)
 
-    def _record(self) -> Generator[SubstepFrame, None, _Recorded]:
-        from hydroforge.execution.operators import record_operator_scope
-        from hydroforge.execution.program import AdaptiveSubstepProgram
-
-        model = self.runtime.model
-        draft = AdaptiveSubstepProgram.recording_draft(
+    def _record(self) -> Generator[SubstepFrame, None, Recorded]:
+        execution = self.context.execution
+        loop = AdaptiveLoop(
+            execution,
             candidate_dt=self.candidate_dt,
             dt=self.dt,
             maximum_dt=self.maximum_dt,
             maximum_steps=self.maximum_steps,
         )
         proposal = record_operator_scope(
-            model,
-            stable_tensors=(draft.candidate,),
+            execution,
+            stable_tensors=(loop.candidate,),
             scope_kind="adaptive proposal",
         )
         physics = record_operator_scope(
-            model,
-            stable_tensors=(draft.counter, draft.time_step),
+            execution,
+            stable_tensors=(loop.counter, loop.time_step),
             scope_kind="adaptive physics",
         )
         with proposal:
             self.proposal()
         try:
             with physics:
-                yield draft.frame
+                yield loop.frame
             owned = (proposal.program, physics.program)
-            aliases = {id(draft.counter): "index"}
+            aliases = {id(loop.counter): "index"}
             signature = tuple(program.fingerprint(aliases) for program in owned)
-        except BaseException as primary:
-            _close_owned(
-                model._execution.capture,
-                (proposal.program, physics.program),
-                primary,
-                scope="adaptive substep recording",
-            )
-            raise
-        return _Recorded(
+        except BaseException:
+            with cleanup_on_exit(
+                "adaptive substep recording",
+                (
+                    lambda: close_owned(
+                        execution.executor,
+                        (proposal.program, physics.program),
+                        scope="adaptive substep recording",
+                    ),
+                ),
+            ):
+                raise
+        return Recorded(
             signature,
             owned,
-            lambda: AdaptiveSubstepProgram(
-                model, draft=draft, proposal=owned[0], body=owned[1]
-            ),
+            lambda: loop.bind(owned[0], owned[1]),
         )
 
 
-class _PredicateScope:
-    def __init__(
-        self,
-        runtime: SubstepRuntime,
-        *,
-        maximum_steps: int,
-    ) -> None:
-        self.runtime = runtime
+class _PredicateScope(InvocationScope):
+    def __init__(self, context: Any, *, maximum_steps: int) -> None:
+        super().__init__(context)
         self.maximum_steps = maximum_steps
 
-    def __iter__(self) -> Iterator[PredicateLoopFrame]:
-        from torch.utils._python_dispatch import _disable_current_modes
-
-        from hydroforge.execution.operators import record_operator_scope
-        from hydroforge.execution.program import PredicateLoopProgram
-        from hydroforge.kernels.context import active_operator_recorder
-
-        request = _PredicateIterationRequest(
-            parent=active_operator_recorder(),
-        )
-        parent = request.parent
-        self.runtime._pending_predicate_scopes += 1
-        draft = PredicateLoopProgram.recording_draft(
-            self.runtime.model,
-            maximum_steps=self.maximum_steps,
-        )
+    def _iterate(self) -> Generator[PredicateLoopFrame, None, None]:
+        parent = recording_sink()
+        if parent is None:
+            raise ValueError(
+                "predicate loops must be nested directly inside a compiled "
+                "fixed substep scope"
+            )
+        if parent.scope_kind != "fixed":
+            raise ValueError(
+                "predicate loops are supported only directly inside a fixed "
+                f"substep; found {parent.scope_kind!r} operator scope"
+            )
+        context = self.context
+        execution = context.execution
+        context.scopes.append("predicate")
+        loop = PredicateLoop(execution, maximum_steps=self.maximum_steps)
         recording = record_operator_scope(
-            self.runtime.model,
-            stable_tensors=(
-                draft.predicate,
-                draft.counter,
-                draft.continue_flag,
-            ),
+            execution,
+            stable_tensors=(loop.predicate, loop.counter, loop.continue_flag),
             scope_kind="predicate",
         )
-        program = None
+        bound = False
         try:
             # The child recorder replaces, rather than stacks on, the parent
             # TorchDispatchMode.  Otherwise every child ATen operator would be
             # intercepted a second time by the outer recorder.
             with _disable_current_modes(), recording:
                 yield PredicateLoopFrame(
-                    index=draft.counter,
-                    continue_flag=draft.predicate,
+                    index=loop.counter,
+                    continue_flag=loop.predicate,
                 )
-            program = PredicateLoopProgram(
-                self.runtime.model,
-                maximum_steps=self.maximum_steps,
-                draft=draft,
-                body=recording.program,
-            )
-            parent.record_predicate_loop(program)
-            self.runtime._pending_predicate_scopes -= 1
+            loop.bind(recording.program)
+            bound = True
+            parent.record_predicate_loop(loop)
+            context.scopes.pop()
         except BaseException:
-            if program is not None:
-                program.close()
+            if bound:
+                loop.close()
             elif recording.program is not None:
-                recording.program.close(self.runtime.model._execution.capture)
+                recording.program.close(execution.executor)
             raise
 
 
-class SubstepRuntime:
-    """Declare compiled loops as ordinary readable Python ``for`` scopes.
+def fixed_scope(
+    context: Any,
+    *,
+    count: object,
+    specialization: Any,
+    final: Callable[[], None] | None,
+) -> _FixedScope:
+    """Declare a fixed loop after decoding the shared count ABI.
 
-    A scope body is entered once for each managed-method specialization to
-    build the operator IR.  Later outer steps skip the Python body and replay
-    the cached device program.  Registered-kernel identity and intercepted
-    ATen operators define the IR; Python function names have no execution
-    meaning.
+    Count-producing device kernels may return :data:`INVALID_SUBSTEP_COUNT`
+    to report an invalid or overflowing result without performing an unsafe
+    integer cast.
     """
-
-    def __init__(self, model: Any, step: Any) -> None:
-        self.model = model
-        self.step = step
-        self._pending_predicate_scopes = 0
-
-    def fixed(
-        self,
-        *,
-        count: object = None,
-        specialization: Any = None,
-        final: Callable[[], None] | None = None,
-    ) -> _FixedScope:
-        """Declare a fixed loop after decoding the shared count ABI.
-
-        Count-producing device kernels may return
-        :data:`INVALID_SUBSTEP_COUNT` to report an invalid or overflowing
-        result without performing an unsafe integer cast.
-        """
-        requested = self.step.requested_sub_steps
-        if (
-            final is None
-            and specialization is None
-            and not self.step._substep_scope_claimed
-            and (count is None or type(count) is int)
-            and (requested is None or type(requested) is int)
+    validate_callback(final, arguments=0, label="fixed final")
+    requested = context.requested_sub_steps
+    try:
+        # Warm steps validate only what changes: the host specialization.
+        if context.substep_claimed or not (
+            (count is None or type(count) is int) and (final is None or callable(final))
         ):
-            request = _plain_fixed_request(count, requested)
-        else:
-            request = _FixedSubstepRequest(
-                count=count,
-                requested_sub_steps=requested,
-                final=final,
-                specialization=specialization,
-                scope_available=not self.step._substep_scope_claimed,
-            )
-        duration, key = self.step.claim_substep_scope(
-            kind="fixed",
-            specialization=(
-                request.specialization_key,
-                ("final", request.final is not None),
-            ),
+            raise ValueError
+        resolved = _fixed_count(count, requested)
+        specialized = specialization_key(specialization)
+    except (TypeError, ValueError):
+        request = _FixedSubstepRequest(
+            count=count,
+            requested_sub_steps=requested,
+            final=final,
+            specialization=specialization,
+            scope_available=not context.substep_claimed,
         )
-        return _FixedScope(
-            self,
-            key=key,
-            count=request.count,
-            duration=duration,
-            final=request.final,
-        )
+        resolved = request.resolved_count
+        specialized = request.specialization_key
+    key = context.claim_substep_scope(
+        "fixed", (specialized, ("final", final is not None))
+    )
+    return _FixedScope(context, key=key, count=resolved, final=final)
 
-    def adaptive(
-        self,
-        *,
-        candidate_dt: torch.Tensor,
-        dt: torch.Tensor,
-        maximum_dt: float,
-        maximum_steps: int,
-        proposal: Callable[[], None],
-        specialization: Any = None,
-    ) -> _AdaptiveScope:
+
+def _tensor_identity(tensor: Any) -> tuple[Any, ...]:
+    return (
+        id(tensor),
+        tensor.dtype,
+        tensor.device,
+        tensor.shape,
+        tensor.layout,
+        tensor.is_contiguous(),
+    )
+
+
+def adaptive_scope(
+    context: Any,
+    *,
+    candidate_dt: torch.Tensor,
+    dt: torch.Tensor,
+    maximum_dt: float,
+    maximum_steps: int,
+    proposal: Callable[[], None],
+    specialization: Any,
+) -> _AdaptiveScope:
+    validate_callback(proposal, arguments=0, label="adaptive proposal")
+    execution = context.execution
+    try:
+        # Warm steps reuse the validation of identical controls and limits;
+        # the tensor identity includes every checked tensor property.
+        if (
+            context.substep_claimed
+            or context.requested_sub_steps is not None
+            or not isinstance(candidate_dt, torch.Tensor)
+            or not isinstance(dt, torch.Tensor)
+        ):
+            raise ValueError
+        key = (
+            _tensor_identity(candidate_dt),
+            _tensor_identity(dt),
+            type(maximum_dt),
+            maximum_dt,
+            type(maximum_steps),
+            maximum_steps,
+            specialization_key(specialization),
+            callable(proposal),
+        )
+        validated = execution.adaptive_requests[key]
+    except (KeyError, TypeError, ValueError):
+        key = None
         request = _AdaptiveSubstepRequest(
             candidate_dt=candidate_dt,
             dt=dt,
@@ -657,67 +606,72 @@ class SubstepRuntime:
             maximum_steps=maximum_steps,
             proposal=proposal,
             specialization=specialization,
-            requested_sub_steps=self.step.requested_sub_steps,
-            model_dtype=self.model.dtype,
-            model_device=self.model.device,
-            scope_available=not self.step._substep_scope_claimed,
+            requested_sub_steps=context.requested_sub_steps,
+            model_dtype=execution.dtype,
+            model_device=execution.device,
+            scope_available=not context.substep_claimed,
         )
-        # Tensor identity keys the cached program, so the controls must be
-        # address-stable model state rather than a fresh tensor per step.
-        for label, tensor in (("candidate_dt", request.candidate_dt), ("dt", request.dt)):
-            if not self.model._execution.is_model_tensor(tensor):
-                raise ValueError(
-                    f"adaptive {label} must be a declared model tensor; a new "
-                    "tensor per step would compile a new program every step"
-                )
-        duration, key = self.step.claim_substep_scope(
-            kind="adaptive",
-            specialization=(
-                request.specialization_key,
-                ("candidate_dt", id(request.candidate_dt)),
-                ("dt", id(request.dt)),
-                ("maximum_dt", request.normalized_maximum_dt),
-                ("maximum_steps", request.maximum_steps),
-            ),
+        validated = (
+            request.normalized_maximum_dt,
+            request.maximum_steps,
+            request.specialization_key,
         )
-        return _AdaptiveScope(
-            self,
-            key=key,
-            duration=duration,
-            candidate_dt=request.candidate_dt,
-            dt=request.dt,
-            maximum_dt=request.normalized_maximum_dt,
-            maximum_steps=request.maximum_steps,
-            proposal=request.proposal,
-        )
-
-    def predicate(self, *, maximum_steps: int) -> _PredicateScope:
-        """Declare a non-temporal loop controlled by a device scalar.
-
-        The body must write ``frame.continue_flag`` on every iteration.  The
-        loop executes at least once and stops when that scalar becomes zero or
-        after ``maximum_steps`` iterations.  It must be nested inside the one
-        lexical fixed substep owned by the managed step.
-        """
-
-        request = _PredicateLoopRequest(maximum_steps=maximum_steps)
-        return _PredicateScope(
-            self,
-            maximum_steps=request.maximum_steps,
-        )
-
-    def _execute_program(self, program: Any, *arguments: int | float) -> int:
-        """Coordinate and account for a fixed or adaptive substep execution."""
-
-        if self.model.world_size > 1:
-            from hydroforge.execution.step import (
-                _DistributedStepEvent,
-                _DistributedStepKind,
+    # Tensor identity keys the cached program, so the controls must be
+    # address-stable model state rather than a fresh tensor per step.
+    for label, tensor in (("candidate_dt", candidate_dt), ("dt", dt)):
+        if not execution.is_model_tensor(tensor):
+            raise ValueError(
+                f"adaptive {label} must be a declared model tensor; a new "
+                "tensor per step would compile a new program every step"
             )
-
-            self.step.synchronize_distributed(
-                _DistributedStepEvent(_DistributedStepKind.SUBSTEP)
+    if key is None:
+        try:
+            key = (
+                _tensor_identity(candidate_dt),
+                _tensor_identity(dt),
+                type(maximum_dt),
+                maximum_dt,
+                type(maximum_steps),
+                maximum_steps,
+                validated[2],
+                True,
             )
-        completed = program.execute(*arguments, self.step)
-        self.step.completed_substeps = completed
-        return completed
+            requests = execution.adaptive_requests
+            if len(requests) >= _HOST_TRIGGER_LIMIT:
+                requests.clear()
+            requests[key] = validated
+        except TypeError:
+            pass
+    maximum, steps, specialized = validated
+    scope_key = context.claim_substep_scope(
+        "adaptive",
+        (
+            specialized,
+            ("candidate_dt", id(candidate_dt)),
+            ("dt", id(dt)),
+            ("maximum_dt", maximum),
+            ("maximum_steps", steps),
+        ),
+    )
+    return _AdaptiveScope(
+        context,
+        key=scope_key,
+        candidate_dt=candidate_dt,
+        dt=dt,
+        maximum_dt=maximum,
+        maximum_steps=steps,
+        proposal=proposal,
+    )
+
+
+def predicate_scope(context: Any, *, maximum_steps: int) -> _PredicateScope:
+    """Declare a non-temporal loop controlled by a device scalar.
+
+    The body must write ``frame.continue_flag`` on every iteration.  The loop
+    executes at least once and stops when that scalar becomes zero or after
+    ``maximum_steps`` iterations.  It must be nested inside the one lexical
+    fixed substep owned by the managed step.
+    """
+
+    request = _PredicateLoopRequest(maximum_steps=maximum_steps)
+    return _PredicateScope(context, maximum_steps=request.maximum_steps)

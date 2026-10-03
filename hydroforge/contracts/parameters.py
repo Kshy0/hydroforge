@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import struct
 from datetime import datetime
 from typing import ClassVar, Self
 
@@ -16,9 +18,9 @@ from pydantic import (
     model_validator,
 )
 
-from hydroforge.contracts.naming import DottedPath
-from hydroforge.contracts.temporal import _require_date, date_calendar
-from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.core.naming import DottedPath
+from hydroforge.core.time import date_calendar, require_date
+from hydroforge.core.validation import HydroForgeModel
 
 ParameterScalar = bool | int | FiniteFloat
 ParameterValue = ParameterScalar | torch.Tensor
@@ -27,14 +29,67 @@ ParameterValue = ParameterScalar | torch.Tensor
 def _owned_tensor(value: torch.Tensor, *, label: str) -> torch.Tensor:
     if value.layout is not torch.strided:
         raise ValueError(f"{label} must use torch.strided layout")
-    if value.is_floating_point():
-        if value.device.type == "meta":
+    if value.device.type == "meta":
+        raise ValueError(f"{label} must contain materialized values, not meta tensors")
+    if value.is_complex():
+        # Model fields are bool, integer or floating; no complex value can bind.
+        raise ValueError(f"{label} must use a real dtype, got {value.dtype}")
+    if value.is_floating_point() and not torch.isfinite(value).all().item():
+        raise ValueError(f"{label} must contain only finite values")
+    return value.detach().clone(memory_format=torch.contiguous_format)
+
+
+def validate_parameter_scalar(
+    value: ParameterScalar, *, dtype: torch.dtype, variable_name: str, is_set: bool
+) -> ParameterScalar:
+    """Bind one already-declared scalar to its target dtype without allocating."""
+    if dtype is torch.bool:
+        if not is_set or type(value) is not bool:
             raise ValueError(
-                f"{label} must contain materialized values, not meta tensors"
+                f"boolean parameter {variable_name!r} requires an exact bool SET value"
             )
-        if not torch.isfinite(value).all().item():
-            raise ValueError(f"{label} must contain only finite values")
-    return value.detach().clone(memory_format=torch.preserve_format)
+        return value
+    if dtype.is_floating_point:
+        if type(value) is not float:
+            raise ValueError(
+                f"floating parameter {variable_name!r} update must be an "
+                "exact float or matching tensor"
+            )
+        if not math.isfinite(value) or abs(value) > torch.finfo(dtype).max:
+            raise ValueError(
+                f"parameter {variable_name!r} update is outside {dtype} range"
+            )
+        encoded = (
+            struct.unpack("=f", struct.pack("=f", value))[0]
+            if dtype == torch.float32
+            else value
+        )
+        if value != 0.0 and encoded == 0.0:
+            raise ValueError(
+                f"parameter {variable_name!r} update underflows {dtype} storage"
+            )
+        return value
+    if dtype in {
+        torch.int8,
+        torch.uint8,
+        torch.int16,
+        torch.uint16,
+        torch.int32,
+        torch.uint32,
+        torch.int64,
+    }:
+        if type(value) is not int:
+            raise ValueError(
+                f"integer parameter {variable_name!r} update must be an "
+                "exact int or matching tensor"
+            )
+        limits = torch.iinfo(dtype)
+        if value < limits.min or value > limits.max:
+            raise ValueError(
+                f"parameter {variable_name!r} update is outside {dtype} range"
+            )
+        return value
+    raise ValueError(f"parameter {variable_name!r} has unsupported dtype {dtype}")
 
 
 class ParameterChange(HydroForgeModel):
@@ -86,7 +141,7 @@ class ParameterChange(HydroForgeModel):
     @field_validator("start")
     @classmethod
     def _validate_start(cls, value: datetime | cftime.datetime):
-        _require_date(value, label="parameter change start")
+        require_date(value, label="parameter change start")
         date_calendar(value)
         return value
 

@@ -16,12 +16,13 @@ import torch
 import torch.distributed as dist
 from pydantic import Field, PrivateAttr, model_validator
 
-from hydroforge.contracts.validation import HydroForgeModel
-from hydroforge.data.parallel import ParallelAxis
-from hydroforge.kernels.context import (
-    active_operator_recorder,
-    compiled_operator_entry,
-)
+from hydroforge.core.identity import digest63
+from hydroforge.core.validation import HydroForgeModel
+from hydroforge.execution.channel import ENSEMBLE_COLLECTIVE_FLAG
+from hydroforge.execution.context import ACTIVE_STEP
+from hydroforge.kernels.calls import compiled_operator_entry, recording_sink
+from hydroforge.parallel.launch import communication_backend
+from hydroforge.parallel.mesh import ParallelAxis
 
 Reduction = Literal["min", "max", "sum"]
 
@@ -41,22 +42,13 @@ _DTYPE_CODES = {
         start=1,
     )
 }
-# MPS has an ABI code so a Metal recorder can reject collectives with its
-# backend-specific compile error before any process group exists. XPU uses the
-# formal Torch path and communicates through XCCL when PyTorch provides it.
-_ABI_DEVICE_CODES = {"cpu": 1, "cuda": 2, "mps": 3, "xpu": 4}
-_COLLECTIVE_DEVICES = frozenset({"cpu", "cuda", "xpu"})
+# MPS physics communicates through Gloo using explicit CPU staging.
+_ABI_DEVICE_CODES = {"cpu": 1, "cuda": 2, "xpu": 3, "mps": 4}
 _REDUCTIONS = {
     "min": (0, dist.ReduceOp.MIN),
     "max": (1, dist.ReduceOp.MAX),
     "sum": (2, dist.ReduceOp.SUM),
 }
-
-# 63-bit FNV-1a parameters: the folded batch signature travels in one int64
-# slot of the managed-step vector, so it must stay non-negative.
-_FNV_OFFSET = 0xCBF29CE484222325
-_FNV_PRIME = 0x100000001B3
-_SIGNATURE_MASK = (1 << 63) - 1
 
 
 class _CollectiveRequest(HydroForgeModel):
@@ -122,8 +114,6 @@ def _tensor_abi(
         raise ValueError(
             f"{operation} does not support device {tensor.device.type!r}"
         ) from error
-    if tensor.device.type not in _COLLECTIVE_DEVICES:
-        raise ValueError(f"{operation} does not support device {tensor.device.type!r}")
     return dtype_code, tensor.numel(), device_code
 
 
@@ -138,16 +128,8 @@ def _batch_signature(
     each tensor's ABI in order, so any cross-rank difference is still rejected.
     """
 
-    digest = _FNV_OFFSET
-    for value in (
-        _REDUCTIONS[reduction][0],
-        -1 if destination is None else destination,
-        *(field for abi in abis for field in abi),
-    ):
-        digest = (
-            (digest ^ (value & 0xFFFFFFFFFFFFFFFF)) * _FNV_PRIME
-        ) & 0xFFFFFFFFFFFFFFFF
-    return len(abis), digest & _SIGNATURE_MASK, sum(abi[1] for abi in abis)
+    digest = digest63((_REDUCTIONS[reduction][0], destination, tuple(abis)))
+    return len(abis), digest, sum(abi[1] for abi in abis)
 
 
 def _validate_collective_environment(
@@ -169,18 +151,18 @@ def _validate_collective_environment(
             raise ValueError(f"{operation} destination is outside the process group")
     if tensor is None or group_size == 1:
         return
-    backend = str(dist.get_backend(**group_kwargs)).lower()
+    backend = communication_backend(dist.get_backend(**group_kwargs))
     required_device = {"nccl": "cuda", "xccl": "xpu"}
     for backend_name, device_type in required_device.items():
-        if backend_name in backend and tensor.device.type != device_type:
+        if backend_name == backend and tensor.device.type != device_type:
             raise ValueError(
                 f"{operation} with {backend_name.upper()} requires a "
                 f"{device_type.upper()} tensor"
             )
-    required_backend = {"cuda": "nccl", "xpu": "xccl"}.get(
+    required_backend = {"cuda": "nccl", "xpu": "xccl", "mps": "gloo"}.get(
         tensor.device.type,
     )
-    if required_backend is not None and required_backend not in backend:
+    if required_backend is not None and required_backend != backend:
         raise ValueError(
             f"{operation} of a {tensor.device.type.upper()} tensor requires "
             f"the {required_backend.upper()} process-group backend, got "
@@ -206,7 +188,7 @@ def _coalescing_group(device: torch.device, group=None):
     if manager is None or device.type != "cuda":
         return nullcontext()
     group_kwargs = {} if group is None else {"group": group}
-    if "nccl" not in str(dist.get_backend(**group_kwargs)).lower():
+    if communication_backend(dist.get_backend(**group_kwargs)) != "nccl":
         return nullcontext()
     return manager(device=device, async_ops=False, **group_kwargs)
 
@@ -222,22 +204,14 @@ def _run_validated_batch(
 ) -> None:
     """Synchronize once and launch one already validated batch."""
 
-    from hydroforge.execution.step import _managed_step_active
-
-    if not _managed_step_active():
+    step = ACTIVE_STEP.get()
+    if step is None:
         raise RuntimeError(
             "HydroForge collectives may be called only inside a managed step "
             "or an operator recorder"
         )
     _code, op = _REDUCTIONS[reduction]
-
-    from hydroforge.execution.step import (
-        _ENSEMBLE_COLLECTIVE_FLAG,
-        _collective_mesh,
-        synchronize_collective,
-    )
-
-    mesh = _collective_mesh()
+    mesh = step.mesh
     if mesh is None and scope == "ensemble":
         raise ValueError("ensemble collectives require an EnsembleParallel mesh")
     group = None if mesh is None else mesh.group(scope)
@@ -257,9 +231,9 @@ def _run_validated_batch(
     )
     # The handshake runs even for an empty batch: a rank that contributes no
     # tensors must still be seen to disagree with one that does.
-    synchronize_collective(
+    step.channel.event(
         _event_kind(operation, reduction, destination)
-        | (_ENSEMBLE_COLLECTIVE_FLAG if scope == "ensemble" else 0),
+        | (ENSEMBLE_COLLECTIVE_FLAG if scope == "ensemble" else 0),
         _batch_signature(abis, reduction, destination),
     )
     if not tensors or group_size == 1:
@@ -273,14 +247,20 @@ def _run_validated_batch(
     group_kwargs = {} if group is None else {"group": group}
     with _coalescing_group(tensors[0].device, **group_kwargs):
         for tensor in tensors:
+            # cpu() decodes emulated storage; never reduce its integer carrier.
+            staging = tensor.cpu() if tensor.device.type == "mps" else tensor
             if destination is None:
-                dist.all_reduce(tensor, op=op, **group_kwargs)
+                dist.all_reduce(staging, op=op, **group_kwargs)
             else:
-                dist.reduce(tensor, dst=global_destination, op=op, **group_kwargs)
+                dist.reduce(staging, dst=global_destination, op=op, **group_kwargs)
+            if staging is not tensor and (
+                destination is None or dist.get_rank() == global_destination
+            ):
+                tensor.copy_(staging)
 
 
 def _submit_collective(request: _CollectiveRequest) -> None:
-    recorder = active_operator_recorder()
+    recorder = recording_sink()
     if recorder is not None:
         recorder.record_collective_batch(
             request.tensors,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from collections.abc import Mapping
 from copy import deepcopy
@@ -12,7 +13,7 @@ from typing import Any, Self
 from pydantic import ConfigDict, Field, PrivateAttr, create_model, model_validator
 from pydantic.fields import FieldInfo
 
-from hydroforge.contracts.validation import HydroForgeModel
+from hydroforge.core.validation import HydroForgeModel
 
 _OPTIONS_METADATA = "hydroforge_options"
 
@@ -191,6 +192,7 @@ class OptionsConfig(HydroForgeModel):
                     f"option field {name!r} has unsupported choice {token!r}; "
                     f"expected one of {sorted(choices)}"
                 )
+        self.specialization_key()
         return self
 
     @staticmethod
@@ -254,7 +256,9 @@ class OptionsConfig(HydroForgeModel):
         for path, value, metadata in self._visit():
             role = "value" if metadata is None else str(metadata["role"])
             resolved = value.value if isinstance(value, Enum) else value
-            if not isinstance(resolved, (str, int, float, bool, type(None))):
+            if type(resolved) not in {str, int, float, bool, type(None)} or (
+                type(resolved) is float and not math.isfinite(resolved)
+            ):
                 raise TypeError(
                     f"option value {path!r} must be a JSON scalar, got "
                     f"{type(resolved).__name__}"

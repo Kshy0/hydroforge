@@ -1,1 +1,1 @@
-"""Cold-path compilation of declarative model field namespaces."""
+"""Pure compilation of model declarations into frozen plans."""

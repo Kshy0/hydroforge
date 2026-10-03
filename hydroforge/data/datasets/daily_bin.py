@@ -7,30 +7,36 @@
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import ClassVar, Literal, Self
+from typing import Annotated
 
 import cftime
 import numpy as np
-from pydantic import Field, PrivateAttr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator
 
-from hydroforge.contracts.temporal import (
+from hydroforge.core.arrays import immutable_array
+from hydroforge.core.time import (
     DateLike,
-    _timedelta_quotient_trusted,
+    require_calendar,
+    require_date,
+    timedelta_quotient,
 )
-from hydroforge.contracts.validation import _immutable_dict
-from hydroforge.data.datasets.base import (
-    _trusted_source_chunk_payload,
-    _TrustedSourceChunk,
-    positive_finite_real,
+from hydroforge.core.validation import FrozenMapping
+from hydroforge.data.datasets.base import ForcingDataset, SourceDirectory
+from hydroforge.data.datasets.keys import daily_time_to_key, single_file_key
+from hydroforge.data.datasets.plan import DatasetPlan, TemporalDomain
+from hydroforge.data.datasets.space import GridSpace
+from hydroforge.data.datasets.storage import SOURCE_FILE_LABEL, UnitFactor
+from hydroforge.data.datasets.timeline import StorageLayout
+from hydroforge.data.datasets.values import MissingPolicy, convert
+from hydroforge.io.files import SourceFiles
+
+FileStartDate = (
+    DateLike | FrozenMapping[Annotated[str, Field(min_length=1)], DateLike] | Callable
 )
-from hydroforge.data.datasets.chunking import SourceChunk
-from hydroforge.data.datasets.gridded import GriddedDataset
-from hydroforge.data.netcdf import daily_time_to_key, single_file_key
-
-FileStartDate = DateLike | Mapping[str, DateLike] | Callable[[str], DateLike]
+_FrameRun = tuple[str, int, int]
 
 
-class DailyBinDataset(GriddedDataset):
+class DailyBinDataset(ForcingDataset):
     """
     Dataset class that reads daily binary files.
 
@@ -41,160 +47,118 @@ class DailyBinDataset(GriddedDataset):
     * **One file per day** (default): ``time_to_key = daily_time_to_key``
       → every date gets a unique key, each file has one frame.
     * **Grouped/single file**: provide ``file_start_date`` (or a key→date
-    mapping/callback) to identify frame zero in each file.  Requested dates
-    are mapped to their absolute offset from that origin; they are never
-    renumbered from zero merely because a run requests a subset of dates.
+      mapping/callback) to identify frame zero in each file.  Requested dates
+      are mapped to their absolute offset from that origin; they are never
+      renumbered from zero merely because a run requests a subset of dates.
+
+    Consecutive frames of one file are read by a single ``np.fromfile``; a
+    mapped view keeps only its source cells before any value check, so cells
+    outside it (for example ocean NaN) never affect the result.  Missing (NaN)
+    values become zero unless ``missing="error"``.
     """
 
-    reusable_expression_reads: ClassVar[bool] = True
-
-    base_dir: Path = Field(strict=False)
-    shape: tuple[int, int]
+    base_dir: SourceDirectory
+    shape: tuple[Annotated[int, Field(ge=1)], Annotated[int, Field(ge=1)]]
     prefix: str
-    unit_factor: float = 1.0
+    unit_factor: UnitFactor = 1.0
     bin_dtype: str = "float32"
     suffix: str = ".one"
-    out_dtype: Literal["float32", "float64"] = "float32"
     lat_south_to_north: bool = False
     lon_0_to_360: bool = False
-    time_to_key: Callable[[DateLike], str] | None = daily_time_to_key
+    time_to_key: Callable[[DateLike], str] = daily_time_to_key
     file_start_date: FileStartDate | None = None
+    missing: MissingPolicy = "zero"
 
-    _storage_dtype: np.dtype = PrivateAttr()
-    _key_cache: dict[DateLike, str] = PrivateAttr(default_factory=dict)
-    _daily_layout: bool = PrivateAttr(default=False)
-    _dt_to_loc: dict[DateLike, tuple[str, int]] = PrivateAttr(
-        default_factory=dict,
-    )
-
-    @field_validator("shape")
-    @classmethod
-    def _validate_shape(cls, shape: tuple[int, int]) -> tuple[int, int]:
-        if any(type(extent) is not int or extent < 1 for extent in shape):
-            raise ValueError("shape values must be exact positive ints")
-        return shape
-
-    @field_validator("unit_factor")
-    @classmethod
-    def _validate_unit_factor(cls, value: float) -> float:
-        return positive_finite_real(value, label="unit_factor")
+    _files: SourceFiles = PrivateAttr()
+    _layout: StorageLayout = PrivateAttr()
+    _runs: tuple[tuple[_FrameRun, ...], ...] = PrivateAttr()
+    _space: GridSpace = PrivateAttr()
 
     @field_validator("time_to_key", mode="before")
     @classmethod
-    def _normalize_time_to_key(cls, value):
+    def _single_file_default(cls, value: Callable | None) -> Callable:
         return single_file_key if value is None else value
 
     @field_validator("bin_dtype")
     @classmethod
     def _validate_bin_dtype(cls, value: str) -> str:
-        storage_dtype = np.dtype(value)
-        if storage_dtype.kind not in {"i", "u", "f"}:
+        if np.dtype(value).kind not in {"i", "u", "f"}:
             raise ValueError("bin_dtype must describe a real numeric dtype")
         return value
 
-    @model_validator(mode="after")
-    def _validate_binary_layout(self) -> Self:
+    def _compile_plan(self, domain: TemporalDomain) -> DatasetPlan:
         if self.time_interval != timedelta(days=1):
             raise ValueError("DailyBinDataset time_interval must be one day")
-        configured = self.file_start_date
-        if isinstance(configured, Mapping):
-            invalid = {
-                key: type(value).__name__
-                for key, value in configured.items()
-                if (
-                    type(key) is not str
-                    or not key
-                    or not isinstance(value, (datetime, cftime.datetime))
-                )
-            }
-            if invalid:
-                raise ValueError(
-                    "file_start_date mappings require non-empty exact string "
-                    f"keys and datetime values: {invalid}"
-                )
-            object.__setattr__(
-                self,
-                "file_start_date",
-                _immutable_dict(configured),
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _inspect_binary_storage(self):
-        self._storage_dtype = np.dtype(self.bin_dtype)
-        self._validate_local_index_extent(
-            self.shape[0] * self.shape[1],
-            label="binary grid",
+        plan = self._planned(domain, self.chunk_len)
+        layout = StorageLayout(
+            base_dir=Path(self.base_dir),
+            prefix=self.prefix,
+            suffix=self.suffix,
+            time_to_key=self.time_to_key,
         )
-        self._build_file_mapping()
-        self._inspect_required_files()
-        return self
-
-    def _build_file_mapping(self):
-        """Map each simulation date to ``(file_key, absolute frame index)``."""
-        dates = {
-            timestamp
-            for chunk in self.chunk_plan
-            for timestamp in chunk._source_times()
-        }
-
-        by_key: dict[str, list] = {}
-        for dt in dates:
-            by_key.setdefault(self._storage_key(dt), []).append(dt)
-        daily_layout = all(
-            len(key_dates) == 1 and key == daily_time_to_key(key_dates[0])
-            for key, key_dates in by_key.items()
+        locations, daily = self._frame_locations(plan, layout)
+        self._files = self._inspect_frames(locations, layout, daily=daily)
+        self._layout = layout
+        self._runs = tuple(
+            self._frame_runs(chunk.source_times(), locations)
+            for chunk in plan.chunk_plan
         )
-        self._daily_layout = daily_layout
+        self._space = self._grid()
+        return plan
+
+    def _frame_locations(
+        self, plan: DatasetPlan, layout: StorageLayout
+    ) -> tuple[dict[DateLike, tuple[str, int]], bool]:
+        """Map each simulated date to ``(file key, absolute frame index)``.
+
+        Also returns whether the files follow the one-file-per-day layout.
+        """
+
+        key = layout.keys()
+        by_key: dict[str, list[DateLike]] = {}
+        for time in dict.fromkeys(
+            time for chunk in plan.chunk_plan for time in chunk.source_times()
+        ):
+            by_key.setdefault(key(time), []).append(time)
+        daily = all(
+            len(times) == 1 and name == daily_time_to_key(times[0])
+            for name, times in by_key.items()
+        )
         # Only the canonical one-file-per-day layout has an implicit frame
         # zero. Any grouped/custom layout (including a one-date subset of a
         # constant file) needs an explicit origin.
-        if daily_layout and self.file_start_date is not None:
+        if daily and self.file_start_date is not None:
             raise ValueError(
                 "file_start_date must be None for one-file-per-day binary layouts"
             )
-        if not daily_layout and self.file_start_date is None:
+        if not daily and self.file_start_date is None:
             raise ValueError(
                 "file_start_date is required for grouped or custom binary file layouts"
             )
-
         locations: dict[DateLike, tuple[str, int]] = {}
-        for key, key_dates in by_key.items():
-            ordered = sorted(key_dates)
-            if daily_layout:
-                for dt in ordered:
-                    locations[dt] = (key, 0)
+        for name, times in by_key.items():
+            if daily:
+                locations[times[0]] = (name, 0)
                 continue
-            origin = self._file_origin(key)
-            for dt in ordered:
-                frame_idx = _timedelta_quotient_trusted(
-                    dt - origin,
+            origin = self._file_origin(name, plan.domain)
+            for time in sorted(times):
+                frame = timedelta_quotient(
+                    time - origin,
                     self.time_interval,
-                    duration_label=(f"file frame offset for key {key!r}"),
+                    duration_label=f"file frame offset for key {name!r}",
                     interval_label="daily binary time_interval",
                 )
-                if frame_idx < 0:
+                if frame < 0:
                     raise ValueError(
-                        f"date {dt!s} precedes file_start_date {origin!s} "
-                        f"for binary file key {key!r}"
+                        f"date {time!s} precedes file_start_date {origin!s} "
+                        f"for binary file key {name!r}"
                     )
-                locations[dt] = (key, frame_idx)
-        self._dt_to_loc = locations
+                locations[time] = (name, frame)
+        return locations, daily
 
-    def _storage_key(self, timestamp: DateLike) -> str:
-        key = self.time_to_key(timestamp)
-        if type(key) is not str:
-            raise ValueError("DailyBinDataset time_to_key must return an exact string")
-        previous = self._key_cache.setdefault(timestamp, key)
-        if previous != key:
-            raise ValueError(
-                "DailyBinDataset time_to_key must be deterministic; "
-                f"{timestamp} mapped to both {previous!r} and {key!r}"
-            )
-        return key
-
-    def _file_origin(self, key: str) -> DateLike:
+    def _file_origin(self, key: str, domain: TemporalDomain) -> DateLike:
         """Resolve and validate the explicit origin for one storage key."""
+
         configured = self.file_start_date
         if isinstance(configured, Mapping):
             try:
@@ -211,22 +175,33 @@ class DailyBinDataset(GriddedDataset):
             raise ValueError(
                 "file_start_date values must be datetime or cftime datetime"
             )
-        return self._require_calendar_datetime(
-            origin,
-            label=f"file_start_date for key {key!r}",
-        )
+        label = f"file_start_date for key {key!r}"
+        require_date(origin, label=label)
+        require_calendar(origin, domain.calendar, label=label)
+        if type(origin) is not type(domain.start):
+            raise ValueError(
+                f"{label} must use the same datetime representation as "
+                "dataset start_date"
+            )
+        return origin
 
-    def _inspect_required_files(self):
-        """Validate that all required files exist and match expected size."""
-        required_frames: dict[Path, int] = {}
-        for key, frame_idx in self._dt_to_loc.values():
-            path = Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}"
-            required_frames[path] = max(required_frames.get(path, 0), frame_idx + 1)
-        # Validate file sizes are consistent with shape
-        ny, nx = self.shape
-        frame_bytes = ny * nx * self._storage_dtype.itemsize
-        for path, minimum_frames in required_frames.items():
-            with self._inspect_source_file(path):
+    def _inspect_frames(
+        self,
+        locations: Mapping[DateLike, tuple[str, int]],
+        layout: StorageLayout,
+        *,
+        daily: bool,
+    ) -> SourceFiles:
+        """Validate that every required file exists and holds its frames."""
+
+        required: dict[Path, int] = {}
+        for key, frame in locations.values():
+            path = layout.path(key)
+            required[path] = max(required.get(path, 0), frame + 1)
+        frame_bytes = self.shape[0] * self.shape[1] * np.dtype(self.bin_dtype).itemsize
+        inspection = SourceFiles.inspect(label=SOURCE_FILE_LABEL)
+        for path, minimum_frames in required.items():
+            with inspection.open(path):
                 file_bytes = path.stat().st_size
                 if file_bytes % frame_bytes != 0:
                     raise ValueError(
@@ -236,37 +211,47 @@ class DailyBinDataset(GriddedDataset):
                         f"(got {file_bytes / frame_bytes:.4f} frames). "
                         f"Check the 'shape' parameter."
                     )
-                observed_frames = file_bytes // frame_bytes
-                if self._daily_layout and observed_frames != 1:
+                frames = file_bytes // frame_bytes
+                if daily and frames != 1:
                     raise ValueError(
                         f"Daily binary file {path} must contain exactly one frame; "
-                        f"found {observed_frames}"
+                        f"found {frames}"
                     )
-                if observed_frames < minimum_frames:
+                if frames < minimum_frames:
                     raise ValueError(
-                        f"Binary file {path} contains {observed_frames} frames, "
+                        f"Binary file {path} contains {frames} frames, "
                         f"but the requested absolute frame offsets require "
                         f"at least {minimum_frames} frames"
                     )
-        self._record_source_files(required_frames)
+        return inspection.files()
 
-    def get_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return (lon, lat) coordinate arrays.
+    @staticmethod
+    def _frame_runs(
+        times: tuple[DateLike, ...],
+        locations: Mapping[DateLike, tuple[str, int]],
+    ) -> tuple[_FrameRun, ...]:
+        """Group consecutive frames of one file into ``(key, first, count)`` runs."""
 
-        Note: shape is (ny, nx) = (lat, lon), so shape[0] is lat size, shape[1] is lon size.
-        Coordinates are cell centers, computed from shape assuming global coverage.
+        runs: list[_FrameRun] = []
+        for time in times:
+            key, frame = locations[time]
+            if runs and runs[-1][0] == key and runs[-1][1] + runs[-1][2] == frame:
+                runs[-1] = (key, runs[-1][1], runs[-1][2] + 1)
+            else:
+                runs.append((key, frame, 1))
+        return tuple(runs)
 
-        If lat_south_to_north is True, latitude goes from -90 to 90 (south to north).
-        Otherwise, latitude goes from 90 to -90 (north to south, default).
+    def _grid(self) -> GridSpace:
+        """Cell centres of a global grid in the declared axis orientation.
 
-        If lon_0_to_360 is True, longitude goes from 0 to 360 (e.g. ERA5-Land binary).
-        Otherwise, longitude goes from -180 to 180 (default).
+        ``shape`` is ``(ny, nx)``: latitude runs 90→-90 (or -90→90 when
+        ``lat_south_to_north``), longitude -180→180 (or 0→360 when
+        ``lon_0_to_360``).
         """
+
         ny, nx = self.shape
-        # Resolution in degrees
         res_lat = 180.0 / ny
         res_lon = 360.0 / nx
-        # Cell centers
         if self.lat_south_to_north:
             lat = np.linspace(-90 + res_lat / 2, 90 - res_lat / 2, ny)
         else:
@@ -275,85 +260,55 @@ class DailyBinDataset(GriddedDataset):
             lon = np.linspace(res_lon / 2, 360 - res_lon / 2, nx)
         else:
             lon = np.linspace(-180 + res_lon / 2, 180 - res_lon / 2, nx)
-        return lon, lat
+        return GridSpace(longitude=immutable_array(lon), latitude=immutable_array(lat))
 
-    def _read_chunk(self, chunk: SourceChunk) -> _TrustedSourceChunk:
-        """Read the chunk's daily frames from binary storage.
+    @property
+    def space(self) -> GridSpace:
+        return self._space
 
-        Returns:
-        - If local_indices is set: (T, N) compressed array
-        - If local_indices is None: (T, Y, X) full grid array
+    def read_storage(self, chunk) -> np.ndarray:
+        """Read ``(T, Y, X)`` frames, or ``(T, N)`` for a mapped view."""
 
-        Spatial convention: (Y, X) = (lat, lon), C-order flatten (lon varies fastest)
+        data = self._read_frames(self._runs[chunk.index], self._space.selection)
+        if self._space.selection is None:
+            return data.reshape(chunk.length, *self.shape)
+        return data
 
-        The spatial selection is applied before any validation or conversion,
-        so cells outside it (for example ocean NaN) never affect the result.
-        Missing (NaN) values inside the selection are zero-filled like
-        ``NetCDFDataset``; infinite values are rejected.
-        """
-        data = self._read_frames(chunk._source_times(), selected=True)
-        if self.local_indices is None:
-            data = data.reshape(chunk.length, *self.shape)
-        if data.dtype.kind == "f":
-            missing = np.isnan(data)
-            if np.any(missing):
-                data[missing] = 0
-        data = _trusted_source_chunk_payload(
-            data,
-            expected_rows=chunk.length,
-            clip_negative=self.clip_negative,
-        )
-        if self.unit_factor == 1.0 and self._direct_output_cast_is_exact(data):
-            return _TrustedSourceChunk(
-                self._finalize_output_data(data, label="daily binary dataset output")
-            )
-        data = self._canonical_calculation_data(
-            data,
-            label="daily binary dataset input",
-        )
-        np.divide(data, self.unit_factor, out=data)
-        return _TrustedSourceChunk(
-            self._finalize_output_data(
-                data,
-                label="daily binary dataset output",
-            )
-        )
-
-    def _read_frames(self, timestamps, *, selected: bool) -> np.ndarray:
-        """Read frames as one owned ``(T, Y*X)`` or selected ``(T, N)`` block.
-
-        Consecutive frames of one file are read by a single ``np.fromfile``.
-        """
-        runs: list[tuple[str, int, int]] = []
-        for timestamp in timestamps:
-            key, frame_idx = self._dt_to_loc[timestamp]
-            if runs and runs[-1][0] == key and runs[-1][1] + runs[-1][2] == frame_idx:
-                runs[-1] = (key, runs[-1][1], runs[-1][2] + 1)
-            else:
-                runs.append((key, frame_idx, 1))
-        ny, nx = self.shape
-        frame_size = ny * nx
-        element_size = self._storage_dtype.itemsize
-        indices = self.local_indices if selected else None
+    def _read_frames(
+        self, runs: tuple[_FrameRun, ...], selection: np.ndarray | None
+    ) -> np.ndarray:
+        frame_size = self.shape[0] * self.shape[1]
+        storage_dtype = np.dtype(self.bin_dtype)
         blocks = []
         for key, first_frame, count in runs:
-            file_path = self._checked_source_path(
-                Path(self.base_dir) / f"{self.prefix}{key}{self.suffix}",
-            )
+            path = self._files.checked(self._layout.path(key))
             data = np.fromfile(
-                file_path,
-                dtype=self._storage_dtype,
+                path,
+                dtype=storage_dtype,
                 count=count * frame_size,
-                offset=first_frame * frame_size * element_size,
+                offset=first_frame * frame_size * storage_dtype.itemsize,
             )
-            self._verify_source_path(file_path)
+            self._files.verify(path)
             data = data.reshape(count, frame_size)
-            blocks.append(data if indices is None else data[:, indices])
+            blocks.append(data if selection is None else data[:, selection])
         return blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=0)
 
-    def _get_first_frame_nan_mask(self) -> np.ndarray | None:
-        data = self._read_frames((self.start_date,), selected=False)
+    def _convert(self, values: np.ndarray) -> np.ndarray:
+        return convert(
+            values,
+            out_dtype=self.out_dtype,
+            unit_factor=self.unit_factor,
+            label="daily binary dataset",
+        )
+
+    def _first_frame_missing(self) -> np.ndarray:
+        """``(Y, X)`` NaN mask of the frame at ``start_date``."""
+
+        key, frame, _count = self._runs[self.chunk_plan.num_spinup_chunks][0]
+        data = self._read_frames(((key, frame, 1),), None)
         return np.isnan(data.reshape(self.shape))
 
-    def close(self):
-        pass
+    def close(self) -> None:
+        """Close this process's file handles (binary reads keep none)."""
+
+        self._files.close()
