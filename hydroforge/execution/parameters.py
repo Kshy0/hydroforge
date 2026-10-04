@@ -23,8 +23,10 @@ import cftime
 import numpy as np
 import torch
 
+from hydroforge.compiler.parameters import validate_set_targets
 from hydroforge.contracts.fields import concrete_tensor_dtype
 from hydroforge.contracts.parameters import ParameterValue, validate_parameter_scalar
+from hydroforge.core.devices import devices_match
 from hydroforge.core.errors import ResourceCleanupError
 from hydroforge.declare.module import AbstractModule
 from hydroforge.declare.tensors import ModulePayload, ModuleTensors
@@ -106,7 +108,6 @@ class _ParameterChangePlan:
 class _TargetIdLookup:
     """Validated global-to-local lookup shared by changes on one ID field."""
 
-    id_values: np.ndarray
     order: np.ndarray
     sorted_ids: np.ndarray
     local_by_global: np.ndarray
@@ -137,10 +138,9 @@ class LocalParameterCompiler:
     def compile(
         self, targets: tuple[ParameterTarget, ...]
     ) -> tuple[_ParameterChangePlan, ...]:
-        return tuple(
-            self._compile_change(target)
-            for target in sorted(targets, key=lambda target: target.start)
-        )
+        plans = tuple(self._compile_change(target) for target in targets)
+        validate_set_targets((item.target, None, item.local_indices) for item in plans)
+        return plans
 
     def _parameter_shape(self, field: FieldEntry) -> tuple[int, ...]:
         view = self.payloads[field.module]
@@ -276,16 +276,16 @@ class LocalParameterCompiler:
                 f"length {local_shape[index_axis]}"
             )
         target_ids = target.target_ids
-        limits = np.iinfo(lookup.id_values.dtype)
+        limits = np.iinfo(lookup.sorted_ids.dtype)
         outside = [
             value for value in target_ids if not limits.min <= value <= limits.max
         ]
         if outside:
             raise ValueError(
                 f"target_ids for {change.variable!r} are outside the "
-                f"{lookup.id_values.dtype} range of {id_name!r}: {outside[:10]}"
+                f"{lookup.sorted_ids.dtype} range of {id_name!r}: {outside[:10]}"
             )
-        target_array = np.asarray(target_ids, dtype=lookup.id_values.dtype)
+        target_array = np.asarray(target_ids, dtype=lookup.sorted_ids.dtype)
         global_indices = lookup.global_indices(target_array)
         missing = global_indices < 0
         if np.any(missing):
@@ -329,22 +329,21 @@ class LocalParameterCompiler:
             raise ValueError(
                 f"parameter target ID field {id_name!r} contains duplicate IDs"
             )
-        id_values = sorted_ids
+        local_by_global = np.full(sorted_ids.size, -1, dtype=np.int64)
         lookup = _TargetIdLookup(
-            id_values=id_values,
             order=order,
             sorted_ids=sorted_ids,
-            local_by_global=np.empty(0, dtype=np.int64),
-            local_extent=0,
+            local_by_global=local_by_global,
+            local_extent=local_id_tensor.numel(),
         )
 
         if local_rows is None:
-            local_rows = np.arange(id_values.size, dtype=np.int64)
+            local_rows = np.arange(sorted_ids.size, dtype=np.int64)
         local_id_values = local_id_tensor.detach().cpu().numpy()
         prepared_global_indices = lookup.global_indices(
-            local_id_values.astype(id_values.dtype, copy=False)
+            local_id_values.astype(sorted_ids.dtype, copy=False)
         )
-        owned = np.zeros(id_values.size, dtype=bool)
+        owned = np.zeros(sorted_ids.size, dtype=bool)
         owned[local_rows] = True
         if np.any(prepared_global_indices < 0) or not np.all(
             owned[prepared_global_indices]
@@ -353,7 +352,6 @@ class LocalParameterCompiler:
                 f"prepared parameter target ID field {id_name!r} contains IDs "
                 "outside its rank-local input partition"
             )
-        local_by_global = np.full(id_values.size, -1, dtype=np.int64)
         local_by_global[prepared_global_indices] = np.arange(
             prepared_global_indices.size,
             dtype=np.int64,
@@ -363,13 +361,7 @@ class LocalParameterCompiler:
             raise ValueError(
                 f"prepared parameter target ID field {id_name!r} contains duplicate IDs"
             )
-        return _TargetIdLookup(
-            id_values=id_values,
-            order=order,
-            sorted_ids=sorted_ids,
-            local_by_global=local_by_global,
-            local_extent=int(prepared_global_indices.size),
-        )
+        return lookup
 
     @staticmethod
     def _validate_update_value(
@@ -406,15 +398,7 @@ class LocalParameterCompiler:
                     f"parameter {variable_name!r} update tensor must use "
                     f"dtype {expected_dtype}; got {value.dtype}"
                 )
-            device_matches = bool(
-                value.device.type == expected_device.type
-                and (
-                    value.device.index is None
-                    or expected_device.index is None
-                    or value.device.index == expected_device.index
-                )
-            )
-            if not device_matches:
+            if not devices_match(value.device, expected_device):
                 raise ValueError(
                     f"parameter {variable_name!r} update tensor must be on "
                     f"device {expected_device}; got {value.device}"
@@ -584,6 +568,12 @@ class ParameterPlanRuntime:
             )
         if not updated:
             return None
+        rebound = (updated.get(identity, item) for identity, item in items.items())
+        validate_set_targets(
+            (item.target, None, None if item.indices is None else item.indices.tolist())
+            for item in rebound
+            if item.is_set_value
+        )
         return (
             tuple(updated.get(id(item), item) for item in self._plans),
             [

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from functools import partial
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -76,14 +77,7 @@ class TorchOperator:
     keywords: Any
     outputs: Any
     writes: tuple[torch.Tensor, ...]
-    _output_reference_ids: frozenset[int] = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self._output_reference_ids = frozenset(
-            id(reference)
-            for reference in _refs(self.outputs)
-            if isinstance(reference, _ValueRef)
-        )
+    functional: Any = None
 
     @staticmethod
     def _static(value: Any) -> Any:
@@ -105,27 +99,35 @@ class TorchOperator:
             outputs,
         )
 
-    def launch(self, values: dict[int, torch.Tensor]) -> None:
+    def launch(
+        self, values: dict[int, torch.Tensor], *, differentiable: bool = False
+    ) -> None:
         def resolve(value: Any) -> Any:
             if isinstance(value, _StableRef):
                 return value.tensor
             if isinstance(value, _ValueRef):
-                # The current node's out= buffer is address-stable storage,
-                # not a dependency. Every other value reference must have
-                # been produced earlier in this exact replay by construction.
-                if id(value) in self._output_reference_ids:
-                    return value.tensor
-                return values[value.index]
+                # Only a new producer's out= buffer is absent. Mutations of
+                # an earlier local result must use that replay's live value.
+                return values.get(value.index, value.tensor)
             return value
 
-        self.function(
+        functional = differentiable and self.functional is not None
+        function = self.functional if functional else self.function
+        keywords = (
+            {name: value for name, value in self.keywords.items() if name != "out"}
+            if functional
+            else self.keywords
+        )
+        result = function(
             *_map(self.arguments, resolve),
-            **_map(self.keywords, resolve),
+            **_map(keywords, resolve),
         )
 
+        # The recorder accepts only a single tensor result, including
+        # mutations; multi-output operators and views have no lowering.
         for reference in _refs(self.outputs):
             if isinstance(reference, _ValueRef):
-                values[reference.index] = reference.tensor
+                values[reference.index] = result
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +140,8 @@ class CompiledKernelCall(MetalCommandNode):
     entry: Any = None
     arguments: Any = None
     buffer_dtypes: Any = None
+    call: Any = None
+    temporaries: tuple[tuple[str, int], ...] = ()
 
     def record(self) -> None:
         """Record the specialized native launch through its dispatcher."""
@@ -165,10 +169,17 @@ class CollectiveOperator:
     writes: tuple[torch.Tensor, ...]
     cuda_graph_capture_safe: bool = False
     scope: str = "spatial"
+    temporaries: tuple[tuple[int, int], ...] = ()
 
-    def launch(self) -> None:
+    def launch(self, values: dict[int, torch.Tensor] | None = None) -> None:
+        tensors = self.tensors
+        if values is not None and self.temporaries:
+            current = list(tensors)
+            for position, index in self.temporaries:
+                current[position] = values[index]
+            tensors = tuple(current)
         launch_recorded_collective_batch(
-            self.tensors,
+            tensors,
             self.abis,
             operation=self.operation,
             reduction=self.reduction,
@@ -194,14 +205,59 @@ class PredicateLoopOperator:
         self.loop.close()
 
 
-def launch_operators(operators: tuple[Any, ...], values: dict[int, Any]) -> None:
+def launch_operators(
+    operators: tuple[Any, ...],
+    values: dict[int, Any],
+    *,
+    differentiable: bool = False,
+) -> None:
     """Launch operators in order; ``values`` carries their local results."""
 
     for operator in operators:
         if isinstance(operator, TorchOperator):
+            operator.launch(values, differentiable=differentiable)
+        elif (
+            differentiable
+            and isinstance(operator, CompiledKernelCall)
+            and operator.temporaries
+        ):
+            # Functional ATen results own fresh autograd storage. Rebind only
+            # their addresses in the already validated native call; static
+            # signatures, layouts and backend selection do not change.
+            arguments = dict(operator.arguments)
+            for name, index in operator.temporaries:
+                arguments[name] = values[index]
+            replace(operator.call, arguments=MappingProxyType(arguments)).compile()()
+        elif differentiable and isinstance(operator, CollectiveOperator):
             operator.launch(values)
         else:
             operator.launch()
+
+
+def rollback_tensors(operators: Iterable[Any]) -> tuple[torch.Tensor, ...]:
+    """State a captured run must restore after warmup.
+
+    A functional ATen producer allocates private storage and overwrites all
+    of it before its consumers. Its old contents are never observable. A
+    temporary produced outside this run is still preserved, so segmented
+    captures cannot change the inputs supplied by an earlier segment.
+    """
+    operators = tuple(operators)
+    private = {
+        id(reference.tensor)
+        for operator in operators
+        if isinstance(operator, TorchOperator) and operator.functional is not None
+        for reference in _refs(operator.outputs)
+        if isinstance(reference, _ValueRef)
+    }
+    return tuple(
+        dict.fromkeys(
+            tensor
+            for operator in operators
+            for tensor in operator.writes
+            if id(tensor) not in private
+        )
+    )
 
 
 def _fingerprint(value: Any, aliases: dict[int, Any]) -> Any:
@@ -233,14 +289,16 @@ def _fingerprint(value: Any, aliases: dict[int, Any]) -> Any:
 class OperatorProgram:
     """One ordered, fully bound substep operator list."""
 
-    def __init__(self, operators: list[Any]) -> None:
+    def __init__(self, operators: list[Any], *, eager: bool = False) -> None:
         self.operators = tuple(operators)
+        self.eager = eager
         self._validate_temporary_uses()
         self.mutated_tensors = tuple(
             dict.fromkeys(
                 tensor for operator in self.operators for tensor in operator.writes
             )
         )
+        self.rollback_tensors = rollback_tensors(self.operators)
         tensors: list[torch.Tensor] = []
         for operator in self.operators:
             tensors.extend(getattr(operator, "reads", ()))
@@ -374,20 +432,28 @@ class OperatorProgram:
         launches = iter(
             compile_calls([operator.call for operator in deferred], pending)
         )
-        compiled = {
-            id(operator): CompiledKernelCall(
-                next(launches),
-                operator.reads,
-                operator.writes,
-                operator.entry,
-                dict(operator.call.arguments),
-                operator.call.buffer_dtypes,
-            )
-            for operator in deferred
-        }
         for program in programs:
+            indices = {
+                id(tensor): index for index, tensor in program._output_values.items()
+            }
             program.operators = tuple(
-                compiled.get(id(operator), operator) for operator in program.operators
+                CompiledKernelCall(
+                    next(launches),
+                    operator.reads,
+                    operator.writes,
+                    operator.entry,
+                    operator.call.arguments,
+                    operator.call.buffer_dtypes,
+                    operator.call,
+                    temporaries=tuple(
+                        (name, indices[id(value)])
+                        for name, value in operator.call.arguments.items()
+                        if isinstance(value, torch.Tensor) and id(value) in indices
+                    ),
+                )
+                if isinstance(operator, DeferredKernelCall)
+                else operator
+                for operator in program.operators
             )
 
     def _validate_temporary_uses(self) -> None:
@@ -447,7 +513,18 @@ class OperatorProgram:
         }
 
     def launch(self) -> None:
-        launch_operators(self.operators, {})
+        if (
+            self.eager
+            and torch.is_grad_enabled()
+            and any(tensor.requires_grad for tensor in self.referenced_tensors)
+        ):
+            # Model buffers keep stable addresses across substeps and forcing
+            # updates. Autograd must save the values at use time, not aliases
+            # of buffers a later substep or managed call will overwrite.
+            with torch.autograd.graph.saved_tensors_hooks(torch.clone, lambda x: x):
+                launch_operators(self.operators, {}, differentiable=True)
+        else:
+            launch_operators(self.operators, {})
 
     def close(self, executor: Any) -> None:
         operators, self.operators = self.operators, ()
@@ -464,6 +541,7 @@ class OperatorProgram:
         finally:
             self._output_values.clear()
             self.mutated_tensors = ()
+            self.rollback_tensors = ()
             self.referenced_tensors = ()
             self._referenced_tensor_ids = frozenset()
 
@@ -587,8 +665,7 @@ class _OperatorRecorder:
     ) -> None:
         """Record one validated communication batch at its sequence point."""
 
-        for tensor in tensors:
-            self.reference(tensor)
+        references = tuple(self.reference(tensor) for tensor in tensors)
         self.operators.append(
             CollectiveOperator(
                 tensors=tensors,
@@ -599,6 +676,11 @@ class _OperatorRecorder:
                 scope=scope,
                 reads=tensors,
                 writes=tensors,
+                temporaries=tuple(
+                    (position, reference.index)
+                    for position, reference in enumerate(references)
+                    if isinstance(reference, _ValueRef)
+                ),
             )
         )
 
@@ -712,7 +794,8 @@ class _TorchOperatorMode(TorchDispatchMode):
             for reference in _refs(outputs)
             if isinstance(reference, _ValueRef)
         )
-        if value_outputs:
+        functional = None
+        if value_outputs and not write_values:
             if len(value_outputs) != 1 or outputs is not value_outputs[0]:
                 raise SubstepCompileError(
                     "compiled ATen out-of-place operators must return exactly "
@@ -724,7 +807,7 @@ class _TorchOperatorMode(TorchDispatchMode):
                     f"Torch operator {schema_name}.{overload} has no explicit "
                     "preallocated replay overload"
                 )
-            function = replay
+            functional, function = function, replay
             encoded_kwargs = dict(encoded_kwargs)
             encoded_kwargs["out"] = value_outputs[0]
         output_writes = tuple(
@@ -739,6 +822,7 @@ class _TorchOperatorMode(TorchDispatchMode):
                 encoded_kwargs,
                 outputs,
                 tuple(dict.fromkeys((*writes, *output_writes))),
+                functional,
             )
         )
         return result
@@ -765,6 +849,7 @@ class OperatorRecording:
             scope_kind=scope_kind,
         )
         self.mode = _TorchOperatorMode(self.recorder)
+        self.grad_scope = torch.no_grad()
         self.scope: Any = None
         self.parent = None
         self.program: OperatorProgram | None = None
@@ -774,7 +859,12 @@ class OperatorRecording:
         scope = routing(self.recorder)
         scope.__enter__()
         try:
-            self.mode.__enter__()
+            self.grad_scope.__enter__()
+            try:
+                self.mode.__enter__()
+            except BaseException:
+                self.grad_scope.__exit__(None, None, None)
+                raise
         except BaseException:
             scope.__exit__(None, None, None)
             raise
@@ -785,6 +875,10 @@ class OperatorRecording:
         failures: list[BaseException] = []
         try:
             self.mode.__exit__(exc_type, exc, traceback)
+        except BaseException as error:
+            failures.append(error)
+        try:
+            self.grad_scope.__exit__(exc_type, exc, traceback)
         except BaseException as error:
             failures.append(error)
         try:
@@ -804,7 +898,10 @@ class OperatorRecording:
             error = ResourceCleanupError("substep recording rollback", causes)
             raise error from (exc if exc is not None else failures[0])
         if exc_type is None:
-            program = OperatorProgram(self.recorder.operators)
+            program = OperatorProgram(
+                self.recorder.operators,
+                eager=self.recorder.execution.executor.name == "eager",
+            )
             if self.recorder.scope_kind != "generic" and not program.operators:
                 raise SubstepCompileError(
                     f"{self.recorder.scope_kind} produced an empty operator IR"

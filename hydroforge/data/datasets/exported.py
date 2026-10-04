@@ -54,7 +54,7 @@ from hydroforge.parallel.distributed import is_rank_zero
 
 logger = logging.getLogger(__name__)
 
-_NUMBA_C_THRESHOLD = 5000  # Use numba for C above this (≈8x faster for glb_15min)
+_NUMBA_C_THRESHOLD = 5000
 
 
 def _int64_vector(value: np.ndarray, *, label: str) -> np.ndarray:
@@ -90,20 +90,19 @@ _TimeShift = Annotated[
 
 @cache
 def _numba_gather() -> Callable[..., np.ndarray]:
-    """Compile the parallel shifted-column gather on first use (numba is optional)."""
+    """Compile the shifted-column gather on first use (Numba is optional)."""
 
     import numba
 
     @numba.njit(cache=True, parallel=True)
     def gather(data, shift, base_t, length, oob_fill):
         T, C = data.shape
-        out = np.full((length, C), oob_fill, dtype=data.dtype)
+        out = np.empty((length, C), dtype=data.dtype)
         for c in numba.prange(C):
             s = int(shift[c])
             for t in range(length):
                 src = base_t + t + s
-                if 0 <= src < T:
-                    out[t, c] = data[src, c]
+                out[t, c] = data[src, c] if 0 <= src < T else oob_fill
         return out
 
     return gather
@@ -485,13 +484,14 @@ class ExportedDataset(ForcingDataset):
         Without ``shift``/``groups``: plain contiguous slice, zero-padded at
         boundaries.
 
-        With shift, dispatches based on ``C``:
-        - ``C >= _NUMBA_C_THRESHOLD`` → parallel per-column numba kernel
-          (~8x faster for large C, e.g. glb_15min runoff).
-        - Otherwise → precomputed ``groups`` slice-copy (fastest for small C,
-          e.g. inflow/loss overlays).
+        A shared column shift is one contiguous slice. Small mixed-shift
+        selections use their precompiled groups; larger selections use the
+        parallel Numba gather without separately prefilling its output.
         """
         T, C = data.shape
+        if groups is not None and len(groups) == 1:
+            base_t += groups[0][0]
+            shift = groups = None
         if shift is None and groups is None:
             lo = max(base_t, 0)
             hi = min(base_t + length, T)

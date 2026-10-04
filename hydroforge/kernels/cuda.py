@@ -103,7 +103,11 @@ class CudaSource(HydroForgeModel):
     ``inline_includes`` by basename, then relative to the including file
     inside ``include_root``.  ``options`` use the runtime compiler's spelling
     (``--ftz=false``, ``-DNAME=value``); ``HYDROFORGE_FAST_MATH`` decides fast
-    math, so sources do not set it.
+    math, so sources do not set it. Expanded source and toolkit headers can
+    use the persistent binary cache. Other external headers (including custom
+    ``-I`` paths or macro includes) compile once per process and must remain
+    unchanged in that process; use ``include_root`` or ``inline_includes`` to
+    make application dependencies part of the persistent cache identity.
     """
 
     path: _SourcePath | None = None

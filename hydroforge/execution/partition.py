@@ -221,8 +221,10 @@ class PartitionRuntime:
             target = bare(metadata.references)
             if not target or name not in source or target not in source:
                 continue
-            values = _host_ids(source.value(name)).reshape(-1)
-            _order, sorted_target, unique = self.sorted_global_key(
+            values = _host_ids(source.value(name))
+            shape = values.shape
+            values = values.reshape(-1)
+            order, sorted_target, unique = self.sorted_global_key(
                 target,
                 lambda target=target: source.value(target),
             )
@@ -241,6 +243,16 @@ class PartitionRuntime:
                     f"value(s) absent from global coordinate '{target}'; "
                     f"examples: {values[missing][:5].tolist()}."
                 )
+            coordinate = self.variable_groups.get(name)
+            if (
+                coordinate is not None
+                and coordinate != self.partition_key
+                and name
+                == (bare(self.schema.fields[coordinate].partition_by) or coordinate)
+            ):
+                # Ownership slicing needs these exact global positions next.
+                # Other references remain lazy to avoid retaining unused indices.
+                self._reference_indices[name] = order[position].reshape(shape)
 
     def _validate_inverse_reference_integrity(
         self,

@@ -16,6 +16,7 @@ import ctypes
 import hashlib
 import json
 import math
+import re
 import sys
 import threading
 from collections.abc import Callable, Iterable, Sequence
@@ -80,7 +81,11 @@ using cuda::std::uint32_t; using cuda::std::uint64_t;
 #endif
 """
 
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
+_INCLUDES = re.compile(
+    r"(?:#|%:)\s*(?:/\*.*?\*/\s*)*(?:include(?:_next)?|import|embed)\b([^\n]*)",
+    re.DOTALL,
+)
 
 
 # ---------------------------------------------------------------------- #
@@ -299,8 +304,9 @@ def _key(request: RtcRequest, target: str) -> str:
     kit = toolkit()
     identity = {
         "version": _CACHE_VERSION,
-        "source": request.program.source,
-        "options": list(request.program.options),
+        "source": RTC_PRELUDE + request.program.source,
+        "name": request.program.name,
+        "options": _options(request.program, target),
         "kernels": list(request.kernels),
         "target": target,
         "compiler": [("hip" if kit.hip else "cuda"), *kit.version],
@@ -336,8 +342,7 @@ def _compile(request: RtcRequest, target: str, device_binary: bool) -> _Binary:
     ):
         for kernel in request.kernels:
             kit.check_rtc(kit.AddNameExpression(program, kernel.encode()))
-        arch = f"--offload-arch={target}" if kit.hip else f"--gpu-architecture={target}"
-        options = [arch, "--std=c++20", *_include_options(), *_options(request.program)]
+        options = _options(request.program, target)
         encoded = (ctypes.c_char_p * len(options))(*(o.encode() for o in options))
         result = kit.CompileProgram(program, len(options), encoded)
         if result != 0:
@@ -386,15 +391,18 @@ _HIP_OPTIONS = {
 }
 
 
-def _options(program: RtcProgram) -> tuple[str, ...]:
-    """Program options in the active runtime compiler's spelling."""
-    if not toolkit().hip:
-        return program.options
-    return tuple(
-        _HIP_OPTIONS.get(option, option)
-        for option in program.options
-        if not option.startswith("--ptxas-options")
-    )
+def _options(program: RtcProgram, target: str) -> tuple[str, ...]:
+    """The exact options shared by cache identity and runtime compilation."""
+    if toolkit().hip:
+        arch = f"--offload-arch={target}"
+        options = tuple(
+            _HIP_OPTIONS.get(option, option)
+            for option in program.options
+            if not option.startswith("--ptxas-options")
+        )
+    else:
+        arch, options = f"--gpu-architecture={target}", program.options
+    return (arch, "--std=c++20", *_include_options(), *options)
 
 
 @cache
@@ -433,6 +441,41 @@ _memory: dict[str, _Binary] = {}
 _memory_lock = threading.Lock()
 
 
+def _persistent(program: RtcProgram) -> bool:
+    """Only persist programs whose remaining headers belong to the toolkit.
+
+    Quoted application headers are already expanded by ``CudaSource``. NVRTC
+    exposes no dependency list for other includes; external search paths,
+    forced headers and macro includes therefore keep only a process-local
+    snapshot. Scanning entire include trees would add work to every build
+    without reliably reproducing the compiler's preprocessing rules.
+    """
+    toolkit_paths = (*_include_options(), *toolkit_include_options())
+    for option in program.options:
+        if (
+            option.startswith(
+                ("-I", "--include", "-include", "--pre-include", "-isystem", "-iquote")
+            )
+            and option not in toolkit_paths
+        ):
+            return False
+    roots = tuple(Path(option[2:]).resolve() for option in toolkit_paths)
+    # RTC_PRELUDE is framework-owned and contains only toolkit/builtin
+    # headers, including inactive CUDA includes under HIP's #else branch.
+    source = program.source.replace("\\\n", "").replace("\\\r\n", "")
+    for include in _INCLUDES.findall(source):
+        literal = re.fullmatch(r"\s*<([^>]+)>\s*(?://.*|/\*.*\*/\s*)?", include)
+        if literal is None:
+            return False
+        name = literal.group(1)
+        if not any(
+            (root / name).is_file() and (root / name).resolve().is_relative_to(root)
+            for root in roots
+        ):
+            return False
+    return True
+
+
 def compile_request(request: RtcRequest, device: int) -> _Binary:
     """Return the cached binary for ``request``, compiling it at most once."""
 
@@ -442,13 +485,20 @@ def compile_request(request: RtcRequest, device: int) -> _Binary:
         cached = _memory.get(key)
     if cached is not None:
         return cached
+    persistent = _persistent(request.program)
     directory = _cache_root() / key[:2]
     image_path = directory / f"{key}.bin"
     names_path = directory / f"{key}.json"
 
     def load() -> _Binary | None:
-        if env.flag(env.CUDA_REBUILD, default=False) or not (
-            image_path.is_file() and names_path.is_file()
+        with _memory_lock:
+            cached = _memory.get(key)
+        if cached is not None:
+            return cached
+        if (
+            not persistent
+            or env.flag(env.CUDA_REBUILD, default=False)
+            or not (image_path.is_file() and names_path.is_file())
         ):
             return None
         return _Binary(image_path.read_bytes(), json.loads(names_path.read_text()))
@@ -463,13 +513,20 @@ def compile_request(request: RtcRequest, device: int) -> _Binary:
                 f"{request.program.name} compile lock",
                 (lambda: release_compile_lock(lock, token),),
             ):
-                binary = _compile(request, target, device_binary)
-                with atomic_output_path(image_path) as temporary:
-                    temporary.write_bytes(binary.image)
-                atomic_write_text(names_path, json.dumps(binary.lowered))
+                # Another thread may have published between the probe and
+                # lock acquisition. Publish memory before releasing the lock,
+                # including programs that deliberately have no disk artifact.
+                binary = load()
+                if binary is None:
+                    binary = _compile(request, target, device_binary)
+                    if persistent:
+                        with atomic_output_path(image_path) as temporary:
+                            temporary.write_bytes(binary.image)
+                        atomic_write_text(names_path, json.dumps(binary.lowered))
+                with _memory_lock:
+                    return _memory.setdefault(key, binary)
     with _memory_lock:
-        _memory.setdefault(key, binary)
-    return binary
+        return _memory.setdefault(key, binary)
 
 
 def precompile_request(request: RtcRequest, device: int) -> CompileRequest:
@@ -863,16 +920,34 @@ def prepare(
             for argument in step.args:
                 retain(argument)
 
+    # The allocation stays alive through ``owners`` for this binding's entire
+    # lifetime. The allocator retains each stream association until that
+    # allocation is freed, so recording every launch repeats the same work.
+    recorded_streams: dict[int, torch.cuda.Stream] = {}
+
     def launch(stream: int | None = None) -> None:
         if current_device() != device:
             with torch.cuda.device(device):
                 return launch(stream)
-        if stream is None:
-            stream = current_stream(device)
-        if owners and not torch.cuda.is_current_stream_capturing():
+        active_stream = current_stream(device)
+        if stream is not None and stream != active_stream:
+            execution_stream = recorded_streams.get(stream)
+            if execution_stream is None:
+                execution_stream = torch.cuda.ExternalStream(stream, device=device)
+            # Callable steps also enqueue PyTorch operations. They must share
+            # the driver's explicit stream and preserve their declared order.
+            with torch.cuda.stream(execution_stream):
+                return launch()
+        stream = active_stream
+        if (
+            owners
+            and stream not in recorded_streams
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             execution_stream = torch.cuda.ExternalStream(stream, device=device)
             for tensor in owners.values():
                 tensor.record_stream(execution_stream)
+            recorded_streams[stream] = execution_stream
         for item in prepared:
             if not isinstance(item, _PreparedLaunch):
                 item()

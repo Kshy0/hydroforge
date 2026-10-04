@@ -267,6 +267,8 @@ class AdaptiveLoop:
     def control_state(self) -> tuple[torch.Tensor, ...]:
         """Control tensors of one torch iteration; capture rollback restores them."""
         return (
+            self.candidate,
+            self.time_step,
             self.duration,
             self.elapsed,
             self.counter,
