@@ -33,7 +33,8 @@ inline Value mul(Value a, Value b) {
 }
 inline Value div(Value a, Value b) {
     float q = a.hi / b.hi;
-    if (!metal::isfinite(q) || b.hi == 0.0f) return {q, 0.0f};
+    if (!metal::isfinite(a.hi) || !metal::isfinite(b.hi) ||
+        !metal::isfinite(q) || b.hi == 0.0f) return {q, 0.0f};
     Value residual = sub(a, mul(b, from_float(q)));
     float correction = (residual.hi + residual.lo) / b.hi;
     return two_sum(q, correction);

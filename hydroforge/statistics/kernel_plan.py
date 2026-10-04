@@ -800,7 +800,7 @@ def _thread_entry(group: GroupKernel) -> StatisticsKernel:
 
     ensemble = group.ensemble_size
     levels = max(variable.levels for variable in group.variables)
-    width = Const(levels, _INDEX)
+    width = Const(max(1, levels), _INDEX)
     parts = []
     for level_axis in (False, True):
         variables = [

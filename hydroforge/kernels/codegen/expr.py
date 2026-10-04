@@ -113,7 +113,7 @@ class _Lowering:
         return Cast(self.names[name], self.dtype)
 
     def select(self, test: ast.AST, body: ast.AST, orelse: ast.AST) -> Expr:
-        return Select(self.truth(test), self.visit(body), self.visit(orelse))
+        return Select(self.truth(test), self.operand(body), self.operand(orelse))
 
 
 def lower_expression(

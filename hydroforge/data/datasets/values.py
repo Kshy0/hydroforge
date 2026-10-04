@@ -40,8 +40,9 @@ def ingest(
         if mask.any():
             if missing == "error":
                 raise ValueError(f"{label} contains missing or non-finite values")
-            # Integer storage has no NaN; masked cells become float64 zeros.
-            raw = (raw if raw.dtype.kind == "f" else raw.astype(np.float64)).filled(0)
+            # Fill in the source dtype so unmasked integers retain their exact
+            # values until the checked floating-point conversion.
+            raw = raw.filled(0)
         else:
             raw = raw.data
     values = np.asarray(raw)
