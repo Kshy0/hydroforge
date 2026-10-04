@@ -9,14 +9,15 @@ Code that differs by backend reads these facts instead of comparing names.
 ``HYDROFORGE_BACKEND`` selects a backend explicitly::
 
     export HYDROFORGE_BACKEND=metal    # Metal shaders (Apple Silicon)
-    export HYDROFORGE_BACKEND=triton   # Triton JIT kernels (NVIDIA/AMD/Intel)
+    export HYDROFORGE_BACKEND=triton   # Triton JIT kernels (CPU/NVIDIA/AMD/Intel)
     export HYDROFORGE_BACKEND=cuda     # NVRTC / HIPRTC device kernels
     export HYDROFORGE_BACKEND=torch    # Formal pure-PyTorch backend
 
 When unset, the model device selects Triton for CUDA/ROCm and XPU, Metal for
 MPS, and Torch otherwise. Triton selection requires a usable matching driver
 and compiler; another backend must be selected explicitly if it is
-unavailable. The ``cuda`` backend also supports AMD/ROCm.
+unavailable. CPU keeps Torch by default; explicit Triton requires an installed
+CPU backend. The ``cuda`` backend also supports AMD/ROCm.
 """
 
 from __future__ import annotations
@@ -200,7 +201,7 @@ TORCH = Backend(
 )
 TRITON = Backend(
     name="triton",
-    devices=frozenset(("cuda", "xpu")),
+    devices=frozenset(("cpu", "cuda", "xpu")),
     toolchain="triton",
     dialect="triton",
     capture="cuda_graph",

@@ -28,6 +28,7 @@ from hydroforge.kernels.toolchain.python import (
     release_generated_module,
 )
 from hydroforge.kernels.toolchain.triton import launch_options, warmup_request
+from hydroforge.platform.triton_driver import proven_triton_device, triton_call_device
 from hydroforge.statistics.kernel_plan import (
     StatisticsCompileContext,
     StatisticsKernel,
@@ -84,10 +85,11 @@ def _bind(
             for param in kernel.function.params
         )
         grid = ((extent + block_size - 1) // block_size,)
-        options = {
-            "BLOCK_SIZE": block_size,
-            **launch_options(function, physics=False),
-        }
+        with proven_triton_device(triton_call_device(arguments)).active():
+            options = {
+                **launch_options(function, physics=False),
+                "BLOCK_SIZE": block_size,
+            }
         launches.append((kernel.phase_mask, function, grid, arguments, options))
     return launches
 
@@ -136,7 +138,12 @@ def compile_statistics(
                 states,
                 BLOCK_SIZE,
                 [
-                    (mask, function[grid], arguments, options)
+                    (
+                        mask,
+                        function[grid],
+                        arguments,
+                        options,
+                    )
                     for mask, function, grid, arguments, options in launches
                 ],
             ]
@@ -147,8 +154,20 @@ def compile_statistics(
     def requests(
         states: Mapping[str, torch.Tensor], block_size: int
     ) -> tuple[CompileRequest, ...]:
+        def warmup(function, grid, arguments, options):
+            with proven_triton_device(triton_call_device(arguments)).active():
+                return function.warmup(*arguments, grid=grid, **options)
+
         return tuple(
-            warmup_request(partial(function.warmup, *arguments, grid=grid, **options))
+            warmup_request(
+                partial(
+                    warmup,
+                    function,
+                    grid,
+                    arguments,
+                    options,
+                )
+            )
             for _mask, function, grid, arguments, options in _bind(
                 jit, states, block_size
             )

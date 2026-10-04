@@ -41,6 +41,15 @@ FAST_MATH = tl.constexpr(TRITON.math.physics_fast_math)
 _HIP = tl.constexpr(torch.version.hip is not None)
 
 
+@core.builtin
+def _is_hip(_semantic=None):
+    # Read the compilation's captured options, never the mutable active driver.
+    backend = getattr(
+        _semantic.builder.options, "backend_name", "hip" if _HIP.value else ""
+    )
+    return tl.constexpr(backend == "hip")
+
+
 @triton.jit
 def constant(value, like):
     """``value`` in the dtype of tensor ``like``; a tensor passes unchanged."""
@@ -73,7 +82,7 @@ def sqrt(value):
     if FAST_MATH:
         return tl.sqrt(value)
     elif value.dtype == tl.float32:
-        if _HIP:
+        if _is_hip():
             # ROCm Triton's sqrt_rn returns NaN for subnormal inputs; OCML's
             # sqrt is IEEE.
             return libdevice.sqrt(value)
@@ -139,7 +148,7 @@ def cbrt(value):
     ROCm Triton's libdevice has no ``cbrt``; ``pow(x, 1/3)`` would round
     worse and return NaN for negative ``x``.
     """
-    if _HIP:
+    if _is_hip():
         return _ocml_cbrt(value)
     else:
         return libdevice.cbrt(value)
