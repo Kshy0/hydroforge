@@ -291,7 +291,11 @@ def launch_options(kernel: Any, *, physics: bool) -> Mapping[str, Any]:
         return cached[2]
     adopt(kernel)
     options: dict[str, Any] = {} if physics else {"enable_fp_fusion": False}
-    if active.get_current_target().backend == "cuda":
+    target = active.get_current_target().backend
+    if target == "cpu":
+        fast = physics and TRITON.math.physics_fast_math
+        options.update(enable_fast_math=fast, enable_fp_fusion=fast)
+    if target == "cuda":
         from triton import knobs
 
         options["enable_reflect_ftz"] = physics and TRITON.math.physics_fast_math

@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Iterable, Mapping
+from contextlib import contextmanager, nullcontext
+from threading import RLock
 from typing import Any
 
 import torch
 
 from hydroforge.core.devices import devices_match
 
+_DRIVER_LOCK = RLock()
+
+
 _TRITON_DEVICE_REGISTRATION_HINTS: Mapping[str, tuple[str, ...]] = {
+    "cpu": ("cpu",),
     # ROCm intentionally uses PyTorch's ``cuda`` device spelling.
     "cuda": ("nvidia", "amd"),
     # Intel's Triton fork registers the backend as ``intel``. Accept ``xpu``
@@ -18,6 +24,7 @@ _TRITON_DEVICE_REGISTRATION_HINTS: Mapping[str, tuple[str, ...]] = {
 }
 
 _TRITON_DEVICE_TARGETS: Mapping[str, tuple[str, ...]] = {
+    "cpu": ("cpu",),
     "cuda": ("cuda", "hip"),
     "xpu": ("xpu", "intel"),
 }
@@ -136,7 +143,7 @@ def _active_triton_runtime(
     return current
 
 
-def require_triton_device(device: torch.device) -> Any:
+def _require_triton_device(device: torch.device) -> Any:
     """Prove Triton's registered and active runtime match ``device``.
 
     Returns the proven active driver.
@@ -152,7 +159,7 @@ def require_triton_device(device: torch.device) -> Any:
     registration_hints = _TRITON_DEVICE_REGISTRATION_HINTS.get(device_type)
     if registration_hints is None:
         raise ValueError(
-            "HydroForge Triton kernels require a CUDA/ROCm or XPU model "
+            "HydroForge Triton kernels require a CPU, CUDA/ROCm or XPU model "
             f"device, got {device_type!r}"
         )
     try:
@@ -179,6 +186,11 @@ def require_triton_device(device: torch.device) -> Any:
                 "hide non-target accelerators or explicitly select the matching "
                 "Triton driver with triton.runtime.driver.set_active(...); "
                 "otherwise select a non-Triton backend explicitly"
+            )
+        elif device_type == "cpu":
+            advice = (
+                "install an official Triton CPU build, or explicitly "
+                "set HYDROFORGE_BACKEND=torch"
             )
         elif device_type == "xpu":
             advice = (
@@ -214,13 +226,19 @@ def require_triton_device(device: torch.device) -> Any:
     return driver.active
 
 
-class ProvenTritonDevice:
-    """The Triton driver proven for one tensor device.
+def require_triton_device(device: torch.device) -> Any:
+    """Prove a matching driver while serializing HydroForge driver selection."""
+    with _DRIVER_LOCK:
+        return _require_triton_device(device)
 
-    Triton launches on its active driver's current device.  Both are mutable
-    process state, so every launch compares the driver identity and the
-    current device index; a replaced driver is proven again, and a launch
-    issued while another device is current runs under this device.
+
+class ProvenTritonDevice:
+    """A device proof used during binding and compilation.
+
+    CPU storage has no selectable index. Driver selection is process-global,
+    so HydroForge serializes selection and compilation. Bound launches do not
+    enter this context or recheck the driver; their caller owns the active
+    driver/device for execution. Rebind after changing that execution context.
     """
 
     __slots__ = ("device", "_config", "_driver", "_current", "_select")
@@ -228,37 +246,79 @@ class ProvenTritonDevice:
     def __init__(self, device: torch.device) -> None:
         from triton.runtime import driver
 
-        runtime = getattr(torch, device.type)
-        self.device = device
+        self.device = torch.device("cpu") if device.type == "cpu" else device
         self._config = driver
-        self._current = (
-            torch._C._cuda_getDevice
-            if device.type == "cuda"
-            else runtime.current_device
-        )
-        self._select = runtime.device
-        with self._select(device.index):
-            self._driver = require_triton_device(device)
+        if device.type == "cpu":
+            self._current = lambda: None
+            self._select = lambda _index: nullcontext()
+        else:
+            runtime = getattr(torch, device.type)
+            self._current = (
+                torch._C._cuda_getDevice
+                if device.type == "cuda"
+                else runtime.current_device
+            )
+            self._select = runtime.device
+        with _DRIVER_LOCK, self._select(self.device.index):
+            self._driver = _require_triton_device(self.device)
 
-    def run(self, launch: Callable[..., Any], arguments: Mapping[str, Any]) -> Any:
-        """Call ``launch(**arguments)`` on this device under the proven driver."""
+    @contextmanager
+    def active(self):
+        """Keep device selection, launch binding and compilation on one target."""
+        with _DRIVER_LOCK:
+            if (
+                self._config.active is self._driver
+                and self._current() == self.device.index
+            ):
+                yield
+                return
+            with self._select(self.device.index):
+                if self._config.active is not self._driver:
+                    self._driver = _require_triton_device(self.device)
+                yield
 
-        if self._config.active is self._driver and self._current() == self.device.index:
-            return launch(**arguments)
-        with self._select(self.device.index):
-            if self._config.active is not self._driver:
-                self._driver = require_triton_device(self.device)
-            return launch(**arguments)
 
-
-_PROVEN_TRITON_DEVICES: dict[tuple[str, int], ProvenTritonDevice] = {}
+_PROVEN_TRITON_DEVICES: dict[tuple[str, int | None], ProvenTritonDevice] = {}
 
 
 def proven_triton_device(device: torch.device) -> ProvenTritonDevice:
-    """Return the cached proof for one concrete tensor device."""
+    """Return a cached proof, canonicalizing the singleton CPU device."""
+    key = (device.type, None if device.type == "cpu" else device.index)
+    with _DRIVER_LOCK:
+        proven = _PROVEN_TRITON_DEVICES.get(key)
+        if proven is None:
+            proven = _PROVEN_TRITON_DEVICES[key] = ProvenTritonDevice(device)
+        return proven
 
-    key = (device.type, device.index)
-    proven = _PROVEN_TRITON_DEVICES.get(key)
-    if proven is None:
-        proven = _PROVEN_TRITON_DEVICES[key] = ProvenTritonDevice(device)
-    return proven
+
+def triton_call_device(
+    values: Iterable[Any], *, device: torch.device | None = None
+) -> torch.device:
+    """Resolve a native call's tensor device before exposing any pointers.
+
+    A bound device also supports calls without buffers. Standalone bufferless
+    calls retain Triton's explicitly selected current device as their default.
+    """
+    pending = list(values)
+    seen: set[int] = set()
+    while pending:
+        value = pending.pop()
+        if isinstance(value, (tuple, list, Mapping)):
+            if id(value) not in seen:
+                seen.add(id(value))
+                pending.extend(value.values() if isinstance(value, Mapping) else value)
+            continue
+        if not isinstance(value, torch.Tensor):
+            continue
+        if device is None:
+            device = value.device
+        elif not devices_match(value.device, device):
+            raise ValueError(
+                f"Triton buffers must share the bound device {device}; "
+                f"got {value.device}"
+            )
+    if device is None:
+        from triton.runtime import driver
+
+        device = torch.device(driver.active.get_active_torch_device())
+    return device

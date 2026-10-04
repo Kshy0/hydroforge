@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Mapping
+from contextvars import copy_context
 from functools import partial
 from typing import Any, ClassVar, Literal, Self
 
@@ -24,6 +25,7 @@ from hydroforge.kernels.registry import (
 from hydroforge.kernels.spec import KernelSpec
 from hydroforge.kernels.toolchain import CompileRequest
 from hydroforge.kernels.toolchain.triton import (
+    active_triton_precision,
     adopt,
     launch_options,
     launch_variant,
@@ -33,29 +35,50 @@ from hydroforge.kernels.toolchain.triton import (
     warmup_request,
 )
 from hydroforge.platform.backend import TRITON, Backend
-from hydroforge.platform.triton_driver import proven_triton_device
+from hydroforge.platform.triton_driver import proven_triton_device, triton_call_device
 
 _FLOAT_KINDS = frozenset(("float32", "float64"))
 
 
-def launch_triton_kernel(kernel: Any, grid: Any, *, physics: bool = True) -> Callable:
+def launch_triton_kernel(
+    kernel: Any, grid: Any, *, physics: bool = True, device: torch.device | None = None
+) -> Callable:
     """Return a precision-aware launch proxy for an inner Triton kernel.
 
     This is intended for compound-program helpers.  The returned callable
-    binds the actual launch arguments first, identifies declared floating
-    scalar parameters, and dispatches a cached fp32/fp64 JIT variant.  Outside
-    a :class:`TritonProgram` the scalar ABI remains unchanged.  Launches use
+    binds the device and scalar ABI on its first call, then reuses the selected
+    launcher and math options. Create it during ``prepare`` and retain it for
+    repeated launches. A precision context from ``prepare`` is retained;
+    otherwise the first call supplies it. Without a precision context the
+    scalar ABI remains unchanged. Launches use
     the HydroForge math defaults of physics or (``physics=False``) framework
     kernels, which explicit launch options override, and compile under the
-    HydroForge compile policy.
+    HydroForge compile policy. ``device`` binds bufferless calls; otherwise
+    tensor arguments determine and validate the launch device once. The caller
+    keeps the bound driver/device and scalar ABI active until rebinding.
     """
 
+    precision_context = copy_context() if active_triton_precision() is not None else None
+    selected = launcher = defaults = None
+
     def launch(*args: Any, **kwargs: Any):
-        selected = launch_variant(kernel, args, kwargs)
-        options = {**launch_options(selected, physics=physics), **kwargs}
+        nonlocal selected, launcher, defaults
+        if launcher is None:
+            target = triton_call_device((*args, *kwargs.values()), device=device)
+            with proven_triton_device(target).active():
+                selected = (
+                    launch_variant(kernel, args, kwargs)
+                    if precision_context is None
+                    else precision_context.run(launch_variant, kernel, args, kwargs)
+                )
+                defaults = launch_options(selected, physics=physics)
+                launcher = selected[grid]
+                if warming():
+                    return selected.warmup(*args, grid=grid, **{**defaults, **kwargs})
+                return launcher(*args, **{**defaults, **kwargs})
         if warming():
-            return selected.warmup(*args, grid=grid, **options)
-        return selected[grid](*args, **options)
+            return selected.warmup(*args, grid=grid, **{**defaults, **kwargs})
+        return launcher(*args, **{**defaults, **kwargs})
 
     return launch
 
@@ -234,7 +257,6 @@ class _TritonKernelImplementation(KernelImplementation):
         static = {
             "BLOCK_SIZE": block,
             **{name: value for name, value in arguments.items() if name in accepted},
-            **launch_options(selected, physics=True),
         }
         return selected, ((extent + block - 1) // block,), static
 
@@ -243,27 +265,23 @@ class _TritonKernelImplementation(KernelImplementation):
         if planned is None:
             return ()
         selected, grid, static = planned
-        return (warmup_request(partial(selected.warmup, grid=grid, **static)),)
+        proven = proven_triton_device(triton_call_device(static.values()))
+
+        def build():
+            with proven.active():
+                options = {**launch_options(selected, physics=True), **static}
+                return selected.warmup(grid=grid, **options)
+
+        return (warmup_request(build),)
 
     def _compile(self, call: KernelCall) -> Launch:
         planned = self._plan(call.arguments)
         if planned is None:
             return empty_launch
         selected, grid, static = planned
-        launcher = selected[grid]
-        device = next(
-            (
-                value.device
-                for value in static.values()
-                if isinstance(value, torch.Tensor)
-            ),
-            None,
-        )
-        if device is None:
-            from triton.runtime import driver
-
-            device = driver.active.get_active_torch_device()
-        return partial(proven_triton_device(device).run, launcher, static)
+        with proven_triton_device(triton_call_device(static.values())).active():
+            options = {**launch_options(selected, physics=True), **static}
+            return partial(selected[grid], **options)
 
 
 class TritonKernel(KernelDeclaration):
@@ -404,11 +422,16 @@ class _TritonProgramImplementation(KernelImplementation):
 
     def _compile(self, call: KernelCall) -> Launch:
         arguments = dict(call.arguments)
-        if not self.names:
-            return self.prepare(arguments, call.buffer_dtypes)
         precision, names = self.precision, self.names
-        with triton_precision_context(precision, names, scalar_types=self.scalar_types):
-            prepared = self.prepare(arguments, call.buffer_dtypes)
+        proven = proven_triton_device(triton_call_device(arguments.values()))
+        with proven.active():
+            if names:
+                with triton_precision_context(
+                    precision, names, scalar_types=self.scalar_types
+                ):
+                    prepared = self.prepare(arguments, call.buffer_dtypes)
+            else:
+                prepared = self.prepare(arguments, call.buffer_dtypes)
 
         def launch() -> None:
             with triton_precision_context(
@@ -416,6 +439,11 @@ class _TritonProgramImplementation(KernelImplementation):
             ):
                 prepared()
 
+        if not names:
+            return prepared
+        close = getattr(prepared, "close", None)
+        if callable(close):
+            launch.close = close
         return launch
 
 
@@ -425,6 +453,8 @@ class TritonProgram(KernelDeclaration):
     ``prepare(arguments, buffer_dtypes)`` runs once per call specialization
     and returns the launch; its inner kernels launch through
     :func:`launch_triton_kernel`, which applies the resolved scalar precision.
+    Retain inner launch helpers in ``prepare`` so repeated calls reuse their
+    binding. Execution requires the bound driver/device to remain active.
     """
 
     toolchain: ClassVar[str] = "triton"
