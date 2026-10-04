@@ -1,8 +1,8 @@
 """Loop executors: the one place execution selects a backend path.
 
 :class:`EagerExecutor` launches recorded programs directly under host
-control, :class:`CudaGraphExecutor` replays captured CUDA graphs (a fixed
-loop's iteration graph once per iteration; adaptive and predicate loops as
+control, :class:`CudaGraphExecutor` replays captured CUDA graphs (bounded
+batches of fixed iterations; adaptive and predicate loops as
 device-side conditional graphs), and :class:`MetalIcbExecutor` replays
 online-lowered Metal command buffers.
 """

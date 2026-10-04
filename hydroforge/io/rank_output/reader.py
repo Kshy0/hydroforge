@@ -342,12 +342,24 @@ class MultiRankStatsReader(HydroForgeModel):
             rank = self._catalog.ranks[rank_index]
             cache = None if self._cache is None else self._cache[rank.rank]
             if cache is not None:
+                paths = tuple(
+                    path
+                    for path, (first, last) in zip(
+                        rank.paths, rank.time_offsets, strict=True
+                    )
+                    if first < self._view.start + stop
+                    and last > self._view.start + start
+                )
+                for path in paths:
+                    self._files.verify(path)
                 values = cache[
                     self._selection(slice(start, stop), member, points, level)
                 ]
                 out[:, out_columns] = _cast_result(
                     _array(values, source=rank.paths[0].name), dtype
                 )
+                for path in paths:
+                    self._files.verify(path)
             else:
                 self._read_series(
                     out,
@@ -489,7 +501,12 @@ class MultiRankStatsReader(HydroForgeModel):
             with self._files.open_netcdf(path) as dataset:
                 variable = dataset.variables[self.var_name]
                 point_axis = 1 if self._catalog.layout.member_count is None else 2
-                sparse = prefer_sparse_axis(variable, point_axis, points)
+                # A single contiguous column costs one NetCDF read even when
+                # decompression touches full-width chunks; keep the other
+                # columns out of the materialized host array.
+                sparse = points.size == 1 or prefer_sparse_axis(
+                    variable, point_axis, points
+                )
                 if self.row_chunk_size is None:
                     # Bound the unfiltered NetCDF read even when the caller
                     # asks for one gauge column: the full saved-point row

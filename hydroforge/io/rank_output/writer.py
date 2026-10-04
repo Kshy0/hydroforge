@@ -49,6 +49,7 @@ from hydroforge.io.netcdf.encoding import (
     saved_dtype,
 )
 from hydroforge.io.netcdf.options import (
+    _probe_blosc_zstd_filter,
     create_netcdf_variable,
     ensure_hdf5_plugins,
     start_blosc_zstd_probe,
@@ -85,6 +86,7 @@ class NetCDFWriteRequest:
     data: np.ndarray
     output_path: Path
     times: tuple[Any, ...]
+    chunk_cache: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +100,7 @@ class _SlotWrite:
     row_shape: tuple[int, ...]
     dtype: str
     times: tuple[Any, ...]
+    chunk_cache: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -118,7 +121,9 @@ class _SlotWrite:
             buffer=buffer,
             offset=self.offset,
         )
-        return NetCDFWriteRequest(self.variable, data, self.output_path, self.times)
+        return NetCDFWriteRequest(
+            self.variable, data, self.output_path, self.times, self.chunk_cache
+        )
 
 
 def _is_wsl() -> bool:
@@ -251,6 +256,13 @@ def _append_netcdf_request(
     time_var = ncfile.variables[TIME_DIM]
     target = _find_data_variable(ncfile, request.variable)
     variable = ncfile.variables[target]
+    if (
+        request.chunk_cache is not None
+        and variable.get_var_chunk_cache()[0] != request.chunk_cache
+    ):
+        # createVariable's cache size lasts only until that Dataset closes.
+        # Apply the same budget to the handle that actually appends the rows.
+        variable.set_var_chunk_cache(size=request.chunk_cache)
     if time_var.dimensions != ("time",):
         raise ValueError(
             f"time variable in {request.output_path} must have dimensions ('time',)"
@@ -493,6 +505,7 @@ class _OutputStream:
     component: int | None
     worker: int | None
     slots: RingSlots
+    chunk_cache: int | None = None
     path: Path | None = None
     # Slot receiving rows and the rows placed in it; a full slot is appended
     # once its last row landed, and the next row moves on to the next slot.
@@ -590,7 +603,11 @@ class RankOutputWriter:
             self._layouts[name] = (shape, info["dtype"])
             dtype = self._dtypes[name] = saved_dtype(info["dtype"], save_precision)
             step_bytes[name] = math.prod(shape) * dtype.itemsize
-        plans = plan_output_batches(step_bytes, max_pending_steps=max_pending_steps)
+        plans = plan_output_batches(
+            step_bytes,
+            max_pending_steps=max_pending_steps,
+            background_writes=bool(num_workers),
+        )
         self._page_lock = page_lockable(step_bytes, plans)
         self._netcdf_schemas = {
             name: NetCDFSchema.compile(
@@ -614,19 +631,33 @@ class RankOutputWriter:
         placements, self._flags_offset = place_slots(rows)
         self._ring_bytes = self._flags_offset + 2 * len(metadata)
         self._streams: dict[str, list[_OutputStream]] = {name: [] for name in metadata}
-        for index, (name, key, component) in enumerate(routes):
+        for name, key, component in routes:
             self._streams[name].append(
                 _OutputStream(
                     key=key,
                     component=component,
-                    worker=index % num_workers if num_workers else None,
+                    worker=None,
                     slots=placements[key],
+                    chunk_cache=self._netcdf_schemas[name].create_options.get(
+                        "chunk_cache"
+                    ),
                     times=[[] for _slot in range(placements[key].depth)],
                     writes=[None] * placements[key].depth,
                 )
             )
+        if num_workers:
+            loads = [0] * num_workers
+            # Keep every file on one worker, balancing the bytes per output
+            # step rather than sending large interleaved streams to one worker.
+            for stream in sorted(
+                self._all_streams(), key=lambda item: item.slots.row_bytes, reverse=True
+            ):
+                stream.worker = min(range(num_workers), key=loads.__getitem__)
+                loads[stream.worker] += max(1, stream.slots.row_bytes)
         try:
-            start_blosc_zstd_probe()
+            start_blosc_zstd_probe(
+                schema.create_options for schema in self._netcdf_schemas.values()
+            )
         except (OSError, subprocess.SubprocessError):
             logger.warning("could not start the Blosc capability probe early")
 
@@ -898,6 +929,7 @@ class RankOutputWriter:
                         layout.row_shape,
                         layout.dtype.str,
                         tuple(stream.times[slot][:count]),
+                        stream.chunk_cache,
                     )
                 )
                 stream.times[slot] = []
@@ -1007,15 +1039,20 @@ class RankOutputWriter:
                     else storage[..., stream.component]
                 ).detach()
                 target = stream.buffers[slot][row]
-                if source.device.type == "mps" and (
-                    target.data_ptr() % 4 or source.dtype != target.dtype
-                ):
-                    # MPS copies into host memory need 4-byte aligned targets
-                    # (rows of 1- or 2-byte values may start unaligned in a
-                    # slot), and a float32 row widened into a float64 slot is
-                    # left unwritten (torch 2.14): convert on the host.
-                    source = source.cpu()
-                target.copy_(source)
+                try:
+                    if source.device.type == "mps" and (
+                        target.data_ptr() % 4 or source.dtype != target.dtype
+                    ):
+                        # MPS copies into host memory need 4-byte aligned targets
+                        # (rows of 1- or 2-byte values may start unaligned in a
+                        # slot), and a float32 row widened into a float64 slot is
+                        # left unwritten (torch 2.14): convert on the host.
+                        source = source.cpu()
+                    target.copy_(source)
+                finally:
+                    # A retained copy/narrowing failure must not keep a view
+                    # alive after close drops the writer's ring buffers.
+                    del target
                 rows.append((stream, slot, row))
         # A rejected step leaves no row behind and the writer usable.
         raise_narrowing_failures(flags)
@@ -1403,4 +1440,8 @@ class RankOutputWriter:
         if self._closed:
             return
         self._closed = True
-        self._cleanup_executor()
+        with cleanup_on_exit(
+            "statistics output",
+            (lambda: _probe_blosc_zstd_filter(start_if_needed=False),),
+        ):
+            self._cleanup_executor()

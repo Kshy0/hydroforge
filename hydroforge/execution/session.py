@@ -22,12 +22,6 @@ from hydroforge.execution.channel import LocalChannel, ProcessGroupChannel
 from hydroforge.execution.checkpoint import CheckpointRuntime
 from hydroforge.execution.inputs import InputBinding, prepare_payloads, shard_inputs
 from hydroforge.execution.namespace import bind_field_owners, bind_namespace
-from hydroforge.execution.outputs import bind_statistics
-from hydroforge.execution.parameters import (
-    LocalParameterCompiler,
-    ParameterPlanRuntime,
-)
-from hydroforge.execution.partition import PartitionRuntime
 from hydroforge.execution.progress import ProgressRuntime
 from hydroforge.execution.runtime import ModelExecution
 from hydroforge.execution.signatures import compiled_signature, declaration_signature
@@ -44,6 +38,8 @@ if TYPE_CHECKING:
     from hydroforge.compiler.plan import ModelPlan
     from hydroforge.contracts.schedule import SimulationSchedule
     from hydroforge.declare.tensors import ModulePayload
+    from hydroforge.execution.parameters import ParameterPlanRuntime
+    from hydroforge.execution.partition import PartitionRuntime
     from hydroforge.statistics.runtime import StatisticsRuntime
 
 _EMPTY_STRUCTURE_HOOK = AbstractModule.update_structure
@@ -273,6 +269,13 @@ class ModelRuntime:
         )
 
     def _build(self) -> None:
+        # Declaration-only imports do not need partition compilation or Numba.
+        from hydroforge.execution.parameters import (
+            LocalParameterCompiler,
+            ParameterPlanRuntime,
+        )
+        from hydroforge.execution.partition import PartitionRuntime
+
         plan = self.plan
         owner = self.owner
         if self.input is None:
@@ -324,6 +327,8 @@ class ModelRuntime:
         owner.initialize_model_state()
         self.checkpoint = CheckpointRuntime(self)
         if plan.output.declaration is not None:
+            from hydroforge.execution.outputs import bind_statistics
+
             self.statistics = bind_statistics(self)
         self.field_owners = bind_field_owners(plan.fields.binding, self.modules, owner)
         execution._refresh_model_tensor_index()

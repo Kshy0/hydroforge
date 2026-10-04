@@ -134,17 +134,16 @@ class ModuleTensors:
         """Resolve computed tensor residency and validate active values."""
 
         module = self.module
-        computed_fields = tuple(
-            field
-            for field in module.spec().tensor_fields.values()
-            if field.computed and field.tensor.category != "virtual"
-        )
-        for field in computed_fields:
-            if not module._is_tensor_field_active(field.name):
-                object.__setattr__(module, field.name, None)
-        for field in computed_fields:
+        active_fields = []
+        for field in module.spec().tensor_fields.values():
+            if not field.computed or field.tensor.category == "virtual":
+                continue
             if module._is_tensor_field_active(field.name):
-                self._validate_computed_field(field, getattr(module, field.name))
+                active_fields.append(field)
+            else:
+                object.__setattr__(module, field.name, None)
+        for field in active_fields:
+            self._validate_computed_field(field, getattr(module, field.name))
         # Derived reference indices are descriptors rather than Pydantic
         # computed fields, but belong to the same stable cold-start phase.
         for name in module._binding.plan.reference_indices:
@@ -212,7 +211,7 @@ class ModuleTensors:
         if module.ensemble_size is not None:
             category = schema.tensor.category
             batched = category in {"state", "init_state"} or (
-                category in {"param", "derived_param", "forcing"}
+                category in {"param", "derived_param", "forcing", "virtual"}
                 and field_name in self.batched_fields
             )
             if batched:
@@ -349,6 +348,10 @@ class ModuleTensors:
                 f"{type(value).__name__}"
             )
         tensor = value
+        if tensor.layout is not torch.strided:
+            raise ValueError(
+                f"Computed field {field.name} must use torch.strided layout"
+            )
         if not self._on_device(tensor):
             raise ValueError(
                 f"Computed field {field.name} must be on device "
@@ -362,8 +365,9 @@ class ModuleTensors:
         expected = self._expected_shape(field.name)
         if expected is not None and tuple(tensor.shape) != expected:
             if (
-                field.tensor.category == "derived_param"
+                field.tensor.category in {"derived_param", "virtual"}
                 and module.ensemble_size is not None
+                and field.name not in self.batched_fields
                 and tuple(tensor.shape) == (module.ensemble_size, *expected)
             ):
                 self.batched_fields.add(field.name)

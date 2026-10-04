@@ -9,8 +9,8 @@
 A conditional-graph WHILE node (:class:`hydroforge.kernels.toolchain.cuda.
 ConditionalWhileGraph`) folds a loop into one graph launch: the body and its
 continuation predicate run on the device, so the host issues one launch per
-adaptive or predicate loop.  A fixed loop replays one iteration graph per
-iteration from the host.  The control kernels are the rules of
+adaptive or predicate loop.  A fixed loop replays bounded batches of iterations
+from the host.  The control kernels are the rules of
 :mod:`hydroforge.kernels.backends.loop_control` printed in CUDA; the
 continuation predicate calls the CUDA-only ``set_conditional`` intrinsic.
 Each control program compiles once with every kernel it holds, the

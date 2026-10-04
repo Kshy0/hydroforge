@@ -16,7 +16,7 @@ from hydroforge.contracts.parameters import ParameterChange, validate_parameter_
 from hydroforge.core.time import DateLike, normalize_calendar_dates
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterable, Mapping
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,12 +170,47 @@ def _target(
     )
 
 
+def validate_set_targets(
+    targets: Iterable[tuple[ParameterTarget, str | None, Iterable[int] | None]],
+) -> None:
+    """Reject SET overlap within each field, start and index namespace.
+
+    Declaration IDs are comparable only within the same key field. After
+    materialization (and structural rebinding), all resolved row indices use
+    the same namespace. Global SETs conflict across every namespace.
+    """
+
+    groups: dict[tuple[str, DateLike], dict[str | None, set[int]] | None] = {}
+    for target, namespace, indices in targets:
+        if not target.is_set_value:
+            continue
+        key = (target.field.qualified, target.start)
+        if key in groups and (groups[key] is None or indices is None):
+            raise ValueError(
+                f"parameter {target.change.variable!r} has overlapping SET "
+                f"plans at {target.start}: a global SET conflicts "
+                "with every other SET"
+            )
+        if indices is None:
+            groups[key] = None
+            continue
+        namespaces = groups.setdefault(key, {})
+        used = namespaces.setdefault(namespace, set())
+        selected = set(indices)
+        if not used.isdisjoint(selected):
+            raise ValueError(
+                f"parameter {target.change.variable!r} has overlapping SET "
+                f"targets at {target.start}"
+            )
+        used.update(selected)
+
+
 def plan_parameters(
     selection: Selection,
     fields: FieldPlan,
     changes: tuple[ParameterChange, ...],
 ) -> tuple[ParameterTarget, ...]:
-    """Resolve every scheduled change and reject overlapping SET plans."""
+    """Resolve declarations and reject SET conflicts known without input I/O."""
 
     if not changes:
         return ()
@@ -190,25 +225,12 @@ def plan_parameters(
             key=lambda target: target.start,
         )
     )
-    for index, item in enumerate(targets):
-        if not item.is_set_value:
-            continue
-        for existing in targets[:index]:
-            if not (
-                existing.is_set_value
-                and existing.field.qualified == item.field.qualified
-                and existing.start == item.start
-            ):
-                continue
-            if existing.target_ids is None or item.target_ids is None:
-                raise ValueError(
-                    f"parameter {item.change.variable!r} has overlapping SET "
-                    f"plans at {item.start}: a global SET conflicts "
-                    "with every other SET"
-                )
-            if set(item.target_ids).intersection(existing.target_ids):
-                raise ValueError(
-                    f"parameter {item.change.variable!r} has overlapping SET "
-                    f"target_ids at {item.start}"
-                )
+    validate_set_targets(
+        (
+            target,
+            None if target.id_field is None else target.id_field.qualified,
+            target.target_ids,
+        )
+        for target in targets
+    )
     return targets

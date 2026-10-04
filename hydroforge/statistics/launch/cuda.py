@@ -9,6 +9,7 @@ are validated and packed once, then replayed.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from itertools import groupby
 from typing import Any
 
 import torch
@@ -52,7 +53,7 @@ def _bind(
             raise RuntimeError(
                 f"{name} must be on the same CUDA/HIP device as all statistics buffers"
             )
-    bound = []
+    steps = []
     for kernel in kernels:
         count = kernel.extent.value(states)
         if count == 0:
@@ -66,8 +67,17 @@ def _bind(
         step = rtc.CudaLaunch(
             kernel.function.name, rtc.blocks(count, block_size), block_size, arguments
         )
-        bound.append((kernel.phase_mask, rtc.prepare(request, (step,), owner.index)))
-    return bound
+        steps.append((kernel.phase_mask, step))
+    # Scatter zero/add/divide and adjacent groups commonly share a phase.
+    # One prepared sequence preserves their dependency order while checking
+    # the current device, stream and allocation lifetime once for that run.
+    return [
+        (
+            mask,
+            rtc.prepare(request, tuple(step for _mask, step in group), owner.index),
+        )
+        for mask, group in groupby(steps, key=lambda item: item[0])
+    ]
 
 
 def compile_statistics(

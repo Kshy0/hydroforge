@@ -57,7 +57,10 @@ class RingSlots:
 
 
 def plan_output_batches(
-    step_bytes: Mapping[str, int], *, max_pending_steps: int
+    step_bytes: Mapping[str, int],
+    *,
+    max_pending_steps: int,
+    background_writes: bool = True,
 ) -> dict[str, tuple[int, int]]:
     """Return each output's ``(depth, batch)`` for :data:`RING_BYTES`.
 
@@ -66,16 +69,18 @@ def plan_output_batches(
     batch`` never exceeds ``max_pending_steps``, so up to that many steps wait
     for their append while the model runs ahead.  Over the ring budget the
     largest outputs first give up slots (down to two, which still overlap
-    filling and appending), then halve their batch.  Outputs too large even
-    for one-row slots keep that layout: their ring exceeds the budget and is
-    not page-locked.
+    filling and appending), then halve their batch. In-process writes use
+    one slot because appending blocks the owner; their next fill waits for
+    that append. Outputs too large even for one-row slots keep that layout:
+    their ring exceeds the budget and is not page-locked.
     """
 
     plans = {}
     for name, size in step_bytes.items():
         batch = min(MAX_BATCH, max_pending_steps, RING_BYTES // max(1, 2 * size))
         batch = max(1, batch)
-        plans[name] = [max(1, max_pending_steps // batch), batch]
+        depth = max(1, max_pending_steps // batch) if background_writes else 1
+        plans[name] = [depth, batch]
 
     def footprint(name: str) -> int:
         depth, batch = plans[name]

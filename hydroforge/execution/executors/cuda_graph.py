@@ -18,7 +18,7 @@ from hydroforge.execution.executors.eager import (
     EagerPredicate,
 )
 from hydroforge.execution.loops import distributed_capture_safe
-from hydroforge.execution.operators import launch_operators
+from hydroforge.execution.operators import launch_operators, rollback_tensors
 from hydroforge.kernels.backends.cuda_control import (
     StatisticsControls,
     control_requests,
@@ -53,11 +53,7 @@ def _capture_runs(
     ):
         group = tuple(group)
         if safe:
-            writes = tuple(
-                dict.fromkeys(
-                    tensor for operator in group for tensor in operator.writes
-                )
-            )
+            writes = rollback_tensors(group)
             runs.append((True, partial(launch_operators, group, values), writes))
         else:
             runs.extend((False, operator.launch, operator.writes) for operator in group)
@@ -65,8 +61,8 @@ def _capture_runs(
 
 
 class CudaGraphExecutor(LoopExecutor):
-    """Capture CUDA graphs: a fixed loop replays one iteration graph per
-    iteration, and conditional WHILE graphs run adaptive and predicate loops
+    """Capture CUDA graphs: fixed loops replay bounded batches of iterations,
+    and conditional WHILE graphs run adaptive and predicate loops
     whole on the device.
 
     Captures run on one side stream and allocate from one graph pool owned by
@@ -328,7 +324,7 @@ class CudaGraphExecutor(LoopExecutor):
     def outer(self, program: Any) -> Any:
         if not program.cuda_graph_capture_safe:
             return DirectRunner(program.launch)
-        return self.repeated(program.launch, mutated_state=program.mutated_tensors)
+        return self.repeated(program.launch, mutated_state=program.rollback_tensors)
 
     def repeated(
         self, body: Callable[[], None], *, mutated_state: tuple[Any, ...]
@@ -395,14 +391,20 @@ class _Repeated:
 
 
 class _Fixed:
-    """Host replay of a fixed loop: one iteration graph launch per iteration,
-    the last one of a loop with a final tail from its own graph."""
+    """Replay a fixed loop in batches, with a separate final-tail graph.
+
+    Eight iterations amortize host launches without capturing a graph for
+    every dynamic loop count. Each statistics binding has at most three
+    graphs: one iteration, one batch, and the optional final iteration.
+    """
+
+    batch_size = 8
 
     def __init__(self, executor: CudaGraphExecutor, loop: Any) -> None:
         self.executor = executor
         self.loop = loop
-        # (folds statistics, final) -> (statistics launch, iteration graph)
-        self.iterations: dict[tuple[bool, bool], tuple[Any, Any]] = {}
+        # (folds statistics, final, repetitions) -> (statistics launch, graph)
+        self.iterations: dict[tuple[bool, bool, int], tuple[Any, Any]] = {}
         # A folded sample weighs the exact width, like a host sample; the
         # loop's own width has the model dtype.
         with _disable_current_modes(), torch.inference_mode(False):
@@ -425,23 +427,30 @@ class _Fixed:
                 self.width.fill_(width)
                 self._width = width
             step.statistics.prelaunch()
-        regular = self._iteration(launch, final=False)
-        if loop.final is None:
-            for _ in range(count):
-                regular.replay()
-        else:
-            final = self._iteration(launch, final=True)
-            for _ in range(count - 1):
-                regular.replay()
+        batches, remainder = divmod(
+            count - int(loop.final is not None), self.batch_size
+        )
+        regular = self._iteration(launch, final=False) if remainder else None
+        batch = (
+            self._iteration(launch, final=False, repetitions=self.batch_size)
+            if batches
+            else None
+        )
+        final = self._iteration(launch, final=True) if loop.final is not None else None
+        for _ in range(batches):
+            batch.replay()
+        for _ in range(remainder):
+            regular.replay()
+        if final is not None:
             final.replay()
         if step.sampling and not fold:
             step.sample(first=count == 1, last=True, weight=duration)
         return count
 
-    def _iteration(self, launch: Any, *, final: bool) -> Any:
-        """Capture one iteration; ``launch`` folds a statistics sample into it."""
+    def _iteration(self, launch: Any, *, final: bool, repetitions: int = 1) -> Any:
+        """Capture ordered iterations with their optional statistics samples."""
 
-        key = (launch is not None, final)
+        key = (launch is not None, final, repetitions)
         cached = self.iterations.get(key)
         if cached is not None:
             if cached[0] is launch:
@@ -453,19 +462,24 @@ class _Fixed:
         programs = loop.programs if final else (loop.body,)
 
         def body() -> None:
-            for program in programs:
-                program.launch()
-            if launch is not None:
-                executor.fixed_statistics_end(loop, launch, self.width)
-                launch(-1)
-            elif loop.controlled:
-                executor.fixed_end(loop)
+            for _ in range(repetitions):
+                for program in programs:
+                    program.launch()
+                if launch is not None:
+                    executor.fixed_statistics_end(loop, launch, self.width)
+                    launch(-1)
+                elif loop.controlled:
+                    executor.fixed_end(loop)
 
         graph = executor.capture(
             body,
             mutated_state=(
                 *((loop.controls,) if launch is not None or loop.controlled else ()),
-                *(tensor for program in programs for tensor in program.mutated_tensors),
+                *(
+                    tensor
+                    for program in programs
+                    for tensor in program.rollback_tensors
+                ),
                 *(() if launch is None else launch.mutated),
             ),
         )
@@ -623,8 +637,8 @@ class _Adaptive:
             reset=loop.reset,
             state=(
                 *loop.control_state,
-                *loop.proposal.mutated_tensors,
-                *loop.body.mutated_tensors,
+                *loop.proposal.rollback_tensors,
+                *loop.body.rollback_tensors,
                 *(() if launch is None else launch.mutated),
             ),
         )
@@ -666,7 +680,7 @@ class _Predicate:
         self.graph = executor.conditional_graph(
             body,
             reset=loop.reset,
-            state=(*loop.control_state, *loop.body.mutated_tensors),
+            state=(*loop.control_state, *loop.body.rollback_tensors),
         )
         return self.graph
 

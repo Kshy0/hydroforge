@@ -430,7 +430,8 @@ def computed_tensor_field(
                     ensemble_size > 1; never checkpointed)
                   - 'shared_state': Reconstructed runtime state (NEVER batched
                     or checkpointed)
-                  - 'virtual': Computed on-demand during analysis/output (not stored in memory)
+                  - 'virtual': Allocated on demand or evaluated as an output
+                    expression; buffer fields may be shared or member-batched
         expr: Expression string for virtual variables
         depends_on: Module name, or names, that must all be active before this
             computed tensor is evaluated or validated.
@@ -1040,11 +1041,15 @@ class AbstractModule(HydroForgeModel, ABC):
         ``initialize_model_state`` method can request a module's internal
         workspace through this small, schema-aware API instead of reaching
         through the controller with private ``_ = module.field`` accesses.
-        Modules do not receive an implicit initialization callback.
+        Computed buffers are checked against their declared shape, dtype,
+        device and contiguous layout. Modules do not receive an implicit
+        initialization callback.
         """
 
+        fields = self.spec().tensor_fields
         for field_name in field_names:
-            if self._tensor_metadata(field_name) is None:
+            field = fields.get(field_name)
+            if field is None and self._tensor_metadata(field_name) is None:
                 raise KeyError(f"Unknown tensor field {self.module_name}.{field_name}")
             if not self._is_tensor_field_active(field_name):
                 raise ValueError(
@@ -1055,6 +1060,8 @@ class AbstractModule(HydroForgeModel, ABC):
                 raise ValueError(
                     f"Active field {self.module_name}.{field_name} resolved to None"
                 )
+            if field is not None and field.computed:
+                self._tensors._validate_computed_field(field, value)
 
 
 def construct_module(

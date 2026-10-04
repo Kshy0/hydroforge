@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
-from functools import cache
+from collections.abc import Iterable, Mapping, Sequence
+from functools import cache, partial
 from importlib.metadata import distributions
 from inspect import signature
 from pathlib import Path
@@ -22,6 +23,7 @@ import numpy as np
 from netCDF4 import Dataset
 from pydantic import BeforeValidator, Field, validate_call
 
+from hydroforge.core.errors import cleanup_on_exit
 from hydroforge.core.validation import FrozenMapping, HydroForgeModel
 from hydroforge.io.netcdf.encoding import BOOL_LOGICAL_DTYPE
 
@@ -238,19 +240,23 @@ def _start_blosc_probe_locked() -> None:
             text=True,
         )
     except BaseException:
-        directory.cleanup()
-        raise
+        with cleanup_on_exit("Blosc capability probe startup", (directory.cleanup,)):
+            raise
     _blosc_probe = (process, directory)
 
 
-def start_blosc_zstd_probe() -> None:
-    """Start the Blosc probe child early; its verdict is collected on first use."""
+def start_blosc_zstd_probe(
+    options: Iterable[Mapping[str, Any]] = (DEFAULT_NETCDF_OPTIONS,),
+) -> None:
+    """Start early only when a planned variable requests the preferred filter."""
 
+    if not any(_uses_default_blosc_zstd_profile(value) for value in options):
+        return
     with _blosc_probe_lock:
         _start_blosc_probe_locked()
 
 
-def _probe_blosc_zstd_filter() -> bool:
+def _probe_blosc_zstd_filter(*, start_if_needed: bool = True) -> bool:
     """Verify that the active NetCDF/HDF5 stack can store any Blosc chunk.
 
     The first caller collects the probe under the lock; concurrent callers
@@ -261,6 +267,8 @@ def _probe_blosc_zstd_filter() -> bool:
     with _blosc_probe_lock:
         if _blosc_probe_verdict is not None:
             return _blosc_probe_verdict
+        if _blosc_probe is None and not start_if_needed:
+            return False
         try:
             _start_blosc_probe_locked()
         except (OSError, subprocess.SubprocessError):
@@ -268,17 +276,24 @@ def _probe_blosc_zstd_filter() -> bool:
             return False
         process, directory = _blosc_probe
         _blosc_probe = None
-        try:
-            stdout, _stderr = process.communicate(timeout=120)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
-            _blosc_probe_verdict = False
-            return False
-        finally:
-            directory.cleanup()
-        _blosc_probe_verdict = process.returncode == 0 and stdout.strip() == "ok"
+        with cleanup_on_exit("Blosc capability probe", (directory.cleanup,)):
+            try:
+                stdout, _stderr = process.communicate(timeout=120)
+            except BaseException as error:
+                _blosc_probe_verdict = False
+                with cleanup_on_exit(
+                    "Blosc capability probe child", (process.kill, process.communicate)
+                ):
+                    if not isinstance(error, subprocess.TimeoutExpired):
+                        raise
+            else:
+                _blosc_probe_verdict = (
+                    process.returncode == 0 and stdout.strip() == "ok"
+                )
         return _blosc_probe_verdict
+
+
+atexit.register(partial(_probe_blosc_zstd_filter, start_if_needed=False))
 
 
 def _resolve_compression_options(
@@ -288,7 +303,7 @@ def _resolve_compression_options(
     dimensions: Sequence[str],
     options: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Resolve the default Blosc-Zstd profile with a portable zlib fallback."""
+    """Resolve the default profile to usable Blosc, native Zstd, then zlib."""
 
     resolved = dict(options)
     if not _uses_default_blosc_zstd_profile(resolved):
@@ -309,8 +324,21 @@ def _resolve_compression_options(
         and _probe_blosc_zstd_filter()
     ):
         return resolved
+    has_filter = getattr(dataset, "has_zstd_filter", None)
+    try:
+        zstd_available = (
+            bool(getattr(_netcdf4, "__has_zstandard_support__", False))
+            and callable(has_filter)
+            and bool(has_filter())
+        )
+    except (OSError, RuntimeError):
+        zstd_available = False
     resolved.pop("blosc_shuffle", None)
-    resolved.update(_ZLIB_FALLBACK_OPTIONS)
+    resolved.update(
+        {"compression": "zstd", "complevel": 1}
+        if zstd_available
+        else _ZLIB_FALLBACK_OPTIONS
+    )
     return resolved
 
 
@@ -324,8 +352,8 @@ def create_netcdf_variable(
 ):
     """Create a variable from :func:`prepare_netcdf_variable_options` options.
 
-    The default Blosc-Zstd profile falls back to zlib where this NetCDF stack
-    cannot store every Blosc chunk.
+    Where this stack cannot store every Blosc chunk, the default falls back
+    to native Zstd level 1 when available, otherwise portable zlib level 4.
     """
 
     dims = tuple(dimensions)
@@ -497,7 +525,7 @@ def plan_streaming_netcdf_chunks(
     write_batch_size: _PositiveChunkCount,
     target_bytes: _PositiveChunkCount = DEFAULT_NETCDF_CHUNK_BYTES,
 ) -> dict[str, Any]:
-    """Add an aligned streaming chunk layout unless the caller chose one."""
+    """Plan aligned streaming chunks and their cache unless the caller chose one."""
 
     normalized = dict(options)
     if "chunksizes" in normalized or normalized.get("contiguous") is True:
@@ -529,6 +557,13 @@ def plan_streaming_netcdf_chunks(
         )
         time_chunk = max(time_chunk, minimum_time)
     normalized["chunksizes"] = (time_chunk, *spatial_chunks)
+    # Appends fill spatial chunks and revisit at most the final time chunk
+    # after a partial flush. A bounded cache avoids retaining many completed
+    # chunks on every open output variable. Explicit layouts/budgets stay as-is.
+    normalized.setdefault(
+        "chunk_cache",
+        max(target_bytes, math.prod(normalized["chunksizes"]) * storage.itemsize),
+    )
     return normalized
 
 
