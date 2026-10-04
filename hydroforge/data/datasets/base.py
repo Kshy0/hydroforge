@@ -80,17 +80,26 @@ def _check_forcing_tensors(
     device: torch.device | None,
     sequence: bool,
     label: str,
+    integer_fields: frozenset[str] = frozenset(),
 ) -> None:
-    """Check the structure, shape, dtype and device of one forcing batch."""
+    """Check one forcing batch, with optional top-level int64 field names."""
+
+    if integer_fields and not isinstance(value, Mapping):
+        raise ValueError(f"{label} integer_output_fields require a mapping")
 
     if isinstance(value, Mapping):
         if not value or any(type(name) is not str or not name for name in value):
             raise ValueError(f"{label} keys must be non-empty exact strings")
+        absent = integer_fields.difference(value)
+        if absent:
+            raise ValueError(
+                f"{label} is missing integer_output_fields: {sorted(absent)!r}"
+            )
         for name, block in value.items():
             _check_forcing_tensors(
                 block,
                 columns=columns,
-                dtype=dtype,
+                dtype=torch.int64 if name in integer_fields else dtype,
                 device=device,
                 sequence=sequence,
                 label=f"{label}.{name}",
@@ -460,6 +469,7 @@ class ForcingDataset(HydroForgeModel, ABC):
                 device=None,
                 sequence=True,
                 label=label,
+                integer_fields=type(self).integer_output_fields,
             )
             return
         self._require_mapping(mapping, caller="shard_forcing()")

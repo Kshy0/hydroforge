@@ -7,7 +7,7 @@ the call sink of a managed step outside recordings, where it launches at once.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from math import prod
@@ -64,6 +64,8 @@ class KernelBinder:
         self._complete_cache: dict[int, tuple[Any, Mapping[str, Any], Mapping]] = {}
         self._launch_cache: dict[int, tuple[Any, Any]] = {}
         self._workspaces: dict[str, tuple[KernelWorkspace, torch.Tensor | None]] = {}
+        # Retain the source objects as well as identities to prevent ID reuse.
+        self._workspace_sources: dict[int, torch.Tensor] = {}
 
     def invalidate(self) -> None:
         """Drop bindings whose scalar specializations may have changed."""
@@ -71,6 +73,11 @@ class KernelBinder:
         self._complete_cache.clear()
         self._launch_cache.clear()
         self._workspaces.clear()
+        self._workspace_sources.clear()
+
+    def content_requires_rebind(self, tensors: Iterable[torch.Tensor]) -> bool:
+        """Whether a content transaction changes a cached CSR dependency."""
+        return any(id(tensor) in self._workspace_sources for tensor in tensors)
 
     def call(self, registry: BackendRegistry, supplied: dict[str, Any]) -> None:
         """Launch one call of a managed step outside any recording."""
@@ -344,6 +351,7 @@ class KernelBinder:
                     f"workspace {declaration.key!r} shape disagrees with its topology"
                 )
             tensor = result.to(device=plan.device, dtype=dtype)
+            self._workspace_sources[id(source)] = source
         self._workspaces[declaration.key] = (declaration, tensor)
         return tensor
 

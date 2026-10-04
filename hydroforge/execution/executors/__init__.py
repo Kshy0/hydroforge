@@ -30,7 +30,9 @@ def select_executor(plan: Any) -> LoopExecutor:
         capture = plan.backend.capture
         expected = {"cuda_graph": "cuda", "metal_icb": "mps"}.get(capture)
         if expected is not None and device.type != expected:
-            raise ValueError(f"{capture} requires a {expected} device")
+            # Capture is an auto-mode preference, not a backend device contract.
+            # In particular, Triton also supports XPU without CUDA graphs.
+            return EagerExecutor(device, **options)
         if capture == "cuda_graph" and conditional_graphs(device):
             return CudaGraphExecutor(device, **options)
         if capture == "metal_icb":

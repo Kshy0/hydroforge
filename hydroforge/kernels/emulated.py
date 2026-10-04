@@ -259,6 +259,8 @@ def _pointwise(op, a, b=0.0):
     boolean = op in {"lt", "le", "eq", "ne", "gt", "ge"}
     dtype = torch.bool if boolean else torch.float32 if op == "convert" else torch.int64
     out = torch.empty(a.shape, dtype=dtype, device=a.device)
+    if a.numel() == 0:
+        return out if boolean or op == "convert" else EmulatedTensor(out)
     launch = _program(op, scalar).specialize(
         {
             "x": a.carrier,
@@ -275,7 +277,9 @@ def _pointwise(op, a, b=0.0):
     try:
         launch()
     finally:
-        launch.close()
+        close = getattr(launch, "close", None)
+        if callable(close):
+            close()
     return out if boolean or op == "convert" else EmulatedTensor(out)
 
 

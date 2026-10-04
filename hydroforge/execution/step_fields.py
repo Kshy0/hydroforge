@@ -53,6 +53,18 @@ def _upload(destination: torch.Tensor, source: torch.Tensor) -> None:
         destination.copy_(source)
 
 
+def _validate_provider_value(source: str, value: int | float, dtype: torch.dtype) -> None:
+    """Validate each demanded representation independently of provider caching."""
+    if dtype in {torch.int32, torch.int64}:
+        limits = torch.iinfo(dtype)
+        if type(value) is not int or not limits.min <= value <= limits.max:
+            raise ValueError(
+                f"provider {source!r} must return an integer within {dtype} range"
+            )
+    else:
+        normalize_floating_scalar(f"provider {source!r}", value, dtype)
+
+
 @dataclass
 class _StepFieldStorage:
     host: torch.Tensor
@@ -298,6 +310,9 @@ class StepFieldRuntime:
                 "index" if dtype == torch.int64 else str(dtype).removeprefix("torch.")
             )
             self.backend.validate_scalars("step fields", {field.source: kind})
+            if field.source in self.providers and field.source in self.values:
+                # Reject a new, incompatible demand before allocating its buffer.
+                _validate_provider_value(field.source, self.values[field.source], dtype)
         if not self._calendar_available and any(
             source in _BUILTIN_STEP_FIELDS and source != "step_seconds"
             for source in demanded
@@ -341,21 +356,14 @@ class StepFieldRuntime:
             for source in dict.fromkeys(source for source, _dtype in self.buffers)
             if source in self.providers and source not in self.values
         }
-        if custom:
-            checked = _StepFieldValues(values=custom).values
-            for source, dtype in self.buffers:
-                if source not in checked:
-                    continue
-                value = checked[source]
-                if dtype in {torch.int32, torch.int64}:
-                    limits = torch.iinfo(dtype)
-                    if type(value) is not int or not limits.min <= value <= limits.max:
-                        raise ValueError(
-                            f"provider {source!r} must return an integer within {dtype} range"
-                        )
-                else:
-                    normalize_floating_scalar(f"provider {source!r}", value, dtype)
-            self.values.update(checked)
+        checked = _StepFieldValues(values=custom).values if custom else {}
+        values = {**self.values, **checked}
+        for source, dtype in self.buffers:
+            if source in self.providers:
+                # A value may have been evaluated earlier in this invocation
+                # under a different dtype demand. Revalidate before any upload.
+                _validate_provider_value(source, values[source], dtype)
+        self.values.update(checked)
 
     def _upload_custom(self) -> None:
         dtypes = set()

@@ -528,7 +528,7 @@ def commit_content_update(
     runtime: ModelRuntime,
     bindings: Iterable[tuple[torch.Tensor, torch.Tensor]],
 ) -> StructuralUpdateResult:
-    """Copy same-shape declared tensors without invalidating captured execution."""
+    """Copy same-shape tensors; rebuild captures if cached CSR inputs change."""
     return _commit_content_update(runtime, _tensor_pairs(bindings))
 
 
@@ -570,6 +570,15 @@ def _commit_content_update(
                 "address-stable content update would change the layout of a "
                 "derived reference index"
             )
+
+    if runtime.execution.kernel_binding.content_requires_rebind(
+        current for current, _ in (*pairs, *derived)
+    ):
+        # Address stability does not imply validity of derived CSR contents.
+        # Reuse the full transaction, retaining the caller's content-copy policy.
+        return _commit_structural_update(
+            runtime, pairs, content_ids=frozenset(replacements)
+        )
 
     bindings = runtime.parameters.prepare_rebind(replacements)
     statistics = runtime.statistics

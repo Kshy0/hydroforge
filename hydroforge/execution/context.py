@@ -119,9 +119,26 @@ def validate_synchronous_function(function: Callable, *, decorator: str) -> None
             or inspect.isasyncgenfunction(implementation)
         )
 
-    implementation = function if inspect.isroutine(function) else function.__call__
-    if is_deferred(inspect.unwrap(implementation, stop=is_deferred)):
-        raise ValueError(f"{decorator} requires a synchronous non-generator function")
+    implementation = function
+    seen: set[int] = set()
+    while True:
+        if id(implementation) in seen:
+            raise ValueError(f"{decorator} has a cyclic callable wrapper")
+        seen.add(id(implementation))
+        if is_deferred(implementation):
+            raise ValueError(
+                f"{decorator} requires a synchronous non-generator function"
+            )
+        # Preserve partial's wrapped function before falling back to __call__.
+        # Inspecting partial.__call__ loses coroutine/generator information.
+        if isinstance(implementation, partial):
+            implementation = implementation.func
+        elif hasattr(implementation, "__wrapped__"):
+            implementation = implementation.__wrapped__
+        elif not inspect.isroutine(implementation):
+            implementation = implementation.__call__
+        else:
+            return
 
 
 def validate_callback(function: Callable | None, *, arguments: int, label: str) -> None:

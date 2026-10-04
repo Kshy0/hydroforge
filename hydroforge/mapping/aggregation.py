@@ -41,6 +41,7 @@ from hydroforge.core.arrays import (
 from hydroforge.core.naming import validate_netcdf_name, validate_safe_path_component
 from hydroforge.core.time import canonical_calendar
 from hydroforge.core.validation import HydroForgeModel
+from hydroforge.io.netcdf.encoding import COMPLETE_DATA_ATTR
 from hydroforge.io.netcdf.options import (
     NetCDFOptions,
     create_netcdf_variable,
@@ -493,5 +494,6 @@ def aggregate_field_to_nc(
             out_var[:, :] = aggregated
         else:
             out_var[:] = aggregated[0]
+        out_var.setncattr(COMPLETE_DATA_ATTR, "true")
 
     return nc_path
