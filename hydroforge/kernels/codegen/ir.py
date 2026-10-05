@@ -360,10 +360,16 @@ class ForK:
 
 @dataclass(frozen=True, slots=True)
 class While:
-    """Repeat ``body`` while ``condition`` holds; one-lane kernels only."""
+    """Repeat ``body`` while ``condition`` holds.
+
+    By default this is a one-lane control loop. ``per_lane`` explicitly
+    permits independent loops in scalar-thread C-family kernels (e.g. CSR).
+    Vectorized printers must reject that form unless they implement masks.
+    """
 
     condition: Expr
     body: tuple[Stmt, ...]
+    per_lane: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -560,7 +566,7 @@ def validate_function(function: KernelFunction) -> None:
                     raise ValueError("loop variable shadows an existing variable")
                 statements(node.body, {**scope, node.var.name: node.var.type})
             elif isinstance(node, While):
-                if lanes:
+                if lanes and not node.per_lane:
                     raise ValueError("While requires a one-lane kernel")
                 expression(node.condition, scope)
                 statements(node.body, scope)

@@ -168,9 +168,13 @@ def _cuda_entry(function: KernelFunction, body: Sequence[str]) -> list[str]:
     ]
 
 
-def _msl_entry(function: KernelFunction, body: Sequence[str]) -> list[str]:
+def _msl_entry(
+    function: KernelFunction, body: Sequence[str], *, emulated: bool = False
+) -> list[str]:
     fields, locals_ = [], []
-    for index, (name, access, native) in enumerate(msl_arguments(function)):
+    for index, (name, access, native) in enumerate(
+        msl_arguments(function, emulated=emulated)
+    ):
         if access is None:
             spelled = scalar(native, "msl")
             fields.append(f"    constant {spelled}* {name} [[id({index})]];")
@@ -194,7 +198,9 @@ def _msl_entry(function: KernelFunction, body: Sequence[str]) -> list[str]:
     ]
 
 
-def msl_arguments(function: KernelFunction) -> tuple[tuple[str, str | None, str], ...]:
+def msl_arguments(
+    function: KernelFunction, *, emulated: bool = False
+) -> tuple[tuple[str, str | None, str], ...]:
     """The MSL argument buffer of ``function``: ``(field, access, native)``.
 
     ``native`` is a buffer's pointee type, atomic for ``atomic_add``, or a
@@ -206,8 +212,16 @@ def msl_arguments(function: KernelFunction) -> tuple[tuple[str, str | None, str]
         if param.access is None:
             fields.append((identifier(param), None, scalar_kind(param.type)))
             continue
-        native = element(param.type, "msl")
+        native = (
+            "hf_hp"
+            if emulated and param.type == torch.float64
+            else element(param.type, "msl")
+        )
         if param.access == "atomic_add":
+            if native == "hf_hp":
+                raise TypeError(
+                    "encoded Metal accumulation requires destination-owned writes"
+                )
             native = f"atomic_{native}"
         fields.append((identifier(param), param.access, native))
     return tuple(fields)

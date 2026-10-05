@@ -9,7 +9,7 @@ from functools import cache
 from pathlib import Path
 
 import torch
-from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._python_dispatch import TorchDispatchMode, return_and_correct_aliasing
 from torch.utils._pytree import tree_map
 
 from hydroforge.kernels import float32x2
@@ -81,6 +81,30 @@ class EmulatedTensor(torch.Tensor):
         raw_kwargs = tree_map(unwrap, kwargs)
         first = tensors[0]
         op = func._schema.name.removeprefix("aten::")
+        if op == "set_":
+            destination = args[0]
+            other = args[1] if len(args) > 1 else kwargs.get("source")
+            if (
+                func is not torch.ops.aten.set_.source_Tensor
+                or not isinstance(destination, cls)
+                or not isinstance(other, cls)
+            ):
+                raise TypeError(
+                    "encoded set_ requires an encoded tensor source and destination"
+                )
+            if destination.device != other.device:
+                raise ValueError("encoded set_ cannot change device")
+            # Retain an independent Tensor object aliasing the replacement's
+            # storage. Mutating the old carrier's metadata would also corrupt
+            # wrappers that hold that same carrier object. Existing views must
+            # keep their original storage, just like ordinary Tensor.set_.
+            carrier = other.carrier.detach()
+            # PyTorch's wrapper helper redispatches the inplace-view metadata
+            # operation under no-dispatch with the Meta key enabled. It updates
+            # shape/strides/offset without requesting native MPS float64 data.
+            result = return_and_correct_aliasing(func, args, kwargs, destination)
+            destination.carrier = carrier
+            return result
         if op in {
             "detach",
             "clone",
@@ -240,6 +264,7 @@ kernel void pointwise(constant Args& args [[buffer(0)]], uint i [[thread_positio
             MetalArgument("n", None, "index"),
         ),
         extent=("n",),
+        encoding="float32x2",
     )
 
 

@@ -438,6 +438,11 @@ def _aggregate_hires_coo(
     """
 
     catchment_idx = find_indices_in(pixel_catchment_id, target_ids)
+    selected = catchment_idx != -1
+    catchment_idx = catchment_idx[selected]
+    pixel_lon = pixel_lon[selected]
+    pixel_lat = pixel_lat[selected]
+    pixel_area = pixel_area[selected]
     try:
         source_idx = source._index_of_points(
             pixel_lon,

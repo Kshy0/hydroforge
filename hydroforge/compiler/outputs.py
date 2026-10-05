@@ -92,10 +92,6 @@ class StatisticsDeclarationCompiler:
 
     def metadata(self, name: str) -> tuple[Any, ...]:
         tensor = self.fields[name].tensor
-        if self.selection.metal_emulation != "native" and tensor.dtype == "hpfloat":
-            raise ValueError(
-                "statistics of emulated hpfloat fields are not implemented; CPU checkpoint export remains available"
-            )
         coordinate = tensor.dim_coords
         if coordinate:
             coordinate = coordinate.split(".")[-1]

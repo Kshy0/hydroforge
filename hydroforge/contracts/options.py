@@ -5,17 +5,30 @@ from __future__ import annotations
 import math
 from collections import Counter
 from collections.abc import Mapping
+from contextvars import ContextVar
 from copy import deepcopy
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Self
 
-from pydantic import ConfigDict, Field, PrivateAttr, create_model, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    ModelWrapValidatorHandler,
+    PrivateAttr,
+    ValidationInfo,
+    create_model,
+    field_validator,
+    model_validator,
+)
 from pydantic.fields import FieldInfo
 
 from hydroforge.core.validation import HydroForgeModel
 
 _OPTIONS_METADATA = "hydroforge_options"
+_BOOL_INPUTS: ContextVar[set[str] | None] = ContextVar(
+    "options_bool_inputs", default=None
+)
 
 
 def _choice_token(value: Any, *, label: str) -> str:
@@ -175,6 +188,39 @@ class OptionsConfig(HydroForgeModel):
     """Immutable nested model options, separate from tensor input."""
 
     model_config = ConfigDict(strict=False)
+    _coerced_bool_fields: frozenset[str] = PrivateAttr(default=frozenset())
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _remember_bool_inputs(
+        cls, value: Any, handler: ModelWrapValidatorHandler
+    ) -> Self:
+        # Keep legacy option coercion. Only options later used for field
+        # activation reject coerced Boolean inputs; nested records have their
+        # own construction-local collector (also safe for concurrent models).
+        if isinstance(value, cls):
+            return handler(value)
+        coerced: set[str] = set()
+        token = _BOOL_INPUTS.set(coerced)
+        try:
+            result = handler(value)
+        finally:
+            _BOOL_INPUTS.reset(token)
+        result._coerced_bool_fields = frozenset(coerced)
+        return result
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _record_bool_input(cls, value: Any, info: ValidationInfo) -> Any:
+        collector = _BOOL_INPUTS.get()
+        if (
+            collector is not None
+            and cls.model_fields[info.field_name].annotation is bool
+            and type(value) is not bool
+        ):
+            collector.add(info.field_name)
+        return value
+
     _forcing_rules: (
         tuple[tuple[str, str, frozenset[str], frozenset[str]], ...] | None
     ) = PrivateAttr(default=None)

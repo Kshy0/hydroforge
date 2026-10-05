@@ -2,7 +2,14 @@
 
 The trailing pair is physical storage, not a model axis. Ordinary Torch
 arithmetic must not operate on the encoded values. Unlike binary64 this
-representation retains the FP32 exponent range.
+representation retains the FP32 exponent range. The low limb loses precision
+near the FP32 subnormal range, and Metal may flush subnormals to zero; roughly
+48 significand bits are therefore not guaranteed for very small values.
+Arithmetic uses round-to-nearest with fast math and contraction disabled.
+MSL hp-to-integer casts explicitly truncate toward zero, saturate outside the
+integer range, and map NaN to zero; this is the encoded Metal cast policy.
+All integers through absolute 2**48 are represented exactly, but arbitrary
+64-bit integers may lose low bits on promotion.
 """
 
 from functools import cache
@@ -41,4 +48,6 @@ def decode(pairs: torch.Tensor) -> torch.Tensor:
     if pairs.dtype != torch.float32 or pairs.ndim == 0 or pairs.shape[-1] != 2:
         raise TypeError("float32x2 decoding requires float32 pairs in the last axis")
     values = pairs.detach().to(device="cpu", dtype=torch.float64, copy=True)
-    return values[..., 0] + values[..., 1]
+    hi, lo = values[..., 0], values[..., 1]
+    # IEEE addition of -0 and +0 would erase a stored negative zero.
+    return torch.where((hi == 0) & (lo == 0), hi, hi + lo)

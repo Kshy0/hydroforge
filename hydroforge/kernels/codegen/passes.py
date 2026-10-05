@@ -151,7 +151,7 @@ def _within(node: Stmt, rewrite: Callable[[Sequence[Stmt]], tuple[Stmt, ...]]):
         case ForK():
             return ForK(node.var, node.count, rewrite(node.body))
         case While():
-            return While(node.condition, rewrite(node.body))
+            return While(node.condition, rewrite(node.body), per_lane=node.per_lane)
         case Block():
             return Block(rewrite(node.body))
     return node

@@ -29,6 +29,7 @@ from hydroforge.kernels.codegen.ir import (
     Store,
     Var,
 )
+from hydroforge.kernels.codegen.msl import emulated_msl
 from hydroforge.kernels.metal import MetalArgument, MetalCommand, MetalProgram
 
 _REAL, _INT = torch.float32, torch.int32
@@ -36,11 +37,17 @@ _REAL, _INT = torch.float32, torch.int32
 
 @cache
 def _program(function: KernelFunction) -> MetalProgram:
+    emulated = any(param.type == torch.float64 for param in function.params)
+    printer = emulated_msl() if emulated else MSL
     return MetalProgram(
-        MSL.program((function,)),
+        printer.program((function,)),
         function.name,
-        tuple(MetalArgument(*field) for field in msl_arguments(function)),
+        tuple(
+            MetalArgument(*field)
+            for field in msl_arguments(function, emulated=emulated)
+        ),
         extent=(),
+        encoding="float32x2" if emulated else "native",
     )
 
 
@@ -65,8 +72,10 @@ def fixed_control_command(
 
 
 @cache
-def _statistics_control(sample_phase: SamplePhase) -> KernelFunction:
-    return statistics_control(sample_phase, _REAL, _REAL, fixed=False)
+def _statistics_control(
+    sample_phase: SamplePhase, source: torch.dtype, destination: torch.dtype
+) -> KernelFunction:
+    return statistics_control(sample_phase, source, destination, fixed=False)
 
 
 def statistics_control_command(
@@ -82,7 +91,7 @@ def statistics_control_command(
     """``sample_phase(flags, first, last)`` is the statistics phase rule."""
 
     return _command(
-        _statistics_control(sample_phase),
+        _statistics_control(sample_phase, weight_source.dtype, weight.dtype),
         weight_source=weight_source,
         continue_flag=continue_flag,
         counter=counter,

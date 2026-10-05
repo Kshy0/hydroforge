@@ -153,6 +153,7 @@ class _StatisticsBinder:
             in_memory=config.sink == "memory",
             result_device=config.result_device,
             save_precision=plan.output.save_dtype,
+            save_kernels=config.save_kernels,
             event_sink=runtime.event_sink,
         )
 

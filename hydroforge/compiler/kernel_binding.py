@@ -18,6 +18,7 @@ import torch
 
 from hydroforge.compiler.fields import BindingSource
 from hydroforge.compiler.selection import resolve_block_size
+from hydroforge.contracts.conditions import is_option_condition
 from hydroforge.contracts.fields import concrete_tensor_dtype
 from hydroforge.contracts.step_fields import StepField
 from hydroforge.kernels.spec import (
@@ -171,6 +172,36 @@ class KernelBindingPlan:
     def _gate(self, spec: KernelSpec, feature: str, disabled: Any, name: str) -> Source:
         enabled = self._compile_time(spec, feature)
         if isinstance(enabled, Fixed):
+            # A raw option flag is not the full field condition (mixed AND,
+            # required_by and output_only also affect residency). Fail once
+            # at binding rather than dispatch a true flag with a null pointer.
+            source = spec.compile_time_sources.get(feature)
+            if isinstance(source, ConfigValue) and name in spec.buffers:
+                field = name.removesuffix("_ptr")
+                conditioned = False
+                for module_name in self.plan.modules:
+                    module_spec = self.plan.spec.modules[module_name]
+                    index = module_spec.reference_indices.get(field)
+                    schema = module_spec.tensor_fields.get(
+                        index.reference if index is not None else field
+                    )
+                    if schema is not None and any(
+                        is_option_condition(item) for item in schema.tensor.depends_on
+                    ):
+                        conditioned = True
+                        break
+                if conditioned:
+                    # Multiple declarations may have one selected active owner.
+                    # Do not disable that owner because another declaration is
+                    # gated off; ordinary owner/dtype ambiguity still fails.
+                    active = bool(self.plan.fields.binding.get(field, ()))
+                    if enabled.value != active:
+                        return Unresolved(
+                            ValueError,
+                            f"{spec.name}.{name}: config feature {feature!r} disagrees "
+                            f"with complete field activation for {field!r}; "
+                            "use automatic optional binding or an activation-consistent feature",
+                        )
             if enabled.value:
                 return self._value(spec, name)
             return Fixed(disabled, "optional", feature)
@@ -213,7 +244,11 @@ class KernelBindingPlan:
             )
         if isinstance(source, (ConfigValue, OptionCode, LiteralValue)):
             if isinstance(source, ConfigValue):
-                value = plan.options.value(source.path)
+                value = (
+                    plan.conditions["options." + source.path]
+                    if "options." + source.path in plan.conditions
+                    else plan.options.value(source.path)
+                )
             elif isinstance(source, OptionCode):
                 value = plan.options.option_code(source.path)
             else:
@@ -304,7 +339,7 @@ class KernelBindingPlan:
             return self._global_dtype(name, field) if optional else None
         source = spec.compile_time_sources.get(feature)
         if not isinstance(source, (ModuleEnabled, ModuleFlag, OutputRequested)):
-            return None
+            return self._global_dtype(name, field) if optional else None
         module_spec = plan.spec.modules.get(source.module)
         if module_spec is None:
             return self._global_dtype(name, field) if optional else None

@@ -43,6 +43,7 @@ from hydroforge.io.netcdf.encoding import (
     BOOL_LOGICAL_DTYPE,
     COMPLETE_DATA_ATTR,
     LOGICAL_DTYPE_ATTR,
+    decoded_output_tensor,
     narrowing_flag,
     netcdf_dtype_encoding,
     raise_narrowing_failures,
@@ -1028,6 +1029,9 @@ class RankOutputWriter:
         rows: list[tuple[_OutputStream, int, int]] = []
         for name, storage in values.items():
             dtype = self._dtypes[name]
+            # Export logical values, never the integer hi/lo carrier. Take
+            # one decoded snapshot for all components and narrowing checks.
+            storage = decoded_output_tensor(storage)
             flag = narrowing_flag(storage, dtype, name=name)
             if flag is not None:
                 flags.append(flag)

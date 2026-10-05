@@ -168,7 +168,9 @@ class CudaSource(HydroForgeModel):
             def replace(match: re.Match[str]) -> str:
                 nonlocal backedges
                 name = match.group(1)
-                path = includes.get(name)
+                # The include spelling selects a declared file, never a new
+                # filesystem path. Root-relative resolution stays below.
+                path = includes.get(Path(name).name)
                 if path is None and root is not None:
                     path = (origin.parent / name).resolve()
                     if not path.is_relative_to(root):

@@ -10,7 +10,9 @@ from typing import Any, TypeVar
 from pydantic import ConfigDict, InstanceOf, validate_call
 
 from hydroforge.compiler.fields import bind_module_fields
+from hydroforge.contracts.conditions import resolve_conditions
 from hydroforge.contracts.fields import FieldDemandPlan
+from hydroforge.contracts.options import OptionsConfig
 from hydroforge.core.events import EventSink, NullEventSink
 from hydroforge.declare.module import AbstractModule, construct_module
 from hydroforge.declare.spec import ModuleBinding
@@ -28,6 +30,7 @@ def build_module(
     outputs: frozenset[str] = frozenset(),
     batched_forcing: frozenset[str] = frozenset(),
     event_sink: InstanceOf[EventSink] | None = None,
+    options: InstanceOf[OptionsConfig] | None = None,
 ) -> ModuleT:
     """Construct one module exactly as a model does, from explicit inputs.
 
@@ -71,11 +74,15 @@ def build_module(
         if field is None or field.tensor.category != "forcing":
             raise ValueError(f"batched_forcing {name!r} must name a forcing field")
     demand = FieldDemandPlan({spec.name: outputs}, {spec.name: outputs})
+    conditions = resolve_conditions(
+        (spec, *(type(module).spec() for module in siblings.values())), options
+    )
     plan = bind_module_fields(
         spec,
         opened,
         demand,
         batched_forcing,
+        conditions=conditions,
         module_specs={
             spec.name: spec,
             **{name: type(module).spec() for name, module in siblings.items()},

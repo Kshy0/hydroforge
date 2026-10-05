@@ -9,12 +9,17 @@ for ``model.results``; the NetCDF sink is
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any, Protocol
 
 import torch
 
-from hydroforge.io.netcdf.encoding import checked_narrowing, raise_narrowing_failures
+from hydroforge.io.netcdf.encoding import (
+    checked_narrowing,
+    decoded_output_tensor,
+    raise_narrowing_failures,
+)
+from hydroforge.kernels.emulated import EmulatedTensor
 
 
 class StatisticsSink(Protocol):
@@ -43,6 +48,9 @@ class MemorySink:
     """Retain every finalized sample as an owned tensor on ``device``.
 
     ``outputs`` maps each output to its storage shape and retained dtype.
+    CPU results are ordinary tensors. On MPS, declared ``encoded_outputs``
+    retained as float64 remain explicitly encoded tensors, including stacked
+    and empty results; other float64 results are rejected at construction.
     """
 
     def __init__(
@@ -50,22 +58,40 @@ class MemorySink:
         outputs: Mapping[str, tuple[tuple[int, ...], torch.dtype]],
         *,
         device: torch.device,
+        encoded_outputs: Collection[str] = (),
     ) -> None:
-        self.device = device
+        self.device = torch.device(device)
         self._layouts = dict(outputs)
+        self._encoded_outputs = frozenset(encoded_outputs)
+        if self.device.type == "mps":
+            for name, (_shape, dtype) in self._layouts.items():
+                if dtype == torch.float64 and name not in self._encoded_outputs:
+                    raise ValueError(
+                        f"statistics output {name!r}: float64 results on MPS "
+                        "require float32x2-encoded storage; use result_device='cpu' "
+                        "or save_precision='float32'"
+                    )
         self._results: dict[str, list[torch.Tensor]] = {name: [] for name in outputs}
 
     def append(self, dt: Any, values: Mapping[str, torch.Tensor]) -> None:
         # One host check covers every narrowed output of the sample.
         flags: list[tuple[torch.Tensor, str, str]] = []
-        converted = {
-            name: value.detach()
-            if self._layouts[name][1].itemsize > value.dtype.itemsize
-            else checked_narrowing(
-                value, self._layouts[name][1], name=name, flags=flags
+        converted = {}
+        for name, value in values.items():
+            dtype = self._layouts[name][1]
+            if self.device.type == "mps" and dtype == torch.float64:
+                if not isinstance(value, EmulatedTensor):
+                    raise TypeError(
+                        f"statistics output {name!r} requires encoded float64 storage"
+                    )
+                converted[name] = value.detach()
+                continue
+            source = decoded_output_tensor(value)
+            converted[name] = (
+                source
+                if dtype.itemsize > source.dtype.itemsize
+                else checked_narrowing(source, dtype, name=name, flags=flags)
             )
-            for name, value in values.items()
-        }
         raise_narrowing_failures(flags)
         copies = {}
         for name, value in converted.items():
@@ -90,8 +116,16 @@ class MemorySink:
                 value.clone(memory_format=torch.preserve_format) for value in values
             ]
         if values:
+            if isinstance(values[0], EmulatedTensor):
+                # Stacking is a bit-preserving layout operation, not encoded
+                # arithmetic. Stack owned carriers without decoding to FP32.
+                return EmulatedTensor(torch.stack([value.carrier for value in values]))
             return torch.stack(values, dim=0)
         shape, dtype = self._layouts[name]
+        if self.device.type == "mps" and dtype == torch.float64:
+            return EmulatedTensor(
+                torch.empty((0, *shape), dtype=torch.int64, device=self.device)
+            )
         return torch.empty((0, *shape), dtype=dtype, device=self.device)
 
     def get(

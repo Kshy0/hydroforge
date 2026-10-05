@@ -18,6 +18,7 @@ from pydantic import (
 )
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
+from hydroforge.contracts.conditions import conditions_satisfied, validate_condition
 from hydroforge.core.expr import parse_value_source
 from hydroforge.core.naming import DottedPath, Identifier
 from hydroforge.core.validation import (
@@ -47,7 +48,11 @@ def _unique_module_names(values: tuple[str, ...]) -> tuple[str, ...]:
 _ModuleNames: TypeAlias = Annotated[
     tuple[Identifier, ...], AfterValidator(_unique_module_names)
 ]
-TensorDependencies: TypeAlias = TensorName | _ModuleNames | None
+_Conditions: TypeAlias = Annotated[
+    tuple[Annotated[str, AfterValidator(validate_condition)], ...],
+    AfterValidator(_unique_module_names),
+]
+TensorDependencies: TypeAlias = str | _Conditions | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +167,7 @@ def tensor_is_active(
     opened_modules: Iterable[str],
     *,
     output_required: bool = False,
+    conditions: Mapping[str, bool] | None = None,
 ) -> bool:
     """Evaluate conditional tensor residency for one specialization.
 
@@ -175,7 +181,7 @@ def tensor_is_active(
     consumers = getattr(metadata, "required_by", ())
     output_only = getattr(metadata, "output_only", False)
     return (
-        all(dependency in opened for dependency in required)
+        conditions_satisfied(required, opened, conditions)
         and (not output_only or output_required)
         and (
             not consumers
@@ -315,7 +321,7 @@ class TensorMetadata:
     selects: TensorName | None = None
     replicated: bool = False
     output: TensorOutput = "auto"
-    depends_on: _ModuleNames = ()
+    depends_on: _Conditions = ()
     required_by: _ModuleNames = ()
     expression: str = ""
     output_only: bool = False

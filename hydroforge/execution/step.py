@@ -77,7 +77,10 @@ class StepContext:
         self.clock = runtime.clock
         self.mesh = plan.parallel
         self.statistics = runtime.statistics
-        self.options_key = plan.options.specialization_key()
+        self.options_key = (
+            plan.options.specialization_key(),
+            tuple(sorted(plan.conditions.items())),
+        )
         self.invocation: ManagedStep | None = None
         self.scopes: list[str] = []
         self.owner: Any = None

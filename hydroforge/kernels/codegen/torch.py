@@ -525,6 +525,10 @@ class _Kernel(TorchPrinter):
                     self.kinds[node.var.name] = _PYTHON
                     lines.append(f"{indent}for {node.var.name} in range({node.count}):")
                     lines.extend(self.block(node.body, depth + 1))
+                case While(per_lane=True):
+                    raise TypeError(
+                        "Torch vectorized printer cannot lower per-lane While"
+                    )
                 case While() if self.predicate is not None:
                     raise TypeError(f"a loop under a per-lane condition: {node!r}")
                 case While():

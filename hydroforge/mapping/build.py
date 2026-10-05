@@ -254,6 +254,7 @@ def _cama_hires_mapping(
             nextxy_data,
             source,
             allow_oob=allow_oob_zero,
+            target_ids=target_ids,
             hires_tag=hires_tag,
             mapinfo_txt=mapinfo_txt,
             hires_idx_precision=hires_idx_precision,

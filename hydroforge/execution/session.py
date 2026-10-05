@@ -248,6 +248,16 @@ class ModelRuntime:
     def _preflight(self) -> None:
         """Prove every rank will materialize the same declaration and inputs."""
 
+        # Resolve rank agreement without constructing an InputBinding.
+        from hydroforge.execution.signatures import field_selection_signature
+
+        failures = self.channel.gather(
+            None,
+            phase="runtime.materialization.field_selection",
+            signature=field_selection_signature(self),
+        )
+        if any(failure is not None for failure in failures):
+            raise distributed_failure_error("distributed field selection", failures)
         signature: tuple[Any, ...] | None = None
         local_error: BaseException | None = None
         try:
