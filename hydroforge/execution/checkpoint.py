@@ -265,6 +265,18 @@ class CheckpointRuntime:
                 field.name
             )
 
+        # Ownership grouping is a construction input even when no module
+        # declares it. Preserve its rank-local rows alongside the root axis.
+        coordinate = plan.spec.partition_key
+        group_name = plan.spec.partition_group
+        if coordinate is not None and group_name not in values:
+            indices = runtime.partition.rank_indices(coordinate)
+            values[group_name] = _host_copy(
+                group_name, runtime.input.read_local(group_name, indices)
+            )
+            groups[group_name] = coordinate
+            distributed.append(group_name)
+
         for coordinate in sorted(set(groups.values())):
             if coordinate in values:
                 continue

@@ -31,6 +31,7 @@ from hydroforge.core.validation import HydroForgeModel
 from hydroforge.data.datasets.base import ForcingDataset, TorchDevice
 from hydroforge.data.datasets.exported import ExportedDataset
 from hydroforge.data.datasets.space import GridSpace
+from hydroforge.io.netcdf.encoding import COMPLETE_DATA_ATTR
 from hydroforge.io.netcdf.options import (
     NetCDFOptions,
     create_netcdf_variable,
@@ -296,6 +297,7 @@ def export_climatology(
             variable = create_netcdf_variable(
                 output, name, dtype_nc, (POINT_DIM,), options=create_options[name]
             )
+            variable.setncattr(COMPLETE_DATA_ATTR, "true")
             variable[:] = means[name]
             variable.setncattr(
                 "description",
@@ -481,6 +483,7 @@ def export_catchment_data(
                     (TIME_DIM, POINT_DIM),
                     options=create_options[name],
                 )
+                variable.setncattr(COMPLETE_DATA_ATTR, "true")
                 variable.setncattr("description", descriptions[name])
                 variable.setncattr("units", units_by_name[name])
                 return output, time_variable, variable
@@ -703,6 +706,7 @@ def export_quantiles(
                 ("quantile", POINT_DIM),
                 options=create_options[key],
             )
+            variable.setncattr(COMPLETE_DATA_ATTR, "true")
             variable.long_name = f"{key} quantile values"
             variables[key] = variable
         if fits:

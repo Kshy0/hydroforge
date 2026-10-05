@@ -11,6 +11,8 @@ MSL text.  Libraries compile on first launch.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import struct
 import weakref
@@ -26,6 +28,7 @@ from pydantic import Field
 
 from hydroforge.core.errors import ResourceCleanupError
 from hydroforge.core.naming import Identifier
+from hydroforge.io.files import atomic_write_text
 from hydroforge.kernels.codegen.types import SCALARS, element, scalar
 from hydroforge.kernels.registry import (
     KernelCall,
@@ -111,6 +114,7 @@ class MetalProgram:
         extent: tuple[str, ...],
         constants: tuple[tuple[str, str], ...] = (),
         origin: toolchain.MetalOrigin = "framework",
+        encoding: str = "native",
     ) -> None:
         names = [argument.name for argument in arguments]
         if len(set(names)) != len(names) or any(not name for name in names):
@@ -125,6 +129,8 @@ class MetalProgram:
         if origin not in {"physics", "aten", "framework"}:
             raise ValueError("invalid Metal library origin")
         for argument in arguments:
+            if argument.native == "hf_hp" and encoding != "float32x2":
+                raise TypeError("hf_hp buffer ABI requires explicit float32x2 encoding")
             if argument.access is None:
                 if argument.native not in _BRIDGE_SCALARS:
                     raise TypeError(
@@ -143,12 +149,13 @@ class MetalProgram:
                     f"{kernel}: {argument.access} buffer {argument.name!r} "
                     f"cannot use Metal pointee type {argument.native!r}"
                 )
-        self.source = source
+        self.source = toolchain.prepare_source(source, origin=origin, encoding=encoding)
         self.kernel = kernel
         self.arguments = arguments
         self.extent = extent
         self.constants = constants
         self.origin = origin
+        self.encoding = encoding
         self.names = tuple(argument.name for argument in arguments)
         self.native_types = tuple(
             "buffer"
@@ -171,6 +178,31 @@ class MetalProgram:
             self._runtime = toolchain.load_metal_kernel()
         return self._runtime
 
+    def save_source(self, path: str | Path) -> Path:
+        """Persist this exact effective compilation unit, including hp helpers.
+
+        A JSON sidecar records the required non-source compile setting. Saving
+        does not compile or execute the program, and changes no cache key.
+        """
+        path = Path(path)
+        fast_math = self.origin == "physics" and METAL.math.physics_fast_math
+        atomic_write_text(path, self.source)
+        atomic_write_text(
+            path.with_suffix(path.suffix + ".json"),
+            json.dumps(
+                {
+                    "origin": self.origin,
+                    "encoding": self.encoding,
+                    "fastMathEnabled": fast_math,
+                    "sha256": hashlib.sha256(self.source.encode()).hexdigest(),
+                },
+                sort_keys=True,
+                indent=2,
+            )
+            + "\n",
+        )
+        return path
+
     def pipeline(self, values: Mapping[str, Any]) -> tuple[Any, int]:
         """The native bridge and the pipeline of these constant values."""
 
@@ -184,7 +216,9 @@ class MetalProgram:
         pipeline = self._pipelines.get(key)
         if pipeline is None:
             pipeline = native.create_pipeline(
-                toolchain.library(self.source, origin=self.origin),
+                toolchain.library(
+                    self.source, origin=self.origin, encoding=self.encoding
+                ),
                 self.kernel,
                 [
                     (index, kind, float(values[name]))
@@ -245,6 +279,13 @@ class MetalProgram:
                     f"{self.kernel}.{argument.name} field declares {dtype}, but "
                     f"the Metal source uses {argument.native}; expected {choices}"
                 )
+            if argument.native == "hf_hp" and buffer_dtypes is None:
+                value = values[argument.name]
+                if getattr(value, "encoding", None) != "float32x2":
+                    raise TypeError(
+                        f"{self.kernel}.{argument.name} requires encoded float32x2 storage, "
+                        "not native float64 bytes"
+                    )
         METAL.validate_extent(
             self.kernel, launch_extent(self.kernel, self.extent, values), 0
         )
@@ -525,6 +566,7 @@ kernel void {spec.name}(
         extent=extent,
         constants=tuple(constants),
         origin=origin,
+        encoding=emulation or "native",
     )
 
 

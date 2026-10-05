@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from hydroforge.compiler.partition import compile_partition
 from hydroforge.compiler.selection import Selection
+from hydroforge.contracts.conditions import conditions_satisfied, module_conditions
 from hydroforge.contracts.fields import (
     FieldDemandPlan,
     PartitionSchema,
@@ -162,12 +163,14 @@ def _field_is_active(
     field: FieldSpec,
     opened_modules: tuple[str, ...] | None,
     field_demand: FieldDemandPlan | None,
+    conditions: Mapping[str, bool] | None = None,
 ) -> bool:
     """Apply tensor residency; without a demand plan output fields are candidates."""
 
     return opened_modules is None or tensor_is_active(
         field.tensor,
         opened_modules,
+        conditions=conditions,
         output_required=(
             field_demand is None
             or field_demand.is_required(field.module_name, field.name)
@@ -179,6 +182,7 @@ def active_reference_indices(
     spec: ModuleSpec,
     opened_modules: tuple[str, ...] | None,
     field_demand: FieldDemandPlan | None = None,
+    conditions: Mapping[str, bool] | None = None,
 ) -> tuple[ReferenceIndexSpec, ...]:
     """Return reference indices whose source field is active."""
 
@@ -186,7 +190,10 @@ def active_reference_indices(
         index
         for index in spec.reference_indices.values()
         if _field_is_active(
-            spec.tensor_fields[index.reference], opened_modules, field_demand
+            spec.tensor_fields[index.reference],
+            opened_modules,
+            field_demand,
+            conditions,
         )
     )
 
@@ -198,6 +205,7 @@ def reference_target(
     opened_modules: tuple[str, ...] | None = None,
     field_demand: FieldDemandPlan | None = None,
     module_specs: Mapping[str, ModuleSpec] | None = None,
+    conditions: Mapping[str, bool] | None = None,
 ) -> FieldSpec:
     """Resolve the one active target field of a reference-index source."""
 
@@ -222,7 +230,7 @@ def reference_target(
         target
         for owner in owners.values()
         if (target := owner.tensor_fields.get(parts[-1])) is not None
-        and _field_is_active(target, opened_modules, field_demand)
+        and _field_is_active(target, opened_modules, field_demand, conditions)
     ]
     if len(candidates) != 1:
         raise ValueError(
@@ -243,6 +251,7 @@ def reference_index_metadata(
     opened_modules: tuple[str, ...] | None = None,
     field_demand: FieldDemandPlan | None = None,
     module_specs: Mapping[str, ModuleSpec] | None = None,
+    conditions: Mapping[str, bool] | None = None,
 ) -> TensorMetadata:
     """Resolve the tensor metadata of one derived reference index."""
 
@@ -254,6 +263,7 @@ def reference_index_metadata(
             opened_modules=opened_modules,
             field_demand=field_demand,
             module_specs=module_specs,
+            conditions=conditions,
         )
         if index.inverse
         else source
@@ -288,17 +298,20 @@ def bind_module_fields(
     batched_forcing: Iterable[str] = (),
     *,
     module_specs: Mapping[str, ModuleSpec] | None = None,
+    conditions: Mapping[str, bool] | None = None,
 ) -> ModuleBindingPlan:
     """Select the active fields and reference-index targets of one module."""
 
     active = {
         name
         for name, field in spec.tensor_fields.items()
-        if _field_is_active(field, opened_modules, field_demand)
+        if _field_is_active(field, opened_modules, field_demand, conditions)
     }
     targets: dict[str, ReferenceTarget] = {}
     indices: dict[str, TensorMetadata] = {}
-    for index in active_reference_indices(spec, opened_modules, field_demand):
+    for index in active_reference_indices(
+        spec, opened_modules, field_demand, conditions
+    ):
         active.add(index.name)
         target = reference_target(
             spec,
@@ -306,6 +319,7 @@ def bind_module_fields(
             opened_modules=opened_modules,
             field_demand=field_demand,
             module_specs=module_specs,
+            conditions=conditions,
         )
         targets[index.reference] = ReferenceTarget(target.module_name, target.name)
         indices[index.name] = reference_index_metadata(
@@ -314,6 +328,7 @@ def bind_module_fields(
             opened_modules=opened_modules,
             field_demand=field_demand,
             module_specs=module_specs,
+            conditions=conditions,
         )
     return ModuleBindingPlan(
         active=frozenset(active),
@@ -336,7 +351,10 @@ def source_dependencies(source: Any) -> tuple[str, ...]:
 
 
 def _field_demand(
-    spec: ModelSpec, opened: tuple[str, ...], declaration: ModelDeclaration
+    spec: ModelSpec,
+    opened: tuple[str, ...],
+    declaration: ModelDeclaration,
+    conditions: Mapping[str, bool],
 ) -> FieldDemandPlan:
     """Resolve output requests to their concrete field dependencies."""
 
@@ -348,8 +366,8 @@ def _field_demand(
     for module_name in opened:
         module = modules[module_name]
         for field in module.tensor_fields.values():
-            if field.excluded or not all(
-                dependency in opened for dependency in field.tensor.depends_on
+            if field.excluded or not conditions_satisfied(
+                field.tensor.depends_on, opened, conditions
             ):
                 continue
             resolver.install(
@@ -360,7 +378,7 @@ def _field_demand(
                     field.tensor.category == "virtual" and field.tensor.expression
                 ),
             )
-        for index in active_reference_indices(module, opened):
+        for index in active_reference_indices(module, opened, conditions=conditions):
             resolver.install(
                 module_name,
                 index.name,
@@ -389,7 +407,11 @@ def _field_demand(
         if index is not None:
             visit((module_name, index.reference))
             target = reference_target(
-                module, index.reference, opened_modules=opened, module_specs=modules
+                module,
+                index.reference,
+                opened_modules=opened,
+                module_specs=modules,
+                conditions=conditions,
             )
             visit((target.module_name, target.name))
             return
@@ -419,7 +441,9 @@ def _field_demand(
             field = resolve(name)
             if direct:
                 if field is None:
-                    continue
+                    raise ValueError(
+                        f"statistics field {name!r} is unknown, ambiguous, or inactive"
+                    )
                 tensor = tensor_metadata(field)
                 if tensor is None or tensor.output == "disabled":
                     raise ValueError(
@@ -433,7 +457,9 @@ def _field_demand(
                     tensor.depends_on or tensor.required_by or tensor.output_only
                 ):
                     observed.setdefault(field[0], set()).add(field[1])
-                    if tensor_is_active(tensor, opened, output_required=False):
+                    if tensor_is_active(
+                        tensor, opened, output_required=False, conditions=conditions
+                    ):
                         continue
             source = parse_value_source(next(iter(item.values())), known)
             for dependency in source_dependencies(source):
@@ -458,7 +484,9 @@ def _check_namespace(
     tensor = field.tensor
     if tensor is not None:
         unknown = sorted(
-            set((*tensor.depends_on, *tensor.required_by)).difference(known_modules)
+            set(
+                (*module_conditions(tensor.depends_on), *tensor.required_by)
+            ).difference(known_modules)
         )
         if unknown:
             raise ValueError(
@@ -495,7 +523,7 @@ def plan_fields(
     """Select, name, validate and index every field of the opened modules."""
 
     opened = selection.modules
-    demand = _field_demand(spec, opened, declaration)
+    demand = _field_demand(spec, opened, declaration, selection.conditions)
     modules = MappingProxyType(
         {
             name: bind_module_fields(
@@ -504,6 +532,7 @@ def plan_fields(
                 demand,
                 declaration.ensemble_forcing_fields.get(name, ()),
                 module_specs=spec.modules,
+                conditions=selection.conditions,
             )
             for name in opened
         }

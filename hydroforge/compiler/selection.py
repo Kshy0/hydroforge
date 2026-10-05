@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
 from typing import TYPE_CHECKING, Literal
 
 import torch
 
+from hydroforge.contracts.conditions import resolve_conditions
 from hydroforge.contracts.fields import tensor_is_active
 from hydroforge.contracts.options import OptionsConfig
 from hydroforge.contracts.runtime import (
@@ -36,6 +38,7 @@ class Selection:
     modules: tuple[str, ...]
     module_order: tuple[str, ...]
     options: OptionsConfig
+    conditions: Mapping[str, bool]
     backend: Backend
     device: torch.device
     precision: Literal["float32", "float64"]
@@ -92,7 +95,9 @@ def resolve_block_size(
     return value
 
 
-def _validate_ensemble_forcing(spec: ModelSpec, declaration: ModelDeclaration) -> None:
+def _validate_ensemble_forcing(
+    spec: ModelSpec, declaration: ModelDeclaration, conditions: Mapping[str, bool]
+) -> None:
     fields = declaration.ensemble_forcing_fields
     if fields and declaration.ensemble_size is None:
         raise ValueError("ensemble_forcing_fields require ensemble_size")
@@ -110,7 +115,7 @@ def _validate_ensemble_forcing(spec: ModelSpec, declaration: ModelDeclaration) -
                 raise ValueError(
                     f"member forcing field {module_name}.{field_name} has category {field.tensor.category!r}, expected 'forcing'"
                 )
-            if not tensor_is_active(field.tensor, opened):
+            if not tensor_is_active(field.tensor, opened, conditions=conditions):
                 raise ValueError(
                     f"member forcing field {module_name}.{field_name} is inactive"
                 )
@@ -146,8 +151,11 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
         parallel.validate_live()
         if ensemble_size != parallel.ensemble_size:
             raise ValueError("model ensemble_size must match the ensemble process mesh")
-    _validate_ensemble_forcing(spec, declaration)
     opened = declaration.opened_modules
+    conditions = resolve_conditions(
+        (spec.modules[name] for name in opened), declaration.options
+    )
+    _validate_ensemble_forcing(spec, declaration, conditions)
     schedule = declaration.simulation_schedule
     for name in opened:
         rule = spec.module_requirements.get(name, DEFAULT_MODULE_REQUIREMENT)
@@ -230,6 +238,7 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
         modules=opened,
         module_order=_module_order(spec, opened),
         options=options,
+        conditions=conditions,
         backend=backend,
         device=device,
         precision=precision,

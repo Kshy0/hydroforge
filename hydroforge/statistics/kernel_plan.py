@@ -330,9 +330,13 @@ class _Values:
         self.statements: list[Stmt] = []
         self.values: dict[str, Var] = {}
 
-    def expression(self, expression: Expression) -> Expr:
+    def expression(
+        self, expression: Expression, dtype: torch.dtype | None = None
+    ) -> Expr:
         names = {name: self.value(name) for name in expression.dependencies}
-        return lower_expression(expression, names, self.dtype)
+        return lower_expression(
+            expression, names, self.dtype if dtype is None else dtype
+        )
 
     def value(self, name: str) -> Var:
         known = self.values.get(name)
@@ -340,7 +344,10 @@ class _Values:
             return known
         source = self.sources.get(name) or TensorSource(name)
         if isinstance(source, ExpressionSource):
-            value = self.expression(source.expression)
+            # Preserve each virtual field's resolved precision boundary. The
+            # consumer's expression casts this value to its own arithmetic type.
+            dtype = self.context.layouts[name].dtype
+            value = self.expression(source.expression, dtype)
         else:
             key = (
                 source.name
@@ -349,8 +356,8 @@ class _Values:
             )
             dtype = self.context.buffer(key).dtype
             value = Load(key, self.offset(key), dtype)
-        local = self.names.var(f"{self.prefix}_{self.context.symbol(name)}", self.dtype)
-        self.statements.append(Let(local, cast(value, self.dtype)))
+        local = self.names.var(f"{self.prefix}_{self.context.symbol(name)}", dtype)
+        self.statements.append(Let(local, cast(value, dtype)))
         self.values[name] = local
         return local
 

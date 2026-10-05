@@ -201,6 +201,7 @@ class StatisticsRuntime:
         self._kernel_module = None
         self._generated_modules: list[tuple[str, str]] = []
         self._saved_kernel_file = None
+        self._close_program = lambda: None
         # Destination of finalized samples, installed with the compilation.
         self.sink: StatisticsSink | None = None
         self._last_time_number: float | None = None
@@ -290,10 +291,7 @@ class StatisticsRuntime:
             # An unpinned host copy to MPS waits for the whole queue; queued
             # fills keep sampling asynchronous.
             required_tensors.update(
-                {
-                    name: torch.zeros(1, dtype=dtype, device=self.device)
-                    for name, dtype in layout
-                }
+                {name: self._full_tensor((1,), 0, dtype) for name, dtype in layout}
             )
             self._kernel_states = required_tensors
             self._control_host_slots = None
@@ -343,11 +341,26 @@ class StatisticsRuntime:
     def _statistics_control_dtype(self) -> torch.dtype:
         """Return the precision shared by aggregation control scalars."""
 
+        if self.backend.name == "metal" and any(
+            layout.dtype == torch.float64
+            for layout in self._statistics_layouts.values()
+        ):
+            return torch.float64
         if "float64" not in self.backend.precisions:
             return torch.float32
         if any(tensor.dtype == torch.float64 for tensor in self._storage.values()):
             return torch.float64
         return torch.float32
+
+    def _full_tensor(self, shape, value, dtype):
+        """Allocate statistics storage explicitly, including later recompiles."""
+        if self.backend.name == "metal" and dtype == torch.float64:
+            from hydroforge.kernels.emulated import EmulatedTensor
+
+            return EmulatedTensor.encode(
+                torch.full(shape, value, dtype=dtype, device="cpu"), self.device
+            )
+        return torch.full(shape, value, dtype=dtype, device=self.device)
 
     def _materialize_compilation(
         self,
@@ -374,7 +387,7 @@ class StatisticsRuntime:
             if dtype == torch.float32:
                 mean_count_limits.add(2**24)
             elif dtype == torch.float64:
-                mean_count_limits.add(2**53)
+                mean_count_limits.add(2**48 if self.backend.name == "metal" else 2**53)
 
         # Visible outputs and hidden dependencies use the same scatter storage.
         self._storage_plan = build_storage_plan(
@@ -414,9 +427,7 @@ class StatisticsRuntime:
                 )
             else:
                 initial = 0
-            self._storage[slot.name] = torch.full(
-                slot.shape, initial, dtype=dtype, device=self.device
-            )
+            self._storage[slot.name] = self._full_tensor(slot.shape, initial, dtype)
             if slot.owner in self._variable_ops:
                 layout = self._statistics_layouts[slot.owner]
                 if self._field_registry[slot.owner].output_index is not None:
@@ -745,6 +756,18 @@ class StatisticsRuntime:
         self._compile_program(compilation.layouts)
         self._publish_launch()
 
+    def content_requires_rebind(self, tensors) -> bool:
+        """Address-stable index edits invalidate cold Metal CSR topology too."""
+        if self.backend.name != "metal":
+            return False
+        sources = {
+            self._tensor_registry[scatter.source.index].untyped_storage()._cdata
+            for scatter in self._statistics_ir.ordered_scatters()
+            if self._storage[StoragePlan.scatter_buffer(scatter.name)].dtype
+            == torch.float64
+        }
+        return any(tensor.untyped_storage()._cdata in sources for tensor in tensors)
+
     def prepare_selection_update(
         self, replacements: Mapping[int, torch.Tensor]
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
@@ -801,8 +824,11 @@ class StatisticsRuntime:
             with cleanup_on_exit(
                 "uninstalled statistics program",
                 (
-                    partial(release_generated_module, name, filename)
-                    for name, filename in result.generated_modules
+                    result.close,
+                    *(
+                        partial(release_generated_module, name, filename)
+                        for name, filename in result.generated_modules
+                    ),
                 ),
             ):
                 raise
@@ -815,15 +841,20 @@ class StatisticsRuntime:
         self._settle_function = result.settle
         self._kernel_module = result.module
         self._saved_kernel_file = result.saved_kernel_file
+        self._close_program = result.close
 
     def _cleanup_generated_modules(self) -> None:
         modules, self._generated_modules = self._generated_modules, []
         self._kernel_module = None
+        close, self._close_program = self._close_program, lambda: None
         with cleanup_on_exit(
             "statistics generated modules",
             (
-                partial(release_generated_module, name, filename)
-                for name, filename in reversed(modules)
+                close,
+                *(
+                    partial(release_generated_module, name, filename)
+                    for name, filename in reversed(modules)
+                ),
             ),
         ):
             pass
@@ -874,7 +905,7 @@ class StatisticsRuntime:
             if binding.output_index is None
             else binding.tensor[binding.output_index]
         )
-        values = tensor.detach().cpu().numpy()
+        values = tensor.detach().to(device="cpu", copy=True).numpy()
         values = np.array(values, order="C", copy=True)
         values.setflags(write=False)
         self.static_vars[binding.name] = {
@@ -942,6 +973,11 @@ class StatisticsRuntime:
                     for key in self._output_keys
                 },
                 device=self.result_device,
+                encoded_outputs={
+                    key
+                    for key in self._output_keys
+                    if getattr(self._storage[key], "encoding", None) == "float32x2"
+                },
             )
             emit(
                 self,

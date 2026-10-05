@@ -385,6 +385,8 @@ class _Fixed:
         )
         # (statistics launch, iteration pair folding it)
         self.folded: tuple[Any, tuple[Any, Any | None]] | None = None
+        self.width = None
+        self._width: float | None = None
 
     def _control(self) -> MetalCommand:
         loop = self.loop
@@ -421,7 +423,7 @@ class _Fixed:
         states = launch.states
         control = statistics_control_command(
             sample_phase=sample_phase_expr,
-            weight_source=loop.weight,
+            weight_source=self.width,
             continue_flag=loop.continue_flag,
             counter=loop.counter,
             flags=states[CONTROL_FLAGS],
@@ -457,7 +459,26 @@ class _Fixed:
             return count
         if fold:
             step.statistics.prelaunch()
-            regular, final = self._folded(step.statistics.launch)
+            launch = step.statistics.launch
+            dtype = launch.states[CONTROL_WEIGHT].dtype
+            if self.width is None or self.width.dtype != dtype:
+                if dtype == torch.float64:
+                    from hydroforge.kernels.emulated import EmulatedTensor
+
+                    self.width = EmulatedTensor.encode(
+                        torch.zeros(1, dtype=torch.float64, device="cpu"),
+                        self.executor.device,
+                    )
+                else:
+                    self.width = torch.zeros(
+                        1, dtype=dtype, device=self.executor.device
+                    )
+                self._width = None
+            width = duration / count
+            if width != self._width:
+                self.width.fill_(width)
+                self._width = width
+            regular, final = self._folded(launch)
         else:
             regular, final = self.iterations
         if final is None:

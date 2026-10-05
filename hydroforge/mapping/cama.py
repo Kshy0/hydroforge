@@ -596,6 +596,7 @@ def _cama_hires_source_cells(
     source: RegularGrid,
     *,
     allow_oob: bool,
+    target_ids: np.ndarray | None = None,
     hires_tag: str | None = "1min",
     mapinfo_txt: str = "location.txt",
     hires_idx_precision: str = "<i2",
@@ -608,6 +609,7 @@ def _cama_hires_source_cells(
     once and gathered per pixel, so no per-pixel coordinates are built.
     Returns ``(catchment_id_hires, areas, source_index)`` with ``-1`` for
     pixels outside the source grid (rejected unless ``allow_oob``).
+    If supplied, ``target_ids`` filters pixels before enforcing source coverage.
     """
     tiles = _cama_hires_tiles(
         map_dir,
@@ -624,11 +626,16 @@ def _cama_hires_source_cells(
     areas: list[np.ndarray] = [np.empty(0, dtype=np.float64)]
     cells: list[np.ndarray] = [np.empty(0, dtype=np.int64)]
     for tile in tiles:
-        ix = source._x_indices(tile.lon)[tile.x_index]
-        iy = source._y_indices(tile.lat)[tile.y_index]
+        selected = (
+            slice(None)
+            if target_ids is None
+            else np.isin(tile.catchment_id, target_ids)
+        )
+        ix = source._x_indices(tile.lon)[tile.x_index[selected]]
+        iy = source._y_indices(tile.lat)[tile.y_index[selected]]
         cells.append(np.where((ix >= 0) & (iy >= 0), iy * source_nx + ix, -1))
-        ids.append(tile.catchment_id.astype(np.int64, copy=False))
-        areas.append(tile.area)
+        ids.append(tile.catchment_id[selected].astype(np.int64, copy=False))
+        areas.append(tile.area[selected])
     source_index = np.concatenate(cells)
     if not allow_oob:
         bad = int(np.count_nonzero(source_index < 0))

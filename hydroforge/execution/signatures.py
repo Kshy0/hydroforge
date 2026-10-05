@@ -127,6 +127,20 @@ def _partition_identity_signature(runtime: ModelRuntime) -> tuple[Any, ...]:
     )
 
 
+def field_selection_signature(runtime: ModelRuntime) -> tuple[Any, ...]:
+    """Input-free agreement before any field-dependent loader or partition read."""
+    plan = runtime.plan
+    return (
+        plan.model,
+        plan.modules,
+        tuple(sorted(plan.conditions.items())),
+        tuple(
+            (name, tuple(sorted(binding.active)))
+            for name, binding in sorted(plan.fields.modules.items())
+        ),
+    )
+
+
 def declaration_signature(runtime: ModelRuntime) -> tuple[Any, ...]:
     """Return the complete rank-shared model control-plane identity."""
     plan = runtime.plan
@@ -154,6 +168,7 @@ def declaration_signature(runtime: ModelRuntime) -> tuple[Any, ...]:
         ("device_type", plan.device.type),
         ("precision", plan.precision, plan.mixed_precision, plan.metal_emulation),
         ("options", signature_value(plan.options)),
+        ("field_conditions", tuple(sorted(plan.conditions.items()))),
         ("execution", model.execution_mode, plan.block_size),
         (
             "parallel",
@@ -200,6 +215,7 @@ def declaration_signature(runtime: ModelRuntime) -> tuple[Any, ...]:
             signature_value(config.variables),
             signature_value(output.windows),
             config.save_precision,
+            config.save_kernels,
         ),
         (
             "netcdf",

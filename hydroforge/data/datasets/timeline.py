@@ -33,6 +33,16 @@ from hydroforge.core.time import (
 from hydroforge.core.validation import frozen_dict
 from hydroforge.data.datasets.plan import DatasetPlan, SourceChunk
 from hydroforge.io.files import FileInspection
+from hydroforge.io.rank_output.schema import (
+    COMMITTED_STEPS_ATTR,
+    FORMAT_ATTR,
+    RANK_ATTR,
+    RUN_ID_ATTR,
+    TIME_DIM,
+    VERSION_ATTR,
+    WORLD_SIZE_ATTR,
+    RankFileHeader,
+)
 
 ReadOp = tuple[str, tuple[int, ...]]
 _UNSET = object()
@@ -380,7 +390,8 @@ class TimelineScan:
                 time_variable = _time_variable(dataset, path, self._variable)
                 self._check_units(dataset, path)
                 self._check_calendar(_file_calendar(time_variable), path)
-                dates = self._dates(time_variable, path, key)
+                committed = self._committed_steps(dataset, time_variable, path)
+                dates = self._dates(time_variable, path, key, committed)
                 self._inspect_variable(dataset, path)
             duplicate = next((date for date in dates if date in self._seen), None)
             if duplicate is not None:
@@ -427,7 +438,37 @@ class TimelineScan:
                 f"{units!r} in {path.name}"
             )
 
-    def _dates(self, time_variable: Any, path: Path, key: str) -> list[DateLike]:
+    def _committed_steps(
+        self, dataset: Any, time_variable: Any, path: Path
+    ) -> int | None:
+        """Restrict framework output to published rows; leave external files alone."""
+
+        protocol = {
+            FORMAT_ATTR,
+            VERSION_ATTR,
+            RANK_ATTR,
+            WORLD_SIZE_ATTR,
+            RUN_ID_ATTR,
+            COMMITTED_STEPS_ATTR,
+        }
+        if not protocol.intersection(dataset.ncattrs()):
+            return None
+        header = RankFileHeader.read(dataset, path=path)
+        variable = dataset.variables[self._variable]
+        if time_variable.dimensions != (TIME_DIM,) or (
+            not variable.dimensions or variable.dimensions[0] != TIME_DIM
+        ):
+            raise ValueError(f"Rank output in {path.name} must share the time axis")
+        if header.committed_steps > len(time_variable):
+            raise ValueError(
+                f"Rank output in {path.name} has inconsistent committed steps: "
+                f"committed={header.committed_steps}, time={len(time_variable)}"
+            )
+        return header.committed_steps
+
+    def _dates(
+        self, time_variable: Any, path: Path, key: str, committed: int | None
+    ) -> list[DateLike]:
         calendar = getattr(time_variable, "calendar", "standard")
         units = getattr(time_variable, "units", None)
         if not isinstance(units, str) or not units.strip():
@@ -438,7 +479,7 @@ class TimelineScan:
             raise ValueError(
                 f"Time variable in {path.name} must be one-dimensional and numeric"
             )
-        raw = time_variable[:]
+        raw = time_variable[:committed]
         if np.ma.isMaskedArray(raw) and np.any(np.ma.getmaskarray(raw)):
             raise ValueError(f"Time variable in {path.name} contains missing values")
         values = np.asarray(raw)

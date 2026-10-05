@@ -20,6 +20,7 @@ from pydantic import (
     model_validator,
 )
 
+from hydroforge.contracts.conditions import module_conditions
 from hydroforge.contracts.options import OptionsConfig
 from hydroforge.contracts.parameters import ParameterChange
 from hydroforge.contracts.runtime import BackendRequirement, ModuleRequirement
@@ -88,9 +89,12 @@ def _model_spec(cls: type[ModelDeclaration]) -> ModelSpec:
         unknown = set(module.references).difference(modules)
         for field in module.tensor_fields.values():
             unknown.update(
-                set((*field.tensor.depends_on, *field.tensor.required_by)).difference(
-                    modules
-                )
+                set(
+                    (
+                        *module_conditions(field.tensor.depends_on),
+                        *field.tensor.required_by,
+                    )
+                ).difference(modules)
             )
         if unknown:
             raise ValueError(
@@ -214,6 +218,10 @@ class OutputConfig(HydroForgeModel):
             "Floating-point precision used for persisted statistics; None "
             "preserves each statistics tensor's resolved precision."
         ),
+    )
+    save_kernels: bool = Field(
+        default=False,
+        description="Save effective generated statistics source under dir/experiment/generated_kernels",
     )
     workers: int = Field(
         default=2,
@@ -351,6 +359,8 @@ class OutputConfig(HydroForgeModel):
 
     @model_validator(mode="after")
     def _validate_destination(self) -> Self:
+        if self.save_kernels and self.dir is None:
+            raise ValueError("save_kernels requires OutputConfig(dir=...)")
         if self.statistics_plan is not None and not self.variables:
             raise ValueError("statistics_plan requires non-empty variables")
         if self.sink != "memory" and "result_device" in self.model_fields_set:

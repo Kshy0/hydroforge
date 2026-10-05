@@ -48,6 +48,15 @@ Models can set a backend-specific mixed-precision default through
 `BackendRequirement(default_mixed_precision=...)`; an explicit
 `mixed_precision=True` or `False` at construction takes precedence.
 
+On Metal, high-precision values use two FP32 components rather than native FP64.
+NetCDF floating outputs default to FP32 independently of mixed precision; set
+`OutputConfig(save_precision="float64")` for FP64 files, or `save_precision=None`
+to preserve each output's logical dtype. See [Metal precision](docs/METAL_FLOAT32X2.md).
+
+Tensor declarations can use `depends_on="options.forcing.par"` to select fields
+from declared Boolean options at construction. Tuples combine module and option
+conditions with AND; disabled fields stay `None`. See [option field conditions](docs/OPTIONS_FIELD_GATES.md).
+
 ## Usage
 
 ```python

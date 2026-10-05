@@ -31,6 +31,10 @@ def _no_requests(
     return ()
 
 
+def _no_close() -> None:
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class CompiledStatistics:
     """One backend's statistics program.
@@ -49,6 +53,7 @@ class CompiledStatistics:
     saved_kernel_file: Path | None
     generated_modules: tuple[tuple[str, str], ...] = ()
     requests: Callable[..., tuple[CompileRequest, ...]] = _no_requests
+    close: Callable[[], None] = _no_close
 
 
 def unique_name(rank: int) -> str:

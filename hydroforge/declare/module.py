@@ -122,8 +122,10 @@ def TensorField(
         output: Output policy. ``auto`` inherits the default SelectionField for
                 ``dim_coords``; ``full`` writes the full local axis; ``disabled``
                 rejects explicit output requests.
-        depends_on: Module name, or names, that must all be open for this field
-                    to be loaded, allocated, and exposed to runtime compilers.
+        depends_on: Module identifier or reserved ``options.<bool_path>`` string,
+                    or a tuple of both. Every condition must hold for loading,
+                    allocation and compiler binding. Options resolve once at
+                    model construction; changing them requires a new model.
         required_by: Consumer module names. The field is active when at least
                      one listed consumer module is open.
         category: Category of the variable:
@@ -433,8 +435,8 @@ def computed_tensor_field(
                   - 'virtual': Allocated on demand or evaluated as an output
                     expression; buffer fields may be shared or member-batched
         expr: Expression string for virtual variables
-        depends_on: Module name, or names, that must all be active before this
-            computed tensor is evaluated or validated.
+        depends_on: Module identifier or ``options.<bool_path>`` string, or a
+            tuple of both (AND), resolved before this tensor is evaluated.
         required_by: Consumer module names. At least one must be active before
             this computed tensor is evaluated or validated.
         output_only: Keep this computed tensor unmaterialized unless it is

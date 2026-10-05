@@ -39,8 +39,11 @@ def compile_statistics_program(
         with cleanup_on_exit(
             "statistics settle compilation",
             (
-                partial(release_generated_module, name, filename)
-                for name, filename in compiled.generated_modules
+                compiled.close,
+                *(
+                    partial(release_generated_module, name, filename)
+                    for name, filename in compiled.generated_modules
+                ),
             ),
         ):
             raise

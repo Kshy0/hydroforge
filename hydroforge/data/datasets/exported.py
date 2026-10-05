@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
@@ -487,6 +488,8 @@ class ExportedDataset(ForcingDataset):
         A shared column shift is one contiguous slice. Small mixed-shift
         selections use their precompiled groups; larger selections use the
         parallel Numba gather without separately prefilling its output.
+        macOS keeps the grouped NumPy path to avoid loading a second OpenMP
+        runtime alongside PyTorch.
         """
         T, C = data.shape
         if groups is not None and len(groups) == 1:
@@ -501,7 +504,7 @@ class ExportedDataset(ForcingDataset):
             if lo < hi:
                 out[lo - base_t : hi - base_t] = data[lo:hi]
             return out
-        if C >= _NUMBA_C_THRESHOLD:
+        if C >= _NUMBA_C_THRESHOLD and sys.platform != "darwin":
             return _numba_gather()(data, shift, base_t, length, float(oob_fill))
         out = np.full((length, C), oob_fill, dtype=data.dtype)
         if groups is None:

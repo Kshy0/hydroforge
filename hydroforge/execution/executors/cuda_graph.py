@@ -225,10 +225,13 @@ class CudaGraphExecutor(LoopExecutor):
                 stream = side.cuda_stream
                 snapshot = self._snapshot(state)
                 for _ in range(self.warmup_iterations):
+                    self._restore(state, snapshot)
                     reset()
                     body(graph, False)
-                # Capture binds addresses, not values: one rollback after
-                # instantiation undoes every warmup.
+                # Each warmup and capture starts from the same physical state.
+                # Enqueue rollback on the side stream before recording operations.
+                self._restore(state, snapshot)
+                reset()
                 torch._C._cuda_beginAllocateToPool(device_index, self.graph_pool)
                 try:
                     graph.begin_capture(stream)

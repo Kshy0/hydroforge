@@ -362,6 +362,10 @@ class _Kernel(TritonPrinter):
                         f"{indent}for {node.var.name} in tl.static_range({node.count}):"
                     )
                     lines.extend(self.branch(node.body, depth + 1))
+                case While(per_lane=True):
+                    raise TypeError(
+                        "Triton vectorized printer cannot lower per-lane While"
+                    )
                 case While() if self.lanes(node.condition) or self.predicate:
                     raise TypeError(f"a loop on a per-lane condition: {node!r}")
                 case While():

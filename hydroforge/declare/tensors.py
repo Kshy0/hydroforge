@@ -54,6 +54,13 @@ class ModulePayload:
         object.__setattr__(self, "_model_fields_set", frozenset(payload))
         object.__setattr__(self, "_default_values", dict(binding.defaults))
         for name in module_type.model_fields:
+            if (
+                name in module_type.spec().tensor_fields
+                and name not in binding.plan.active
+                and name not in payload
+            ):
+                object.__setattr__(self, name, None)
+                continue
             if name in payload:
                 value = payload[name]
             elif defer_defaults:
@@ -166,7 +173,7 @@ class ModuleTensors:
                     )
                 raise ValueError(
                     f"Inactive field {module.module_name}.{field.name} was "
-                    f"supplied explicitly; open its dependencies: {dependencies}"
+                    f"supplied explicitly; unsatisfied activation conditions: {dependencies}"
                 )
             object.__setattr__(module, field.name, None)
 

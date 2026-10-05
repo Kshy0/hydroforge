@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sys
 import threading
 from contextlib import contextmanager
@@ -100,11 +101,40 @@ MetalOrigin = Literal["physics", "aten", "framework"]
 # leading the source, turns contraction off for the whole library.
 _NO_CONTRACTION = "#pragma METAL fp contract(off)\n"
 
-_LIBRARIES: dict[tuple[str, bool], int] = {}
+_LIBRARIES: dict[tuple[str, bool, str], int] = {}
 _LIBRARY_LOCK = threading.Lock()
 
 
-def library(source: str, *, origin: MetalOrigin) -> int:
+def prepare_source(
+    source: str, *, origin: MetalOrigin, encoding: str = "native"
+) -> str:
+    """The exact source saved, hashed, and submitted to the native compiler."""
+    if encoding not in {"native", "float32x2"}:
+        raise ValueError(f"unknown Metal encoding {encoding!r}")
+    if encoding == "float32x2" and METAL.math.physics_fast_math:
+        raise ValueError("Metal float32x2 requires HYDROFORGE_FAST_MATH=0")
+    if encoding == "float32x2":
+        # Comments are removed by preprocessing, including ones directly
+        # adjacent to a pragma. Generated pair programs need no _Pragma;
+        # reject that indirection rather than attempting macro expansion.
+        spliced = source.replace("\\\r\n", "").replace("\\\n", "")
+        checked = re.sub(r"/\*.*?\*/|//[^\n]*", " ", spliced, flags=re.DOTALL)
+        unsafe = re.search(
+            r"(?mi)^\s*#\s*pragma\s+(?:METAL\s+fp\s+(?:contract\s*\(\s*(?:on|fast)\s*\)|"
+            r"math_mode\s*\(\s*(?:relaxed|fast)\s*\))|STDC\s+FP_CONTRACT\s+ON)(?=\s|$)",
+            checked,
+        )
+        if unsafe or re.search(r"\b(?:_Pragma|__pragma)\b", checked):
+            raise ValueError(
+                "Metal float32x2 source cannot re-enable unsafe math or contraction"
+            )
+    if origin == "framework" or encoding == "float32x2":
+        if not source.startswith(_NO_CONTRACTION):
+            source = _NO_CONTRACTION + source
+    return source
+
+
+def library(source: str, *, origin: MetalOrigin, encoding: str = "native") -> int:
     """Compile one MSL library once per source text and origin.
 
     Metal otherwise compiles with fast math.  Physics libraries follow the
@@ -115,10 +145,9 @@ def library(source: str, *, origin: MetalOrigin) -> int:
     code is structured.
     """
 
+    source = prepare_source(source, origin=origin, encoding=encoding)
     fast_math = origin == "physics" and METAL.math.physics_fast_math
-    if origin == "framework":
-        source = _NO_CONTRACTION + source
-    key = (hashlib.sha256(source.encode()).hexdigest(), fast_math)
+    key = (hashlib.sha256(source.encode()).hexdigest(), fast_math, encoding)
     with _LIBRARY_LOCK:
         compiled = _LIBRARIES.get(key)
         if compiled is None:

@@ -456,6 +456,89 @@ class _TensorSnapshot:
     index_axis: int
 
 
+def _tensor_byte_ranges(
+    tensor: torch.Tensor, indices: torch.Tensor | None = None, axis: int = 0
+) -> tuple[tuple[int, int], ...]:
+    """Exact occupied byte intervals, including offsets and selected rows.
+
+    Model parameters are contiguous. Keep a strided fallback for resident
+    aliases so a shared allocation alone never implies overlapping values.
+    This is cold-path validation, never part of a recorded numerical kernel.
+    """
+
+    if tensor.numel() == 0:
+        return ()
+    size = tensor.element_size()
+    pointer = tensor.data_ptr()
+    if tensor.is_contiguous():
+        if indices is None:
+            return ((pointer, pointer + tensor.numel() * size),)
+        rows = sorted(set(indices.tolist()))
+        block = tensor.stride(axis) * size
+        outer = tensor.numel() // (tensor.shape[axis] * tensor.stride(axis))
+        ranges = (
+            (
+                pointer + (prefix * tensor.shape[axis] + row) * block,
+                pointer + (prefix * tensor.shape[axis] + row + 1) * block,
+            )
+            for prefix in range(outer)
+            for row in rows
+        )
+    else:
+        selected = None if indices is None else set(indices.tolist())
+        ranges = (
+            (
+                pointer
+                + sum(i * stride for i, stride in zip(index, tensor.stride())) * size,
+                pointer
+                + (sum(i * stride for i, stride in zip(index, tensor.stride())) + 1)
+                * size,
+            )
+            for index in np.ndindex(tuple(tensor.shape))
+            if selected is None or index[axis] in selected
+        )
+        ranges = sorted(ranges)
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def _ranges_overlap(left, right) -> bool:
+    i = j = 0
+    while i < len(left) and j < len(right):
+        if left[i][0] < right[j][1] and right[j][0] < left[i][1]:
+            return True
+        if left[i][1] <= right[j][0]:
+            i += 1
+        else:
+            j += 1
+    return False
+
+
+def _validate_resident_sets(items, replacements=None) -> None:
+    """Reject same-time SETs that write any common resident bytes."""
+
+    replacements = {} if replacements is None else replacements
+    groups = {}
+    for item in items:
+        if not item.is_set_value:
+            continue
+        current = getattr(item.module, item.attr_name)
+        tensor = replacements.get(id(current), current)
+        ranges = _tensor_byte_ranges(tensor, item.indices, item.index_axis)
+        previous = groups.setdefault((item.start_time, tensor.device), [])
+        if any(_ranges_overlap(ranges, other) for other in previous):
+            raise ValueError(
+                f"parameter {item.variable_name!r} has overlapping SET "
+                f"targets in shared storage at {item.start_time}"
+            )
+        previous.append(ranges)
+
+
 class ParameterPlanRuntime:
     """Apply rank-local plans compiled by ``LocalParameterCompiler``."""
 
@@ -466,6 +549,8 @@ class ParameterPlanRuntime:
     ) -> None:
         self.runtime = runtime
         self._plans = tuple(self._bind(item) for item in plans)
+        _validate_resident_sets(self._plans)
+        self._aliases: dict[str, set[str]] = {}
         self.dependencies: Mapping[str, tuple[str, ...]] = MappingProxyType({})
         self._derived: dict[str, tuple[Any, str, cached_property]] = {}
         self._dependency_revision: int | None = None
@@ -568,7 +653,8 @@ class ParameterPlanRuntime:
             )
         if not updated:
             return None
-        rebound = (updated.get(identity, item) for identity, item in items.items())
+        rebound = tuple(updated.get(identity, item) for identity, item in items.items())
+        _validate_resident_sets(rebound, replacements)
         validate_set_targets(
             (item.target, None, None if item.indices is None else item.indices.tolist())
             for item in rebound
@@ -689,12 +775,32 @@ class ParameterPlanRuntime:
             raise ValueError(
                 f"cyclic parameter tensor dependencies: {error.args[1]}"
             ) from error
+        # Qualified names can refer to the same tensor or overlapping views.
+        # Rebuild from live resident buffers after every structural revision.
+        resident = {}
+        for qualified, (module, name, _metadata) in declared.items():
+            value = module.__dict__.get(name)
+            if isinstance(value, torch.Tensor):
+                resident[qualified] = (value.device, _tensor_byte_ranges(value))
+        aliases = {name: {name} for name in resident}
+        names = tuple(resident)
+        for index, name in enumerate(names):
+            device, ranges = resident[name]
+            for other in names[:index]:
+                other_device, other_ranges = resident[other]
+                if device == other_device and _ranges_overlap(ranges, other_ranges):
+                    aliases[name].add(other)
+                    aliases[other].add(name)
         # Publish only a complete graph; a failed discovery remains retryable.
+        self._aliases = aliases
         self._derived = {name: candidates[name] for name in order if name in candidates}
         self.dependencies = MappingProxyType(dependencies)
         self._dependency_revision = revision
 
     def _refresh_derived_parameters(self, changed: set[str]) -> None:
+        changed.update(
+            alias for name in tuple(changed) for alias in self._aliases.get(name, ())
+        )
         with torch.inference_mode():
             for qualified, (module, name, descriptor) in self._derived.items():
                 if changed.isdisjoint(self.dependencies[qualified]):
@@ -709,7 +815,7 @@ class ParameterPlanRuntime:
                     )
                 )
                 current.copy_(fresh)
-                changed.add(qualified)
+                changed.update(self._aliases.get(qualified, (qualified,)))
             for module_name in self.runtime.plan.modules:
                 self.runtime.modules[module_name].validate_parameters()
 
@@ -879,8 +985,13 @@ class ParameterPlanRuntime:
             )
         self._step_transaction_snapshots = snapshots
         try:
-            for (_, attr), plans in grouped.items():
-                self._apply_grouped_changes(plans[0].item.module, attr, plans)
+            # SET precedes increment even when different logical fields
+            # share storage, just as it does for one field's grouped plans.
+            for is_set in (True, False):
+                for (_, attr), plans in grouped.items():
+                    selected = [p for p in plans if p.item.is_set_value == is_set]
+                    if selected:
+                        self._apply_grouped_changes(plans[0].item.module, attr, selected)
             self._refresh_derived_parameters(
                 {
                     f"{plans[0].item.module.module_name}.{attr}"

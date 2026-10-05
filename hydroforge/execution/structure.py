@@ -571,8 +571,10 @@ def _commit_content_update(
                 "derived reference index"
             )
 
-    if runtime.execution.kernel_binding.content_requires_rebind(
-        current for current, _ in (*pairs, *derived)
+    changed = tuple(current for current, _ in (*pairs, *derived))
+    statistics = runtime.statistics
+    if runtime.execution.kernel_binding.content_requires_rebind(changed) or (
+        statistics is not None and statistics.content_requires_rebind(changed)
     ):
         # Address stability does not imply validity of derived CSR contents.
         # Reuse the full transaction, retaining the caller's content-copy policy.

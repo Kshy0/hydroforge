@@ -10,8 +10,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 from hydroforge.core.errors import cleanup_on_exit
 from hydroforge.kernels.codegen.c import MSL, msl_arguments
+from hydroforge.kernels.codegen.msl import emulated_msl
 from hydroforge.kernels.metal import MetalArgument, MetalProgram
 from hydroforge.platform.backend import METAL
 from hydroforge.statistics.kernel_plan import (
@@ -19,6 +22,8 @@ from hydroforge.statistics.kernel_plan import (
     StatisticsKernelPlan,
 )
 from hydroforge.statistics.launch import CompiledStatistics, save_source
+from hydroforge.statistics.launch.metal_scatter import encoded_scatter
+from hydroforge.statistics.storage import StoragePlan
 
 # The launch value naming a program's thread count; no argument field.
 _THREADS = "__threads"
@@ -27,25 +32,56 @@ _THREADS = "__threads"
 def compile_statistics(
     context: StatisticsCompileContext, plan: StatisticsKernelPlan
 ) -> CompiledStatistics:
-    kernels = plan.kernels("loop")
-    source = MSL.program([kernel.function for kernel in kernels])
+    kernels = []
+    extra = {}
+    for scatter, declared in zip(
+        plan.scatters, plan.lowering.ir.ordered_scatters(), strict=True
+    ):
+        add = scatter.add
+        if (
+            context.storage[StoragePlan.scatter_buffer(declared.name)].dtype
+            == torch.float64
+        ):
+            add, topology = encoded_scatter(
+                context, plan.lowering, declared.name, declared.source
+            )
+            extra.update(topology)
+        kernels.extend(
+            item for item in (scatter.zero, add, scatter.divide) if item is not None
+        )
+    kernels.extend(plan.group_kernels("loop"))
+    sample_count = len(kernels)
+    kernels.extend(plan.settle_kernels("loop"))
+    emulated = any(
+        layout.dtype == torch.float64 for layout in context.layouts.values()
+    ) or any(
+        param.type == torch.float64
+        for kernel in kernels
+        for param in kernel.function.params
+    )
+    printer = emulated_msl() if emulated else MSL
+    source = printer.program([kernel.function for kernel in kernels])
     programs = []
     for kernel in kernels:
-        fields = msl_arguments(kernel.function)
+        fields = msl_arguments(kernel.function, emulated=emulated)
         program = MetalProgram(
             source,
             kernel.function.name,
             tuple(MetalArgument(*field) for field in fields),
             extent=(_THREADS,),
+            encoding="float32x2" if emulated else "native",
         )
         names = tuple(zip(kernel.function.params, (field[0] for field in fields)))
         programs.append((kernel, program, names))
+        source = program.source
 
-    def bind(states):
+    def bind(states, selected):
         launches = []
-        for kernel, program, names in programs:
+        for kernel, program, names in selected:
             values = {
-                field: states[param.name]
+                field: extra[param.name]
+                if param.name in extra
+                else states[param.name]
                 if param.access is not None
                 else kernel.scalars[param.name].value(states)
                 for param, field in names
@@ -57,14 +93,18 @@ def compile_statistics(
         return launches
 
     bound: list[Any] = []
+    settled: list[Any] = []
+    closed = False
 
     def internal_update_statistics(states, BLOCK_SIZE, phase):
+        if closed:
+            raise RuntimeError("Metal statistics program is closed")
         # The launches, and so the argument bindings, of one bound state
         # mapping serve every sample; Metal launches a fixed width.
         del BLOCK_SIZE
         if not bound or bound[0] is not states:
             previous = bound[1] if bound else ()
-            bound[:] = [states, bind(states)]
+            bound[:] = [states, bind(states, programs[:sample_count])]
             with cleanup_on_exit(
                 "Metal statistics bindings",
                 (
@@ -78,12 +118,54 @@ def compile_statistics(
             if mask is None or phase < 0 or phase & mask:
                 launch()
 
+    def settle(states, is_outer_first):
+        if closed:
+            raise RuntimeError("Metal statistics program is closed")
+        # The runtime already writes the close phase to device controls.
+        del is_outer_first
+        if not settled or settled[0] is not states:
+            previous = settled[1] if settled else ()
+            settled[:] = [states, bind(states, programs[sample_count:])]
+            with cleanup_on_exit(
+                "Metal settle bindings",
+                (
+                    launch.close
+                    for _mask, launch in previous
+                    if hasattr(launch, "close")
+                ),
+            ):
+                pass
+        for _mask, launch in settled[1]:
+            launch()
+
+    def close():
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        launches = tuple(
+            launch
+            for held in (bound, settled)
+            if held
+            for _mask, launch in held[1]
+            if hasattr(launch, "close")
+        )
+        bound.clear()
+        settled.clear()
+        extra.clear()
+        with cleanup_on_exit(
+            "Metal statistics program", (launch.close for launch in launches)
+        ):
+            pass
+
+    saved = save_source(context, source, ".metal") if context.save_kernels else None
+    if saved is not None and programs:
+        programs[0][1].save_source(saved)
     return CompiledStatistics(
         lowering=plan.lowering,
         function=internal_update_statistics,
-        settle=None,
+        settle=settle if sample_count < len(kernels) else None,
         module=None,
-        saved_kernel_file=(
-            save_source(context, source, ".metal") if context.save_kernels else None
-        ),
+        saved_kernel_file=saved,
+        close=close,
     )
