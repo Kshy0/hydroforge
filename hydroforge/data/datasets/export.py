@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """NetCDF exports of forcing datasets and the CaMa mapping-table generator.
 
 Time-series exports are single-rank files of the rank-output schema
@@ -285,7 +291,8 @@ def export_climatology(
         )
         for name, value in accumulators.items()
     }
-    logger.info("Climatology averaged over %d timesteps", total_steps)
+    if is_rank_zero():
+        logger.info("Climatology averaged over %d timesteps", total_steps)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with atomic_netcdf_dataset(out_path, format="NETCDF4") as output:
@@ -306,7 +313,8 @@ def export_climatology(
                 else descriptions[name],
             )
             variable.setncattr("units", units_by_name[name])
-    logger.info("Saved climatology to %s", out_path)
+    if is_rank_zero():
+        logger.info("Saved climatology to %s", out_path)
     return out_path
 
 
@@ -810,12 +818,13 @@ def generate_mapping_table(
                 mapping.metadata.get("source_mask_repaired_rows", 0),
             )
     mapping.save(out_path)
-    logger.info(
-        "Saved grid mapping to %s: shape=%s, nnz=%d, source=%dx%d",
-        out_path,
-        mapping.matrix.shape,
-        mapping.matrix.nnz,
-        space.longitude.size,
-        space.latitude.size,
-    )
+    if is_rank_zero():
+        logger.info(
+            "Saved grid mapping to %s: shape=%s, nnz=%d, source=%dx%d",
+            out_path,
+            mapping.matrix.shape,
+            mapping.matrix.nnz,
+            space.longitude.size,
+            space.latitude.size,
+        )
     return out_path

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Triton driver discovery and validation for a selected model device."""
 
 from __future__ import annotations
@@ -253,11 +259,7 @@ class ProvenTritonDevice:
             self._select = lambda _index: nullcontext()
         else:
             runtime = getattr(torch, device.type)
-            self._current = (
-                torch._C._cuda_getDevice
-                if device.type == "cuda"
-                else runtime.current_device
-            )
+            self._current = runtime.current_device
             self._select = runtime.device
         with _DRIVER_LOCK, self._select(self.device.index):
             self._driver = _require_triton_device(self.device)

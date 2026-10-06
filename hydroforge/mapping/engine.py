@@ -1,15 +1,19 @@
-"""Overlap engines that turn source/target geometry into mapping weights.
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
 
-Two engines share a CSR output via :mod:`hydroforge.mapping.build`:
+"""Overlap engine that turns source/target geometry into mapping weights.
 
-* :func:`_regular_overlap_csr` -- analytic separable overlap between a source
-  regular grid and axis-aligned rectangular target cells.  On geographic grids
-  the per-cell weight is the true spherical overlap area
-  (``R^2 * dlon_rad * (sin(lat_hi) - sin(lat_lo))``), so the area weighting is
-  latitude-correct without any external dependency.
-* :func:`_aggregate_hires_coo` -- vectorized area-weighted aggregation of
-  high-resolution pixels (e.g. MERIT ``catmxy``) onto source grid cells, for
-  catchments that are unions of many hires pixels.
+:func:`_regular_overlap_csr` computes the analytic separable overlap between a
+source regular grid and axis-aligned rectangular target cells as CSR rows for
+:mod:`hydroforge.mapping.build`.  On geographic grids the per-cell weight is
+the true spherical overlap area
+(``R^2 * dlon_rad * (sin(lat_hi) - sin(lat_lo))``), so the area weighting is
+latitude-correct without any external dependency.  High-resolution pixel
+aggregation (e.g. MERIT ``catmxy``) is assembled from COO triplets by
+:func:`_hires_coo`.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from hydroforge.core.arrays import canonical_floating_array, find_indices_in
+from hydroforge.core.arrays import canonical_floating_array
 from hydroforge.mapping.grid import RegularGrid
 from hydroforge.mapping.target import TargetSupport
 
@@ -376,83 +380,12 @@ def _normalise_rows(rows: _OverlapRows) -> tuple[np.ndarray, np.ndarray]:
         return scaled / np.repeat(totals, lengths), anomalous
 
 
-def _regular_overlap_rows(
-    source: RegularGrid,
-    target: TargetSupport,
-) -> list[tuple[np.ndarray, np.ndarray, float]]:
-    """Analytic separable overlap between ``source`` cells and target rectangles.
-
-    For each target cell the overlap with the source grid is separable into a
-    1-D longitude interval overlap and a 1-D latitude interval overlap.  On a
-    geographic grid the weight is the spherical overlap area
-    ``R^2 * dlon_rad * (sin(phi_hi) - sin(phi_lo))`` (latitude-correct); on a
-    projected grid it is the planar overlap area.
-
-    Returns one ``(source_cols, weights, coverage)`` tuple per target, where
-    ``source_cols`` index the C-order ``(y, x)`` flattened source grid and
-    ``coverage`` is the covered-area fraction in the same geometry used by
-    the returned weights.
-    """
-    if target.bounds is None:
-        raise ValueError("overlap requires target cell bounds")
-    rows = _regular_overlap_csr(source, target)
-    return [
-        (
-            rows.cols[start:stop].copy(),
-            rows.values[start:stop].copy(),
-            float(coverage),
-        )
-        for start, stop, coverage in zip(
-            rows.indptr[:-1].tolist(), rows.indptr[1:].tolist(), rows.coverage
-        )
-    ]
-
-
 def _raise_hires_oob_hint(exc: ValueError, *, allow_oob_zero: bool) -> None:
     if not allow_oob_zero and "points fall outside the source grid" in str(exc):
         raise ValueError(
             f"{exc}; set allow_oob_zero=True to ignore out-of-bounds "
             "hires pixels as zero contribution"
         ) from exc
-
-
-def _aggregate_hires_coo(
-    source: RegularGrid,
-    target_ids: np.ndarray,
-    pixel_catchment_id: np.ndarray,
-    pixel_area: np.ndarray,
-    pixel_lon: np.ndarray,
-    pixel_lat: np.ndarray,
-    *,
-    allow_oob_zero: bool,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Area-weighted aggregation of hires pixels onto source grid cells.
-
-    Inputs are canonical: unique int64 ``target_ids``, equal-size int64 pixel
-    catchment IDs and float64 areas and coordinates.  Returns ``(rows, cols,
-    data)`` COO triplets where ``rows`` index into ``target_ids`` (the
-    catchment that each pixel drains to) and ``cols`` index flattened source
-    grid cells.  Pixels whose catchment is absent from ``target_ids`` are
-    dropped.  Coordinates outside the source grid raise unless
-    ``allow_oob_zero``, which drops those pixels.
-    """
-
-    catchment_idx = find_indices_in(pixel_catchment_id, target_ids)
-    selected = catchment_idx != -1
-    catchment_idx = catchment_idx[selected]
-    pixel_lon = pixel_lon[selected]
-    pixel_lat = pixel_lat[selected]
-    pixel_area = pixel_area[selected]
-    try:
-        source_idx = source._index_of_points(
-            pixel_lon,
-            pixel_lat,
-            allow_oob=allow_oob_zero,
-        )
-    except ValueError as exc:
-        _raise_hires_oob_hint(exc, allow_oob_zero=allow_oob_zero)
-        raise
-    return _hires_coo(catchment_idx, source_idx, pixel_area)
 
 
 def _hires_coo(

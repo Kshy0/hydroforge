@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Coordinate ownership graph of the active tensor fields."""
 
 from __future__ import annotations
@@ -7,6 +13,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from hydroforge.contracts.fields import PartitionSchema, TensorMetadata
+from hydroforge.core.graph import dependency_order
 
 if TYPE_CHECKING:
     from hydroforge.compiler.fields import FieldEntry
@@ -18,14 +25,34 @@ def bare(name: str | None) -> str | None:
     return name.rsplit(".", 1)[-1] if name else None
 
 
-def coordinate_identity(name: str, entries: Iterable[FieldEntry]) -> str:
-    """Resolve a coordinate to its unique owner before comparing schemas."""
-    candidates = {
-        entry.qualified: entry
-        for entry in entries
-        if entry.tensor.is_coordinate
-        and (entry.qualified == name if "." in name else entry.name == name)
-    }
+CoordinateIndex = Mapping[str, frozenset[str]]
+
+
+def coordinate_index(entries: Iterable[FieldEntry]) -> CoordinateIndex:
+    """Map bare and qualified coordinate names to their owners' qualified names."""
+
+    owners: dict[str, set[str]] = {}
+    for entry in entries:
+        if entry.tensor.is_coordinate:
+            owners.setdefault(entry.qualified, set()).add(entry.qualified)
+            owners.setdefault(entry.name, set()).add(entry.qualified)
+    return MappingProxyType({name: frozenset(found) for name, found in owners.items()})
+
+
+def coordinate_identity(
+    name: str,
+    entries: Iterable[FieldEntry] = (),
+    *,
+    index: CoordinateIndex | None = None,
+) -> str:
+    """Resolve a coordinate to its unique owner before comparing schemas.
+
+    Pass a prebuilt ``index`` when resolving many names over the same entries.
+    """
+
+    candidates = (coordinate_index(entries) if index is None else index).get(
+        name, frozenset()
+    )
     if len(candidates) != 1:
         raise ValueError(f"coordinate {name!r} has no unique declared owner")
     return next(iter(candidates))
@@ -80,6 +107,7 @@ def _schema(
             )
     coordinates = {name for name, metadata in fields.items() if metadata.is_coordinate}
     if modules is not None:
+        index = coordinate_index(entries)
         for entry in entries:
             for token in (
                 entry.tensor.dim_coords,
@@ -87,7 +115,7 @@ def _schema(
                 entry.tensor.selects,
             ):
                 if token:
-                    coordinate_identity(token, entries)
+                    coordinate_identity(token, index=index)
     # Output coordinates and selections resolve by unqualified name, which
     # an expression virtual would otherwise own.
     shadowing = sorted(
@@ -210,17 +238,13 @@ def _schema(
         target = bare(fields[via].references) if via else bare(metadata.references)
         if target is not None:
             lineage[coordinate] = target
-    for origin in lineage:
-        seen: set[str] = set()
-        coordinate = origin
-        while coordinate in lineage:
-            if coordinate in seen:
-                raise ValueError(
-                    "partition coordinate lineage must be acyclic; "
-                    f"cycle includes {coordinate!r}"
-                )
-            seen.add(coordinate)
-            coordinate = lineage[coordinate]
+    dependency_order(
+        sorted(lineage),
+        lambda coordinate: (lineage[coordinate],) if coordinate in lineage else (),
+        cycle_message=lambda cycle: (
+            f"partition coordinate lineage must be acyclic; cycle includes {cycle[0]!r}"
+        ),
+    )
 
     return PartitionSchema(
         fields=MappingProxyType(fields),

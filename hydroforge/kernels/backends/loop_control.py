@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Device loop control rules shared by the CUDA and Metal control kernels.
 
 Compiled loops keep their control scalars on the device, so small one-lane
@@ -24,7 +30,8 @@ Adaptive iteration
     propagation (the ``torch.minimum`` contract).  An invalid (NaN or
     non-positive) width sets the error flag and is replaced by the remainder,
     so the loop body stays finite while the error ends the loop.  ``end``
-    advances the elapsed time and the counter, flags an interval not complete
+    advances the elapsed time (to exactly the duration after a step clipped
+    to the remainder) and the counter, flags an interval not complete
     after ``maximum_steps`` iterations, and continues while time remains and
     no error is set.
 """
@@ -162,9 +169,16 @@ def adaptive_end(
     """Advance an adaptive loop; declares :data:`NEXT` (the continue value)."""
 
     time = Var("time", elapsed.type)
+    remaining = Var("remaining", elapsed.type)
     count = Var("count", counter.type)
     return (
-        Let(time, Binary("+", elapsed, dt)),
+        # ``elapsed + (duration - elapsed)`` can round one ulp short of
+        # ``duration``; a step clipped to the remainder ends the interval.
+        Let(remaining, Binary("-", duration, elapsed)),
+        Let(
+            time,
+            Select(Compare(">=", dt, remaining), duration, Binary("+", elapsed, dt)),
+        ),
         _store(elapsed, time),
         Let(count, Binary("+", counter, Const(1, _INT))),
         _store(counter, count),

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Metal kernel declarations and the typed programs they compile to.
 
 :class:`MetalKernel` is a physics kernel written as MSL statements: its
@@ -304,7 +310,7 @@ class MetalProgram:
         return _MetalLaunch(self, dict(values), threads, group_size)
 
     def specialize(self, values: Mapping[str, Any], group_size: int) -> Launch:
-        self.validate(values, group_size)
+        """The validated launch of ``values`` (:meth:`launch` validates)."""
         return self.launch(values, group_size)
 
     def _prepare(self, values: dict[str, Any], threads: int, group_size: int):

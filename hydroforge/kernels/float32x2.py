@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Explicit two-component FP32 buffers for Metal high-precision kernels.
 
 The trailing pair is physical storage, not a model axis. Ordinary Torch
@@ -40,6 +46,13 @@ def encode(values: torch.Tensor, device: torch.device | str = "mps") -> torch.Te
     if bool((finite & (values != 0) & (hi == 0)).any()):
         raise OverflowError("float32x2 input underflows the FP32 exponent range")
     lo = torch.where(finite, (values - hi.double()).float(), 0.0)
+    # Rounding the residual can reach half an ulp of an odd ``hi``; renormalize
+    # with an exact FP32 sum so every pair is canonical (``hi == hi + lo``),
+    # which the limb-wise Metal comparisons require.
+    # A zero ``hi`` keeps its sign (its ``lo`` is zero).
+    total = hi + lo
+    lo = torch.where(finite, lo - (total - hi), 0.0)
+    hi = torch.where(finite & (hi != 0), total, hi)
     return torch.stack((hi, lo), dim=-1).to(device, copy=True)
 
 

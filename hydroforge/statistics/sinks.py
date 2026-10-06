@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Destinations of finalized statistics samples.
 
 A sink receives the storage tensors of every output that closed a window,
@@ -94,18 +100,37 @@ class MemorySink:
             )
         raise_narrowing_failures(flags)
         copies = {}
+        # Values leaving their device move in one transfer per dtype: a
+        # blocking copy per output would wait on the device once per output.
+        moving: dict[torch.dtype, list[str]] = {}
         for name, value in converted.items():
-            dtype = self._layouts[name][1]
-            if value.dtype == dtype:
+            if isinstance(value, EmulatedTensor):
+                copies[name] = value.to(copy=True)
+            elif value.device == self.device:
                 copies[name] = value.to(
-                    device=self.device, copy=value.dtype == values[name].dtype
+                    dtype=self._layouts[name][1],
+                    copy=value.dtype == values[name].dtype,
                 )
             else:
-                # Exact widening follows the move: the sampling device may
-                # lack the wider type (MPS has no float64).
-                copies[name] = value.to(device=self.device).to(dtype)
+                moving.setdefault(value.dtype, []).append(name)
+        for names in moving.values():
+            parts = [converted[name] for name in names]
+            if len(parts) == 1:
+                moved = (parts[0].to(device=self.device),)
+            else:
+                flat = torch.cat([part.reshape(-1) for part in parts])
+                moved = flat.to(device=self.device).split(
+                    [part.numel() for part in parts]
+                )
+            for name, part, value in zip(names, parts, moved, strict=True):
+                copies[name] = value.view(part.shape)
         for name, value in copies.items():
-            self._results[name].append(value)
+            # Exact widening follows the move: the sampling device may lack
+            # the wider type (MPS has no float64).
+            dtype = self._layouts[name][1]
+            self._results[name].append(
+                value if value.dtype == dtype else value.to(dtype)
+            )
 
     def _snapshot(
         self, name: str, selection: slice, *, as_stacked: bool

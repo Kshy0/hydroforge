@@ -1,10 +1,16 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Typed model capability contracts; free-form requirement dicts are forbidden."""
 
 from __future__ import annotations
 
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from hydroforge.core.validation import HydroForgeModel
 
@@ -16,6 +22,8 @@ MODEL_OWNED_MODULE_FIELDS = (
     "mixed_precision",
     "metal_emulation",
     "ensemble_size",
+    "init_mode",
+    "options",
 )
 
 
@@ -44,6 +52,13 @@ class BackendRequirement(HydroForgeModel):
     default_block_size: int | None = Field(default=None, ge=1)
     capture: bool = True
 
+    @field_validator("precision", mode="before")
+    @classmethod
+    def _freeze_precision(cls, value: Any) -> Any:
+        """Accept a set literal for the strict frozenset declaration."""
+
+        return frozenset(value) if type(value) is set else value
+
     @model_validator(mode="after")
     def _validate_requirement(self) -> Self:
         if (
@@ -63,9 +78,17 @@ class BackendRequirement(HydroForgeModel):
                 and value > self.max_block_size
             ):
                 raise ValueError(f"{label} backend block size is outside its range")
+        if (
+            self.block_size is not None
+            and self.default_block_size is not None
+            and self.block_size != self.default_block_size
+        ):
+            raise ValueError(
+                "default backend block size must equal the fixed block size"
+            )
         return self
 
-    def _validate_precision(
+    def validate_precision(
         self,
         precision: str,
         mixed_precision: bool,

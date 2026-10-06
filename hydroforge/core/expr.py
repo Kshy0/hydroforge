@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Backend-neutral expression language for virtual fields and statistics.
 
 Expressions are parsed from Python syntax into a validated AST with their
@@ -137,6 +143,8 @@ _FUNCTION_ARITIES = {
 
 @lru_cache(maxsize=256)
 def parse_operation(spelling: str) -> StatisticOperation:
+    """Parse one statistics operation; ``.spelling`` is its canonical form."""
+
     parts = spelling.split("_")
     if len(parts) > 2:
         raise ValueError(f"invalid statistics operation {spelling!r}")
@@ -162,7 +170,13 @@ def parse_operation(spelling: str) -> StatisticOperation:
             f"{spelling!r} requires an inner statistics window; "
             "use a compound operation such as argmax_mean or max3_last"
         )
-    return StatisticOperation(spelling, outer, inner, k, stores_index)
+    # One canonical spelling per operation: ``max1_mean`` and ``max01_mean``
+    # are ``max_mean``, so equivalent requests cannot become two outputs.
+    canonical = (
+        f"{'arg' if stores_index else ''}{outer.value}{k if k > 1 else ''}"
+        f"{'' if inner is None else '_' + inner.value}"
+    )
+    return StatisticOperation(canonical, outer, inner, k, stores_index)
 
 
 class _ExpressionValidator(ast.NodeVisitor):

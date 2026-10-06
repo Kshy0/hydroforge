@@ -331,7 +331,7 @@ def find_indices_in(a: _IntegerVector, b: _IntegerVector) -> np.ndarray:
     return index
 
 
-_TORCH_INDEX_DTYPES = frozenset(
+TORCH_INTEGER_DTYPES = frozenset(
     {
         torch.int8,
         torch.uint8,
@@ -342,12 +342,13 @@ _TORCH_INDEX_DTYPES = frozenset(
         torch.int64,
     }
 )
+"""Integer tensor dtypes accepted at HydroForge's input boundaries."""
 
 
 def _index_tensor(value: torch.Tensor) -> torch.Tensor:
     if value.ndim != 1:
         raise ValueError("torch index lookup tensors must be one-dimensional")
-    if value.dtype not in _TORCH_INDEX_DTYPES:
+    if value.dtype not in TORCH_INTEGER_DTYPES:
         raise ValueError("torch index lookup tensors must contain integers")
     return value
 

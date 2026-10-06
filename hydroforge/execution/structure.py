@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Between-step structural tensor updates derived from declared dimensions."""
 
 from __future__ import annotations
@@ -411,6 +417,7 @@ def _validate_replacements(
             raise ValueError("tensor update targets must not share storage")
         targets.add(identity)
     replacements: dict[int, torch.Tensor] = {}
+    rebound: set[tuple[torch.device, int]] = set()
     for current, replacement in pairs:
         if current is replacement:
             raise ValueError(f"{kind} replacement must use staged storage")
@@ -433,10 +440,19 @@ def _validate_replacements(
             )
         if replacement.layout is not torch.strided or not replacement.is_contiguous():
             raise ValueError(f"{kind} replacement must be a contiguous strided tensor")
-        if (replacement.device, replacement.untyped_storage()._cdata) in targets:
+        storage = (replacement.device, replacement.untyped_storage()._cdata)
+        if storage in targets:
             raise ValueError(
                 f"{kind} replacement must not share storage with any update target"
             )
+        if kind == "structural" and id(current) not in content_ids:
+            # ``set_`` adopts the replacement storage; a shared one would
+            # alias two distinct model fields.
+            if storage in rebound:
+                raise ValueError(
+                    "structural replacements must not share storage with each other"
+                )
+            rebound.add(storage)
         replacements[id(current)] = replacement
     return replacements
 
@@ -533,16 +549,14 @@ def commit_content_update(
 
 
 def _validate_content_coordinates(fields, replacements, pairs, content_ids) -> None:
+    currents = {id(current): current for current, _ in pairs}
     for identity in content_ids:
         matches = fields[identity]
         for _module, field_name, metadata in matches:
             if (
                 metadata is not None
                 and metadata.is_coordinate
-                and not torch.equal(
-                    next(current for current, _ in pairs if id(current) == identity),
-                    replacements[identity],
-                )
+                and not torch.equal(currents[identity], replacements[identity])
             ):
                 raise ValueError(
                     f"address-stable content update cannot change coordinate "
@@ -583,7 +597,6 @@ def _commit_content_update(
         )
 
     bindings = runtime.parameters.prepare_rebind(replacements)
-    statistics = runtime.statistics
     selections = (
         () if statistics is None else statistics.prepare_selection_update(replacements)
     )

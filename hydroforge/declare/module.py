@@ -11,6 +11,7 @@ This is the highest level abstraction that all modules inherit from.
 
 from __future__ import annotations
 
+import math
 import warnings
 from abc import ABC
 from collections.abc import Mapping
@@ -42,12 +43,14 @@ from pydantic import (
     validate_call,
 )
 
-from hydroforge.contracts.fields import TensorMetadata
+from hydroforge.contracts.fields import TensorDependencies, TensorMetadata
+from hydroforge.contracts.options import OptionsConfig
 from hydroforge.contracts.runtime import MODEL_OWNED_MODULE_FIELDS
 from hydroforge.core.arrays import find_indices_in_torch
+from hydroforge.core.errors import UnknownFieldError, error_message
 from hydroforge.core.events import ModelEvent
 from hydroforge.core.naming import Identifier
-from hydroforge.core.validation import HydroForgeModel
+from hydroforge.core.validation import HydroForgeModel, require_unique
 from hydroforge.declare.kernel_field import _KernelField
 from hydroforge.declare.spec import (
     FieldSpec,
@@ -69,19 +72,40 @@ _TENSOR_METADATA = "__hydroforge_tensor__"
 _SPEC = "__hydroforge_spec__"
 
 
-def _require_unique(values: tuple[str, ...]) -> tuple[str, ...]:
-    if len(values) != len(set(values)):
-        raise ValueError("must not contain duplicates")
-    return values
-
-
 _STRICT = ConfigDict(strict=True)
 _IDENTIFIER = TypeAdapter(Identifier, config=_STRICT)
 _DESCRIPTION = TypeAdapter(Annotated[str, Field(min_length=1)], config=_STRICT)
 _UNIQUE_IDENTIFIERS = TypeAdapter(
-    Annotated[tuple[Identifier, ...], AfterValidator(_require_unique)],
+    Annotated[tuple[Identifier, ...], AfterValidator(require_unique)],
     config=_STRICT,
 )
+
+
+_INTEGER_DEFAULT_LIMITS = {
+    "int": torch.iinfo(torch.int64),
+    "idx": torch.iinfo(torch.int32),
+}
+
+
+def _validate_scalar_default(value: bool | int | float, dtype: str) -> None:
+    """Reject scalar defaults that ``torch.full`` would silently convert."""
+
+    if dtype == "bool":
+        if type(value) is not bool:
+            raise ValueError("TensorField default for dtype 'bool' must be a bool")
+        return
+    if type(value) is bool:
+        raise ValueError(f"TensorField default for dtype {dtype!r} must not be a bool")
+    limits = _INTEGER_DEFAULT_LIMITS.get(dtype)
+    if limits is None:
+        return
+    if type(value) is not int:
+        raise ValueError(f"TensorField default for dtype {dtype!r} must be an int")
+    if not limits.min <= value <= limits.max:
+        raise ValueError(
+            f"TensorField default {value} is outside the {dtype!r} range "
+            f"[{limits.min}, {limits.max}]"
+        )
 
 
 def TensorField(
@@ -97,10 +121,17 @@ def TensorField(
     references: str | None = None,
     selects: str | None = None,
     replicated: bool = False,
-    output: Literal["auto", "full", "disabled"] = "auto",
-    depends_on: str | tuple[str, ...] | None = None,
-    required_by: str | tuple[str, ...] | None = None,
+    output: Literal["auto", "full", "disabled"] | None = None,
+    depends_on: TensorDependencies = None,
+    required_by: TensorDependencies = None,
     default: Any = _NO_FIELD_DEFAULT,
+    *,
+    units: str | None = None,
+    finite: bool | None = None,
+    ge: float | None = None,
+    gt: float | None = None,
+    le: float | None = None,
+    lt: float | None = None,
 ) -> Any:
     """
     Create a tensor field with shape information directly in AbstractModule.
@@ -121,13 +152,16 @@ def TensorField(
                     Valid only for CoordinateField declarations.
         output: Output policy. ``auto`` inherits the default SelectionField for
                 ``dim_coords``; ``full`` writes the full local axis; ``disabled``
-                rejects explicit output requests.
-        depends_on: Module identifier or reserved ``options.<bool_path>`` string,
-                    or a tuple of both. Every condition must hold for loading,
-                    allocation and compiler binding. Options resolve once at
-                    model construction; changing them requires a new model.
-        required_by: Consumer module names. The field is active when at least
-                     one listed consumer module is open.
+                rejects explicit output requests. Omitted, it is ``disabled``
+                for forcing and ``mode='discard'`` fields and ``auto`` otherwise.
+        depends_on: A condition (``hydroforge.contracts.module``/``opt``
+                    expressions), a module identifier, a reserved
+                    ``options.<bool_path>`` string, or a tuple of them (AND).
+                    It must hold for loading, allocation and compiler binding.
+                    Options resolve once at model construction; changing them
+                    requires a new model.
+        required_by: Consumer conditions (usually module names). The field is
+                     active when at least one of them holds (OR).
         category: Category of the variable:
                   - 'topology': Static structure (NEVER batched)
                   - 'param': Input parameter (can be batched)
@@ -141,7 +175,20 @@ def TensorField(
                   - 'cpu': Move to CPU memory to save GPU memory
                   - 'discard': Set to None after initialization to maximize memory saving
         default: Scalar default (bool, int, float or None) expanded to the
-                 declared shape when the module is constructed.
+                 declared shape when the module is constructed. It must match
+                 ``dtype`` exactly: bool for ``bool``, an in-range int for
+                 ``int``/``idx``, and an int or float for floating dtypes.
+        units: Physical units of the values (e.g. ``"kg m-2 s-1"``);
+                 declaration metadata only.
+        finite: Reject NaN and infinities. Defaults to True for floating
+                 dtypes, except fields whose default is NaN (an unset
+                 placeholder); declare ``finite=False`` for other fields that
+                 hold NaN. Invalid for other dtypes.
+        ge, gt, le, lt: Inclusive/exclusive value bounds (at most one lower
+                 and one upper). NaN violates a bound.
+
+    ``finite`` and the bounds are checked once, when the model materializes,
+    for stored non-forcing fields.
     """
     if category not in _STORED_CATEGORIES:
         raise ValueError(
@@ -155,6 +202,17 @@ def TensorField(
         type(None),
     ):
         raise ValueError("TensorField default must be a bool, int, float or None")
+    if default is not _NO_FIELD_DEFAULT and default is not None:
+        _validate_scalar_default(default, dtype)
+    if output is None:
+        output = "disabled" if category == "forcing" or mode == "discard" else "auto"
+    bounds = {"ge": ge, "gt": gt, "le": le, "lt": lt}
+    for name, bound in bounds.items():
+        if bound is not None and type(bound) not in (int, float):
+            raise ValueError(f"TensorField {name} must be an int or float")
+    nan_default = type(default) is float and math.isnan(default)
+    if finite is None:
+        finite = dtype in {"float", "hpfloat"} and not nan_default
     metadata = TensorMetadata(
         shape=shape,
         dtype=dtype,
@@ -170,7 +228,21 @@ def TensorField(
         output=output,
         depends_on=depends_on,
         required_by=required_by,
+        units=units,
+        finite=finite,
+        **{
+            name: None if bound is None else float(bound)
+            for name, bound in bounds.items()
+        },
     )
+    # A NaN default fills an unset placeholder; its bounds are not checked.
+    if default is not _NO_FIELD_DEFAULT and default is not None and not nan_default:
+        violated = metadata.value_violations(torch.tensor(default))
+        if violated:
+            raise ValueError(
+                f"TensorField default {default!r} violates "
+                f"{', '.join(label for label, _mask in violated)}"
+            )
     info = (
         Field(description=description)
         if default is _NO_FIELD_DEFAULT
@@ -312,6 +384,19 @@ def ReferenceIndexField(
     return _ReferenceIndexDescriptor(reference, inverse=inverse, device=device)
 
 
+def check_module_conflicts(
+    module_name: str, conflicts: tuple[str, ...], opened: tuple[str, ...]
+) -> None:
+    """Reject an opened module selection that contains a declared conflict."""
+
+    present = [name for name in conflicts if name in opened and name != module_name]
+    if present:
+        raise ValueError(
+            f"Module '{module_name}' conflicts with modules present in "
+            f"opened_modules: {present}. These modules cannot be enabled together."
+        )
+
+
 _TModule = TypeVar("_TModule", bound="AbstractModule")
 _TReference = TypeVar("_TReference", covariant=True)
 
@@ -411,8 +496,8 @@ def computed_tensor_field(
         "topology", "derived_param", "state", "shared_state", "virtual"
     ] = "derived_param",
     expr: str | None = None,
-    depends_on: str | tuple[str, ...] | None = None,
-    required_by: str | tuple[str, ...] | None = None,
+    depends_on: TensorDependencies = None,
+    required_by: TensorDependencies = None,
     output: Literal["auto", "full", "disabled"] = "auto",
     output_only: bool = False,
 ):
@@ -435,10 +520,11 @@ def computed_tensor_field(
                   - 'virtual': Allocated on demand or evaluated as an output
                     expression; buffer fields may be shared or member-batched
         expr: Expression string for virtual variables
-        depends_on: Module identifier or ``options.<bool_path>`` string, or a
-            tuple of both (AND), resolved before this tensor is evaluated.
-        required_by: Consumer module names. At least one must be active before
-            this computed tensor is evaluated or validated.
+        depends_on: A condition, module identifier or ``options.<bool_path>``
+            string, or a tuple of them (AND), resolved before this tensor is
+            evaluated.
+        required_by: Consumer conditions (usually module names). At least one
+            must hold before this computed tensor is evaluated or validated.
         output_only: Keep this computed tensor unmaterialized unless it is
             directly requested by statistics. This is an output-storage
             policy; it does not introduce a new checkpoint/state lifecycle
@@ -466,9 +552,41 @@ def computed_tensor_field(
 
     def decorate(prop: Any) -> Any:
         setattr(_property_function(prop), _TENSOR_METADATA, metadata)
+        if isinstance(prop, property) and not isinstance(prop, _ActivatedProperty):
+            prop = _ActivatedProperty(prop.fget, prop.fset, prop.fdel, prop.__doc__)
         return declare(prop)
 
     return decorate
+
+
+class _ActivatedProperty(property):
+    """A plain-property (virtual) tensor that reads ``None`` while inactive.
+
+    Cached properties get ``None`` stored when the module is specialized; a
+    plain property is recomputed on every access, so its reads are guarded.
+    The field is the attribute name the property is bound to.
+    """
+
+    def __init__(
+        self,
+        fget: Any = None,
+        fset: Any = None,
+        fdel: Any = None,
+        doc: str | None = None,
+    ) -> None:
+        super().__init__(fget, fset, fdel, doc)
+        self.field_name = getattr(fget, "__name__", None)
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self.field_name = name
+
+    def __get__(self, instance: Any, owner: type | None = None) -> Any:
+        if instance is None:
+            return self
+        binding = getattr(instance, "_binding", None)
+        if binding is not None and self.field_name not in binding.plan.active:
+            return None
+        return super().__get__(instance, owner)
 
 
 def _declared_attributes(owner: type) -> dict[str, Any]:
@@ -554,7 +672,15 @@ def _module_spec(cls: type[AbstractModule]) -> ModuleSpec:
     module_name = _IDENTIFIER.validate_python(cls.module_name)
     description = _DESCRIPTION.validate_python(cls.description)
     conflicts = _UNIQUE_IDENTIFIERS.validate_python(cls.conflicts)
-    excluded_names = _UNIQUE_IDENTIFIERS.validate_python(cls.nc_excluded_fields)
+    # Model-owned fields stay excluded even when a module adds its own names.
+    # Repeating a model-owned name (e.g. ``(*base, "options")``) is harmless.
+    declared_excluded = _UNIQUE_IDENTIFIERS.validate_python(
+        tuple(dict.fromkeys(cls.nc_excluded_fields))
+    )
+    excluded_names = (
+        *declared_excluded,
+        *(name for name in MODEL_OWNED_MODULE_FIELDS if name not in declared_excluded),
+    )
     fields = {
         name: _field_spec(
             module_name, name, info, computed=False, excluded_names=excluded_names
@@ -688,6 +814,22 @@ class AbstractModule(HydroForgeModel, ABC):
         strict=True,
         description="Number of parallel simulations (ensemble members)",
     )
+    init_mode: Literal["cold", "restart"] | None = Field(
+        default=None,
+        description=(
+            "The model's declared initialization mode; None leaves restart "
+            "detection to the module"
+        ),
+    )
+    options: OptionsConfig = Field(
+        default_factory=OptionsConfig,
+        exclude=True,
+        description=(
+            "The model's root options, supplied by the model. Modules derive "
+            "kernel flags and constants from them; re-annotate the field "
+            "(``options: MyOptions``) for typed access"
+        ),
+    )
 
     _binding: ModuleBinding = PrivateAttr()
     _tensors: ModuleTensors = PrivateAttr()
@@ -801,7 +943,7 @@ class AbstractModule(HydroForgeModel, ABC):
                 )
             return ModuleTensors._prepare_payload(cls, payload, binding)
         except (KeyError, TypeError, OverflowError) as error:
-            raise ValueError(str(error)) from error
+            raise ValueError(error_message(error)) from error
 
     @model_validator(mode="after")
     def _canonicalize_module_payload(self, info: ValidationInfo) -> Self:
@@ -813,21 +955,23 @@ class AbstractModule(HydroForgeModel, ABC):
         """
 
         binding = info.context[_MODULE_BINDING]
+        # Cheap selection checks run before any tensor is validated or computed.
+        if self.module_name not in self.opened_modules:
+            raise ValueError(
+                f"`{self.module_name}` is not listed in `opened_modules`. "
+                "All active modules must include themselves in that list."
+            )
+        check_module_conflicts(self.module_name, self.conflicts, self.opened_modules)
         try:
             self._binding = binding
             self._tensors = ModuleTensors(
                 self,
                 batched_fields=binding.plan.batched_forcing,
             )
-            if self.module_name not in self.opened_modules:
-                raise ValueError(
-                    f"`{self.module_name}` is not listed in `opened_modules`. "
-                    "All active modules must include themselves in that list."
-                )
             self._tensors._validate_declared()
             self._tensors._finalize_computed()
         except (KeyError, TypeError, OverflowError) as error:
-            raise ValueError(str(error)) from error
+            raise ValueError(error_message(error)) from error
         return self
 
     def _reference_target(self, field_name: str) -> torch.Tensor:
@@ -940,20 +1084,6 @@ class AbstractModule(HydroForgeModel, ABC):
 
         return self._tensors._expected_dtype(field_name)
 
-    @model_validator(mode="after")
-    def _validate_opened_modules(self) -> Self:
-        v = self.opened_modules
-        present_conflicts = [
-            c for c in self.conflicts if c in v and c != self.module_name
-        ]
-        if present_conflicts:
-            raise ValueError(
-                f"Module '{self.module_name}' conflicts with modules present in opened_modules: {present_conflicts}. "
-                f"These modules cannot be enabled together."
-            )
-
-        return self
-
     def gather_tensor(
         self,
         tensor: torch.Tensor,
@@ -1005,7 +1135,9 @@ class AbstractModule(HydroForgeModel, ABC):
         if isinstance(field, str):
             metadata = self._tensor_metadata(field)
             if metadata is None:
-                raise ValueError(f"unknown tensor field {self.module_name}.{field}")
+                raise UnknownFieldError(
+                    f"unknown tensor field {self.module_name}.{field}"
+                )
             if self.ensemble_size is None or metadata.category == "topology":
                 return False
             if metadata.category == "forcing":
@@ -1052,7 +1184,9 @@ class AbstractModule(HydroForgeModel, ABC):
         for field_name in field_names:
             field = fields.get(field_name)
             if field is None and self._tensor_metadata(field_name) is None:
-                raise KeyError(f"Unknown tensor field {self.module_name}.{field_name}")
+                raise UnknownFieldError(
+                    f"Unknown tensor field {self.module_name}.{field_name}"
+                )
             if not self._is_tensor_field_active(field_name):
                 raise ValueError(
                     f"Cannot materialize inactive field {self.module_name}.{field_name}"

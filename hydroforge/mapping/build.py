@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Orchestrators that assemble :class:`MappingTable` objects from engines."""
 
 from __future__ import annotations
@@ -10,11 +16,10 @@ import numpy as np
 from pydantic import AfterValidator, InstanceOf, validate_call
 from scipy.sparse import csr_matrix
 
-from hydroforge.core.arrays import find_indices_in
 from hydroforge.core.validation import HydroForgeModel
-from hydroforge.mapping.cama import _cama_hires_source_cells
+from hydroforge.mapping.cama import _cama_cell_targets, _cama_hires_source_cells
 from hydroforge.mapping.engine import (
-    _aggregate_hires_coo,
+    _EARTH_RADIUS_M,
     _hires_coo,
     _normalise_row,
     _normalise_rows,
@@ -91,16 +96,6 @@ def build_regular_grid_mapping(
         raise ValueError("overlap requires target bounds")
     if method == "nearest" and (target.x is None or target.y is None):
         raise ValueError("nearest requires target center coordinates")
-    if method == "overlap" and source.is_geographic:
-        bounds = target.bounds
-        if np.any((bounds[:, 2] < -90.0) | (bounds[:, 3] > 90.0)):
-            raise ValueError(
-                "geographic target latitude bounds must lie within [-90, 90]"
-            )
-        if source._periodic_x and np.any(bounds[:, 1] - bounds[:, 0] > 360.0 + 1e-9):
-            raise ValueError(
-                "geographic target longitude width cannot exceed 360 degrees"
-            )
     n_target = target.target_ids.size
     coverage = np.zeros(n_target, dtype=np.float32)
 
@@ -167,9 +162,14 @@ def _hires_mapping(
     rows: np.ndarray,
     cols: np.ndarray,
     data: np.ndarray,
+    coverage: np.ndarray,
     metadata: Mapping[str, Any],
 ) -> MappingTable:
-    """Assemble summed hires pixel areas as a ``catchment x source`` table."""
+    """Assemble summed hires pixel areas as a ``catchment x source`` table.
+
+    ``coverage`` is each catchment's area fraction that lies on the source
+    grid, like the covered-area fraction of overlap mappings.
+    """
 
     matrix = csr_matrix(
         (data, (rows, cols)),
@@ -181,7 +181,7 @@ def _hires_mapping(
         matrix=matrix,
         source_x=source.x,
         source_y=source.y,
-        coverage=np.asarray(matrix.sum(axis=1), dtype=np.float64).ravel(),
+        coverage=coverage,
         metadata={
             **metadata,
             "method": "hires_aggregate",
@@ -193,34 +193,80 @@ def _hires_mapping(
     )
 
 
-def _build_hires_aggregate_mapping(
+def _covered_fraction(
+    rows: np.ndarray, areas: np.ndarray, covered: np.ndarray, count: int
+) -> np.ndarray:
+    """Per-row fraction of ``areas`` flagged ``covered``; zero for empty rows."""
+
+    total = np.bincount(rows, weights=areas, minlength=count)
+    inside = np.bincount(rows[covered], weights=areas[covered], minlength=count)
+    return np.divide(inside, total, out=np.zeros(count), where=total > 0.0)
+
+
+def _cama_cell_mapping(
     source: RegularGrid,
     target_ids: np.ndarray,
-    pixel_catchment_id: np.ndarray,
-    pixel_area: np.ndarray,
-    pixel_lon: np.ndarray,
-    pixel_lat: np.ndarray,
+    map_dir: Path,
+    nx: int,
+    ny: int,
     *,
-    allow_oob_zero: bool = False,
-    metadata: Mapping[str, Any] | None = None,
+    map_precision: str,
+    allow_oob_zero: bool,
+    metadata: Mapping[str, Any],
 ) -> MappingTable:
-    """Area-weighted ``catchment x source`` mapping from explicit hires pixels.
+    """Spread each CaMa catchment area over the source cells its cell overlaps.
 
-    The per-pixel reference for :func:`_cama_hires_mapping`; inputs are the
-    canonical arrays of :func:`~hydroforge.mapping.engine._aggregate_hires_coo`.
-    Weights are raw pixel areas without per-row normalization.
+    Without a high-resolution map a catchment is known only through its
+    low-resolution cell. Its area (``ctmare.bin`` or the spherical cell
+    area) is distributed over the separable spherical overlap of that cell
+    with the source grid, so a finer source grid is area-averaged instead
+    of sampled at the cell center.
     """
 
-    rows, cols, data = _aggregate_hires_coo(
-        source,
-        target_ids,
-        pixel_catchment_id,
-        pixel_area,
-        pixel_lon,
-        pixel_lat,
-        allow_oob_zero=allow_oob_zero,
+    bounds, areas = _cama_cell_targets(
+        map_dir, nx, ny, target_ids, map_precision=map_precision
     )
-    return _hires_mapping(source, target_ids, rows, cols, data, metadata or {})
+    overlap = _regular_overlap_csr(
+        source, TargetSupport(target_ids=target_ids, bounds=bounds)
+    )
+    coverage = overlap.coverage
+    uncovered = int(np.count_nonzero(coverage < _MIN_FULL_COVERAGE))
+    if uncovered and not allow_oob_zero:
+        raise ValueError(
+            f"{uncovered}/{target_ids.size} points fall outside the source grid "
+            "(CaMa cells not fully covered by the source grid)"
+        )
+    if source.is_geographic:
+        cell_area = (
+            np.radians(bounds[:, 1] - bounds[:, 0])
+            * _EARTH_RADIUS_M
+            * _EARTH_RADIUS_M
+            * (np.sin(np.radians(bounds[:, 3])) - np.sin(np.radians(bounds[:, 2])))
+        )
+    else:
+        cell_area = (bounds[:, 1] - bounds[:, 0]) * (bounds[:, 3] - bounds[:, 2])
+    lengths = np.diff(overlap.indptr)
+    # Pixels outside the source grid are dropped, as on the hires path.
+    values = overlap.values * np.repeat(areas / cell_area, lengths)
+    return MappingTable._assemble(
+        target_ids=target_ids,
+        matrix=csr_matrix(
+            (values, overlap.cols, overlap.indptr),
+            shape=(target_ids.size, source._size),
+            dtype=np.float64,
+        ),
+        source_x=source.x,
+        source_y=source.y,
+        coverage=np.minimum(coverage, 1.0),
+        metadata={
+            **metadata,
+            "method": "cama_cell_overlap",
+            "normalization": "sum",
+            **_source_metadata(source),
+            "target_kind": "catchment",
+            "overlap_engine": "separable",
+        },
+    )
 
 
 def _cama_hires_mapping(
@@ -240,14 +286,26 @@ def _cama_hires_mapping(
 ) -> MappingTable:
     """Aggregate the hires pixels of a CaMa map directory onto ``source``.
 
-    Equal to :func:`_build_hires_aggregate_mapping` of the same pixels, but
-    each hires tile's longitude and latitude axes are located on ``source``
-    once instead of once per pixel.  Inputs are validated by
+    Each hires tile's longitude and latitude axes are located on ``source``
+    once instead of once per pixel.  With ``hires_tag=None`` the
+    low-resolution cells are overlapped instead (:func:`_cama_cell_mapping`).
+    Inputs are validated by
     :func:`~hydroforge.mapping.aggregation.build_cama_mapping`.
     """
 
     try:
-        pixel_catchment_id, pixel_area, source_idx = _cama_hires_source_cells(
+        if hires_tag is None:
+            return _cama_cell_mapping(
+                source,
+                target_ids,
+                map_dir,
+                nx,
+                ny,
+                map_precision=map_precision,
+                allow_oob_zero=allow_oob_zero,
+                metadata=metadata,
+            )
+        catchment_idx, pixel_area, source_idx = _cama_hires_source_cells(
             map_dir,
             nx,
             ny,
@@ -263,6 +321,8 @@ def _cama_hires_mapping(
     except ValueError as exc:
         _raise_hires_oob_hint(exc, allow_oob_zero=allow_oob_zero)
         raise
-    catchment_idx = find_indices_in(pixel_catchment_id, target_ids)
     rows, cols, data = _hires_coo(catchment_idx, source_idx, pixel_area)
-    return _hires_mapping(source, target_ids, rows, cols, data, metadata)
+    coverage = _covered_fraction(
+        catchment_idx, pixel_area, source_idx >= 0, target_ids.size
+    )
+    return _hires_mapping(source, target_ids, rows, cols, data, coverage, metadata)

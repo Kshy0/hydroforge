@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Compilation of kernel programs: requests, caches and batched precompilation.
 
 Every program HydroForge compiles (physics kernels, statistics programs,
@@ -109,9 +115,12 @@ def precompile(requests: Iterable[CompileRequest], *, jobs: int | None = None) -
         if pool is not None:
             pool.shutdown(wait=True)
     for future in futures:
-        if future.exception() is not None:
-            errors.append(future.exception())
+        if (error := future.exception()) is not None:
+            errors.append(error)
     if errors:
+        # Report every failed program, raising the first one's own type.
+        for other in errors[1:]:
+            errors[0].add_note(f"another program also failed: {other!r}")
         raise errors[0]
 
 

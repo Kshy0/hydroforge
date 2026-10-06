@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Explicit distributed operators for compiled substeps.
 
 Every collective goes through one batched path: a batch costs a single
@@ -10,7 +16,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import nullcontext
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -18,7 +25,10 @@ from pydantic import Field, PrivateAttr, model_validator
 
 from hydroforge.core.identity import digest63
 from hydroforge.core.validation import HydroForgeModel
-from hydroforge.execution.channel import ENSEMBLE_COLLECTIVE_FLAG
+from hydroforge.execution.channel import (
+    ENSEMBLE_COLLECTIVE_FLAG,
+    require_process_group,
+)
 from hydroforge.execution.context import ACTIVE_STEP
 from hydroforge.kernels.calls import compiled_operator_entry, recording_sink
 from hydroforge.parallel.launch import communication_backend
@@ -84,13 +94,6 @@ class _CollectiveRequest(HydroForgeModel):
         return self._abis
 
 
-def _require_distributed(operation: str) -> None:
-    if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError(
-            f"{operation} requires an initialized torch.distributed process group"
-        )
-
-
 def _tensor_abi(
     tensor: torch.Tensor,
     *,
@@ -133,41 +136,44 @@ def _batch_signature(
 
 
 def _validate_collective_environment(
-    tensor: torch.Tensor | None,
+    device: torch.device | None,
     *,
     operation: str,
     destination: int | None = None,
     group=None,
     group_size: int | None = None,
-) -> None:
-    """Validate batch-invariant process-group state exactly once."""
+) -> str | None:
+    """Validate batch-invariant process-group state; return its backend."""
 
     if group_size != 1:
-        _require_distributed(operation)
+        require_process_group(operation)
     group_kwargs = {} if group is None else {"group": group}
     if destination is not None:
         size = dist.get_world_size(**group_kwargs) if group_size is None else group_size
         if not 0 <= destination < size:
             raise ValueError(f"{operation} destination is outside the process group")
-    if tensor is None or group_size == 1:
-        return
-    backend = communication_backend(dist.get_backend(**group_kwargs))
+    if device is None or group_size == 1:
+        return None
+    backend = communication_backend(
+        dist.get_backend(**group_kwargs), device_type=device.type
+    )
     required_device = {"nccl": "cuda", "xccl": "xpu"}
     for backend_name, device_type in required_device.items():
-        if backend_name == backend and tensor.device.type != device_type:
+        if backend_name == backend and device.type != device_type:
             raise ValueError(
                 f"{operation} with {backend_name.upper()} requires a "
                 f"{device_type.upper()} tensor"
             )
     required_backend = {"cuda": "nccl", "xpu": "xccl", "mps": "gloo"}.get(
-        tensor.device.type,
+        device.type,
     )
     if required_backend is not None and required_backend != backend:
         raise ValueError(
-            f"{operation} of a {tensor.device.type.upper()} tensor requires "
+            f"{operation} of a {device.type.upper()} tensor requires "
             f"the {required_backend.upper()} process-group backend, got "
             f"{backend}"
         )
+    return backend
 
 
 def _event_kind(
@@ -181,16 +187,85 @@ def _event_kind(
     return 100 + destination * 3 + reduction_code
 
 
-def _coalescing_group(device: torch.device, group=None):
+def _coalescing_group(device: torch.device, backend: str | None, group=None):
     """Group the batch into one NCCL submission when the backend allows it."""
 
     manager = getattr(dist, "_coalescing_manager", None)
-    if manager is None or device.type != "cuda":
+    if manager is None or device.type != "cuda" or backend != "nccl":
         return nullcontext()
     group_kwargs = {} if group is None else {"group": group}
-    if communication_backend(dist.get_backend(**group_kwargs)) != "nccl":
-        return nullcontext()
     return manager(device=device, async_ops=False, **group_kwargs)
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchEnvironment:
+    """Process-group facts of one recorded batch, resolved once."""
+
+    group: Any
+    group_size: int | None
+    backend: str | None
+    global_destination: int | None
+    receives: bool
+
+
+# (mesh id, scope, operation, destination, device) -> (mesh, world, environment).
+# The mesh and default group are compared by identity, so a rebuilt mesh or a
+# re-initialized process group resolves afresh.
+_ENVIRONMENTS: dict[tuple[Any, ...], tuple[Any, Any, _BatchEnvironment]] = {}
+
+
+def _batch_environment(
+    mesh: Any,
+    *,
+    scope: ParallelAxis,
+    operation: str,
+    destination: int | None,
+    device: torch.device | None,
+) -> _BatchEnvironment:
+    world = dist.group.WORLD if dist.is_available() and dist.is_initialized() else None
+    key = (id(mesh), scope, operation, destination, device)
+    cached = _ENVIRONMENTS.get(key)
+    if cached is not None and cached[0] is mesh and cached[1] is world:
+        return cached[2]
+    if mesh is None and scope == "ensemble":
+        raise ValueError("ensemble collectives require an EnsembleParallel mesh")
+    group = None if mesh is None else mesh.group(scope)
+    group_size = (
+        None
+        if mesh is None
+        else mesh.spatial_partitions
+        if scope == "spatial"
+        else mesh.ensemble_partitions
+    )
+    backend = _validate_collective_environment(
+        device,
+        operation=operation,
+        destination=destination,
+        group=group,
+        group_size=group_size,
+    )
+    global_destination = destination
+    if destination is not None and mesh is not None:
+        ranks = mesh.rank_groups(scope)[
+            mesh.ensemble_rank if scope == "spatial" else mesh.spatial_rank
+        ]
+        global_destination = ranks[destination]
+    receives = destination is None or (
+        group_size != 1 and dist.get_rank() == global_destination
+    )
+    environment = _BatchEnvironment(
+        group, group_size, backend, global_destination, receives
+    )
+    # Keep only the current mesh and process group: a stale entry would
+    # otherwise retain a released mesh and its groups.
+    for stale in [
+        other
+        for other, (owner, group_world, _environment) in _ENVIRONMENTS.items()
+        if owner is not mesh or group_world is not world
+    ]:
+        del _ENVIRONMENTS[stale]
+    _ENVIRONMENTS[key] = (mesh, world, environment)
+    return environment
 
 
 def _run_validated_batch(
@@ -211,23 +286,12 @@ def _run_validated_batch(
             "or an operator recorder"
         )
     _code, op = _REDUCTIONS[reduction]
-    mesh = step.mesh
-    if mesh is None and scope == "ensemble":
-        raise ValueError("ensemble collectives require an EnsembleParallel mesh")
-    group = None if mesh is None else mesh.group(scope)
-    group_size = (
-        None
-        if mesh is None
-        else mesh.spatial_partitions
-        if scope == "spatial"
-        else mesh.ensemble_partitions
-    )
-    _validate_collective_environment(
-        tensors[0] if tensors else None,
+    environment = _batch_environment(
+        step.mesh,
+        scope=scope,
         operation=operation,
         destination=destination,
-        group=group,
-        group_size=group_size,
+        device=tensors[0].device if tensors else None,
     )
     # The handshake runs even for an empty batch: a rank that contributes no
     # tensors must still be seen to disagree with one that does.
@@ -236,26 +300,24 @@ def _run_validated_batch(
         | (ENSEMBLE_COLLECTIVE_FLAG if scope == "ensemble" else 0),
         _batch_signature(abis, reduction, destination),
     )
-    if not tensors or group_size == 1:
+    if not tensors or environment.group_size == 1:
         return
-    global_destination = destination
-    if destination is not None and mesh is not None:
-        ranks = mesh.rank_groups(scope)[
-            mesh.ensemble_rank if scope == "spatial" else mesh.spatial_rank
-        ]
-        global_destination = ranks[destination]
+    group = environment.group
     group_kwargs = {} if group is None else {"group": group}
-    with _coalescing_group(tensors[0].device, **group_kwargs):
+    with _coalescing_group(tensors[0].device, environment.backend, **group_kwargs):
         for tensor in tensors:
             # cpu() decodes emulated storage; never reduce its integer carrier.
             staging = tensor.cpu() if tensor.device.type == "mps" else tensor
             if destination is None:
                 dist.all_reduce(staging, op=op, **group_kwargs)
             else:
-                dist.reduce(staging, dst=global_destination, op=op, **group_kwargs)
-            if staging is not tensor and (
-                destination is None or dist.get_rank() == global_destination
-            ):
+                dist.reduce(
+                    staging,
+                    dst=environment.global_destination,
+                    op=op,
+                    **group_kwargs,
+                )
+            if staging is not tensor and environment.receives:
                 tensor.copy_(staging)
 
 

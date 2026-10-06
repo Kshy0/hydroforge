@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Field selection of one model specialization: demand, activation and names."""
 
 from __future__ import annotations
@@ -12,7 +18,7 @@ from pydantic import BaseModel
 
 from hydroforge.compiler.partition import compile_partition
 from hydroforge.compiler.selection import Selection
-from hydroforge.contracts.conditions import conditions_satisfied, module_conditions
+from hydroforge.contracts.conditions import conditions_satisfied
 from hydroforge.contracts.fields import (
     FieldDemandPlan,
     PartitionSchema,
@@ -472,26 +478,16 @@ def _field_demand(
 def _check_namespace(
     definitions: dict[str, FieldSpec],
     field: FieldSpec,
-    known_modules: Mapping[str, Any],
     active: bool,
 ) -> None:
     """Reject conflicting declarations of one bare name across modules.
 
     Expression virtuals may share a name with their source in another module;
-    that is the standard subcell-to-cell aggregation pattern.
+    that is the standard subcell-to-cell aggregation pattern.  Unknown module
+    conditions were already rejected when the model spec was built.
     """
 
     tensor = field.tensor
-    if tensor is not None:
-        unknown = sorted(
-            set(
-                (*module_conditions(tensor.depends_on), *tensor.required_by)
-            ).difference(known_modules)
-        )
-        if unknown:
-            raise ValueError(
-                f"Tensor field {field.module_name}.{field.name} depends on unknown modules: {unknown}"
-            )
     if field.excluded or not active:
         return
     # Virtual lookup precedence belongs to FieldNameResolver. This table
@@ -549,7 +545,7 @@ def plan_fields(
         for name, field in module.fields.items():
             tensor = field.tensor
             active = tensor is None or name in binding.active
-            _check_namespace(definitions, field, spec.modules, active)
+            _check_namespace(definitions, field, active)
             if tensor is None:
                 sources.append((name, BindingSource(module_name)))
             else:

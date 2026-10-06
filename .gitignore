@@ -6,4 +6,3 @@ build/
 *.egg
 .eggs/
 hydroforge/validation/
-tests/

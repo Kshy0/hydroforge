@@ -134,13 +134,21 @@ def _cast_result(value: np.ndarray, dtype: np.dtype) -> np.ndarray:
     # Tiny values may round to subnormals or zero; only overflow fails.
     if np.any(np.isfinite(array) & ~np.isfinite(converted)):
         raise OverflowError(f"{label} contains values outside {dtype} range")
-    if array.dtype.kind in "iu" and not np.array_equal(
-        array.astype(object),
-        converted.astype(object),
-    ):
-        raise ValueError(
-            f"{label} contains integers that are not exactly representable as {dtype}"
-        )
+    if array.dtype.kind in "iu" and array.size:
+        # Round-trip in place of a per-element Python comparison.  A value
+        # rounded up to 2**bits (or below the signed minimum) is out of the
+        # source range, whose cast back would wrap or saturate.
+        bits = array.dtype.itemsize * 8
+        signed = array.dtype.kind == "i"
+        upper = math.ldexp(1.0, bits - int(signed))
+        lower = -upper if signed else 0.0
+        in_range = (converted < upper) & (converted >= lower)
+        back = np.where(in_range, converted, 0).astype(array.dtype)
+        if not in_range.all() or np.any(back != array):
+            raise ValueError(
+                f"{label} contains integers that are not exactly representable "
+                f"as {dtype}"
+            )
     return converted
 
 

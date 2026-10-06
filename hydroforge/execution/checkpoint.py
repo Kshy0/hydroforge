@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Construction-input snapshots, equivalent to parameter files.
 
 Persist parameters, topology and initializable physical state, never calendar,
@@ -65,10 +71,23 @@ class _CheckpointSaveStage:
     groups: dict[str, str]
 
 
+def _torch_numpy_dtype(name: str, dtype: torch.dtype) -> np.dtype:
+    """Return the NetCDF-writable NumPy dtype of one Torch dtype."""
+
+    try:
+        return torch.empty(0, dtype=dtype, device="cpu").numpy().dtype
+    except TypeError as error:
+        raise TypeError(
+            f"checkpoint construction input {name!r} has dtype {dtype}, "
+            "which has no NumPy equivalent"
+        ) from error
+
+
 def _host_copy(name: str, value: Any) -> Any:
     """Detach one construction value into host storage owned by the snapshot."""
 
     if isinstance(value, torch.Tensor):
+        _torch_numpy_dtype(name, value.dtype)
         return value.detach().to(device="cpu", copy=True).numpy()
     if isinstance(value, np.ndarray):
         return np.array(value, order="K", copy=True, subok=False)
@@ -152,18 +171,22 @@ class CheckpointRuntime:
         return failures, checkpoint_id
 
     @staticmethod
-    def _numpy_dtype(value: Any) -> np.dtype:
+    def _numpy_dtype(name: str, value: Any) -> np.dtype:
+        if isinstance(value, torch.dtype):
+            return _torch_numpy_dtype(name, value)
         if isinstance(value, torch.Tensor):
-            return torch.empty(0, dtype=value.dtype, device="cpu").numpy().dtype
+            return _torch_numpy_dtype(name, value.dtype)
         return np.asarray(value).dtype
+
+    def _local_indices(self, name: str) -> np.ndarray | None:
+        runtime = self.runtime
+        group = runtime.plan.fields.variable_groups.get(name)
+        return None if group is None else runtime.partition.rank_indices(group)
 
     def _local_input_value(self, name: str) -> Any:
         """Reload one rank-local input whose runtime storage was discarded."""
 
-        runtime = self.runtime
-        group = runtime.plan.fields.variable_groups.get(name)
-        indices = None if group is None else runtime.partition.rank_indices(group)
-        return runtime.input.read_local(name, indices)
+        return self.runtime.input.read_local(name, self._local_indices(name))
 
     def _field_value(self, field: _InputField) -> Any:
         value = getattr(field.module, field.name)
@@ -196,15 +219,24 @@ class CheckpointRuntime:
             ):
                 # Non-numeric declaration defaults are not construction values.
                 continue
+            metadata = None
             if value is None:
                 if name not in source:
                     # A discarded optional tensor that originated from its
                     # declared default is reconstructed from that same default.
                     continue
-                value = self._local_input_value(name)
-            shape = tuple(
-                value.shape if isinstance(value, torch.Tensor) else np.shape(value)
-            )
+                # The layout needs only metadata; ``save`` reads the values.
+                metadata = source.local_metadata(name, self._local_indices(name))
+                if metadata is None:
+                    value = self._local_input_value(name)
+            if metadata is None:
+                shape = tuple(
+                    value.shape if isinstance(value, torch.Tensor) else np.shape(value)
+                )
+                dtype = self._numpy_dtype(name, value)
+            else:
+                shape = metadata[0]
+                dtype = self._numpy_dtype(name, metadata[1])
             coordinate = groups.get(name)
             fields[name] = _InputField(
                 name=name,
@@ -212,7 +244,7 @@ class CheckpointRuntime:
                 module=module,
                 info=info,
                 shape=shape,
-                numpy_dtype=self._numpy_dtype(value),
+                numpy_dtype=dtype,
                 coordinate=coordinate,
                 partition_axis=(
                     len(shape) - len(info.tensor.shape)
@@ -246,12 +278,7 @@ class CheckpointRuntime:
 
         for field in self.plan.fields:
             if field.coordinate is not None:
-                if field.partition_axis != 0:
-                    raise ValueError(
-                        f"checkpoint field {field.name!r} is partitioned on axis "
-                        f"{field.partition_axis}; construction inputs partition "
-                        "axis 0 only"
-                    )
+                # ``save`` has validated the axis-0 partition layout.
                 groups[field.name] = field.coordinate
             elif plan.rank != 0:
                 continue
@@ -436,10 +463,13 @@ class CheckpointRuntime:
         stage_error: BaseException | None = None
         try:
             runtime.require_healthy(f"{type(runtime.owner).__name__}.save_state")
+            # Validate the layout before any side effect (statistics flush).
             for field in self.plan.fields:
                 if field.coordinate is not None and field.partition_axis != 0:
                     raise ValueError(
-                        f"checkpoint field {field.name!r} must partition construction inputs on axis 0"
+                        f"checkpoint field {field.name!r} is partitioned on axis "
+                        f"{field.partition_axis}; construction inputs partition "
+                        "axis 0 only"
                     )
             self._flush_statistics_output()
             stage = self._stage_save()
@@ -464,6 +494,8 @@ class CheckpointRuntime:
         part = parts[plan.rank]
         options = plan.output.config.checkpoint_netcdf
         single = plan.world_size == 1
+        # Restarts compare the model's parameter options with these.
+        fingerprint = {"options": plan.options, "opened_modules": plan.modules}
 
         def write() -> None:
             if path.exists():
@@ -477,11 +509,14 @@ class CheckpointRuntime:
                 )
             # A single part is the checkpoint itself; rank parts are
             # compressed once, by the merge.
+            # Rank parts carry no global attributes; the merge records the
+            # option fingerprint of the published checkpoint.
             write_construction_input(
                 part,
                 stage.values,
                 partitions=stage.groups,
                 netcdf_options=options if single else {},
+                **(fingerprint if single else {}),
             )
 
         def publish() -> None:
@@ -492,7 +527,11 @@ class CheckpointRuntime:
                 return
             with atomic_output_path(path) as temporary:
                 merge_construction_parts(
-                    temporary, parts, partitions=stage.groups, netcdf_options=options
+                    temporary,
+                    parts,
+                    partitions=stage.groups,
+                    netcdf_options=options,
+                    **fingerprint,
                 )
 
         def commit() -> None:

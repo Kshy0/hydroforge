@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Explicit progress state and service."""
 
 from __future__ import annotations
@@ -85,9 +91,9 @@ class ProgressState:
         )
 
     def format_unbounded(self) -> str:
-        label = "spin-up" if self.phase == "spinup" else "running"
+        # Only unscheduled runs are unbounded, and they have no spin-up phase.
         unit = "step" if self.current_step == 1 else "steps"
-        return f"[{label} {self.current_step} {unit}] {self.speed:.2f} steps/s"
+        return f"[running {self.current_step} {unit}] {self.speed:.2f} steps/s"
 
 
 class ProgressRuntime:
@@ -106,7 +112,7 @@ class ProgressRuntime:
         if schedule._is_regular:
             return (step.index + int(completed)) / len(schedule)
         date = step.end if completed else step.start
-        return (date - schedule._start) / (schedule._end - schedule._start)
+        return (date - schedule.start) / (schedule.end - schedule.start)
 
     def _phase(self, step: Any) -> str:
         return "unbounded" if self.schedule is None or step is None else step.phase

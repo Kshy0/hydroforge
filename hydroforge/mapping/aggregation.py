@@ -78,12 +78,16 @@ _Name = Annotated[str, Field(min_length=1)]
 # The output time axis stores decoded values, so only these semantic
 # attributes carry over; packing, masking and bounds belong to the source.
 _TIME_SEMANTIC_ATTRIBUTES = ("units", "calendar", "long_name", "standard_name", "axis")
+# Source values aggregated per block of time rows (128 MiB of float64).
+_AGGREGATE_BLOCK_VALUES = 1 << 24
 
 
 @dataclass(frozen=True, slots=True)
 class _AggregateFieldPlan:
     mapping: MappingTable
-    field: np.ndarray
+    variable: Any
+    normalized: bool
+    units: str
     has_time: bool
     time_values: np.ndarray | None
     time_attributes: Mapping[str, Any]
@@ -91,118 +95,145 @@ class _AggregateFieldPlan:
 
 
 def _compile_aggregate_field_plan(
-    field_nc: Path,
+    dataset: nc.Dataset,
     var_name: str,
     mapping_npz: Path,
     *,
-    normalized: bool,
+    normalized: bool | None,
+    output_units: str | None,
     out_name: str,
     dtype: str,
     netcdf_options: Mapping[str, Any],
 ) -> _AggregateFieldPlan:
-    """Validate and own all external arrays before aggregation begins."""
+    """Validate the mapping and field metadata before aggregation begins.
+
+    Field values are read and validated block by block while aggregating.
+    """
 
     mapping = MappingTable.load(mapping_npz)
+    # Summed (area) weights add field x m^2; averaging is the default there.
+    summed = mapping.metadata.get("normalization") == "sum"
+    if normalized is None:
+        normalized = summed
+    if output_units is None:
+        if summed and not normalized:
+            raise ValueError(
+                "unnormalized aggregation with summed (area) weights yields the "
+                "field times the weight units (m^2 for CaMa mappings); pass "
+                "units explicitly"
+            )
+        output_units = "mm"
     if normalized:
         mapping = mapping.row_normalized()
 
     time_values = None
     time_attributes: dict[str, Any] = {}
-    ensure_hdf5_plugins()
-    with nc.Dataset(field_nc, "r") as dataset:
-        variable = dataset.variables[var_name]
-        if variable.ndim not in {2, 3}:
-            raise ValueError(
-                f"field variable {var_name!r} must be 2-D or 3-D; "
-                f"got shape {variable.shape}"
-            )
-        if tuple(variable.shape[-2:]) != mapping._source_shape:
-            raise ValueError(
-                f"field variable {var_name!r} has spatial shape "
-                f"{tuple(variable.shape[-2:])}, expected "
-                f"{mapping._source_shape}"
-            )
-        spatial_dimensions = variable.dimensions[-2:]
-        for dimension, expected, label in (
-            (spatial_dimensions[0], mapping.source_y, "y"),
-            (spatial_dimensions[1], mapping.source_x, "x"),
-        ):
-            coordinate = dataset.variables[dimension]
-            if coordinate.dimensions != (dimension,):
-                raise ValueError(
-                    f"spatial coordinate {dimension!r} must be one-dimensional"
-                )
-            raw_coordinate = coordinate[:]
-            if np.ma.isMaskedArray(raw_coordinate) and np.any(
-                np.ma.getmaskarray(raw_coordinate)
-            ):
-                raise ValueError(
-                    f"spatial coordinate {dimension!r} contains missing values"
-                )
-            observed = canonical_float64(
-                raw_coordinate,
-                label=f"spatial coordinate {dimension!r}",
-            )
-            if observed.shape != expected.shape or not np.array_equal(
-                observed, expected
-            ):
-                raise ValueError(
-                    f"spatial coordinate {dimension!r} does not match the "
-                    f"mapping source {label}-axis"
-                )
-        if np.dtype(variable.dtype).kind not in {"f", "i", "u"}:
-            raise ValueError(
-                f"field variable {var_name!r} must contain real numeric values"
-            )
-        has_time = variable.ndim == 3
-        ntime = int(variable.shape[0]) if has_time else 1
-        if out_name == "catchment_id" or (has_time and out_name == TIME_DIM):
-            raise ValueError(
-                f"aggregate output {out_name!r} conflicts with a coordinate variable"
-            )
-        output_options = prepare_netcdf_variable_options(
-            netcdf_options,
-            dtype=dtype,
-            dimensions=(TIME_DIM, POINT_DIM) if has_time else (POINT_DIM,),
-            name=out_name,
+    variable = dataset.variables[var_name]
+    if variable.ndim not in {2, 3}:
+        raise ValueError(
+            f"field variable {var_name!r} must be 2-D or 3-D; "
+            f"got shape {variable.shape}"
         )
-        if has_time:
-            time_dimension = variable.dimensions[0]
-            time_variable = dataset.variables[time_dimension]
-            if time_variable.dimensions != (time_dimension,):
-                raise ValueError(
-                    f"time coordinate {time_dimension!r} must be one-dimensional"
-                )
-            units = getattr(time_variable, "units", None)
-            if not isinstance(units, str) or not units.strip():
-                raise ValueError("time coordinate must declare nonempty CF units")
-            calendar = canonical_calendar(
-                getattr(time_variable, "calendar", "standard")
+    if tuple(variable.shape[-2:]) != mapping._source_shape:
+        raise ValueError(
+            f"field variable {var_name!r} has spatial shape "
+            f"{tuple(variable.shape[-2:])}, expected "
+            f"{mapping._source_shape}"
+        )
+    spatial_dimensions = variable.dimensions[-2:]
+    for dimension, expected, label in (
+        (spatial_dimensions[0], mapping.source_y, "y"),
+        (spatial_dimensions[1], mapping.source_x, "x"),
+    ):
+        coordinate = dataset.variables[dimension]
+        if coordinate.dimensions != (dimension,):
+            raise ValueError(
+                f"spatial coordinate {dimension!r} must be one-dimensional"
             )
-            raw_time = time_variable[:]
-            if np.ma.isMaskedArray(raw_time) and np.any(np.ma.getmaskarray(raw_time)):
-                raise ValueError("time coordinate contains missing values")
-            time_values = np.array(raw_time, order="C", copy=True)
-            if (
-                time_values.shape != (ntime,)
-                or time_values.dtype.kind not in {"f", "i", "u"}
-                or not np.isfinite(time_values).all()
-            ):
-                raise ValueError(
-                    "time coordinate must contain one finite numeric value "
-                    "per field row"
-                )
-            decoded = list(nc.num2date(time_values, units=units, calendar=calendar))
-            if any(right <= left for left, right in zip(decoded, decoded[1:])):
-                raise ValueError("time coordinate must be strictly increasing")
-            time_attributes = {
-                name: time_variable.getncattr(name)
-                for name in _TIME_SEMANTIC_ATTRIBUTES
-                if name in time_variable.ncattrs()
-            }
+        raw_coordinate = coordinate[:]
+        if np.ma.isMaskedArray(raw_coordinate) and np.any(
+            np.ma.getmaskarray(raw_coordinate)
+        ):
+            raise ValueError(
+                f"spatial coordinate {dimension!r} contains missing values"
+            )
+        observed = canonical_float64(
+            raw_coordinate,
+            label=f"spatial coordinate {dimension!r}",
+        )
+        if observed.shape != expected.shape or not np.array_equal(observed, expected):
+            raise ValueError(
+                f"spatial coordinate {dimension!r} does not match the "
+                f"mapping source {label}-axis"
+            )
+    if np.dtype(variable.dtype).kind not in {"f", "i", "u"}:
+        raise ValueError(
+            f"field variable {var_name!r} must contain real numeric values"
+        )
+    has_time = variable.ndim == 3
+    ntime = int(variable.shape[0]) if has_time else 1
+    if out_name == "catchment_id" or (has_time and out_name == TIME_DIM):
+        raise ValueError(
+            f"aggregate output {out_name!r} conflicts with a coordinate variable"
+        )
+    output_options = prepare_netcdf_variable_options(
+        netcdf_options,
+        dtype=dtype,
+        dimensions=(TIME_DIM, POINT_DIM) if has_time else (POINT_DIM,),
+        name=out_name,
+    )
+    if has_time:
+        time_dimension = variable.dimensions[0]
+        time_variable = dataset.variables[time_dimension]
+        if time_variable.dimensions != (time_dimension,):
+            raise ValueError(
+                f"time coordinate {time_dimension!r} must be one-dimensional"
+            )
+        units = getattr(time_variable, "units", None)
+        if not isinstance(units, str) or not units.strip():
+            raise ValueError("time coordinate must declare nonempty CF units")
+        calendar = canonical_calendar(getattr(time_variable, "calendar", "standard"))
+        raw_time = time_variable[:]
+        if np.ma.isMaskedArray(raw_time) and np.any(np.ma.getmaskarray(raw_time)):
+            raise ValueError("time coordinate contains missing values")
+        time_values = np.array(raw_time, order="C", copy=True)
+        if (
+            time_values.shape != (ntime,)
+            or time_values.dtype.kind not in {"f", "i", "u"}
+            or not np.isfinite(time_values).all()
+        ):
+            raise ValueError(
+                "time coordinate must contain one finite numeric value per field row"
+            )
+        decoded = list(nc.num2date(time_values, units=units, calendar=calendar))
+        if any(right <= left for left, right in zip(decoded, decoded[1:])):
+            raise ValueError("time coordinate must be strictly increasing")
+        time_attributes = {
+            name: time_variable.getncattr(name)
+            for name in _TIME_SEMANTIC_ATTRIBUTES
+            if name in time_variable.ncattrs()
+        }
 
-        field = variable[:]
+    if time_values is not None:
+        time_values.setflags(write=False)
+    return _AggregateFieldPlan(
+        mapping=mapping,
+        variable=variable,
+        normalized=normalized,
+        units=output_units,
+        has_time=has_time,
+        time_values=time_values,
+        time_attributes=time_attributes,
+        output_options=output_options,
+    )
 
+
+def _read_field_block(
+    plan: _AggregateFieldPlan, var_name: str, start: int, stop: int
+) -> np.ndarray:
+    """Read time rows ``[start, stop)`` as float64 with masked values as NaN."""
+
+    field = plan.variable[start:stop] if plan.has_time else plan.variable[:]
     if np.ma.isMaskedArray(field):
         mask = np.ma.getmaskarray(field)
         raw_field = np.asarray(field.data)
@@ -220,19 +251,9 @@ def _compile_aggregate_field_plan(
             dtype="float64",
             label=f"field variable {var_name!r}",
         )
-    if not has_time:
+    if not plan.has_time:
         canonical_field = canonical_field[None, ...]
-    canonical_field.setflags(write=False)
-    if time_values is not None:
-        time_values.setflags(write=False)
-    return _AggregateFieldPlan(
-        mapping=mapping,
-        field=canonical_field,
-        has_time=has_time,
-        time_values=time_values,
-        time_attributes=time_attributes,
-        output_options=output_options,
-    )
+    return canonical_field
 
 
 @validate_call(config=HydroForgeModel.model_config)
@@ -255,8 +276,10 @@ def build_cama_mapping(
     """Build an area-weighted ``catchment x source`` mapping from MERIT hires pixels.
 
     Rows follow the ``parameter_nc`` catchment order when given, otherwise the
-    CaMa map order; weights are raw hires pixel areas (no per-row
-    normalization).
+    CaMa map order; weights are raw hires pixel areas in m^2 (no per-row
+    normalization) and coverage is each catchment's area fraction on the
+    source grid.  With ``hires_tag=None`` each catchment area is spread over
+    the spherical overlap of its low-resolution cell with the source grid.
     """
 
     source = RegularGrid.from_coordinates(
@@ -408,9 +431,9 @@ def aggregate_field_to_nc(
     out_name: str | None = None,
     dtype: Literal["float32", "float64"] = "float32",
     netcdf_options: NetCDFOptions = Field(default_factory=default_netcdf_options),
-    units: _Name = "mm",
+    units: _Name | None = None,
     description: str | None = None,
-    normalized: bool = False,
+    normalized: bool | None = None,
 ) -> Path:
     """Apply a saved mapping to a static or climatology field, writing a NetCDF.
 
@@ -420,38 +443,61 @@ def aggregate_field_to_nc(
     Output dims are ``(saved_points,)`` or ``(time, saved_points)`` with a
     ``catchment_id`` coordinate.  A time series carries the rank-output header
     and the source time axis unchanged, so ``MultiRankStatsReader`` reads it.
+    Time rows are aggregated in blocks, so the field is never held whole.
 
     Masked source cells are excluded: with ``normalized=True`` each target is
     the weighted mean of its valid sources; unnormalized sums treat masked
     cells as zero.  A target is NaN only when all of its sources are masked.
+    ``normalized=None`` averages mappings with summed (area) weights, such as
+    :func:`build_cama_mapping`, and applies mean mappings as stored.
+    ``units`` defaults to ``"mm"``; unnormalized area-weighted sums have the
+    field's units times m^2 and must name their units explicitly.
     """
 
     out_name = validate_safe_path_component(
         var_name if out_name is None else out_name, label="out_name"
     )
     validate_netcdf_name(out_name)
-    plan = _compile_aggregate_field_plan(
-        field_nc,
-        var_name,
-        mapping_npz,
-        normalized=normalized,
-        out_name=out_name,
-        dtype=dtype,
-        netcdf_options=netcdf_options,
-    )
+    ensure_hdf5_plugins()
+    with nc.Dataset(field_nc, "r") as dataset:
+        plan = _compile_aggregate_field_plan(
+            dataset,
+            var_name,
+            mapping_npz,
+            normalized=normalized,
+            output_units=units,
+            out_name=out_name,
+            dtype=dtype,
+            netcdf_options=netcdf_options,
+        )
+        _write_aggregated_field(
+            plan,
+            var_name,
+            out_dir,
+            out_name=out_name,
+            dtype=dtype,
+            description=description,
+        )
+    return out_dir / rank_file_name(out_name, 0)
+
+
+def _write_aggregated_field(
+    plan: _AggregateFieldPlan,
+    var_name: str,
+    out_dir: Path,
+    *,
+    out_name: str,
+    dtype: str,
+    description: str | None,
+) -> None:
+    """Aggregate ``plan`` block by block into one atomically published file."""
+
     mapping = plan.mapping
-    field = plan.field
     has_time = plan.has_time
     time_values = plan.time_values
-    time_attributes = plan.time_attributes
-
-    aggregated = canonical_floating_array(
-        _aggregate_masked_field(mapping, field, normalized=normalized),
-        dtype=dtype,
-        label="aggregated values",
-        allow_nan=True,
-    )
     n_catch = mapping.matrix.shape[0]
+    ntime = len(time_values) if has_time else 1
+    block = max(1, _AGGREGATE_BLOCK_VALUES // max(mapping.matrix.shape[1], 1))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     nc_path = out_dir / rank_file_name(out_name, 0)
@@ -471,7 +517,7 @@ def aggregate_field_to_nc(
 
         if has_time:
             time_var = ds.createVariable(TIME_DIM, time_values.dtype, (TIME_DIM,))
-            time_var.setncatts(time_attributes)
+            time_var.setncatts(plan.time_attributes)
             time_var[:] = time_values
 
         write_point_coordinate(ds, "catchment_id", mapping.target_ids)
@@ -488,12 +534,22 @@ def aggregate_field_to_nc(
             f"Catchment-aggregated {out_name}" if description is None else description
         )
         out_var.setncattr("description", resolved_description)
-        out_var.setncattr("units", units)
+        out_var.setncattr("units", plan.units)
 
-        if has_time:
-            out_var[:, :] = aggregated
-        else:
-            out_var[:] = aggregated[0]
+        for start in range(0, ntime, block):
+            stop = min(start + block, ntime)
+            aggregated = canonical_floating_array(
+                _aggregate_masked_field(
+                    mapping,
+                    _read_field_block(plan, var_name, start, stop),
+                    normalized=plan.normalized,
+                ),
+                dtype=dtype,
+                label="aggregated values",
+                allow_nan=True,
+            )
+            if has_time:
+                out_var[start:stop, :] = aggregated
+            else:
+                out_var[:] = aggregated[0]
         out_var.setncattr(COMPLETE_DATA_ATTR, "true")
-
-    return nc_path

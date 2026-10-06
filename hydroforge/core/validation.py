@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Shared Pydantic base for declarative HydroForge API objects."""
 
 from __future__ import annotations
@@ -7,6 +13,7 @@ from copy import deepcopy
 from typing import Annotated, Any, NoReturn, TypeAlias, TypeVar
 
 from pydantic import AfterValidator, BaseModel, ConfigDict
+from pydantic.fields import FieldInfo
 
 _PUBLIC_MODEL_CONFIG = ConfigDict(
     arbitrary_types_allowed=True,
@@ -134,6 +141,27 @@ def frozen_dict(values: Any) -> _ImmutableDict:
     """Return an immutable, picklable copy of one mapping."""
 
     return _ImmutableDict(values)
+
+
+def field_default(field: FieldInfo) -> Any:
+    """Return a field's declared default as Pydantic would supply it.
+
+    ``FieldInfo.get_default`` deep-copies plain defaults, which frozen
+    HydroForge models deliberately reject.  Those defaults are immutable, so
+    they are returned as declared instead of failing.
+    """
+
+    if field.default_factory is None and isinstance(field.default, HydroForgeModel):
+        return field.default
+    return field.get_default(call_default_factory=True)
+
+
+def require_unique(values: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Validate that a declared tuple repeats no item."""
+
+    if len(values) != len(set(values)):
+        raise ValueError("must not contain duplicates")
+    return values
 
 
 _Key = TypeVar("_Key")

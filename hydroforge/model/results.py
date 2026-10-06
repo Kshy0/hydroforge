@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Statistics results of one model, read through ``model.results``."""
 
 from __future__ import annotations
@@ -7,6 +13,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 import torch
 from pydantic import ConfigDict, Field, validate_call
 
+from hydroforge.core.expr import parse_operation
 from hydroforge.execution.session import ModelRuntime
 from hydroforge.statistics.storage import StoragePlan
 
@@ -16,6 +23,13 @@ if TYPE_CHECKING:
     from hydroforge.statistics.sinks import MemorySink
 
 _QUERY = validate_call(config=ConfigDict(strict=True))
+
+
+def _operation(op: str) -> str:
+    """Spell an operation as ``OutputConfig.variables`` canonicalizes it."""
+
+    canonical = op.lower()
+    return canonical if canonical == "static" else parse_operation(canonical).spelling
 
 
 class ModelResults:
@@ -76,6 +90,7 @@ class ModelResults:
     ) -> torch.Tensor | list[torch.Tensor]:
         """Return isolated copies of one retained output, stacked over time."""
 
+        op = _operation(op)
         return self._retained((name, op)).get(
             StoragePlan.output(name, op), as_stacked=as_stacked, start=start, stop=stop
         )
@@ -96,12 +111,14 @@ class ModelResults:
     def accumulator(self, name: str, op: str = "mean") -> torch.Tensor:
         """Return a differentiable snapshot without exposing captured storage."""
 
+        op = _operation(op)
         return self._statistics((name, op)).accumulator(name, op)
 
     @_QUERY
     def pop(self, name: str, op: str = "mean") -> torch.Tensor | None:
         """Pop the newest retained result without keeping its history."""
 
+        op = _operation(op)
         return self._retained((name, op)).pop(StoragePlan.output(name, op))
 
     @_QUERY

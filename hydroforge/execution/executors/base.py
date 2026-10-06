@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """The loop-executor protocol and the capture ownership every executor shares."""
 
 from __future__ import annotations
@@ -52,20 +58,37 @@ class LoopExecutor:
         del statistics
         return ()
 
-    def register(self, resource: Any) -> Any:
-        """Register a closeable backend resource under model ownership."""
+    def register(
+        self, resource: Any, *, finalizer: Callable[[], None] | None = None
+    ) -> Any:
+        """Register a closeable backend resource under model ownership.
 
-        self._resources.append((resource, self._finalizer(resource)))
+        ``finalizer`` replaces the resource's own close/destroy/reset when its
+        release also owns related state (for example a memory-pool reference).
+        """
+
+        if finalizer is None:
+            finalizer = self._finalizer(resource)
+        self._resources.append((resource, finalizer))
         return resource
 
     def release(self, resource: Any) -> None:
         """Release one owned resource and remove every retained reference."""
 
         index = next(
-            index
-            for index, (owned, _finalizer) in enumerate(self._resources)
-            if owned is resource
+            (
+                index
+                for index, (owned, _finalizer) in enumerate(self._resources)
+                if owned is resource
+            ),
+            None,
         )
+        if index is None:
+            raise LookupError(
+                f"{type(resource).__name__} is not a resource owned by this "
+                f"{type(self).__name__}; it was never registered or was "
+                "already released"
+            )
         _owned, finalizer = self._resources.pop(index)
         finalizer()
 

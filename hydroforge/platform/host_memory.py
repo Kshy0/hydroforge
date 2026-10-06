@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Page-locking of existing host memory through the device driver.
 
 Registered memory is a valid target of asynchronous device-to-host copies.
@@ -91,7 +97,9 @@ def register_host_memory(address: int, nbytes: int, device: torch.device) -> str
         return str(error)
     with torch.cuda.device(device):
         # The driver call needs the device's primary context to be current.
-        torch.cuda.synchronize()
+        # Any runtime call binds it to this thread; a stream query does so
+        # without waiting for the device's queued work.
+        torch.cuda.current_stream(device).query()
         return registry.failure(registry.register(address, nbytes, 0))
 
 

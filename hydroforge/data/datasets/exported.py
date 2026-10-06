@@ -18,7 +18,14 @@ from pathlib import Path
 from typing import Annotated, Any, Self
 
 import numpy as np
-from pydantic import AfterValidator, Field, PositiveInt, PrivateAttr, validate_call
+from pydantic import (
+    AfterValidator,
+    Field,
+    PositiveInt,
+    PrivateAttr,
+    model_validator,
+    validate_call,
+)
 
 from hydroforge.core.arrays import UniqueIds, immutable_array
 from hydroforge.core.time import DateLike
@@ -37,9 +44,12 @@ from hydroforge.data.datasets.storage import (
     NetCDFStore,
     TimeAggregation,
     UnitFactor,
+    UnitsName,
     concatenate_reads,
+    resolve_units,
     scan_storage,
     storage_chunk_len,
+    variable_units,
 )
 from hydroforge.data.datasets.timeline import ReadOp, StorageLayout
 from hydroforge.io.files import SourceFiles
@@ -90,10 +100,13 @@ _TimeShift = Annotated[
 
 
 @cache
-def _numba_gather() -> Callable[..., np.ndarray]:
-    """Compile the shifted-column gather on first use (Numba is optional)."""
+def _numba_gather() -> Callable[..., np.ndarray] | None:
+    """Compile the shifted-column gather on first use; ``None`` without Numba."""
 
-    import numba
+    try:
+        import numba
+    except ImportError:
+        return None
 
     @numba.njit(cache=True, parallel=True)
     def gather(data, shift, base_t, length, oob_fill):
@@ -116,6 +129,18 @@ class _Resident:
     main: np.ndarray | dict[str, np.ndarray]
     spinup: np.ndarray | dict[str, np.ndarray] | None
 
+    def columns(self, positions: np.ndarray) -> _Resident:
+        """The resident values of storage ``positions`` in that order."""
+
+        def take(values: Any) -> Any:
+            if values is None:
+                return None
+            if isinstance(values, dict):
+                return {name: take(block) for name, block in values.items()}
+            return np.ascontiguousarray(values[:, positions])
+
+        return _Resident(main=take(self.main), spinup=take(self.spinup))
+
 
 class _PointShards:
     """Validate that every shard stores one variable on one exact point axis."""
@@ -125,9 +150,11 @@ class _PointShards:
         self._coordinate = coordinate
         self._dtype: np.dtype | None = None
         self.ids: np.ndarray | None = None
+        self.units: list[str | None] = []
 
     def inspect(self, dataset: Any, path: Path) -> None:
         variable = dataset.variables[self._variable]
+        self.units.append(variable_units(variable))
         dtype = np.dtype(variable.dtype)
         if dtype.kind not in {"i", "u", "f"}:
             raise ValueError(
@@ -177,10 +204,12 @@ class ExportedDataset(ForcingDataset):
     :meth:`selected` returns a view in a requested ID order, optionally with a
     per-column time shift; values need no mapping, so :meth:`shard_forcing`
     only checks the batch.  Missing and non-finite values are rejected unless
-    ``missing="zero"``.
+    ``missing="zero"``. ``target_units`` (with optional ``source_units``)
+    converts the variable's ``units`` as in :class:`NetCDFDataset`.
 
     Shifted columns and :meth:`windowed` training windows read a resident copy
-    (:meth:`load_to_memory`).  The copy stays in its process: DataLoader
+    (:meth:`load_to_memory`); ``in_memory=True`` loads it at construction, so
+    fork-started DataLoader workers share it.  The copy stays in its process:
     workers started by spawn or forkserver load their own on first use.
     """
 
@@ -193,6 +222,8 @@ class ExportedDataset(ForcingDataset):
     coord_name: str = "catchment_id"
     in_memory: bool = False
     unit_factor: UnitFactor = 1.0
+    source_units: UnitsName | None = None
+    target_units: UnitsName | None = None
     time_aggregation: TimeAggregation = None
     window_length: int | None = Field(default=None, ge=1)
     window_starts: Annotated[np.ndarray, AfterValidator(_window_starts)] | None = Field(
@@ -241,15 +272,26 @@ class ExportedDataset(ForcingDataset):
                 ),
             ),
         )
+        unit_factor, unit_scale, unit_offset = resolve_units(self, points.units)
         self._store = NetCDFStore(
             files=inspection.files(),
             layout=layout,
             timeline=scan.freeze(plan, SourceChunk.source_times),
-            unit_factor=self.unit_factor,
+            unit_factor=unit_factor,
             aggregation=self.time_aggregation,
+            unit_scale=unit_scale,
+            unit_offset=unit_offset,
         )
         self._space = PointSpace(ids=points.ids)
         return plan
+
+    @model_validator(mode="after")
+    def _load_declared_resident(self) -> Self:
+        # Load once in the constructing process: a lazy first-read load would
+        # run separately in every fork-started DataLoader worker.
+        if self.in_memory and self._resident is None:
+            self.load_to_memory()
+        return self
 
     def __getstate__(self) -> dict[str, Any]:
         # A resident copy can be gigabytes; each process loads its own.
@@ -318,7 +360,7 @@ class ExportedDataset(ForcingDataset):
         """A conservative element width of reading ``operations``."""
 
         width = np.dtype(self.out_dtype).itemsize
-        if self.time_aggregation is not None or self.unit_factor != 1:
+        if self.time_aggregation is not None or self._store.converts_units:
             width = max(width, 8)
         for key in dict.fromkeys(key for key, _rows in operations):
             with self._store.files.open_netcdf(self._store.path(key)) as dataset:
@@ -488,8 +530,8 @@ class ExportedDataset(ForcingDataset):
         A shared column shift is one contiguous slice. Small mixed-shift
         selections use their precompiled groups; larger selections use the
         parallel Numba gather without separately prefilling its output.
-        macOS keeps the grouped NumPy path to avoid loading a second OpenMP
-        runtime alongside PyTorch.
+        macOS (and an environment without Numba) keeps the grouped NumPy path,
+        avoiding a second OpenMP runtime alongside PyTorch.
         """
         T, C = data.shape
         if groups is not None and len(groups) == 1:
@@ -504,8 +546,13 @@ class ExportedDataset(ForcingDataset):
             if lo < hi:
                 out[lo - base_t : hi - base_t] = data[lo:hi]
             return out
-        if C >= _NUMBA_C_THRESHOLD and sys.platform != "darwin":
-            return _numba_gather()(data, shift, base_t, length, float(oob_fill))
+        gather = (
+            _numba_gather()
+            if C >= _NUMBA_C_THRESHOLD and sys.platform != "darwin"
+            else None
+        )
+        if gather is not None:
+            return gather(data, shift, base_t, length, float(oob_fill))
         out = np.full((length, C), oob_fill, dtype=data.dtype)
         if groups is None:
             groups = ExportedDataset._compile_groups(shift)
@@ -556,6 +603,10 @@ class ExportedDataset(ForcingDataset):
         same = self._space.selection is not None and np.array_equal(
             self._space.selection, space.selection
         )
+        resident = self._resident if same else None
+        if self._resident is not None and self._space.selection is None:
+            # The complete resident copy holds every column in storage order.
+            resident = self._resident.columns(space.selection)
         return self._view(
             {"window_length": None, "window_starts": None},
             _space=space,
@@ -563,7 +614,7 @@ class ExportedDataset(ForcingDataset):
             _columns=_column_window(space.selection),
             _shift=shift,
             _shift_groups=None if shift is None else self._compile_groups(shift),
-            _resident=self._resident if same else None,
+            _resident=resident,
         )
 
     @validate_call(config=HydroForgeModel.model_config)

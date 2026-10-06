@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Statement reordering on kernel IR for block-program printers.
 
 A block program (Triton) runs a statement for all lanes at once, so an
@@ -26,6 +32,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 
 from hydroforge.kernels.codegen.ir import (
+    PHASE,
     Assign,
     AtomicAdd,
     Block,
@@ -90,6 +97,9 @@ def _expression(node: Expr) -> Effects:
             reads.add(item.buffer)
         elif isinstance(item, Var):
             uses.add(item.name)
+        elif isinstance(item, PhaseTest):
+            # A phase test reads the kernel's sample phase local.
+            uses.add(PHASE.name)
         pending.extend(subexpressions(item))
     return Effects(reads=frozenset(reads), uses=frozenset(uses))
 
@@ -97,42 +107,60 @@ def _expression(node: Expr) -> Effects:
 def effects(statements: Stmt | Sequence[Stmt]) -> Effects:
     """The buffers and locals ``statements`` read and write."""
 
+    return _effects(statements, None)
+
+
+def _effects(statements: Stmt | Sequence[Stmt], cache: dict | None) -> Effects:
+    """:func:`effects`, memoized per statement object in ``cache``."""
+
     if not isinstance(statements, Sequence):
-        statements = (statements,)
+        return _statement(statements, cache)
     result = Effects()
     for node in statements:
-        match node:
-            case Let() | Assign():
-                result |= _expression(node.value) | Effects(
-                    defines=frozenset((node.var.name,))
-                )
-            case Store() | AtomicAdd():
-                result |= (
-                    _expression(node.index)
-                    | _expression(node.value)
-                    | Effects(writes=frozenset((node.buffer,)))
-                )
-            case If():
-                result |= (
-                    _expression(node.condition)
-                    | effects(node.then)
-                    | effects(node.orelse)
-                )
-            case ForK():
-                result |= effects(node.body) | Effects(
-                    defines=frozenset((node.var.name,))
-                )
-            case While():
-                result |= _expression(node.condition) | effects(node.body)
-            case Evaluate():
-                result |= _expression(node.call)
-            case Guard():
-                result |= _expression(node.condition)
-            case Block():
-                result |= effects(node.body)
-            case _:
-                raise TypeError(f"not a statement: {node!r}")
+        result |= _statement(node, cache)
     return result
+
+
+def _statement(node: Stmt, cache: dict | None) -> Effects:
+    if cache is not None:
+        known = cache.get(id(node))
+        if known is not None and known[0] is node:
+            return known[1]
+    match node:
+        case Let() | Assign():
+            touched = _expression(node.value) | Effects(
+                defines=frozenset((node.var.name,))
+            )
+        case Store() | AtomicAdd():
+            touched = (
+                _expression(node.index)
+                | _expression(node.value)
+                | Effects(writes=frozenset((node.buffer,)))
+            )
+        case If():
+            touched = (
+                _expression(node.condition)
+                | _effects(node.then, cache)
+                | _effects(node.orelse, cache)
+            )
+        case ForK():
+            touched = _effects(node.body, cache) | Effects(
+                defines=frozenset((node.var.name,))
+            )
+        case While():
+            touched = _expression(node.condition) | _effects(node.body, cache)
+        case Evaluate():
+            touched = _expression(node.call)
+        case Guard():
+            touched = _expression(node.condition)
+        case Block():
+            touched = _effects(node.body, cache)
+        case _:
+            raise TypeError(f"not a statement: {node!r}")
+    if cache is not None:
+        # The node is kept with its effects so its id is not reused.
+        cache[id(node)] = (node, touched)
+    return touched
 
 
 Implies = Callable[[PhaseTest, PhaseTest], bool]
@@ -169,18 +197,26 @@ def hoist(statements: Sequence[Stmt], implies: Implies) -> tuple[Stmt, ...]:
     down only past statements it commutes with.
     """
 
+    return _hoist(statements, implies, {})
+
+
+def _hoist(
+    statements: Sequence[Stmt], implies: Implies, cache: dict
+) -> tuple[Stmt, ...]:
     result: list[Stmt] = []
     for node in reversed(statements):
-        node = _within(node, lambda body: hoist(body, implies))
+        node = _within(node, lambda body: _hoist(body, implies, cache))
         position, joined = 0, None
         if _phase_if(node):
-            moved = effects(node)
+            moved = _effects(node, cache)
             for position, target in enumerate(result):
-                joined = _join(node, target, implies)
+                joined = _join(node, target, implies, cache)
                 if joined is not None:
                     result[position] = joined
                     break
-                if isinstance(target, Guard) or not moved.commutes(effects(target)):
+                if isinstance(target, Guard) or not moved.commutes(
+                    _effects(target, cache)
+                ):
                     break
             else:
                 position = len(result)
@@ -190,7 +226,7 @@ def hoist(statements: Sequence[Stmt], implies: Implies) -> tuple[Stmt, ...]:
     return tuple(result)
 
 
-def _join(node: If, target: Stmt, implies: Implies) -> If | None:
+def _join(node: If, target: Stmt, implies: Implies, cache: dict) -> If | None:
     """``node`` and the later ``target`` as one ``If``, if they may join."""
 
     if not _phase_if(target):
@@ -198,55 +234,71 @@ def _join(node: If, target: Stmt, implies: Implies) -> If | None:
     if target.condition == node.condition:
         return If(
             node.condition,
-            hoist((*node.then, *target.then), implies),
-            hoist((*node.orelse, *target.orelse), implies),
+            _hoist((*node.then, *target.then), implies, cache),
+            _hoist((*node.orelse, *target.orelse), implies, cache),
         )
     # A nested ``If`` must have no else branch: it would no longer run where
     # the outer test fails.
     if not node.orelse and implies(node.condition, target.condition):
-        return If(target.condition, hoist((node, *target.then), implies), target.orelse)
+        return If(
+            target.condition,
+            _hoist((node, *target.then), implies, cache),
+            target.orelse,
+        )
     if not target.orelse and implies(target.condition, node.condition):
-        return If(node.condition, hoist((*node.then, target), implies), node.orelse)
+        return If(
+            node.condition,
+            _hoist((*node.then, target), implies, cache),
+            node.orelse,
+        )
     return None
 
 
 def sink(statements: Sequence[Stmt]) -> tuple[Stmt, ...]:
     """Move each ``Let`` into the one phase-``If`` branch that uses it.
 
-    The ``Let`` moves when exactly one later statement uses its local, that
-    statement is a phase ``If`` whose condition does not, only one of its
-    branches does, and every statement in between commutes with the ``Let``.
+    The ``Let`` moves when exactly one later statement uses its local, no
+    later statement assigns it, that statement is a phase ``If`` whose
+    condition does not use it, only one of its branches does, and every
+    statement in between commutes with the ``Let``.
     """
 
-    result = [_within(node, sink) for node in statements]
+    return _sink(statements, {})
+
+
+def _sink(statements: Sequence[Stmt], cache: dict) -> tuple[Stmt, ...]:
+    result = [_within(node, lambda body: _sink(body, cache)) for node in statements]
     for position in range(len(result) - 1, -1, -1):
         node = result[position]
         if not isinstance(node, Let):
             continue
         name = node.var.name
-        users = [
-            index
+        later = [
+            (index, _statement(result[index], cache))
             for index in range(position + 1, len(result))
-            if name in effects(result[index]).uses
         ]
-        if len(users) != 1:
+        users = [index for index, touched in later if name in touched.uses]
+        if len(users) != 1 or any(name in touched.defines for _, touched in later):
             continue
         target = result[users[0]]
         if not _phase_if(target) or name in _expression(target.condition).uses:
             continue
-        in_then = name in effects(target.then).uses
-        if in_then == (name in effects(target.orelse).uses):
+        in_then = name in _effects(target.then, cache).uses
+        if in_then == (name in _effects(target.orelse, cache).uses):
             continue
-        moved = effects(node)
+        moved = _effects(node, cache)
         if not all(
-            moved.commutes(effects(result[index]))
-            for index in range(position + 1, users[0])
+            moved.commutes(touched) for index, touched in later if index < users[0]
         ):
             continue
         if in_then:
-            target = If(target.condition, sink((node, *target.then)), target.orelse)
+            target = If(
+                target.condition, _sink((node, *target.then), cache), target.orelse
+            )
         else:
-            target = If(target.condition, target.then, sink((node, *target.orelse)))
+            target = If(
+                target.condition, target.then, _sink((node, *target.orelse), cache)
+            )
         result[users[0]] = target
         del result[position]
     return tuple(result)

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Stable physical-kernel authoring API."""
 
 from hydroforge.kernels.cuda import (
@@ -12,12 +18,10 @@ from hydroforge.kernels.registry import BackendRegistry
 from hydroforge.kernels.spec import (
     KernelSpec,
     KernelWorkspace,
-    config_value,
     constant,
     literal_value,
     module_enabled,
     module_flag,
-    option_code,
     output_requested,
 )
 from hydroforge.kernels.torch import TorchKernel
@@ -42,12 +46,10 @@ __all__ = [
     "TritonKernel",
     "TritonProgram",
     "TritonSequence",
-    "config_value",
     "constant",
     "launch_triton_kernel",
     "literal_value",
     "module_enabled",
     "module_flag",
-    "option_code",
     "output_requested",
 ]

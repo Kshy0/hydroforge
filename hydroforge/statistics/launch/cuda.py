@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """CUDA/HIP statistics: one runtime-compiled program, prepared launches.
 
 The plan's kernels map one thread to each saved point, member and level.
@@ -94,12 +100,12 @@ def compile_statistics(
         device = torch.cuda.current_device()
     bound: list[Any] = []
 
-    def internal_update_statistics(states, BLOCK_SIZE, phase):
+    def internal_update_statistics(states, block_size, phase):
         # Rebinding follows a replaced state mapping or block size; the
         # mapping itself keeps every bound tensor alive.  A negative
         # ``phase`` launches every kernel to gate on device controls.
-        if not bound or bound[0] is not states or bound[1] != BLOCK_SIZE:
-            bound[:] = [states, BLOCK_SIZE, _bind(request, kernels, states, BLOCK_SIZE)]
+        if not bound or bound[0] is not states or bound[1] != block_size:
+            bound[:] = [states, block_size, _bind(request, kernels, states, block_size)]
         for mask, launch in bound[2]:
             if mask is None or phase < 0 or phase & mask:
                 launch()

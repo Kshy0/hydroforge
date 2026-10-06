@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Backend-owned ATen contracts for explicit compiled substeps."""
 
 from __future__ import annotations
@@ -265,6 +271,11 @@ def _validate_copy(args: tuple[Any, ...]) -> None:
     destination, source = args[:2]
     _require_contiguous("copy_", destination, source)
     _require_same_shape("copy_", destination, source)
+    if destination.device != source.device:
+        _error(
+            "Compiled ATen copy_ requires source and destination on one device; "
+            f"got {source.device} -> {destination.device}"
+        )
     if destination.dtype != source.dtype:
         _error("Compiled ATen copy_ requires identical source/destination dtype")
     if destination.dtype not in COMPILED_ATEN_DTYPES:

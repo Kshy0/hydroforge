@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Output stage: statistics declaration, windows and the output directory."""
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ from hydroforge.compiler.fields import (
     FieldPlan,
     source_dependencies,
 )
-from hydroforge.compiler.partition import coordinate_identity
+from hydroforge.compiler.partition import bare, coordinate_identity, coordinate_index
 from hydroforge.compiler.selection import Selection
 from hydroforge.contracts.fields import concrete_tensor_dtype
 from hydroforge.contracts.windows import EveryStep, StatisticsOutput, StatisticsPlan
@@ -31,6 +37,7 @@ from hydroforge.core.expr import (
     parse_value_source,
     validate_expression_constants,
 )
+from hydroforge.core.graph import dependency_order
 from hydroforge.core.naming import sanitize_symbol
 from hydroforge.io.netcdf.encoding import netcdf_dtype_encoding
 from hydroforge.io.netcdf.options import prepare_netcdf_variable_options
@@ -78,6 +85,8 @@ class StatisticsDeclarationCompiler:
         self.field_plan = fields
         self.config = config
         self._parsed_sources: dict[str, ValueSource] = {}
+        # Built once: schema_identity resolves coordinates per dependency.
+        self.coordinate_index = coordinate_index(fields.entries.values())
 
     def parse_source(self, expression: str) -> ValueSource:
         source = self._parsed_sources.get(expression)
@@ -92,14 +101,10 @@ class StatisticsDeclarationCompiler:
 
     def metadata(self, name: str) -> tuple[Any, ...]:
         tensor = self.fields[name].tensor
-        coordinate = tensor.dim_coords
-        if coordinate:
-            coordinate = coordinate.split(".")[-1]
+        coordinate = bare(tensor.dim_coords)
         return (
             tuple(
-                dimension.rsplit(".", 1)[-1]
-                if isinstance(dimension, str)
-                else dimension
+                bare(dimension) if isinstance(dimension, str) else dimension
                 for dimension in tensor.shape
             ),
             tensor.output,
@@ -112,13 +117,13 @@ class StatisticsDeclarationCompiler:
         entry = self.fields[name]
         return (
             tuple(
-                token.rsplit(".", 1)[-1] if isinstance(token, str) else token
+                bare(token) if isinstance(token, str) else token
                 for token in entry.tensor.shape
             ),
             None
             if entry.tensor.dim_coords is None
             else coordinate_identity(
-                entry.tensor.dim_coords, self.field_plan.entries.values()
+                entry.tensor.dim_coords, index=self.coordinate_index
             ),
         )
 
@@ -253,7 +258,7 @@ class StatisticsDeclarationCompiler:
             target_field = self.fields.get(name)
             target_tensor = None if target_field is None else target_field.tensor
             target_coord = None if target_tensor is None else target_tensor.dim_coords
-            bare_target = None if target_coord is None else target_coord.split(".")[-1]
+            bare_target = bare(target_coord)
             if (
                 target_tensor is None
                 or target_tensor.output != "auto"
@@ -359,17 +364,6 @@ class StatisticsDeclarationCompiler:
         )
         return MappingProxyType(dict(options))
 
-    def visit(self, name: str) -> None:
-        if name in self.visited or name not in self.virtual_graph:
-            return
-        if name in self.visiting:
-            raise ValueError(f"cyclic statistics dependency involving {name!r}")
-        self.visiting.add(name)
-        for dependency in self.virtual_graph[name]:
-            self.visit(dependency)
-        self.visiting.remove(name)
-        self.visited.add(name)
-
     def resolve_declared_source(self, name: str) -> Any:
         existing = self.compiled_sources.get(name)
         if existing is not None:
@@ -420,9 +414,10 @@ class StatisticsDeclarationCompiler:
         self.compiled_netcdf_options[name] = self.compile_output_options(name, metadata)
 
     def collect_fields(self) -> None:
+        # OutputConfig already rejected repeated field/operation pairs,
+        # conflicting alias expressions and declarations without a dynamic
+        # output; only the canonical output records are built here.
         self.outputs: list[StatisticsOutput] = []
-        expressions: dict[str, str | None] = {}
-        pairs: set[tuple[str, str]] = set()
         for operation, items in self.config.variables.items():
             for item in items:
                 if isinstance(item, str):
@@ -430,21 +425,11 @@ class StatisticsDeclarationCompiler:
                     expression = None
                 else:
                     name, expression = next(iter(item.items()))
-                output = StatisticsOutput(
-                    name=name, operation=operation, expression=expression
-                )
-                pair = (output.name, output.operation)
-                if pair in pairs:
-                    raise ValueError("variables must not repeat a field/operation")
-                pairs.add(pair)
-                previous = expressions.setdefault(output.name, output.expression)
-                if previous != output.expression:
-                    raise ValueError(
-                        f"statistics output {output.name!r} has conflicting expressions"
+                self.outputs.append(
+                    StatisticsOutput(
+                        name=name, operation=operation, expression=expression
                     )
-                self.outputs.append(output)
-        if not any(output.operation != "static" for output in self.outputs):
-            raise ValueError("variables requires at least one dynamic output")
+                )
         # Inactive output-only fields stay visible so an alias can shadow them.
         field_names: FieldNameResolver[FieldEntry] = FieldNameResolver()
         for entry in self.field_plan.entries.values():
@@ -458,7 +443,7 @@ class StatisticsDeclarationCompiler:
         self.fields = field_names.entries
         self.known = set(self.fields)
         self.selection_targets = {
-            field.tensor.selects.split(".")[-1]
+            bare(field.tensor.selects)
             for field in self.fields.values()
             if field.tensor.selects
         }
@@ -543,10 +528,14 @@ class StatisticsDeclarationCompiler:
             self.virtual_graph[name] = source_dependencies(
                 self.parse_source(tensor.expression)
             )
-        self.visiting: set[str] = set()
-        self.visited: set[str] = set()
-        for name in tuple(self.virtual_graph):
-            self.visit(name)
+        graph = self.virtual_graph
+        dependency_order(
+            graph,
+            lambda name: (item for item in graph.get(name, ()) if item in graph),
+            cycle_message=lambda cycle: (
+                f"cyclic statistics dependency involving {cycle[0]!r}"
+            ),
+        )
 
     def compile_program(self) -> StatisticsDeclaration:
         self.grouped_operations: dict[str, list[Any]] = {}
@@ -681,7 +670,7 @@ def _windows(declaration: ModelDeclaration) -> StatisticsPlan | None:
     if schedule is None:
         if not (
             isinstance(plan.inner, EveryStep)
-            and isinstance(plan._effective_outer, EveryStep)
+            and isinstance(plan.effective_outer, EveryStep)
         ):
             raise ValueError(
                 "calendar or explicit statistics windows require simulation_schedule"

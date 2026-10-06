@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Element-wise kernel IR shared by the framework code generators.
 
 Expressions and statements spell out every operation, operand order and
@@ -119,21 +125,22 @@ class Binary:
         left, right = type_of(self.left), type_of(self.right)
         if left is not None and right is not None and left != right:
             raise TypeError(f"{self.op} operands differ in type: {left} and {right}")
+        if self.op == "%" and not integral(self):
+            raise TypeError(
+                "% requires integer operands; use the py_mod intrinsic for floats"
+            )
         if (
             self.op in ("/", "%")
             and isinstance(self.right, Const)
             and self.right.value == 0
-            and (right is None or not right.is_floating_point)
+            and integral(self)
         ):
             raise ValueError("integer division or remainder by literal zero")
         if self.op in {"&", "|"} and any(
             dtype is not None and dtype.is_floating_point for dtype in (left, right)
         ):
             raise TypeError("bitwise operations require integer operands")
-        if (
-            self.op in {"/", "%"}
-            and not (left or right or torch.int64).is_floating_point
-        ):
+        if self.op in {"/", "%"} and integral(self):
             numerator, divisor = constant_value(self.left), constant_value(self.right)
             if divisor == 0:
                 raise ValueError("integer division or remainder by constant zero")
@@ -302,6 +309,19 @@ def type_of(expression: Expr) -> torch.dtype | None:
     raise TypeError(f"unknown kernel expression {expression!r}")
 
 
+def integral(expression: Binary) -> bool:
+    """Whether ``expression`` is integer arithmetic; untyped operands are
+    integers unless one is a floating literal."""
+
+    dtype = type_of(expression)
+    if dtype is not None:
+        return not dtype.is_floating_point
+    return not any(
+        isinstance(item, Const) and type(item.value) is float
+        for item in (expression.left, expression.right)
+    )
+
+
 def cast(expression: Expr, dtype: torch.dtype) -> Expr:
     """``expression`` converted to ``dtype``; no conversion if it has it."""
 
@@ -416,6 +436,21 @@ class KernelFunction:
         validate_function(self)
 
 
+def _wrapped(value: int | float | bool, dtype: torch.dtype | None):
+    """``value`` wrapped to the width of integer ``dtype``, as C stores it."""
+
+    if (
+        dtype is None
+        or dtype == torch.bool
+        or dtype.is_floating_point
+        or type(value) is not int
+    ):
+        return value
+    limits = torch.iinfo(dtype)
+    span = limits.max - limits.min + 1
+    return (value - limits.min) % span + limits.min
+
+
 def constant_value(expression: Expr) -> int | float | bool | None:
     """Fold only defined literal arithmetic for static domain checks."""
     if isinstance(expression, Const):
@@ -424,19 +459,29 @@ def constant_value(expression: Expr) -> int | float | bool | None:
         value = constant_value(expression.operand)
         if value is None:
             return None
-        return float(value) if expression.type.is_floating_point else int(value)
+        if expression.type == torch.bool:
+            return bool(value)
+        if expression.type.is_floating_point:
+            return float(value)
+        try:
+            return _wrapped(int(value), expression.type)
+        except (ArithmeticError, ValueError):
+            return None
     if isinstance(expression, Unary) and expression.op == "neg":
         value = constant_value(expression.operand)
-        return None if value is None else -value
+        return None if value is None else _wrapped(-value, type_of(expression))
     if isinstance(expression, Binary):
         left, right = constant_value(expression.left), constant_value(expression.right)
         if left is None or right is None:
             return None
-        if expression.op == "/" and not type_of(expression).is_floating_point:
+        if expression.op == "/" and integral(expression):
             if right == 0:
                 return None
             quotient = abs(left) // abs(right)
-            return -quotient if (left < 0) != (right < 0) else quotient
+            return _wrapped(
+                -quotient if (left < 0) != (right < 0) else quotient,
+                type_of(expression),
+            )
         operations = {
             "+": lambda: left + right,
             "-": lambda: left - right,
@@ -447,7 +492,7 @@ def constant_value(expression: Expr) -> int | float | bool | None:
             "|": lambda: left | right,
         }
         try:
-            return operations[expression.op]()
+            return _wrapped(operations[expression.op](), type_of(expression))
         except (ArithmeticError, TypeError):
             return None
     return None

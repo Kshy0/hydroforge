@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Address-stable time bindings driven by a compiled device clock aggregator."""
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ from hydroforge.compiler.step_fields import (
     StepFieldOutput,
     step_field_program,
 )
+from hydroforge.contracts.fields import precision_dtype
 from hydroforge.contracts.step_fields import (
     _BUILTIN_STEP_FIELDS,
     StepField,
@@ -53,7 +60,9 @@ def _upload(destination: torch.Tensor, source: torch.Tensor) -> None:
         destination.copy_(source)
 
 
-def _validate_provider_value(source: str, value: int | float, dtype: torch.dtype) -> None:
+def _validate_provider_value(
+    source: str, value: int | float, dtype: torch.dtype
+) -> None:
     """Validate each demanded representation independently of provider caching."""
     if dtype in {torch.int32, torch.int64}:
         limits = torch.iinfo(dtype)
@@ -281,7 +290,7 @@ class StepFieldRuntime:
         self._deferred = False
 
     def concrete_dtype(self, field: StepField) -> torch.dtype:
-        return self.dtype if field.dtype == "precision" else getattr(torch, field.dtype)
+        return precision_dtype(field.dtype, self.dtype)
 
     def bind_many(self, fields: Iterable[StepField]) -> None:
         fields = tuple(

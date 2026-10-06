@@ -12,7 +12,7 @@ import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from functools import lru_cache, partial
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -36,6 +36,7 @@ from hydroforge.io.rank_output.writer import RankOutputWriter
 from hydroforge.kernels.toolchain import CompileRequest
 from hydroforge.kernels.toolchain.python import release_generated_module
 from hydroforge.platform.backend import Backend
+from hydroforge.platform.devices import float64_supported
 from hydroforge.statistics.compiler import compile_statistics_program
 from hydroforge.statistics.ir import StatisticsProgram, build_statistics_ir
 from hydroforge.statistics.kernel_plan import StatisticsCompileContext
@@ -50,6 +51,7 @@ from hydroforge.statistics.phases import (
     CONTROL_MACRO_INDEX,
     CONTROL_MACRO_STEPS,
     CONTROL_PHASE,
+    CONTROL_STATE,
     CONTROL_WEIGHT,
     SampleFlags,
     sample_phase,
@@ -66,13 +68,17 @@ from hydroforge.statistics.windows import (
     WindowState,
 )
 
+_INNER_FIRST = int(SampleFlags.INNER_FIRST)
 _INNER_LAST = int(SampleFlags.INNER_LAST)
-_OUTER_FIRST = int(SampleFlags.OUTER_FIRST)
 
 
-@lru_cache(maxsize=128)
 def _control_float_value(dtype: torch.dtype, value: float) -> float:
-    return float(torch.tensor(value, dtype=dtype, device="cpu").item())
+    """``value`` rounded to the control ``dtype`` without a tensor."""
+
+    if dtype == torch.float64:
+        return float(value)
+    with np.errstate(over="ignore"):
+        return float(np.float32(value))
 
 
 def _weak_shutdown_callback(runtime: Any):
@@ -181,10 +187,10 @@ class StatisticsRuntime:
 
         self._controller = StatisticsWindowController(self.windows, self.schedule)
         self._step_flags = 0
+        # Host mirror of a float32 window weight sum (see ``sample``).
+        self._weight_guard = False
+        self._window_weight = np.float32(0.0)
 
-        # Internal state
-        # Generic stats state (for all ops)
-        self._variables: set[str] = set()  # original variable names
         self._variable_ops: dict[str, list[str]] = {}  # var -> list[ops]
         self._storage: dict[str, torch.Tensor] = {}  # out_name -> tensor
         self._output_keys: list[str] = []  # list of keys in storage that are outputs
@@ -197,7 +203,7 @@ class StatisticsRuntime:
         # Cache for sanitized names
         self._safe_name_cache: dict[str, str] = {}
 
-        # Kernel state (mean fast-path)
+        # Installed backend program
         self._kernel_module = None
         self._generated_modules: list[tuple[str, str]] = []
         self._saved_kernel_file = None
@@ -252,23 +258,31 @@ class StatisticsRuntime:
                 )
             )
         }
+        reserved = self._storage_plan.slots.keys() | CONTROL_STATE
+
+        def bind_model(name: str) -> None:
+            # Kernels bind model tensors and statistics storage by name: a
+            # model tensor named like a slot would receive its updates.
+            if name in reserved:
+                raise ValueError(
+                    f"model tensor {name!r} collides with statistics state"
+                )
+            required_tensors[name] = self._tensor_registry[name]
+
         for name in (
             *(variable.name for variable in ir.variables),
             *(scatter.name for scatter in scatters),
         ):
             for dependency in self._statistics_program.leaf_tensors(name):
-                required_tensors[dependency] = self._tensor_registry[dependency]
+                bind_model(dependency)
         for scatter in scatters:
-            index = scatter.source.index
-            required_tensors[index] = self._tensor_registry[index]
+            bind_model(scatter.source.index)
         for variable in ir.variables:
             if variable.output_group != "__full__":
-                required_tensors[variable.output_group] = self._tensor_registry[
-                    variable.output_group
-                ]
+                bind_model(variable.output_group)
             for dim_name in variable.tensor_shape:
                 if isinstance(dim_name, str) and dim_name in self._tensor_registry:
-                    required_tensors[dim_name] = self._tensor_registry[dim_name]
+                    bind_model(dim_name)
 
         for name, tensor in required_tensors.items():
             if not devices_match(tensor.device, self.device):
@@ -301,17 +315,21 @@ class StatisticsRuntime:
             control_bytes, dtype=torch.uint8, device=self.device
         )
         host_slots = []
-        # Pinned slots let the host run ahead of queued statistics launches.
-        for _slot in range(16 if self.device.type == "cuda" else 1):
+        # Pinned slots let the host run ahead of queued statistics launches
+        # on stream-ordered accelerators; elsewhere one slot copies in order.
+        streams = (
+            getattr(torch, self.device.type)
+            if self.device.type in {"cuda", "xpu"}
+            else None
+        )
+        for _slot in range(1 if streams is None else 16):
             host = torch.zeros(
                 control_bytes,
                 dtype=torch.uint8,
                 device="cpu",
-                pin_memory=self.device.type == "cuda",
+                pin_memory=streams is not None,
             )
-            host_slots.append(
-                (host, {}, torch.cuda.Event() if self.device.type == "cuda" else None)
-            )
+            host_slots.append((host, {}, None if streams is None else streams.Event()))
         offset = 0
         for name, dtype in layout:
             stop = offset + dtype.itemsize
@@ -324,6 +342,7 @@ class StatisticsRuntime:
         self._kernel_states = required_tensors
         self._control_buffer = control_buffer
         self._control_host_slots = host_slots
+        self._control_streams = streams
         self._control_slot_index = 0
 
     def _check_offsets(self, tensors: Mapping[str, torch.Tensor]) -> None:
@@ -390,22 +409,34 @@ class StatisticsRuntime:
                 mean_count_limits.add(2**48 if self.backend.name == "metal" else 2**53)
 
         # Visible outputs and hidden dependencies use the same scatter storage.
+        # Sample weights accumulate in float64 where backend and device have
+        # it natively; elsewhere ``sample`` guards their float32 sum.
+        # Devices without a known FP64 capability keep float32 weights.
+        wide_weights = (
+            "float64" in self.backend.precisions
+            and self.device.type in {"cpu", "cuda", "mps", "xpu"}
+            and float64_supported(self.device)
+        )
         self._storage_plan = build_storage_plan(
             compilation.program,
             compilation.layouts,
             self._variable_ops,
             self.ensemble_size,
+            weight_dtype=torch.float64 if wide_weights else None,
         )
+        self._weight_guard = self._float32_weight_slots()
         for slot in self._storage_plan.slots.values():
-            row = 1
             if slot.owner in self._variable_ops:
                 layout = self._statistics_layouts[slot.owner]
                 if self._field_registry[slot.owner].output_index is not None:
-                    row = math.prod(slot.shape[int(layout.batched) + 1 :])
+                    # Saved points index the rows after any member axis.
+                    self._indexed_storage_rows[slot.name] = math.prod(
+                        slot.shape[int(layout.batched) + 1 :]
+                    )
             self.backend.validate_extent(
                 f"statistics buffer {slot.name!r}",
                 math.prod(slot.shape),
-                self.block_size * row,
+                self.block_size * self._indexed_storage_rows.get(slot.name, 1),
             )
         for slot in self._storage_plan.slots.values():
             dtype = slot.dtype
@@ -428,13 +459,6 @@ class StatisticsRuntime:
             else:
                 initial = 0
             self._storage[slot.name] = self._full_tensor(slot.shape, initial, dtype)
-            if slot.owner in self._variable_ops:
-                layout = self._statistics_layouts[slot.owner]
-                if self._field_registry[slot.owner].output_index is not None:
-                    # Saved points index the rows after any member axis.
-                    self._indexed_storage_rows[slot.name] = math.prod(
-                        slot.shape[int(layout.batched) + 1 :]
-                    )
             if slot.output:
                 self._output_keys.append(slot.name)
 
@@ -448,9 +472,6 @@ class StatisticsRuntime:
             output_coord = field_info.output_coord
             dim_coords = metadata.dim_coords
             full_output = field_info.output_index is None
-
-            # Track
-            self._variables.add(var_name)
 
             for operation in operation_nodes:
                 op = operation.spelling
@@ -524,10 +545,16 @@ class StatisticsRuntime:
         """Resolve the windows of one managed step; return whether it samples.
 
         ``step`` is ``None`` for an unscheduled call, which is a whole
-        window.  A spin-up step belongs to no window.
+        window.  A spin-up step belongs to no window.  A sampled window is
+        published at its start time, so it needs one.
         """
 
         if step is None:
+            if enabled and time is None:
+                raise ValueError(
+                    "statistics outputs are labeled by model time; configure "
+                    "simulation_schedule or initial_time"
+                )
             events = WHOLE_WINDOW
         elif step.is_spin_up:
             events = None
@@ -559,14 +586,52 @@ class StatisticsRuntime:
         """Publish the controls of one host-issued sample; return its phase."""
 
         phase = sample_phase(self._step_flags, first=first, last=last)
+        weight = self._convert_weight(weight)
+        if self._weight_guard:
+            self._accumulate_float32_weight(weight, phase)
         state = self.window_state
         count, index = (
             state.claim(phase)
             if phase & _INNER_LAST
             else (state.macro_count, state.macro_index)
         )
-        self._write_control(self._convert_weight(weight), phase, count, index)
+        self._write_control(weight, phase, count, index)
         return phase
+
+    def _float32_weight_slots(self) -> bool:
+        """Whether a mean accumulates its window's sample weight in float32."""
+
+        names = {
+            name
+            for variable in self._variable_ops
+            for name in (
+                StoragePlan.sample_weight(variable),
+                StoragePlan.inner_weight(variable, Reduction.MEAN),
+            )
+        }
+        return any(
+            slot.dtype == torch.float32
+            for name, slot in self._storage_plan.slots.items()
+            if name in names
+        )
+
+    def _accumulate_float32_weight(self, weight: float, phase: int) -> None:
+        """Mirror the device's float32 window weight sum of host samples.
+
+        A float32 sum stops growing once it is 2**24 times the sample weight;
+        the mean would then silently become a moving average, so the sample
+        that would leave the sum unchanged is rejected instead.
+        """
+
+        total = np.float32(0.0) if phase & _INNER_FIRST else self._window_weight
+        accumulated = total + np.float32(weight)
+        if accumulated == total:
+            raise OverflowError(
+                "statistics mean window weight exceeds float32 resolution: "
+                f"a {weight!r} weight no longer changes the accumulated "
+                f"{float(total)!r}; use shorter windows or float64 storage"
+            )
+        self._window_weight = accumulated
 
     def prelaunch(self) -> None:
         """Publish the controls of a device loop that folds every iteration.
@@ -592,9 +657,10 @@ class StatisticsRuntime:
         phase = state.settle_phase()
         if phase:
             count, index = state.claim(phase)
-            self._write_control(0.0, phase, count, index)
+            # Only settle kernels read the controls of a close.
             if self._settle_function is not None:
-                self._settle_function(self._kernel_states, bool(phase & _OUTER_FIRST))
+                self._write_control(0.0, phase, count, index)
+                self._settle_function(self._kernel_states, phase)
         label = state.close()
         if label is not None:
             self.finalize_time_step(label)
@@ -619,7 +685,7 @@ class StatisticsRuntime:
             host_values[name][0] = value
         self._control_buffer.copy_(host, non_blocking=event is not None)
         if event is not None:
-            event.record(torch.cuda.current_stream(self.device))
+            event.record(self._control_streams.current_stream(self.device))
         self._control_slot_index = (self._control_slot_index + 1) % len(slots)
 
     def _convert_weight(self, weight: float) -> float:
@@ -809,7 +875,7 @@ class StatisticsRuntime:
             ensemble_size=self.ensemble_size,
             save_kernels=self.save_kernels,
             kernels_dir=self.kernels_dir,
-            variables=frozenset(self._variables),
+            variables=frozenset(self._variable_ops),
             layouts=MappingProxyType(dict(layouts)),
             storage=MappingProxyType(dict(self._storage)),
             tensors=MappingProxyType(dict(self._tensor_registry)),
@@ -943,13 +1009,8 @@ class StatisticsRuntime:
         self,
         compilation: StatisticsCompilation,
     ) -> None:
-        """
-        Initialize streaming aggregation for specified variables.
-        Creates NetCDF file structure but writes time steps incrementally.
-
-        Args:
-            compilation: Compiler-owned operations, expressions and layouts.
-        """
+        """Materialize ``compilation`` and install its sink: retained results
+        in memory, or a streaming NetCDF writer."""
         emit(
             self,
             "info",

@@ -138,16 +138,6 @@ def control_requests(
     return tuple(rtc.precompile_request(request, device) for request in requests)
 
 
-@functools.lru_cache(maxsize=256)
-def _launcher(
-    request: rtc.RtcRequest,
-    kernel: str,
-    args: tuple[rtc.KernelArgument, ...],
-    device: int,
-):
-    return rtc.prepare(request, (rtc.CudaLaunch(kernel, 1, 1, args),), device)
-
-
 def _launch(
     request: rtc.RtcRequest,
     function: KernelFunction,
@@ -155,7 +145,12 @@ def _launch(
     device: torch.device,
 ) -> None:
     """Launch the one lane of ``function`` with parameters bound by name, on
-    the current stream of ``device`` (the capture stream while capturing)."""
+    the current stream of ``device`` (the capture stream while capturing).
+
+    Control launches run while warming up and capturing graphs, so each
+    binds afresh: a process-wide cache of bindings would keep the control
+    tensors of closed models alive.  The compiled program stays cached.
+    """
 
     args = tuple(
         rtc.pointer(values[param.name])
@@ -164,7 +159,7 @@ def _launch(
         for param in function.params
     )
     index = torch.cuda.current_device() if device.index is None else device.index
-    _launcher(request, function.name, args, index)()
+    rtc.prepare(request, (rtc.CudaLaunch(function.name, 1, 1, args),), index)()
 
 
 def fixed_end(

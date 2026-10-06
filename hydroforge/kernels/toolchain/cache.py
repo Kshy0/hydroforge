@@ -1,7 +1,14 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Cross-process compile locks and the compiler's process environment.
 
 A lock file records ``host:pid:time:token``; waiters poll it, remove it when its local
-holder has died, and optionally steal it once it is stale. Every create/remove
+holder has died (or its PID was reused by a newer process), and optionally
+steal it once it is stale. Every create/remove
 decision runs under an OS file lock on a sibling guard file.  The lock timing
 is configured by the ``HYDROFORGE_COMPILE_LOCK_*`` variables of
 :mod:`hydroforge.platform.env`; the Metal extension build and the runtime
@@ -24,6 +31,9 @@ from hydroforge.core.errors import cleanup_on_exit
 from hydroforge.platform import env
 
 _compiler_environment_lock = RLock()
+# Tokens of compile locks this process holds; a lock naming this process's
+# PID with another token was left by an earlier process that had the same PID.
+_held_tokens: set[str] = set()
 
 
 @contextmanager
@@ -82,19 +92,45 @@ def clear_abandoned_torch_lock(build_dir: Path) -> None:
     (build_dir / "lock").unlink(missing_ok=True)
 
 
-def _read_compile_lock_holder(lock_path: Path) -> tuple[str | None, int | None]:
+def _read_compile_lock_holder(
+    lock_path: Path,
+) -> tuple[str | None, int | None, float | None, str]:
+    """Return the holder's host, PID, creation time and the raw token."""
     try:
         raw = lock_path.read_text(errors="replace").strip()
     except OSError:
-        return None, None
-    parts = raw.split(":", 2)
+        return None, None, None, ""
+    parts = raw.split(":", 3)
     if len(parts) < 2:
-        return None, None
+        return None, None, None, raw
     try:
         pid = int(parts[1])
     except ValueError:
         pid = None
-    return parts[0] or None, pid
+    try:
+        created = float(parts[2]) if len(parts) > 2 else None
+    except ValueError:
+        created = None
+    return parts[0] or None, pid, created, raw
+
+
+def _process_started_after(pid: int, timestamp: float) -> bool:
+    """Whether Linux reports ``pid`` started after ``timestamp`` (PID reuse)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        boot = next(
+            float(line.split()[1])
+            for line in Path("/proc/stat").read_text().splitlines()
+            if line.startswith("btime ")
+        )
+        # Fields after the parenthesized command start at field 3 (state);
+        # field 22 is the start time in clock ticks since boot.
+        ticks = float(stat.rsplit(")", 1)[1].split()[19])
+        started = boot + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration):
+        return False
+    # Token times round to a second and btime is whole seconds.
+    return started > timestamp + 2.0
 
 
 def _process_is_alive(pid: int | None) -> bool:
@@ -157,23 +193,40 @@ def _compile_lock_guard(lock_path: Path):
         yield
 
 
+def _holder_is_dead(pid: int | None, created: float | None, token: str) -> bool:
+    """Whether a lock holder on this host has exited, including PID reuse."""
+    if pid == os.getpid():
+        return token not in _held_tokens
+    if not _process_is_alive(pid):
+        return True
+    return (
+        pid is not None and created is not None and _process_started_after(pid, created)
+    )
+
+
 def _remove_abandoned_compile_lock_unlocked(
     lock_path: Path, *, stale_after: float
 ) -> bool:
-    if stale_after <= 0.0:
-        return False
     try:
         age = time.time() - lock_path.stat().st_mtime
     except OSError:
         return False
-    holder_host, holder_pid = _read_compile_lock_holder(lock_path)
+    holder_host, holder_pid, created, token = _read_compile_lock_holder(lock_path)
     local_host = socket.gethostname()
-    dead_local_holder = holder_host == local_host and not _process_is_alive(holder_pid)
+    dead_local_holder = holder_host == local_host and _holder_is_dead(
+        holder_pid, created, token
+    )
     if dead_local_holder:
         grace = env.nonnegative_float(env.COMPILE_LOCK_DEAD_PID_GRACE, default=2.0)
-        if age < min(stale_after, grace):
+        if stale_after > 0.0:
+            grace = min(stale_after, grace)
+        if age < grace:
             return False
-    elif age < stale_after or not env.flag(env.COMPILE_LOCK_STEAL, default=False):
+    elif (
+        stale_after <= 0.0
+        or age < stale_after
+        or not env.flag(env.COMPILE_LOCK_STEAL, default=False)
+    ):
         return False
     lock_path.unlink(missing_ok=True)
     return True
@@ -185,7 +238,8 @@ def acquire_compile_lock(
     """Return an acquisition token and no value, or no token and a cache hit.
 
     A zero timeout waits forever and a zero stale age never removes a lock
-    whose holder may be alive.
+    whose holder may be alive; a lock whose local holder has exited (also
+    when its PID now names a newer process) is removed after a short grace.
     """
     stale_after = env.nonnegative_float(env.COMPILE_LOCK_STALE, default=1800.0)
     poll = max(0.05, env.nonnegative_float(env.COMPILE_LOCK_POLL, default=0.25))
@@ -228,12 +282,15 @@ def acquire_compile_lock(
                         "incomplete compile lock", (lock_path.unlink,)
                     ):
                         raise
+                _held_tokens.add(token)
                 return token, None
         if removed:
             continue
         if lock_path.exists():
             if deadline is not None and time.time() > deadline:
-                holder_host, holder_pid = _read_compile_lock_holder(lock_path)
+                holder_host, holder_pid, _created, _token = _read_compile_lock_holder(
+                    lock_path
+                )
                 holder = (
                     f"{holder_host or 'unknown'}:{holder_pid}"
                     if holder_pid is not None
@@ -251,6 +308,7 @@ def acquire_compile_lock(
 
 def release_compile_lock(lock_path: Path, token: str) -> None:
     with _compile_lock_guard(lock_path):
+        _held_tokens.discard(token)
         try:
             if lock_path.read_text() == token:
                 lock_path.unlink()

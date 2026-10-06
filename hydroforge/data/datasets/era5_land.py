@@ -5,7 +5,7 @@
 #
 
 from collections.abc import Callable, Sequence
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +29,23 @@ def _is_day_start(time: DateLike) -> bool:
         and time.second == 0
         and time.microsecond == 0
     )
+
+
+def _missing_mask(raw: np.ndarray) -> np.ndarray | None:
+    """Masked or NaN positions of one read, or ``None`` when there are none."""
+
+    mask = np.ma.getmask(raw)
+    missing = None if mask is np.ma.nomask or not mask.any() else mask
+    data = np.ma.getdata(raw)
+    if (
+        data.dtype.kind == "f"
+        and data.size
+        and not (np.isfinite(data.min()) and np.isfinite(data.max()))
+    ):
+        nan = np.isnan(data)
+        if nan.any():
+            missing = nan if missing is None else missing | nan
+    return missing
 
 
 class ERA5LandAccumDataset(NetCDFDataset):
@@ -89,7 +106,7 @@ class ERA5LandAccumDataset(NetCDFDataset):
 
     var_name: str = "ro"
     prefix: str = "runoff_"
-    time_to_key: Callable[[datetime], str] = monthly_time_to_key
+    time_to_key: Callable[[DateLike], str] = monthly_time_to_key
     clip_incremental_negative: bool = True
 
     def _compile_plan(self, domain: TemporalDomain) -> DatasetPlan:
@@ -107,7 +124,13 @@ class ERA5LandAccumDataset(NetCDFDataset):
         ):
             if start is not None:
                 self._require_midnight_grid(start, label)
-        return super()._compile_plan(domain)
+        plan = super()._compile_plan(domain)
+        if self._store.unit_offset != 0.0:
+            raise ValueError(
+                "ERA5LandAccumDataset cannot apply an offset unit conversion "
+                "to cumulative records"
+            )
+        return plan
 
     def _daily_steps(self) -> int:
         return timedelta_quotient(
@@ -220,8 +243,7 @@ class ERA5LandAccumDataset(NetCDFDataset):
         # Keep observation validity until after differencing. A missing
         # predecessor makes the following increment missing too; midnight
         # resets depend only on the current observation.
-        missing = np.ma.getmaskarray(raw) | np.isnan(np.ma.getdata(raw))
-        has_missing = missing.any()
+        missing = _missing_mask(raw)
         # Accumulations are never clipped: clipping bounds the increments.
         values = ingest(
             raw,
@@ -230,12 +252,18 @@ class ERA5LandAccumDataset(NetCDFDataset):
             clip_negative=False,
             label="source chunk",
         )
-        data = as_float64(values, label="ERA5 cumulative input") / self.unit_factor
+        # The fresh read (and so its float64 promotion) is owned here.
+        data = as_float64(values, label="ERA5 cumulative input")
+        store = self._store
+        if store.unit_factor != 1.0:
+            np.divide(data, store.unit_factor, out=data)
+        if store.unit_scale != 1.0:
+            np.multiply(data, store.unit_scale, out=data)
         increments = self._transform_cumulative_to_incremental(
             data[1:] if needs_previous else data,
             chunk.source_times(),
             data[0] if needs_previous else None,
-            missing=missing if has_missing else None,
+            missing=missing,
         )
         return finalize(
             increments,

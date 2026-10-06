@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Metal indirect command buffers over online-lowered substep programs.
 
 Recorded ATen operators lower strictly to online Metal kernels (never to an
@@ -29,6 +35,7 @@ from hydroforge.execution.operators import (
 )
 from hydroforge.kernels.backends import metal_aten
 from hydroforge.kernels.backends.metal_control import (
+    SCATTER_ERROR_STATUS,
     adaptive_control_commands,
     fixed_control_command,
     statistics_control_command,
@@ -441,22 +448,12 @@ class _Fixed:
         loop = self.loop
         self.lowered.reset()
         fold = step.fold
-        loop.prepare(
-            count, duration / count, controls=True, weight=fold or loop.weighted
-        )
-        if fold and self.lowered.errors:
-            # Bounds flags are host-visible only after replay. Keep the same
-            # per-iteration sampling semantics, checking before each sample.
-            regular, final = self.iterations
-            for index in range(count):
-                (
-                    final if final is not None and index == count - 1 else regular
-                ).replay()
-                self.lowered.check()
-                step.sample(
-                    first=index == 0, last=index == count - 1, weight=duration / count
-                )
-            return count
+        # A folded sample weighs ``self.width``; only a body reading the
+        # loop's own width needs it written, as on the CUDA path.
+        loop.prepare(count, duration / count, controls=True, weight=loop.weighted)
+        # Bounds flags are sticky and host-visible only after replay: one check
+        # after the whole loop fails the step before ``finish`` can publish any
+        # folded statistics, so scatter bodies keep the folded path.
         if fold:
             step.statistics.prelaunch()
             launch = step.statistics.launch
@@ -512,6 +509,13 @@ class _Adaptive:
         self.executor = executor
         self.loop = loop
         self.lowered = LoweredPrograms(loop.proposal, loop.body)
+        # One lowering shares a single scatter bounds flag; the end command
+        # folds it into ``status[0]`` so iterations need no extra flag read.
+        if len(self.lowered.errors) > 1:
+            raise SubstepCompileError(
+                "a Metal adaptive iteration must share one scatter bounds flag"
+            )
+        self.scatter_error = self.lowered.errors[0] if self.lowered.errors else None
         begin, accept, end = adaptive_control_commands(
             candidate=loop.candidate,
             maximum=loop.maximum,
@@ -523,6 +527,7 @@ class _Adaptive:
             error_flag=loop.error_flag,
             status=loop.status,
             maximum_steps=loop.maximum_steps,
+            scatter_error=self.scatter_error,
         )
         proposal, body = self.lowered.commands
         self.iteration = executor.capture_commands(
@@ -532,14 +537,17 @@ class _Adaptive:
     def run(self, duration: float, step: Any) -> int:
         self.lowered.reset()
 
-        # The end command writes ``status`` inside the command buffer.
-        def iterate():
-            self.iteration.replay()
-            self.lowered.check()
+        # The end command writes ``status`` inside the command buffer,
+        # including the sticky scatter bounds flag, so each iteration's single
+        # status read checks it before the host samples the state.
+        def check_failed(failed: int) -> None:
+            if failed & SCATTER_ERROR_STATUS:
+                raise IndexError("Metal scatter_add index is outside the output extent")
+            self.loop.check_completion(failed & ~SCATTER_ERROR_STATUS)
 
-        count = host_adaptive(self.loop, step, iterate, ())
-        self.lowered.check()
-        return count
+        return host_adaptive(
+            self.loop, step, self.iteration.replay, (), check_failed=check_failed
+        )
 
     def close(self) -> None:
         iteration, self.iteration = self.iteration, None

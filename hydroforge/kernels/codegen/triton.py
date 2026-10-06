@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Triton spelling of kernel IR.
 
 A Triton kernel runs a block of lanes per program: ``ThreadIndex`` is the
@@ -12,21 +18,29 @@ branches.  Loads of per-lane addresses always carry the mask in effect,
 so both operands of ``tl.where`` stay in bounds.
 
 FP32 division and square root are IEEE (``tl.div_rn``, ``tl.sqrt_rn``; ROCm
-uses OCML's IEEE ``sqrt``), and transcendental functions call the libdevice
-functions CUDA uses: Triton's defaults are approximate instructions.  The
-prelude's helpers are the NaN rules: ``hydroforge_maximum``/``_minimum``
-ignore one NaN operand and ``hydroforge_weighted_mean`` is the incremental
-mean with the blended fallback for non-finite results.
+uses OCML's IEEE ``sqrt``, chosen by the compilation's target), and
+transcendental functions call the libdevice functions CUDA uses: Triton's
+defaults are approximate instructions.  The prelude's helpers are the NaN
+rules: ``hydroforge_maximum``/``_minimum`` ignore one NaN operand and
+``hydroforge_weighted_mean`` is the incremental mean with the blended
+fallback for non-finite results; ``hydroforge_py_mod`` is Python's remainder.
+
+Lane indices are int64, like the IR's ``ThreadIndex``.  A store or atomic
+addition at a uniform address under a per-lane mask runs once per active
+lane, as each C thread does.  A local that starts uniform and later takes
+per-lane values starts as a tile, so branches and loops keep its type.
+``ForK`` unrolls short loops and loops at run time otherwise.
 """
 
 from __future__ import annotations
 
+import keyword
 import math
 from collections.abc import Sequence
 
 import torch
 
-from hydroforge.kernels.codegen.c import identifier
+from hydroforge.kernels.codegen.c import _word, identifier
 from hydroforge.kernels.codegen.ir import (
     PHASE,
     Assign,
@@ -55,6 +69,7 @@ from hydroforge.kernels.codegen.ir import (
     Unary,
     Var,
     While,
+    integral,
     type_of,
 )
 from hydroforge.kernels.codegen.passes import effects, subexpressions
@@ -64,7 +79,9 @@ _INDENT = "    "
 PRELUDE = """\
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
+
+# libdevice is Triton's module, or its NumPy form under TRITON_INTERPRET=1.
+from hydroforge.kernels.triton_math import is_hip, libdevice
 
 
 # Ignore one-sided NaN and select like the C printers (``a > b ? a : b``).
@@ -90,10 +107,42 @@ def hydroforge_divide(numerator, denominator):
 
 
 @triton.jit
+def hydroforge_sqrt(value):
+    # ROCm Triton's sqrt_rn returns NaN for subnormal inputs; OCML's sqrt is
+    # IEEE.  The compilation's target decides, not the importing process.
+    if value.dtype == tl.float32:
+        if is_hip():
+            return libdevice.sqrt(value)
+        else:
+            return tl.sqrt_rn(value)
+    else:
+        return tl.sqrt(value)
+
+
+@triton.jit
+def hydroforge_py_mod(left, right):
+    # Python's remainder: the sign of the divisor.
+    remainder = libdevice.fmod(left, right)
+    adjust = (remainder != 0) & ((remainder < 0) != (right < 0))
+    return tl.where(adjust, remainder + right, remainder)
+
+
+@triton.jit
 def hydroforge_weighted_mean(old_value, old_weight, value, weight):
     # Incremental form bounds FP32 drift; non-finite results keep the
-    # blended form's infinity/NaN propagation.
+    # blended form's infinity/NaN propagation.  Finite weights whose sum
+    # overflows are halved first, as the C and Metal forms do.
     new_weight = old_weight + weight
+    # The halved sum is finite exactly when both weights are.
+    half_old_weight = old_weight * 0.5
+    half_weight = weight * 0.5
+    half_new_weight = half_old_weight + half_weight
+    halve = (tl.abs(new_weight) == float('inf')) & (
+        tl.abs(half_new_weight) < float('inf')
+    )
+    old_weight = tl.where(halve, half_old_weight, old_weight)
+    weight = tl.where(halve, half_weight, weight)
+    new_weight = tl.where(halve, half_new_weight, new_weight)
     ratio = hydroforge_divide(weight, new_weight)
     incremental = old_value + (value - old_value) * ratio
     blended = old_value * hydroforge_divide(old_weight, new_weight) + value * ratio
@@ -107,17 +156,20 @@ _GLOBALS = frozenset(
         "triton",
         "tl",
         "libdevice",
+        "is_hip",
         "BLOCK_SIZE",
         "hydroforge_maximum",
         "hydroforge_minimum",
         "hydroforge_divide",
+        "hydroforge_sqrt",
+        "hydroforge_py_mod",
         "hydroforge_weighted_mean",
     )
 )
 
 _FUNCTIONS = {
     "abs": "tl.abs",
-    "sqrt": "tl.sqrt",
+    "sqrt": "hydroforge_sqrt",
     "exp": "libdevice.exp",
     "log": "libdevice.log",
     "sin": "libdevice.sin",
@@ -129,7 +181,11 @@ _FUNCTIONS = {
     "weighted_mean": "hydroforge_weighted_mean",
 }
 
-_LANES = "tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)"
+# The program index widens before it scales, so lanes past 2**31 stay exact.
+_LANES = "tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)"
+
+# ``ForK`` loops up to this count unroll (``tl.static_range``).
+_UNROLL = 4
 
 
 def _type(dtype: torch.dtype) -> str:
@@ -151,9 +207,68 @@ def _type(dtype: torch.dtype) -> str:
     return f"tl.{names[dtype]}"
 
 
-def _integral(node: Expr) -> bool:
-    dtype = type_of(node)
-    return dtype is not None and not dtype.is_floating_point
+def _integral(node: Binary) -> bool:
+    return integral(node)
+
+
+def _shape(atoms: frozenset) -> str | None:
+    """The tile shape of the lane axes ``atoms``, if it has one."""
+
+    tiles = {atom for atom in atoms if atom != "lanes"}
+    if not atoms:
+        return None
+    if atoms == {"lanes"}:
+        return "(BLOCK_SIZE,)"
+    if "lanes" in atoms or len(tiles) > 2:
+        return None
+    rows = "BLOCK_SIZE" if "tile0" in tiles else "1"
+    columns = [atom[1] for atom in tiles if atom != "tile0"]
+    if len(columns) > 1:
+        return None
+    return f"({rows}, {columns[0] if columns else 1})"
+
+
+def _lane_atoms(statements: Sequence[Stmt]) -> dict[str, frozenset]:
+    """The lane axes each local ever takes: its values and the per-lane
+    conditions it is assigned under, to a fixed point."""
+
+    atoms: dict[str, frozenset] = {}
+
+    def of(node: Expr) -> frozenset:
+        match node:
+            case ThreadIndex():
+                return frozenset(("lanes",))
+            case TileIndex(axis=0):
+                return frozenset(("tile0",))
+            case TileIndex():
+                return frozenset((("tile1", node.extent),))
+            case Var():
+                return atoms.get(node.name, frozenset())
+        return frozenset().union(*map(of, subexpressions(node)))
+
+    def visit(body: Sequence[Stmt], condition: frozenset) -> bool:
+        changed = False
+        for node in body:
+            match node:
+                case Let() | Assign():
+                    taken = of(node.value)
+                    if isinstance(node, Assign):
+                        taken |= condition
+                    known = atoms.get(node.var.name, frozenset())
+                    if not taken <= known:
+                        atoms[node.var.name] = known | taken
+                        changed = True
+                case If():
+                    inner = condition | of(node.condition)
+                    changed |= visit(node.then, inner)
+                    changed |= visit(node.orelse, inner)
+                case ForK() | While() | Block():
+                    changed |= visit(node.body, condition)
+        return changed
+
+    while visit(statements, frozenset()):
+        pass
+    return atoms
 
 
 def _literal(value: bool | int | float) -> str:
@@ -168,7 +283,9 @@ class TritonPrinter:
     def expr(self, node: Expr) -> str:
         match node:
             case Var():
-                return node.name
+                # Scalar parameters are declared with non-word characters
+                # replaced; locals are identifiers, which this keeps.
+                return _word(node.name)
             case Const(value=bool()) | Const(type=None):
                 return _literal(node.value)
             case Const() if not node.type.is_floating_point:
@@ -205,21 +322,15 @@ class TritonPrinter:
                     f"tl.cast({self.expr(item)}, {_type(node.type)})"
                     for item in node.arguments
                 )
-                if node.function == "pow":
-                    return f"libdevice.pow({left}, {right})"
-                remainder = f"libdevice.fmod({left}, {right})"
-                adjust = (
-                    f"(({remainder} != 0.0) & (({remainder} < 0.0) != ({right} < 0.0)))"
+                function = (
+                    "libdevice.pow" if node.function == "pow" else "hydroforge_py_mod"
                 )
-                return f"tl.where({adjust}, {remainder} + {right}, {remainder})"
+                return f"{function}({left}, {right})"
             case Call(function="isnan"):
                 (operand,) = (self.expr(item) for item in node.arguments)
                 return f"({operand} != {operand})"
             case Call():
                 function = _FUNCTIONS[node.function]
-                if node.function == "sqrt" and node.type == torch.float32:
-                    # ROCm Triton's sqrt_rn returns NaN for subnormal inputs.
-                    function = "libdevice.sqrt" if torch.version.hip else "tl.sqrt_rn"
                 arguments = ", ".join(self.expr(item) for item in node.arguments)
                 return f"{function}({arguments})"
             case PhaseTest():
@@ -257,6 +368,7 @@ class _Kernel(TritonPrinter):
         touched = effects(function.body)
         taken = touched.uses | touched.defines
         clashes = (set(params) & touched.defines) | ((set(params) | taken) & _GLOBALS)
+        clashes |= {name for name in (*params, *taken) if keyword.iskeyword(name)}
         if len(set(params)) != len(params) or clashes:
             raise ValueError(
                 f"{function.name}: parameter names collide: {params}; "
@@ -265,6 +377,7 @@ class _Kernel(TritonPrinter):
         self.names = Names((*params, *taken, *_GLOBALS))
         self.buffers = {param.name: identifier(param) for param in function.params}
         self.varying: set[str] = set()
+        self.atoms = _lane_atoms(function.body)
         self.mask: str | None = None
         self.predicate: str | None = None
 
@@ -303,8 +416,11 @@ class _Kernel(TritonPrinter):
     def access(self, name: str, node: Store | AtomicAdd) -> str:
         pointer = f"{self.buffers[node.buffer]} + {self.expr(node.index)}"
         value = self.expr(node.value)
-        if self.mask is None or not self.lanes(node.index):
+        if self.mask is None:
             return f"{name}({pointer}, {value})"
+        if not self.lanes(node.index):
+            # One address for every active lane, as each C thread writes.
+            pointer = f"{pointer} + tl.zeros_like({self.mask}).to(tl.int32)"
         return f"{name}({pointer}, {value}, mask={self.mask})"
 
     def local(self, base: str, value: str, lines: list[str], indent: str) -> str:
@@ -329,6 +445,14 @@ class _Kernel(TritonPrinter):
                 case Let() | Assign():
                     value = self.expr(node.value)
                     varying = self.lanes(node.value)
+                    shape = _shape(self.atoms.get(node.var.name, frozenset()))
+                    if isinstance(node, Let) and not varying and shape is not None:
+                        # A uniform start of a local that takes per-lane
+                        # values later: branches and loops keep one type.
+                        if node.var.type is not None:
+                            value = f"tl.cast({value}, {_type(node.var.type)})"
+                        value = f"tl.broadcast_to({value}, {shape})"
+                        varying = True
                     if isinstance(node, Assign) and self.predicate is not None:
                         value = f"tl.where({self.predicate}, {value}, {node.var.name})"
                         varying = True
@@ -358,8 +482,9 @@ class _Kernel(TritonPrinter):
                         lines.append(f"{indent}else:")
                         lines.extend(self.branch(node.orelse, depth + 1))
                 case ForK():
+                    loop = "tl.static_range" if node.count <= _UNROLL else "tl.range"
                     lines.append(
-                        f"{indent}for {node.var.name} in tl.static_range({node.count}):"
+                        f"{indent}for {node.var.name} in {loop}({node.count}):"
                     )
                     lines.extend(self.branch(node.body, depth + 1))
                 case While(per_lane=True):

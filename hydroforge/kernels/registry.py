@@ -309,7 +309,9 @@ class BackendRegistry(HydroForgeModel):
 
     A value is a declaration or a zero-argument factory returning one; a
     factory defers imports a backend may lack.  Calling the registry inside a
-    managed step records or launches the kernel. ``backend_specs`` explicitly
+    managed step records or launches the kernel; inside a model's
+    ``initialize_model_state`` and ``@between_steps`` bodies it binds and
+    launches eagerly. ``backend_specs`` explicitly
     declares backend workspace bindings; model calls keep the shared interface.
     """
 
@@ -375,8 +377,8 @@ class BackendRegistry(HydroForgeModel):
                 )
         if sink is None:
             raise ValueError(
-                f"{self.name} may be called only while HydroForge records or "
-                "executes a validated model step"
+                f"{self.name} may be called only inside a managed model step, "
+                "initialize_model_state or a @between_steps method"
             )
         sink.call(self, arguments)
 

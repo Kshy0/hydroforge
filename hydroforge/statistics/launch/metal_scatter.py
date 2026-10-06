@@ -1,14 +1,27 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Destination-owned encoded scatter: stable CSR topology built once.
 
 Two float32 limbs cannot be independently atomically added. One lane owns
-each destination and reduces its incoming values in original source order.
-The cold CPU topology build is O(N log N), replay work is O(N + targets),
-and no per-sample CPU arithmetic or full source-by-target scan is needed.
+each destination and reduces its incoming values in original source order
+into a local sum, then writes the target (and a mean's count) once, so the
+program needs no zero pre-kernel.  The cold CPU topology build is
+O(N log N), replay work is O(N + targets), and no per-sample CPU arithmetic
+or full source-by-target scan is needed.  Unlike atomic scatters, the sums
+are deterministic; a target with many contributors is reduced by one lane.
 """
+
+from __future__ import annotations
+
+from collections.abc import Mapping
 
 import torch
 
-from hydroforge.core.expr import Reduction
+from hydroforge.core.expr import Reduction, ScatterSource
 from hydroforge.kernels.codegen.ir import (
     Assign,
     Binary,
@@ -36,16 +49,25 @@ from hydroforge.statistics.kernel_plan import (
     TARGET_SIZE,
     TOTAL,
     Count,
+    StatisticsCompileContext,
     StatisticsKernel,
     _gated,
     _member_offset,
     _Values,
 )
+from hydroforge.statistics.lowering import StatisticsLowering
 from hydroforge.statistics.phases import CONTROL_PHASE
 from hydroforge.statistics.storage import COUNT_DTYPE, StoragePlan
 
 
-def encoded_scatter(context, lowering, name, source):
+def encoded_scatter(
+    context: StatisticsCompileContext,
+    lowering: StatisticsLowering,
+    name: str,
+    source: ScatterSource,
+) -> tuple[StatisticsKernel, Mapping[str, torch.Tensor]]:
+    """The destination-owned add of one float64 scatter and its topology."""
+
     buffer = StoragePlan.scatter_buffer(name)
     count = (
         StoragePlan.scatter_count(name) if source.reduction is Reduction.MEAN else None
@@ -93,11 +115,12 @@ def encoded_scatter(context, lowering, name, source):
         Let(value, cast(values.expression(source.value), torch.float64))
     )
     cursor, end, first = (
-        Var(f"csr_{name}", torch.int64) for name in ("cursor", "end", "first")
+        Var(f"csr_{role}", torch.int64) for role in ("cursor", "end", "first")
     )
+    total = Var("csr_total", torch.float64)
     leaves = [key for key in lowering.ir.scatter_inputs(name) if key != source.index]
     params = (
-        Param(buffer, torch.float64, "read_write"),
+        Param(buffer, torch.float64, "write"),
         *((Param(count, COUNT_DTYPE, "write"),) if count is not None else ()),
     )
     params += (
@@ -120,20 +143,18 @@ def encoded_scatter(context, lowering, name, source):
             end,
             Load(offset_name, Binary("+", _SCATTER_TARGET, Const(1, _INDEX)), _INDEX),
         ),
+        Let(total, Const(0, torch.float64)),
         While(
             Compare("<", cursor, end),
             (
                 Let(_SCATTER_SOURCE, Load(order_name, cursor, _INDEX)),
                 *values.statements,
-                Store(
-                    buffer,
-                    LINEAR,
-                    Binary("+", Load(buffer, LINEAR, torch.float64), value),
-                ),
+                Assign(total, Binary("+", total, value)),
                 Assign(cursor, Binary("+", cursor, Const(1, _INDEX))),
             ),
             per_lane=True,
         ),
+        Store(buffer, LINEAR, total),
         *(
             (Store(count, LINEAR, cast(Binary("-", end, first), COUNT_DTYPE)),)
             if count is not None

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Single owner of one model's runtime state and external resources."""
 
 from __future__ import annotations
@@ -30,7 +36,9 @@ from hydroforge.execution.structure import (
     StructuralUpdateContext,
     StructuralUpdateResult,
 )
+from hydroforge.io.construction_input import check_options_fingerprint
 from hydroforge.io.manifest import write_model_manifest
+from hydroforge.kernels.calls import routing
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -69,7 +77,7 @@ class RuntimeClock:
         if schedule is None:
             return self.time
         if self.schedule_index == len(schedule):
-            return schedule._end
+            return schedule.end
         return schedule._step_at_trusted(self.schedule_index).start
 
 
@@ -288,6 +296,9 @@ class ModelRuntime:
 
         plan = self.plan
         owner = self.owner
+        check_options_fingerprint(
+            owner.input_proxy.attrs, plan.options, opened_modules=plan.modules
+        )
         if self.input is None:
             self.input = InputBinding(plan, owner.input_proxy, self.event_sink)
         self.partition = PartitionRuntime(plan, self.input)
@@ -331,10 +342,13 @@ class ModelRuntime:
             group=plan.spec.partition_group,
         )
         self._construct_modules(payloads)
+        self._check_field_values()
         for name in plan.modules:
             self.modules[name]._tensors._apply_modes()
         self.model_state_entered = True
-        owner.initialize_model_state()
+        # Registered kernels called by the hook bind like inside a step.
+        with routing(execution.kernel_binding):
+            owner.initialize_model_state()
         self.checkpoint = CheckpointRuntime(self)
         if plan.output.declaration is not None:
             from hydroforge.execution.outputs import bind_statistics
@@ -353,7 +367,7 @@ class ModelRuntime:
         plan = self.plan
         if plan.rank != 0:
             return
-        seen: set[int] = set()
+        seen: set[tuple[torch.device, int]] = set()
         modules: dict[str, float] = {}
         total = 0
         for name in plan.modules:
@@ -365,12 +379,16 @@ class ModelRuntime:
                     continue
                 value = getattr(module, field.name, None)
                 if (
-                    isinstance(value, torch.Tensor)
-                    and value.device.type == module.device.type
-                    and value.data_ptr() not in seen
+                    not isinstance(value, torch.Tensor)
+                    or value.device.type != module.device.type
                 ):
-                    seen.add(value.data_ptr())
-                    size += value.element_size() * value.nelement()
+                    continue
+                # Views share one storage; count each storage once in full.
+                storage = value.untyped_storage()
+                identity = (value.device, storage._cdata)
+                if identity not in seen:
+                    seen.add(identity)
+                    size += storage.nbytes()
             total += size
             modules[name] = size / (1024 * 1024)
         statistics = (
@@ -438,6 +456,22 @@ class ModelRuntime:
             {name: modules.get(name) for name in specs}
         )
         self.namespace = bind_namespace(self.plan.fields.names, modules)
+
+    def _check_field_values(self) -> None:
+        """Check declared ``finite`` and bounds of stored fields in one pass.
+
+        Runs on each rank's local values before tensor modes discard any
+        construction-only field.
+        """
+
+        problems: list[str] = []
+        for name in self.plan.module_order:
+            problems.extend(self.modules[name]._tensors.constraint_violations())
+        if problems:
+            raise ValueError(
+                "model input violates declared field constraints:\n  - "
+                + "\n  - ".join(problems)
+            )
 
     def _commit(self, initialization_error: BaseException | None) -> None:
         """Commit materialization only after every rank reports success."""
@@ -561,6 +595,11 @@ class ModelRuntime:
         """Run the ordered module structure pass and commit one staged update."""
 
         self.require_healthy(f"{type(self.owner).__name__}.update_structure")
+        return self.run_structure_hooks()
+
+    def run_structure_hooks(self) -> StructuralUpdateResult | None:
+        """Run the structure pass of a runtime already proven healthy."""
+
         if not self.structure_hooks:
             return None
         context = StructuralUpdateContext(self)

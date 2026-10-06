@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Immutable public declarations for scheduled parameter changes."""
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from pydantic import (
     model_validator,
 )
 
+from hydroforge.core.arrays import TORCH_INTEGER_DTYPES
 from hydroforge.core.naming import DottedPath
 from hydroforge.core.time import date_calendar, require_date
 from hydroforge.core.validation import HydroForgeModel
@@ -69,15 +76,7 @@ def validate_parameter_scalar(
                 f"parameter {variable_name!r} update underflows {dtype} storage"
             )
         return value
-    if dtype in {
-        torch.int8,
-        torch.uint8,
-        torch.int16,
-        torch.uint16,
-        torch.int32,
-        torch.uint32,
-        torch.int64,
-    }:
+    if dtype in TORCH_INTEGER_DTYPES:
         if type(value) is not int:
             raise ValueError(
                 f"integer parameter {variable_name!r} update must be an "
@@ -181,15 +180,7 @@ class ParameterChange(HydroForgeModel):
                 )
             if target_ids.ndim != 1:
                 raise ValueError("parameter target_ids must be one-dimensional")
-            if target_ids.dtype not in {
-                torch.int8,
-                torch.uint8,
-                torch.int16,
-                torch.uint16,
-                torch.int32,
-                torch.uint32,
-                torch.int64,
-            }:
+            if target_ids.dtype not in TORCH_INTEGER_DTYPES:
                 raise ValueError("parameter target_ids must contain integers")
             if target_ids.numel() == 0:
                 raise ValueError("parameter target_ids must not be empty")

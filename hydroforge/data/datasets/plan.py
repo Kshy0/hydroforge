@@ -1,10 +1,19 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Immutable temporal plans compiled once for one forcing dataset."""
 
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Literal, Self, cast
+
+import numpy as np
 
 from hydroforge.contracts.schedule import SimulationSchedule, SpinupSchedule
 from hydroforge.core.time import (
@@ -16,12 +25,65 @@ from hydroforge.core.time import (
 
 UpsamplingMethod = Literal["repeat", "distribute"]
 
+# The standard (mixed Julian/Gregorian) and proleptic Gregorian calendars label
+# every instant from the 1582-10-15 reform onwards identically.
+_GREGORIAN_CALENDARS = frozenset({"standard", "proleptic_gregorian"})
+_GREGORIAN_REFORM = (1582, 10, 15)
+
+
+def _components(value: DateLike) -> tuple[int, ...]:
+    return (
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+        value.microsecond,
+    )
+
+
+def _domain_dates(domain: TemporalDomain) -> tuple[DateLike, ...]:
+    if domain.spinup is None:
+        return (domain.start,)
+    return (domain.start, domain.spinup.source_start, domain.spinup.source_end)
+
+
+def _same_temporal_contract(mine: TemporalDomain, theirs: TemporalDomain) -> bool:
+    """Whether two domains read the same instants on the same cadence."""
+
+    if (mine.interval, mine.count, mine.spinup_count) != (
+        theirs.interval,
+        theirs.count,
+        theirs.spinup_count,
+    ):
+        return False
+    if mine.calendar == theirs.calendar:
+        return type(theirs.start) is type(mine.start) and (
+            mine.start == theirs.start and mine.spinup == theirs.spinup
+        )
+    if {mine.calendar, theirs.calendar} != _GREGORIAN_CALENDARS:
+        return False
+    if (mine.spinup is None) != (theirs.spinup is None):
+        return False
+    if mine.spinup is not None and mine.spinup.cycles != theirs.spinup.cycles:
+        return False
+    left, right = _domain_dates(mine), _domain_dates(theirs)
+    return all(
+        _components(a) == _components(b) and _components(a)[:3] >= _GREGORIAN_REFORM
+        for a, b in zip(left, right, strict=True)
+    )
+
 
 def plan_index(index: int, length: int, *, label: str) -> int:
-    """Resolve one exact, possibly negative sequence index."""
+    """Resolve one integer (``__index__``), possibly negative, sequence index.
 
-    if type(index) is not int:
+    Booleans are rejected; NumPy integers from custom samplers are accepted.
+    """
+
+    if isinstance(index, (bool, np.bool_)) or not hasattr(type(index), "__index__"):
         raise TypeError(f"{label} index must be an int; got {type(index).__name__}")
+    index = operator.index(index)
     resolved = index + length if index < 0 else index
     if not 0 <= resolved < length:
         raise IndexError(
@@ -302,10 +364,7 @@ class DatasetPlan:
         """Reject a plan that reads different samples or chunks on another cadence."""
 
         mine, theirs = self.domain, other.domain
-        if type(theirs.start) is not type(mine.start) or any(
-            getattr(theirs, name) != getattr(mine, name)
-            for name in ("calendar", "start", "interval", "count", "spinup")
-        ):
+        if not _same_temporal_contract(mine, theirs):
             raise ValueError(f"{label} has a different temporal contract")
         if other.schedule.cadence != self.schedule.cadence:
             raise ValueError(f"{label} has a different model cadence")

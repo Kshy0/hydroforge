@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Runtime compilation and launch of CUDA/HIP device code.
 
 NVRTC (hiprtc under ROCm) compiles device-only sources in process, so no host
@@ -15,13 +21,14 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import logging
 import math
 import re
 import sys
 import threading
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from functools import cache, partial
+from functools import cache, lru_cache, partial
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +88,7 @@ using cuda::std::uint32_t; using cuda::std::uint64_t;
 #endif
 """
 
+_logger = logging.getLogger(__name__)
 _CACHE_VERSION = 2
 _INCLUDES = re.compile(
     r"(?:#|%:)\s*(?:/\*.*?\*/\s*)*(?:include(?:_next)?|import|embed)\b([^\n]*)",
@@ -176,15 +184,13 @@ class _Toolkit:
             self.driver_version = version.value
 
     def _bind_rtc(self, symbol: str, *argtypes: Any, alias: str | None = None) -> None:
-        function = getattr(self.rtc, f"{self._rtc_prefix}{symbol}")
-        function.argtypes, function.restype = argtypes, ctypes.c_int
+        function = _bind(self.rtc, f"{self._rtc_prefix}{symbol}", *argtypes)
         setattr(self, alias or symbol, function)
 
     def _bind_driver(
         self, symbol: str, *argtypes: Any, alias: str | None = None
     ) -> None:
-        function = getattr(self.driver, f"{self._driver_prefix}{symbol}")
-        function.argtypes, function.restype = argtypes, ctypes.c_int
+        function = _bind(self.driver, f"{self._driver_prefix}{symbol}", *argtypes)
         setattr(self, alias or symbol, function)
 
     def check_rtc(self, result: int) -> None:
@@ -205,6 +211,13 @@ class _Toolkit:
         raise RuntimeError(
             f"{action} failed: {message.decode() if message else f'error {result}'}"
         )
+
+
+def _bind(library: ctypes.CDLL, symbol: str, *argtypes: Any) -> Any:
+    """One entry point of ``library`` returning a status code."""
+    function = getattr(library, symbol)
+    function.argtypes, function.restype = argtypes, ctypes.c_int
+    return function
 
 
 def _load_first(names: Sequence[str]) -> ctypes.CDLL:
@@ -266,8 +279,11 @@ class RtcRequest:
 
 @dataclass(frozen=True, slots=True)
 class _Binary:
+    """A compiled image, its lowered kernel names and its cache key."""
+
     image: bytes
     lowered: dict[str, str]
+    key: str
 
 
 def _target(device: int) -> tuple[str, bool]:
@@ -290,17 +306,17 @@ def _target(device: int) -> tuple[str, bool]:
 def _supported_architectures() -> frozenset[int]:
     kit = toolkit()
     count = ctypes.c_int()
-    number = getattr(kit.rtc, "nvrtcGetNumSupportedArchs")
-    number.argtypes, number.restype = (ctypes.POINTER(ctypes.c_int),), ctypes.c_int
+    number = _bind(kit.rtc, "nvrtcGetNumSupportedArchs", ctypes.POINTER(ctypes.c_int))
     kit.check_rtc(number(ctypes.byref(count)))
     values = (ctypes.c_int * count.value)()
-    listing = getattr(kit.rtc, "nvrtcGetSupportedArchs")
-    listing.argtypes, listing.restype = (ctypes.POINTER(ctypes.c_int),), ctypes.c_int
+    listing = _bind(kit.rtc, "nvrtcGetSupportedArchs", ctypes.POINTER(ctypes.c_int))
     kit.check_rtc(listing(values))
     return frozenset(values)
 
 
+@lru_cache(maxsize=1024)
 def _key(request: RtcRequest, target: str) -> str:
+    """Cache identity, memoized: hashing a large source is not repeated."""
     kit = toolkit()
     identity = {
         "version": _CACHE_VERSION,
@@ -322,7 +338,9 @@ def _cache_root() -> Path:
     return Path(_get_build_directory("hydroforge_rtc", verbose=False))
 
 
-def _compile(request: RtcRequest, target: str, device_binary: bool) -> _Binary:
+def _compile(
+    request: RtcRequest, target: str, device_binary: bool, key: str
+) -> _Binary:
     kit = toolkit()
     program = ctypes.c_void_p()
     source = RTC_PRELUDE + request.program.source
@@ -366,7 +384,7 @@ def _compile(request: RtcRequest, target: str, device_binary: bool) -> _Binary:
                 kit.GetLoweredName(program, kernel.encode(), ctypes.byref(name))
             )
             lowered[kernel] = name.value.decode()
-        return _Binary(image.raw, lowered)
+        return _Binary(image.raw, lowered, key)
 
 
 def _program_log(program: ctypes.c_void_p) -> str:
@@ -382,12 +400,14 @@ def _program_log(program: ctypes.c_void_p) -> str:
 
 
 # hiprtc spells the numerical controls as Clang flags; ptxas has no AMD analog.
+# NVRTC fast math never assumes finite values, so Clang keeps honoring NaN and
+# infinity: under ``-ffinite-math-only`` it folds ``isnan`` checks to false.
 _HIP_OPTIONS = {
-    "--use_fast_math": "-ffast-math",
-    "--ftz=false": "-fno-gpu-flush-denormals-to-zero",
-    "--ftz=true": "-fgpu-flush-denormals-to-zero",
-    "--fmad=false": "-ffp-contract=off",
-    "--fmad=true": "-ffp-contract=fast",
+    "--use_fast_math": ("-ffast-math", "-fno-finite-math-only"),
+    "--ftz=false": ("-fno-gpu-flush-denormals-to-zero",),
+    "--ftz=true": ("-fgpu-flush-denormals-to-zero",),
+    "--fmad=false": ("-ffp-contract=off",),
+    "--fmad=true": ("-ffp-contract=fast",),
 }
 
 
@@ -396,9 +416,10 @@ def _options(program: RtcProgram, target: str) -> tuple[str, ...]:
     if toolkit().hip:
         arch = f"--offload-arch={target}"
         options = tuple(
-            _HIP_OPTIONS.get(option, option)
+            flag
             for option in program.options
             if not option.startswith("--ptxas-options")
+            for flag in _HIP_OPTIONS.get(option, (option,))
         )
     else:
         arch, options = f"--gpu-architecture={target}", program.options
@@ -406,13 +427,19 @@ def _options(program: RtcProgram, target: str) -> tuple[str, ...]:
 
 
 @cache
+def _toolkit_include_roots() -> tuple[Path, ...]:
+    """The CUDA toolkit's include directories, as PyTorch locates them."""
+    from torch.utils.cpp_extension import include_paths
+
+    return tuple(dict.fromkeys(Path(path) for path in include_paths("cuda")))
+
+
+@cache
 def _include_options() -> tuple[str, ...]:
     """Expose libcu++ and the CUDA headers shipped with the toolkit."""
     if toolkit().hip:
         return ()
-    from torch.utils.cpp_extension import include_paths
-
-    roots = [Path(path) for path in include_paths("cuda")]
+    roots = _toolkit_include_roots()
     candidates = [*roots, *(root / "cccl" for root in roots)]
     return tuple(
         f"-I{path}" for path in dict.fromkeys(candidates) if (path / "cuda").is_dir()
@@ -428,11 +455,9 @@ def toolkit_include_options() -> tuple[str, ...]:
     """
     if toolkit().hip:
         return ()
-    from torch.utils.cpp_extension import include_paths
-
     return tuple(
         f"-I{path}"
-        for path in dict.fromkeys(Path(p) for p in include_paths("cuda"))
+        for path in _toolkit_include_roots()
         if (path / "cuda_device_runtime_api.h").is_file()
     )
 
@@ -486,7 +511,11 @@ def compile_request(request: RtcRequest, device: int) -> _Binary:
     if cached is not None:
         return cached
     persistent = _persistent(request.program)
-    directory = _cache_root() / key[:2]
+    try:
+        directory = _cache_root() / key[:2]
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        return _compile_unshared(request, target, device_binary, key, error)
     image_path = directory / f"{key}.bin"
     names_path = directory / f"{key}.json"
 
@@ -501,13 +530,15 @@ def compile_request(request: RtcRequest, device: int) -> _Binary:
             or not (image_path.is_file() and names_path.is_file())
         ):
             return None
-        return _Binary(image_path.read_bytes(), json.loads(names_path.read_text()))
+        return _Binary(image_path.read_bytes(), json.loads(names_path.read_text()), key)
 
     binary = load()
     if binary is None:
-        directory.mkdir(parents=True, exist_ok=True)
         lock = directory / f"{key}.lock"
-        token, binary = acquire_compile_lock(lock, cache_probe=load)
+        try:
+            token, binary = acquire_compile_lock(lock, cache_probe=load)
+        except OSError as error:
+            return _compile_unshared(request, target, device_binary, key, error)
         if binary is None:
             with cleanup_on_exit(
                 f"{request.program.name} compile lock",
@@ -518,13 +549,40 @@ def compile_request(request: RtcRequest, device: int) -> _Binary:
                 # including programs that deliberately have no disk artifact.
                 binary = load()
                 if binary is None:
-                    binary = _compile(request, target, device_binary)
+                    binary = _compile(request, target, device_binary, key)
                     if persistent:
-                        with atomic_output_path(image_path) as temporary:
-                            temporary.write_bytes(binary.image)
-                        atomic_write_text(names_path, json.dumps(binary.lowered))
+                        try:
+                            with atomic_output_path(image_path) as temporary:
+                                temporary.write_bytes(binary.image)
+                            atomic_write_text(names_path, json.dumps(binary.lowered))
+                        except OSError as error:
+                            _logger.warning(
+                                "%s: runtime compile cache write failed (%s); "
+                                "the binary stays in memory",
+                                request.program.name,
+                                error,
+                            )
                 with _memory_lock:
                     return _memory.setdefault(key, binary)
+    with _memory_lock:
+        return _memory.setdefault(key, binary)
+
+
+def _compile_unshared(
+    request: RtcRequest,
+    target: str,
+    device_binary: bool,
+    key: str,
+    error: OSError,
+) -> _Binary:
+    """Compile into the memory cache when the disk cache is unusable."""
+
+    _logger.warning(
+        "%s: runtime compile cache unavailable (%s); compiling in memory only",
+        request.program.name,
+        error,
+    )
+    binary = _compile(request, target, device_binary, key)
     with _memory_lock:
         return _memory.setdefault(key, binary)
 
@@ -589,15 +647,11 @@ def int32(value: int) -> KernelArgument:
 
 
 def uint32(value: int) -> KernelArgument:
-    if type(value) is not int or not 0 <= value < 2**32:
-        raise ValueError(f"uint32 kernel argument out of range: {value}")
-    return KernelArgument(ctypes.c_uint32, value)
+    return KernelArgument(ctypes.c_uint32, _checked_uint(value, 32))
 
 
 def uint64(value: int) -> KernelArgument:
-    if type(value) is not int or not 0 <= value < 2**64:
-        raise ValueError(f"uint64 kernel argument out of range: {value}")
-    return KernelArgument(ctypes.c_uint64, value)
+    return KernelArgument(ctypes.c_uint64, _checked_uint(value, 64))
 
 
 def int64(value: int) -> KernelArgument:
@@ -647,6 +701,14 @@ def _checked_int(value: int, bits: int) -> int:
     return value
 
 
+def _checked_uint(value: int, bits: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"integer kernel argument required, got {value!r}")
+    if not 0 <= value < 2**bits:
+        raise ValueError(f"uint{bits} kernel argument out of range: {value}")
+    return value
+
+
 _SCALAR_ARGUMENTS = {
     torch.float32: float32,
     torch.float64: float64,
@@ -672,16 +734,15 @@ def _dim3(value: int | Sequence[int], what: str) -> tuple[int, int, int]:
         raise ValueError(f"CUDA {what} must be 1-3 positive ints, got {value!r}")
     if what == "grid" and (values[0] >= 2**31 or any(v > 65535 for v in values[1:])):
         raise ValueError(f"CUDA grid exceeds device limits: {values}")
-    if what == "block" and prod_int(values) > 1024:
-        raise ValueError(f"CUDA block exceeds 1024 threads: {values}")
+    if what == "block" and (
+        math.prod(values) > 1024
+        or any(v > limit for v, limit in zip(values, (1024, 1024, 64)))
+    ):
+        raise ValueError(
+            f"CUDA block exceeds 1024 threads or the (1024, 1024, 64) "
+            f"dimension limits: {values}"
+        )
     return (*values, *(1,) * (3 - len(values)))
-
-
-def prod_int(values: Iterable[int]) -> int:
-    result = 1
-    for value in values:
-        result *= value
-    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -724,7 +785,7 @@ _shared_memory: dict[int, int] = {}
 def _function(binary: _Binary, kernel: str, device: int) -> ctypes.c_void_p:
     kit = toolkit()
     lowered = binary.lowered[kernel]
-    module_key = (hashlib.sha256(binary.image).hexdigest(), device)
+    module_key = (binary.key, device)
     with _memory_lock:
         lock = _module_locks.setdefault(module_key, threading.Lock())
     with lock:
@@ -761,10 +822,9 @@ def _compiled_parameters(
 
     kit = toolkit()
     if kit.hip:
-        digest = hashlib.sha256(binary.image).hexdigest()
-        tables = _amdgpu_tables.get(digest)
+        tables = _amdgpu_tables.get(binary.key)
         if tables is None:
-            tables = _amdgpu_tables[digest] = amdgpu.kernel_parameters(binary.image)
+            tables = _amdgpu_tables[binary.key] = amdgpu.kernel_parameters(binary.image)
         return tables.get(binary.lowered[kernel])
     if kit.param_info is None:
         return None
@@ -1052,9 +1112,7 @@ class _GraphDriver:
             ("destroy_exec", "cuGraphExecDestroy", (p,)),
             ("destroy", "cuGraphDestroy", (p,)),
         ):
-            function = getattr(kit.driver, symbol)
-            function.argtypes, function.restype = argtypes, ctypes.c_int
-            setattr(self, name, function)
+            setattr(self, name, _bind(kit.driver, symbol, *argtypes))
         self.check = kit.check_driver
 
 

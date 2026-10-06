@@ -11,11 +11,95 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
+_SUPPORTED_COMMUNICATION_BACKENDS = frozenset({"gloo", "nccl", "xccl"})
+# PyTorch's default collective backend of each device type; an ``undefined``
+# default group creates these lazily for the devices it meets.
+_DEFAULT_DEVICE_BACKENDS = {"cpu": "gloo", "cuda": "nccl", "xpu": "xccl"}
+_ACCELERATOR_PREFERENCE = ("cuda", "xpu")
 
-def communication_backend(value: object) -> str:
-    """Decode the supported PyTorch communication enum/string spellings."""
-    name = str(value).lower().removeprefix("backend.")
-    if name not in {"gloo", "nccl", "xccl"}:
+
+def _available_accelerators() -> tuple[str, ...]:
+    import torch
+
+    return tuple(
+        kind
+        for kind in _ACCELERATOR_PREFERENCE
+        if getattr(torch, kind, None) is not None
+        and getattr(torch, kind).is_available()
+    )
+
+
+def _device_backend_entries(text: str, value: object) -> dict[str, str]:
+    entries: dict[str, str] = {}
+    for item in text.split(","):
+        kind, separator, name = item.partition(":")
+        kind, name = kind.strip(), name.strip()
+        if not separator or not kind or not name or kind in entries:
+            raise ValueError(f"malformed communication backend {value!r}")
+        entries[kind] = name
+    return entries
+
+
+def _select_device_backend(
+    entries: Mapping[str, str], device_type: str | None, value: object
+) -> str:
+    if device_type is not None:
+        kind = str(device_type).lower()
+        if kind not in entries and kind == "mps":
+            # MPS collectives are staged through CPU tensors.
+            kind = "cpu"
+        if kind not in entries:
+            raise ValueError(
+                f"communication backend {value!r} has no entry for device type "
+                f"{device_type!r}"
+            )
+        return entries[kind]
+    accelerators = [kind for kind in entries if kind != "cpu"]
+    if len(accelerators) == 1:
+        return entries[accelerators[0]]
+    for kind in _ACCELERATOR_PREFERENCE:
+        if kind in entries:
+            return entries[kind]
+    if accelerators:
+        raise ValueError(
+            f"communication backend {value!r} names several accelerator "
+            "backends; pass the device type"
+        )
+    return entries["cpu"]
+
+
+def communication_backend(value: object, device_type: str | None = None) -> str:
+    """Decode the supported PyTorch communication backend spellings.
+
+    ``value`` is a backend name or enum (``"nccl"``, ``Backend.NCCL``), a
+    per-device list (``"cpu:gloo,cuda:nccl"``), or ``"undefined"`` (a default
+    group created without a backend, whose per-device backends PyTorch
+    creates lazily with the defaults ``cpu:gloo,cuda:nccl,xpu:xccl``).
+    For a list, ``device_type`` selects its entry (MPS falls back to the CPU
+    entry). Without ``device_type`` the sole accelerator entry is chosen,
+    otherwise CUDA, then XPU, then the CPU entry; ``"undefined"`` then only
+    considers the accelerators available in this runtime. A plain name is
+    returned unchanged whatever ``device_type`` is.
+    """
+    text = str(value).strip().lower().removeprefix("backend.")
+    if text == "undefined":
+        kinds = (
+            tuple(_DEFAULT_DEVICE_BACKENDS)
+            if device_type is not None
+            else ("cpu", *_available_accelerators())
+        )
+        name = _select_device_backend(
+            {kind: _DEFAULT_DEVICE_BACKENDS[kind] for kind in kinds},
+            device_type,
+            value,
+        )
+    elif ":" in text:
+        name = _select_device_backend(
+            _device_backend_entries(text, value), device_type, value
+        )
+    else:
+        name = text
+    if name not in _SUPPORTED_COMMUNICATION_BACKENDS:
         raise ValueError(f"unsupported communication backend {value!r}")
     return name
 
@@ -34,6 +118,14 @@ LOCAL_PROCESS_COUNT_ENV = (
     "MV2_COMM_WORLD_LOCAL_SIZE",
 )
 
+# Global task counts of launchers that do not export ``WORLD_SIZE``.
+SCHEDULER_TASK_COUNT_ENV = (
+    "SLURM_STEP_NUM_TASKS",
+    "OMPI_COMM_WORLD_SIZE",
+    "PMI_SIZE",
+    "MV2_COMM_WORLD_SIZE",
+)
+
 
 def require_launcher_environment(environment: Mapping[str, str]) -> None:
     """Native env:// must not consume a different launcher observation."""
@@ -48,6 +140,7 @@ def require_launcher_environment(environment: Mapping[str, str]) -> None:
         "ZE_AFFINITY_MASK",
         *LOCAL_PROCESS_RANK_ENV,
         *LOCAL_PROCESS_COUNT_ENV,
+        *SCHEDULER_TASK_COUNT_ENV,
     )
     if any(os.environ.get(name) != environment.get(name) for name in names):
         raise RuntimeError("launcher environment changed during distributed setup")
@@ -129,6 +222,18 @@ def _world_size_environment(
         raise ValueError(
             f"WORLD_SIZE must be a positive integer, got {raw_world_size!r}"
         )
+    if raw_world_size is None:
+        # A scheduler that started several tasks without the env:// variables
+        # would otherwise run every task as an independent single process.
+        for name in SCHEDULER_TASK_COUNT_ENV:
+            tasks = _environment_index(name, minimum=1, environment=environment)
+            if tasks is not None and tasks > 1:
+                raise ValueError(
+                    f"{name}={tasks} reports a multi-process launch, but "
+                    "WORLD_SIZE is not set; export WORLD_SIZE, RANK, "
+                    "MASTER_ADDR and MASTER_PORT for every task or launch "
+                    "with torchrun"
+                )
     return raw_world_size, ws_env
 
 

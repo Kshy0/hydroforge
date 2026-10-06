@@ -1,10 +1,16 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Transactional execution boundaries for public model-authored APIs."""
 
 from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 from typing import Any, TypeVar, cast
 
@@ -20,6 +26,7 @@ from hydroforge.execution.context import (
     validate_synchronous_function,
 )
 from hydroforge.execution.session import ModelRuntime
+from hydroforge.kernels.calls import routing
 
 _F = TypeVar("_F", bound=Callable[..., Any])
 
@@ -148,8 +155,15 @@ def between_steps(function: _F) -> _F:
 
         result: Any = None
         body_error: BaseException | None = None
+        # Registered kernels called by the body bind like inside a step.
+        execution = runtime.execution
         try:
-            result = function(self, *args, **kwargs)
+            with (
+                nullcontext()
+                if execution is None
+                else routing(execution.kernel_binding)
+            ):
+                result = function(self, *args, **kwargs)
         except BaseException as error:
             body_error = error
 

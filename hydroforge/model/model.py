@@ -4,6 +4,8 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
+"""The public ``AbstractModel``: declaration, compilation and runtime ownership."""
+
 from __future__ import annotations
 
 from abc import ABC

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """CUDA graph captures and device-side conditional loops."""
 
 from __future__ import annotations
@@ -5,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from functools import cached_property, partial
 from itertools import groupby
-from typing import Any
+from typing import Any, NoReturn
 
 import torch
 from torch.utils._python_dispatch import _disable_current_modes
@@ -91,13 +97,10 @@ class CudaGraphExecutor(LoopExecutor):
         """The loop control programs not yet requested; statistics folding
         adds the sample control program."""
 
-        index = self.device.index
-        if index is None:
-            index = torch.cuda.current_device()
         requests = tuple(
             request
             for request in control_requests(
-                index, sample_phase_expr if statistics else None
+                self.device.index, sample_phase_expr if statistics else None
             )
             if request.key not in self._requested
         )
@@ -166,26 +169,14 @@ class CudaGraphExecutor(LoopExecutor):
                 current.wait_stream(side)
                 self._restore(state, snapshot)
             except BaseException as primary:
-                failures: list[BaseException] = [primary]
-                try:
-                    side.synchronize()
-                except BaseException as cleanup_error:
-                    failures.append(cleanup_error)
-                try:
-                    self._restore(state, snapshot)
-                except BaseException as cleanup_error:
-                    failures.append(cleanup_error)
-                if graph is not None:
-                    try:
-                        self._finalizer(graph)()
-                    except BaseException as cleanup_error:
-                        failures.append(cleanup_error)
-                if len(failures) > 1:
-                    error = ResourceCleanupError(
-                        "CUDA graph capture transaction", failures
-                    )
-                    raise error from primary
-                raise
+                self._abort_capture(
+                    primary,
+                    "CUDA graph capture transaction",
+                    side,
+                    state,
+                    snapshot,
+                    None if graph is None else self._finalizer(graph),
+                )
             return self.register(graph)
 
     def conditional_graph(
@@ -211,15 +202,14 @@ class CudaGraphExecutor(LoopExecutor):
         reset: Callable[[], None],
         state: tuple[torch.Tensor, ...],
     ) -> ConditionalWhileGraph:
-        device = self.device
         graph = ConditionalWhileGraph()
-        device_index = (
-            torch.cuda.current_device() if device.index is None else device.index
-        )
-        current = torch.cuda.current_stream(device)
+        device_index = self.device.index
+        pool = self.graph_pool
+        current = torch.cuda.current_stream(self.device)
         side = self.capture_stream
         side.wait_stream(current)
         snapshot: list[torch.Tensor] | None = None
+        pooled = False
         try:
             with torch.cuda.stream(side):
                 stream = side.cuda_stream
@@ -232,7 +222,11 @@ class CudaGraphExecutor(LoopExecutor):
                 # Enqueue rollback on the side stream before recording operations.
                 self._restore(state, snapshot)
                 reset()
-                torch._C._cuda_beginAllocateToPool(device_index, self.graph_pool)
+                # Route only this thread's allocations to the pool, as
+                # ``torch.cuda.use_mem_pool`` does. The routing reference is
+                # retained by the graph and released after it is destroyed.
+                torch._C._cuda_beginAllocateCurrentThreadToPool(device_index, pool)
+                pooled = True
                 try:
                     graph.begin_capture(stream)
                     try:
@@ -250,37 +244,68 @@ class CudaGraphExecutor(LoopExecutor):
                     else:
                         graph.end_capture(stream)
                 finally:
-                    torch._C._cuda_endAllocateToPool(device_index, self.graph_pool)
+                    torch._C._cuda_endAllocateToPool(device_index, pool)
                 graph.instantiate()
             current.wait_stream(side)
             self._restore(state, snapshot)
         except BaseException as primary:
-            failures: list[BaseException] = [primary]
-            # The body and warmups run on ``side``.  Exiting the stream context
-            # does not wait for queued work, so restoring tensors or destroying
-            # the graph immediately can race an in-flight failed capture.
-            # Synchronization is cold-path cleanup only.
-            try:
-                side.synchronize()
-            except BaseException as cleanup_error:
-                failures.append(cleanup_error)
-            if snapshot is not None:
-                try:
-                    self._restore(state, snapshot)
-                except BaseException as cleanup_error:
-                    failures.append(cleanup_error)
-            try:
-                graph.destroy()
-            except BaseException as cleanup_error:
-                failures.append(cleanup_error)
-            if len(failures) > 1:
-                error = ResourceCleanupError(
-                    "conditional CUDA graph transaction", failures
-                )
-                raise error from primary
-            raise
-        self.register(graph)
+            self._abort_capture(
+                primary,
+                "conditional CUDA graph transaction",
+                side,
+                state,
+                snapshot,
+                partial(self._destroy_pooled, graph, device_index, pool, pooled),
+            )
+        self.register(
+            graph,
+            finalizer=partial(self._destroy_pooled, graph, device_index, pool, True),
+        )
         return graph
+
+    @staticmethod
+    def _destroy_pooled(
+        graph: ConditionalWhileGraph, device_index: int, pool: Any, pooled: bool
+    ) -> None:
+        """Destroy a conditional graph, then drop its private-pool reference."""
+
+        try:
+            graph.destroy()
+        finally:
+            if pooled:
+                torch._C._cuda_releasePool(device_index, pool)
+
+    def _abort_capture(
+        self,
+        primary: BaseException,
+        scope: str,
+        side: torch.cuda.Stream,
+        state: tuple[torch.Tensor, ...],
+        snapshot: list[torch.Tensor] | None,
+        destroy: Callable[[], None] | None,
+    ) -> NoReturn:
+        """Roll back a failed capture transaction and raise its failure.
+
+        The body and warmups run on ``side``.  Exiting the stream context does
+        not wait for queued work, so restoring tensors or destroying the graph
+        immediately can race an in-flight failed capture.  Synchronization is
+        cold-path cleanup only.
+        """
+
+        failures: list[BaseException] = [primary]
+        cleanups = [side.synchronize]
+        if snapshot is not None:
+            cleanups.append(partial(self._restore, state, snapshot))
+        if destroy is not None:
+            cleanups.append(destroy)
+        for cleanup in cleanups:
+            try:
+                cleanup()
+            except BaseException as cleanup_error:
+                failures.append(cleanup_error)
+        if len(failures) > 1:
+            raise ResourceCleanupError(scope, failures) from primary
+        raise primary
 
     def fixed_end(self, loop: Any) -> None:
         """Advance a fixed loop's counter."""

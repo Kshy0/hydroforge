@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Immutable simulation call schedules with optional forcing spin-up."""
 
 from __future__ import annotations
@@ -180,6 +186,11 @@ class SimulationSchedule(HydroForgeModel):
         regular = all(present)
         if regular and self.explicit_steps:
             raise ValueError("schedule cannot be both regular and explicit")
+        if not regular and self.source_interval is not None:
+            raise ValueError(
+                "source_interval applies only to regular schedules; explicit "
+                "steps declare their own source intervals"
+            )
         if self.spinup is not None and not regular:
             raise ValueError("spinup is currently supported only by regular schedules")
         if regular:
@@ -250,7 +261,9 @@ class SimulationSchedule(HydroForgeModel):
             raise ValueError("schedule must contain model intervals")
         normalized_steps = []
         for index, step in enumerate(self.explicit_steps):
-            normalized_step = SimulationStep(
+            # Each step was validated on construction; joint normalization
+            # only changes the date representation, never the ordering.
+            normalized_step = SimulationStep._from_schedule_trusted(
                 index=step.index,
                 start=cast(
                     DateLike,
@@ -363,18 +376,28 @@ class SimulationSchedule(HydroForgeModel):
         return self._compiled_reuse_count
 
     @property
-    def _start(self) -> DateLike:
+    def start(self) -> DateLike:
         """Start of the main simulation period."""
         if self._is_regular:
             return cast(DateLike, self.regular_start)
         return self.explicit_steps[0].start
 
     @property
-    def _end(self) -> DateLike:
+    def end(self) -> DateLike:
         """End of the main simulation period and complete execution."""
         if self._is_regular:
             return cast(DateLike, self.regular_end)
         return self.explicit_steps[-1].end
+
+    @property
+    def _start(self) -> DateLike:
+        """Private alias of :attr:`start` kept for existing callers."""
+        return self.start
+
+    @property
+    def _end(self) -> DateLike:
+        """Private alias of :attr:`end` kept for existing callers."""
+        return self.end
 
     @property
     def _num_spinup_steps(self) -> int:
@@ -423,9 +446,9 @@ class SimulationSchedule(HydroForgeModel):
                 reuse_count=reuse_count,
             )
         main_model_index = index - spinup_steps
-        start = self._start + cadence * main_model_index
+        start = self.start + cadence * main_model_index
         source_index, reuse_index = divmod(main_model_index, reuse_count)
-        source_start = self._start + source_interval * source_index
+        source_start = self.start + source_interval * source_index
         return SimulationStep._from_schedule_trusted(
             index=index,
             start=start,
@@ -438,9 +461,14 @@ class SimulationSchedule(HydroForgeModel):
         )
 
     def _main_index_at(self, start: DateLike) -> int:
+        """Private alias of :meth:`main_index_at` kept for existing callers."""
+        return self.main_index_at(start)
+
+    def main_index_at(self, start: DateLike) -> int:
+        """Return the main-step index that starts exactly at ``start``."""
         require_date(start, label="model current_time")
         require_calendar(start, self.calendar, label="model current_time")
-        if type(start) is not type(self._start):
+        if type(start) is not type(self.start):
             raise TypeError(
                 "model current_time and schedule must use the same datetime "
                 "representation"
@@ -460,7 +488,7 @@ class SimulationSchedule(HydroForgeModel):
             ):
                 return lower
             raise KeyError(start)
-        regular_start = self._start
+        regular_start = self.start
         regular_step = cast(timedelta, self.regular_step)
         offset = timedelta_microseconds(start - regular_start)
         cadence = timedelta_microseconds(regular_step)
@@ -493,7 +521,7 @@ class SimulationSchedule(HydroForgeModel):
         fields = (
             ("Schedule type", schedule_type),
             ("Calendar", self.calendar),
-            ("Main period", f"[{self._start}, {self._end})"),
+            ("Main period", f"[{self.start}, {self.end})"),
             ("Model cadence", cadence),
             ("Source interval", source_interval),
             ("Source reuse", source_reuse),

@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, Any, Self, cast
 
 import numpy as np
@@ -171,6 +172,7 @@ def _decode_netcdf_input_array(variable: Any, value: Any, *, name: str) -> np.nd
 
 
 _INPUT_FILE_LABEL = "NetCDF input file"
+_FILES_LOCK = Lock()
 _InputName = Annotated[str, Field(min_length=1)]
 _InputExtent = Annotated[int, Field(ge=0)]
 _InputPath = Annotated[Path, Field(strict=False)]
@@ -619,10 +621,13 @@ class InputProxy(HydroForgeModel):
 
     Public construction copies every caller value once; ``from_nc`` and the
     functional updates own their values without a second copy, and derived
-    proxies share every unchanged value.  Resident NumPy values are read-only,
-    and every public read returns an independent snapshot.  Lazy variables
-    are read from their file on each use; ``close()`` releases the read
-    handles, which later reads reopen.
+    proxies share every unchanged value and the lazy read handles.  Resident
+    NumPy values are read-only, and every public read returns an independent
+    snapshot.  Lazy variables are read from their file on each use;
+    ``close()`` releases the read handles, which later reads reopen.
+
+    Direct construction defaults to ``lazy=True`` (sources may stay on
+    disk), whereas :meth:`from_nc` defaults to ``lazy=False`` (eager reads).
     """
 
     data: Mapping[_InputName, InputValue]
@@ -750,7 +755,7 @@ class InputProxy(HydroForgeModel):
         data = dict(self._resident_items())
         data.update(values)
         known = self.visible_vars.union(self.sources)
-        return self._owned(
+        derived = self._owned(
             data,
             attrs=self.attrs,
             dims={**self.dims, **({} if dimensions is None else dimensions)},
@@ -759,6 +764,7 @@ class InputProxy(HydroForgeModel):
             injected_vars=self.injected_vars.union(set(values).difference(known)),
             sources=self.sources,
         )
+        return self._sharing_files(derived)
 
     @validate_call(config=HydroForgeModel.model_config)
     def without(self, *names: _InputName) -> Self:
@@ -772,7 +778,7 @@ class InputProxy(HydroForgeModel):
         missing = removed.difference(self.visible_vars).difference(self.sources)
         if missing:
             raise ValueError(f"InputProxy variable(s) not found: {sorted(missing)}")
-        return self._owned(
+        derived = self._owned(
             {
                 name: value
                 for name, value in self._resident_items()
@@ -789,6 +795,7 @@ class InputProxy(HydroForgeModel):
                 if name not in removed
             },
         )
+        return self._sharing_files(derived)
 
     @classmethod
     @validate_call(config=HydroForgeModel.model_config)
@@ -923,11 +930,18 @@ class InputProxy(HydroForgeModel):
         self._require(key)
         return self._shape(key)
 
+    def _public(self, key: str, value: Any) -> Any:
+        """Detach resident storage; a lazy read is already the caller's own."""
+
+        if key in cast(_ResidentInputData, self.data)._values:
+            return _snapshot_input_value(value)
+        return value
+
     def get_subset(self, key: str, indices: Any) -> Any:
         """Return a snapshot of one orthogonal selection of a variable.
 
         Resident variables are sliced in memory; lazy variables read only the
-        selection from their file.
+        selection from their file, and that fresh read is returned uncopied.
         """
 
         self._require(key)
@@ -938,19 +952,19 @@ class InputProxy(HydroForgeModel):
             selector = normalize_selection(indices, self._shape(key))
         except (TypeError, IndexError) as error:
             raise ValueError(f"invalid input subset selection: {error}") from error
-        return _snapshot_input_value(self._subset(key, selector))
+        return self._public(key, self._subset(key, selector))
 
     def get(self, key: str, default: Any = None) -> Any:
         if key not in self.visible_vars:
             return default
-        return _snapshot_input_value(self._value(key))
+        return self._public(key, self._value(key))
 
     def keys(self) -> set[str]:
         return set(self.visible_vars)
 
     def __getitem__(self, key: str) -> Any:
         self._require(key)
-        return _snapshot_input_value(self._value(key))
+        return self._public(key, self._value(key))
 
     def __contains__(self, key: str) -> bool:
         return key in self.visible_vars
@@ -959,10 +973,19 @@ class InputProxy(HydroForgeModel):
         """The identities of every lazy source file with process-local handles."""
 
         if self._files is None:
-            self._files = SourceFiles(
-                _source_identities(self.sources), label=_INPUT_FILE_LABEL
-            )
+            with _FILES_LOCK:
+                if self._files is None:
+                    self._files = SourceFiles(
+                        _source_identities(self.sources), label=_INPUT_FILE_LABEL
+                    )
         return self._files
+
+    def _sharing_files(self, derived: Self) -> Self:
+        """Let a derived proxy reuse this proxy's read handles."""
+
+        if derived.sources:
+            derived._files = self._source_files()
+        return derived
 
     def close(self) -> None:
         """Close process-local lazy read handles; later reads reopen them."""

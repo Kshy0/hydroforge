@@ -25,7 +25,6 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["hydroforge*"]
-exclude = ["hydroforge.validation*"]
 namespaces = false
 
 [tool.setuptools.package-data]

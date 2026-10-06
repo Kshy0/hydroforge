@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Rectilinear grid geometry for spatial mapping.
 
 The :class:`RegularGrid` describes a source or target rectilinear grid with
@@ -221,19 +227,23 @@ def _index_axis_points(
     *,
     ascending: bool,
 ) -> np.ndarray:
-    """Locate values in canonical non-overlapping cell bounds."""
+    """Locate values in canonical non-overlapping cell bounds.
 
-    oriented = values if ascending else -values
-    lower = bounds[:, 0] if ascending else -bounds[:, 1]
-    upper = bounds[:, 1] if ascending else -bounds[:, 0]
-    indices = np.searchsorted(lower, oriented, side="right") - 1
+    A value on an edge shared by two cells belongs to the cell with the
+    larger coordinates, whichever way the axis is ordered.
+    """
+
+    ordered = bounds if ascending else bounds[::-1]
+    indices = np.searchsorted(ordered[:, 0], values, side="right") - 1
     candidates = np.clip(indices, 0, bounds.shape[0] - 1)
     valid = (
-        np.isfinite(oriented)
+        np.isfinite(values)
         & (indices >= 0)
         & (indices < bounds.shape[0])
-        & (oriented <= upper[candidates])
+        & (values <= ordered[candidates, 1])
     )
+    if not ascending:
+        indices = bounds.shape[0] - 1 - indices
     return np.where(valid, indices, -1).astype(np.int64)
 
 

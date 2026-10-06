@@ -15,15 +15,17 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections import OrderedDict
-from collections.abc import Callable, Mapping
-from concurrent.futures import ProcessPoolExecutor
+from collections import OrderedDict, deque
+from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import cache, partial
 from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from weakref import WeakSet
 
 import cftime
 import netCDF4 as nc
@@ -127,6 +129,7 @@ class _SlotWrite:
         )
 
 
+@cache
 def _is_wsl() -> bool:
     if not sys.platform.startswith("linux"):
         return False
@@ -138,11 +141,9 @@ def _is_wsl() -> bool:
         return False
 
 
+# Least number of append handles a process keeps open; a writer raises it to
+# the number of files it routes to that process so appends never thrash.
 _WORKER_FILE_CACHE_SIZE = 32
-_WORKER_NETCDF_FILES: OrderedDict[
-    Path,
-    tuple[nc.Dataset, tuple[int, int]],
-] = OrderedDict()
 
 
 def _worker_file_identity(path: Path) -> tuple[int, int]:
@@ -150,83 +151,165 @@ def _worker_file_identity(path: Path) -> tuple[int, int]:
     return status.st_dev, status.st_ino
 
 
-def _close_worker_netcdf_files() -> None:
-    """Close every Dataset cached inside one writer subprocess."""
+class StreamAppendError(RuntimeError):
+    """Appends of some streams of one write task failed; the others landed."""
 
-    entries = tuple(_WORKER_NETCDF_FILES.values())
-    _WORKER_NETCDF_FILES.clear()
-    failures: list[BaseException] = []
-    for dataset, _identity in entries:
-        try:
+    def __init__(self, streams: tuple[str, ...], message: str) -> None:
+        super().__init__(streams, message)
+        self.streams = streams
+        self.message = message
+
+    def __str__(self) -> str:
+        return f"NetCDF append failed for {list(self.streams)}: {self.message}"
+
+
+class _AppendHandles:
+    """Bounded LRU of persistent append handles owned by one process.
+
+    A handle is reopened when its path was externally replaced.  A path whose
+    append failed is refused afterwards: appending later rows would close the
+    gap silently instead of leaving the uncommitted batch detectable.
+    """
+
+    def __init__(self, capacity: int = _WORKER_FILE_CACHE_SIZE) -> None:
+        self.capacity = max(1, capacity)
+        self._handles: OrderedDict[Path, tuple[nc.Dataset, tuple[int, int]]] = (
+            OrderedDict()
+        )
+        self._failed: set[Path] = set()
+
+    def open(self, path: Path) -> nc.Dataset:
+        """Return an append handle of ``path``, opening it when needed."""
+
+        canonical = path.absolute()
+        if canonical in self._failed:
+            raise RuntimeError(
+                f"an earlier append to NetCDF output {canonical} failed; "
+                "later rows are refused"
+            )
+        identity = _worker_file_identity(canonical)
+        entry = self._handles.pop(canonical, None)
+        if entry is not None:
+            dataset, cached_identity = entry
+            if cached_identity == identity:
+                self._handles[canonical] = entry
+                return dataset
             dataset.close()
-        except BaseException as error:
-            failures.append(error)
-    if len(failures) == 1:
-        raise failures[0]
-    if failures:
-        raise ResourceCleanupError("NetCDF worker file cache", failures)
+        ensure_hdf5_plugins()
+        dataset = nc.Dataset(canonical, "a")
+        self._handles[canonical] = (dataset, identity)
+        while len(self._handles) > self.capacity:
+            _old_path, (old_dataset, _old_identity) = self._handles.popitem(last=False)
+            old_dataset.close()
+        return dataset
+
+    def evict(self, path: Path) -> None:
+        entry = self._handles.pop(path.absolute(), None)
+        if entry is not None:
+            entry[0].close()
+
+    def release(self, paths: Iterable[Path]) -> None:
+        """Close the handles of files that receive no further rows."""
+
+        with cleanup_on_exit(
+            "NetCDF append handle release",
+            tuple(partial(self.evict, path) for path in paths),
+        ):
+            pass
+
+    def close(self) -> None:
+        """Close every handle, attempting all of them."""
+
+        entries = tuple(self._handles.values())
+        self._handles.clear()
+        with cleanup_on_exit(
+            "NetCDF append handles", tuple(dataset.close for dataset, _ in entries)
+        ):
+            pass
+
+    def append(
+        self, requests: tuple[NetCDFWriteRequest, ...]
+    ) -> tuple[tuple[str, int], ...]:
+        """Append each request in order through the persistent handles."""
+
+        results = []
+        failed: list[tuple[str, BaseException]] = []
+        for index, request in enumerate(requests):
+            path = request.output_path.absolute()
+            try:
+                results.append(_append_netcdf_request(self.open(path), request))
+            except BaseException as error:
+                # An ``Exception`` costs only its own file; anything else
+                # leaves this batch and the rest of the task unappended.
+                fatal = not isinstance(error, Exception)
+                self._failed.update(
+                    item.output_path.absolute()
+                    for item in (requests[index:] if fatal else (request,))
+                )
+                try:
+                    self.evict(path)
+                except BaseException:
+                    logger.exception(
+                        "failed to evict NetCDF append handle after append failure: %s",
+                        path,
+                    )
+                if fatal:
+                    raise
+                failed.append((request.variable, error))
+        if len(failed) == 1 and len(requests) == 1:
+            raise failed[0][1]
+        if failed:
+            raise StreamAppendError(
+                tuple(variable for variable, _error in failed),
+                "; ".join(
+                    f"{variable}: {failure_description(error)['message']}"
+                    for variable, error in failed
+                ),
+            ) from failed[0][1]
+        return tuple(results)
 
 
-def _initialize_netcdf_worker() -> None:
-    """Install deterministic cleanup in one spawned output process."""
+# Append handles of an output worker process, sized by its initializer.
+_WORKER_HANDLES = _AppendHandles()
+# In-process append handles of live writers, closed before any fork so no
+# HDF5 handle open for writing is duplicated into a child process.
+_OWNER_HANDLES: WeakSet[_AppendHandles] = WeakSet()
 
+
+def _close_owner_handles_before_fork() -> None:
+    for handles in tuple(_OWNER_HANDLES):
+        try:
+            handles.close()
+        except BaseException:
+            logger.exception("failed to close NetCDF append handles before fork")
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(before=_close_owner_handles_before_fork)
+
+
+def _initialize_netcdf_worker(capacity: int = _WORKER_FILE_CACHE_SIZE) -> None:
+    """Size the handle cache and install cleanup in one spawned output process."""
+
+    global _WORKER_HANDLES
+    _WORKER_HANDLES = _AppendHandles(capacity)
     atexit.register(_release_worker)
 
 
 def _release_worker() -> None:
     """Close the cached files and ring mappings of one output worker."""
 
-    with cleanup_on_exit(
-        "NetCDF output worker", (_close_worker_netcdf_files, detach_rings)
-    ):
+    with cleanup_on_exit("NetCDF output worker", (_WORKER_HANDLES.close, detach_rings)):
         pass
-
-
-def _evict_worker_netcdf_file(path: Path) -> None:
-    entry = _WORKER_NETCDF_FILES.pop(path, None)
-    if entry is not None:
-        entry[0].close()
 
 
 def _close_worker_netcdf_paths(paths: tuple[Path, ...]) -> None:
     """Release cached append handles of files that receive no further rows."""
 
-    failures: list[BaseException] = []
-    for path in paths:
-        try:
-            _evict_worker_netcdf_file(path.absolute())
-        except BaseException as error:
-            failures.append(error)
-    if len(failures) == 1:
-        raise failures[0]
-    if failures:
-        raise ResourceCleanupError("NetCDF worker file release", failures)
+    _WORKER_HANDLES.release(paths)
 
 
-def _cached_worker_netcdf_file(path: Path) -> nc.Dataset:
-    """Return an append handle, reopening if the path was externally replaced."""
-
-    canonical = path.absolute()
-    identity = _worker_file_identity(canonical)
-    entry = _WORKER_NETCDF_FILES.pop(canonical, None)
-    if entry is not None:
-        dataset, cached_identity = entry
-        if cached_identity == identity:
-            _WORKER_NETCDF_FILES[canonical] = entry
-            return dataset
-        dataset.close()
-    ensure_hdf5_plugins()
-    dataset = nc.Dataset(canonical, "a")
-    _WORKER_NETCDF_FILES[canonical] = (dataset, identity)
-    while len(_WORKER_NETCDF_FILES) > _WORKER_FILE_CACHE_SIZE:
-        _old_path, (old_dataset, _old_identity) = _WORKER_NETCDF_FILES.popitem(
-            last=False
-        )
-        old_dataset.close()
-    return dataset
-
-
-def _find_data_variable(ncfile, var_name: str):
+def _find_data_variable(ncfile: nc.Dataset, var_name: str) -> str:
     """Locate the target data variable inside an open NetCDF dataset."""
     safe = sanitize_symbol(var_name)
     if var_name in ncfile.variables:
@@ -238,7 +321,7 @@ def _find_data_variable(ncfile, var_name: str):
     )
 
 
-def _wsl_drop_cache(output_path) -> None:
+def _wsl_drop_cache(output_path: Path) -> None:
     """WSL optimisation: advise the kernel to drop page-cache for *output_path*."""
     if _is_wsl() and hasattr(os, "posix_fadvise"):
         try:
@@ -349,44 +432,13 @@ def _append_netcdf_request(
     return request.variable, committed_len - 1
 
 
-def _write_netcdf_process(request: NetCDFWriteRequest) -> tuple[str, int]:
-    """Append one already-batched request in a single file transaction."""
-
-    ensure_hdf5_plugins()
-    with nc.Dataset(request.output_path, "a") as ncfile:
-        return _append_netcdf_request(ncfile, request)
-
-
-def _write_netcdf_group_process(
-    requests: tuple[NetCDFWriteRequest, ...],
-) -> tuple[tuple[str, int], ...]:
-    """Write several streams through worker-local persistent file handles."""
-
-    results = []
-    for request in requests:
-        path = request.output_path.absolute()
-        try:
-            dataset = _cached_worker_netcdf_file(path)
-            results.append(_append_netcdf_request(dataset, request))
-        except BaseException:
-            try:
-                _evict_worker_netcdf_file(path)
-            except BaseException:
-                logger.exception(
-                    "failed to evict NetCDF worker handle after append failure: %s",
-                    path,
-                )
-            raise
-    return tuple(results)
-
-
 def _write_ring_slots(
     ring: str, writes: tuple[_SlotWrite, ...]
 ) -> tuple[tuple[str, int], ...]:
     """Append slots of a shared ring through worker-local file handles."""
 
     buffer = attached_ring(ring)
-    return _write_netcdf_group_process(tuple(write.request(buffer) for write in writes))
+    return _WORKER_HANDLES.append(tuple(write.request(buffer) for write in writes))
 
 
 def _output_components(variable: str, order: int) -> tuple[tuple[str, str, str], ...]:
@@ -495,7 +547,7 @@ class PendingNetCDFWrite:
     """One background task and the rows it appends per stream."""
 
     step_counts: tuple[tuple[str, int], ...]
-    future: Any
+    future: Future[Any]
 
 
 @dataclass(eq=False, slots=True)
@@ -512,6 +564,10 @@ class _OutputStream:
     # once its last row landed, and the next row moves on to the next slot.
     slot: int = 0
     rows: int = 0
+    # Per slot: rows already submitted by a durability flush, and the times
+    # of the rows placed since.  A flushed slot keeps filling, so later
+    # appends stay aligned with the file's time chunks.
+    submitted: list[int] = field(default_factory=list)
     times: list[list[Any]] = field(default_factory=list)
     writes: list[PendingNetCDFWrite | None] = field(default_factory=list)
     buffers: tuple[torch.Tensor, ...] = ()
@@ -584,6 +640,9 @@ class RankOutputWriter:
         self._write_executors: list[ProcessPoolExecutor] = []
         self._pending_writes: list[PendingNetCDFWrite] = []
         self._background_failure: BaseException | None = None
+        # Output streams whose buffered rows a failure invalidated; ``None``
+        # once a failure invalidated the rows of every stream.
+        self._poisoned: set[str] | None = set()
         self._unsynced_paths: set[Path] = set()
         self._ring: OutputRing | None = None
         self._asynchronous = False
@@ -592,8 +651,8 @@ class RankOutputWriter:
         self._flag_rows: tuple[torch.Tensor, ...] = ()
         self._flag_row = 0
         # Steps whose copies were enqueued, oldest first; a step stays here
-        # until it landed, so a cancelled wait cannot lose its rows.
-        self._staged: list[_StagedStep] = []
+        # until it landed, so an interrupted wait cannot lose its rows.
+        self._staged: deque[_StagedStep] = deque()
         # Exact storage layout and saved dtype of every output.
         self._layouts: dict[str, tuple[tuple[int, ...], torch.dtype]] = {}
         self._dtypes: dict[str, torch.dtype] = {}
@@ -621,6 +680,17 @@ class RankOutputWriter:
             )
             for name, info in metadata.items()
         }
+        file_variables: dict[str, str] = {}
+        for name, schema in self._netcdf_schemas.items():
+            for file_variable, _long_name, _suffix in _output_components(
+                name, schema.order
+            ):
+                other = file_variables.setdefault(file_variable, name)
+                if other != name:
+                    raise ValueError(
+                        f"statistics outputs {other!r} and {name!r} would both "
+                        f"write the rank files of {file_variable!r}"
+                    )
         rows = {}
         routes = []
         for name, schema in self._netcdf_schemas.items():
@@ -642,6 +712,7 @@ class RankOutputWriter:
                     chunk_cache=self._netcdf_schemas[name].create_options.get(
                         "chunk_cache"
                     ),
+                    submitted=[0] * placements[key].depth,
                     times=[[] for _slot in range(placements[key].depth)],
                     writes=[None] * placements[key].depth,
                 )
@@ -655,6 +726,18 @@ class RankOutputWriter:
             ):
                 stream.worker = min(range(num_workers), key=loads.__getitem__)
                 loads[stream.worker] += max(1, stream.slots.row_bytes)
+        # Every file a process appends keeps its handle open.
+        self._worker_files = [
+            max(
+                _WORKER_FILE_CACHE_SIZE,
+                1 + sum(stream.worker == worker for stream in self._all_streams()),
+            )
+            for worker in range(num_workers)
+        ]
+        self._local_handles = _AppendHandles(
+            max(_WORKER_FILE_CACHE_SIZE, 1 + len(self._all_streams()))
+        )
+        _OWNER_HANDLES.add(self._local_handles)
         try:
             start_blosc_zstd_probe(
                 schema.create_options for schema in self._netcdf_schemas.values()
@@ -665,16 +748,11 @@ class RankOutputWriter:
     def sync_appended_files(self) -> None:
         """Fsync every file appended since the last durability boundary."""
 
-        failures: list[BaseException] = []
-        for path in sorted(self._unsynced_paths):
-            try:
-                fsync_file(path)
-            except BaseException as error:
-                failures.append(error)
-        if len(failures) == 1:
-            raise failures[0]
-        if failures:
-            raise ResourceCleanupError("NetCDF output fsync", failures)
+        with cleanup_on_exit(
+            "NetCDF output fsync",
+            tuple(partial(fsync_file, path) for path in sorted(self._unsynced_paths)),
+        ):
+            pass
         self._unsynced_paths.clear()
 
     def _emit_event(self, event: ModelEvent) -> None:
@@ -709,6 +787,12 @@ class RankOutputWriter:
             if self._on_failure is not None:
                 self._on_failure(failure)
         raise self._background_failure
+
+    def _poison(self, keys: Iterable[str]) -> None:
+        """Mark streams whose buffered rows may no longer reach their files."""
+
+        if self._poisoned is not None:
+            self._poisoned.update(keys)
 
     def _resolve_run_id(self) -> str:
         """Return one identity shared by every file in this output run."""
@@ -832,7 +916,9 @@ class RankOutputWriter:
                     )
             for source, target in moves:
                 if os.path.lexists(target) and not target.is_symlink():
-                    source.chmod(stat.S_IMODE(target.stat().st_mode))
+                    # Keep the old permissions, but the run appends to the
+                    # new file: a read-only predecessor must not lock it.
+                    source.chmod(stat.S_IMODE(target.stat().st_mode) | stat.S_IWUSR)
 
             backups: list[tuple[Path, Path]] = []
             installed: list[Path] = []
@@ -911,7 +997,11 @@ class RankOutputWriter:
         return tuple(stream for streams in self._streams.values() for stream in streams)
 
     def _submit(self, slots: list[tuple[_OutputStream, int, int]]) -> None:
-        """Append ``(stream, slot, rows)`` batches, one task per worker."""
+        """Append each slot's unsubmitted rows up to ``stop``, one task per worker.
+
+        ``slots`` holds ``(stream, slot, stop)``; the rows before the slot's
+        ``submitted`` mark were already appended by a durability flush.
+        """
 
         by_worker: dict[int | None, list[tuple[_OutputStream, int, int]]] = {}
         for item in slots:
@@ -919,41 +1009,49 @@ class RankOutputWriter:
         failures: list[BaseException] = []
         for worker, items in by_worker.items():
             writes = []
-            for stream, slot, count in items:
+            counts = []
+            for stream, slot, stop in items:
                 layout = stream.slots
+                start = stream.submitted[slot]
                 writes.append(
                     _SlotWrite(
                         stream.key,
                         stream.path,
-                        layout.slot_offset(slot),
-                        count,
+                        layout.slot_offset(slot) + start * layout.row_bytes,
+                        stop - start,
                         layout.row_shape,
                         layout.dtype.str,
-                        tuple(stream.times[slot][:count]),
+                        tuple(stream.times[slot]),
                         stream.chunk_cache,
                     )
                 )
+                counts.append((stream.key, stop - start))
                 stream.times[slot] = []
+                stream.submitted[slot] = stop
             self._unsynced_paths.update(write.output_path for write in writes)
+            if worker is None:
+                # In process, one failed file does not hold back the others.
+                for index, write in enumerate(writes):
+                    try:
+                        self._local_handles.append((write.request(self._ring.buffer),))
+                    except Exception as error:
+                        self._poison((counts[index][0],))
+                        failures.append(error)
+                    except BaseException:
+                        self._poison(key for key, _count in counts[index:])
+                        raise
+                continue
             try:
-                if worker is None:
-                    for write in writes:
-                        _write_netcdf_process(write.request(self._ring.buffer))
-                    continue
                 future = self._write_executors[worker].submit(
                     _write_ring_slots, self._ring.name, tuple(writes)
                 )
             except BaseException as error:
+                self._poison(key for key, _count in counts)
                 failures.append(error)
                 continue
-            pending = PendingNetCDFWrite(
-                step_counts=tuple(
-                    (stream.key, count) for stream, _slot, count in items
-                ),
-                future=future,
-            )
+            pending = PendingNetCDFWrite(step_counts=tuple(counts), future=future)
             self._pending_writes.append(pending)
-            for stream, slot, _count in items:
+            for stream, slot, _stop in items:
                 stream.writes[slot] = pending
         if len(failures) == 1:
             raise failures[0]
@@ -975,7 +1073,18 @@ class RankOutputWriter:
         except BaseException as error:
             self._latch_failures("NetCDF write submission", [error])
 
-    def _next_row(self, stream: _OutputStream, *, dt) -> tuple[int, int]:
+    def _partial_slots(self) -> list[tuple[_OutputStream, int, int]]:
+        """Return each partly filled slot holding rows not yet submitted."""
+
+        return [
+            (stream, stream.slot, stream.rows)
+            for stream in self._all_streams()
+            if stream.submitted[stream.slot] < stream.rows < stream.slots.batch
+        ]
+
+    def _next_row(
+        self, stream: _OutputStream, *, dt: datetime | cftime.datetime
+    ) -> tuple[int, int]:
         """Return where the stream's next row goes, once that slot is free."""
 
         slot, row = stream.slot, stream.rows
@@ -987,22 +1096,29 @@ class RankOutputWriter:
                 self._land_staged()
         pending = stream.writes[slot]
         if row == 0 and pending is not None:
-            # The ring bounds retained rows: reuse waits for the slot's append.
-            stream.writes[slot] = None
+            # The ring bounds retained rows: reuse waits for the slot's last
+            # append (a stream's appends complete in submission order).  An
+            # interrupted wait keeps the append tracked for a later wait.
             if pending in self._pending_writes:
-                self._pending_writes.remove(pending)
                 try:
                     self._wait_for(pending, dt=dt)
-                except BaseException as error:
+                except Exception as error:
+                    self._pending_writes.remove(pending)
+                    stream.writes[slot] = None
                     self._latch_failures("NetCDF slot reuse", [error])
+                self._pending_writes.remove(pending)
+            stream.writes[slot] = None
         return slot, row
 
     @staticmethod
-    def _place(rows: list[tuple[_OutputStream, int, int]], dt) -> None:
+    def _place(
+        rows: list[tuple[_OutputStream, int, int]], dt: datetime | cftime.datetime
+    ) -> None:
         for stream, slot, row in rows:
             stream.slot, stream.rows = slot, row + 1
             if row == 0:
                 stream.times[slot] = []
+                stream.submitted[slot] = 0
             stream.times[slot].append(dt)
 
     def _layout_of(self, name: str, storage: torch.Tensor) -> torch.dtype:
@@ -1022,7 +1138,9 @@ class RankOutputWriter:
             )
         return self._dtypes[name]
 
-    def _write_step(self, values: Mapping[str, torch.Tensor], dt) -> None:
+    def _write_step(
+        self, values: Mapping[str, torch.Tensor], dt: datetime | cftime.datetime
+    ) -> None:
         """Copy one step into the ring, check it, and append full slots."""
 
         flags: list[tuple[torch.Tensor, str, str]] = []
@@ -1063,7 +1181,9 @@ class RankOutputWriter:
         self._place(rows, dt)
         self._submit_full(tuple(rows))
 
-    def _stage(self, values: Mapping[str, torch.Tensor], dt) -> None:
+    def _stage(
+        self, values: Mapping[str, torch.Tensor], dt: datetime | cftime.datetime
+    ) -> None:
         """Snapshot on the device, enqueue the copies into the ring, queue the step.
 
         Ring views stay temporaries here and in :meth:`_land`, so a raised
@@ -1075,22 +1195,25 @@ class RankOutputWriter:
         snapshots: list[torch.Tensor] = []
         for name, storage in values.items():
             dtype = self._dtypes[name]
-            flag = narrowing_flag(storage, dtype, name=name)
-            if flag is not None:
-                flags.append(flag)
+            flag = None
             for stream in self._streams[name]:
                 rows.append((stream, *self._next_row(stream, dt=dt)))
                 source = (
                     storage
                     if stream.component is None
                     else storage[..., stream.component]
-                )
+                ).detach()
                 # A deferred copy must not observe the next step's updates.
-                snapshots.append(
-                    source.detach().to(
-                        dtype=dtype, memory_format=torch.contiguous_format, copy=True
-                    )
+                snapshot = source.to(
+                    dtype=dtype, memory_format=torch.contiguous_format, copy=True
                 )
+                snapshots.append(snapshot)
+                # The converted snapshot reveals overflow without a temporary.
+                entry = narrowing_flag(source, dtype, name=name, converted=snapshot)
+                if entry is not None:
+                    flag = entry if flag is None else (flag[0] | entry[0], *entry[1:])
+            if flag is not None:
+                flags.append(flag)
         if flags:
             snapshots.append(torch.stack([flag for flag, _name, _label in flags]))
         if self._copy_stream is None:
@@ -1120,7 +1243,7 @@ class RankOutputWriter:
         self._staged.append(_StagedStep(tuple(rows), tuple(flags), flag_row, event))
 
     def _land(self, staged: _StagedStep) -> None:
-        """Wait for a staged step, check its flags, and append full slots."""
+        """Wait for a staged step and check its flags."""
 
         staged.event.synchronize()
         if staged.flags:
@@ -1129,45 +1252,82 @@ class RankOutputWriter:
                 staged.flags,
                 self._flag_rows[staged.flag_row][: len(staged.flags)].tolist(),
             )
-        self._submit_full(staged.rows)
 
     def _land_staged(self, *, keep: int = 0) -> None:
-        """Land queued steps, oldest first, until ``keep`` remain in flight."""
+        """Land queued steps, oldest first, until ``keep`` remain in flight.
+
+        An interrupted wait leaves its step queued for a later landing.
+        """
 
         while len(self._staged) > keep:
+            staged = self._staged[0]
             try:
-                self._land(self._staged[0])
-            except BaseException as error:
+                self._land(staged)
+            except Exception as error:
+                # The rejected step's rows already sit in every stream's slot.
+                self._poisoned = None
                 # The newest step's copies still land before the failure.
                 with cleanup_on_exit(
                     "statistics output staging", (self._staged[-1].event.synchronize,)
                 ):
                     self._latch_failures("statistics output staging", [error])
-            self._staged.pop(0)
+            self._staged.popleft()
+            self._submit_full(staged.rows)
 
-    def _flush_all_write_buffers(self, *, latch: bool = True) -> None:
-        """Append every partly filled slot (year transition, durability, close)."""
+    def _flush_all_write_buffers(
+        self, *, latch: bool = True, next_slot: bool = False
+    ) -> None:
+        """Append every partly filled slot (year transition, durability, close).
+
+        A flushed slot keeps receiving rows, so later appends stay aligned
+        with the file's time chunks; ``next_slot`` instead starts each
+        stream's next row in a fresh slot, aligned for a new file.
+        """
         self._raise_if_background_failed()
+        self._land_staged()
         try:
-            self._land_staged()
-            partial = [
-                (stream, stream.slot, stream.rows)
-                for stream in self._all_streams()
-                if 0 < stream.rows < stream.slots.batch
-            ]
+            partial = self._partial_slots()
             if partial:
                 self._submit(partial)
-                for stream, _slot, _rows in partial:
-                    stream.rows = stream.slots.batch
         except BaseException as error:
             if latch:
                 self._latch_failures("NetCDF write buffers", [error])
             raise
+        if next_slot:
+            for stream in self._all_streams():
+                if 0 < stream.rows < stream.slots.batch:
+                    stream.rows = stream.slots.batch
+
+    def _flush_surviving_buffers(self) -> None:
+        """After a failure, append the buffered rows the failure left intact."""
+
+        poisoned = self._poisoned
+        if poisoned is None or self._ring is None:
+            return
+        slots: list[tuple[_OutputStream, int, int]] = []
+        while self._staged:
+            staged = self._staged[0]
+            # A step that failed its range check must not reach any file.
+            self._land(staged)
+            self._staged.popleft()
+            slots.extend(
+                (stream, slot, stream.slots.batch)
+                for stream, slot, row in staged.rows
+                if row == stream.slots.batch - 1
+            )
+        slots.extend(self._partial_slots())
+        slots = [item for item in slots if item[0].key not in poisoned]
+        if slots:
+            self._submit(slots)
 
     def _release_worker_files(self, paths: tuple[Path, ...]) -> None:
         """Close completed files in every worker after their queued appends."""
 
         failures: list[BaseException] = []
+        try:
+            self._local_handles.release(paths)
+        except BaseException as error:
+            failures.append(error)
         for executor in self._write_executors:
             try:
                 future = executor.submit(_close_worker_netcdf_paths, paths)
@@ -1177,11 +1337,22 @@ class RankOutputWriter:
             self._pending_writes.append(PendingNetCDFWrite((), future))
         self._latch_failures("NetCDF worker file release", failures)
 
-    def _wait_for(self, pending: PendingNetCDFWrite, *, dt) -> None:
+    def _wait_for(
+        self,
+        pending: PendingNetCDFWrite,
+        *,
+        dt: datetime | cftime.datetime | None,
+    ) -> None:
         try:
             pending.future.result()
         except Exception as exc:
-            outputs = tuple(key for key, _count in pending.step_counts)
+            # A partial task failure names the streams that did not land.
+            outputs = (
+                exc.streams
+                if isinstance(exc, StreamAppendError)
+                else tuple(key for key, _count in pending.step_counts)
+            )
+            self._poison(outputs)
             self._emit_event(
                 ModelEvent(
                     level="error",
@@ -1190,7 +1361,11 @@ class RankOutputWriter:
                     fields={
                         "output": outputs[0] if len(outputs) == 1 else outputs,
                         "outputs": outputs,
-                        "steps": dict(pending.step_counts),
+                        "steps": {
+                            key: count
+                            for key, count in pending.step_counts
+                            if key in outputs
+                        },
                         "time": str(dt),
                         "error": failure_description(exc)["message"],
                     },
@@ -1198,7 +1373,7 @@ class RankOutputWriter:
             )
             raise
 
-    def poll(self, dt) -> None:
+    def poll(self, dt: datetime | cftime.datetime | None) -> None:
         """Observe every completed background write without blocking."""
 
         self._raise_if_background_failed()
@@ -1210,7 +1385,7 @@ class RankOutputWriter:
                 continue
             try:
                 self._wait_for(pending, dt=dt)
-            except BaseException as error:
+            except Exception as error:
                 failures.append(error)
         self._pending_writes = remaining
         if failures:
@@ -1219,27 +1394,32 @@ class RankOutputWriter:
                 failures,
             )
 
-    def flush(self, dt) -> None:
+    def flush(self, dt: datetime | cftime.datetime | None) -> None:
         """Make every accepted statistics row durable without closing workers."""
 
         self._raise_if_background_failed()
         failures: list[BaseException] = []
         try:
             self._flush_all_write_buffers(latch=False)
-        except BaseException as error:
+        except Exception as error:
             failures.append(error)
         pending, self._pending_writes = self._pending_writes, []
-        for item in pending:
+        for index, item in enumerate(pending):
             try:
                 self._wait_for(item, dt=dt)
-            except BaseException as error:
+            except Exception as error:
                 failures.append(error)
+            except BaseException:
+                # Interrupted: the unobserved appends stay tracked.
+                self._pending_writes[:0] = pending[index:]
+                raise
         if not failures:
             # Workers have synced HDF5 buffers and committed-step markers to
             # the OS; fsync makes those committed rows survive a crash.
             try:
                 self.sync_appended_files()
-            except BaseException as error:
+            except Exception as error:
+                self._poisoned = None
                 failures.append(error)
         if failures:
             self._latch_failures(
@@ -1260,8 +1440,9 @@ class RankOutputWriter:
                 self._create_netcdf_files(year=dt.year)
                 self._current_year = dt.year
             elif self._current_year != dt.year:
-                # Rows of the old year go to its files before the new ones.
-                self._flush_all_write_buffers()
+                # Rows of the old year go to its files before the new ones,
+                # and the new files start in fresh, chunk-aligned slots.
+                self._flush_all_write_buffers(next_slot=True)
                 self._release_worker_files(
                     tuple(stream.path for stream in self._all_streams())
                 )
@@ -1295,8 +1476,8 @@ class RankOutputWriter:
             self._write_step(values, dt)
             self._last_times.update(dict.fromkeys(values, numeric_time))
             return
-        # At most one step is in flight (a cancelled landing may leave two),
-        # so the two flag rows never overlap.
+        # At most one step is in flight (an interrupted landing may leave
+        # two, landed here first), so the two flag rows never overlap.
         self._land_staged(keep=1)
         self._stage(values, dt)
         # The previous step is checked while this one's copies run.
@@ -1341,12 +1522,24 @@ class RankOutputWriter:
         with cleanup_on_exit("statistics output ring", actions):
             pass
 
-    def _cleanup_executor(self) -> None:
+    def _shutdown(self) -> None:
+        """Flush, drain and stop the workers, fsync, then release the ring.
+
+        After a failure the rows of streams it left intact are still
+        appended and every appended file is still made durable.
+        """
+
         failures: list[BaseException] = []
+        failure = self._background_failure
         try:
-            self._flush_all_write_buffers()
+            if failure is None:
+                self._flush_all_write_buffers()
+            else:
+                failures.append(failure)
+                self._flush_surviving_buffers()
         except BaseException as error:
-            failures.append(error)
+            if error is not failure:
+                failures.append(error)
         pending, self._pending_writes = self._pending_writes, []
         for item in pending:
             try:
@@ -1363,12 +1556,15 @@ class RankOutputWriter:
                 executor.shutdown(wait=True)
             except BaseException as error:
                 failures.append(error)
-        if not failures:
-            # Workers have closed their handles; make the appended rows durable.
-            try:
-                self.sync_appended_files()
-            except BaseException as error:
-                failures.append(error)
+        try:
+            self._local_handles.close()
+        except BaseException as error:
+            failures.append(error)
+        # Every process has closed its handles; make the appended rows durable.
+        try:
+            self.sync_appended_files()
+        except BaseException as error:
+            failures.append(error)
         try:
             self._release_ring()
         except BaseException as error:
@@ -1398,11 +1594,12 @@ class RankOutputWriter:
         try:
             self._ring = ring
             self._bind_ring(ring)
-            for _ in range(self.num_workers):
+            for worker in range(self.num_workers):
                 executor = ProcessPoolExecutor(
                     max_workers=1,
                     mp_context=get_context("spawn"),
                     initializer=_initialize_netcdf_worker,
+                    initargs=(self._worker_files[worker],),
                 )
                 created.append(executor)
                 ready.append(PendingNetCDFWrite((), executor.submit(os.getpid)))
@@ -1448,4 +1645,4 @@ class RankOutputWriter:
             "statistics output",
             (lambda: _probe_blosc_zstd_filter(start_if_needed=False),),
         ):
-            self._cleanup_executor()
+            self._shutdown()

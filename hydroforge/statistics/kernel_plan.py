@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Statistics lowered to kernel IR before any backend spelling.
 
 :func:`plan_statistics` turns a lowered schedule into scatter pre-kernels
@@ -20,6 +26,12 @@ Sample bodies address their element through the locals ``t`` (member),
 and, in the full layout, ``linear``; the mapping defines them.  A scatter
 add runs one thread per source point and member, or one lane per source
 point unrolling members (:meth:`StatisticsKernelPlan.scatter_kernels`).
+
+Scatter adds are atomic, so the order in which contributions to one target
+are summed is unspecified: CUDA, Triton and Metal float32 scatter sums can
+differ in their last bits between runs and from the sequential PyTorch CPU
+and Metal float64 (destination-owned) sums, and so can ties of statistics
+that compare them.
 """
 
 from __future__ import annotations
@@ -221,7 +233,8 @@ class ScatterKernels:
     """The pre-kernels of one scatter source.
 
     ``add`` maps one thread to each source point and member; ``add_members``
-    maps one lane to each source point and unrolls the members.
+    maps one lane to each source point and unrolls the members.  Both add
+    atomically, so floating-point sums depend on the device's add order.
     """
 
     zero: StatisticsKernel
@@ -570,6 +583,10 @@ def _variable(
                 point = _member_offset(context.member_stride(key, 2), SOURCE)
                 return _level_offset(point, width)
 
+    weights = (
+        StoragePlan.sample_weight(name),
+        StoragePlan.inner_weight(name, Reduction.MEAN),
+    )
     ctx = SampleContext(
         offset=offset,
         weight=_control_var(controls[CONTROL_WEIGHT]),
@@ -577,6 +594,14 @@ def _variable(
         macro_index=_control_var(controls[CONTROL_MACRO_INDEX]),
         names=names,
         prefix=prefix,
+        weight_dtype=next(
+            (
+                context.storage[slot].dtype
+                for slot in weights
+                if slot in context.storage
+            ),
+            None,
+        ),
     )
     head = tuple(statements)
     values = _Values(context, lowering, names, prefix, dtype, source_offset)

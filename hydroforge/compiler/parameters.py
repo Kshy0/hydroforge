@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Parameter stage: resolve scheduled changes to fields and main steps."""
 
 from __future__ import annotations
@@ -9,7 +15,7 @@ import cftime
 import torch
 
 from hydroforge.compiler.fields import FieldEntry, FieldPlan
-from hydroforge.compiler.partition import coordinate_identity
+from hydroforge.compiler.partition import coordinate_identity, coordinate_index
 from hydroforge.compiler.selection import Selection
 from hydroforge.contracts.fields import concrete_tensor_dtype
 from hydroforge.contracts.parameters import ParameterChange, validate_parameter_scalar
@@ -85,15 +91,16 @@ def _id_field(
         raise ValueError(
             f"parameter target ID field {id_name!r} must be one-dimensional"
         )
+    index = coordinate_index(names.values())
     coordinate = (
         None
         if tensor.dim_coords is None
-        else coordinate_identity(tensor.dim_coords, names.values())
+        else coordinate_identity(tensor.dim_coords, index=index)
     )
     id_coordinate = (
         id_field.qualified
         if id_tensor.is_coordinate
-        else coordinate_identity(id_tensor.dim_coords, names.values())
+        else coordinate_identity(id_tensor.dim_coords, index=index)
         if id_tensor.dim_coords
         else None
     )
@@ -111,13 +118,13 @@ def _target(
     schedule = selection.schedule
     label = f"parameter change {change.variable!r} start"
     _calendar, normalized, _defaulted = normalize_calendar_dates(
-        {label: change.start, "schedule start": schedule._start},
+        {label: change.start, "schedule start": schedule.start},
         calendar=schedule.calendar,
-        preserve_cftime_declaration=isinstance(schedule._start, cftime.datetime),
+        preserve_cftime_declaration=isinstance(schedule.start, cftime.datetime),
     )
     start = normalized[label]
     try:
-        main_index = schedule._main_index_at(start)
+        main_index = schedule.main_index_at(start)
     except KeyError:
         raise ValueError(
             f"parameter change {change.variable!r} start {start!r} is not a "

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Backend-neutral compiled loops over recorded operator programs.
 
 A loop owns its device control scalars and recorded bodies.  ``bind`` asks
@@ -14,7 +20,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.utils._python_dispatch import _disable_current_modes
 
-from hydroforge.core.errors import SubstepCompileError
 from hydroforge.execution.context import SubstepFrame, close_runner
 from hydroforge.execution.operators import PredicateLoopOperator
 
@@ -79,13 +84,11 @@ class FixedLoop:
         )
 
     def bind(self, body: Any, final: Any | None = None) -> FixedLoop:
-        """Attach the recorded body and build its backend runner."""
+        """Attach the recorded body and build its backend runner.
 
-        if not body.operators:
-            raise SubstepCompileError(
-                "fixed substep produced an empty operator IR; backend kernels "
-                "must be registered through BackendRegistry + KernelSpec"
-            )
+        Recordings reject an empty operator IR before any loop binds it.
+        """
+
         self.body = body
         self.final = final
         programs = self.programs
@@ -172,8 +175,6 @@ class PredicateLoop:
     def bind(self, body: Any) -> PredicateLoop:
         """Attach the recorded loop body and build its backend runner."""
 
-        if not body.operators:
-            raise SubstepCompileError("predicate loop produced an empty operator IR")
         self.body = body
         self.runner = self.executor.predicate(self)
         return self
@@ -213,13 +214,31 @@ class AdaptiveLoop:
         maximum_steps: int,
     ) -> None:
         self.executor = execution.executor
-        self.candidate = candidate_dt.view(1)
-        self.time_step = dt.view(1)
         self.maximum = maximum_dt
         self.maximum_steps = maximum_steps
         # The first loop build may happen under ``torch.inference_mode``.
         # Runtime-owned controls must remain ordinary tensors because they are
         # also mutated by capture setup and cleanup outside inference mode.
+        # Like the other loops, construction is compiler work that no active
+        # operator recorder may intercept.
+        with _disable_current_modes():
+            self._allocate(candidate_dt, dt, maximum_dt, maximum_steps)
+            self.status_sources = (self.error_flag, self.continue_flag, dt.view(1))
+        self.completion_sources = (self.error_flag, self.counter)
+        self.frame = SubstepFrame(index=self.counter, dt=dt)
+        self.proposal: Any = None
+        self.body: Any = None
+        self.runner: Any = None
+
+    def _allocate(
+        self,
+        candidate_dt: torch.Tensor,
+        dt: torch.Tensor,
+        maximum_dt: float,
+        maximum_steps: int,
+    ) -> None:
+        self.candidate = candidate_dt.view(1)
+        self.time_step = dt.view(1)
         with torch.inference_mode(False):
             options = dict(device=candidate_dt.device, dtype=candidate_dt.dtype)
             counts = dict(device=candidate_dt.device, dtype=torch.int32)
@@ -250,12 +269,6 @@ class AdaptiveLoop:
             pinned = candidate_dt.device.type == "cuda"
             self.status_host = torch.zeros(3, dtype=dt.dtype, pin_memory=pinned)
             self.completion_host = torch.zeros(2, dtype=torch.int32, pin_memory=pinned)
-        self.status_sources = (self.error_flag, self.continue_flag, dt.view(1))
-        self.completion_sources = (self.error_flag, self.counter)
-        self.frame = SubstepFrame(index=self.counter, dt=dt)
-        self.proposal: Any = None
-        self.body: Any = None
-        self.runner: Any = None
 
     @property
     def programs(self) -> tuple[Any, ...]:
@@ -288,14 +301,6 @@ class AdaptiveLoop:
     def bind(self, proposal: Any, body: Any) -> AdaptiveLoop:
         """Attach the recorded proposal and physics body; build the runner."""
 
-        if not proposal.operators:
-            raise SubstepCompileError(
-                "adaptive dt proposal produced an empty operator IR"
-            )
-        if not body.operators:
-            raise SubstepCompileError(
-                "adaptive physics body produced an empty operator IR"
-            )
         self.proposal = proposal
         self.body = body
         self.runner = self.executor.adaptive(self)
@@ -323,8 +328,12 @@ class AdaptiveLoop:
         # finite positive remainder so the already-captured physics tail does
         # not receive zero/NaN before the host reports the strict error.
         torch.where(self.predicate_a, self.remaining, self.accepted, out=self.time_step)
+        # A width clipped to the remainder closes the interval exactly;
+        # ``elapsed + (duration - elapsed)`` may round below ``duration``.
+        torch.eq(self.time_step, self.remaining, out=self.predicate_c)
         self.body.launch()
         self.elapsed.add_(self.time_step)
+        torch.where(self.predicate_c, self.duration, self.elapsed, out=self.elapsed)
         self.counter.add_(self.one_count)
         torch.ge(self.counter, self.maximum_count, out=self.predicate_b)
         torch.lt(self.elapsed, self.duration, out=self.predicate_c)
@@ -340,7 +349,7 @@ class AdaptiveLoop:
             raise ValueError(
                 "adaptive substep proposal must be finite and positive and "
                 "the interval must complete within "
-                f"maximum_sub_steps={self.maximum_steps}"
+                f"maximum_steps={self.maximum_steps}"
             )
 
     @staticmethod

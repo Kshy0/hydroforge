@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """File identities, process-local NetCDF read handles, and atomic publication."""
 
 from __future__ import annotations
@@ -9,6 +15,7 @@ from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from threading import RLock
 from types import MappingProxyType
@@ -17,7 +24,7 @@ from weakref import WeakSet
 
 from netCDF4 import Dataset
 
-from hydroforge.core.errors import ResourceCleanupError
+from hydroforge.core.errors import cleanup_on_exit
 from hydroforge.io.netcdf.options import ensure_hdf5_plugins
 
 
@@ -73,6 +80,11 @@ def _close_handle_pools_before_fork() -> None:
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(before=_close_handle_pools_before_fork)
+
+
+def _close_if_open(dataset: Dataset) -> None:
+    if dataset.isopen():
+        dataset.close()
 
 
 class _NetCDFHandlePool:
@@ -132,18 +144,14 @@ class _NetCDFHandlePool:
         """Close all handles owned by the current process, idempotently."""
 
         self._reset_for_process()
-        failures: list[BaseException] = []
         with self._lock:
             handles = tuple(self._handles.values())
             self._handles.clear()
-            for dataset in handles:
-                try:
-                    if dataset.isopen():
-                        dataset.close()
-                except BaseException as error:
-                    failures.append(error)
-        if failures:
-            raise ResourceCleanupError("NetCDF read handles", tuple(failures))
+            with cleanup_on_exit(
+                "NetCDF read handles",
+                tuple(partial(_close_if_open, dataset) for dataset in handles),
+            ):
+                pass
 
     def __getstate__(self) -> dict[str, int]:
         return {"max_open_files": self.max_open_files}

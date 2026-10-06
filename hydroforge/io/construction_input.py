@@ -1,8 +1,17 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Construction-input NetCDF files: the format of checkpoints.
 
 A construction input holds exactly the values that build a model
-(parameters, topology and initial physical state) and nothing else: no
-global attributes, no time axis and no run metadata.  One dimension rule
+(parameters, topology and initial physical state) and nothing else: no time
+axis and no run metadata. Its only optional global attribute is the
+``hydroforge_options`` fingerprint of the options the values were built with
+(``write_construction_input(..., options=...)``); a model materializing from
+such a file rejects options that differ from it.  One dimension rule
 names every axis.  The leading axis of a variable partitioned by a
 coordinate group is named after that group, so the group's coordinate
 variable and all its fields share one CF coordinate dimension; every other
@@ -19,7 +28,9 @@ value semantics.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import json
+import warnings
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,8 +39,10 @@ from unicodedata import normalize
 
 import numpy as np
 from netCDF4 import Dataset
-from pydantic import Field, validate_call
+from pydantic import Field, InstanceOf, validate_call
 
+from hydroforge.contracts.options import HydroForgeOptionWarning, OptionsConfig
+from hydroforge.core.errors import user_stacklevel
 from hydroforge.core.naming import validate_netcdf_name
 from hydroforge.core.validation import HydroForgeModel
 from hydroforge.io.netcdf.encoding import (
@@ -50,6 +63,130 @@ from hydroforge.io.netcdf.options import (
 from hydroforge.io.netcdf.read import decoded_dtype
 
 _FilePath = Annotated[Path, Field(strict=False)]
+
+OPTIONS_ATTR = "hydroforge_options"
+"""Global attribute holding the JSON of ``options.parameter_options()``."""
+
+OPTIONS_INACTIVE_ATTR = "hydroforge_options_inactive"
+"""Global attribute listing (JSON) parameter options declared by the writer's
+options but not recorded because their ``affects_parameters`` condition (or
+relevance) was false when the file was written."""
+
+
+def _json_value(value: Any) -> Any:
+    """Round-trip one option value through JSON (tuples become lists)."""
+
+    return json.loads(json.dumps(value, default=str))
+
+
+def options_fingerprint(
+    options: OptionsConfig, *, opened_modules: Iterable[str] | None = None
+) -> str:
+    """Return the JSON fingerprint of the options parameter files depend on.
+
+    ``opened_modules`` (the model's selection) decides ``affects_parameters``
+    conditions that name modules and drops irrelevant options; see
+    ``OptionsConfig.parameter_options``.
+    """
+
+    return json.dumps(
+        dict(options.parameter_options(opened_modules=opened_modules)),
+        sort_keys=True,
+        default=str,
+    )
+
+
+def options_attributes(
+    options: OptionsConfig, *, opened_modules: Iterable[str] | None = None
+) -> dict[str, str]:
+    """Return the global attributes recording ``options`` in a file."""
+
+    if opened_modules is not None:
+        opened_modules = tuple(opened_modules)
+    recorded = options.parameter_options(opened_modules=opened_modules)
+    attributes = {
+        OPTIONS_ATTR: options_fingerprint(options, opened_modules=opened_modules)
+    }
+    inactive = sorted(options.parameter_option_paths().difference(recorded))
+    if inactive:
+        attributes[OPTIONS_INACTIVE_ATTR] = json.dumps(inactive)
+    return attributes
+
+
+def _inactive_paths(attrs: Mapping[str, Any]) -> set[str]:
+    recorded = attrs.get(OPTIONS_INACTIVE_ATTR)
+    if recorded is None:
+        return set()
+    try:
+        paths = json.loads(str(recorded))
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"input global attribute {OPTIONS_INACTIVE_ATTR!r} is not valid JSON"
+        ) from error
+    if not isinstance(paths, list) or any(type(path) is not str for path in paths):
+        raise ValueError(
+            f"input global attribute {OPTIONS_INACTIVE_ATTR!r} must be a list of paths"
+        )
+    return set(paths)
+
+
+def check_options_fingerprint(
+    attrs: Mapping[str, Any],
+    options: OptionsConfig,
+    *,
+    opened_modules: Iterable[str] | None = None,
+) -> None:
+    """Compare a file's ``hydroforge_options`` with the model's options.
+
+    Options recorded in the file and declared ``affects_parameters`` by the
+    model must agree; one ``ValueError`` lists every mismatch. Options present
+    on only one side are reported in one ``HydroForgeOptionWarning``. Files
+    without the attribute are not checked. Options the model leaves out of
+    ``parameter_options(opened_modules=...)`` (``affects_parameters``
+    condition false, or irrelevant with ``opened_modules``) are neither
+    compared nor reported, nor are options the file lists as inactive.
+    """
+
+    recorded = attrs.get(OPTIONS_ATTR)
+    if recorded is None:
+        return
+    try:
+        stored = json.loads(str(recorded))
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"input global attribute {OPTIONS_ATTR!r} is not valid JSON"
+        ) from error
+    if not isinstance(stored, dict):
+        raise ValueError(f"input global attribute {OPTIONS_ATTR!r} must be an object")
+    current = {
+        path: _json_value(value)
+        for path, value in options.parameter_options(
+            opened_modules=opened_modules
+        ).items()
+    }
+    inactive = options.parameter_option_paths().difference(current)
+    stored = {path: value for path, value in stored.items() if path not in inactive}
+    inactive_in_file = _inactive_paths(attrs)
+    mismatches = [
+        f"options.{path}: model={current[path]!r}, input file={stored[path]!r}"
+        for path in sorted(current.keys() & stored.keys())
+        if current[path] != stored[path]
+    ]
+    if mismatches:
+        raise ValueError(
+            "the model's options differ from the options the input file was "
+            "built with (" + OPTIONS_ATTR + "):\n  - " + "\n  - ".join(mismatches)
+        )
+    only_file = sorted(stored.keys() - current.keys())
+    only_model = sorted(current.keys() - stored.keys() - inactive_in_file)
+    if only_file or only_model:
+        warnings.warn(
+            f"input file {OPTIONS_ATTR} and the model's parameter options name "
+            f"different options; recorded only in the file: {only_file}; "
+            f"declared only by the model: {only_model}",
+            HydroForgeOptionWarning,
+            stacklevel=user_stacklevel(),
+        )
 
 
 def construction_dims(
@@ -177,12 +314,18 @@ def write_construction_input(
     *,
     partitions: Mapping[str, str],
     netcdf_options: NetCDFOptions,
+    options: InstanceOf[OptionsConfig] | None = None,
+    opened_modules: tuple[str, ...] | None = None,
 ) -> None:
     """Write host arrays and scalars as one construction-input file.
 
     ``partitions`` maps each partitioned variable, including the group's
     coordinate variable, to its coordinate group; ``netcdf_options`` are
-    ``Dataset.createVariable`` options.
+    ``Dataset.createVariable`` options. ``options`` (the model's options the
+    values were built with) records the ``hydroforge_options`` fingerprint of
+    its parameter options as a global attribute; pass the model's
+    ``opened_modules`` to decide ``affects_parameters`` conditions that name
+    modules (see :func:`options_attributes`).
     """
 
     arrays = {}
@@ -196,7 +339,16 @@ def write_construction_input(
         netcdf_options,
     )
     ensure_hdf5_plugins()
+    if options is None and opened_modules is not None:
+        raise ValueError("opened_modules requires options")
+    attributes = (
+        {}
+        if options is None
+        else options_attributes(options, opened_modules=opened_modules)
+    )
     with Dataset(path, "w", format="NETCDF4") as dataset:
+        for name, value in attributes.items():
+            dataset.setncattr(name, value)
         for name, value in arrays.items():
             _write(dataset, name, value, plans[name])
 
@@ -207,7 +359,19 @@ def _read(part: Path, variable: Any, name: str) -> np.ndarray:
         raise ValueError(
             f"construction part {str(part)!r} variable {name!r} contains missing values"
         )
-    return np.asarray(decode_netcdf_logical_array(variable, raw, name=name))
+    values = np.asarray(decode_netcdf_logical_array(variable, raw, name=name))
+    if variable.dtype is str:
+        # Variable-length strings read as objects; restore the written kind.
+        values = values.astype(str)
+    return values
+
+
+def _same_layout(values: np.ndarray, plan: _VariablePlan) -> bool:
+    # A string's width is a property of its values, not of the variable.
+    same_dtype = (
+        values.dtype == plan.dtype or values.dtype.kind == plan.dtype.kind == "U"
+    )
+    return same_dtype and values.shape[1:] == plan.shape[1:]
 
 
 @validate_call(config=HydroForgeModel.model_config)
@@ -217,13 +381,16 @@ def merge_construction_parts(
     *,
     partitions: Mapping[str, str],
     netcdf_options: NetCDFOptions,
+    options: InstanceOf[OptionsConfig] | None = None,
+    opened_modules: tuple[str, ...] | None = None,
 ) -> None:
     """Concatenate rank-local construction parts into one file.
 
     Every partitioned variable occurs in every part and is concatenated along
     its group axis in part order; the other variables come from part zero
     only, whose variable order the merged file keeps.  Coordinate IDs must be
-    unique across the parts.
+    unique across the parts. ``options`` and ``opened_modules`` record the
+    merged file's option fingerprint as in :func:`write_construction_input`.
     """
 
     input_identities = set()
@@ -312,7 +479,16 @@ def merge_construction_parts(
                 (sum(piece.size for piece in coordinates[group]), *shape[1:]),
             )
         plans = _plan_variables(layouts, partitions, netcdf_options)
+        if options is None and opened_modules is not None:
+            raise ValueError("opened_modules requires options")
+        attributes = (
+            {}
+            if options is None
+            else options_attributes(options, opened_modules=opened_modules)
+        )
         with Dataset(path, "w", format="NETCDF4") as merged:
+            for name, value in attributes.items():
+                merged.setncattr(name, value)
             for name, plan in plans.items():
                 group = partitions.get(name)
                 if group is None:
@@ -334,7 +510,7 @@ def merge_construction_parts(
                         else _read(part, dataset.variables[name], name)
                     )
                     # Actual decode is a new value boundary even after schema preflight.
-                    if values.dtype != plan.dtype or values.shape[1:] != plan.shape[1:]:
+                    if not _same_layout(values, plan):
                         raise TypeError(
                             f"construction part {str(part)!r} variable {name!r} changed decoded layout"
                         )

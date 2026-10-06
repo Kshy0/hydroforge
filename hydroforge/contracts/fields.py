@@ -1,7 +1,14 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Generic field contracts extracted from module declarations."""
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -18,12 +25,18 @@ from pydantic import (
 )
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
-from hydroforge.contracts.conditions import conditions_satisfied, validate_condition
+from hydroforge.contracts.conditions import (
+    Condition,
+    any_condition_satisfied,
+    conditions_satisfied,
+)
+from hydroforge.core.arrays import TORCH_INTEGER_DTYPES
 from hydroforge.core.expr import parse_value_source
-from hydroforge.core.naming import DottedPath, Identifier
+from hydroforge.core.naming import DottedPath
 from hydroforge.core.validation import (
     FrozenMapping,
     HydroForgeModel,
+    require_unique,
 )
 
 
@@ -39,20 +52,12 @@ TensorDType = Literal["float", "hpfloat", "int", "idx", "bool"]
 TensorOutput = Literal["auto", "full", "disabled"]
 
 
-def _unique_module_names(values: tuple[str, ...]) -> tuple[str, ...]:
-    if len(values) != len(set(values)):
-        raise ValueError("contains duplicate module names")
-    return values
-
-
-_ModuleNames: TypeAlias = Annotated[
-    tuple[Identifier, ...], AfterValidator(_unique_module_names)
-]
 _Conditions: TypeAlias = Annotated[
-    tuple[Annotated[str, AfterValidator(validate_condition)], ...],
-    AfterValidator(_unique_module_names),
+    tuple[Condition, ...],
+    AfterValidator(require_unique),
 ]
-TensorDependencies: TypeAlias = str | _Conditions | None
+TensorDependencies: TypeAlias = Any
+"""A condition, a module name, an ``options.<path>`` string, or a tuple."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,7 +181,7 @@ def tensor_is_active(
     """
     if isinstance(metadata, RuntimeTensorMetadata):
         metadata = metadata.tensor
-    opened = set(opened_modules)
+    opened = frozenset(opened_modules)
     required = getattr(metadata, "depends_on", ())
     consumers = getattr(metadata, "required_by", ())
     output_only = getattr(metadata, "output_only", False)
@@ -186,9 +191,21 @@ def tensor_is_active(
         and (
             not consumers
             or output_required
-            or any(item in opened for item in consumers)
+            or any_condition_satisfied(consumers, opened, conditions)
         )
     )
+
+
+def offending_indices(mask: torch.Tensor, limit: int = 5) -> list[Any]:
+    """Return the first ``limit`` indices where ``mask`` is true.
+
+    One-dimensional masks yield ints; higher ranks yield index tuples.
+    """
+
+    return [
+        tuple(index) if len(index) != 1 else index[0]
+        for index in torch.nonzero(mask)[:limit].tolist()
+    ]
 
 
 def concrete_tensor_dtype(
@@ -216,6 +233,12 @@ def concrete_tensor_dtype(
         raise TypeError(f"unsupported tensor dtype declaration {kind!r}") from error
 
 
+def precision_dtype(name: str, precision: torch.dtype) -> torch.dtype:
+    """Resolve a ``"precision"`` placeholder or an exact torch dtype name."""
+
+    return precision if name == "precision" else getattr(torch, name)
+
+
 def cast_declared_tensor(
     tensor: torch.Tensor,
     target: torch.dtype,
@@ -230,15 +253,6 @@ def cast_declared_tensor(
 
     if tensor.dtype == target:
         return tensor
-    integer_types = {
-        torch.int8,
-        torch.uint8,
-        torch.int16,
-        torch.uint16,
-        torch.int32,
-        torch.uint32,
-        torch.int64,
-    }
     if target in {torch.float32, torch.float64}:
         if not tensor.is_floating_point():
             raise TypeError(
@@ -254,7 +268,7 @@ def cast_declared_tensor(
                     "finite values exceed the float32 range"
                 )
     elif target in {torch.int32, torch.int64}:
-        if tensor.dtype not in integer_types:
+        if tensor.dtype not in TORCH_INTEGER_DTYPES:
             raise TypeError(
                 f"{name} declares {target} but received non-integer "
                 f"dtype {tensor.dtype}"
@@ -322,16 +336,22 @@ class TensorMetadata:
     replicated: bool = False
     output: TensorOutput = "auto"
     depends_on: _Conditions = ()
-    required_by: _ModuleNames = ()
+    required_by: _Conditions = ()
     expression: str = ""
     output_only: bool = False
+    units: str | None = None
+    finite: bool = False
+    ge: float | None = None
+    gt: float | None = None
+    le: float | None = None
+    lt: float | None = None
 
     @field_validator("depends_on", "required_by", mode="before")
     @classmethod
     def _canonical_dependencies(cls, value: Any, info: ValidationInfo) -> Any:
         if value is None:
             return ()
-        if type(value) is str:
+        if type(value) is not tuple and type(value) is not list:
             return (value,)
         # A before validator hands JSON arrays on as Python lists.
         if info.mode == "json" and type(value) is list:
@@ -392,7 +412,137 @@ class TensorMetadata:
                 raise ValueError(
                     "output_only fields must permit explicit statistics output"
                 )
+        self._validate_value_contract()
         return self
+
+    def _validate_value_contract(self) -> None:
+        """Validate units and value constraints."""
+
+        if self.units is not None and (
+            not self.units or self.units != self.units.strip()
+        ):
+            raise ValueError("units must be a non-empty string without padding")
+        bounds = {
+            name: getattr(self, name)
+            for name in ("ge", "gt", "le", "lt")
+            if getattr(self, name) is not None
+        }
+        if (self.finite or bounds) and (
+            self.dtype == "bool" or self.category == "virtual"
+        ):
+            raise ValueError(
+                "finite and value bounds require a stored numeric tensor field"
+            )
+        if self.finite and self.dtype not in {"float", "hpfloat"}:
+            raise ValueError("finite applies only to floating dtypes")
+        if any(not math.isfinite(value) for value in bounds.values()):
+            raise ValueError("value bounds must be finite numbers")
+        if "ge" in bounds and "gt" in bounds:
+            raise ValueError("declare at most one of ge and gt")
+        if "le" in bounds and "lt" in bounds:
+            raise ValueError("declare at most one of le and lt")
+        lower = bounds.get("ge", bounds.get("gt"))
+        upper = bounds.get("le", bounds.get("lt"))
+        if (
+            lower is not None
+            and upper is not None
+            and (
+                lower > upper or (lower == upper and ("gt" in bounds or "lt" in bounds))
+            )
+        ):
+            raise ValueError(f"value bounds {bounds} admit no value")
+
+    @property
+    def has_value_constraints(self) -> bool:
+        """Whether materialization checks finiteness or bounds of this field."""
+
+        return self.finite or any(
+            getattr(self, name) is not None for name in ("ge", "gt", "le", "lt")
+        )
+
+    def value_violations(self, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+        """Return ``(constraint, mask)`` for every violated value constraint.
+
+        With ``finite`` NaN violates the bounds too; a non-finite field may
+        hold NaN, and its bounds apply to the other values.
+        """
+
+        return value_violations(
+            tensor, finite=self.finite, ge=self.ge, gt=self.gt, le=self.le, lt=self.lt
+        )
+
+
+def value_violations(
+    tensor: torch.Tensor,
+    *,
+    finite: bool = False,
+    ge: float | None = None,
+    gt: float | None = None,
+    le: float | None = None,
+    lt: float | None = None,
+) -> list[tuple[str, torch.Tensor]]:
+    """Return ``(constraint, mask)`` for every violated value constraint.
+
+    With ``finite`` NaN and infinities are rejected and NaN also violates the
+    bounds; without it NaN is allowed and the bounds apply to the other
+    values. Reads one flag array back from the tensor's device.
+    """
+
+    return violated_masks(
+        constraint_masks(tensor, finite=finite, ge=ge, gt=gt, le=le, lt=lt)
+    )
+
+
+def constraint_masks(
+    tensor: torch.Tensor,
+    *,
+    finite: bool = False,
+    ge: float | None = None,
+    gt: float | None = None,
+    le: float | None = None,
+    lt: float | None = None,
+) -> list[tuple[str, torch.Tensor]]:
+    """Return ``(constraint, mask)`` of every declared constraint, unchecked.
+
+    A mask is true where the value violates its constraint. Building the masks
+    never synchronizes the device; :func:`violated_masks` reads them back.
+    """
+
+    checks: list[tuple[str, torch.Tensor]] = []
+    allow_nan = not finite and tensor.is_floating_point()
+    if finite and tensor.is_floating_point():
+        checks.append(("finite", ~torch.isfinite(tensor)))
+    for name, bound, holds in (
+        ("ge", ge, torch.greater_equal),
+        ("gt", gt, torch.greater),
+        ("le", le, torch.less_equal),
+        ("lt", lt, torch.less),
+    ):
+        if bound is not None:
+            violated = ~holds(tensor, bound)
+            if allow_nan:
+                violated &= ~torch.isnan(tensor)
+            checks.append((f"{name}={bound!r}", violated))
+    return checks
+
+
+def violated_masks(
+    checks: list[tuple[Any, torch.Tensor]],
+) -> list[tuple[Any, torch.Tensor]]:
+    """Keep the ``(key, mask)`` entries whose mask has a true value.
+
+    Flags are reduced per device and read back with one synchronization per
+    device, however many masks are checked.
+    """
+
+    by_device: dict[torch.device, list[int]] = {}
+    for index, (_key, mask) in enumerate(checks):
+        by_device.setdefault(mask.device, []).append(index)
+    violated: set[int] = set()
+    for indices in by_device.values():
+        flags = torch.stack([checks[index][1].any() for index in indices]).tolist()
+        violated.update(index for index, flag in zip(indices, flags) if flag)
+    return [check for index, check in enumerate(checks) if index in violated]
 
 
 class PartitionSchema(HydroForgeModel):

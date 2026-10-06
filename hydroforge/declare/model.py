@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Model declaration fields, class-level declarations and the frozen ``ModelSpec``."""
 
 from __future__ import annotations
@@ -20,8 +26,11 @@ from pydantic import (
     model_validator,
 )
 
-from hydroforge.contracts.conditions import module_conditions
-from hydroforge.contracts.options import OptionsConfig
+from hydroforge.contracts.conditions import (
+    declared_condition_errors,
+    field_conditions,
+)
+from hydroforge.contracts.options import OptionsConfig, reject_rules_declaration
 from hydroforge.contracts.parameters import ParameterChange
 from hydroforge.contracts.runtime import BackendRequirement, ModuleRequirement
 from hydroforge.contracts.schedule import SimulationSchedule
@@ -34,7 +43,7 @@ from hydroforge.contracts.windows import StatisticsPlan
 from hydroforge.core.events import ConsoleEventSink, EventSink
 from hydroforge.core.expr import parse_operation, parse_value_source
 from hydroforge.core.naming import Identifier, validate_safe_path_component
-from hydroforge.core.validation import FrozenMapping, HydroForgeModel
+from hydroforge.core.validation import FrozenMapping, HydroForgeModel, field_default
 from hydroforge.data.input import InputProxy
 from hydroforge.declare.kernel_field import _KernelField
 from hydroforge.declare.module import (
@@ -42,8 +51,9 @@ from hydroforge.declare.module import (
     _STRICT,
     ModuleReference,
     _declared_attributes,
+    check_module_conflicts,
 )
-from hydroforge.declare.spec import ModelSpec, StepFieldPlan
+from hydroforge.declare.spec import ModelSpec, ModuleSpec, StepFieldPlan
 from hydroforge.io.netcdf.options import (
     default_netcdf_options,
     normalize_netcdf_variable_options,
@@ -62,9 +72,45 @@ _PARTITION_KEY = TypeAdapter(Identifier | None, config=_STRICT)
 _PARTITION_GROUP = TypeAdapter(Identifier, config=_STRICT)
 
 
+def _contract_errors(
+    cls: type[ModelDeclaration], modules: Mapping[str, ModuleSpec]
+) -> list[str]:
+    """Check every condition and option declaration of a model class."""
+
+    errors: list[str] = []
+    options_type = cls.model_fields["options"].annotation
+    for module in modules.values():
+        unknown = set(module.references).difference(modules)
+        for field in module.tensor_fields.values():
+            for condition in field_conditions(field):
+                unknown.update(condition.modules().difference(modules))
+                errors.extend(
+                    f"{module.name}.{field.name}: {error}"
+                    for error in declared_condition_errors(condition, options_type)
+                )
+        if unknown:
+            errors.append(
+                f"Module {module.name!r} references unknown modules: {sorted(unknown)}"
+            )
+    if (
+        isinstance(options_type, type)
+        and issubclass(options_type, OptionsConfig)
+        and options_type is not OptionsConfig
+    ):
+        unknown = options_type.referenced_modules().difference(modules)
+        if unknown:
+            errors.append(
+                f"options type {options_type.__name__} references unknown "
+                f"modules: {sorted(unknown)}"
+            )
+        errors.extend(options_type.nested_declaration_errors())
+    return errors
+
+
 def _model_spec(cls: type[ModelDeclaration]) -> ModelSpec:
     """Validate and freeze one model class declaration."""
 
+    reject_rules_declaration(cls)
     for name, field in cls.model_fields.items():
         if isinstance(field.default, ModuleReference):
             raise ValueError(f"module reference {name!r} conflicts with a model field")
@@ -85,21 +131,13 @@ def _model_spec(cls: type[ModelDeclaration]) -> ModelSpec:
     modules = {
         name: reference.module_type.spec() for name, reference in references.items()
     }
-    for module in modules.values():
-        unknown = set(module.references).difference(modules)
-        for field in module.tensor_fields.values():
-            unknown.update(
-                set(
-                    (
-                        *module_conditions(field.tensor.depends_on),
-                        *field.tensor.required_by,
-                    )
-                ).difference(modules)
-            )
-        if unknown:
-            raise ValueError(
-                f"Module {module.name!r} references unknown modules: {sorted(unknown)}"
-            )
+    errors = _contract_errors(cls, modules)
+    if len(errors) == 1:
+        raise ValueError(errors[0])
+    if errors:
+        raise ValueError(
+            f"{cls.__name__} declares invalid contracts:\n  - " + "\n  - ".join(errors)
+        )
     return ModelSpec(
         model_type=cls,
         modules=MappingProxyType(modules),
@@ -128,16 +166,14 @@ def _model_spec(cls: type[ModelDeclaration]) -> ModelSpec:
 
 
 def include_option_required_modules(cls: type[ModelDeclaration], data: Any) -> Any:
-    """Materialize modules implied by selected options before validation."""
+    """Open modules required by options declared ``on_missing="open"``."""
 
     if not isinstance(data, Mapping):
         return data
     values = dict(data)
     options_field = cls.model_fields["options"]
     raw_options = (
-        values["options"]
-        if "options" in values
-        else options_field.get_default(call_default_factory=True)
+        values["options"] if "options" in values else field_default(options_field)
     )
     options = (
         raw_options
@@ -149,13 +185,18 @@ def include_option_required_modules(cls: type[ModelDeclaration], data: Any) -> A
     opened = (
         values["opened_modules"]
         if "opened_modules" in values
-        else opened_field.get_default(call_default_factory=True)
+        else field_default(opened_field)
     )
     if type(opened) is not tuple:
         return values
     module_specs = cls.spec().modules
+    # Only on_missing="open" choices add modules; "error" choices are checked
+    # with every other construction contract once the selection is final.
     required = {
-        module for modules in options.required_modules().values() for module in modules
+        module
+        for requirement in options.option_requirements()
+        if requirement.on_missing == "open"
+        for module in requirement.modules
     }
     pending = list(required)
     while pending:
@@ -292,8 +333,10 @@ class OutputConfig(HydroForgeModel):
     def _validate_variables(cls, value: Any):
         """Canonicalize the original user-facing statistics declaration."""
 
-        if type(value) is not dict:
-            raise ValueError("variables must be an exact dict")
+        # A mapping of lists, or the frozen mapping of tuples this field
+        # stores, so a validated configuration can be passed on again.
+        if not isinstance(value, Mapping):
+            raise ValueError("variables must be a mapping")
         normalized: dict[str, tuple[str | Mapping[str, str], ...]] = {}
         for operation, items in value.items():
             if type(operation) is not str or not operation:
@@ -302,13 +345,15 @@ class OutputConfig(HydroForgeModel):
                 )
             canonical = operation.lower()
             if canonical != "static":
-                parse_operation(canonical)
+                canonical = parse_operation(canonical).spelling
             if canonical in normalized:
                 raise ValueError(
                     f"variables contains duplicate normalized operation {canonical!r}"
                 )
-            if type(items) is not list:
-                raise ValueError(f"variables[{operation!r}] must be an exact list")
+            if type(items) not in (list, tuple):
+                raise ValueError(
+                    f"variables[{operation!r}] must be an exact list or tuple"
+                )
             compiled_items: list[str | Mapping[str, str]] = []
             for item in items:
                 if type(item) is str:
@@ -316,7 +361,7 @@ class OutputConfig(HydroForgeModel):
                         raise ValueError("statistics field names must be non-empty")
                     compiled_items.append(item)
                     continue
-                if type(item) is not dict or len(item) != 1:
+                if not isinstance(item, Mapping) or len(item) != 1:
                     raise ValueError(
                         "variables items must be field names or "
                         "one-item {alias: expression} dicts"
@@ -334,7 +379,7 @@ class OutputConfig(HydroForgeModel):
                         "statistics aliases and expressions must be "
                         "non-empty exact strings"
                     )
-                compiled_items.append(item)
+                compiled_items.append({alias: expression})
                 parse_value_source(expression)
             normalized[canonical] = tuple(compiled_items)
         pairs = set()
@@ -498,6 +543,21 @@ class ModelDeclaration(HydroForgeModel):
         default_factory=OutputConfig,
         description="Statistics, checkpoint and output-file configuration",
     )
+    strict_options: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "Reject, instead of warning about, options that differ from their "
+            "defaults while their relevant_when condition is false"
+        ),
+    )
+    init_mode: Literal["cold", "restart"] | None = Field(
+        default=None,
+        description=(
+            "Explicit initialization mode passed to every module as "
+            "init_mode; None keeps each module's own restart detection"
+        ),
+    )
 
     # The compiled plan and the runtime that owns every materialized resource.
     _plan: Any = PrivateAttr()
@@ -579,24 +639,14 @@ class ModelDeclaration(HydroForgeModel):
                     f"opened_modules: {missing_deps}. Required modules: "
                     f"{required}. Available modules: {value}"
                 )
-            present_conflicts = [
-                conflict
-                for conflict in module_spec.conflicts
-                if conflict in value and conflict != module
-            ]
-            if present_conflicts:
-                raise ValueError(
-                    f"Module '{module}' conflicts with modules present in "
-                    f"opened_modules: {present_conflicts}. These modules cannot "
-                    "be enabled together."
-                )
+            check_module_conflicts(module, module_spec.conflicts, value)
         return value
 
     @field_validator("ensemble_forcing_fields", mode="before")
     @classmethod
     def _validate_ensemble_forcing_declaration(cls, value: Any):
-        if type(value) is not dict:
-            raise ValueError("ensemble_forcing_fields must be an exact dict")
+        if not isinstance(value, Mapping):
+            raise ValueError("ensemble_forcing_fields must be a mapping")
         normalized: dict[str, tuple[str, ...]] = {}
         for module_name, field_names in value.items():
             if type(module_name) is not str or not module_name:

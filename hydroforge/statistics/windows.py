@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Statistics windows over model steps and the host state of open windows."""
 
 from __future__ import annotations
@@ -61,7 +67,7 @@ class StatisticsWindowController:
         self.schedule = schedule
         self._explicit_starts = {
             id(rule): tuple(window.start for window in rule.windows)
-            for rule in (plan.inner, plan._effective_outer)
+            for rule in (plan.inner, plan.effective_outer)
             if isinstance(rule, ExplicitWindows)
         }
         self._last_inner_key: Any = None
@@ -78,7 +84,7 @@ class StatisticsWindowController:
         if final.is_spin_up:
             return _NO_WINDOW
         position = self._rule_position(
-            self.plan._effective_outer,
+            self.plan.effective_outer,
             start=final.start,
             end=final.end,
             previous_key=None,
@@ -94,7 +100,7 @@ class StatisticsWindowController:
         schedule = self.schedule
         if schedule is None:
             return
-        for rule in (self.plan.inner, self.plan._effective_outer):
+        for rule in (self.plan.inner, self.plan.effective_outer):
             if isinstance(rule, ExplicitWindows):
                 for window in rule.windows:
                     require_calendar(
@@ -107,7 +113,7 @@ class StatisticsWindowController:
                         schedule.calendar,
                         label=f"explicit window {window.name!r} end",
                     )
-                    if type(window.start) is not type(schedule._start):
+                    if type(window.start) is not type(schedule.start):
                         raise ValueError(
                             f"explicit window {window.name!r} and simulation "
                             "schedule must use the same datetime representation"
@@ -253,7 +259,7 @@ class StatisticsWindowController:
         """
 
         final_step = step.index == len(self.schedule) - 1
-        outer_rule = self.plan._effective_outer
+        outer_rule = self.plan.effective_outer
         inner_position = self._rule_position(
             self.plan.inner,
             start=step.start,
@@ -450,7 +456,13 @@ class WindowState:
             self.outer_folded = False
         label, self.start_time = self.start_time, None
         self.inner_samples = False
-        return label if self.dirty else None
+        if not self.dirty:
+            return None
+        if label is None:
+            # ``None`` means "nothing to publish"; a sampled window must not
+            # be dropped silently for want of a time label.
+            raise RuntimeError("statistics window closed without a start time")
+        return label
 
 
 def bind_statistics_plan_schedule(
@@ -470,9 +482,9 @@ def bind_statistics_plan_schedule(
             for index, window in enumerate(rule.windows)
         }
         _calendar, normalized, _defaulted = normalize_calendar_dates(
-            {**values, "schedule start": schedule._start},
+            {**values, "schedule start": schedule.start},
             calendar=schedule.calendar,
-            preserve_cftime_declaration=isinstance(schedule._start, cftime.datetime),
+            preserve_cftime_declaration=isinstance(schedule.start, cftime.datetime),
         )
         return ExplicitWindows(
             windows=tuple(
@@ -501,7 +513,7 @@ def validate_statistics_window_schedule(
     controller = StatisticsWindowController(plan, schedule)
     controller._validate_schedule_contract()
     if isinstance(plan.inner, EveryStep) and isinstance(
-        plan._effective_outer,
+        plan.effective_outer,
         EveryStep,
     ):
         return

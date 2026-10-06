@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Demand-driven scalar time aggregation as one-lane kernel IR."""
 
 from __future__ import annotations
@@ -8,6 +14,7 @@ from dataclasses import dataclass
 import torch
 
 from hydroforge.core.expr import Expression
+from hydroforge.core.graph import dependency_order
 from hydroforge.kernels.codegen.expr import lower_expression
 from hydroforge.kernels.codegen.ir import (
     Assign,
@@ -59,20 +66,14 @@ class StepFieldCompileContext:
     expressions: Mapping[str, Expression]
 
     def dependencies(self) -> tuple[str, ...]:
-        ordered: dict[str, None] = {}
-
-        def visit(name: str) -> None:
-            if name in ordered:
-                return
-            expression = self.expressions.get(name)
-            if expression is not None:
-                for dependency in expression.dependencies:
-                    visit(dependency)
-            ordered[name] = None
-
-        for output in self.outputs:
-            visit(output.source)
-        return tuple(ordered)
+        expressions = self.expressions
+        return dependency_order(
+            dict.fromkeys(output.source for output in self.outputs),
+            lambda name: expressions[name].dependencies if name in expressions else (),
+            cycle_message=lambda cycle: (
+                f"cyclic device step field expression: {cycle[0]!r}"
+            ),
+        )
 
     @property
     def requires_calendar(self) -> bool:

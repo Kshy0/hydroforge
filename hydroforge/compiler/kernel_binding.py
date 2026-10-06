@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Static resolution of kernel parameters against one model plan.
 
 A parameter a call site omits binds by name: a step field, an optional value
@@ -18,17 +24,14 @@ import torch
 
 from hydroforge.compiler.fields import BindingSource
 from hydroforge.compiler.selection import resolve_block_size
-from hydroforge.contracts.conditions import is_option_condition
-from hydroforge.contracts.fields import concrete_tensor_dtype
+from hydroforge.contracts.fields import concrete_tensor_dtype, precision_dtype
 from hydroforge.contracts.step_fields import StepField
 from hydroforge.kernels.spec import (
-    ConfigValue,
     KernelSpec,
     KernelWorkspace,
     LiteralValue,
     ModuleEnabled,
     ModuleFlag,
-    OptionCode,
     OutputRequested,
 )
 
@@ -172,36 +175,6 @@ class KernelBindingPlan:
     def _gate(self, spec: KernelSpec, feature: str, disabled: Any, name: str) -> Source:
         enabled = self._compile_time(spec, feature)
         if isinstance(enabled, Fixed):
-            # A raw option flag is not the full field condition (mixed AND,
-            # required_by and output_only also affect residency). Fail once
-            # at binding rather than dispatch a true flag with a null pointer.
-            source = spec.compile_time_sources.get(feature)
-            if isinstance(source, ConfigValue) and name in spec.buffers:
-                field = name.removesuffix("_ptr")
-                conditioned = False
-                for module_name in self.plan.modules:
-                    module_spec = self.plan.spec.modules[module_name]
-                    index = module_spec.reference_indices.get(field)
-                    schema = module_spec.tensor_fields.get(
-                        index.reference if index is not None else field
-                    )
-                    if schema is not None and any(
-                        is_option_condition(item) for item in schema.tensor.depends_on
-                    ):
-                        conditioned = True
-                        break
-                if conditioned:
-                    # Multiple declarations may have one selected active owner.
-                    # Do not disable that owner because another declaration is
-                    # gated off; ordinary owner/dtype ambiguity still fails.
-                    active = bool(self.plan.fields.binding.get(field, ()))
-                    if enabled.value != active:
-                        return Unresolved(
-                            ValueError,
-                            f"{spec.name}.{name}: config feature {feature!r} disagrees "
-                            f"with complete field activation for {field!r}; "
-                            "use automatic optional binding or an activation-consistent feature",
-                        )
             if enabled.value:
                 return self._value(spec, name)
             return Fixed(disabled, "optional", feature)
@@ -242,18 +215,8 @@ class KernelBindingPlan:
                 f"kernel compile-time parameter {name!r} has no explicit "
                 "compile-time source",
             )
-        if isinstance(source, (ConfigValue, OptionCode, LiteralValue)):
-            if isinstance(source, ConfigValue):
-                value = (
-                    plan.conditions["options." + source.path]
-                    if "options." + source.path in plan.conditions
-                    else plan.options.value(source.path)
-                )
-            elif isinstance(source, OptionCode):
-                value = plan.options.option_code(source.path)
-            else:
-                value = source.value
-            return Fixed(value, "compile_time", name)
+        if isinstance(source, LiteralValue):
+            return Fixed(source.value, "compile_time", name)
         module_spec = plan.spec.modules.get(source.module)
         if module_spec is None:
             return Unresolved(
@@ -306,11 +269,9 @@ class KernelBindingPlan:
 
         plan = self.plan
         if name in spec.workspace:
-            dtype = spec.workspace[name].dtype
-            return plan.dtype if dtype == "precision" else getattr(torch, dtype)
+            return precision_dtype(spec.workspace[name].dtype, plan.dtype)
         if name in spec.step_fields:
-            dtype = spec.step_fields[name].dtype
-            return plan.dtype if dtype == "precision" else getattr(torch, dtype)
+            return precision_dtype(spec.step_fields[name].dtype, plan.dtype)
         field = name.removesuffix("_ptr")
         optional = name in spec.optional
         typed = []

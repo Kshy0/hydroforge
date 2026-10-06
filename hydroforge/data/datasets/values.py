@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """The single read-side value pipeline of forcing datasets.
 
 Every storage read passes ``ingest`` once: masked and NaN values follow the
@@ -161,15 +167,20 @@ def convert(
     aggregation: AggregationMethod | Mapping[str, AggregationMethod] | None = None,
     factor: int = 1,
     label: str,
+    unit_scale: float = 1.0,
+    unit_offset: float = 0.0,
 ) -> np.ndarray | dict[str, np.ndarray]:
-    """Aggregate ``factor`` source rows per output row, divide, and narrow.
+    """Aggregate ``factor`` source rows per output row, convert units, narrow.
 
+    Values are divided by ``unit_factor``, then multiplied by ``unit_scale``
+    and shifted by ``unit_offset`` (a ``check_units`` conversion).
     ``label`` names the storage kind in errors (``"NetCDF dataset"``).
     Unscaled, unaggregated values that allow a :func:`direct_cast` skip the
     float64 calculation copy.
     """
 
-    if aggregation is None and unit_factor == 1.0 and direct_cast(values.dtype):
+    identity = unit_factor == 1.0 and unit_scale == 1.0 and unit_offset == 0.0
+    if aggregation is None and identity and direct_cast(values.dtype):
         return finalize(
             values,
             out_dtype=out_dtype,
@@ -187,14 +198,24 @@ def convert(
             for name, method in aggregation.items()
         }
     blocks = converted.values() if isinstance(converted, dict) else (converted,)
-    if unit_factor != 1.0:
-        for block in blocks:
+    for block in blocks:
+        if unit_factor != 1.0:
             np.divide(block, unit_factor, out=block)
+        if unit_scale != 1.0:
+            np.multiply(block, unit_scale, out=block)
+        if unit_offset != 0.0:
+            np.add(block, unit_offset, out=block)
     reduces = aggregation in ("sum", "mean") or (
         isinstance(aggregation, Mapping)
         and any(method in {"sum", "mean"} for method in aggregation.values())
     )
-    checked = not bounded(values.dtype, out_dtype) or unit_factor < 1.0 or reduces
+    checked = (
+        not bounded(values.dtype, out_dtype)
+        or unit_factor < 1.0
+        or unit_scale > 1.0
+        or unit_offset != 0.0
+        or reduces
+    )
     if isinstance(converted, dict):
         return {
             name: finalize(
