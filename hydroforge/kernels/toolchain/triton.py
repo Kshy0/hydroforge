@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Triton toolchain: compile policy, launch options and precision variants.
 
 Compile policy
@@ -38,6 +44,7 @@ Precision variants
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import inspect
 import logging
 import re
@@ -69,6 +76,61 @@ _active_policy: ContextVar[bool] = ContextVar(
     "hydroforge_triton_compile_policy", default=False
 )
 _install_lock = threading.Lock()
+_NATIVE_MARKER = "hydroforge_native_pipeline"
+_MISSING = object()
+
+
+class _IdentityCache:
+    """Values per object identity and key, without hashing the object.
+
+    Triton's ``JITFunction.__hash__`` is relatively expensive.  Each entry
+    keeps its object, so an ``id`` is never reused while its entry exists;
+    like the other compiled-artifact caches, entries are never evicted.
+    """
+
+    __slots__ = ("_entries",)
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[Any, ...], tuple[Any, Any]] = {}
+
+    def get(self, owner: Any, *key: Any) -> Any:
+        cached = self._entries.get((id(owner), *key))
+        return _MISSING if cached is None or cached[0] is not owner else cached[1]
+
+    def put(self, owner: Any, value: Any, *key: Any) -> Any:
+        self._entries[(id(owner), *key)] = (owner, value)
+        return value
+
+
+def _native_marker(key: str) -> Any:
+    """Triton's cache entry recording that ``key`` needs the native pipeline."""
+    from triton.runtime.cache import get_cache_manager
+
+    return get_cache_manager(hashlib.sha256(f"{_POLICY}:{key}".encode()).hexdigest())
+
+
+def _known_native(key: str) -> bool:
+    """Whether the policy already failed for ``key``, here or in an earlier
+    process: a failed compilation leaves no Triton cache entry of its own."""
+    if key in _native_specializations:
+        return True
+    try:
+        known = _native_marker(key).get_file(_NATIVE_MARKER) is not None
+    except Exception:
+        return False
+    if known:
+        _native_specializations.add(key)
+    return known
+
+
+def _record_native(key: str) -> None:
+    _native_specializations.add(key)
+    try:
+        _native_marker(key).put(b"", _NATIVE_MARKER, binary=True)
+    except Exception:
+        _logger.debug(
+            "could not persist the Triton native-pipeline marker", exc_info=True
+        )
 
 
 def _coalesce_is_identity(ttir: str, threads: int) -> bool:
@@ -112,7 +174,7 @@ def _compile_with_fallback(compile_fn):
         hook = knobs.runtime.add_stages_inspection_hook
         preceding_key = hook() if hook is not None else ("", "")
         key = get_cache_key(src, backend, parsed, env) + repr(preceding_key)
-        if key in _native_specializations:
+        if _known_native(key):
             return compile_fn(src, target=target, options=options, _env_vars=env)
         policy = _active_policy.set(True)
         attempt = _policy_attempt.set(False)
@@ -131,7 +193,7 @@ def _compile_with_fallback(compile_fn):
                     )
                 finally:
                     _active_policy.reset(native)
-                _native_specializations.add(key)
+                _record_native(key)
                 _logger.warning(
                     "Triton policy compilation failed for %s; using the native pipeline",
                     src.name,
@@ -267,7 +329,7 @@ def _toolkit_libdevice() -> str | None:
     return None
 
 
-_LAUNCH_OPTIONS: dict[tuple[int, bool], tuple[Any, Any, Mapping[str, Any]]] = {}
+_LAUNCH_OPTIONS = _IdentityCache()
 
 
 def launch_options(kernel: Any, *, physics: bool) -> Mapping[str, Any]:
@@ -285,10 +347,9 @@ def launch_options(kernel: Any, *, physics: bool) -> Mapping[str, Any]:
     from triton.runtime import driver
 
     active = driver.active
-    key = (id(kernel), physics)
-    cached = _LAUNCH_OPTIONS.get(key)
-    if cached is not None and cached[0] is kernel and cached[1] is active:
-        return cached[2]
+    cached = _LAUNCH_OPTIONS.get(kernel, physics)
+    if cached is not _MISSING and cached[0] is active:
+        return cached[1]
     adopt(kernel)
     options: dict[str, Any] = {} if physics else {"enable_fp_fusion": False}
     target = active.get_current_target().backend
@@ -303,7 +364,7 @@ def launch_options(kernel: Any, *, physics: bool) -> Mapping[str, Any]:
             libdevice = _toolkit_libdevice()
             if libdevice is not None:
                 options["extern_libs"] = (("libdevice", libdevice),)
-    _LAUNCH_OPTIONS[key] = (kernel, active, options)
+    _LAUNCH_OPTIONS.put(kernel, (active, options), physics)
     return options
 
 
@@ -372,9 +433,7 @@ def active_triton_precision() -> tuple[str | None, frozenset[str]] | None:
     return None if active is None else active[:2]
 
 
-_TRITON_PRECISION_VARIANTS: dict[
-    tuple[int, tuple[tuple[str, str], ...]], tuple[Any, Any]
-] = {}
+_TRITON_PRECISION_VARIANTS = _IdentityCache()
 
 
 def precision_variant(
@@ -424,17 +483,10 @@ def precision_variant(
     ):
         return kernel
 
-    # Keep the source object alongside the integer key.  This avoids invoking
-    # Triton's relatively expensive ``JITFunction.__hash__`` while also
-    # preventing an id-reuse collision after a lazily-created implementation is
-    # collected.
     typed_names = tuple(sorted(types_by_name.items()))
-    key = (id(kernel), typed_names)
-    cached = _TRITON_PRECISION_VARIANTS.get(key)
-    if cached is not None:
-        source_kernel, variant = cached
-        if source_kernel is kernel:
-            return variant
+    cached = _TRITON_PRECISION_VARIANTS.get(kernel, typed_names)
+    if cached is not _MISSING:
+        return cached
 
     import triton
     import triton.language as tl
@@ -470,9 +522,9 @@ def precision_variant(
         )
         if hasattr(kernel, name) and getattr(kernel, name) not in (None, [], {})
     }
-    compiled = triton.jit(variant, **jit_kwargs)
-    _TRITON_PRECISION_VARIANTS[key] = (kernel, compiled)
-    return compiled
+    return _TRITON_PRECISION_VARIANTS.put(
+        kernel, triton.jit(variant, **jit_kwargs), typed_names
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,18 +537,14 @@ class _TritonLaunchSignature:
     float_defaults: frozenset[str]
 
 
-_TRITON_LAUNCH_SIGNATURES: dict[int, tuple[Any, _TritonLaunchSignature | None]] = {}
-
-
-_TRITON_LAUNCH_VARIANTS: dict[
-    tuple[int, str | None, frozenset[str], tuple[tuple[str, str], ...]], tuple[Any, Any]
-] = {}
+_TRITON_LAUNCH_SIGNATURES = _IdentityCache()
+_TRITON_LAUNCH_VARIANTS = _IdentityCache()
 
 
 def _triton_launch_signature(kernel: Any) -> _TritonLaunchSignature | None:
-    cached = _TRITON_LAUNCH_SIGNATURES.get(id(kernel))
-    if cached is not None and cached[0] is kernel:
-        return cached[1]
+    cached = _TRITON_LAUNCH_SIGNATURES.get(kernel)
+    if cached is not _MISSING:
+        return cached
     try:
         signature = inspect.signature(getattr(kernel, "fn", kernel))
     except (TypeError, ValueError):
@@ -516,8 +564,7 @@ def _triton_launch_signature(kernel: Any) -> _TritonLaunchSignature | None:
                 if isinstance(parameter.default, float)
             ),
         )
-    _TRITON_LAUNCH_SIGNATURES[id(kernel)] = (kernel, layout)
-    return layout
+    return _TRITON_LAUNCH_SIGNATURES.put(kernel, layout)
 
 
 def _declared_float_arguments(
@@ -590,14 +637,12 @@ def launch_variant(
     typed = tuple(
         sorted((name, kind) for name, kind in scalar_types.items() if name in names)
     )
-    key = (id(kernel), precision, names, typed)
-    cached = _TRITON_LAUNCH_VARIANTS.get(key)
-    if cached is not None and cached[0] is kernel:
-        return cached[1]
+    cached = _TRITON_LAUNCH_VARIANTS.get(kernel, precision, names, typed)
+    if cached is not _MISSING:
+        return cached
     selected = (
         precision_variant(kernel, precision, names, scalar_types=dict(typed))
         if typed
         else precision_variant(kernel, precision, names)
     )
-    _TRITON_LAUNCH_VARIANTS[key] = (kernel, selected)
-    return selected
+    return _TRITON_LAUNCH_VARIANTS.put(kernel, selected, precision, names, typed)

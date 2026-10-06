@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Typed boundary between external input storage and model tensors.
 
 ``InputProxy`` deliberately remains a storage abstraction: it can expose
@@ -24,6 +30,7 @@ from hydroforge.core.events import EventSink, ModelEvent, emit
 from hydroforge.data.input import select_values
 from hydroforge.declare.spec import FieldSpec, ModuleBinding
 from hydroforge.declare.tensors import ModulePayload
+from hydroforge.execution.binding import error_message
 from hydroforge.io.netcdf.read import normalize_selection
 
 if TYPE_CHECKING:
@@ -312,7 +319,11 @@ class InputBinding:
 
         return self._prepare(name, self.value(name))
 
-    def read_local(self, name: str, spatial_indices=None) -> Any:
+    def _local_selector(
+        self, name: str, spatial_indices=None
+    ) -> tuple[Any, ...] | None:
+        """The normalized rank-local selector of ``name``; ``None`` reads all."""
+
         axis = self.axes.get(name, 0)
         mesh = self.plan.parallel
         members = slice(None) if mesh is None else mesh.member_slice
@@ -321,8 +332,47 @@ class InputBinding:
         elif axis == 1:
             selector = members
         else:
+            return None
+        return normalize_selection(selector, self.proxy._shape(name))
+
+    def local_metadata(
+        self, name: str, spatial_indices=None
+    ) -> tuple[tuple[int, ...], torch.dtype] | None:
+        """Shape and dtype :meth:`read_local` returns, without reading values.
+
+        ``None`` for fields without a declared tensor dtype, whose prepared
+        value is a host scalar or object.
+        """
+
+        spec = self.fields.get(name)
+        if spec is None or spec.dtype is None:
+            return None
+        stored = self.proxy._shape(name)
+        selector = self._local_selector(name, spatial_indices)
+        if selector is None:
+            shape = stored
+        else:
+            selected: list[int] = []
+            for axis, item in enumerate(selector):
+                if isinstance(item, slice):
+                    selected.append(len(range(*item.indices(stored[axis]))))
+                elif isinstance(item, np.ndarray):
+                    selected.append(int(item.size))
+            shape = (*selected, *stored[len(selector) :])
+        members = self.plan.local_ensemble_size
+        tensor = spec.field.tensor
+        if (
+            members is not None
+            and tensor.category in {"state", "init_state"}
+            and len(shape) == len(tensor.shape)
+        ):
+            shape = (members, *shape)
+        return tuple(int(extent) for extent in shape), spec.dtype
+
+    def read_local(self, name: str, spatial_indices=None) -> Any:
+        selector = self._local_selector(name, spatial_indices)
+        if selector is None:
             return self[name]
-        selector = normalize_selection(selector, self.proxy._shape(name))
         value = self._values.get(name)
         return self._prepare(
             name,
@@ -473,14 +523,17 @@ def prepare_payloads(
                 "mixed_precision": plan.mixed_precision,
                 "metal_emulation": plan.metal_emulation,
                 "ensemble_size": plan.local_ensemble_size,
+                "init_mode": plan.init_mode,
+                "options": plan.options,
             }
         )
         try:
             payload = module_type.prepare_module_input(payload)
-            if not isinstance(payload, dict):
-                raise TypeError(
-                    f"module {name!r} prepare_module_input must return a dict"
-                )
+        except (KeyError, TypeError, OverflowError) as error:
+            raise ValueError(error_message(error)) from error
+        if not isinstance(payload, dict):
+            raise TypeError(f"module {name!r} prepare_module_input must return a dict")
+        try:
             prepared[name] = ModulePayload(
                 module_type,
                 payload,
@@ -496,5 +549,5 @@ def prepare_payloads(
                 defer_defaults=True,
             )
         except (KeyError, TypeError, OverflowError) as error:
-            raise ValueError(str(error)) from error
+            raise ValueError(error_message(error)) from error
     return prepared

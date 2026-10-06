@@ -1,8 +1,15 @@
-"""The one route of registered kernel calls inside a managed step.
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
 
-A registered kernel called inside a managed step goes to the innermost call
-sink as ``sink.call(registry, arguments)``: the recorder of an operator
-recording, or the step's kernel binder, which launches at once.  A sink's
+"""The one route of registered kernel calls of a model.
+
+A registered kernel goes to the innermost call sink as
+``sink.call(registry, arguments)``: the recorder of an operator recording, or
+the model's kernel binder, which launches at once. The binder is installed
+for managed steps, ``initialize_model_state`` and ``@between_steps`` bodies.  A sink's
 ``recording`` tells callers whether nothing launches until compilation.
 """
 

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Metal statistics: one MSL library, argument bindings reused per states.
 
 The plan's kernels map one thread to each saved point and loop over members
@@ -21,7 +27,11 @@ from hydroforge.statistics.kernel_plan import (
     StatisticsCompileContext,
     StatisticsKernelPlan,
 )
-from hydroforge.statistics.launch import CompiledStatistics, save_source
+from hydroforge.statistics.launch import (
+    CompiledStatistics,
+    save_source,
+    source_path,
+)
 from hydroforge.statistics.launch.metal_scatter import encoded_scatter
 from hydroforge.statistics.storage import StoragePlan
 
@@ -37,18 +47,18 @@ def compile_statistics(
     for scatter, declared in zip(
         plan.scatters, plan.lowering.ir.ordered_scatters(), strict=True
     ):
-        add = scatter.add
+        zero, add = scatter.zero, scatter.add
         if (
             context.storage[StoragePlan.scatter_buffer(declared.name)].dtype
             == torch.float64
         ):
+            # The destination-owned add writes every target and count itself.
             add, topology = encoded_scatter(
                 context, plan.lowering, declared.name, declared.source
             )
             extra.update(topology)
-        kernels.extend(
-            item for item in (scatter.zero, add, scatter.divide) if item is not None
-        )
+            zero = None
+        kernels.extend(item for item in (zero, add, scatter.divide) if item is not None)
     kernels.extend(plan.group_kernels("loop"))
     sample_count = len(kernels)
     kernels.extend(plan.settle_kernels("loop"))
@@ -96,12 +106,12 @@ def compile_statistics(
     settled: list[Any] = []
     closed = False
 
-    def internal_update_statistics(states, BLOCK_SIZE, phase):
+    def internal_update_statistics(states, block_size, phase):
         if closed:
             raise RuntimeError("Metal statistics program is closed")
         # The launches, and so the argument bindings, of one bound state
         # mapping serve every sample; Metal launches a fixed width.
-        del BLOCK_SIZE
+        del block_size
         if not bound or bound[0] is not states:
             previous = bound[1] if bound else ()
             bound[:] = [states, bind(states, programs[:sample_count])]
@@ -118,11 +128,12 @@ def compile_statistics(
             if mask is None or phase < 0 or phase & mask:
                 launch()
 
-    def settle(states, is_outer_first):
+    def settle(states, phase):
         if closed:
             raise RuntimeError("Metal statistics program is closed")
-        # The runtime already writes the close phase to device controls.
-        del is_outer_first
+        # The settle kernels read ``phase`` from the device controls, which
+        # the runtime wrote before this call.
+        del phase
         if not settled or settled[0] is not states:
             previous = settled[1] if settled else ()
             settled[:] = [states, bind(states, programs[sample_count:])]
@@ -158,9 +169,13 @@ def compile_statistics(
         ):
             pass
 
-    saved = save_source(context, source, ".metal") if context.save_kernels else None
-    if saved is not None and programs:
-        programs[0][1].save_source(saved)
+    saved = None
+    if context.save_kernels:
+        # A program saves its effective unit (with hp helpers) and sidecar.
+        if programs:
+            saved = programs[0][1].save_source(source_path(context, ".metal"))
+        else:
+            saved = save_source(context, source, ".metal")
     return CompiledStatistics(
         lowering=plan.lowering,
         function=internal_update_statistics,

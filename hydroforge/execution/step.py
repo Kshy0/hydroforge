@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Managed-step invocations: driver validation, the step transaction and its
 authoring scopes.
 
@@ -32,8 +38,13 @@ from hydroforge.execution.context import (
     validate_synchronous_function,
 )
 from hydroforge.execution.outer import outer_scope
-from hydroforge.execution.substeps import adaptive_scope, fixed_scope, predicate_scope
-from hydroforge.kernels.calls import routing
+from hydroforge.execution.substeps import (
+    INVALID_SUBSTEP_COUNT,
+    adaptive_scope,
+    fixed_scope,
+    predicate_scope,
+)
+from hydroforge.kernels.calls import recording_sink, routing
 
 if TYPE_CHECKING:
     from hydroforge.execution.session import ModelRuntime
@@ -43,21 +54,18 @@ _F = TypeVar("_F", bound=Callable[..., Any])
 
 # Messages for an authoring scope left by ``break`` or ``return`` before its
 # program was recorded and launched, keyed by the innermost open scope.
-_OPEN_SCOPE_ERRORS: dict[str, tuple[type[Exception], str]] = {
+_OPEN_SCOPE_ERRORS: dict[str, str] = {
     "substep": (
-        RuntimeError,
         "compiled substep scope was exited before recording and execution "
-        "completed; do not break or return from a step.fixed/adaptive loop",
+        "completed; do not break or return from a step.fixed/adaptive loop"
     ),
     "outer": (
-        RuntimeError,
         "outer operator scope was exited before recording and launch "
-        "completed; do not break or return from a step.outer() loop",
+        "completed; do not break or return from a step.outer() loop"
     ),
     "predicate": (
-        SubstepCompileError,
         "predicate loop scope was exited before recording completed; do not "
-        "break or return from a step.predicate() loop",
+        "break or return from a step.predicate() loop"
     ),
 }
 
@@ -159,9 +167,20 @@ class StepContext:
         elif self.current_time is not None:
             self.clock.time = self.current_time + self.duration
 
+    @staticmethod
+    def _require_unnested(kind: str) -> None:
+        """Reject a scope declared inside another scope's operator recording."""
+
+        if recording_sink() is not None:
+            raise SubstepCompileError(
+                f"step.{kind}() scopes cannot be nested inside another "
+                "fixed, adaptive, predicate or outer scope"
+            )
+
     def claim_substep_scope(self, kind: str, specialization: Any) -> tuple[Any, ...]:
         """Claim this managed method's sole cached substep scope."""
 
+        self._require_unnested(kind)
         self.substep_claimed = True
         self.scopes.append("substep")
         return (self.owner, kind, self.options_key, specialization)
@@ -173,6 +192,7 @@ class StepContext:
         shared helper) records one program per occurrence, in order.
         """
 
+        self._require_unnested("outer")
         occurrence = self._outer_sites.get(site, 0)
         self._outer_sites[site] = occurrence + 1
         self.scopes.append("outer")
@@ -182,8 +202,7 @@ class StepContext:
         """Reject a scope exited by ``break``/``return`` before completion."""
 
         if len(self.scopes) > depth:
-            error, message = _OPEN_SCOPE_ERRORS[self.scopes[-1]]
-            raise error(message)
+            raise SubstepCompileError(_OPEN_SCOPE_ERRORS[self.scopes[-1]])
 
     def sample(self, *, first: bool, last: bool, weight: float) -> None:
         """Run one host-issued statistics sample when the step collects output."""
@@ -305,17 +324,17 @@ class _Conditions:
     """Runtime facts a driver request is validated against."""
 
     time_step_supplied: bool
-    schedule_configured: bool
     spinup: bool
-    statistics_configured: bool
     current_time_available: bool
+    schedule_configured: bool
+    statistics_configured: bool
 
 
 class _StepRequest(HydroForgeModel):
     """The complete driver-owned input to one managed-step invocation."""
 
     time_step: timedelta | None = None
-    num_sub_steps: int | None = Field(default=None, ge=1, lt=(1 << 31) - 1)
+    num_sub_steps: int | None = Field(default=None, ge=1, lt=INVALID_SUBSTEP_COUNT)
     output_enabled: bool | None = None
 
     @model_validator(mode="after")
@@ -352,13 +371,13 @@ class _StepRequest(HydroForgeModel):
 class _Invocation:
     """One validated driver request resolved against the runtime clock."""
 
-    __slots__ = ("current_time", "scheduled_step", "request", "key")
+    __slots__ = ("current_time", "scheduled_step", "request", "conditions")
 
-    def __init__(self, current_time, scheduled_step, request, key) -> None:
+    def __init__(self, current_time, scheduled_step, request, conditions) -> None:
         self.current_time = current_time
         self.scheduled_step = scheduled_step
         self.request = request
-        self.key = key
+        self.conditions = conditions
 
     def signature(self) -> Any:
         """Return the exact driver and schedule identity shared by all ranks."""
@@ -371,7 +390,7 @@ class _Invocation:
                 request.time_step,
                 request.num_sub_steps,
                 request.output_enabled,
-                self.key[6:],
+                self.conditions,
             )
         )
 
@@ -456,19 +475,16 @@ class _ManagedStepDescriptor:
         duration = kwargs.get("time_step")
         count = kwargs.get("num_sub_steps")
         output = kwargs.get("output_enabled")
-        key = (
-            type(duration),
-            duration,
-            type(count),
-            count,
-            type(output),
-            output,
-            "time_step" in kwargs,
+        # An explicit ``None`` is the advertised default, not a supplied value.
+        conditions = (
+            duration is not None,
             step is not None and step.is_spin_up,
             current_time is not None,
             schedule is not None,
             statistics_configured,
         )
+        key = (type(duration), duration, type(count), count, type(output), output)
+        key += conditions
         cacheable = (
             kwargs.keys() <= _FRAMEWORK_STEP_PARAMETERS
             and (duration is None or type(duration) is timedelta)
@@ -479,17 +495,11 @@ class _ManagedStepDescriptor:
         if request is None:
             request = _StepRequest.model_validate(
                 kwargs,
-                context=_Conditions(
-                    time_step_supplied="time_step" in kwargs,
-                    schedule_configured=schedule is not None,
-                    spinup=key[7],
-                    statistics_configured=statistics_configured,
-                    current_time_available=key[8],
-                ),
+                context=_Conditions(*conditions),
             )
             if cacheable and len(self.requests) < 64:
                 self.requests[key] = request
-        return _Invocation(current_time, step, request, key)
+        return _Invocation(current_time, step, request, conditions)
 
 
 class _StepPolicy:
@@ -564,18 +574,15 @@ class _StepPolicy:
         current_time = invocation.current_time
         progress = self.progress
         entered_user_step = False
-        preparation_failed = False
         try:
             if statistics is not None:
                 statistics.sink.poll(current_time)
-            try:
-                if context.mesh is not None:
-                    context.mesh.validate_live()
-                if self.runtime.structure_hooks:
-                    self.runtime.update_structure()
-            except BaseException:
-                preparation_failed = True
-                raise
+            if context.mesh is not None:
+                context.mesh.validate_live()
+            if self.runtime.structure_hooks:
+                # A structural commit poisons the model itself once it has
+                # mutated state; a rejected staging leaves the model usable.
+                self.runtime.run_structure_hooks()
             context.begin(invocation, self.descriptor)
             managed = ManagedStep(context)
             step = invocation.scheduled_step
@@ -635,7 +642,7 @@ class _StepPolicy:
                 context.commit_clock()
             return result
         except BaseException as error:
-            poison = preparation_failed or entered_user_step or channel.distributed
+            poison = entered_user_step or channel.distributed
             resolved = self._fail(
                 snapshot,
                 error,
@@ -670,7 +677,9 @@ def managed_step(function: _F) -> _F:
     @wraps(function)
     def wrapper(*args, **kwargs):
         # ``ModelRuntime.of`` without importing the session that imports us.
-        runtime = (args[0] if args else kwargs["self"]).__pydantic_private__["_runtime"]
+        if not args:
+            raise TypeError(f"{method_name}() requires the model instance positionally")
+        runtime = args[0].__pydantic_private__["_runtime"]
         channel = runtime.channel
         materialized = runtime.state == "materialized"
         if materialized and not channel.distributed:

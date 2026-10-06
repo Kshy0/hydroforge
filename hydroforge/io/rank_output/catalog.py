@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Discovery and validation of the rank files of one output variable."""
 
 from __future__ import annotations
@@ -267,9 +273,13 @@ def scan_rank_files(
     Every rank ``0..world_size-1`` must be present with one shared layout,
     run identity and coordinate name; saved-point IDs are unique across
     ranks.  The catalog timeline is the committed prefix common to all ranks.
+    Files of an earlier run left beside the output (another run identity)
+    are ignored: the output is the run that wrote the newest file.  A rank
+    may lack trailing years another rank already started.
     """
 
-    by_rank: dict[int, dict[int | None, Path]] = {}
+    parsed_paths: dict[Path, tuple[int, int | None]] = {}
+    run_ids: dict[Path, str] = {}
     for path in files.identities:
         parsed = parse_rank_file_name(path.name, var_name, split_by_year=split_by_year)
         if parsed is None:
@@ -278,7 +288,19 @@ def scan_rank_files(
                 f"configured {'year-split' if split_by_year else 'single-file'} "
                 "rank naming contract"
             )
-        rank, year = parsed
+        parsed_paths[path] = parsed
+        with files.open_netcdf(path) as dataset:
+            run_ids[path] = RankFileHeader.read(dataset, path=path).run_id
+    if len(set(run_ids.values())) > 1:
+        newest = max(run_ids, key=lambda path: files.identities[path].mtime_ns)
+        parsed_paths = {
+            path: parsed
+            for path, parsed in parsed_paths.items()
+            if run_ids[path] == run_ids[newest]
+        }
+
+    by_rank: dict[int, dict[int | None, Path]] = {}
+    for path, (rank, year) in parsed_paths.items():
         rank_paths = by_rank.setdefault(rank, {})
         if year in rank_paths:
             raise ValueError(
@@ -316,14 +338,18 @@ def scan_rank_files(
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 
-    reference = scanned[0]
-    layout = reference.layout
-    for other in scanned[1:]:
-        if other.years != reference.years:
+    layout = scanned[0].layout
+    # Ranks create a year's files on their own first row of that year, so a
+    # stopped run may leave some ranks a year behind; the common committed
+    # prefix below excludes the extra year.
+    years = max((entry.years for entry in scanned), key=len)
+    for other in scanned:
+        if other.years != years[: len(other.years)]:
             raise ValueError(
-                f"rank {other.rank} output years differs from rank 0: "
-                f"{other.years!r} != {reference.years!r}"
+                f"rank {other.rank} output years {other.years!r} are not a "
+                f"prefix of {years!r}"
             )
+    for other in scanned[1:]:
         for field in fields(RankLayout):
             left, right = getattr(other.layout, field.name), getattr(layout, field.name)
             if left != right:

@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <memory>
@@ -59,7 +60,8 @@ std::mutex* const retired_mutex = new std::mutex();
 auto* const retired_resources = new std::vector<std::shared_ptr<void>>();
 
 // Completion handlers only hand ownership back; Objective-C and Torch
-// releases run here, on a host thread calling into this extension.
+// releases run here, on a host thread calling into this extension: every
+// create, release, dispatch and replay drains what has completed.
 void drain_retired_resources() {
   std::vector<std::shared_ptr<void>> completed;
   {
@@ -134,11 +136,15 @@ NSUInteger validate_group_size(const Pipeline& pipeline, uint64_t requested) {
   return static_cast<NSUInteger>(requested);
 }
 
+// Scalar arguments of one binding share one buffer, one slot each. A slot
+// keeps every constant-address-space offset 256-byte aligned, as macOS
+// requires of constant buffer offsets.
+constexpr NSUInteger kScalarSlot = 256;
+
 template <typename Scalar>
-id<MTLBuffer> allocate_scalar_buffer(id<MTLDevice> device, pybind11::handle value) {
+void write_scalar(id<MTLBuffer> buffer, NSUInteger offset, pybind11::handle value) {
   Scalar scalar = pybind11::cast<Scalar>(value);
-  return [device newBufferWithBytes:&scalar length:sizeof(scalar)
-                           options:MTLResourceStorageModeShared];
+  std::memcpy(static_cast<char*>([buffer contents]) + offset, &scalar, sizeof(scalar));
 }
 
 MTLLanguageVersion latest_stable_msl_version() {
@@ -360,6 +366,20 @@ int64_t create_argument_binding(
               "Failed to allocate Metal argument buffer");
   [pipeline->argument_encoder setArgumentBuffer:binding->encoded offset:0];
   binding->resources.push_back({binding->encoded, MTLResourceUsageRead});
+  NSUInteger scalar_count = 0;
+  for (const auto kind : pipeline->argument_types) {
+    if (kind != Pipeline::ArgumentType::Buffer) ++scalar_count;
+  }
+  id<MTLBuffer> scalars = nil;
+  if (scalar_count != 0) {
+    scalars = [device newBufferWithLength:scalar_count * kScalarSlot
+                                  options:MTLResourceStorageModeShared];
+    TORCH_CHECK(scalars != nil, "Failed to allocate Metal scalar argument buffer");
+    // The binding owns the +1 reference from here on, including on errors.
+    binding->owned_scalar_buffers.push_back(scalars);
+    binding->resources.push_back({scalars, MTLResourceUsageRead});
+  }
+  NSUInteger scalar_offset = 0;
   for (pybind11::ssize_t i = 0; i < arguments.size(); ++i) {
     const auto kind = pipeline->argument_types[static_cast<size_t>(i)];
     pybind11::handle value = arguments[i];
@@ -376,24 +396,24 @@ int64_t create_argument_binding(
         offset = tensor.storage_offset() * tensor.element_size();
         binding->retained_tensors.push_back(tensor);
       }
-    } else if (kind == Pipeline::ArgumentType::Float32) {
-      buffer = allocate_scalar_buffer<float>(device, value);
-    } else if (kind == Pipeline::ArgumentType::Int32) {
-      buffer = allocate_scalar_buffer<int32_t>(device, value);
-    } else if (kind == Pipeline::ArgumentType::UInt32) {
-      buffer = allocate_scalar_buffer<uint32_t>(device, value);
-    } else if (kind == Pipeline::ArgumentType::Int64) {
-      buffer = allocate_scalar_buffer<int64_t>(device, value);
     } else {
-      buffer = allocate_scalar_buffer<bool>(device, value);
+      buffer = scalars;
+      offset = scalar_offset;
+      scalar_offset += kScalarSlot;
+      if (kind == Pipeline::ArgumentType::Float32) {
+        write_scalar<float>(buffer, offset, value);
+      } else if (kind == Pipeline::ArgumentType::Int32) {
+        write_scalar<int32_t>(buffer, offset, value);
+      } else if (kind == Pipeline::ArgumentType::UInt32) {
+        write_scalar<uint32_t>(buffer, offset, value);
+      } else if (kind == Pipeline::ArgumentType::Int64) {
+        write_scalar<int64_t>(buffer, offset, value);
+      } else {
+        write_scalar<bool>(buffer, offset, value);
+      }
     }
-    if (kind != Pipeline::ArgumentType::Buffer) {
-      binding->owned_scalar_buffers.push_back(buffer);
-    }
-    TORCH_CHECK(buffer != nil || kind == Pipeline::ArgumentType::Buffer,
-                "Failed to allocate Metal scalar argument buffer at index ", i);
     [pipeline->argument_encoder setBuffer:buffer offset:offset atIndex:i];
-    if (buffer != nil) {
+    if (buffer != nil && kind == Pipeline::ArgumentType::Buffer) {
       binding->resources.push_back({
           buffer, pipeline->argument_usage[static_cast<size_t>(i)]});
     }
@@ -419,6 +439,7 @@ void dispatch(
     int64_t binding_id,
     uint64_t threads,
     uint64_t requested_group_size) {
+  drain_retired_resources();
   validate_grid_extent(threads);
   auto pipeline = get_pipeline(pipeline_id);
   auto binding = get_binding(binding_id, pipeline_id);
@@ -445,6 +466,7 @@ void dispatch_sequence(
     const std::vector<uint64_t>& threads,
     const std::vector<uint64_t>& group_sizes,
     const std::vector<bool>& barriers) {
+  drain_retired_resources();
   const size_t count = pipeline_ids.size();
   TORCH_CHECK(binding_ids.size() == count && threads.size() == count &&
                   group_sizes.size() == count && barriers.size() == count,
@@ -572,6 +594,7 @@ int64_t create_icb(
 }
 
 void replay_icb(int64_t graph_id, uint64_t replays) {
+  drain_retired_resources();
   TORCH_CHECK(replays > 0, "ICB replay count must be positive");
   std::shared_ptr<ICBGraph> graph;
   {

@@ -44,10 +44,8 @@ def _read_fortran(path: Path, shape: tuple[int, ...], dtype: np.dtype) -> np.nda
             f"binary file {path} has {identity.size} bytes; expected "
             f"{expected_size} bytes for shape {shape} and dtype {dtype.str!r}"
         )
-    try:
-        array = np.fromfile(path, dtype=dtype, count=prod(shape))
-    finally:
-        identity.verify(path, label="binary file")
+    array = np.fromfile(path, dtype=dtype, count=prod(shape))
+    identity.verify(path, label="binary file")
     return array.reshape(shape, order="F")
 
 

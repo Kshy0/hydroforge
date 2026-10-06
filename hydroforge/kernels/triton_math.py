@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Triton math for physics kernels, exact in the kernel's precision.
 
 Two Triton lowerings make kernels deviate from the CPU reference models and
@@ -25,13 +31,22 @@ index.
 
 Operands may be tensors or Python numbers, but at least one operand of each
 call must be a tensor, whose dtype types the numbers.
+
+Under the Triton interpreter (``TRITON_INTERPRET=1``, CPU verification),
+``libdevice`` is replaced by NumPy forms of the same functions and
+:func:`is_hip` is false; compiled kernels are unaffected. Generated kernels
+import ``libdevice`` from this module for the same reason.
 """
 
 from __future__ import annotations
 
+from typing import Any
+
+import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton import knobs
 from triton.language import core
 from triton.language.extra import libdevice
 
@@ -39,15 +54,76 @@ from hydroforge.platform.backend import TRITON
 
 FAST_MATH = tl.constexpr(TRITON.math.physics_fast_math)
 _HIP = tl.constexpr(torch.version.hip is not None)
+INTERPRET = bool(knobs.runtime.interpret)
+"""Whether ``triton.jit`` builds interpreted functions (``TRITON_INTERPRET=1``).
+
+Read once at import, as ``triton.jit`` itself decides when this module's
+functions are decorated.
+"""
 
 
-@core.builtin
-def _is_hip(_semantic=None):
-    # Read the compilation's captured options, never the mutable active driver.
-    backend = getattr(
-        _semantic.builder.options, "backend_name", "hip" if _HIP.value else ""
-    )
-    return tl.constexpr(backend == "hip")
+if INTERPRET:
+
+    class _InterpretedLibdevice:
+        """NumPy (CPU libm) forms of the libdevice functions HydroForge calls.
+
+        The Triton interpreter cannot lower extern calls; it already evaluates
+        ``tl.div_rn``/``tl.sqrt_rn``/``tl.exp`` with NumPy, so these keep the
+        interpreted results IEEE/libm accurate. Compiled kernels never use it.
+        """
+
+        _FUNCTIONS = {
+            "cbrt": np.cbrt,
+            "cos": np.cos,
+            "exp": np.exp,
+            "fmod": np.fmod,
+            "log": np.log,
+            "pow": np.power,
+            "sin": np.sin,
+            "sqrt": np.sqrt,
+            "tan": np.tan,
+        }
+
+        def __getattr__(self, name: str) -> Any:
+            try:
+                op = self._FUNCTIONS[name]
+            except KeyError:
+                raise AttributeError(
+                    f"libdevice.{name} has no TRITON_INTERPRET form"
+                ) from None
+
+            def call(*args: tl.tensor) -> tl.tensor:
+                from triton.runtime.interpreter import TensorHandle
+
+                first = args[0]
+                result = next(
+                    (arg.type for arg in args if arg.type.is_block()), first.type
+                )
+                data = np.asarray(op(*(arg.handle.data for arg in args)))
+                data = data.astype(first.handle.data.dtype, copy=False)
+                return tl.tensor(TensorHandle(data, first.handle.dtype.scalar), result)
+
+            return call
+
+    libdevice = _InterpretedLibdevice()  # noqa: F811
+
+    def is_hip():
+        """The interpreter runs on the CPU, never on ROCm."""
+        return tl.constexpr(False)
+
+else:
+
+    @core.builtin
+    def is_hip(_semantic=None):
+        """Whether the compilation targets ROCm.
+
+        Reads the compilation's captured options, never the mutable active
+        driver.
+        """
+        backend = getattr(
+            _semantic.builder.options, "backend_name", "hip" if _HIP.value else ""
+        )
+        return tl.constexpr(backend == "hip")
 
 
 @triton.jit
@@ -82,7 +158,7 @@ def sqrt(value):
     if FAST_MATH:
         return tl.sqrt(value)
     elif value.dtype == tl.float32:
-        if _is_hip():
+        if is_hip():
             # ROCm Triton's sqrt_rn returns NaN for subnormal inputs; OCML's
             # sqrt is IEEE.
             return libdevice.sqrt(value)
@@ -148,7 +224,7 @@ def cbrt(value):
     ROCm Triton's libdevice has no ``cbrt``; ``pow(x, 1/3)`` would round
     worse and return NaN for negative ``x``.
     """
-    if _is_hip():
+    if is_hip():
         return _ocml_cbrt(value)
     else:
         return libdevice.cbrt(value)
@@ -193,6 +269,7 @@ __all__ = [
     "constant",
     "divide",
     "exp",
+    "is_hip",
     "log",
     "pow",
     "sqrt",

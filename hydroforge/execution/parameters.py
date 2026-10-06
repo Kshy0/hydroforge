@@ -30,7 +30,7 @@ from hydroforge.core.devices import devices_match
 from hydroforge.core.errors import ResourceCleanupError
 from hydroforge.declare.module import AbstractModule
 from hydroforge.declare.tensors import ModulePayload, ModuleTensors
-from hydroforge.execution.partition import _searchsorted_batch
+from hydroforge.execution.partition import searchsorted_batch
 
 if TYPE_CHECKING:
     from hydroforge.compiler.fields import FieldEntry
@@ -114,7 +114,7 @@ class _TargetIdLookup:
     local_extent: int
 
     def global_indices(self, ids: np.ndarray) -> np.ndarray:
-        position = _searchsorted_batch(self.sorted_ids, ids)
+        position = searchsorted_batch(self.sorted_ids, ids)
         valid = position < self.sorted_ids.size
         hit = np.zeros(ids.shape, dtype=bool)
         hit[valid] = self.sorted_ids[position[valid]] == ids[valid]
@@ -557,6 +557,10 @@ class ParameterPlanRuntime:
         self._active_plans: list[ActivePlan] = []
         self._next_plan_idx = 0
         self._step_transaction_snapshots: list[tuple[Any, str, Any]] = []
+        # Static per-binding snapshot state, so applying active plans every
+        # step neither synchronizes on ``unique`` nor reallocates buffers.
+        self._snapshot_indices: dict[tuple[int, ...], torch.Tensor] = {}
+        self._derived_buffers: dict[str, torch.Tensor] = {}
 
     def _bind(self, item: _ParameterChangePlan) -> PlanItem:
         module = self.runtime.modules[item.module_name]
@@ -634,7 +638,7 @@ class ParameterPlanRuntime:
                     lookup = lookups[id(candidate_ids)] = (order, values[order])
                 order, ordered = lookup
                 requested = np.asarray(target.target_ids, dtype=ordered.dtype)
-                found = _searchsorted_batch(ordered, requested)
+                found = searchsorted_batch(ordered, requested)
                 present = found < ordered.size
                 present[present] &= ordered[found[present]] == requested[present]
                 positions = tuple(np.flatnonzero(present).tolist())
@@ -675,6 +679,7 @@ class ParameterPlanRuntime:
 
         if candidate is not None:
             self._plans, self._active_plans = candidate
+            self._snapshot_indices.clear()
 
     @staticmethod
     def _evaluate_derived(
@@ -794,6 +799,7 @@ class ParameterPlanRuntime:
         # Publish only a complete graph; a failed discovery remains retryable.
         self._aliases = aliases
         self._derived = {name: candidates[name] for name in order if name in candidates}
+        self._derived_buffers.clear()
         self.dependencies = MappingProxyType(dependencies)
         self._dependency_revision = revision
 
@@ -807,12 +813,12 @@ class ParameterPlanRuntime:
                     continue
                 fresh = self._evaluate_derived(module, name, descriptor)
                 current = getattr(module, name)
+                saved = self._derived_buffers.get(qualified)
+                if saved is None:
+                    saved = self._derived_buffers[qualified] = torch.empty_like(current)
+                saved.copy_(current.detach())
                 self._step_transaction_snapshots.append(
-                    (
-                        module,
-                        name,
-                        _TensorSnapshot(current.detach().clone(), None, 0),
-                    )
+                    (module, name, _TensorSnapshot(saved, None, 0))
                 )
                 current.copy_(fresh)
                 changed.update(self._aliases.get(qualified, (qualified,)))
@@ -863,15 +869,21 @@ class ParameterPlanRuntime:
                 index_axis=item.index_axis,
             )
 
-    @staticmethod
     def _snapshot_value(
+        self,
         value: torch.Tensor,
         plans: list[ActivePlan],
     ) -> _TensorSnapshot:
         indexed = [active.item.indices for active in plans]
         if all(indices is not None for indices in indexed):
             index_axis = plans[0].item.index_axis
-            indices = torch.unique(torch.cat(indexed))
+            key = tuple(id(active.item) for active in plans)
+            indices = self._snapshot_indices.get(key)
+            if indices is None:
+                # Bound items are retained by ``_plans``; their identities are
+                # stable until ``install_rebind`` clears this cache.
+                indices = torch.unique(torch.cat(indexed))
+                self._snapshot_indices[key] = indices
             values = value.detach().index_select(index_axis, indices)
             return _TensorSnapshot(values, indices, index_axis)
         return _TensorSnapshot(
@@ -991,7 +1003,9 @@ class ParameterPlanRuntime:
                 for (_, attr), plans in grouped.items():
                     selected = [p for p in plans if p.item.is_set_value == is_set]
                     if selected:
-                        self._apply_grouped_changes(plans[0].item.module, attr, selected)
+                        self._apply_grouped_changes(
+                            plans[0].item.module, attr, selected
+                        )
             self._refresh_derived_parameters(
                 {
                     f"{plans[0].item.module.module_name}.{attr}"

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Metal control kernels of compiled loops.
 
 The kernels are the rules of :mod:`hydroforge.kernels.backends.loop_control`
@@ -22,10 +28,13 @@ from hydroforge.kernels.backends.loop_control import (
 )
 from hydroforge.kernels.codegen.c import MSL, identifier, msl_arguments
 from hydroforge.kernels.codegen.ir import (
+    Binary,
     Cast,
+    Compare,
     Const,
     KernelFunction,
     Param,
+    Select,
     Store,
     Var,
 )
@@ -127,7 +136,12 @@ def _adaptive_accept() -> KernelFunction:
     )
 
 
-def _adaptive_end() -> KernelFunction:
+# ``status[0]`` gains this bit when a scatter of the iteration wrote an
+# out-of-range index (see :func:`adaptive_control_commands`).
+SCATTER_ERROR_STATUS = 2
+
+
+def _adaptive_end(*, scatter_error: bool = False) -> KernelFunction:
     params = (
         Param("duration", _REAL, "read"),
         Param("dt", _REAL, "read"),
@@ -137,10 +151,22 @@ def _adaptive_end() -> KernelFunction:
         Param("error", _INT, "read_write"),
         Param("status", _REAL, "write"),
         Param("maximum_steps", torch.int64),
+        *((Param("scatter_error", _INT, "read"),) if scatter_error else ()),
     )
     duration, dt, elapsed, counter, continue_flag, error = map(cell, params[:6])
+    failed: Any = Cast(error, _REAL)
+    if scatter_error:
+        failed = Binary(
+            "+",
+            failed,
+            Select(
+                Compare("!=", cell(params[-1]), Const(0, _INT)),
+                Const(float(SCATTER_ERROR_STATUS), _REAL),
+                Const(0.0, _REAL),
+            ),
+        )
     return KernelFunction(
-        "hf_adaptive_end",
+        "hf_adaptive_end_checked" if scatter_error else "hf_adaptive_end",
         params,
         (
             *loop_control.adaptive_end(
@@ -153,7 +179,7 @@ def _adaptive_end() -> KernelFunction:
                 maximum_steps=Var("maximum_steps", torch.int64),
             ),
             # ``(error, continue, dt)`` for one host read.
-            Store("status", Const(0), Cast(error, _REAL)),
+            Store("status", Const(0), failed),
             Store("status", Const(1), Cast(NEXT, _REAL)),
             Store("status", Const(2), dt),
         ),
@@ -162,6 +188,7 @@ def _adaptive_end() -> KernelFunction:
 
 _ADAPTIVE_ACCEPT = _adaptive_accept()
 _ADAPTIVE_END = _adaptive_end()
+_ADAPTIVE_END_CHECKED = _adaptive_end(scatter_error=True)
 
 
 def adaptive_control_commands(
@@ -176,8 +203,14 @@ def adaptive_control_commands(
     error_flag: torch.Tensor,
     status: torch.Tensor,
     maximum_steps: int,
+    scatter_error: torch.Tensor | None = None,
 ) -> tuple[MetalCommand, MetalCommand, MetalCommand]:
-    """``status`` receives ``(error, continue, dt)`` for one host read."""
+    """``status`` receives ``(error, continue, dt)`` for one host read.
+
+    With the iteration's ``(1,)`` int32 ``scatter_error`` bounds flag,
+    ``status[0]`` also adds :data:`SCATTER_ERROR_STATUS` when that flag is
+    set, so the host needs no separate read of it per iteration.
+    """
 
     begin = _command(_ADAPTIVE_BEGIN, candidate=candidate, maximum=maximum)
     accept = _command(
@@ -189,7 +222,7 @@ def adaptive_control_commands(
         error=error_flag,
     )
     end = _command(
-        _ADAPTIVE_END,
+        _ADAPTIVE_END if scatter_error is None else _ADAPTIVE_END_CHECKED,
         duration=duration,
         dt=dt,
         elapsed=elapsed,
@@ -198,5 +231,6 @@ def adaptive_control_commands(
         error=error_flag,
         status=status,
         maximum_steps=maximum_steps,
+        **({} if scatter_error is None else {"scatter_error": scatter_error}),
     )
     return begin, accept, end

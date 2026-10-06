@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """PyTorch spelling of kernel IR.
 
 Kernels (:meth:`TorchPrinter.kernel`) run every lane at once as tensor
@@ -12,12 +18,19 @@ loaded values select per lane with ``torch.where``, and atomic additions
 become ``index_add_``.  A ``While`` is a Python loop, so its condition is
 one value.  Floating literals and converted operands are tensors on the
 program's device.  A loaded view of a buffer the kernel writes is cloned
-when a local keeps it.
+when a local keeps it past a write of that buffer.
+
+Tensors that depend on nothing loaded (literals, lane ranges and locals of
+them) are module constants, created once when the module loads with the
+kernel's ``device``, which the module binds before its kernels.  A stored
+weighted mean writes its destination directly.
 """
 
 from __future__ import annotations
 
+import keyword
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -50,9 +63,10 @@ from hydroforge.kernels.codegen.ir import (
     Unary,
     Var,
     While,
+    integral,
     type_of,
 )
-from hydroforge.kernels.codegen.passes import effects, subexpressions
+from hydroforge.kernels.codegen.passes import _expression, effects, subexpressions
 
 _INDENT = "    "
 
@@ -79,26 +93,74 @@ def _hydroforge_binary_operands(left, right):
     return left, right
 
 
+# Select like the C printers (``a > b ? a : b``), also for signed zeros:
+# ``fmax`` decides NaN operands and distinct values, equal ones take
+# ``right``.  The eager CPU kernels of ``fmax``/``fmin`` return their first
+# operand for equal values, so there one call suffices.
 def hydroforge_maximum(left, right):
-    return torch.fmax(*_hydroforge_binary_operands(left, right))
+    left, right = _hydroforge_binary_operands(left, right)
+    if left.device.type == "cpu" and not torch.compiler.is_compiling():
+        return torch.fmax(right, left)
+    return torch.where(left == right, right, torch.fmax(left, right))
 
 
 def hydroforge_minimum(left, right):
-    return torch.fmin(*_hydroforge_binary_operands(left, right))
+    left, right = _hydroforge_binary_operands(left, right)
+    if left.device.type == "cpu" and not torch.compiler.is_compiling():
+        return torch.fmin(right, left)
+    return torch.where(left == right, right, torch.fmin(left, right))
+
+
+# ``operation(target, operand)``, in place on the temporary ``target`` when
+# the shape and dtype allow (the operations commute, so the order is exact).
+def _hydroforge_accumulate(target, operand, operation):
+    if (
+        torch.broadcast_shapes(target.shape, operand.shape) == target.shape
+        and operand.dtype == target.dtype
+    ):
+        return getattr(target, operation + "_")(operand)
+    return getattr(torch, operation)(target, operand)
 
 
 # Incremental update: its FP32 error stays bounded as the window grows.
 # Non-finite results fall back to the blended form so infinities and
-# NaNs propagate exactly as before.
-def hydroforge_weighted_mean(old, old_weight, value, weight):
+# NaNs propagate exactly as before.  The temporaries are updated in place;
+# ``out`` (which may alias ``old``) receives the result.  On the CPU, outside
+# compilation, the blended form is computed only when some result needs it.
+def hydroforge_weighted_mean(old, old_weight, value, weight, out=None):
     new_weight = old_weight + weight
     ratio = weight / new_weight
-    incremental = old + (value - old) * ratio
-    return torch.where(
-        torch.isfinite(incremental),
-        incremental,
-        old * (old_weight / new_weight) + value * ratio,
+    # old + (value - old) * ratio
+    incremental = _hydroforge_accumulate(
+        _hydroforge_accumulate(value - old, ratio, "mul"), old, "add"
     )
+    # x - x is exactly 0 for finite x, NaN for infinities and NaN.
+    finite = (incremental - incremental) == 0
+    if (
+        incremental.device.type == "cpu"
+        and not torch.compiler.is_compiling()
+        and bool(finite.all())
+    ):
+        return incremental if out is None else out.copy_(incremental)
+    # old * (old_weight / new_weight) + value * ratio
+    blended = _hydroforge_accumulate(
+        old * (old_weight / new_weight), value * ratio, "add"
+    )
+    if out is None:
+        return torch.where(finite, incremental, blended)
+    # ``out=`` rejects autograd, so a differentiable update copies instead.
+    if (
+        not torch.compiler.is_compiling()
+        and not (
+            torch.is_grad_enabled()
+            and (incremental.requires_grad or blended.requires_grad)
+        )
+        and out.shape
+        == torch.broadcast_shapes(finite.shape, incremental.shape, blended.shape)
+        and out.dtype == incremental.dtype == blended.dtype
+    ):
+        return torch.where(finite, incremental, blended, out=out)
+    return out.copy_(torch.where(finite, incremental, blended))
 
 
 def hydroforge_remainder(left, right):
@@ -115,6 +177,7 @@ _GLOBALS = frozenset(
         "states",
         "_hydroforge_tensor_operand",
         "_hydroforge_binary_operands",
+        "_hydroforge_accumulate",
         "hydroforge_maximum",
         "hydroforge_minimum",
         "hydroforge_weighted_mean",
@@ -143,6 +206,44 @@ def _literal(value: bool | int | float) -> str:
     if isinstance(value, float) and not math.isfinite(value):
         return f"float('{value}')"
     return repr(value)
+
+
+_LITERAL = re.compile(
+    r"-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?|float\('-?(inf|nan)'\)|True|False"
+)
+
+
+def _fresh(node: Expr) -> bool:
+    """Whether ``node`` always spells a new value, never a view it reads."""
+
+    match node:
+        case Binary() | Unary() | Compare() | Call() | Const() | PhaseTest():
+            return True
+        case Logical():
+            return len(node.operands) > 1
+        case Select():
+            return _fresh(node.positive) and _fresh(node.negative)
+        case Cast():
+            return (
+                node.type == torch.bool
+                or type_of(node.operand) != node.type
+                or _fresh(node.operand)
+            )
+    return False
+
+
+def _assigned(statements: Sequence[Stmt]) -> frozenset[str]:
+    """Every local some ``Assign`` in ``statements`` writes."""
+
+    names: set[str] = set()
+    pending = list(statements)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, Assign):
+            names.add(node.var.name)
+        for field in ("then", "orelse", "body"):
+            pending.extend(getattr(node, field, ()))
+    return frozenset(names)
 
 
 class TorchPrinter:
@@ -262,18 +363,111 @@ class _Kernel(TorchPrinter):
             raise ValueError(
                 f"{function.name}: locals take reserved names {sorted(taken & _GLOBALS)}"
             )
+        keywords = sorted(name for name in taken if keyword.iskeyword(name))
+        if keywords:
+            raise ValueError(f"{function.name}: locals take Python keywords {keywords}")
         self.names = Names((*taken, *_GLOBALS))
         self.written = touched.writes
+        self.assigned = _assigned(function.body)
         self.kinds: dict[str, str | _Lanes] = {PHASE.name: _PYTHON}
         self.count: str | None = None
         self.predicate: str | None = None
+        # Module constants: spelling -> name, and locals bound to one.
+        self.constants: dict[str, str] = {}
+        self.static: dict[str, str] = {}
 
     def lines(self) -> list[str]:
         body = self.stmts(self.function.body, 1, top=True)
+        constants = [f"{name} = {text}" for text, name in self.constants.items()]
         return [
+            *constants,
+            *(["", ""] if constants else []),
             f"def {self.function.name}(states, {PHASE.name}):",
             *(body or [f"{_INDENT}pass"]),
         ]
+
+    def constant(self, text: str) -> str:
+        """A module constant spelled ``text``, created once at load time."""
+
+        name = self.constants.get(text)
+        if name is None:
+            name = self.constants[text] = (
+                f"_{self.function.name}_c{len(self.constants)}"
+            )
+        return name
+
+    def tensor(self, value: str, dtype) -> str:
+        text = super().tensor(value, dtype)
+        return self.constant(text) if _LITERAL.fullmatch(value) else text
+
+    def certain_tensor(self, node: Expr) -> bool:
+        """Whether ``node`` spells a tensor (never a Python value)."""
+
+        match node:
+            case Load() | Cast():
+                return True
+            case Var():
+                return node.name in self.static or self.kinds.get(node.name) == _TENSOR
+            case Const():
+                return not _python_const(node)
+            case Select() if self.kind(node.condition) != _PYTHON:
+                return True
+            case Select():
+                return self.certain_tensor(node.positive) and self.certain_tensor(
+                    node.negative
+                )
+            case Call() if node.function != "py_mod":
+                return True
+            case Binary() | Compare() | Unary() | Logical() | Call():
+                return any(self.certain_tensor(item) for item in subexpressions(node))
+        return False
+
+    def is_static(self, node: Expr) -> bool:
+        """Whether ``node`` depends on nothing loaded or local to a call."""
+
+        match node:
+            case Const():
+                return True
+            case ThreadIndex():
+                return self.count is not None and _integer(self.count) is not None
+            case Var():
+                if node.name in self.scalars or node.name in self.static:
+                    return True
+                kind = self.kinds.get(node.name)
+                return (
+                    isinstance(kind, _Lanes)
+                    and _integer(kind.base) is not None
+                    and self.count is not None
+                    and _integer(self.count) is not None
+                )
+            case Load() | PhaseTest():
+                return False
+        return all(self.is_static(item) for item in subexpressions(node))
+
+    def clobbered(self, node: Let, rest: Sequence[Stmt]) -> bool:
+        """Whether a later statement writes a buffer ``node`` may view while
+        its local is still read, so the local must own a copy."""
+
+        name = node.var.name
+        viewed = _expression(node.value).reads & self.written
+        if not viewed:
+            return False
+        written = False
+        for later in rest:
+            touched = effects(later)
+            uses = name in touched.uses
+            if written and uses:
+                return True
+            if touched.writes & viewed:
+                # A store computes its value before it writes.
+                if uses and not (
+                    isinstance(later, (Store, AtomicAdd))
+                    and _fresh(later.value)
+                    and name not in _expression(later.index).uses
+                ):
+                    return True
+                written = True
+        return False
 
     # Index arithmetic: Python integers and lane indices.
 
@@ -338,8 +532,12 @@ class _Kernel(TorchPrinter):
     def lanes_tensor(self, lanes: _Lanes) -> str:
         """A lane index as an int64 tensor."""
 
-        arange = f"torch.arange({self.lane_count()}, device={self.device})"
-        return _add(lanes.base, _scale(arange, lanes.stride))
+        count = self.lane_count()
+        arange = f"torch.arange({count}, device={self.device})"
+        offsets = _scale(arange, lanes.stride)
+        if _integer(count) is not None:
+            offsets = self.constant(offsets)
+        return _add(lanes.base, offsets)
 
     def target(self, buffer: str, index: Expr) -> tuple[str, str]:
         """What ``index`` addresses in ``buffer``: its spelling and form.
@@ -392,6 +590,8 @@ class _Kernel(TorchPrinter):
         if isinstance(address, _Lanes):
             return self.lanes_tensor(address)
         match node:
+            case Var() if node.name in self.static:
+                return self.static[node.name]
             case Var():
                 return node.name
             case Const() if _python_const(node):
@@ -409,9 +609,7 @@ class _Kernel(TorchPrinter):
                 return f"torch.logical_not({self.value(node.operand)})"
             case Unary():
                 return f"(-{self.value(node.operand)})"
-            case Binary(op="/") if not (
-                type_of(node) or torch.float32
-            ).is_floating_point:
+            case Binary(op="/") if integral(node):
                 left, right = self.value(node.left), self.value(node.right)
                 return f"torch.div({left}, {right}, rounding_mode='trunc')"
             case Binary() | Compare():
@@ -438,12 +636,9 @@ class _Kernel(TorchPrinter):
                 )
             case Cast():
                 source_type = type_of(node.operand)
-                value = self.tensor(
-                    self.value(
-                        node.operand, own=own and type_of(node.operand) == node.type
-                    ),
-                    source_type,
-                )
+                value = self.value(node.operand, own=own and source_type == node.type)
+                if not self.certain_tensor(node.operand):
+                    value = self.tensor(value, source_type)
                 if node.type == torch.bool:
                     return f"({value} != 0)"
                 if (
@@ -456,21 +651,37 @@ class _Kernel(TorchPrinter):
                     # Preserve narrowing even when Inductor fuses an arange
                     # through a subsequent widening cast.
                     value = f"({value} & {torch.iinfo(node.type).max})"
+                elif source_type == node.type:
+                    return value
                 return f"({value}).to({node.type})"
             case Call():
-                function = _FUNCTIONS[node.function]
-                arguments = ", ".join(
-                    self.tensor(self.value(item), type_of(item))
-                    if function.startswith("torch.") and self.kind(item) == _PYTHON
-                    else self.value(item)
-                    for item in node.arguments
-                )
-                return f"{function}({arguments})"
+                return f"{_FUNCTIONS[node.function]}({self.arguments(node)})"
             case PhaseTest():
                 return f"(({PHASE.name} & {int(node.bits)}) != 0)"
         raise TypeError(f"not a PyTorch kernel expression: {node!r}")
 
     # Statements.
+
+    def arguments(self, node: Call) -> str:
+        """The arguments of an intrinsic: tensors, except for Python's
+        remainder, which keeps Python operands Python."""
+
+        return ", ".join(
+            self.tensor(self.value(item), type_of(item))
+            if node.function != "py_mod" and self.kind(item) == _PYTHON
+            else self.value(item)
+            for item in node.arguments
+        )
+
+    def narrowed(self, bound: str) -> str:
+        """The lane count of ``bound`` within the current one."""
+
+        if self.count is None or self.count == bound:
+            return bound
+        known = _integer(self.count), _integer(bound)
+        if None not in known:
+            return str(min(known))
+        return f"min({self.count}, {bound})"
 
     def bound(self, condition: Expr) -> str | None:
         """The lane count ``lane < bound`` sets, if ``condition`` is one."""
@@ -505,16 +716,19 @@ class _Kernel(TorchPrinter):
 
         indent = _INDENT * depth
         lines: list[str] = []
-        for node in statements:
+        for position, node in enumerate(statements):
             match node:
                 case Let(var=var) if var.name == PHASE.name:
                     pass  # the sample phase is the ``phase`` argument
-                case Let() | Assign():
+                case Let():
+                    own = self.clobbered(node, statements[position + 1 :])
+                    lines.extend(self.assign(node, indent, own))
+                case Assign():
                     lines.extend(self.assign(node, indent))
                 case Store():
                     lines.append(f"{indent}{self.store(node)}")
                 case AtomicAdd():
-                    lines.append(f"{indent}{self.atomic_add(node)}")
+                    lines.extend(self.atomic_add(node, indent))
                 case Guard() if not top:
                     raise TypeError(f"a guard inside a branch or loop: {node!r}")
                 case Guard():
@@ -547,11 +761,25 @@ class _Kernel(TorchPrinter):
         finally:
             self.count, self.predicate = state
 
-    def assign(self, node: Let | Assign, indent: str) -> list[str]:
+    def assign(self, node: Let | Assign, indent: str, own: bool = True) -> list[str]:
         name = node.var.name
         address = self.index(node.value)
         if isinstance(node, Let) and isinstance(address, _Lanes):
             self.kinds[name] = address
+            return []
+        if (
+            isinstance(node, Let)
+            and name not in self.assigned
+            and not isinstance(address, str)
+            and self.kind(node.value) == _TENSOR
+            and self.is_static(node.value)
+        ):
+            # Nothing it reads changes between calls: one module constant.
+            value = self.value(node.value)
+            self.static[name] = (
+                value if value in self.constants.values() else self.constant(value)
+            )
+            self.kinds[name] = _TENSOR
             return []
         if isinstance(address, str):
             if isinstance(node, Assign) and self.predicate is not None:
@@ -563,7 +791,7 @@ class _Kernel(TorchPrinter):
                 return [f"{indent}{name} = {value}"]
             self.kinds[name] = _PYTHON
             return [f"{indent}{name} = {address}"]
-        value = self.value(node.value, own=True)
+        value = self.value(node.value, own=own)
         kind = self.kind(node.value)
         if isinstance(node, Assign) and self.predicate is not None:
             value, kind = self.selected(value, name), _TENSOR
@@ -572,6 +800,14 @@ class _Kernel(TorchPrinter):
 
     def store(self, node: Store) -> str:
         target, form = self.target(node.buffer, node.index)
+        if (
+            self.predicate is None
+            and form != "gather"
+            and isinstance(node.value, Call)
+            and node.value.function == "weighted_mean"
+        ):
+            arguments = self.arguments(node.value)
+            return f"{_FUNCTIONS['weighted_mean']}({arguments}, out={target})"
         value = self.selected(self.value(node.value), target)
         if form != "whole":
             return f"{target} = {value}"
@@ -579,9 +815,10 @@ class _Kernel(TorchPrinter):
             return f"{target}.fill_({value})"
         return f"{target}.copy_({value})"
 
-    def atomic_add(self, node: AtomicAdd) -> str:
+    def atomic_add(self, node: AtomicAdd, indent: str) -> list[str]:
         if self.sizes[node.buffer] == 0:
-            return "pass"
+            return []
+        lines: list[str] = []
         address = self.index(node.index)
         index = (
             self.lanes_tensor(address)
@@ -597,14 +834,17 @@ class _Kernel(TorchPrinter):
             # zeroed buffer can hold as -0.0.
             index = f"torch.where({self.predicate}, {index}, 0)"
             value = f"torch.where({self.predicate}, {value}, 0)"
+        if not _integer(index) and not index.isidentifier():
+            index = self.local("index", index, lines, indent)
         dtype = self.dtypes[node.buffer]
         value = f"({self.tensor(value, dtype)}).expand_as({index})"
-        return f"states[{node.buffer!r}].index_add_(0, {index}, {value})"
+        lines.append(f"{indent}states[{node.buffer!r}].index_add_(0, {index}, {value})")
+        return lines
 
     def guard(self, node: Guard, indent: str) -> list[str]:
         bound = self.bound(node.condition)
         if bound is not None:
-            self.count = bound
+            self.count = self.narrowed(bound)
             return []
         condition = self.value(node.condition)
         if self.kind(node.condition) == _PYTHON:
@@ -622,7 +862,7 @@ class _Kernel(TorchPrinter):
                 raise TypeError(f"a lane bound with an else branch: {node!r}")
             state = self.count
             try:
-                self.count = bound
+                self.count = self.narrowed(bound)
                 return self.stmts(node.then, depth)
             finally:
                 self.count = state

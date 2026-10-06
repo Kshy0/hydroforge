@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """NetCDF variable options: compression profile, filter plugins, and chunk plans."""
 
 from __future__ import annotations
@@ -214,15 +220,32 @@ print("ok")
 """
 
 
+def _blosc_profile(options: Mapping[str, Any]) -> str | None:
+    """Return the probe key of a Blosc compression request, else ``None``."""
+
+    compression = options.get("compression")
+    if type(compression) is not str or not compression.startswith("blosc_"):
+        return None
+    # Dataset.createVariable defaults: complevel=4, blosc_shuffle=1.
+    profile = {
+        "compression": compression,
+        "complevel": options.get("complevel", 4),
+        "blosc_shuffle": options.get("blosc_shuffle", 1),
+    }
+    return json.dumps(profile, sort_keys=True)
+
+
+_DEFAULT_BLOSC_PROFILE = _blosc_profile(DEFAULT_NETCDF_OPTIONS)
+
 _blosc_probe_lock = Lock()
-# One probe per process: the started child until collected, then its verdict.
-_blosc_probe: tuple[subprocess.Popen, TemporaryDirectory] | None = None
-_blosc_probe_verdict: bool | None = None
+# One probe per Blosc profile and process: the started child until
+# collected, then its verdict.
+_blosc_probes: dict[str, tuple[subprocess.Popen, TemporaryDirectory]] = {}
+_blosc_probe_verdicts: dict[str, bool] = {}
 
 
-def _start_blosc_probe_locked() -> None:
-    global _blosc_probe
-    if _blosc_probe is not None or _blosc_probe_verdict is not None:
+def _start_blosc_probe_locked(profile: str) -> None:
+    if profile in _blosc_probes or profile in _blosc_probe_verdicts:
         return
     ensure_hdf5_plugins()
     directory = TemporaryDirectory(prefix="hydroforge_netcdf_probe-")
@@ -232,8 +255,8 @@ def _start_blosc_probe_locked() -> None:
                 sys.executable,
                 "-c",
                 _BLOSC_PROBE_SCRIPT,
-                str(Path(directory.name) / "blosc_zstd.nc"),
-                json.dumps(dict(DEFAULT_NETCDF_OPTIONS)),
+                str(Path(directory.name) / "blosc.nc"),
+                profile,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -242,55 +265,76 @@ def _start_blosc_probe_locked() -> None:
     except BaseException:
         with cleanup_on_exit("Blosc capability probe startup", (directory.cleanup,)):
             raise
-    _blosc_probe = (process, directory)
+    _blosc_probes[profile] = (process, directory)
 
 
 def start_blosc_zstd_probe(
     options: Iterable[Mapping[str, Any]] = (DEFAULT_NETCDF_OPTIONS,),
 ) -> None:
-    """Start early only when a planned variable requests the preferred filter."""
+    """Start early a probe of each Blosc profile a planned variable requests."""
 
-    if not any(_uses_default_blosc_zstd_profile(value) for value in options):
-        return
+    profiles = {_blosc_profile(value) for value in options} - {None}
     with _blosc_probe_lock:
-        _start_blosc_probe_locked()
+        for profile in sorted(profiles):
+            _start_blosc_probe_locked(profile)
 
 
-def _probe_blosc_zstd_filter(*, start_if_needed: bool = True) -> bool:
-    """Verify that the active NetCDF/HDF5 stack can store any Blosc chunk.
+def _collect_blosc_probe_locked(profile: str) -> bool:
+    process, directory = _blosc_probes.pop(profile)
+    with cleanup_on_exit("Blosc capability probe", (directory.cleanup,)):
+        try:
+            stdout, _stderr = process.communicate(timeout=120)
+        except BaseException as error:
+            _blosc_probe_verdicts[profile] = False
+            with cleanup_on_exit(
+                "Blosc capability probe child", (process.kill, process.communicate)
+            ):
+                if not isinstance(error, subprocess.TimeoutExpired):
+                    raise
+        else:
+            _blosc_probe_verdicts[profile] = (
+                process.returncode == 0 and stdout.strip() == "ok"
+            )
+    return _blosc_probe_verdicts[profile]
+
+
+def _probe_blosc_filter(profile: str) -> bool:
+    """Verify that the active NetCDF/HDF5 stack can store any chunk of ``profile``.
 
     The first caller collects the probe under the lock; concurrent callers
     wait for and share its verdict.
     """
 
-    global _blosc_probe, _blosc_probe_verdict
     with _blosc_probe_lock:
-        if _blosc_probe_verdict is not None:
-            return _blosc_probe_verdict
-        if _blosc_probe is None and not start_if_needed:
-            return False
+        if profile in _blosc_probe_verdicts:
+            return _blosc_probe_verdicts[profile]
         try:
-            _start_blosc_probe_locked()
+            _start_blosc_probe_locked(profile)
         except (OSError, subprocess.SubprocessError):
-            _blosc_probe_verdict = False
+            _blosc_probe_verdicts[profile] = False
             return False
-        process, directory = _blosc_probe
-        _blosc_probe = None
-        with cleanup_on_exit("Blosc capability probe", (directory.cleanup,)):
-            try:
-                stdout, _stderr = process.communicate(timeout=120)
-            except BaseException as error:
-                _blosc_probe_verdict = False
-                with cleanup_on_exit(
-                    "Blosc capability probe child", (process.kill, process.communicate)
-                ):
-                    if not isinstance(error, subprocess.TimeoutExpired):
-                        raise
-            else:
-                _blosc_probe_verdict = (
-                    process.returncode == 0 and stdout.strip() == "ok"
-                )
-        return _blosc_probe_verdict
+        return _collect_blosc_probe_locked(profile)
+
+
+def _probe_blosc_zstd_filter(*, start_if_needed: bool = True) -> bool:
+    """Probe the default Blosc profile; without ``start_if_needed`` only collect.
+
+    Collecting reaps every started probe child and returns the default
+    profile's verdict, or ``False`` when it was never probed.
+    """
+
+    if start_if_needed:
+        return _probe_blosc_filter(_DEFAULT_BLOSC_PROFILE)
+    with _blosc_probe_lock:
+        with cleanup_on_exit(
+            "Blosc capability probes",
+            tuple(
+                partial(_collect_blosc_probe_locked, profile)
+                for profile in tuple(_blosc_probes)
+            ),
+        ):
+            pass
+        return _blosc_probe_verdicts.get(_DEFAULT_BLOSC_PROFILE, False)
 
 
 atexit.register(partial(_probe_blosc_zstd_filter, start_if_needed=False))
@@ -303,16 +347,30 @@ def _resolve_compression_options(
     dimensions: Sequence[str],
     options: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Resolve the default profile to usable Blosc, native Zstd, then zlib."""
+    """Resolve the default profile to usable Blosc, native Zstd, then zlib.
+
+    An explicitly chosen Blosc profile is kept, but rejected where this
+    stack fails incompressible chunks of it.
+    """
 
     resolved = dict(options)
-    if not _uses_default_blosc_zstd_profile(resolved):
+    profile = _blosc_profile(resolved)
+    if profile is None:
         return resolved
     has_filter = getattr(dataset, "has_blosc_filter", None)
     try:
         blosc_available = callable(has_filter) and bool(has_filter())
     except (OSError, RuntimeError):
         blosc_available = False
+    if not _uses_default_blosc_zstd_profile(resolved):
+        if blosc_available and not _probe_blosc_filter(profile):
+            raise ValueError(
+                f"NetCDF compression {resolved['compression']!r} fails "
+                "incompressible chunks on this NetCDF/HDF5 stack, which would "
+                "leave the file unclosable; use the default compression or "
+                "another filter"
+            )
+        return resolved
     if (
         blosc_available
         and not _blosc_chunk_is_too_small(
@@ -555,7 +613,17 @@ def plan_streaming_netcdf_chunks(
         minimum_time = math.ceil(
             MIN_BLOSC_CHUNK_BYTES / (spatial_elements * storage.itemsize)
         )
-        time_chunk = max(time_chunk, minimum_time)
+        if minimum_time > time_chunk:
+            # Stay aligned with whole appends: the smallest large-enough
+            # divisor of the batch, else a whole multiple of it.
+            time_chunk = next(
+                (
+                    steps
+                    for steps in range(minimum_time, write_batch_size + 1)
+                    if write_batch_size % steps == 0
+                ),
+                math.ceil(minimum_time / write_batch_size) * write_batch_size,
+            )
     normalized["chunksizes"] = (time_chunk, *spatial_chunks)
     # Appends fill spatial chunks and revisit at most the final time chunk
     # after a partial flush. A bounded cache avoids retaining many completed
@@ -579,9 +647,12 @@ def plan_fixed_netcdf_chunks(
     normalized = dict(options)
     if not shape or "chunksizes" in normalized or normalized.get("contiguous") is True:
         return normalized
+    # A variable-length string has no fixed width; HDF5 stores a 16-byte
+    # heap reference per element.
+    itemsize = np.dtype(dtype).itemsize or 16
     normalized["chunksizes"] = _fit_spatial_chunks(
         tuple(shape),
-        max_elements=max(1, target_bytes // np.dtype(dtype).itemsize),
+        max_elements=max(1, target_bytes // itemsize),
     )
     return normalized
 

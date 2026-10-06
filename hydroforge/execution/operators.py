@@ -1,9 +1,15 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Typed operator IR recorded only inside explicit compiled substeps."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from types import MappingProxyType
 from typing import Any
@@ -78,6 +84,8 @@ class TorchOperator:
     outputs: Any
     writes: tuple[torch.Tensor, ...]
     functional: Any = None
+    # ``(arguments, keywords, resolved arguments, resolved keywords)``.
+    _resolved: Any = field(default=None, init=False, repr=False, compare=False)
 
     @staticmethod
     def _static(value: Any) -> Any:
@@ -98,6 +106,28 @@ class TorchOperator:
             self._static(self.keywords),
             outputs,
         )
+
+    def launch_static(self) -> None:
+        """Launch with every reference bound to its address-stable tensor.
+
+        Valid whenever no earlier replay value differs from its ``out=``
+        buffer, i.e. a non-differentiable launch that starts without values.
+        """
+
+        arguments, keywords = self.arguments, self.keywords
+        resolved = self._resolved
+        if (
+            resolved is None
+            or resolved[0] is not arguments
+            or resolved[1] is not keywords
+        ):
+            resolved = self._resolved = (
+                arguments,
+                keywords,
+                self._static(arguments),
+                self._static(keywords),
+            )
+        self.function(*resolved[2], **resolved[3])
 
     def launch(
         self, values: dict[int, torch.Tensor], *, differentiable: bool = False
@@ -213,6 +243,15 @@ def launch_operators(
 ) -> None:
     """Launch operators in order; ``values`` carries their local results."""
 
+    if not differentiable and not values:
+        # Every local result is then its own ``out=`` buffer, so each
+        # operator's references resolve once to the same stable tensors.
+        for operator in operators:
+            if isinstance(operator, TorchOperator):
+                operator.launch_static()
+            else:
+                operator.launch()
+        return
     for operator in operators:
         if isinstance(operator, TorchOperator):
             operator.launch(values, differentiable=differentiable)
@@ -770,6 +809,7 @@ class _TorchOperatorMode(TorchDispatchMode):
         # Mutations already have a validated output; pure operations need
         # only metadata and one stable, uninitialized replay destination.
         if write_values:
+            # Already validated against the mutated output above.
             result = write_values[0]
         else:
             with _disable_current_modes():
@@ -787,7 +827,7 @@ class _TorchOperatorMode(TorchDispatchMode):
                 meta_result = function(*_map(args, metadata), **_map(kwargs, metadata))
                 device = next(_tensors((args, kwargs))).device
                 result = torch.empty_like(meta_result, device=device)
-        validate_compiled_aten(function, args, kwargs, result)
+            validate_compiled_aten(function, args, kwargs, result)
         outputs = self.recorder.encode_outputs(result)
         value_outputs = tuple(
             reference
@@ -893,6 +933,14 @@ class OperatorRecording:
             self.recorder.restore()
         except BaseException as error:
             failures.append(error)
+        if exc_type is not None or failures:
+            # No program will own the nested loops this body already bound.
+            for operator in self.recorder.operators:
+                if isinstance(operator, PredicateLoopOperator):
+                    try:
+                        operator.close(self.recorder.execution.executor)
+                    except BaseException as error:
+                        failures.append(error)
         if failures:
             causes = (() if exc is None else (exc,)) + tuple(failures)
             error = ResourceCleanupError("substep recording rollback", causes)

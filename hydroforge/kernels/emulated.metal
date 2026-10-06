@@ -68,6 +68,9 @@ inline hf_hp hf_hp_tan(hf_hp a) { return hf_hp_from_value(hf_float32x2::tan(a.va
 inline hf_hp hf_hp_pow(hf_hp a, hf_hp b) { return hf_hp_from_value(hf_float32x2::pow(a.value, b.value)); }
 inline hf_hp hf_hp_fmod(hf_hp a, hf_hp b) { return hf_hp_from_value(hf_float32x2::fmod(a.value, b.value)); }
 inline hf_hp hf_hp_mod(hf_hp a, hf_hp b) { return hf_hp_from_value(hf_float32x2::mod(a.value, b.value)); }
+inline hf_hp hf_hp_floor(hf_hp a) { return hf_hp_from_value(hf_float32x2::floor(a.value)); }
+inline hf_hp hf_hp_ceil(hf_hp a) { return hf_hp_from_value(hf_float32x2::ceil(a.value)); }
+inline hf_hp hf_hp_trunc(hf_hp a) { return hf_hp_from_value(hf_float32x2::trunc(a.value)); }
 // Also protect handwritten kernels using unqualified Metal math names.
 inline hf_hp abs(hf_hp a) { return hf_hp_abs(a); }
 inline hf_hp sqrt(hf_hp a) { return hf_hp_sqrt(a); }
@@ -76,6 +79,10 @@ inline hf_hp log(hf_hp a) { return hf_hp_log(a); }
 inline hf_hp sin(hf_hp a) { return hf_hp_sin(a); }
 inline hf_hp cos(hf_hp a) { return hf_hp_cos(a); }
 inline hf_hp tan(hf_hp a) { return hf_hp_tan(a); }
+inline hf_hp fabs(hf_hp a) { return hf_hp_abs(a); }
+inline hf_hp floor(hf_hp a) { return hf_hp_floor(a); }
+inline hf_hp ceil(hf_hp a) { return hf_hp_ceil(a); }
+inline hf_hp trunc(hf_hp a) { return hf_hp_trunc(a); }
 inline hf_hp pow(hf_hp a, hf_hp b) { return hf_hp_pow(a,b); }
 template<typename T> inline hf_hp pow(hf_hp a, T b) { return hf_hp_pow(a,hf_hp(b)); }
 template<typename T> inline hf_hp pow(T a, hf_hp b) { return hf_hp_pow(hf_hp(a),b); }
@@ -84,6 +91,7 @@ template<typename T> inline hf_hp fmod(hf_hp a, T b) { return hf_hp_fmod(a,hf_hp
 template<typename T> inline hf_hp fmod(T a, hf_hp b) { return hf_hp_fmod(hf_hp(a),b); }
 inline bool isnan(hf_hp a) { return hf_float32x2::isnan(a.value); }
 inline bool isfinite(hf_hp a) { return hf_float32x2::isfinite(a.value); }
+inline bool isinf(hf_hp a) { return !isfinite(a) && !isnan(a); }
 inline bool hydroforge_isnan(hf_hp a) { return isnan(a); }
 inline hf_hp hydroforge_maximum(hf_hp a, hf_hp b) {
     if (isnan(a)) return b;
@@ -105,6 +113,36 @@ template<typename T> inline hf_hp hydroforge_minimum(hf_hp a, T b) { return hydr
 template<typename T> inline hf_hp hydroforge_minimum(T a, hf_hp b) { return hydroforge_minimum(hf_hp(a), b); }
 template<typename T> inline hf_hp hydroforge_maximum(hf_hp a, T b) { return hydroforge_maximum(a, hf_hp(b)); }
 template<typename T> inline hf_hp hydroforge_maximum(T a, hf_hp b) { return hydroforge_maximum(hf_hp(a), b); }
+inline hf_hp fmin(hf_hp a, hf_hp b) { return hydroforge_minimum(a, b); }
+inline hf_hp fmax(hf_hp a, hf_hp b) { return hydroforge_maximum(a, b); }
+template<typename T> inline hf_hp fmin(hf_hp a, T b) { return fmin(a, hf_hp(b)); }
+template<typename T> inline hf_hp fmin(T a, hf_hp b) { return fmin(hf_hp(a), b); }
+template<typename T> inline hf_hp fmax(hf_hp a, T b) { return fmax(a, hf_hp(b)); }
+template<typename T> inline hf_hp fmax(T a, hf_hp b) { return fmax(hf_hp(a), b); }
+// Math without a pair implementation must not silently convert through the
+// implicit float conversion and compute in FP32: these overloads are exact
+// matches, so such calls fail to compile instead.
+hf_hp round(hf_hp) = delete;
+hf_hp rint(hf_hp) = delete;
+hf_hp fract(hf_hp) = delete;
+hf_hp sign(hf_hp) = delete;
+hf_hp rsqrt(hf_hp) = delete;
+hf_hp cbrt(hf_hp) = delete;
+hf_hp exp2(hf_hp) = delete;
+hf_hp exp10(hf_hp) = delete;
+hf_hp log2(hf_hp) = delete;
+hf_hp log10(hf_hp) = delete;
+hf_hp asin(hf_hp) = delete;
+hf_hp acos(hf_hp) = delete;
+hf_hp atan(hf_hp) = delete;
+hf_hp sinh(hf_hp) = delete;
+hf_hp cosh(hf_hp) = delete;
+hf_hp tanh(hf_hp) = delete;
+hf_hp atan2(hf_hp, hf_hp) = delete;
+hf_hp copysign(hf_hp, hf_hp) = delete;
+hf_hp powr(hf_hp, hf_hp) = delete;
+hf_hp clamp(hf_hp, hf_hp, hf_hp) = delete;
+hf_hp fma(hf_hp, hf_hp, hf_hp) = delete;
 
 inline hf_hp hydroforge_weighted_mean(hf_hp old_value, hf_hp old_weight, hf_hp value, hf_hp weight) {
     hf_hp new_weight = old_weight + weight;

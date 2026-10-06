@@ -7,7 +7,8 @@ native CUDA, and Metal backends.
 
 | Package | Contents |
 |---|---|
-| `hydroforge.model` | Model and module declarations, tensor fields, execution and output configuration |
+| `hydroforge.model` | `AbstractModel`, module declarations (`AbstractModule`, `TensorField`, `module_ref`, ...) and `OutputConfig` |
+| `hydroforge.contracts` | Typed declarations used by models: `OptionsConfig`, conditions (`module`, `opt`), `option`, `SimulationSchedule`, `SpinupSchedule`, `StatisticsPlan` and its windows, `ParameterChange`, `BackendRequirement`, `ModuleRequirement`, step fields |
 | `hydroforge.execution` | Managed model steps and substep execution |
 | `hydroforge.data` | Eager and lazy model inputs |
 | `hydroforge.data.datasets` | Streaming forcing datasets and dataset exports |
@@ -16,6 +17,13 @@ native CUDA, and Metal backends.
 | `hydroforge.kernels` | Kernel specifications and backend implementations |
 | `hydroforge.parallel` | Distributed setup and ensemble partitioning |
 | `hydroforge.platform` | Device and backend selection |
+| `hydroforge.statistics` | Statistics programs, windows and runtime behind `OutputConfig` |
+| `hydroforge.testing` | Single-module construction and kernel interception for tests |
+| `hydroforge.core` | Dependency-free validation, errors, calendars and arrays |
+
+Internal layers: `hydroforge.declare` holds the declarations re-exported by
+`hydroforge.model`, and `hydroforge.compiler` compiles a declaration into the
+frozen plan exposed as `model.plan`.
 
 ## Installation
 
@@ -45,17 +53,11 @@ export HYDROFORGE_BACKEND=triton  # triton, cuda, metal, or torch
 
 Backend availability also depends on the model's kernel implementations.
 Models can set a backend-specific mixed-precision default through
-`BackendRequirement(default_mixed_precision=...)`; an explicit
+`hydroforge.contracts.BackendRequirement(default_mixed_precision=...)`; an explicit
 `mixed_precision=True` or `False` at construction takes precedence.
 
 On Metal, high-precision values use two FP32 components rather than native FP64.
 NetCDF floating outputs default to FP32 independently of mixed precision; set
-`OutputConfig(save_precision="float64")` for FP64 files, or `save_precision=None`
-to preserve each output's logical dtype. See [Metal precision](docs/METAL_FLOAT32X2.md).
-
-Tensor declarations can use `depends_on="options.forcing.par"` to select fields
-from declared Boolean options at construction. Tuples combine module and option
-conditions with AND; disabled fields stay `None`. See [option field conditions](docs/OPTIONS_FIELD_GATES.md).
 
 ## Usage
 
@@ -68,6 +70,7 @@ from hydroforge.model import (
     computed_tensor_field,
     module_ref,
 )
+from hydroforge.contracts import OptionsConfig, SimulationSchedule, StatisticsPlan
 from hydroforge.execution import between_steps, managed_step
 from hydroforge.data import InputProxy
 from hydroforge.data.datasets import (
@@ -90,6 +93,31 @@ advance them. Set execution options directly on the model with
 `parallel=mesh`. Configure statistics through `OutputConfig`, with `mean`, `sum`,
 `min`, `max`, `first`, and `last` reductions. Results can be kept in memory or
 written to NetCDF.
+
+### Kernels, modules and options
+
+Kernel specs never read options. Every module receives the model's root
+options as its `options` field (a model-owned field like `opened_modules`,
+never read from inputs or written to checkpoints and outputs) and derives
+kernel flags and constants from them; specs bind module fields by exact name
+(`module_flag(...)`, `constant(...)` served by a `kernel_field`):
+
+```python
+class Soil(AbstractModule):
+    options: MyOptions                      # typed access to the model options
+
+    @kernel_field
+    def SOIL_SOLVER(self) -> int:
+        return self.options.option_code("soil.solver")
+```
+
+Registered kernels bind their arguments from the model automatically, and
+launch eagerly, wherever the model runs them: inside `@managed_step` bodies,
+inside `initialize_model_state()` (cold starts, derived state) and inside
+`@between_steps` methods (for example re-deriving parameters after a setter
+copied new values). Kernels that read step fields should be called from
+managed steps, where the step's values are prepared. Elsewhere a registered
+kernel call is an error.
 
 ## License
 

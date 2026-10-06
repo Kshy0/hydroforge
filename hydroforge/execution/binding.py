@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Kernel argument values of one constructed model.
 
 :class:`KernelBinder` completes the calls of registered kernels from the
@@ -38,6 +44,14 @@ if TYPE_CHECKING:
 
 class UnboundKernelArgument(KeyError):
     """A canonical ABI parameter has no owner in the model namespace."""
+
+
+def error_message(error: BaseException) -> str:
+    """Message of a wrapped error, without ``KeyError``'s repr quoting."""
+
+    if isinstance(error, KeyError) and len(error.args) == 1:
+        return str(error.args[0])
+    return str(error)
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,7 +119,7 @@ class KernelBinder:
             )
             return implementation.call(arguments, buffer_dtypes=buffer_dtypes)
         except (KeyError, TypeError, ValueError, OverflowError) as error:
-            raise ValueError(str(error)) from error
+            raise ValueError(error_message(error)) from error
 
     def arguments(
         self, registry: BackendRegistry, supplied: Mapping[str, Any]
@@ -155,7 +169,7 @@ class KernelBinder:
                     self._complete_cache[id(registry)] = cached
                 arguments, buffer_dtypes = cached[1], cached[2]
         except (KeyError, TypeError, ValueError, OverflowError) as error:
-            raise ValueError(str(error)) from error
+            raise ValueError(error_message(error)) from error
         return arguments, buffer_dtypes
 
     def _complete_supplied(

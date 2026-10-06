@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Every cross-rank agreement of one model runtime.
 
 ``LocalChannel`` serves a single-rank runtime: each agreement is decided
@@ -110,6 +116,15 @@ class LocalChannel:
         pass
 
 
+def require_process_group(what: str) -> None:
+    """Reject distributed work before ``torch.distributed`` is initialized."""
+
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError(
+            f"{what} requires an initialized torch.distributed process group"
+        )
+
+
 _CONTROL_PLANE: tuple[Any, tuple[Any, bool]] | None = None
 
 
@@ -127,7 +142,16 @@ def distributed_control_plane() -> tuple[Any, bool]:
     cached = _CONTROL_PLANE
     if cached is not None and cached[0] is world:
         return cached[1]
-    if communication_backend(dist.get_backend()) == "gloo":
+    default_backend = dist.get_backend()
+    try:
+        # A per-device default group ("cpu:gloo,cuda:nccl") carries CPU
+        # tensors through its CPU entry.
+        host_backend = communication_backend(default_backend, device_type="cpu")
+    except ValueError:
+        if ":" not in str(default_backend):
+            raise
+        host_backend = None  # a per-device list without a CPU entry
+    if host_backend == "gloo":
         plane: tuple[Any, bool] = (None, True)
     elif dist.is_gloo_available():
         plane = (dist.new_group(backend="gloo"), True)
@@ -156,13 +180,6 @@ class ProcessGroupChannel:
         self._outputs: list[torch.Tensor] = []
         self._preflight: StagedPreflight | None = None
         self._terminal = False
-
-    @staticmethod
-    def _require_process_group(what: str) -> None:
-        if not dist.is_available() or not dist.is_initialized():
-            raise RuntimeError(
-                f"{what} require an initialized torch.distributed process group"
-            )
 
     def _rows(
         self, kind: int, signature: tuple[int, int, int], digest: int, flag: int
@@ -232,7 +249,7 @@ class ProcessGroupChannel:
     ) -> tuple[Failures, tuple[Any, ...]]:
         """Exchange one tagged transaction record and optional phase payload."""
 
-        self._require_process_group("multi-rank model transactions")
+        require_process_group("a multi-rank model transaction")
         if type(phase) is not str or not phase:
             raise RuntimeError(
                 "distributed public transaction phase must be a non-empty string"
@@ -310,7 +327,7 @@ class ProcessGroupChannel:
     def open_step(self, preflight: StagedPreflight | None = None) -> None:
         """Start the event sequence of one managed-step invocation."""
 
-        self._require_process_group("multi-rank managed steps")
+        require_process_group("a multi-rank managed step")
         self._terminal = False
         self._preflight = preflight
         self.rejection = None

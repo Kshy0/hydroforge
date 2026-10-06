@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Kernel parameter types recovered from Itanium-mangled kernel names.
 
 NVRTC and hiprtc both report a kernel instantiation's lowered (mangled) name,
@@ -111,6 +117,10 @@ class _Demangler:
         if code == "S" and self.peek(2) == "St":
             self.take(2)
             node = ("class", f"std::{self.source_name()}")
+            if self.peek() != "I":
+                return (self.remember(node) if is_type else node), None
+            # An unscoped template name is a substitution candidate.
+            self.remember(node)
         elif code == "S":
             node = self.substitution()
             if self.peek() != "I":

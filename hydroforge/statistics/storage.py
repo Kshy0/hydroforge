@@ -1,9 +1,20 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Accumulator storage of compiled statistics and the one source of its names.
 
 Every slot a statistics program allocates, binds or publishes is named by a
 :class:`StoragePlan` rule: operation outputs ``{variable}_{operation}``,
 arg-reduction values ``..._aux``, the sample weight of a simple mean, inner
 window states and weights, and scatter buffers and counts.
+
+A variable with a simple ``mean`` records its inner ``mean`` window in the
+same output and sample weight slots: both are the weighted mean of the open
+inner window.  Sample weights may use a wider dtype than their variable, so
+long windows of short substeps keep accumulating time exactly.
 """
 
 from __future__ import annotations
@@ -119,7 +130,22 @@ class StoragePlan:
         )
 
     @classmethod
-    def inner_slots(cls, variable: str, inner: Reduction) -> InnerSlots:
+    def inner_slots(
+        cls,
+        variable: str,
+        inner: Reduction,
+        operations: Iterable[StatisticOperation] = (),
+    ) -> InnerSlots:
+        """The recorded state of ``inner``; ``operations`` are the variable's
+        own, whose simple ``mean`` already records an inner ``mean``."""
+
+        if inner is Reduction.MEAN and any(
+            operation.inner is None and operation.outer is Reduction.MEAN
+            for operation in operations
+        ):
+            return InnerSlots(
+                cls.output(variable, Reduction.MEAN.value), cls.sample_weight(variable)
+            )
         return InnerSlots(
             cls.inner_state(variable, inner),
             cls.inner_weight(variable, inner) if inner is Reduction.MEAN else None,
@@ -137,13 +163,18 @@ def variable_slots(
     operations: Iterable[StatisticOperation],
     shape: tuple[int, ...],
     dtype: torch.dtype,
+    weight_dtype: torch.dtype | None = None,
 ) -> tuple[StorageSlot, ...]:
-    """Slots of one statistic variable of ``shape`` and value ``dtype``."""
+    """Slots of one statistic variable of ``shape`` and value ``dtype``;
+    sample weights use ``weight_dtype`` (``dtype`` when omitted)."""
 
+    operations = tuple(operations)
+    weight_dtype = dtype if weight_dtype is None else weight_dtype
     slots: dict[str, StorageSlot] = {}
 
     def add(name, slot_shape, slot_dtype, initialization, output=False) -> None:
-        if name not in slots:
+        # A shared inner mean may name a simple mean's output first.
+        if name not in slots or output and not slots[name].output:
             slots[name] = StorageSlot(
                 name, variable, slot_shape, slot_dtype, initialization, output
             )
@@ -159,15 +190,15 @@ def variable_slots(
         else:
             add(names.output, operation_shape, dtype, initialization, output=True)
         if names.sample_weight is not None:
-            add(names.sample_weight, shape, dtype, zero)
+            add(names.sample_weight, shape, weight_dtype, zero)
         if operation.inner is None:
             continue
         # A ``last`` inner state records the last sampled value for a window
         # closed by a step that collects no output.
-        inner = StoragePlan.inner_slots(variable, operation.inner)
+        inner = StoragePlan.inner_slots(variable, operation.inner, operations)
         add(inner.state, shape, dtype, storage_initialization(operation.inner))
         if inner.weight is not None:
-            add(inner.weight, shape, dtype, zero)
+            add(inner.weight, shape, weight_dtype, zero)
     return tuple(slots.values())
 
 
@@ -176,8 +207,12 @@ def build_storage_plan(
     layouts: Mapping[str, StatisticsVariableLayout],
     variables: Iterable[str],
     ensemble_size: int,
+    weight_dtype: torch.dtype | None = None,
 ) -> StoragePlan:
-    """Scatter buffers of every scatter source, then each variable's slots."""
+    """Scatter buffers of every scatter source, then each variable's slots.
+
+    ``weight_dtype`` widens floating sample weights (``None`` keeps each
+    variable's dtype)."""
 
     slots: dict[str, StorageSlot] = {}
     zero = StorageInitialization.ZERO
@@ -199,6 +234,9 @@ def build_storage_plan(
             program.operations[variable],
             layout.actual_shape,
             layout.dtype,
+            weight_dtype
+            if weight_dtype is not None and layout.dtype.is_floating_point
+            else None,
         ):
             slots[slot.name] = slot
     return StoragePlan(MappingProxyType(slots))

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Declarative, read-only calendar inputs for model-bound kernel buffers."""
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ from typing import Literal
 from pydantic import ConfigDict, FiniteFloat, field_validator, validate_call
 
 from hydroforge.core.expr import Expression, ExpressionSource, parse_value_source
+from hydroforge.core.graph import dependency_order
 from hydroforge.core.naming import Identifier
 from hydroforge.core.time import DateLike
 from hydroforge.core.validation import HydroForgeModel
@@ -139,20 +146,15 @@ def compile_step_field_expressions(
         if not isinstance(source, ExpressionSource):
             raise ValueError("device step fields require scalar expressions")
         compiled[name] = source.expression
-    ordered = {}
-    visiting = set()
-
-    def visit(name: str) -> None:
-        if name in ordered or name not in compiled:
-            return
-        if name in visiting:
-            raise ValueError(f"cyclic device step field expression: {name!r}")
-        visiting.add(name)
-        for dependency in compiled[name].dependencies:
-            visit(dependency)
-        visiting.remove(name)
-        ordered[name] = compiled[name]
-
-    for name in compiled:
-        visit(name)
-    return MappingProxyType(ordered)
+    order = dependency_order(
+        compiled,
+        lambda name: (
+            dependency
+            for dependency in compiled[name].dependencies
+            if dependency in compiled
+        ),
+        cycle_message=lambda cycle: (
+            f"cyclic device step field expression: {cycle[0]!r}"
+        ),
+    )
+    return MappingProxyType({name: compiled[name] for name in order})

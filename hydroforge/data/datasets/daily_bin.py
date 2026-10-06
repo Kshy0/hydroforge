@@ -23,9 +23,14 @@ from hydroforge.core.time import (
 from hydroforge.core.validation import FrozenMapping
 from hydroforge.data.datasets.base import ForcingDataset, SourceDirectory
 from hydroforge.data.datasets.keys import daily_time_to_key, single_file_key
-from hydroforge.data.datasets.plan import DatasetPlan, TemporalDomain
+from hydroforge.data.datasets.plan import DatasetPlan, SourceChunk, TemporalDomain
 from hydroforge.data.datasets.space import GridSpace
-from hydroforge.data.datasets.storage import SOURCE_FILE_LABEL, UnitFactor
+from hydroforge.data.datasets.storage import (
+    SOURCE_FILE_LABEL,
+    UnitFactor,
+    UnitsName,
+    resolve_units,
+)
 from hydroforge.data.datasets.timeline import StorageLayout
 from hydroforge.data.datasets.values import MissingPolicy, convert
 from hydroforge.io.files import SourceFiles
@@ -51,20 +56,31 @@ class DailyBinDataset(ForcingDataset):
       are mapped to their absolute offset from that origin; they are never
       renumbered from zero merely because a run requests a subset of dates.
 
-    Consecutive frames of one file are read by a single ``np.fromfile``; a
-    mapped view keeps only its source cells before any value check, so cells
-    outside it (for example ocean NaN) never affect the result.  Missing (NaN)
-    values become zero unless ``missing="error"``.
+    Consecutive frames of one file are read together; a mapped view reads
+    only the latitude rows spanning its source cells and keeps only those
+    cells before any value check, so cells outside it (for example ocean NaN)
+    never affect the result.  Missing values (NaN, or ``fill_value`` when set)
+    become zero unless ``missing="error"``.
+
+    Binary files record no units: ``target_units`` converts from the declared
+    ``source_units`` with :func:`~hydroforge.core.units.check_units`.
+
+    The grid is global unless ``extent=(west, east, south, north)`` gives the
+    outer cell edges of a regional grid.
     """
 
     base_dir: SourceDirectory
     shape: tuple[Annotated[int, Field(ge=1)], Annotated[int, Field(ge=1)]]
     prefix: str
     unit_factor: UnitFactor = 1.0
+    source_units: UnitsName | None = None
+    target_units: UnitsName | None = None
     bin_dtype: str = "float32"
     suffix: str = ".one"
     lat_south_to_north: bool = False
     lon_0_to_360: bool = False
+    extent: tuple[float, float, float, float] | None = None
+    fill_value: float | None = None
     time_to_key: Callable[[DateLike], str] = daily_time_to_key
     file_start_date: FileStartDate | None = None
     missing: MissingPolicy = "zero"
@@ -73,6 +89,7 @@ class DailyBinDataset(ForcingDataset):
     _layout: StorageLayout = PrivateAttr()
     _runs: tuple[tuple[_FrameRun, ...], ...] = PrivateAttr()
     _space: GridSpace = PrivateAttr()
+    _units: tuple[float, float, float] = PrivateAttr(default=(1.0, 1.0, 0.0))
 
     @field_validator("time_to_key", mode="before")
     @classmethod
@@ -86,9 +103,26 @@ class DailyBinDataset(ForcingDataset):
             raise ValueError("bin_dtype must describe a real numeric dtype")
         return value
 
+    @field_validator("extent")
+    @classmethod
+    def _validate_extent(
+        cls, value: tuple[float, float, float, float] | None
+    ) -> tuple[float, float, float, float] | None:
+        if value is not None:
+            west, east, south, north = value
+            if not all(np.isfinite(value)) or west >= east or south >= north:
+                raise ValueError(
+                    "extent must be finite (west, east, south, north) with "
+                    "west < east and south < north"
+                )
+        return value
+
     def _compile_plan(self, domain: TemporalDomain) -> DatasetPlan:
+        if self.extent is not None and self.lon_0_to_360:
+            raise ValueError("lon_0_to_360 applies only to the default global extent")
         if self.time_interval != timedelta(days=1):
             raise ValueError("DailyBinDataset time_interval must be one day")
+        self._units = resolve_units(self)
         plan = self._planned(domain, self.chunk_len)
         layout = StorageLayout(
             base_dir=Path(self.base_dir),
@@ -242,71 +276,109 @@ class DailyBinDataset(ForcingDataset):
         return tuple(runs)
 
     def _grid(self) -> GridSpace:
-        """Cell centres of a global grid in the declared axis orientation.
+        """Cell centres of the grid in the declared axis orientation.
 
-        ``shape`` is ``(ny, nx)``: latitude runs 90→-90 (or -90→90 when
-        ``lat_south_to_north``), longitude -180→180 (or 0→360 when
-        ``lon_0_to_360``).
+        ``shape`` is ``(ny, nx)``: latitude runs north→south (or south→north
+        when ``lat_south_to_north``) and longitude west→east over ``extent``,
+        by default 90→-90 and -180→180 (or 0→360 when ``lon_0_to_360``).
         """
 
         ny, nx = self.shape
-        res_lat = 180.0 / ny
-        res_lon = 360.0 / nx
+        if self.extent is not None:
+            west, east, south, north = self.extent
+        else:
+            west, east = (0.0, 360.0) if self.lon_0_to_360 else (-180.0, 180.0)
+            south, north = -90.0, 90.0
+        res_lat = (north - south) / ny
+        res_lon = (east - west) / nx
         if self.lat_south_to_north:
-            lat = np.linspace(-90 + res_lat / 2, 90 - res_lat / 2, ny)
+            lat = np.linspace(south + res_lat / 2, north - res_lat / 2, ny)
         else:
-            lat = np.linspace(90 - res_lat / 2, -90 + res_lat / 2, ny)
-        if self.lon_0_to_360:
-            lon = np.linspace(res_lon / 2, 360 - res_lon / 2, nx)
-        else:
-            lon = np.linspace(-180 + res_lon / 2, 180 - res_lon / 2, nx)
+            lat = np.linspace(north - res_lat / 2, south + res_lat / 2, ny)
+        lon = np.linspace(west + res_lon / 2, east - res_lon / 2, nx)
         return GridSpace(longitude=immutable_array(lon), latitude=immutable_array(lat))
 
     @property
     def space(self) -> GridSpace:
         return self._space
 
-    def read_storage(self, chunk) -> np.ndarray:
+    def read_storage(self, chunk: SourceChunk) -> np.ndarray:
         """Read ``(T, Y, X)`` frames, or ``(T, N)`` for a mapped view."""
 
         data = self._read_frames(self._runs[chunk.index], self._space.selection)
         if self._space.selection is None:
-            return data.reshape(chunk.length, *self.shape)
-        return data
+            data = data.reshape(chunk.length, *self.shape)
+        return self._masked(data)
+
+    def _masked(self, data: np.ndarray) -> np.ndarray:
+        """Mask ``fill_value`` sentinels so the missing policy applies."""
+
+        if self.fill_value is None:
+            return data
+        fill = np.asarray(self.fill_value).astype(data.dtype)
+        missing = data == fill
+        return np.ma.MaskedArray(data, missing) if missing.any() else data
 
     def _read_frames(
         self, runs: tuple[_FrameRun, ...], selection: np.ndarray | None
     ) -> np.ndarray:
-        frame_size = self.shape[0] * self.shape[1]
+        ny, nx = self.shape
+        frame_size = ny * nx
         storage_dtype = np.dtype(self.bin_dtype)
+        rows = columns = None
+        if selection is not None and selection.size:
+            # Frames are row-major, so the latitude rows spanning the
+            # selection are one contiguous band of each frame.
+            first_row = int(selection.min()) // nx
+            rows = slice(first_row, int(selection.max()) // nx + 1)
+            columns = selection - first_row * nx
         blocks = []
         for key, first_frame, count in runs:
             path = self._files.checked(self._layout.path(key))
-            data = np.fromfile(
-                path,
-                dtype=storage_dtype,
-                count=count * frame_size,
-                offset=first_frame * frame_size * storage_dtype.itemsize,
-            )
+            if selection is None:
+                data = np.fromfile(
+                    path,
+                    dtype=storage_dtype,
+                    count=count * frame_size,
+                    offset=first_frame * frame_size * storage_dtype.itemsize,
+                ).reshape(count, frame_size)
+            elif columns is None:
+                data = np.empty((count, 0), dtype=storage_dtype)
+            else:
+                frames = np.memmap(
+                    path,
+                    dtype=storage_dtype,
+                    mode="r",
+                    offset=first_frame * frame_size * storage_dtype.itemsize,
+                    shape=(count, ny, nx),
+                )
+                band = np.array(frames[:, rows, :]).reshape(count, -1)
+                del frames
+                data = band[:, columns]
             self._files.verify(path)
-            data = data.reshape(count, frame_size)
-            blocks.append(data if selection is None else data[:, selection])
+            blocks.append(data)
         return blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=0)
 
     def _convert(self, values: np.ndarray) -> np.ndarray:
+        unit_factor, unit_scale, unit_offset = self._units
         return convert(
             values,
             out_dtype=self.out_dtype,
-            unit_factor=self.unit_factor,
+            unit_factor=unit_factor,
             label="daily binary dataset",
+            unit_scale=unit_scale,
+            unit_offset=unit_offset,
         )
 
     def _first_frame_missing(self) -> np.ndarray:
-        """``(Y, X)`` NaN mask of the frame at ``start_date``."""
+        """``(Y, X)`` missing-value mask of the frame at ``start_date``."""
 
         key, frame, _count = self._runs[self.chunk_plan.num_spinup_chunks][0]
-        data = self._read_frames(((key, frame, 1),), None)
-        return np.isnan(data.reshape(self.shape))
+        data = self._read_frames(((key, frame, 1),), None).reshape(self.shape)
+        missing = np.ma.getmaskarray(self._masked(data))
+        if data.dtype.kind == "f":
+            missing = missing | np.isnan(data)
+        return missing
 
     def close(self) -> None:
         """Close this process's file handles (binary reads keep none)."""

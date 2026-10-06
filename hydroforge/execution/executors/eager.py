@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Direct launches of recorded programs under host-controlled loops."""
 
 from __future__ import annotations
@@ -40,12 +46,19 @@ class EagerFixed:
 
 
 def host_adaptive(
-    loop: Any, step: Any, iterate: Callable[[], None], sources: tuple[Any, ...]
+    loop: Any,
+    step: Any,
+    iterate: Callable[[], None],
+    sources: tuple[Any, ...],
+    *,
+    check_failed: Callable[[int], None] | None = None,
 ) -> int:
     """Run an adaptive loop whose iterations the host launches one by one.
 
     Each iteration reads ``(error, continue, dt)`` once from ``loop.status``,
     packed from ``sources`` unless the iteration writes it itself.
+    ``check_failed`` replaces ``loop.check_completion`` for an iteration that
+    packs further error bits into the status word.
     """
 
     loop.reset()
@@ -54,7 +67,7 @@ def host_adaptive(
     while continuing:
         iterate()
         failed, flag, weight = loop.fetch(sources, loop.status, loop.status_host)
-        loop.check_completion(int(failed))
+        (check_failed or loop.check_completion)(int(failed))
         if not math.isfinite(weight) or weight <= 0.0:
             raise ValueError(
                 f"adaptive substep proposal produced an invalid accepted width {weight}"

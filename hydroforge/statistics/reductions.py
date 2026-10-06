@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """The statistics reduction state machine, written once as kernel IR.
 
 One sample of one variable element updates, in order, the recorded state
@@ -5,8 +11,11 @@ of each inner reduction and then every output operation.  A simple
 operation folds the sampled value into its window; a compound operation
 folds the closing inner result into its outer window at ``INNER_LAST``.
 A settle closes inner windows without a sample: each inner result is read
-from its recorded state, which restarts, and the compound operations fold it
-as a sample at ``INNER_LAST`` would.  Printers spell the statements; every
+from its recorded state and the compound operations fold it as a sample at
+``INNER_LAST`` would.  Recorded states need no reset at a close: the next
+window's first sample (``INNER_FIRST``) restarts them, and a settle only
+reads a window that has samples.  Sample weights accumulate in
+``SampleContext.weight_dtype``, which may be wider than the value dtype.  Printers spell the statements; every
 dialect runs the same operation sequence, so their results differ only where
 their NaN helpers do.
 """
@@ -60,7 +69,8 @@ class SampleContext:
 
     ``offset`` addresses the element in every slot of the variable (top-k
     slots hold ``k`` entries per element); ``names`` allocates the locals of
-    the kernel and ``prefix`` makes them readable.
+    the kernel and ``prefix`` makes them readable.  ``weight_dtype`` is the
+    dtype of the sample weight slots (the value dtype when ``None``).
     """
 
     offset: Expr
@@ -69,6 +79,7 @@ class SampleContext:
     macro_index: Expr
     names: Names
     prefix: str
+    weight_dtype: torch.dtype | None = None
 
     def local(self, role: str, dtype: torch.dtype) -> Var:
         return self.names.var(f"{self.prefix}_{role}", dtype)
@@ -84,6 +95,49 @@ def _better(reduction: Reduction) -> str:
 
 def _isnan(value: Expr) -> Expr:
     return Call("isnan", (value,), torch.bool)
+
+
+def _weighted_mean(
+    old: Expr,
+    weight_slot: str,
+    value: Expr,
+    dtype: torch.dtype,
+    ctx: SampleContext,
+    role: str,
+) -> tuple[tuple[Let, Store], Expr]:
+    """Fold ``value`` into the weighted mean ``old`` of the open window.
+
+    Returns the load and the store of the accumulated weight, which enclose
+    every use of the returned mean, and the mean.
+
+    The accumulated weight keeps ``ctx.weight_dtype``: in the value dtype
+    alone a float32 sum stops growing once it is 2**24 times the sample
+    weight, which turns a long window's mean into a moving average.
+    """
+
+    weight_dtype = dtype if ctx.weight_dtype is None else ctx.weight_dtype
+    offset = ctx.offset
+    old_weight = ctx.local(role, weight_dtype)
+    mean = Call(
+        "weighted_mean",
+        (old, cast(old_weight, dtype), cast(value, dtype), cast(ctx.weight, dtype)),
+        dtype,
+    )
+    return (
+        Let(
+            old_weight,
+            Select(
+                INNER_FIRST,
+                Const(0, weight_dtype),
+                Load(weight_slot, offset, weight_dtype),
+            ),
+        ),
+        Store(
+            weight_slot,
+            offset,
+            Binary("+", old_weight, cast(ctx.weight, weight_dtype)),
+        ),
+    ), mean
 
 
 def inner(
@@ -108,9 +162,8 @@ def inner(
             Let(result, state),
         ), result
     result = ctx.local(f"{reduction.value}_inner", dtype)
+    old = ctx.local(f"{reduction.value}_inner_old", dtype)
     if reduction in {Reduction.MAX, Reduction.MIN}:
-        old = ctx.local(f"{reduction.value}_inner_old", dtype)
-        reset = Const(float("-inf" if reduction is Reduction.MAX else "inf"), dtype)
         return (
             Let(old, state),
             Let(
@@ -119,43 +172,21 @@ def inner(
                     INNER_FIRST, value, Call(_extremum(reduction), (old, value), dtype)
                 ),
             ),
-            If(
-                INNER_LAST,
-                (Store(slots.state, offset, reset),),
-                (Store(slots.state, offset, result),),
-            ),
+            Store(slots.state, offset, result),
         ), result
-    weight = cast(ctx.weight, dtype)
-    old = ctx.local(f"{reduction.value}_inner_old", dtype)
     statements: list[Stmt] = [Let(old, Select(INNER_FIRST, zero, state))]
     if reduction is Reduction.SUM:
+        weight = cast(ctx.weight, dtype)
         statements.append(
             Let(result, Binary("+", old, Binary("*", cast(value, dtype), weight)))
         )
-        statements.append(
-            If(
-                INNER_LAST,
-                (Store(slots.state, offset, zero),),
-                (Store(slots.state, offset, result),),
-            )
+    else:
+        weighted, mean = _weighted_mean(
+            old, slots.weight, value, dtype, ctx, "mean_inner_weight"
         )
-        return tuple(statements), result
-    old_weight = ctx.local("mean_inner_weight", dtype)
-    statements += [
-        Let(old_weight, Select(INNER_FIRST, zero, Load(slots.weight, offset, dtype))),
-        Let(
-            result,
-            Call("weighted_mean", (old, old_weight, cast(value, dtype), weight), dtype),
-        ),
-        If(
-            INNER_LAST,
-            (Store(slots.state, offset, zero), Store(slots.weight, offset, zero)),
-            (
-                Store(slots.state, offset, result),
-                Store(slots.weight, offset, Binary("+", old_weight, weight)),
-            ),
-        ),
-    ]
+        load, store = weighted
+        statements += [load, Let(result, mean), store]
+    statements.append(Store(slots.state, offset, result))
     return tuple(statements), result
 
 
@@ -170,29 +201,15 @@ def _simple(
     zero = Const(0, dtype)
     match operation.outer:
         case Reduction.MEAN:
-            weight = cast(ctx.weight, dtype)
             old = ctx.local("mean_old", dtype)
-            old_weight = ctx.local("mean_weight", dtype)
+            weighted, mean = _weighted_mean(
+                old, slots.sample_weight, value, dtype, ctx, "mean_weight"
+            )
             return (
                 Let(old, Select(INNER_FIRST, zero, Load(out, offset, dtype))),
-                Let(
-                    old_weight,
-                    Select(INNER_FIRST, zero, Load(slots.sample_weight, offset, dtype)),
-                ),
-                Store(
-                    out,
-                    offset,
-                    Call(
-                        "weighted_mean",
-                        (old, old_weight, cast(value, dtype), weight),
-                        dtype,
-                    ),
-                ),
-                Store(
-                    slots.sample_weight,
-                    offset,
-                    Select(INNER_LAST, zero, Binary("+", old_weight, weight)),
-                ),
+                weighted[0],
+                Store(out, offset, mean),
+                weighted[1],
             )
         case Reduction.SUM:
             old = ctx.local("sum_old", dtype)
@@ -439,11 +456,17 @@ def variable_update(
     statements: list[Stmt] = []
     results: dict[Reduction, Expr] = {}
     for reduction in _inner_reductions(operations):
-        recorded, results[reduction] = inner(
-            reduction, value, dtype, StoragePlan.inner_slots(variable, reduction), ctx
-        )
+        slots = StoragePlan.inner_slots(variable, reduction, operations)
+        recorded, results[reduction] = inner(reduction, value, dtype, slots, ctx)
         statements.extend(recorded)
     for operation in operations:
+        if (
+            operation.inner is None
+            and operation.outer is Reduction.MEAN
+            and Reduction.MEAN in results
+        ):
+            # The inner mean already recorded this window in the same slots.
+            continue
         sampled = value if operation.inner is None else results[operation.inner]
         statements.extend(
             sample(
@@ -466,26 +489,16 @@ def variable_settle(
     """Close the inner windows of ``variable`` at one element without a sample.
 
     Simple operations already hold their window results; each compound
-    operation folds its inner window's recorded result, and the inner state
-    restarts as a closing sample leaves it.
+    operation folds its inner window's recorded result.  The next window's
+    first sample restarts the recorded state.
     """
 
     statements: list[Stmt] = []
     results: dict[Reduction, Expr] = {}
     for reduction in _inner_reductions(operations):
-        slots = StoragePlan.inner_slots(variable, reduction)
+        slots = StoragePlan.inner_slots(variable, reduction, operations)
         result = ctx.local(f"{reduction.value}_inner", dtype)
         statements.append(Let(result, Load(slots.state, ctx.offset, dtype)))
-        if reduction in {Reduction.MAX, Reduction.MIN}:
-            reset = float("-inf" if reduction is Reduction.MAX else "inf")
-            statements.append(Store(slots.state, ctx.offset, Const(reset, dtype)))
-        elif reduction in {Reduction.MEAN, Reduction.SUM}:
-            zero = Const(0, dtype)
-            statements.extend(
-                Store(slot, ctx.offset, zero)
-                for slot in (slots.state, slots.weight)
-                if slot is not None
-            )
         results[reduction] = result
     for operation in operations:
         if operation.inner is not None:

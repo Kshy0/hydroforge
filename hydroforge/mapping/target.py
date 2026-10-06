@@ -1,8 +1,16 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Target supports that consume values from a source grid.
 
 A :class:`TargetSupport` is the destination geometry of a mapping: regular-grid
-mask cells, per-cell points (e.g. VIC), or CaMa catchments reconstructed from a
-``parameters.nc`` ``GridSpec`` annotation.
+mask cells (:meth:`TargetSupport.from_mask`), per-cell points such as VIC
+(:meth:`TargetSupport.from_points`), or any rectangles with explicit bounds.
+CaMa catchments are mapped from their map directory by
+:func:`~hydroforge.mapping.aggregation.build_cama_mapping` instead.
 """
 
 from __future__ import annotations

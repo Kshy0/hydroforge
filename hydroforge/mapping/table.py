@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Sparse mapping table from flattened source grid cells to target supports."""
 
 from __future__ import annotations
@@ -15,6 +21,7 @@ from pydantic import (
     AfterValidator,
     BeforeValidator,
     Field,
+    PrivateAttr,
     field_serializer,
     field_validator,
     model_validator,
@@ -162,10 +169,16 @@ class _ImmutableCSR(csr_matrix):
         super().setdiag(values, k=k)
 
     def sort_indices(self) -> None:
+        # SciPy reductions call these unconditionally; canonical storage
+        # needs no change, so only a real mutation is rejected.
+        if self.has_sorted_indices:
+            return
         self._reject_mutation()
         super().sort_indices()
 
     def sum_duplicates(self) -> None:
+        if self.has_canonical_format:
+            return
         self._reject_mutation()
         super().sum_duplicates()
 
@@ -218,6 +231,9 @@ class LocalMapping(HydroForgeModel):
     target_ids: np.ndarray
     source_indices: np.ndarray
     source_to_target: csr_matrix
+
+    # ``target x active_source`` CSR derived once for :meth:`to_torch`.
+    _target_rows: csr_matrix | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _validate_local_mapping(self) -> Self:
@@ -312,8 +328,11 @@ class LocalMapping(HydroForgeModel):
             raise TypeError("sparse mapping dtype must be float32 or float64")
         if layout not in {torch.sparse_csr, torch.sparse_coo}:
             raise ValueError(f"unsupported sparse mapping layout {layout}")
-        matrix = self.source_to_target.T.tocsr()
-        matrix.sort_indices()
+        matrix = self._target_rows
+        if matrix is None:
+            matrix = self.source_to_target.T.tocsr()
+            matrix.sort_indices()
+            self._target_rows = matrix
         data = canonical_floating_array(
             matrix.data,
             dtype="float32" if dtype == torch.float32 else "float64",
@@ -566,34 +585,35 @@ class MappingTable(HydroForgeModel):
         valid_grid: np.ndarray,
         start_y: np.ndarray,
         start_x: np.ndarray,
-        periodic_x: bool,
+        source_x: np.ndarray,
+        source_y: np.ndarray,
+        geographic: bool,
     ) -> np.ndarray | None:
-        """Nearest valid source cell (Euclidean, index space) of every start.
+        """Nearest valid source cell center of every start cell center.
 
-        One exact Euclidean distance transform serves all starts; equidistant
-        candidates are resolved by the transform. A periodic x axis is wrapped
-        by padding half a period of columns on each side.
+        Geographic grids compare great-circle distances (chords between unit
+        vectors), so longitude convergence and a periodic axis are exact;
+        other grids compare planar coordinate distances.
         """
-        ny, nx = valid_grid.shape
         if not np.any(valid_grid):
             return None
-        start_x = np.mod(start_x, nx) if periodic_x else start_x
-        pad = min(nx, nx // 2 + 1) if periodic_x else 0
-        grid = (
-            np.concatenate(
-                (valid_grid[:, nx - pad :], valid_grid, valid_grid[:, :pad]), axis=1
-            )
-            if pad
-            else valid_grid
-        )
-        from scipy.ndimage import distance_transform_edt
+        from scipy.spatial import cKDTree
 
-        nearest = distance_transform_edt(
-            ~grid, return_distances=False, return_indices=True
-        )
-        near_y = nearest[0][start_y, start_x + pad].astype(np.int64)
-        near_x = (nearest[1][start_y, start_x + pad].astype(np.int64) - pad) % nx
-        return near_y * nx + near_x
+        nx = valid_grid.shape[1]
+
+        def points(rows: np.ndarray, cols: np.ndarray) -> np.ndarray:
+            if not geographic:
+                return np.column_stack((source_x[cols], source_y[rows]))
+            lat = np.radians(source_y[rows])
+            lon = np.radians(source_x[cols])
+            return np.column_stack(
+                (np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat))
+            )
+
+        valid_y, valid_x = np.nonzero(valid_grid)
+        tree = cKDTree(points(valid_y, valid_x))
+        _distance, nearest = tree.query(points(start_y, start_x))
+        return valid_y[nearest].astype(np.int64) * nx + valid_x[nearest]
 
     def _source_periodic_x(self) -> bool:
         """Whether the source longitude axis wraps, from its bound span."""
@@ -697,7 +717,8 @@ class MappingTable(HydroForgeModel):
         ``valid_source_mask`` has the ``(y, x)`` source grid shape.
         ``empty_row_policy="nearest"`` repairs rows that originally had source
         support but become empty after masking by assigning the original row sum
-        to the nearest valid source cell.
+        to the nearest valid source cell.  Coverage is scaled by the fraction
+        of each row's original weight that remains on valid source cells.
         """
 
         if valid_source_mask.shape != self._source_shape:
@@ -750,15 +771,18 @@ class MappingTable(HydroForgeModel):
                 y0, x0 = self._weighted_center_indices(
                     original, candidates, nx, periodic_x
                 )
-                nearest = self._nearest_valid_cols(valid_grid, y0, x0, periodic_x)
+                nearest = self._nearest_valid_cols(
+                    valid_grid,
+                    y0,
+                    x0,
+                    self.source_x,
+                    self.source_y,
+                    self.metadata.get("source_is_geographic") is True,
+                )
                 if nearest is not None:
                     repair_row = candidates.tolist()
                     repair_col = nearest.tolist()
-                    repair_val = (
-                        original_row_sums[candidates]
-                        if preserve_row_sum
-                        else np.ones(candidates.size)
-                    ).tolist()
+                    repair_val = original_row_sums[candidates].tolist()
 
             if repair_row:
                 repair = csr_matrix(
@@ -785,12 +809,18 @@ class MappingTable(HydroForgeModel):
             "source_mask_repaired_rows": repaired_rows,
             "source_mask_scaled_rows": scaled_rows,
         }
+        coverage = np.asarray(self.coverage, dtype=np.float64) * np.divide(
+            valid_row_sums,
+            original_row_sums,
+            out=np.ones_like(original_row_sums),
+            where=original_row_sums > 0.0,
+        )
         return MappingTable._assemble(
             target_ids=self.target_ids,
             matrix=masked,
             source_x=self.source_x,
             source_y=self.source_y,
-            coverage=self.coverage,
+            coverage=coverage,
             metadata=metadata,
         )
 

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Test helpers that construct declarations outside a model runtime."""
 
 from __future__ import annotations
@@ -38,9 +44,15 @@ def build_module(
     this module plus its ``references``, which supply already constructed
     sibling modules. ``outputs`` names fields of this module requested
     directly by output, and ``batched_forcing`` its member-batched forcing.
+    ``options`` resolves option conditions and becomes the module's
+    ``options`` field, as a model supplies it.
     """
 
     values = dict(values)
+    if options is not None:
+        if "options" in values and values["options"] is not options:
+            raise ValueError("pass the module options once, as options=")
+        values["options"] = options
     siblings = {module.module_name: module for module in references}
     if len(siblings) != len(references):
         raise ValueError("references contain duplicate module names")
@@ -75,7 +87,9 @@ def build_module(
             raise ValueError(f"batched_forcing {name!r} must name a forcing field")
     demand = FieldDemandPlan({spec.name: outputs}, {spec.name: outputs})
     conditions = resolve_conditions(
-        (spec, *(type(module).spec() for module in siblings.values())), options
+        (spec, *(type(module).spec() for module in siblings.values())),
+        options,
+        opened,
     )
     plan = bind_module_fields(
         spec,

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Backend-neutral kernel declarations.
 
 A :class:`KernelSpec` declares every parameter of one logical kernel exactly
@@ -74,22 +80,6 @@ class OutputRequested(HydroForgeModel):
     dtype: Literal["bool"] = "bool"
 
 
-class ConfigValue(HydroForgeModel):
-    """A compile-time scalar read from the model's frozen options."""
-
-    kind: Literal["config_value"] = "config_value"
-    path: DottedPath
-    dtype: ConstantKind
-
-
-class OptionCode(HydroForgeModel):
-    """The stable integer code of one declared model option."""
-
-    kind: Literal["option_code"] = "option_code"
-    path: DottedPath
-    dtype: Literal["int32"] = "int32"
-
-
 class LiteralValue(HydroForgeModel):
     """A fixed compile-time scalar owned by one kernel variant."""
 
@@ -108,12 +98,7 @@ class LiteralValue(HydroForgeModel):
 
 
 CompileTimeSource: TypeAlias = (
-    ModuleEnabled
-    | ModuleFlag
-    | OutputRequested
-    | ConfigValue
-    | OptionCode
-    | LiteralValue
+    ModuleEnabled | ModuleFlag | OutputRequested | LiteralValue
 )
 Parameter: TypeAlias = (
     AccessMode | RuntimeKind | Constant | CompileTimeSource | StepField
@@ -138,14 +123,6 @@ def output_requested(module: str, field: str) -> OutputRequested:
     """Bind a kernel feature to the model's frozen statistics output plan."""
 
     return OutputRequested(module=module, field=field)
-
-
-def config_value(path: str, dtype: ConstantKind) -> ConfigValue:
-    return ConfigValue(path=path, dtype=dtype)
-
-
-def option_code(path: str) -> OptionCode:
-    return OptionCode(path=path)
 
 
 def literal_value(
@@ -268,7 +245,7 @@ def _resolved(declaration: Any, precision: str) -> Any:
 
     if declaration == "precision":
         return precision
-    if isinstance(declaration, (Constant, ConfigValue, LiteralValue)) and (
+    if isinstance(declaration, (Constant, LiteralValue)) and (
         declaration.dtype == "precision"
     ):
         return type(declaration).model_construct(
@@ -668,11 +645,9 @@ __all__ = [
     "KernelSpec",
     "KernelWorkspace",
     "buffer_access_semantics",
-    "config_value",
     "constant",
     "literal_value",
     "module_enabled",
     "module_flag",
-    "option_code",
     "output_requested",
 ]

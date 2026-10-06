@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Cached compiled operator scopes outside the physical substep clock."""
 
 from __future__ import annotations
@@ -19,8 +25,7 @@ if TYPE_CHECKING:
 
 class _OuterProgram:
     def __init__(self, execution: ModelExecution, operators: Any) -> None:
-        if operators is None or not operators.operators:
-            raise RuntimeError("outer operator scope produced an empty program")
+        # The "outer" recording already rejects an empty operator IR.
         self.executor = execution.executor
         self.operators = operators
         self.runner = self.executor.outer(operators)

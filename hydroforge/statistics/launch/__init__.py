@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Backend programs of compiled statistics and what every backend returns.
 
 The submodules are named after their dialects (``cuda``, ``metal``,
@@ -41,8 +47,9 @@ class CompiledStatistics:
 
     ``function(states, block_size, phase)`` runs one sample; a negative
     ``phase`` reads the sample phase from device controls.
-    ``settle(states, is_outer_first)`` folds a close without a sample and is
-    ``None`` without compound statistics.  ``requests(states, block_size)``
+    ``settle(states, phase)`` folds a close without a sample whose ``phase``
+    the runtime has also written to the device controls; it is ``None``
+    without compound statistics.  ``requests(states, block_size)``
     describes the native compilation the first sample would otherwise do.
     """
 
@@ -62,9 +69,15 @@ def unique_name(rank: int) -> str:
     return f"{datetime.now().strftime('%H%M%S')}_r{rank}_{uuid4().hex}"
 
 
+def source_path(context: StatisticsCompileContext, suffix: str) -> Path:
+    """A fresh path for generated source under the kernels directory."""
+
+    return context.kernels_dir / f"kern_{unique_name(context.rank)}{suffix}"
+
+
 def save_source(context: StatisticsCompileContext, text: str, suffix: str) -> Path:
     """Write generated source for inspection under the kernels directory."""
 
-    path = context.kernels_dir / f"kern_{unique_name(context.rank)}{suffix}"
+    path = source_path(context, suffix)
     atomic_write_text(path, text)
     return path

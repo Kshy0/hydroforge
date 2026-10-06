@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Triton statistics: one generated module of block-program kernels.
 
 The plan's kernels run a block of lanes per program: output groups map lanes
@@ -117,7 +123,7 @@ def compile_statistics(
     context: StatisticsCompileContext, plan: StatisticsKernelPlan
 ) -> CompiledStatistics:
     kernels, source = program(plan, states={**context.tensors, **context.storage})
-    name = f"hydroforge_statistics_r{context.rank}_{unique_name(context.rank)}"
+    name = f"hydroforge_statistics_{unique_name(context.rank)}"
     module = compile_generated_module(source, name=name)
     try:
         jit = tuple(
@@ -129,14 +135,14 @@ def compile_statistics(
         raise
     bound: list[Any] = []
 
-    def internal_update_statistics(states, BLOCK_SIZE, phase):
+    def internal_update_statistics(states, block_size, phase):
         # Rebinding follows a replaced state mapping or block size.  A
         # negative ``phase`` launches every kernel to gate on device controls.
-        if not bound or bound[0] is not states or bound[1] != BLOCK_SIZE:
-            launches = _bind(jit, states, BLOCK_SIZE)
+        if not bound or bound[0] is not states or bound[1] != block_size:
+            launches = _bind(jit, states, block_size)
             bound[:] = [
                 states,
-                BLOCK_SIZE,
+                block_size,
                 [
                     (
                         mask,

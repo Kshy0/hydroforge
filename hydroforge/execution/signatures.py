@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Rank-shared identities of a model declaration and its materialization."""
 
 from __future__ import annotations
@@ -46,8 +52,8 @@ def _schedule_signature(schedule: SimulationSchedule | None) -> Any:
         "explicit",
         schedule.calendar,
         len(schedule.explicit_steps),
-        signature_value(schedule._start),
-        signature_value(schedule._end),
+        signature_value(schedule.start),
+        signature_value(schedule.end),
         digest.hexdigest(),
     )
 
@@ -169,6 +175,7 @@ def declaration_signature(runtime: ModelRuntime) -> tuple[Any, ...]:
         ("precision", plan.precision, plan.mixed_precision, plan.metal_emulation),
         ("options", signature_value(plan.options)),
         ("field_conditions", tuple(sorted(plan.conditions.items()))),
+        ("init_mode", plan.init_mode),
         ("execution", model.execution_mode, plan.block_size),
         (
             "parallel",

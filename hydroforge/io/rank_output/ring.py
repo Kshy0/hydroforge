@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """The preallocated host ring that carries output rows to rank files.
 
 A writer owns one ring for its whole run.  Every output stream holds
@@ -65,19 +71,21 @@ def plan_output_batches(
     """Return each output's ``(depth, batch)`` for :data:`RING_BYTES`.
 
     ``step_bytes`` is the bytes one step adds to an output (all components).
-    A batch is ``min(MAX_BATCH, max_pending_steps)`` rows and ``depth *
-    batch`` never exceeds ``max_pending_steps``, so up to that many steps wait
-    for their append while the model runs ahead.  Over the ring budget the
-    largest outputs first give up slots (down to two, which still overlap
-    filling and appending), then halve their batch. In-process writes use
-    one slot because appending blocks the owner; their next fill waits for
-    that append. Outputs too large even for one-row slots keep that layout:
-    their ring exceeds the budget and is not page-locked.
+    A batch is ``min(MAX_BATCH, max_pending_steps)`` rows, halved for
+    background writes so at least two slots overlap filling and appending,
+    and ``depth * batch`` never exceeds ``max_pending_steps``, so up to that
+    many steps wait for their append while the model runs ahead.  Over the
+    ring budget the largest outputs first give up slots (down to two, which
+    still overlap filling and appending), then halve their batch. In-process
+    writes use one slot because appending blocks the owner; their next fill
+    waits for that append. Outputs too large even for one-row slots keep that
+    layout: their ring exceeds the budget and is not page-locked.
     """
 
     plans = {}
+    pending_rows = max_pending_steps // 2 if background_writes else max_pending_steps
     for name, size in step_bytes.items():
-        batch = min(MAX_BATCH, max_pending_steps, RING_BYTES // max(1, 2 * size))
+        batch = min(MAX_BATCH, pending_rows, RING_BYTES // max(1, 2 * size))
         batch = max(1, batch)
         depth = max(1, max_pending_steps // batch) if background_writes else 1
         plans[name] = [depth, batch]

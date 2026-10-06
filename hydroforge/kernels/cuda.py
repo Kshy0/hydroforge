@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Runtime-compiled CUDA/HIP kernel declarations.
 
 A :class:`CudaSource` is one device-only source and its compiler options; any
@@ -465,7 +471,9 @@ def constant_literal(kind: str, value: Any) -> str:
     if kind == "uint32":
         return f"{value}u"
     if kind == "float32":
-        return f"{repr(value)}f"
+        # Round once on the host, as by-value arguments do, and spell the
+        # exact FP32 value: a decimal literal would round a second time.
+        return f"{ctypes.c_float(value).value.hex()}f"
     if kind == "float64":
         return repr(value)
     raise TypeError(f"unsupported CUDA compile-time kind {kind!r}")

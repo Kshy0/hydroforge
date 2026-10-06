@@ -28,9 +28,12 @@ from hydroforge.data.datasets.storage import (
     NetCDFStore,
     TimeAggregation,
     UnitFactor,
+    UnitsName,
     concatenate_reads,
+    resolve_units,
     scan_storage,
     storage_chunk_len,
+    variable_units,
 )
 from hydroforge.data.datasets.timeline import ReadOp, StorageLayout, TimelineScan
 from hydroforge.data.datasets.values import MissingPolicy
@@ -78,9 +81,11 @@ class _GridShards:
         self._dtype: np.dtype | None = None
         self._grid: tuple[Any, ...] | None = None
         self.shards: dict[Path, _Shard] = {}
+        self.units: list[str | None] = []
 
     def inspect(self, dataset: Any, path: Path) -> None:
         variable = dataset.variables[self._variable]
+        self.units.append(variable_units(variable))
         dtype = np.dtype(variable.dtype)
         if dtype.kind not in {"i", "u", "f"}:
             raise ValueError(
@@ -270,6 +275,12 @@ class NetCDFDataset(ForcingDataset):
     times of one file into a single read.  A mapped view reads only the
     bounding box of its source cells, or sparse tiles of it.  Missing values
     become zero unless ``missing="error"``.
+
+    ``target_units`` opts in to unit checking: the variable's ``units``
+    attribute (or ``source_units``) is converted to ``target_units`` with
+    :func:`~hydroforge.core.units.check_units`; an unknown pair needs an
+    explicit ``unit_factor``. Without ``target_units`` values are only divided
+    by ``unit_factor``.
     """
 
     base_dir: SourceDirectory
@@ -277,6 +288,8 @@ class NetCDFDataset(ForcingDataset):
     prefix: str
     chunk_len: int | None = Field(default=None, ge=1)
     unit_factor: UnitFactor = 1.0
+    source_units: UnitsName | None = None
+    target_units: UnitsName | None = None
     suffix: str = ".nc"
     time_to_key: Callable[[DateLike], str] = yearly_time_to_key
     time_aggregation: TimeAggregation = None
@@ -318,12 +331,15 @@ class NetCDFDataset(ForcingDataset):
             ),
         )
         self._locate_support(scan, plan)
+        unit_factor, unit_scale, unit_offset = resolve_units(self, grid.units)
         self._store = NetCDFStore(
             files=inspection.files(),
             layout=layout,
             timeline=scan.freeze(plan, self._read_times),
-            unit_factor=self.unit_factor,
+            unit_factor=unit_factor,
             aggregation=self.time_aggregation,
+            unit_scale=unit_scale,
+            unit_offset=unit_offset,
         )
         self._shards = grid.shards
         self._space = grid.space()
@@ -435,9 +451,10 @@ class NetCDFDataset(ForcingDataset):
         )
 
     def _first_frame_missing(self) -> np.ndarray:
-        """``(Y, X)`` mask of missing values in the first read source frame."""
+        """``(Y, X)`` mask of missing values in the frame at ``start_date``."""
 
-        first = self.chunk_plan[0].source_start + self._storage_offset()
+        main = self.chunk_plan[self.chunk_plan.num_spinup_chunks]
+        first = main.source_start + self._storage_offset()
         key, rows = self._store.timeline.operations([first])[0]
         path = self._store.path(key)
         axes = self._shards[path].axes

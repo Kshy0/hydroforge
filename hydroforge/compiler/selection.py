@@ -1,23 +1,29 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """First compilation stage: modules, backend, precision, clock and topology."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from graphlib import CycleError, TopologicalSorter
 from typing import TYPE_CHECKING, Literal
 
 import torch
 
 from hydroforge.contracts.conditions import resolve_conditions
 from hydroforge.contracts.fields import tensor_is_active
-from hydroforge.contracts.options import OptionsConfig
+from hydroforge.contracts.options import OptionsConfig, check_option_contracts
 from hydroforge.contracts.runtime import (
     DEFAULT_BACKEND_REQUIREMENT,
     DEFAULT_MODULE_REQUIREMENT,
     BackendRequirement,
 )
 from hydroforge.contracts.schedule import SimulationSchedule
+from hydroforge.core.graph import dependency_order
 from hydroforge.core.time import DateLike, normalize_calendar_dates
 from hydroforge.declare.spec import ModelSpec
 from hydroforge.parallel.distributed import ProcessTopology
@@ -59,6 +65,7 @@ class Selection:
     local_ensemble_size: int | None
     member_ids: tuple[int, ...] | None
     parallel: EnsembleParallel | None
+    init_mode: Literal["cold", "restart"] | None
 
 
 def resolve_block_size(
@@ -124,22 +131,18 @@ def _validate_ensemble_forcing(
 def _module_order(spec: ModelSpec, opened: tuple[str, ...]) -> tuple[str, ...]:
     """Return the deterministic dependency order of the opened modules."""
 
-    sorter: TopologicalSorter[str] = TopologicalSorter()
-    for name in opened:
-        sorter.add(
-            name,
-            *(
-                reference
-                for reference in spec.modules[name].references
-                if reference in opened
-            ),
-        )
-    try:
-        return tuple(sorter.static_order())
-    except CycleError as error:
-        raise ValueError(
-            f"opened module references must form an acyclic construction graph: {error.args[1]}"
-        ) from error
+    return dependency_order(
+        opened,
+        lambda name: (
+            reference
+            for reference in spec.modules[name].references
+            if reference in opened
+        ),
+        cycle_message=lambda cycle: (
+            "opened module references must form an acyclic construction "
+            f"graph: {list(cycle)}"
+        ),
+    )
 
 
 def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
@@ -152,6 +155,9 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
         if ensemble_size != parallel.ensemble_size:
             raise ValueError("model ensemble_size must match the ensemble process mesh")
     opened = declaration.opened_modules
+    check_option_contracts(
+        declaration.options, opened, strict_options=declaration.strict_options
+    )
     conditions = resolve_conditions(
         (spec.modules[name] for name in opened), declaration.options
     )
@@ -165,13 +171,9 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
             raise ValueError(
                 f"module {name!r} requires simulation_schedule or initial_time"
             )
+    # Option-required modules were opened by the declaration's
+    # before-validator (on_missing="open") or checked above ("error").
     options = declaration.options
-    for path, required in options.required_modules().items():
-        missing = sorted(set(required).difference(opened))
-        if missing:
-            raise ValueError(
-                f"option {path}={options.choice(path)!r} requires opened_modules to include {missing}"
-            )
 
     device = declaration.device
     backend = resolve_backend(device)
@@ -221,7 +223,7 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
                 "metal_emulation requires Metal, float32 compute and mixed_precision=True"
             )
     backend.validate_precision(precision, mixed_precision and emulation == "native")
-    model_rule._validate_precision(precision, mixed_precision, backend=backend.name)
+    model_rule.validate_precision(precision, mixed_precision, backend=backend.name)
     options.validate_backend(backend.name)
     block_size = declaration.block_size
     if block_size is None:
@@ -263,4 +265,5 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
         ),
         member_ids=None if parallel is None else parallel.member_ids,
         parallel=parallel,
+        init_mode=declaration.init_mode,
     )

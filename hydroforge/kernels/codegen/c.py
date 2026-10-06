@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """The C-family printer of kernel IR: CUDA C++ and the Metal Shading Language.
 
 Both dialects share statement and expression spelling; a trait supplies what
@@ -8,16 +14,20 @@ spelled ``p_<name>`` and scalar parameters by name, with non-word characters
 replaced.
 
 The prelude helpers are the dialects' NaN rules: ``nan_max``/``nan_min``
-ignore one NaN operand and ``weighted_mean`` is the incremental mean with a
-blended fallback for non-finite results.  CUDA tests NaN and finiteness with
-the math library; MSL tests IEEE bits, which fast math cannot fold away.
+ignore one NaN operand and otherwise select ``a > b ? a : b``,
+``weighted_mean`` is the incremental mean with a blended fallback for
+non-finite results, and ``py_mod`` is Python's remainder.  CUDA tests NaN and
+finiteness with the math library; MSL tests IEEE bits, which fast math cannot
+fold away.  An untyped floating literal next to a ``float`` operand is spelled
+as a ``float``, so it does not promote the operation to ``double``.
 """
 
 from __future__ import annotations
 
+import copy
 import math
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -50,6 +60,7 @@ from hydroforge.kernels.codegen.ir import (
     Unary,
     Var,
     While,
+    type_of,
 )
 from hydroforge.kernels.codegen.passes import effects
 from hydroforge.kernels.codegen.types import element, scalar, scalar_kind
@@ -64,8 +75,11 @@ template <> __device__ inline float hf_min<float>(float a, float b) { if (isnan(
 template <> __device__ inline double hf_max<double>(double a, double b) { if (isnan(a)) return b; if (isnan(b)) return a; return a > b ? a : b; }
 template <> __device__ inline double hf_min<double>(double a, double b) { if (isnan(a)) return b; if (isnan(b)) return a; return a < b ? a : b; }
 // Incremental form bounds FP32 drift; non-finite results keep the
-// blended form's infinity/NaN propagation.
-template <typename T> __device__ inline T hf_weighted_mean(T old_v, T old_w, T value, T weight) { T new_w = old_w + weight; T ratio = weight / new_w; T incremental = old_v + (value - old_v) * ratio; return isfinite(incremental) ? incremental : old_v * (old_w / new_w) + value * ratio; }
+// blended form's infinity/NaN propagation.  Finite weights whose sum
+// overflows are halved first, as the float32x2 Metal form does.
+template <typename T> __device__ inline T hf_weighted_mean(T old_v, T old_w, T value, T weight) { T new_w = old_w + weight; if (!isfinite(new_w) && isfinite(old_w) && isfinite(weight)) { old_w = old_w * T(0.5); weight = weight * T(0.5); new_w = old_w + weight; } T ratio = weight / new_w; T incremental = old_v + (value - old_v) * ratio; return isfinite(incremental) ? incremental : old_v * (old_w / new_w) + value * ratio; }
+// Python's remainder: the sign of the divisor.
+template <typename T> __device__ inline T hf_py_mod(T a, T b) { T r = fmod(a, b); return (r != T(0) && ((r < T(0)) != (b < T(0)))) ? r + b : r; }
 """
 
 _MSL_PRELUDE = """\
@@ -77,27 +91,42 @@ using namespace metal;
 inline bool hydroforge_isnan(float value) {
     return (as_type<uint>(value) & 0x7fffffffu) > 0x7f800000u;
 }
+inline bool hydroforge_isfinite(float value) {
+    return (as_type<uint>(value) & 0x7f800000u) != 0x7f800000u;
+}
 inline float hydroforge_nan() {
     return as_type<float>(0x7fc00000u);
 }
+// Select like CUDA (``a > b ? a : b``), also for signed zeros.
 inline float hydroforge_maximum(float left, float right) {
     if (hydroforge_isnan(left)) return right;
     if (hydroforge_isnan(right)) return left;
-    return max(left, right);
+    return left > right ? left : right;
 }
 inline float hydroforge_minimum(float left, float right) {
     if (hydroforge_isnan(left)) return right;
     if (hydroforge_isnan(right)) return left;
-    return min(left, right);
+    return left < right ? left : right;
 }
 // Incremental form bounds FP32 drift; non-finite results keep the
 // blended form's infinity/NaN propagation (bit test survives fast math).
+// Finite weights whose sum overflows are halved first.
 inline float hydroforge_weighted_mean(float old_value, float old_weight, float value, float weight) {
     float new_weight = old_weight + weight;
+    if (!hydroforge_isfinite(new_weight) && hydroforge_isfinite(old_weight) && hydroforge_isfinite(weight)) {
+        old_weight = old_weight * 0.5f;
+        weight = weight * 0.5f;
+        new_weight = old_weight + weight;
+    }
     float ratio = weight / new_weight;
     float incremental = old_value + (value - old_value) * ratio;
-    if ((as_type<uint>(incremental) & 0x7f800000u) != 0x7f800000u) return incremental;
+    if (hydroforge_isfinite(incremental)) return incremental;
     return old_value * (old_weight / new_weight) + value * ratio;
+}
+// Python's remainder: the sign of the divisor.
+inline float hydroforge_py_mod(float left, float right) {
+    float remainder = fmod(left, right);
+    return (remainder != 0.0f && ((remainder < 0.0f) != (right < 0.0f))) ? remainder + right : remainder;
 }
 inline int hydroforge_maximum(int left, int right) { return max(left, right); }
 inline int hydroforge_minimum(int left, int right) { return min(left, right); }
@@ -109,18 +138,33 @@ inline uchar hydroforge_minimum(uchar left, uchar right) { return min(left, righ
 
 _MATH = {name: name for name in ("sqrt", "exp", "log", "sin", "cos", "tan", "pow")}
 
+# Types C arithmetic promotes to ``int``.
+_PROMOTED = frozenset((torch.bool, torch.int8, torch.uint8, torch.int16, torch.uint16))
+
+_CXX_KEYWORDS = frozenset(
+    """alignas alignof and asm auto bool break case catch char class const
+    constexpr continue default delete do double else enum explicit extern
+    false float for friend goto if inline int long namespace new noexcept not
+    nullptr operator or private protected public register return short signed
+    sizeof static struct switch template this throw true try typedef typename
+    union unsigned using virtual void volatile while""".split()
+)
+
 
 def _c_type(node: Expr) -> torch.dtype | None:
-    """The C type of ``node`` where no overload can change it."""
+    """The C type of ``node`` where no overload or promotion can change it."""
 
     match node:
         case Var() | Const() | Load() | Cast():
             return node.type
         case Unary(op="neg"):
-            return _c_type(node.operand)
+            operand = _c_type(node.operand)
+            return None if operand in _PROMOTED else operand
         case Binary():
             left = _c_type(node.left)
-            return left if left == _c_type(node.right) else None
+            if left in _PROMOTED or left != _c_type(node.right):
+                return None
+            return left
         case Select():
             positive = _c_type(node.positive)
             return positive if positive == _c_type(node.negative) else None
@@ -138,6 +182,15 @@ def identifier(param: Param) -> str:
     return _word(param.name) if param.access is None else f"p_{_word(param.name)}"
 
 
+def _spelling(dtype: torch.dtype, dialect: str) -> str:
+    """A tensor element's spelling, else the scalar kind's (``uint32``)."""
+
+    try:
+        return element(dtype, dialect)
+    except TypeError:
+        return scalar(scalar_kind(dtype), dialect)
+
+
 @dataclass(frozen=True, slots=True)
 class _Trait:
     dialect: str
@@ -148,12 +201,18 @@ class _Trait:
     prelude: str
     nan: Callable[[str], str]
     entry: Callable[[KernelFunction, Sequence[str]], list[str]]
+    # Spelling of an untyped finite floating literal.
+    literal: Callable[[float], str] = repr
+    # Read of an atomic buffer element, if plain loads cannot read one.
+    atomic_load: str | None = None
+    # Names the entry, the prelude and the dialect bind.
+    reserved: frozenset[str] = frozenset()
 
 
 def _cuda_entry(function: KernelFunction, body: Sequence[str]) -> list[str]:
     params = []
     for param in function.params:
-        spelled = element(param.type, "cuda")
+        spelled = _spelling(param.type, "cuda")
         if param.access is None:
             params.append(f"{spelled} {identifier(param)}")
         else:
@@ -232,9 +291,11 @@ class CPrinter:
 
     def __init__(self, trait: _Trait) -> None:
         self.trait = trait
+        # Atomic buffers of the kernel being printed (``atomic_load`` only).
+        self.atomics: frozenset[str] = frozenset()
 
     def type(self, dtype: torch.dtype) -> str:
-        return element(dtype, self.trait.dialect)
+        return _spelling(dtype, self.trait.dialect)
 
     def cast(self, text: str, dtype: torch.dtype) -> str:
         # Metal bool buffers use bytes, but casts must normalize truth values.
@@ -246,7 +307,7 @@ class CPrinter:
         if isinstance(value, bool):
             return "true" if value else "false"
         if node.type is None:
-            return repr(value)
+            return self.trait.literal(value) if type(value) is float else repr(value)
         if isinstance(value, float) and math.isnan(value):
             return self.trait.nan(self.type(node.type))
         if isinstance(value, float) and math.isinf(value):
@@ -256,48 +317,70 @@ class CPrinter:
     def buffer(self, name: str) -> str:
         return f"p_{_word(name)}"
 
+    def operand(self, node: Expr, context: Iterable[Expr]) -> str:
+        """``node`` spelled next to ``context``: an untyped floating literal
+        takes the ``float`` type of a ``float`` neighbour."""
+
+        if (
+            isinstance(node, Const)
+            and node.type is None
+            and type(node.value) is float
+            and any(type_of(item) == torch.float32 for item in context)
+        ):
+            try:
+                return self.const(Const(node.value, torch.float32))
+            except OverflowError:
+                pass
+        return self.expr(node)
+
     def expr(self, node: Expr) -> str:
         match node:
             case Var():
-                return node.name
+                # Scalar parameters are declared with non-word characters
+                # replaced; locals are identifiers, which this keeps.
+                return _word(node.name)
             case Const():
                 return self.const(node)
             case Load():
+                pointer = f"{self.buffer(node.buffer)} + {self.expr(node.index)}"
+                if node.buffer in self.atomics:
+                    return self.trait.atomic_load.format(pointer=pointer)
                 return f"{self.buffer(node.buffer)}[{self.expr(node.index)}]"
             case Unary(op="neg"):
-                return f"(-{self.expr(node.operand)})"
+                operand = self.expr(node.operand)
+                # ``--1`` would be a decrement.
+                return f"(-({operand}))" if operand.startswith("-") else f"(-{operand})"
             case Unary():
                 return f"(!{self.expr(node.operand)})"
             case Binary() | Compare():
-                return f"({self.expr(node.left)} {node.op} {self.expr(node.right)})"
+                left = self.operand(node.left, (node.right,))
+                right = self.operand(node.right, (node.left,))
+                return f"({left} {node.op} {right})"
             case Logical():
                 symbol = " && " if node.op == "and" else " || "
                 return f"({symbol.join(self.expr(item) for item in node.operands)})"
             case Select():
-                return (
-                    f"(({self.expr(node.condition)}) ? ({self.expr(node.positive)}) "
-                    f": ({self.expr(node.negative)}))"
-                )
+                positive = self.operand(node.positive, (node.negative,))
+                negative = self.operand(node.negative, (node.positive,))
+                return f"(({self.expr(node.condition)}) ? ({positive}) : ({negative}))"
             case Cast():
                 operand = self.expr(node.operand)
                 if _c_type(node.operand) == node.type:
                     return operand
                 return self.cast(operand, node.type)
-            case Call(function="py_mod"):
-                left, right = (self.expr(item) for item in node.arguments)
-                remainder = f"fmod({left}, {right})"
-                adjust = (
-                    f"(({remainder} != 0.0) && "
-                    f"(({remainder} < 0.0) != ({right} < 0.0)))"
-                )
-                return f"(({adjust}) ? ({remainder} + {right}) : ({remainder}))"
             case Call():
                 function = self.trait.functions.get(node.function)
+                if node.function == "abs" and not (
+                    node.type is None or node.type.is_floating_point
+                ):
+                    function = "abs"
                 if function is None:
                     raise TypeError(
                         f"{self.trait.dialect} has no intrinsic {node.function!r}"
                     )
-                arguments = ", ".join(self.expr(item) for item in node.arguments)
+                arguments = ", ".join(
+                    self.operand(item, node.arguments) for item in node.arguments
+                )
                 return f"{function}({arguments})"
             case PhaseTest():
                 return f"(({PHASE.name} & {int(node.bits)}) != 0)"
@@ -361,13 +444,29 @@ class CPrinter:
 
     def kernel(self, function: KernelFunction) -> str:
         names = [identifier(param) for param in function.params]
-        shadowed = set(names).intersection(effects(function.body).defines)
+        defines = effects(function.body).defines
+        shadowed = set(names).intersection(defines)
         if len(set(names)) != len(names) or shadowed:
             raise ValueError(
                 f"{function.name}: parameter names collide: {names}; "
                 f"locals shadowing parameters: {sorted(shadowed)}"
             )
-        body = self.stmts(function.body)
+        reserved = (
+            self.trait.reserved | _CXX_KEYWORDS | {f"{function.name}_args"}
+        ).intersection((*names, *defines))
+        if reserved:
+            raise ValueError(
+                f"{function.name}: names reserved by {self.trait.dialect}: "
+                f"{sorted(reserved)}"
+            )
+        printer = self
+        atomics = frozenset(
+            param.name for param in function.params if param.access == "atomic_add"
+        )
+        if self.trait.atomic_load is not None and atomics:
+            printer = copy.copy(self)
+            printer.atomics = atomics
+        body = printer.stmts(function.body)
         return "\n".join(self.trait.entry(function, body))
 
     def program(self, functions: Sequence[KernelFunction]) -> str:
@@ -384,6 +483,7 @@ CUDA = CPrinter(
         functions={
             **_MATH,
             "abs": "fabs",
+            "py_mod": "hf_py_mod",
             "nan_max": "hf_max",
             "nan_min": "hf_min",
             "weighted_mean": "hf_weighted_mean",
@@ -392,10 +492,22 @@ CUDA = CPrinter(
         },
         cast="static_cast<{type}>({value})",
         atomic_add="atomicAdd({pointer}, {value})",
-        thread_index="int64_t(blockIdx.x) * blockDim.x + threadIdx.x",
+        thread_index="(int64_t(blockIdx.x) * blockDim.x + threadIdx.x)",
         prelude=_CUDA_PRELUDE,
         nan=lambda spelled: f"static_cast<{spelled}>(NAN)",
         entry=_cuda_entry,
+        reserved=frozenset(
+            (
+                "blockIdx",
+                "blockDim",
+                "threadIdx",
+                "gridDim",
+                "hf_max",
+                "hf_min",
+                "hf_weighted_mean",
+                "hf_py_mod",
+            )
+        ),
     )
 )
 MSL = CPrinter(
@@ -404,6 +516,7 @@ MSL = CPrinter(
         functions={
             **_MATH,
             "abs": "fabs",
+            "py_mod": "hydroforge_py_mod",
             "nan_max": "hydroforge_maximum",
             "nan_min": "hydroforge_minimum",
             "weighted_mean": "hydroforge_weighted_mean",
@@ -415,5 +528,27 @@ MSL = CPrinter(
         prelude=_MSL_PRELUDE,
         nan=lambda spelled: "hydroforge_nan()",
         entry=_msl_entry,
+        # Metal has no ``double``: an untyped literal is an exact float.
+        literal=lambda value: value.hex() + "f",
+        atomic_load="atomic_load_explicit({pointer}, memory_order_relaxed)",
+        reserved=frozenset(
+            (
+                "tid",
+                "args",
+                "metal",
+                "kernel",
+                "device",
+                "constant",
+                "thread",
+                "threadgroup",
+                "hydroforge_isnan",
+                "hydroforge_isfinite",
+                "hydroforge_nan",
+                "hydroforge_maximum",
+                "hydroforge_minimum",
+                "hydroforge_weighted_mean",
+                "hydroforge_py_mod",
+            )
+        ),
     )
 )

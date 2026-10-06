@@ -1,17 +1,31 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Module tensor materialization from declared field specs."""
 
 from __future__ import annotations
 
 import inspect
+import math
 from collections.abc import Mapping
+from functools import cached_property
 from numbers import Integral
 from typing import Any, get_args
 
 import torch
 from pydantic_core import PydanticUndefined
 
-from hydroforge.contracts.fields import TensorMetadata, concrete_tensor_dtype
+from hydroforge.contracts.fields import (
+    TensorMetadata,
+    concrete_tensor_dtype,
+    offending_indices,
+)
 from hydroforge.core.devices import devices_match
+from hydroforge.core.errors import UnknownFieldError
+from hydroforge.core.validation import field_default
 from hydroforge.declare.spec import ModuleBinding
 
 
@@ -74,9 +88,7 @@ class ModulePayload:
     def _default_value(self, name: str) -> Any:
         defaults = self._default_values
         if name not in defaults:
-            defaults[name] = self._module_type.model_fields[name].get_default(
-                call_default_factory=True,
-            )
+            defaults[name] = field_default(self._module_type.model_fields[name])
         return defaults[name]
 
     @property
@@ -143,12 +155,17 @@ class ModuleTensors:
         module = self.module
         active_fields = []
         for field in module.spec().tensor_fields.values():
-            if not field.computed or field.tensor.category == "virtual":
+            if not field.computed:
                 continue
             if module._is_tensor_field_active(field.name):
-                active_fields.append(field)
-            else:
+                # Virtual fields stay lazy until output or a kernel needs them.
+                if field.tensor.category != "virtual":
+                    active_fields.append(field)
+            elif isinstance(
+                inspect.getattr_static(type(module), field.name, None), cached_property
+            ):
                 object.__setattr__(module, field.name, None)
+            # Plain-property virtual getters return None while inactive.
         for field in active_fields:
             self._validate_computed_field(field, getattr(module, field.name))
         # Derived reference indices are descriptors rather than Pydantic
@@ -162,8 +179,8 @@ class ModuleTensors:
             if field.computed or module._is_tensor_field_active(field.name):
                 continue
             if field.name in module.model_fields_set:
-                required = ", ".join(field.tensor.depends_on)
-                consumers = ", ".join(field.tensor.required_by)
+                required = ", ".join(map(str, field.tensor.depends_on))
+                consumers = ", ".join(map(str, field.tensor.required_by))
                 dependencies = required
                 if consumers:
                     dependencies = (
@@ -229,7 +246,9 @@ class ModuleTensors:
         module = self.module
         metadata = module._tensor_metadata(field_name)
         if metadata is None:
-            raise ValueError(f"unknown tensor field {module.module_name}.{field_name}")
+            raise UnknownFieldError(
+                f"unknown tensor field {module.module_name}.{field_name}"
+            )
         return concrete_tensor_dtype(
             metadata.dtype,
             module.precision,
@@ -252,12 +271,16 @@ class ModuleTensors:
             if value is None:
                 tensor = None
             elif isinstance(value, (int, float, bool)):
-                tensor = torch.full(
-                    shape,
-                    value,
-                    dtype=self._expected_dtype(schema.name),
-                    device=module.device,
-                )
+                dtype = self._expected_dtype(schema.name)
+                if (
+                    dtype.is_floating_point
+                    and math.isfinite(value)
+                    and abs(value) > torch.finfo(dtype).max
+                ):
+                    raise ValueError(
+                        f"Default {value!r} for {schema.name} exceeds the {dtype} range"
+                    )
+                tensor = torch.full(shape, value, dtype=dtype, device=module.device)
             else:
                 raise ValueError(
                     f"Unsupported default type for {schema.name}: {type(value)}"
@@ -389,6 +412,31 @@ class ModuleTensors:
                 f"Computed field {module.module_name}.{field.name} must use "
                 f"dtype {dtype}, got {tensor.dtype}"
             )
+
+    def constraint_violations(self) -> list[str]:
+        """Describe stored non-forcing values violating ``finite``/bounds."""
+
+        module = self.module
+        problems = []
+        for field in module.spec().tensor_fields.values():
+            metadata = field.tensor
+            if (
+                field.computed
+                or metadata.category == "forcing"
+                or not metadata.has_value_constraints
+                or not module._is_tensor_field_active(field.name)
+            ):
+                continue
+            value = getattr(module, field.name, None)
+            if not isinstance(value, torch.Tensor) or not value.numel():
+                continue
+            for label, mask in metadata.value_violations(value):
+                problems.append(
+                    f"{module.module_name}.{field.name}: "
+                    f"{int(mask.sum().item())} value(s) violate {label}; "
+                    f"first indices {offending_indices(mask)}"
+                )
+        return problems
 
     def _on_device(self, tensor: torch.Tensor) -> bool:
         return devices_match(tensor.device, self.module.device)

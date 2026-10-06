@@ -196,50 +196,32 @@ def is_rank_zero() -> bool:
     return True
 
 
-def get_world_size() -> int:
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_world_size()
-    return 1
-
-
 def _local_device_index(
     local_rank: int,
     device_count: int,
     *,
     device_type: str,
     visibility: str | None,
-    environment: Mapping[str, str] | None = None,
 ) -> int:
     """Bind one local rank to a visible accelerator index.
 
     Node-wide visibility binds ``LOCAL_RANK`` directly. A single visible
     device is per-process binding (``--gpus-per-task=1`` or a per-rank
-    visibility mask). Fewer visible devices than local ranks are shared
-    round-robin only when the declared node-local process count is an exact
-    multiple of the visible device count; anything else is rejected as a
-    likely launcher misconfiguration.
+    visibility mask). Fewer visible devices than local ranks would make ranks
+    share one accelerator, which NCCL/XCCL reject, so it is refused here.
     """
 
     if local_rank < device_count:
         return local_rank
     if device_count == 1:
         return 0
-    local_count = _local_process_count(environment)
-    if (
-        device_count > 1
-        and local_count is not None
-        and local_rank < local_count
-        and local_count % device_count == 0
-    ):
-        return local_rank % device_count
     raise RuntimeError(
         f"LOCAL_RANK/device index {local_rank} is outside the {device_count} "
         f"{device_type.upper()} device(s) visible on this node "
-        f"(visibility mask={visibility!r}), and the node-local process count "
-        f"{local_count!r} is not a multiple of the visible device count. The "
-        "launcher must assign one valid local device index per process or "
-        "expose one device per process. WORLD_SIZE may legitimately exceed "
-        "this node-local device count in a multi-node job."
+        f"(visibility mask={visibility!r}); NCCL/XCCL need one device per "
+        "rank. The launcher must assign one valid local device index per "
+        "process or expose one device per process. WORLD_SIZE may "
+        "legitimately exceed this node-local device count in a multi-node job."
     )
 
 
@@ -275,7 +257,6 @@ def _accelerator_candidate(
             device_count,
             device_type=device_type,
             visibility=visibility,
-            environment=environment,
         )
         index = bound if candidate.index is None else candidate.index
         if index != bound:
@@ -338,22 +319,25 @@ def _candidate_device(
     *,
     local_rank: int,
     world_size: int,
-    initialized_backend: Literal["gloo", "nccl", "xccl"] | None,
+    initialized_backend: str | None,
     required_kernel_backend: Literal["torch", "triton", "cuda", "metal"] | None,
     environment: Mapping[str, str] | None = None,
 ) -> torch.device:
-    """Validate, activate, and kernel-preflight one ordered candidate."""
+    """Validate, activate, and kernel-preflight one ordered candidate.
 
-    compatible_types = tuple(
-        kind
-        for kind, backend in _COMMUNICATION_BACKENDS.items()
-        if backend == initialized_backend
-    )
-    if compatible_types and candidate.type not in compatible_types:
-        raise RuntimeError(
-            f"initialized {initialized_backend.upper()} communication backend "
-            f"requires a device from {compatible_types!r}"
-        )
+    ``initialized_backend`` is the raw ``dist.get_backend()`` spelling of an
+    existing default group (a name, a per-device list or ``undefined``).
+    """
+
+    if initialized_backend is not None:
+        observed = _backend_name(initialized_backend, candidate.type)
+        required = _COMMUNICATION_BACKENDS[candidate.type]
+        if observed != required:
+            raise RuntimeError(
+                f"initialized {observed.upper()} communication backend cannot "
+                f"serve a {candidate.type!r} device, which requires "
+                f"{required.upper()}"
+            )
 
     if candidate.type == "cpu":
         device = torch.device("cpu")
@@ -383,7 +367,7 @@ def _select_distributed_device(
     *,
     local_rank: int,
     world_size: int,
-    initialized_backend: Literal["gloo", "nccl", "xccl"] | None,
+    initialized_backend: str | None,
     environment: Mapping[str, str] | None = None,
 ) -> torch.device:
     """Select the first fully usable device in the caller's declared order."""
@@ -644,14 +628,12 @@ def _setup_distributed_trusted(
                 f"RANK={rank_env} disagrees with the initialized process "
                 f"group rank={rank}"
             )
-        observed_backend = _backend_name(dist.get_backend())
-        if observed_backend not in {"gloo", "nccl", "xccl"}:
-            raise RuntimeError(
-                f"initialized communication backend {observed_backend!r} is "
-                "unsupported; HydroForge supports Gloo, NCCL/RCCL, and XCCL"
-            )
-        backend: Literal["gloo", "nccl", "xccl"] | None = observed_backend
+        # Resolved per candidate device: a default group may be created
+        # without a backend (``undefined``) or with a per-device list.
+        initialized_backend: str | None = str(dist.get_backend())
+        backend: Literal["gloo", "nccl", "xccl"] | None = None
     else:
+        initialized_backend = None
         if ws_env == 1 and local_rank != 0:
             raise ValueError(
                 f"local rank is {local_rank}, but WORLD_SIZE={ws_env}; "
@@ -696,9 +678,11 @@ def _setup_distributed_trusted(
             request,
             local_rank=local_rank,
             world_size=world_size,
-            initialized_backend=backend,
+            initialized_backend=initialized_backend,
             environment=environment,
         )
+        if initialized_backend is not None:
+            backend = _backend_name(initialized_backend, device.type)
     require_launcher_environment(environment)
     if not initialized and world_size > 1:
         assert expected_rank is not None
@@ -723,7 +707,7 @@ def _setup_distributed_trusted(
             dist.init_process_group(**arguments)
             rank = dist.get_rank()
             world_size = dist.get_world_size()
-            observed_backend = _backend_name(dist.get_backend())
+            observed_backend = _backend_name(dist.get_backend(), device.type)
             if rank != expected_rank:
                 raise RuntimeError(
                     f"initialized rank={rank} disagrees with preflight RANK={expected_rank}"

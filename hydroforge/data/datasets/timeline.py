@@ -15,7 +15,7 @@ dataset.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from itertools import groupby
 from pathlib import Path
@@ -85,21 +85,88 @@ class StorageLayout:
 
 @dataclass(frozen=True, slots=True)
 class NetCDFTimeline:
-    """Scanned file times and the compiled storage reads of every plan chunk."""
+    """Scanned file times and the compiled storage reads of every plan chunk.
 
-    locations: Mapping[DateLike, tuple[str, int]]
+    Per-chunk reads use only ``reads``.  ``locations`` holds one date object
+    per scanned record, so pickling (DataLoader workers) ships it as compact
+    integer arrays that are decoded on the first :meth:`operations` call.
+    """
+
+    locations: Mapping[DateLike, tuple[str, int]] | None
     keys: tuple[str, ...]
     source_interval: timedelta | None
     aggregation_factor: int
     reads: tuple[tuple[ReadOp, ...], ...]
+    _packed: tuple[Any, ...] | None = field(default=None, repr=False, compare=False)
 
     def operations(self, times: Iterable[DateLike]) -> tuple[ReadOp, ...]:
         """Storage reads of arbitrary output times (aggregation expanded)."""
 
         return _operations(
-            self.locations,
+            self._locations(),
             _source_times(times, self.source_interval, self.aggregation_factor),
         )
+
+    def _locations(self) -> Mapping[DateLike, tuple[str, int]]:
+        if self.locations is None:
+            origin, offsets, key_names, key_index, rows = self._packed
+            object.__setattr__(
+                self,
+                "locations",
+                frozen_dict(
+                    {
+                        origin + timedelta(microseconds=int(offset)): (
+                            key_names[int(key)],
+                            int(row),
+                        )
+                        for offset, key, row in zip(
+                            offsets, key_index, rows, strict=True
+                        )
+                    }
+                ),
+            )
+            object.__setattr__(self, "_packed", None)
+        return self.locations
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = {
+            "keys": self.keys,
+            "source_interval": self.source_interval,
+            "aggregation_factor": self.aggregation_factor,
+            "reads": self.reads,
+            "locations": None,
+            "_packed": self._packed,
+        }
+        if self.locations is not None and self.locations:
+            origin = next(iter(self.locations))
+            names = tuple(dict.fromkeys(key for key, _row in self.locations.values()))
+            positions = {name: index for index, name in enumerate(names)}
+            state["_packed"] = (
+                origin,
+                np.fromiter(
+                    (timedelta_microseconds(time - origin) for time in self.locations),
+                    dtype=np.int64,
+                    count=len(self.locations),
+                ),
+                names,
+                np.fromiter(
+                    (positions[key] for key, _row in self.locations.values()),
+                    dtype=np.int64,
+                    count=len(self.locations),
+                ),
+                np.fromiter(
+                    (row for _key, row in self.locations.values()),
+                    dtype=np.int64,
+                    count=len(self.locations),
+                ),
+            )
+        elif self.locations is not None:
+            state["locations"] = self.locations
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        for name, value in state.items():
+            object.__setattr__(self, name, value)
 
 
 def _source_times(
@@ -192,6 +259,8 @@ def _support_keys(
 
 
 def _time_variable(dataset: Any, path: Path, variable: str) -> Any:
+    if variable not in dataset.variables:
+        raise ValueError(f"Data variable {variable!r} not found in file: {path.name}")
     data_dimensions = set(dataset.variables[variable].dimensions)
     candidates = [
         dataset.variables[name]
@@ -201,7 +270,10 @@ def _time_variable(dataset: Any, path: Path, variable: str) -> Any:
         and dataset.variables[name].dimensions[0] in data_dimensions
     ]
     if not candidates:
-        raise ValueError(f"Time variable not found in file: {path.name}")
+        raise ValueError(
+            f"Time variable ('time' or 'valid_time' on a dimension of "
+            f"{variable!r}) not found in file: {path.name}"
+        )
     if len(candidates) > 1:
         names = [candidate.name for candidate in candidates]
         raise ValueError(f"Ambiguous time variables in {path.name}: {names}")
@@ -210,6 +282,18 @@ def _time_variable(dataset: Any, path: Path, variable: str) -> Any:
 
 def _file_calendar(time_variable: Any) -> str:
     return canonical_calendar(getattr(time_variable, "calendar", "standard"))
+
+
+# The standard (mixed Julian/Gregorian) and proleptic Gregorian calendars
+# label every instant from 1582-10-15 onwards identically.
+_GREGORIAN_CALENDARS = frozenset({"standard", "proleptic_gregorian"})
+_GREGORIAN_REFORM = (1582, 10, 15)
+
+
+def calendars_equivalent(left: str, right: str) -> bool:
+    """Whether two canonical calendars agree on every post-reform date."""
+
+    return left == right or {left, right} == _GREGORIAN_CALENDARS
 
 
 def probe_calendar(
@@ -251,12 +335,14 @@ class TimelineScan:
         calendar: str,
         template: type,
         inspect_variable: Callable[[Any, Path], None],
+        reference: DateLike | None = None,
     ) -> None:
         self._inspection = inspection
         self._layout = layout
         self._variable = variable
         self._calendar = calendar
         self._template = template
+        self._reference = reference
         self._inspect_variable = inspect_variable
         self._key = layout.keys()
         self._units: object = _UNSET
@@ -405,12 +491,12 @@ class TimelineScan:
     def _check_calendar(self, calendar: str, path: Path) -> None:
         if self._file_calendar is None:
             self._file_calendar = calendar
-        elif calendar != self._file_calendar:
+        elif not calendars_equivalent(calendar, self._file_calendar):
             raise ValueError(
                 "forcing files use inconsistent calendars: "
                 f"{self._file_calendar!r} and {calendar!r} in {path.name}"
             )
-        if calendar != self._calendar:
+        if not calendars_equivalent(calendar, self._calendar):
             raise ValueError(
                 f"forcing files use calendar {calendar!r}, but the dataset "
                 f"declares or implies calendar {self._calendar!r}"
@@ -504,6 +590,8 @@ class TimelineScan:
                 ) from error
         if not dates:
             raise ValueError(f"Time axis is empty in {path.name}")
+        if canonical_calendar(calendar) != self._calendar:
+            dates = self._rebind_gregorian(dates, path)
         non_increasing = next(
             (right for left, right in zip(dates, dates[1:]) if right <= left),
             None,
@@ -514,6 +602,48 @@ class TimelineScan:
                 f"first invalid timestamp is {non_increasing}"
             )
         return dates
+
+    def _rebind_gregorian(self, dates: list[DateLike], path: Path) -> list[DateLike]:
+        """Express post-reform dates of an equivalent calendar in the domain's."""
+
+        early = next(
+            (
+                date
+                for date in dates
+                if (date.year, date.month, date.day) < _GREGORIAN_REFORM
+            ),
+            None,
+        )
+        if early is not None:
+            raise ValueError(
+                f"Time axis in {path.name} uses a different Gregorian calendar "
+                f"than the dataset and contains {early}, before 1582-10-15, "
+                "where the two calendars differ"
+            )
+
+        def rebuild(date: DateLike) -> DateLike:
+            components = (
+                date.year,
+                date.month,
+                date.day,
+                date.hour,
+                date.minute,
+                date.second,
+                date.microsecond,
+            )
+            if self._reference is not None:
+                return self._reference.replace(
+                    year=components[0],
+                    month=components[1],
+                    day=components[2],
+                    hour=components[3],
+                    minute=components[4],
+                    second=components[5],
+                    microsecond=components[6],
+                )
+            return self._template(*components)
+
+        return [rebuild(date) for date in dates]
 
     def _year_relative_days(
         self,

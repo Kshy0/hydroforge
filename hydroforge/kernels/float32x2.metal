@@ -132,6 +132,47 @@ inline bool to_bool(Value a) { return !zero(a); }
 constant Value LN2 = {0x1.62e4300000000p-1f, -0x1.05c6100000000p-29f};
 constant Value PIO2 = {0x1.921fb60000000p+0f, -0x1.777a5c0000000p-25f};
 constant Value PIO4 = {0x1.921fb60000000p-1f, -0x1.777a5c0000000p-26f};
+// Cody-Waite splits: n * LN2_1/LN2_2 is exact for |n| < 2^8 and
+// q * PIO2_1..PIO2_3 for |q| < 2^10; the pair tails carry the remainder.
+constant float LN2_1 = 0x1.62e4p-1f, LN2_2 = 0x1.7f7cp-20f;
+constant Value LN2_3 = {0x1.1cf79ap-36f, 0x1.793c76p-61f};
+constant float PIO2_1 = 0x1.9218p+0f, PIO2_2 = 0x1.ed5p-14f, PIO2_3 = 0x1.10bp-30f;
+constant Value PIO2_4 = {0x1.184698p-44f, 0x1.3198a2p-69f};
+// Pair reciprocals 1/n at index n (index 0 unused); series terms multiply by them.
+constant Value RECIPROCAL[28] = {
+    {0x0.0p+0f, 0x0.0p+0f}, {0x1.0000000000000p+0f, 0x0.0p+0f},
+    {0x1.0000000000000p-1f, 0x0.0p+0f}, {0x1.5555560000000p-2f, -0x1.5555560000000p-27f},
+    {0x1.0000000000000p-2f, 0x0.0p+0f}, {0x1.99999a0000000p-3f, -0x1.99999a0000000p-29f},
+    {0x1.5555560000000p-3f, -0x1.5555560000000p-28f}, {0x1.24924a0000000p-3f, -0x1.b6db6e0000000p-28f},
+    {0x1.0000000000000p-3f, 0x0.0p+0f}, {0x1.c71c720000000p-4f, -0x1.c71c720000000p-31f},
+    {0x1.99999a0000000p-4f, -0x1.99999a0000000p-30f}, {0x1.745d180000000p-4f, -0x1.745d180000000p-29f},
+    {0x1.5555560000000p-4f, -0x1.5555560000000p-29f}, {0x1.3b13b20000000p-4f, -0x1.89d89e0000000p-29f},
+    {0x1.24924a0000000p-4f, -0x1.b6db6e0000000p-29f}, {0x1.1111120000000p-4f, -0x1.ddddde0000000p-29f},
+    {0x1.0000000000000p-4f, 0x0.0p+0f}, {0x1.e1e1e20000000p-5f, -0x1.e1e1e20000000p-33f},
+    {0x1.c71c720000000p-5f, -0x1.c71c720000000p-32f}, {0x1.af286c0000000p-5f, -0x1.af286c0000000p-32f},
+    {0x1.99999a0000000p-5f, -0x1.99999a0000000p-31f}, {0x1.8618620000000p-5f, -0x1.e79e7a0000000p-31f},
+    {0x1.745d180000000p-5f, -0x1.745d180000000p-30f}, {0x1.642c860000000p-5f, -0x1.bd37a60000000p-31f},
+    {0x1.5555560000000p-5f, -0x1.5555560000000p-30f}, {0x1.47ae140000000p-5f, 0x1.eb851e0000000p-31f},
+    {0x1.3b13b20000000p-5f, -0x1.89d89e0000000p-30f}, {0x1.2f684c0000000p-5f, -0x1.2f684c0000000p-32f}
+};
+// 1/((2k)(2k+1)) at index k: the ratio of consecutive sine series terms.
+constant Value SIN_STEP[11] = {
+    {0x0.0p+0f, 0x0.0p+0f}, {0x1.5555560000000p-3f, -0x1.5555560000000p-28f},
+    {0x1.99999a0000000p-5f, -0x1.99999a0000000p-31f}, {0x1.8618620000000p-6f, -0x1.e79e7a0000000p-32f},
+    {0x1.c71c720000000p-7f, -0x1.c71c720000000p-34f}, {0x1.29e4120000000p-7f, 0x1.3c82540000000p-32f},
+    {0x1.a41a420000000p-8f, -0x1.6f96fa0000000p-34f}, {0x1.3813820000000p-8f, -0x1.8fd8fe0000000p-33f},
+    {0x1.e1e1e20000000p-9f, -0x1.e1e1e20000000p-37f}, {0x1.7f40600000000p-9f, -0x1.7f40600000000p-36f},
+    {0x1.3813820000000p-9f, -0x1.8fd8fe0000000p-34f}
+};
+// 1/((2k-1)(2k)) at index k: the ratio of consecutive cosine series terms.
+constant Value COS_STEP[11] = {
+    {0x0.0p+0f, 0x0.0p+0f}, {0x1.0000000000000p-1f, 0x0.0p+0f},
+    {0x1.5555560000000p-4f, -0x1.5555560000000p-29f}, {0x1.1111120000000p-5f, -0x1.ddddde0000000p-30f},
+    {0x1.24924a0000000p-6f, -0x1.b6db6e0000000p-31f}, {0x1.6c16c20000000p-7f, -0x1.27d27e0000000p-32f},
+    {0x1.f07c200000000p-8f, -0x1.f07c200000000p-33f}, {0x1.6816820000000p-8f, -0x1.2fd2fe0000000p-33f},
+    {0x1.1111120000000p-8f, -0x1.ddddde0000000p-33f}, {0x1.ac57020000000p-9f, -0x1.4ea3fa0000000p-35f},
+    {0x1.58ed240000000p-9f, -0x1.efd4e20000000p-34f}
+};
 
 inline Value sqrt(Value a) {
     if (isnan(a)) return nan();
@@ -152,15 +193,17 @@ inline Value exp(Value a) {
     // Guards bound the integer reduction, beyond FP32 overflow/underflow.
     if (lt(from_float(90.0f), a)) return inf();
     if (lt(a, from_float(-105.0f))) return from_float(0.0f);
-    int n = int(metal::rint(a.hi * 1.4426950408889634f));
-    Value r = sub(a, mul(from_long(long(n)), LN2));
+    float n = metal::rint(a.hi * 1.4426950408889634f);
+    Value r = sub(a, from_float(n * LN2_1));
+    r = sub(r, from_float(n * LN2_2));
+    r = sub(r, mul(from_float(n), LN2_3));
     Value term = from_float(1.0f), result = term;
     // |r| <= 0.347; 18 Taylor terms leave < 2^-83 truncation error.
     for (int k = 1; k <= 18; ++k) {
-        term = div(mul_normal(term, r), from_float(float(k)));
+        term = mul_normal(mul_normal(term, r), RECIPROCAL[k]);
         result = add(result, term);
     }
-    return scale(result, n);
+    return scale(result, int(n));
 }
 inline Value log(Value a) {
     if (isnan(a)) return nan();
@@ -175,7 +218,7 @@ inline Value log(Value a) {
     // atanh series: |z| <= 0.172; the tail after z^27 is < 2^-76.
     for (int k = 3; k <= 27; k += 2) {
         term = mul_normal(term, z2);
-        result = add(result, div(term, from_float(float(k))));
+        result = add(result, mul_normal(term, RECIPROCAL[k]));
     }
     return add(scale(result, 1), mul(from_long(long(e)), LN2));
 }
@@ -285,18 +328,33 @@ inline Reduced reduce(Value a) {
     if (signbit(a)) { fraction = neg(fraction); quadrant = (-quadrant) & 3; }
     return {mul_normal(fraction, PIO2), quadrant};
 }
+// Cody-Waite reduction of moderate arguments. Its pair subtractions lose
+// relative precision only near a zero of the reduced argument, which the
+// exact Payne-Hanek reduction then handles.
+inline bool reduce_moderate(Value a, thread Reduced& reduced) {
+    if (!(metal::fabs(a.hi) <= 1024.0f)) return false;
+    float q = metal::rint(a.hi * 0x1.45f306p-1f);  // 2/pi
+    Value r = sub(a, from_float(q * PIO2_1));
+    r = sub(r, from_float(q * PIO2_2));
+    r = sub(r, from_float(q * PIO2_3));
+    r = sub(r, mul(from_float(q), PIO2_4));
+    if (metal::fabs(r.hi) < 0x1p-10f) return false;
+    reduced = Reduced{r, int(q) & 3};
+    return true;
+}
 inline void sincos(Value a, thread Value& s, thread Value& c) {
     if (!isfinite(a)) { s = nan(); c = nan(); return; }
     if (zero(a)) { s = a; c = from_float(1.0f); return; }
-    Reduced reduced = le(abs(a), PIO4) ? Reduced{a, 0} : reduce(a);
+    Reduced reduced = {a, 0};
+    if (!le(abs(a), PIO4) && !reduce_moderate(a, reduced)) reduced = reduce(a);
     Value x = reduced.fraction, x2 = neg(mul_normal(x, x));
     Value st = x, ct = from_float(1.0f);
     s = st; c = ct;
     // |x| <= pi/4. Terms through sin(x)^19/cos(x)^20 bound truncation
     // below 2^-72; pair rounding, not native trig accuracy, dominates.
     for (int k = 1; k <= 10; ++k) {
-        st = div(mul_normal(st, x2), from_float(float((2*k) * (2*k+1))));
-        ct = div(mul_normal(ct, x2), from_float(float((2*k-1) * (2*k))));
+        st = mul_normal(mul_normal(st, x2), SIN_STEP[k]);
+        ct = mul_normal(mul_normal(ct, x2), COS_STEP[k]);
         s = add(s, st); c = add(c, ct);
     }
     Value old_s = s;

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Validated expressions (:mod:`hydroforge.core.expr`) lowered to kernel IR.
 
 Every dialect evaluates an expression in one value type: names, operands
@@ -24,6 +30,7 @@ from hydroforge.kernels.codegen.ir import (
     Logical,
     Select,
     Unary,
+    type_of,
 )
 
 _ARITHMETIC = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/"}
@@ -58,7 +65,10 @@ class _Lowering:
         return Cast(self.visit(node), self.dtype)
 
     def truth(self, node: ast.AST) -> Expr:
-        return Compare("!=", self.visit(node), Const(0.0))
+        value = self.visit(node)
+        if type_of(value) == torch.bool:
+            return value
+        return Compare("!=", value, Const(0.0))
 
     def visit(self, node: ast.AST) -> Expr:
         match node:

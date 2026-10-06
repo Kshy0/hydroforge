@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Metal toolchain: the Objective-C++ bridge, libraries, pipelines and ICBs.
 
 The bridge (``metal.mm``) is built once per environment as a PyTorch
@@ -37,15 +43,6 @@ _recording_sequence: ContextVar[Any] = ContextVar(
     "hydroforge_metal_recording_sequence",
     default=None,
 )
-
-
-def _raise_failures(scope: str, failures: list[BaseException]) -> None:
-    if not failures:
-        return
-    if len(failures) == 1:
-        raise failures[0]
-    error = ResourceCleanupError(scope, failures)
-    raise error from failures[0]
 
 
 def metal_resource_identity(value: Any) -> tuple[Any, ...]:
@@ -249,8 +246,7 @@ class MetalCommandSequence:
             raise error from failures[0]
 
     def dispatch(self) -> None:
-        failures: list[BaseException] = []
-        try:
+        with cleanup_on_exit("Metal command dispatch", (self.close,)):
             native, pipelines, bindings, threads, groups, barriers = self._prepare()
             if native is not None:
                 native.dispatch_sequence(
@@ -260,44 +256,28 @@ class MetalCommandSequence:
                     groups,
                     barriers,
                 )
-        except BaseException as error:
-            failures.append(error)
-        try:
-            self.close()
-        except BaseException as error:
-            failures.append(error)
-        _raise_failures("Metal command dispatch", failures)
 
     def capture(self) -> MetalICB | MetalNoOpICB:
-        failures: list[BaseException] = []
-        native = None
-        graph_id = None
-        empty = False
+        native = graph_id = None
         try:
-            native, pipelines, bindings, threads, groups, barriers = self._prepare()
-            if native is None:
-                empty = True
-            else:
-                graph_id = native.create_icb(
-                    pipelines,
-                    bindings,
-                    threads,
-                    groups,
-                    barriers,
-                )
-        except BaseException as error:
-            failures.append(error)
-        try:
-            self.close()
-        except BaseException as error:
-            failures.append(error)
-        if failures and graph_id is not None:
-            try:
-                native.release_icb(graph_id)
-            except BaseException as error:
-                failures.append(error)
-        _raise_failures("Metal ICB capture", failures)
-        return MetalNoOpICB() if empty else MetalICB(native, graph_id)
+            with cleanup_on_exit("Metal ICB capture", (self.close,)):
+                native, pipelines, bindings, threads, groups, barriers = self._prepare()
+                if native is not None:
+                    graph_id = native.create_icb(
+                        pipelines,
+                        bindings,
+                        threads,
+                        groups,
+                        barriers,
+                    )
+        except BaseException:
+            if graph_id is None:
+                raise
+            with cleanup_on_exit(
+                "Metal ICB capture", (lambda: native.release_icb(graph_id),)
+            ):
+                raise
+        return MetalNoOpICB() if native is None else MetalICB(native, graph_id)
 
 
 @dataclass

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Device prefetch of input batches with explicit stream ownership."""
 
 from collections.abc import Mapping
@@ -13,13 +19,36 @@ def _map_tensors(value, operation):
     if isinstance(value, torch.Tensor):
         return operation(value)
     if isinstance(value, Mapping):
-        return {name: _map_tensors(item, operation) for name, item in value.items()}
+        mapped = {name: _map_tensors(item, operation) for name, item in value.items()}
+        if type(value) is dict:
+            return mapped
+        try:
+            return type(value)(mapped)
+        except TypeError:
+            return mapped
     if isinstance(value, (tuple, list)):
         items = [_map_tensors(item, operation) for item in value]
         if isinstance(value, tuple) and hasattr(value, "_fields"):
             return type(value)(*items)
         return type(value)(items)
     return value
+
+
+def _tensors(value):
+    """Yield every tensor of one nested batch without rebuilding it."""
+
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            yield from _tensors(item)
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _tensors(item)
+
+
+def _nbytes(batch) -> int:
+    return sum(tensor.numel() * tensor.element_size() for tensor in _tensors(batch))
 
 
 @validate_call(config=HydroForgeModel.model_config)
@@ -63,30 +92,26 @@ def prefetch_to_device(
             hosts.append((event, batch))
             return value, event
 
-        def size_of(batch):
-            sizes = []
-            _map_tensors(
-                batch,
-                lambda tensor: sizes.append(tensor.numel() * tensor.element_size()),
-            )
-            return sum(sizes)
+        def fetch():
+            batch = next(iterator, sentinel)
+            return batch, (0 if batch is sentinel else _nbytes(batch))
 
         pending = None
         try:
-            batch = next(iterator, sentinel)
+            batch, nbytes = fetch()
             while batch is not sentinel:
                 if pending is None:
                     pending = load(batch)
                 current, ready = pending
                 consumer = torch.cuda.current_stream(device)
                 consumer.wait_event(ready)
-                _map_tensors(current, lambda tensor: tensor.record_stream(consumer))
-                if size_of(batch) <= max_prefetch_bytes:
-                    batch = next(iterator, sentinel)
+                for tensor in _tensors(current):
+                    tensor.record_stream(consumer)
+                if nbytes <= max_prefetch_bytes:
+                    batch, nbytes = fetch()
                     pending = (
                         load(batch)
-                        if batch is not sentinel
-                        and size_of(batch) <= max_prefetch_bytes
+                        if batch is not sentinel and nbytes <= max_prefetch_bytes
                         else None
                     )
                     yield current
@@ -94,7 +119,7 @@ def prefetch_to_device(
                     ready.synchronize()
                     pending = None
                     yield current
-                    batch = next(iterator, sentinel)
+                    batch, nbytes = fetch()
         finally:
             try:
                 stream.synchronize()

@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Declarative statistics windows and their canonical output requests."""
 
 from __future__ import annotations
@@ -11,6 +17,9 @@ from hydroforge.core.time import DateLike, normalize_calendar_dates
 from hydroforge.core.validation import HydroForgeModel
 
 CalendarPeriod = Literal["day", "month", "year"]
+_MAX_MONTH_DAYS = {
+    month: 30 if month in {2, 4, 6, 9, 11} else 31 for month in range(1, 13)
+}
 
 
 class EveryStep(HydroForgeModel):
@@ -26,6 +35,13 @@ class CalendarWindow(HydroForgeModel):
     def _validate_window(self) -> Self:
         if self.period != "year" and (self.start_month != 1 or self.start_day != 1):
             raise ValueError("custom origins are supported only for year windows")
+        # The longest month in any supported calendar; whether the origin
+        # exists in every year is checked once a schedule binds the calendar.
+        if self.start_day > _MAX_MONTH_DAYS[self.start_month]:
+            raise ValueError(
+                f"annual statistics origin {self.start_month:02d}-"
+                f"{self.start_day:02d} does not exist in any supported calendar"
+            )
         return self
 
 
@@ -82,7 +98,9 @@ class ExplicitWindows(HydroForgeModel):
         )
         windows = []
         for index, window in enumerate(self.windows):
-            normalized_window = ExplicitWindow(
+            # Each window was validated on construction; joint normalization
+            # only changes the date representation.
+            normalized_window = ExplicitWindow.model_construct(
                 name=window.name,
                 start=cast(
                     DateLike,
@@ -147,7 +165,13 @@ class StatisticsPlan(HydroForgeModel):
     partial_period: Literal["close", "drop"] = "close"
 
     @property
-    def _effective_outer(self) -> WindowRule:
+    def effective_outer(self) -> WindowRule:
         """Return the resolved outer rule without rewriting caller input."""
 
         return self.inner if self.outer is None else self.outer
+
+    @property
+    def _effective_outer(self) -> WindowRule:
+        """Private alias of :attr:`effective_outer` kept for existing callers."""
+
+        return self.effective_outer

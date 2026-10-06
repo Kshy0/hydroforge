@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Sample phases shared by host control, device loops and generated kernels.
 
 A statistics *sample* is one aggregation launch after one physical substep of
@@ -73,10 +79,9 @@ def sample_phase(flags: int, *, first: bool, last: bool) -> int:
     """Return the phase of one sample of a step carrying ``flags``."""
 
     if last:
-        return flags & (_FIRST_SUBSTEP | _LAST_SUBSTEP if first else _LAST_SUBSTEP) | (
-            _STEP_LAST
-        )
-    return flags & _FIRST_SUBSTEP if first else 0
+        kept = (_FIRST_SUBSTEP | _LAST_SUBSTEP) if first else _LAST_SUBSTEP
+        return (flags & kept) | _STEP_LAST
+    return (flags & _FIRST_SUBSTEP) if first else 0
 
 
 def sample_phase_expr(flags: Expr, first: Expr, last: Expr) -> Expr:
@@ -89,7 +94,8 @@ def sample_phase_expr(flags: Expr, first: Expr, last: Expr) -> Expr:
     return Binary("|", Binary("&", flags, substep), bits(last, _STEP_LAST))
 
 
-_SAMPLE_PHASES = frozenset(
+# Every phase a sample can carry (settles excluded).
+SAMPLE_PHASES = frozenset(
     sample_phase(flags, first=first, last=last)
     for flags in range(STEP_BITS + 1)
     for first in (False, True)
@@ -104,7 +110,7 @@ def phase_implies(bits: int, implied: int) -> bool:
     last substep of a step.
     """
 
-    return all(phase & implied for phase in _SAMPLE_PHASES if phase & bits)
+    return all(phase & implied for phase in SAMPLE_PHASES if phase & bits)
 
 
 # Control scalars written once per sample and read by generated kernels.

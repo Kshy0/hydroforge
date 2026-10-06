@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Explicit model-authored compiled sub-step scopes.
 
 A scope body is entered once for each managed-method specialization to build
@@ -69,15 +75,32 @@ def close_owned(executor: Any, owned: tuple[Any, ...], *, scope: str) -> None:
         pass
 
 
-class HostVariants:
-    """Recorded host values of one scope's primary program and the step
-    triggers (duration, count) already matched to a variant."""
+class _HostVariant:
+    """One built program of a scope and the cache key that owns it."""
 
-    __slots__ = ("signature", "triggers")
+    __slots__ = ("key", "program")
+
+    def __init__(self, key: tuple[Any, ...], program: Any) -> None:
+        self.key = key
+        self.program = program
+
+
+class HostVariants:
+    """Recorded host values of one scope's primary program, its built
+    variants and the step triggers (duration, count) already matched to one.
+
+    Triggers map straight to their variant, so a warm step never hashes or
+    compares a recorded signature.  ``recent`` orders the non-primary
+    variants from least to most recently used.
+    """
+
+    __slots__ = ("signature", "entries", "recent", "triggers")
 
     def __init__(self, signature: tuple[Any, ...]) -> None:
         self.signature = signature
-        self.triggers: OrderedDict[tuple[Any, ...], tuple[Any, ...]] = OrderedDict()
+        self.entries: dict[tuple[Any, ...], _HostVariant] = {}
+        self.recent: OrderedDict[_HostVariant, None] = OrderedDict()
+        self.triggers: OrderedDict[tuple[Any, ...], _HostVariant] = OrderedDict()
 
 
 def cached_program(
@@ -96,27 +119,22 @@ def cached_program(
     ``specialization=``.
     """
 
-    programs = execution.programs
     variants = execution.host_variants.get(key)
     if variants is not None:
-        signature = variants.triggers.get(trigger, _MISSING_PROGRAM)
-        if signature is not _MISSING_PROGRAM:
-            program = programs.get(
-                key
-                if signature == variants.signature
-                else (*key, (_HOST_VARIANT, signature))
-            )
-            if program is not None:
-                variants.triggers.move_to_end(trigger)
-                return program
+        entry = variants.triggers.get(trigger)
+        if entry is not None:
+            variants.triggers.move_to_end(trigger)
+            if entry in variants.recent:
+                variants.recent.move_to_end(entry)
+            return entry.program
     recorded = yield from record()
     signature = recorded.signature
     if variants is None or signature == variants.signature:
         variant = key
     else:
         variant = (*key, (_HOST_VARIANT, signature))
-    program = programs.get(variant)
-    if program is not None:
+    entry = None if variants is None else variants.entries.get(variant)
+    if entry is not None:
         close_owned(execution.executor, recorded.owned, scope="verified recording")
     else:
         try:
@@ -131,41 +149,41 @@ def cached_program(
                 ),
             ):
                 raise
-        programs[variant] = program
+        execution.programs[variant] = program
+        entry = _HostVariant(variant, program)
         if variants is None:
             variants = execution.host_variants[key] = HostVariants(signature)
-        else:
-            _evict_host_variants(programs, key, variants)
-    variants.triggers[trigger] = signature
+        variants.entries[variant] = entry
+    if variant is not key:
+        variants.recent[entry] = None
+        variants.recent.move_to_end(entry)
+    variants.triggers[trigger] = entry
     variants.triggers.move_to_end(trigger)
     if len(variants.triggers) > _HOST_TRIGGER_LIMIT:
         variants.triggers.popitem(last=False)
-    return program
+    _evict_host_variants(execution.programs, variants)
+    return entry.program
 
 
-def _evict_host_variants(
-    programs: dict[Any, Any], key: tuple[Any, ...], variants: HostVariants
-) -> None:
-    size = len(key) + 1
-    candidates = [
-        candidate
-        for candidate in programs
-        if len(candidate) == size
-        and candidate[:-1] == key
-        and isinstance(candidate[-1], tuple)
-        and candidate[-1][:1] == (_HOST_VARIANT,)
-    ]
-    if len(candidates) <= _HOST_VARIANT_LIMIT:
-        return
-    oldest = candidates[0]
-    evicted = programs.pop(oldest)
-    signature = oldest[-1][1]
-    triggers = variants.triggers
-    for trigger in [
-        trigger for trigger, value in triggers.items() if value == signature
-    ]:
-        del triggers[trigger]
-    evicted.close()
+def _evict_host_variants(programs: dict[Any, Any], variants: HostVariants) -> None:
+    """Close the least recently used non-primary variants beyond the limit."""
+
+    evicted = []
+    while len(variants.recent) > _HOST_VARIANT_LIMIT:
+        entry, _ = variants.recent.popitem(last=False)
+        del variants.entries[entry.key]
+        programs.pop(entry.key, None)
+        triggers = variants.triggers
+        for trigger in [
+            trigger for trigger, value in triggers.items() if value is entry
+        ]:
+            del triggers[trigger]
+        evicted.append(entry.program)
+    # Bookkeeping is complete before any close can fail.
+    with cleanup_on_exit(
+        "host-variant eviction", (program.close for program in evicted)
+    ):
+        pass
 
 
 class _FixedSubstepRequest(HydroForgeModel):
@@ -360,12 +378,9 @@ class _FixedScope(InvocationScope):
                 final = record_operator_scope(
                     execution, stable_tensors=controls, scope_kind="fixed final"
                 )
+                # The recording rejects an empty final IR on exit.
                 with final:
                     self.final()
-                if not final.program.operators:
-                    raise SubstepCompileError(
-                        "fixed final callback produced an empty operator IR"
-                    )
                 owned.append(final.program)
             aliases = dict(zip(map(id, controls), ("count", "index", "dt")))
             signature = tuple(program.fingerprint(aliases) for program in owned)
@@ -474,12 +489,12 @@ class _PredicateScope(InvocationScope):
     def _iterate(self) -> Generator[PredicateLoopFrame, None, None]:
         parent = recording_sink()
         if parent is None:
-            raise ValueError(
+            raise SubstepCompileError(
                 "predicate loops must be nested directly inside a compiled "
                 "fixed substep scope"
             )
         if parent.scope_kind != "fixed":
-            raise ValueError(
+            raise SubstepCompileError(
                 "predicate loops are supported only directly inside a fixed "
                 f"substep; found {parent.scope_kind!r} operator scope"
             )

@@ -270,14 +270,15 @@ class ForcingDataset(HydroForgeModel, ABC):
     def read(self, chunk: SourceChunk) -> np.ndarray | dict[str, np.ndarray]:
         """Read one chunk of this dataset's plan at model cadence.
 
-        Views share their source's plan, so its chunks are accepted by both;
-        any other chunk object is rejected.
+        Views share their source's plan, so its chunks are accepted by both,
+        as are equal chunks of a copy (for example a DataLoader worker's);
+        any other chunk is rejected.
         """
 
         if not isinstance(chunk, SourceChunk):
             raise TypeError("read() requires a SourceChunk of this chunk_plan")
         chunks = self._plan.chunk_plan.chunks
-        if not (0 <= chunk.index < len(chunks)) or chunks[chunk.index] is not chunk:
+        if not (0 <= chunk.index < len(chunks)) or chunks[chunk.index] != chunk:
             raise ValueError(
                 "source chunk does not belong to this dataset's chunk plan"
             )

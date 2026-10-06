@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Value encoding for stored outputs: logical dtypes and checked narrowing."""
 
 from typing import Any
@@ -100,12 +106,18 @@ def _narrowing_limit(source: torch.dtype, target: torch.dtype) -> float | None:
 
 
 def narrowing_flag(
-    tensor: torch.Tensor, target_dtype: torch.dtype, *, name: str
+    tensor: torch.Tensor,
+    target_dtype: torch.dtype,
+    *,
+    name: str,
+    converted: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, str, str] | None:
     """Return the device flag of finite values a lossy narrowing overflows.
 
     ``None`` when ``target_dtype`` holds every value of the tensor's dtype.
     Encoded values are checked after decoding, so their flag is on the CPU.
+    ``converted``, the tensor already narrowed to ``target_dtype``, lets the
+    check count new infinities instead of materializing a magnitude copy.
     """
 
     source = tensor.detach()
@@ -115,7 +127,11 @@ def narrowing_flag(
     if limit is None:
         return None
     source = decoded_output_tensor(source)
-    if source.numel():
+    if converted is not None:
+        # Narrowing maps exactly the finite values beyond the target range
+        # (after rounding) to infinity and keeps every other infinity.
+        outside = torch.isinf(converted).sum() > torch.isinf(source).sum()
+    elif source.numel():
         magnitude = torch.nan_to_num(source, nan=0.0, posinf=0.0, neginf=0.0)
         outside = magnitude.abs_().amax() > limit
     else:
@@ -141,8 +157,8 @@ def checked_narrowing(
     source = decoded_output_tensor(tensor)
     if source.dtype == target_dtype:
         return source
-    entry = narrowing_flag(source, target_dtype, name=name)
     converted = source.to(dtype=target_dtype)
+    entry = narrowing_flag(source, target_dtype, name=name, converted=converted)
     if entry is not None:
         if flags is None:
             raise_narrowing_failures((entry,))

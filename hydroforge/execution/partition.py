@@ -1,3 +1,9 @@
+# LICENSE HEADER MANAGED BY add-license-header
+# Copyright (c) 2025 Shengyu Kang (Wuhan University)
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+
 """Rank-local partition service over the bound global inputs."""
 
 from __future__ import annotations
@@ -87,14 +93,14 @@ class GroupRankLookup(HydroForgeModel):
     def _lookup_trusted(self, values: np.ndarray) -> np.ndarray:
         """Resolve compiled group IDs known to belong to this lookup."""
 
-        positions = _searchsorted_batch(self.group_ids, values)
+        positions = searchsorted_batch(self.group_ids, values)
         return self.ranks[positions]
 
     def __len__(self) -> int:
         return len(self.group_ids)
 
 
-def _searchsorted_batch(sorted_values: np.ndarray, queries: np.ndarray) -> np.ndarray:
+def searchsorted_batch(sorted_values: np.ndarray, queries: np.ndarray) -> np.ndarray:
     """``np.searchsorted`` that sorts large query batches for memory locality."""
 
     queries = np.asarray(queries)
@@ -233,7 +239,7 @@ class PartitionRuntime:
                     f"Reference target coordinate '{target}' must contain "
                     "unique values."
                 )
-            position = _searchsorted_batch(sorted_target, values)
+            position = searchsorted_batch(sorted_target, values)
             found = position < sorted_target.size
             found[found] = sorted_target[position[found]] == values[found]
             missing = ~found
@@ -280,7 +286,7 @@ class PartitionRuntime:
         order, sorted_target, _unique = self.sorted_global_key(
             target, lambda: self.source.value(target)
         )
-        index = order[_searchsorted_batch(sorted_target, values)]
+        index = order[searchsorted_batch(sorted_target, values)]
         self._reference_indices[name] = index
         return index
 
