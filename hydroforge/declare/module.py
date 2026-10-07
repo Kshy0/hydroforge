@@ -500,6 +500,7 @@ def computed_tensor_field(
     required_by: TensorDependencies = None,
     output: Literal["auto", "full", "disabled"] = "auto",
     output_only: bool = False,
+    units: str | None = None,
 ):
     """
     Create a computed tensor field with shape information for AbstractModule.
@@ -531,6 +532,8 @@ def computed_tensor_field(
             category. HydroForge exposes an inactive computed tensor as
             ``None`` after specialization, so field implementations do not
             need an activation guard.
+        units: Physical units of the values (e.g. ``"km3"``), recorded in the
+            metadata like ``TensorField`` units.
     """
     if category not in _COMPUTED_CATEGORIES:
         raise ValueError(
@@ -547,6 +550,7 @@ def computed_tensor_field(
         required_by=required_by,
         output=output,
         output_only=output_only,
+        units=units,
     )
     declare = computed_field(description=description)
 
