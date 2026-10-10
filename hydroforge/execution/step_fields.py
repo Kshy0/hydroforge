@@ -288,6 +288,7 @@ class StepFieldRuntime:
         self._device_demand = False
         self._requested: CompiledStepFields | None = None
         self._deferred = False
+        self._width_unknown = False
 
     def concrete_dtype(self, field: StepField) -> torch.dtype:
         return precision_dtype(field.dtype, self.dtype)
@@ -328,6 +329,10 @@ class StepFieldRuntime:
         ):
             raise ValueError(
                 "calendar step fields require initial_time or a simulation_schedule"
+            )
+        if self._width_unknown and "step_seconds" in demanded:
+            raise ValueError(
+                "step_seconds during initialization requires a simulation_schedule"
             )
         with _disable_current_modes(), torch.inference_mode(False):
             changed = False
@@ -509,7 +514,19 @@ class StepFieldRuntime:
             with _disable_current_modes(), torch.inference_mode(False):
                 self.program.run(advance=False)
 
+    def prepare_initial(self, current_time: Any, step_seconds: float | None) -> None:
+        """Describe the initial clock for ``initialize_model_state``.
+
+        ``step_seconds`` is the next scheduled step's width; without a schedule
+        it is unknown and cannot be bound.  The first step re-anchors.
+        """
+
+        self.prepare(current_time, 0.0 if step_seconds is None else step_seconds)
+        self._width_unknown = step_seconds is None
+        self._expected = None
+
     def prepare(self, current_time: Any, step_seconds: float) -> None:
+        self._width_unknown = False
         continuous = (
             self.clock is not None
             and self._expected is not None

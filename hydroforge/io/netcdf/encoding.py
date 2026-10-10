@@ -77,23 +77,6 @@ def saved_dtype(dtype: torch.dtype, save_precision: torch.dtype | None) -> torch
     return dtype
 
 
-def decoded_output_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """Detach ordinary storage, or snapshot encoded values as CPU float64.
-
-    An encoded tensor's int64 carrier is never an integer output. Decode at
-    the export boundary before narrowing, NumPy conversion or copying into
-    ordinary host storage. ``copy=True`` is required even for a CPU-backed
-    encoded tensor: a no-op ``cpu()`` would leave the wrapper undecoded.
-    """
-
-    from hydroforge.kernels.emulated import EmulatedTensor
-
-    source = tensor.detach()
-    if isinstance(source, EmulatedTensor):
-        return source.to(device="cpu", copy=True)
-    return source
-
-
 def _narrowing_limit(source: torch.dtype, target: torch.dtype) -> float | None:
     """Return the finite magnitude bound of a lossy float narrowing, if any."""
 
@@ -110,14 +93,13 @@ def narrowing_flag(
     target_dtype: torch.dtype,
     *,
     name: str,
-    converted: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, str, str] | None:
-    """Return the device flag of finite values a lossy narrowing overflows.
+    """Return the device flag of finite values outside the target range.
 
     ``None`` when ``target_dtype`` holds every value of the tensor's dtype.
-    Encoded values are checked after decoding, so their flag is on the CPU.
-    ``converted``, the tensor already narrowed to ``target_dtype``, lets the
-    check count new infinities instead of materializing a magnitude copy.
+    ``tensor`` holds logical values; encoded storage is decoded by its owner.
+    The magnitude is compared before rounding: a value that would round to
+    the target's largest finite value is still outside its range.
     """
 
     source = tensor.detach()
@@ -126,45 +108,12 @@ def narrowing_flag(
     limit = _narrowing_limit(source.dtype, target_dtype)
     if limit is None:
         return None
-    source = decoded_output_tensor(source)
-    if converted is not None:
-        # Narrowing maps exactly the finite values beyond the target range
-        # (after rounding) to infinity and keeps every other infinity.
-        outside = torch.isinf(converted).sum() > torch.isinf(source).sum()
-    elif source.numel():
+    if source.numel():
         magnitude = torch.nan_to_num(source, nan=0.0, posinf=0.0, neginf=0.0)
         outside = magnitude.abs_().amax() > limit
     else:
         outside = torch.zeros((), dtype=torch.bool, device=source.device)
     return outside, name, str(target_dtype).removeprefix("torch.")
-
-
-def checked_narrowing(
-    tensor: torch.Tensor,
-    target_dtype: torch.dtype,
-    *,
-    name: str,
-    flags: list[tuple[torch.Tensor, str, str]] | None = None,
-) -> torch.Tensor:
-    """Convert logical values, rejecting finite values out of range.
-
-    Tiny values may round to subnormals or zero.  With ``flags`` the
-    device-side overflow flag is queued for a deferred host check; otherwise
-    it is checked before returning. Encoded Metal values are snapshotted and
-    decoded on the CPU first; ordinary tensors stay on their device.
-    """
-
-    source = decoded_output_tensor(tensor)
-    if source.dtype == target_dtype:
-        return source
-    converted = source.to(dtype=target_dtype)
-    entry = narrowing_flag(source, target_dtype, name=name, converted=converted)
-    if entry is not None:
-        if flags is None:
-            raise_narrowing_failures((entry,))
-        else:
-            flags.append(entry)
-    return converted
 
 
 def raise_narrowing_failures(

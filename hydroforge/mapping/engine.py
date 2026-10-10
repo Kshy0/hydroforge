@@ -59,6 +59,33 @@ def _normalise_row(values: np.ndarray) -> np.ndarray:
 _OVERLAP_CHUNK_ENTRIES = 1 << 22
 
 
+def _area_factors(
+    width: np.ndarray, ymin: np.ndarray, ymax: np.ndarray, *, geographic: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """Separable ``(lon, lat)`` factors of the cell area ``lat * lon``.
+
+    Geographic factors are ``R * dlon_rad`` and ``R * (sin(lat_hi) -
+    sin(lat_lo))``, so the area is spherical (m^2); overlap rows evaluate
+    each factor once per source column or row.
+    """
+
+    if geographic:
+        return (
+            np.radians(width) * _EARTH_RADIUS_M,
+            (np.sin(np.radians(ymax)) - np.sin(np.radians(ymin))) * _EARTH_RADIUS_M,
+        )
+    return width, ymax - ymin
+
+
+def _cell_area(
+    width: np.ndarray, ymin: np.ndarray, ymax: np.ndarray, *, geographic: bool
+) -> np.ndarray:
+    """Area of axis-aligned cells: spherical (m^2) on geographic grids."""
+
+    lon_weight, lat_weight = _area_factors(width, ymin, ymax, geographic=geographic)
+    return lat_weight * lon_weight
+
+
 def _segment_arange(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     """Concatenate ``arange(start, start + length)`` over all segments."""
 
@@ -157,14 +184,12 @@ def _regular_overlap_row(
     row_idx = np.nonzero(lat_overlap > 0.0)[0]
     if col_idx.size == 0 or row_idx.size == 0:
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
-    if source.is_geographic:
-        lon_weight = np.radians(lon_overlap[col_idx]) * _EARTH_RADIUS_M
-        lat_weight = (
-            np.sin(np.radians(lat_hi[row_idx])) - np.sin(np.radians(lat_lo[row_idx]))
-        ) * _EARTH_RADIUS_M
-    else:
-        lon_weight = lon_overlap[col_idx]
-        lat_weight = lat_overlap[row_idx]
+    lon_weight, lat_weight = _area_factors(
+        lon_overlap[col_idx],
+        lat_lo[row_idx],
+        lat_hi[row_idx],
+        geographic=source.is_geographic,
+    )
     area = lat_weight[:, None] * lon_weight[None, :]
     cols = (row_idx[:, None] * source.x.size + col_idx[None, :]).ravel()
     return cols.astype(np.int64), area.ravel().astype(np.float64)
@@ -258,15 +283,7 @@ def _regular_overlap_csr(
     entries = n_rows * n_cols
     entries[shared_columns] = 0
 
-    if geographic:
-        target_area = (
-            np.radians(target_width)
-            * _EARTH_RADIUS_M
-            * _EARTH_RADIUS_M
-            * (np.sin(np.radians(ymax)) - np.sin(np.radians(ymin)))
-        )
-    else:
-        target_area = target_width * (ymax - ymin)
+    target_area = _cell_area(target_width, ymin, ymax, geographic=geographic)
     if not np.all(np.isfinite(target_area) & (target_area > 0)):
         raise ValueError("target areas must be finite and positive")
 
@@ -320,14 +337,9 @@ def _regular_overlap_csr(
         row_ymax = np.repeat(ymax[chunk], chunk_rows)
         lat_lo = np.maximum(row_ymin, y_lo[row_index])
         lat_hi = np.minimum(row_ymax, y_hi[row_index])
-        if geographic:
-            lon_weight = np.radians(lon_overlap) * _EARTH_RADIUS_M
-            lat_weight = (
-                np.sin(np.radians(lat_hi)) - np.sin(np.radians(lat_lo))
-            ) * _EARTH_RADIUS_M
-        else:
-            lon_weight = lon_overlap
-            lat_weight = lat_hi - lat_lo
+        lon_weight, lat_weight = _area_factors(
+            lon_overlap, lat_lo, lat_hi, geographic=geographic
+        )
 
         chunk_entries = entries[chunk]
         owner = np.repeat(np.arange(chunk.size, dtype=np.int64), chunk_entries)

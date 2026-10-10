@@ -87,7 +87,7 @@ class UnknownFieldError(KeyError, ValueError):
 def error_message(error: BaseException) -> str:
     """Return an exception's message without ``KeyError``'s repr quoting."""
 
-    if type(error) is KeyError and len(error.args) == 1:
+    if isinstance(error, KeyError) and len(error.args) == 1:
         return str(error.args[0])
     return _exception_message(error)
 

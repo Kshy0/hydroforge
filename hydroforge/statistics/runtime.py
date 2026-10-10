@@ -56,7 +56,11 @@ from hydroforge.statistics.phases import (
     SampleFlags,
     sample_phase,
 )
-from hydroforge.statistics.sinks import MemorySink, StatisticsSink
+from hydroforge.statistics.sinks import (
+    MemorySink,
+    StatisticsSink,
+    decoded_output_tensor,
+)
 from hydroforge.statistics.storage import (
     StorageInitialization,
     StoragePlan,
@@ -615,23 +619,48 @@ class StatisticsRuntime:
             if name in names
         )
 
-    def _accumulate_float32_weight(self, weight: float, phase: int) -> None:
-        """Mirror the device's float32 window weight sum of host samples.
+    def _accumulate_float32_weight(
+        self, weight: float, phase: int, *, samples: int = 1
+    ) -> None:
+        """Mirror the device's float32 window weight sum of ``samples`` samples.
 
         A float32 sum stops growing once it is 2**24 times the sample weight;
         the mean would then silently become a moving average, so the sample
-        that would leave the sum unchanged is rejected instead.
+        that would leave the sum unchanged is rejected instead.  The device
+        adds samples one at a time, which a sequential float32 accumulation
+        reproduces exactly.
         """
 
         total = np.float32(0.0) if phase & _INNER_FIRST else self._window_weight
-        accumulated = total + np.float32(weight)
-        if accumulated == total:
+        totals = np.add.accumulate(
+            np.concatenate(
+                ([total], np.full(samples, weight, dtype=np.float32))
+            ).astype(np.float32),
+            dtype=np.float32,
+        )
+        stalled = np.flatnonzero(totals[1:] == totals[:-1])
+        if stalled.size:
             raise OverflowError(
                 "statistics mean window weight exceeds float32 resolution: "
                 f"a {weight!r} weight no longer changes the accumulated "
-                f"{float(total)!r}; use shorter windows or float64 storage"
+                f"{float(totals[stalled[0]])!r}; use shorter windows or float64 "
+                "storage"
             )
-        self._window_weight = accumulated
+        self._window_weight = totals[-1]
+
+    def fold_weights(self, count: int, duration: float) -> None:
+        """Mirror the window weight sum of a device loop that folds samples.
+
+        Fixed loops fold ``count`` samples of ``duration / count`` and are
+        mirrored exactly before launch.  Adaptive loops report only their
+        iteration count after the launch; their mean width is mirrored, which
+        detects a stalled sum once a typical sample no longer changes it.
+        """
+
+        if self._weight_guard:
+            weight = self._convert_weight(duration / count)
+            phase = sample_phase(self._step_flags, first=True, last=count == 1)
+            self._accumulate_float32_weight(weight, phase, samples=count)
 
     def prelaunch(self) -> None:
         """Publish the controls of a device loop that folds every iteration.
@@ -734,7 +763,14 @@ class StatisticsRuntime:
         time_number = self._validate_next_time(dt)
         dirty = self.window_state.dirty
         keys = [key for key in self._output_keys if key in dirty]
-        self.sink.append(dt, {key: self._storage[key] for key in keys})
+        values = {key: self._storage[key] for key in keys}
+        if not self.in_memory:
+            # The NetCDF writer exports logical values, never an encoded
+            # tensor's hi/lo carrier; memory results may stay encoded on MPS.
+            values = {
+                key: decoded_output_tensor(value) for key, value in values.items()
+            }
+        self.sink.append(dt, values)
         dirty.difference_update(keys)
         self._current_time_index += 1
         self._last_time_number = time_number

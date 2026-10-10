@@ -19,7 +19,7 @@ from scipy.sparse import csr_matrix
 from hydroforge.core.validation import HydroForgeModel
 from hydroforge.mapping.cama import _cama_cell_targets, _cama_hires_source_cells
 from hydroforge.mapping.engine import (
-    _EARTH_RADIUS_M,
+    _cell_area,
     _hires_coo,
     _normalise_row,
     _normalise_rows,
@@ -236,15 +236,12 @@ def _cama_cell_mapping(
             f"{uncovered}/{target_ids.size} points fall outside the source grid "
             "(CaMa cells not fully covered by the source grid)"
         )
-    if source.is_geographic:
-        cell_area = (
-            np.radians(bounds[:, 1] - bounds[:, 0])
-            * _EARTH_RADIUS_M
-            * _EARTH_RADIUS_M
-            * (np.sin(np.radians(bounds[:, 3])) - np.sin(np.radians(bounds[:, 2])))
-        )
-    else:
-        cell_area = (bounds[:, 1] - bounds[:, 0]) * (bounds[:, 3] - bounds[:, 2])
+    cell_area = _cell_area(
+        bounds[:, 1] - bounds[:, 0],
+        bounds[:, 2],
+        bounds[:, 3],
+        geographic=source.is_geographic,
+    )
     lengths = np.diff(overlap.indptr)
     # Pixels outside the source grid are dropped, as on the hires path.
     values = overlap.values * np.repeat(areas / cell_area, lengths)

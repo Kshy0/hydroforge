@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timedelta
-from typing import Annotated, Any, TypeAlias
+from typing import Annotated, Any, TypeAlias, cast
 
 import cftime
 from pydantic import Field, validate_call
@@ -90,12 +90,22 @@ def canonical_calendar(calendar: str) -> str:
     return canonical
 
 
-def _calendar_date(
-    value: DateLike, calendar: str, has_year_zero: bool | None = None
-) -> DateLike:
-    """Rebuild a checked date in one canonical calendar's representation."""
+# The standard (mixed Julian/Gregorian) and proleptic Gregorian calendars label
+# every instant from the 1582-10-15 reform onwards identically.
+GREGORIAN_REFORM = (1582, 10, 15)
+_GREGORIAN_CALENDARS = frozenset({"standard", "proleptic_gregorian"})
 
-    components = (
+
+def calendars_equivalent(left: str, right: str) -> bool:
+    """Whether two canonical calendars agree on every post-reform date."""
+
+    return left == right or {left, right} == _GREGORIAN_CALENDARS
+
+
+def date_components(value: DateLike) -> tuple[int, int, int, int, int, int, int]:
+    """Year through microsecond of a date, independent of its calendar type."""
+
+    return (
         value.year,
         value.month,
         value.day,
@@ -104,6 +114,14 @@ def _calendar_date(
         value.second,
         value.microsecond,
     )
+
+
+def _calendar_date(
+    value: DateLike, calendar: str, has_year_zero: bool | None = None
+) -> DateLike:
+    """Rebuild a checked date in one canonical calendar's representation."""
+
+    components = date_components(value)
     if calendar == "standard":
         return datetime(*components)
     try:
@@ -168,7 +186,7 @@ def normalize_calendar_dates(
             value is not None
             and (
                 value.year > 9999
-                or (value.year, value.month, value.day) < (1582, 10, 15)
+                or (value.year, value.month, value.day) < GREGORIAN_REFORM
             )
             for value in values.values()
         )
@@ -210,6 +228,18 @@ def normalize_calendar_dates(
                 f"{label} cannot be represented in calendar {resolved!r}: {value!r}"
             ) from error
     return resolved, normalized, configured is None and inferred is None
+
+
+def declared_dates(values: Mapping[str, DateLike]) -> tuple[DateLike, ...]:
+    """Bind labelled dates of one declaration to their shared calendar.
+
+    cftime declarations are preserved; the dates return in label order.
+    """
+
+    _calendar, normalized, _defaulted = normalize_calendar_dates(
+        values, calendar=None, preserve_cftime_declaration=True
+    )
+    return tuple(cast(DateLike, normalized[label]) for label in values)
 
 
 def date_calendar(value: DateLike) -> str:

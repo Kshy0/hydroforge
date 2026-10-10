@@ -17,30 +17,16 @@ import numpy as np
 
 from hydroforge.contracts.schedule import SimulationSchedule, SpinupSchedule
 from hydroforge.core.time import (
+    GREGORIAN_REFORM,
     DateLike,
+    calendars_equivalent,
+    date_components,
     normalize_calendar_dates,
     timedelta_microseconds,
     timedelta_quotient,
 )
 
 UpsamplingMethod = Literal["repeat", "distribute"]
-
-# The standard (mixed Julian/Gregorian) and proleptic Gregorian calendars label
-# every instant from the 1582-10-15 reform onwards identically.
-_GREGORIAN_CALENDARS = frozenset({"standard", "proleptic_gregorian"})
-_GREGORIAN_REFORM = (1582, 10, 15)
-
-
-def _components(value: DateLike) -> tuple[int, ...]:
-    return (
-        value.year,
-        value.month,
-        value.day,
-        value.hour,
-        value.minute,
-        value.second,
-        value.microsecond,
-    )
 
 
 def _domain_dates(domain: TemporalDomain) -> tuple[DateLike, ...]:
@@ -62,7 +48,7 @@ def _same_temporal_contract(mine: TemporalDomain, theirs: TemporalDomain) -> boo
         return type(theirs.start) is type(mine.start) and (
             mine.start == theirs.start and mine.spinup == theirs.spinup
         )
-    if {mine.calendar, theirs.calendar} != _GREGORIAN_CALENDARS:
+    if not calendars_equivalent(mine.calendar, theirs.calendar):
         return False
     if (mine.spinup is None) != (theirs.spinup is None):
         return False
@@ -70,7 +56,8 @@ def _same_temporal_contract(mine: TemporalDomain, theirs: TemporalDomain) -> boo
         return False
     left, right = _domain_dates(mine), _domain_dates(theirs)
     return all(
-        _components(a) == _components(b) and _components(a)[:3] >= _GREGORIAN_REFORM
+        date_components(a) == date_components(b)
+        and date_components(a)[:3] >= GREGORIAN_REFORM
         for a, b in zip(left, right, strict=True)
     )
 

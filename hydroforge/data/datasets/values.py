@@ -26,6 +26,10 @@ from hydroforge.core.arrays import canonical_floating_array
 MissingPolicy = Literal["zero", "error"]
 AggregationMethod = Literal["mean", "max", "min", "sum"]
 
+# Columns converted together: bounds the float64 calculation copy (32 MiB)
+# while keeping each element's arithmetic, and so its result, unchanged.
+_BLOCK_ELEMENTS = 1 << 22
+
 
 def ingest(
     raw: np.ndarray,
@@ -130,25 +134,20 @@ def direct_cast(source: np.dtype) -> bool:
 
 
 def as_float64(values: np.ndarray, *, label: str) -> np.ndarray:
-    """Promote finite values to a float64 calculation array.
+    """Copy finite values into a new float64 calculation array.
 
-    64-bit integers above 2**53 are rejected rather than rounded; the result
-    may be ``values`` itself, which callers own.
+    64-bit integers above 2**53 are rejected rather than rounded.  The result
+    never aliases ``values``, so callers may scale it in place.
     """
 
     if values.dtype.kind in {"i", "u"} and values.dtype.itemsize >= 8:
         return canonical_floating_array(values, dtype="float64", label=label)
-    return np.ascontiguousarray(values, dtype=np.float64)
+    return np.array(values, dtype=np.float64, order="C")
 
 
 def _aggregate(
     values: np.ndarray, method: AggregationMethod, factor: int
 ) -> np.ndarray:
-    if values.shape[0] % factor != 0:
-        raise ValueError(
-            f"Cannot aggregate {values.shape[0]} source frames into "
-            f"windows of {factor} frames"
-        )
     grouped = values.reshape((values.shape[0] // factor, factor) + values.shape[1:])
     if method == "mean":
         return grouped.mean(axis=1, dtype=np.float64)
@@ -187,24 +186,11 @@ def convert(
             checked=not bounded(values.dtype, out_dtype),
             label=f"{label} output",
         )
-    calculation = as_float64(values, label=f"{label} input")
-    if aggregation is None:
-        converted: np.ndarray | dict[str, np.ndarray] = calculation
-    elif isinstance(aggregation, str):
-        converted = _aggregate(calculation, aggregation, factor)
-    else:
-        converted = {
-            name: _aggregate(calculation, method, factor)
-            for name, method in aggregation.items()
-        }
-    blocks = converted.values() if isinstance(converted, dict) else (converted,)
-    for block in blocks:
-        if unit_factor != 1.0:
-            np.divide(block, unit_factor, out=block)
-        if unit_scale != 1.0:
-            np.multiply(block, unit_scale, out=block)
-        if unit_offset != 0.0:
-            np.add(block, unit_offset, out=block)
+    if aggregation is not None and values.shape[0] % factor != 0:
+        raise ValueError(
+            f"Cannot aggregate {values.shape[0]} source frames into "
+            f"windows of {factor} frames"
+        )
     reduces = aggregation in ("sum", "mean") or (
         isinstance(aggregation, Mapping)
         and any(method in {"sum", "mean"} for method in aggregation.values())
@@ -216,16 +202,36 @@ def convert(
         or unit_offset != 0.0
         or reduces
     )
-    if isinstance(converted, dict):
-        return {
-            name: finalize(
-                block,
-                out_dtype=out_dtype,
-                checked=checked,
-                label=f"{label} output variable {name!r}",
-            )
-            for name, block in converted.items()
-        }
-    return finalize(
-        converted, out_dtype=out_dtype, checked=checked, label=f"{label} output"
+    methods: Mapping[str | None, AggregationMethod | None] = (
+        aggregation if isinstance(aggregation, Mapping) else {None: aggregation}
     )
+    labels = {
+        name: f"{label} output" if name is None else f"{label} output variable {name!r}"
+        for name in methods
+    }
+    frames = values.reshape(values.shape[0], -1)
+    rows = frames.shape[0] if aggregation is None else frames.shape[0] // factor
+    results = {name: np.empty((rows, frames.shape[1]), out_dtype) for name in methods}
+    width = max(1, _BLOCK_ELEMENTS // max(1, frames.shape[0]))
+    for start in range(0, frames.shape[1], width):
+        columns = slice(start, start + width)
+        calculation = as_float64(frames[:, columns], label=f"{label} input")
+        for name, method in methods.items():
+            block = (
+                calculation
+                if method is None
+                else _aggregate(calculation, method, factor)
+            )
+            if unit_factor != 1.0:
+                np.divide(block, unit_factor, out=block)
+            if unit_scale != 1.0:
+                np.multiply(block, unit_scale, out=block)
+            if unit_offset != 0.0:
+                np.add(block, unit_offset, out=block)
+            results[name][:, columns] = finalize(
+                block, out_dtype=out_dtype, checked=checked, label=labels[name]
+            )
+    shape = (rows, *values.shape[1:])
+    if isinstance(aggregation, Mapping):
+        return {name: result.reshape(shape) for name, result in results.items()}
+    return results[None].reshape(shape)

@@ -26,11 +26,11 @@ import torch
 
 from hydroforge.compiler.partition import bare, coordinate_is_partitioned
 from hydroforge.contracts.fields import cast_declared_tensor
+from hydroforge.core.errors import error_message
 from hydroforge.core.events import EventSink, ModelEvent, emit
 from hydroforge.data.input import select_values
 from hydroforge.declare.spec import FieldSpec, ModuleBinding
 from hydroforge.declare.tensors import ModulePayload
-from hydroforge.execution.binding import error_message
 from hydroforge.io.netcdf.read import normalize_selection
 
 if TYPE_CHECKING:
@@ -208,6 +208,10 @@ class InputBinding:
             for name, spec in self.fields.items()
             if spec.field.required and name not in self.proxy
         )
+        spec = self.plan.spec
+        # Every rank's ownership derives from the group of the partition key.
+        if spec.partition_key is not None and spec.partition_group not in self.proxy:
+            missing = sorted({*missing, spec.partition_group})
         if missing:
             raise KeyError(
                 f"Required fields are missing from InputProxy: {missing}; "

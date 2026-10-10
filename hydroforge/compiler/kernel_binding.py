@@ -132,6 +132,13 @@ class KernelBindingPlan:
         self.plan = plan
         self._bindings: dict[int, tuple[KernelSpec, KernelBinding]] = {}
 
+    @property
+    def ensemble_size(self) -> int:
+        """The ``ensemble_size`` argument: this rank's members, 1 if none."""
+
+        members = self.plan.local_ensemble_size
+        return 1 if members is None else members
+
     def bind(self, spec: KernelSpec) -> KernelBinding:
         cached = self._bindings.get(id(spec))
         if cached is not None:
@@ -187,8 +194,7 @@ class KernelBindingPlan:
             return spec.workspace[name]
         plan = self.plan
         if name == "ensemble_size":
-            members = plan.local_ensemble_size
-            return Fixed(1 if members is None else members, "model_config", "model")
+            return Fixed(self.ensemble_size, "model_config", "model")
         if name in spec.compile_time_sources:
             return self._compile_time(spec, name)
         field = name.removesuffix("_ptr")

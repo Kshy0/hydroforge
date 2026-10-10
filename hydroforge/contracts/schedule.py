@@ -15,6 +15,7 @@ from pydantic import Field, PrivateAttr, model_validator
 
 from hydroforge.core.time import (
     DateLike,
+    declared_dates,
     normalize_calendar_dates,
     require_calendar,
     require_date,
@@ -44,24 +45,14 @@ class SimulationStep(HydroForgeModel):
     def _validate_step(self) -> Self:
         source_start = self.start if self.source_start is None else self.source_start
         source_end = self.end if self.source_end is None else self.source_end
-        date_values = {
-            "simulation step start": self.start,
-            "simulation step end": self.end,
-            "simulation step source start": source_start,
-            "simulation step source end": source_end,
-        }
-        _calendar, normalized, _defaulted = normalize_calendar_dates(
-            date_values,
-            calendar=None,
-            preserve_cftime_declaration=True,
+        start, end, source_start, source_end = declared_dates(
+            {
+                "simulation step start": self.start,
+                "simulation step end": self.end,
+                "simulation step source start": source_start,
+                "simulation step source end": source_end,
+            }
         )
-        start = cast(DateLike, normalized["simulation step start"])
-        end = cast(DateLike, normalized["simulation step end"])
-        source_start = cast(
-            DateLike,
-            normalized["simulation step source start"],
-        )
-        source_end = cast(DateLike, normalized["simulation step source end"])
         if end <= start:
             raise ValueError("simulation step must have positive duration")
         if source_end <= source_start:
@@ -124,17 +115,12 @@ class SpinupSchedule(HydroForgeModel):
 
     @model_validator(mode="after")
     def _validate_spinup(self) -> Self:
-        date_values = {
-            "spinup source start": self.source_start,
-            "spinup source end": self.source_end,
-        }
-        _calendar, normalized, _defaulted = normalize_calendar_dates(
-            date_values,
-            calendar=None,
-            preserve_cftime_declaration=True,
+        source_start, source_end = declared_dates(
+            {
+                "spinup source start": self.source_start,
+                "spinup source end": self.source_end,
+            }
         )
-        source_start = cast(DateLike, normalized["spinup source start"])
-        source_end = cast(DateLike, normalized["spinup source end"])
         if source_end <= source_start:
             raise ValueError("spinup source end must be after its start")
         object.__setattr__(self, "source_start", source_start)

@@ -882,7 +882,8 @@ def resolve_conditions(
     ``"options.<path>"`` spelling. An atom that cannot be read (for example
     one traversing a ``None`` record) is left out when a guard such as
     ``opt("record").is_set() & ...`` short-circuits it for ``opened_modules``
-    (default: the given modules); otherwise its error is raised.
+    (default: the given modules); otherwise its error is raised. A path the
+    options type does not declare is always an error.
     """
 
     specs = tuple(modules)
@@ -899,7 +900,15 @@ def resolve_conditions(
                         if options is None:
                             raise ValueError("provide an explicit options context")
                         values[key] = atom.resolve(options)
-                    except ValueError:
+                    except (TypeError, ValueError):
+                        if options is not None:
+                            # Only a declared path may be short-circuited.
+                            try:
+                                atom.check_declared(type(options))
+                            except (TypeError, ValueError) as error:
+                                raise ValueError(
+                                    f"{module_spec.name}.{field.name}: {error}"
+                                ) from error
                         unreadable.add(key)
     if unreadable:
         # Evaluate like ``tensor_is_active``: an unreadable atom that the
@@ -919,7 +928,7 @@ def resolve_conditions(
                 try:
                     if all(item.evaluate(context) for item in tensor.depends_on):
                         any(item.evaluate(context) for item in tensor.required_by)
-                except ValueError as error:
+                except (TypeError, ValueError) as error:
                     raise ValueError(
                         f"{module_spec.name}.{field.name}: {error}"
                     ) from error

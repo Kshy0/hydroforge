@@ -31,7 +31,7 @@ import numpy as np
 from pydantic import AfterValidator
 
 from hydroforge.io.binary import binread, read_map
-from hydroforge.mapping.engine import _EARTH_RADIUS_M
+from hydroforge.mapping.engine import _cell_area
 from hydroforge.mapping.grid import RegularGrid
 
 
@@ -279,12 +279,7 @@ def _lowres_cell_areas(
             )
         return areas
     edges = np.clip(north - np.arange(ny + 1, dtype=np.float64) * csize, -90.0, 90.0)
-    row_area = (
-        _EARTH_RADIUS_M
-        * _EARTH_RADIUS_M
-        * np.radians(csize)
-        * (np.sin(np.radians(edges[:-1])) - np.sin(np.radians(edges[1:])))
-    )
+    row_area = _cell_area(csize, edges[1:], edges[:-1], geographic=True)
     areas = row_area[y_idx]
     if not np.all(np.isfinite(areas) & (areas > 0.0)):
         raise ValueError("active low-resolution cell areas must be finite and positive")

@@ -27,7 +27,7 @@ from pydantic import (
     validate_call,
 )
 
-from hydroforge.core.arrays import UniqueIds, immutable_array
+from hydroforge.core.arrays import IdSelection, immutable_array
 from hydroforge.core.time import DateLike
 from hydroforge.core.validation import HydroForgeModel
 from hydroforge.data.datasets.base import ForcingDataset, SourceDirectory
@@ -571,14 +571,17 @@ class ExportedDataset(ForcingDataset):
     @validate_call(config=HydroForgeModel.model_config)
     def selected(
         self,
-        target_ids: UniqueIds,
+        target_ids: IdSelection,
         *,
         time_shift_steps: _TimeShift | None = None,
     ) -> Self:
-        """Return a view of ``target_ids`` in that order.
+        """Gather source columns for ``target_ids``, preserving order and repeats.
 
         ``time_shift_steps`` gives each selected column an integer source-time
-        offset (read from the resident copy).  The view shares this dataset's
+        offset (read from the resident copy). Repeated IDs may have different
+        offsets, for example when physical cells supply several ghost nodes.
+        IDs stored on the source axis must remain unique; this query does not
+        create new source identities. The view shares this dataset's
         plan and files; a resident copy is shared when the selection is equal.
         Window declarations are not carried over.
         """

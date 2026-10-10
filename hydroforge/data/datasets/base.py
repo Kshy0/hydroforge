@@ -36,7 +36,7 @@ from pydantic import (
     validate_call,
 )
 
-from hydroforge.core.arrays import UniqueIds, canonical_floating_array
+from hydroforge.core.arrays import IdSelection, UniqueIds, canonical_floating_array
 from hydroforge.core.devices import devices_match
 from hydroforge.core.errors import cleanup_on_exit
 from hydroforge.core.time import DateLike
@@ -816,9 +816,7 @@ class DatasetExpression(CompositeDataset):
             and not isinstance(self._right, ForcingDataset)
             and self._right == 0
         ):
-            raise ZeroDivisionError(
-                "dataset expression scalar denominator must be nonzero"
-            )
+            raise ValueError("dataset expression scalar denominator must be nonzero")
         return self
 
     def _require_compatible(
@@ -902,8 +900,8 @@ class DatasetExpression(CompositeDataset):
         return self._derived(lambda child: child._mapped(source_indices, target_ids))
 
     @validate_call(config=HydroForgeModel.model_config)
-    def selected(self, target_ids: UniqueIds) -> Self:
-        """Select every point operand together, preserving the expression."""
+    def selected(self, target_ids: IdSelection) -> Self:
+        """Gather every point operand in query order, including repeated IDs."""
 
         if not isinstance(self.space, PointSpace):
             raise TypeError("selected() requires point datasets")
