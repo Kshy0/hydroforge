@@ -35,6 +35,8 @@ from hydroforge.compiler.kernel_binding import (
     StepFieldValue,
     Unresolved,
 )
+from hydroforge.contracts.fields import precision_dtype
+from hydroforge.core.errors import error_message
 from hydroforge.kernels.registry import BackendRegistry, KernelCall
 from hydroforge.kernels.spec import KernelSpec, KernelWorkspace
 
@@ -44,14 +46,6 @@ if TYPE_CHECKING:
 
 class UnboundKernelArgument(KeyError):
     """A canonical ABI parameter has no owner in the model namespace."""
-
-
-def error_message(error: BaseException) -> str:
-    """Message of a wrapped error, without ``KeyError``'s repr quoting."""
-
-    if isinstance(error, KeyError) and len(error.args) == 1:
-        return str(error.args[0])
-    return str(error)
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,8 +307,7 @@ class KernelBinder:
 
         def value(field: str) -> Any:
             if field == "ensemble_size":
-                members = plan.local_ensemble_size
-                return 1 if members is None else members
+                return self.plan.ensemble_size
             return self._resolve(
                 binding, field, FieldValue(field, plan.fields.binding.get(field, ()))
             ).value
@@ -328,11 +321,7 @@ class KernelBinder:
             return result
 
         shape = tuple(dimension(field) for field in declaration.shape)
-        dtype = (
-            plan.dtype
-            if declaration.dtype == "precision"
-            else getattr(torch, declaration.dtype)
-        )
+        dtype = precision_dtype(declaration.dtype, plan.dtype)
         if prod(shape) > (2**63 - 1) // dtype.itemsize:
             raise OverflowError(
                 f"workspace {declaration.key!r} exceeds int64 byte size"

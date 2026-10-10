@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from pydantic import Field, InstanceOf, validate_call
 
-from hydroforge.core.arrays import UniqueIds
+from hydroforge.core.arrays import IdSelection
 from hydroforge.core.validation import FrozenMapping, HydroForgeModel, frozen_dict
 from hydroforge.data.datasets.base import CompositeDataset, ForcingDataset
 from hydroforge.data.datasets.exported import ExportedDataset
@@ -102,8 +102,8 @@ class MultiVariableDataset(CompositeDataset):
         )
 
     @validate_call(config=HydroForgeModel.model_config)
-    def selected(self, target_ids: UniqueIds) -> Self:
-        """Return a view of every point variable at ``target_ids`` in that order."""
+    def selected(self, target_ids: IdSelection) -> Self:
+        """Gather every point variable in query order, including repeated IDs."""
 
         if not isinstance(self.space, PointSpace):
             raise TypeError("selected() requires point datasets")

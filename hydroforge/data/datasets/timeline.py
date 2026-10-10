@@ -25,8 +25,11 @@ import numpy as np
 from netCDF4 import num2date
 
 from hydroforge.core.time import (
+    GREGORIAN_REFORM,
     DateLike,
+    calendars_equivalent,
     canonical_calendar,
+    date_components,
     timedelta_microseconds,
     timedelta_quotient,
 )
@@ -282,18 +285,6 @@ def _time_variable(dataset: Any, path: Path, variable: str) -> Any:
 
 def _file_calendar(time_variable: Any) -> str:
     return canonical_calendar(getattr(time_variable, "calendar", "standard"))
-
-
-# The standard (mixed Julian/Gregorian) and proleptic Gregorian calendars
-# label every instant from 1582-10-15 onwards identically.
-_GREGORIAN_CALENDARS = frozenset({"standard", "proleptic_gregorian"})
-_GREGORIAN_REFORM = (1582, 10, 15)
-
-
-def calendars_equivalent(left: str, right: str) -> bool:
-    """Whether two canonical calendars agree on every post-reform date."""
-
-    return left == right or {left, right} == _GREGORIAN_CALENDARS
 
 
 def probe_calendar(
@@ -610,7 +601,7 @@ class TimelineScan:
             (
                 date
                 for date in dates
-                if (date.year, date.month, date.day) < _GREGORIAN_REFORM
+                if (date.year, date.month, date.day) < GREGORIAN_REFORM
             ),
             None,
         )
@@ -622,15 +613,7 @@ class TimelineScan:
             )
 
         def rebuild(date: DateLike) -> DateLike:
-            components = (
-                date.year,
-                date.month,
-                date.day,
-                date.hour,
-                date.minute,
-                date.second,
-                date.microsecond,
-            )
+            components = date_components(date)
             if self._reference is not None:
                 return self._reference.replace(
                     year=components[0],

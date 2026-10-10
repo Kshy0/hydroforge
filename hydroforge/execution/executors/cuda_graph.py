@@ -72,7 +72,9 @@ class CudaGraphExecutor(LoopExecutor):
     whole on the device.
 
     Captures run on one side stream and allocate from one graph pool owned by
-    this executor, on the model device, while callers keep their streams.
+    this executor, on the model device, while callers keep their streams. The
+    executor holds the pool as a ``MemPool`` so releasing every graph never
+    leaves a freeable pool id to be reused by the next capture.
     """
 
     name = "cuda_graph"
@@ -88,7 +90,7 @@ class CudaGraphExecutor(LoopExecutor):
             raise ValueError("warmup_iterations must be a non-negative exact int")
         super().__init__(device, world_size=world_size)
         self.warmup_iterations = warmup_iterations
-        self._graph_pool: Any = None
+        self._graph_pool: torch.cuda.MemPool | None = None
         self._capture_stream: torch.cuda.Stream | None = None
         self._statistics_graph: tuple[Any, torch.cuda.CUDAGraph] | None = None
         self._requested: set[str] = set()
@@ -108,11 +110,12 @@ class CudaGraphExecutor(LoopExecutor):
         return requests
 
     @property
-    def graph_pool(self) -> Any:
+    def graph_pool(self) -> tuple[int, int]:
+        """The id of the private pool every capture of this executor uses."""
         if self._graph_pool is None:
             with torch.cuda.device(self.device):
-                self._graph_pool = torch.cuda.graph_pool_handle()
-        return self._graph_pool
+                self._graph_pool = torch.cuda.MemPool()
+        return self._graph_pool.id
 
     @property
     def capture_stream(self) -> torch.cuda.Stream:
@@ -454,6 +457,7 @@ class _Fixed:
             if width != self._width:
                 self.width.fill_(width)
                 self._width = width
+            step.statistics.fold_weights(count, duration)
             step.statistics.prelaunch()
         batches, remainder = divmod(
             count - int(loop.final is not None), self.batch_size
@@ -624,6 +628,8 @@ class _Adaptive:
             loop.completion_sources, loop.completion, loop.completion_host
         )
         loop.check_completion(failed)
+        if launch is not None:
+            step.statistics.fold_weights(count, duration)
         if launch is None and step.sampling:
             step.sample(first=True, last=True, weight=duration)
         return count

@@ -715,10 +715,14 @@ class MappingTable(HydroForgeModel):
         """Return a mapping with invalid source cells removed.
 
         ``valid_source_mask`` has the ``(y, x)`` source grid shape.
-        ``empty_row_policy="nearest"`` repairs rows that originally had source
-        support but become empty after masking by assigning the original row sum
-        to the nearest valid source cell.  Coverage is scaled by the fraction
-        of each row's original weight that remains on valid source cells.
+        ``preserve_row_sum`` rescales each row's surviving weights to its
+        original sum.  ``empty_row_policy="nearest"`` repairs rows that
+        originally had source support but become empty after masking by
+        assigning one weight to the nearest valid source cell: the original
+        row sum when ``preserve_row_sum`` is true, otherwise ``1``, so no row
+        sum is synthesized when sums are not preserved.  Coverage is scaled by
+        the fraction of each row's original weight that remains on valid
+        source cells.
         """
 
         if valid_source_mask.shape != self._source_shape:
@@ -782,7 +786,11 @@ class MappingTable(HydroForgeModel):
                 if nearest is not None:
                     repair_row = candidates.tolist()
                     repair_col = nearest.tolist()
-                    repair_val = original_row_sums[candidates].tolist()
+                    repair_val = (
+                        original_row_sums[candidates]
+                        if preserve_row_sum
+                        else np.ones(candidates.size)
+                    ).tolist()
 
             if repair_row:
                 repair = csr_matrix(

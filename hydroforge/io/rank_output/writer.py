@@ -45,7 +45,6 @@ from hydroforge.io.netcdf.encoding import (
     BOOL_LOGICAL_DTYPE,
     COMPLETE_DATA_ATTR,
     LOGICAL_DTYPE_ATTR,
-    decoded_output_tensor,
     narrowing_flag,
     netcdf_dtype_encoding,
     raise_narrowing_failures,
@@ -1147,9 +1146,14 @@ class RankOutputWriter:
         rows: list[tuple[_OutputStream, int, int]] = []
         for name, storage in values.items():
             dtype = self._dtypes[name]
-            # Export logical values, never the integer hi/lo carrier. Take
-            # one decoded snapshot for all components and narrowing checks.
-            storage = decoded_output_tensor(storage)
+            # Values are logical: the statistics runtime decodes encoded
+            # storage before it reaches this writer.
+            if type(storage) is not torch.Tensor:
+                raise TypeError(
+                    f"NetCDF output {name!r} requires an ordinary tensor of "
+                    f"logical values, got {type(storage).__name__}"
+                )
+            storage = storage.detach()
             flag = narrowing_flag(storage, dtype, name=name)
             if flag is not None:
                 flags.append(flag)
@@ -1208,8 +1212,7 @@ class RankOutputWriter:
                     dtype=dtype, memory_format=torch.contiguous_format, copy=True
                 )
                 snapshots.append(snapshot)
-                # The converted snapshot reveals overflow without a temporary.
-                entry = narrowing_flag(source, dtype, name=name, converted=snapshot)
+                entry = narrowing_flag(source, dtype, name=name)
                 if entry is not None:
                     flag = entry if flag is None else (flag[0] | entry[0], *entry[1:])
             if flag is not None:

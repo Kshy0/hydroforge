@@ -24,7 +24,7 @@ import numpy as np
 from pydantic import AfterValidator, Field
 
 from hydroforge.core.arrays import positive_finite_float64
-from hydroforge.core.time import DateLike
+from hydroforge.core.time import DateLike, calendars_equivalent
 from hydroforge.core.units import check_units, normalize_units
 from hydroforge.core.validation import FrozenMapping
 from hydroforge.data.datasets.plan import TemporalDomain
@@ -32,7 +32,6 @@ from hydroforge.data.datasets.timeline import (
     NetCDFTimeline,
     StorageLayout,
     TimelineScan,
-    calendars_equivalent,
     probe_calendar,
 )
 from hydroforge.data.datasets.values import AggregationMethod, convert

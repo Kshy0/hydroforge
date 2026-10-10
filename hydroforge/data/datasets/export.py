@@ -77,12 +77,12 @@ _SafeName = Annotated[str, AfterValidator(partial(_output_name, label="name"))]
 
 def _quantile_levels(value: np.ndarray) -> np.ndarray:
     if np.ma.isMaskedArray(value):
-        raise TypeError("quantiles must not be a masked array")
+        raise ValueError("quantiles must not be a masked array")
     array = np.asarray(value)
     if array.ndim != 1 or array.size == 0:
         raise ValueError("quantiles must be a non-empty one-dimensional array")
     if array.dtype.kind not in {"f", "i", "u"}:
-        raise TypeError("quantiles must contain real numeric values")
+        raise ValueError("quantiles must contain real numeric values")
     if not np.isfinite(array).all() or np.any((array < 0) | (array > 1)):
         raise ValueError("quantiles must lie within [0, 1]")
     result = canonical_float64(array, label="quantiles")
@@ -596,7 +596,8 @@ def export_quantiles(
     """Write per-point temporal quantiles of the main period.
 
     The file has dimensions ``quantile`` and ``saved_points`` with the
-    ``catchment_id`` coordinate in the dataset's (selected) order.  Exact
+    ``catchment_id`` coordinate in the dataset's (selected) order; that
+    coordinate is an identity, so the selection must not repeat IDs.  Exact
     quantiles need each point's full series: when the estimated source
     working set (three arrays on the expanded source time axis, at the
     widest source or output width) exceeds ``max_buffer_mb``, points are
@@ -613,6 +614,9 @@ def export_quantiles(
     space = dataset.space
     point_ids = space.selected_ids
     columns = point_ids.size
+    # The written coordinate is an identity; a query may repeat IDs.
+    if np.unique(point_ids).size != columns:
+        raise ValueError("export_quantiles requires unique selected IDs")
     steps = dataset.num_main_source_steps
     _declared_names(dataset, name)
     prepare_netcdf_variable_options(

@@ -21,7 +21,7 @@ from hydroforge.core.errors import (
     failure_description,
 )
 from hydroforge.core.events import emit
-from hydroforge.core.time import DateLike
+from hydroforge.core.time import DateLike, timedelta_microseconds
 from hydroforge.declare.module import AbstractModule, construct_module
 from hydroforge.declare.spec import ModuleBinding
 from hydroforge.execution.channel import LocalChannel, ProcessGroupChannel
@@ -79,6 +79,16 @@ class RuntimeClock:
         if self.schedule_index == len(schedule):
             return schedule.end
         return schedule._step_at_trusted(self.schedule_index).start
+
+    @property
+    def next_step_seconds(self) -> float | None:
+        """Width of the next scheduled step; unknown without a schedule."""
+
+        schedule = self.schedule
+        if schedule is None or self.schedule_index == len(schedule):
+            return None
+        step = schedule._step_at_trusted(self.schedule_index)
+        return timedelta_microseconds(step.end - step.start) / 1_000_000
 
 
 class ModelRuntime:
@@ -346,7 +356,11 @@ class ModelRuntime:
         for name in plan.modules:
             self.modules[name]._tensors._apply_modes()
         self.model_state_entered = True
-        # Registered kernels called by the hook bind like inside a step.
+        # Registered kernels called by the hook bind like inside a step,
+        # with step fields describing the initial clock.
+        execution.step_fields.prepare_initial(
+            self.clock.current_time, self.clock.next_step_seconds
+        )
         with routing(execution.kernel_binding):
             owner.initialize_model_state()
         self.checkpoint = CheckpointRuntime(self)

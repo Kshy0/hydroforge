@@ -64,7 +64,9 @@ def launch_triton_kernel(
     keeps the bound driver/device and scalar ABI active until rebinding.
     """
 
-    precision_context = copy_context() if active_triton_precision() is not None else None
+    precision_context = (
+        copy_context() if active_triton_precision() is not None else None
+    )
     selected = launcher = defaults = None
 
     def launch(*args: Any, **kwargs: Any):

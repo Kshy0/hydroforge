@@ -99,7 +99,11 @@ class DailyBinDataset(ForcingDataset):
     @field_validator("bin_dtype")
     @classmethod
     def _validate_bin_dtype(cls, value: str) -> str:
-        if np.dtype(value).kind not in {"i", "u", "f"}:
+        try:
+            kind = np.dtype(value).kind
+        except TypeError as error:
+            raise ValueError(f"bin_dtype {value!r} is not a NumPy dtype") from error
+        if kind not in {"i", "u", "f"}:
             raise ValueError("bin_dtype must describe a real numeric dtype")
         return value
 

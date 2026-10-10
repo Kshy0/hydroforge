@@ -115,7 +115,7 @@ class GridSpace:
 
 @dataclass(frozen=True, slots=True)
 class PointSpace:
-    """Unique integer point IDs in storage order, optionally reordered."""
+    """Unique storage point IDs, optionally gathered in an order with repeats."""
 
     ids: np.ndarray
     selection: np.ndarray | None = None
@@ -129,7 +129,7 @@ class PointSpace:
         return self.ids if self.selection is None else self.ids[self.selection]
 
     def select(self, target_ids: np.ndarray, *, label: str) -> PointSpace:
-        """Return the storage positions of ``target_ids`` in their order."""
+        """Return source positions in query order; repeated IDs repeat positions."""
 
         positions = find_indices_in(target_ids, self.ids)
         missing = int(np.count_nonzero(positions == -1))

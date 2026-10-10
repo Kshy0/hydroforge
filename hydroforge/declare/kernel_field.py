@@ -17,7 +17,11 @@ T = TypeVar("T")
 
 
 class _KernelField(cached_property):
-    """A model value evaluated once when its first kernel plan is compiled."""
+    """A model value evaluated once per materialization.
+
+    ``materialize`` reads every kernel field when it indexes the model's
+    tensors, so each one must be computable whenever its owner is opened.
+    """
 
     __hydroforge_kernel_field__ = True
 

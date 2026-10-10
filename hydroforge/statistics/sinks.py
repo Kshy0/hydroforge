@@ -20,12 +20,51 @@ from typing import Any, Protocol
 
 import torch
 
-from hydroforge.io.netcdf.encoding import (
-    checked_narrowing,
-    decoded_output_tensor,
-    raise_narrowing_failures,
-)
+from hydroforge.io.netcdf.encoding import narrowing_flag, raise_narrowing_failures
 from hydroforge.kernels.emulated import EmulatedTensor
+
+
+def decoded_output_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Detach ordinary storage, or snapshot encoded values as CPU float64.
+
+    An encoded tensor's int64 carrier is never an integer output. Decode at
+    the export boundary before narrowing, NumPy conversion or copying into
+    ordinary host storage. ``copy=True`` is required even for a CPU-backed
+    encoded tensor: a no-op ``cpu()`` would leave the wrapper undecoded.
+    """
+
+    source = tensor.detach()
+    if isinstance(source, EmulatedTensor):
+        return source.to(device="cpu", copy=True)
+    return source
+
+
+def checked_narrowing(
+    tensor: torch.Tensor,
+    target_dtype: torch.dtype,
+    *,
+    name: str,
+    flags: list[tuple[torch.Tensor, str, str]] | None = None,
+) -> torch.Tensor:
+    """Convert logical values, rejecting finite values out of range.
+
+    Tiny values may round to subnormals or zero.  With ``flags`` the
+    device-side overflow flag is queued for a deferred host check; otherwise
+    it is checked before returning. Encoded Metal values are snapshotted and
+    decoded on the CPU first; ordinary tensors stay on their device.
+    """
+
+    source = decoded_output_tensor(tensor)
+    if source.dtype == target_dtype:
+        return source
+    converted = source.to(dtype=target_dtype)
+    entry = narrowing_flag(source, target_dtype, name=name)
+    if entry is not None:
+        if flags is None:
+            raise_narrowing_failures((entry,))
+        else:
+            flags.append(entry)
+    return converted
 
 
 class StatisticsSink(Protocol):
@@ -57,6 +96,11 @@ class MemorySink:
     CPU results are ordinary tensors. On MPS, declared ``encoded_outputs``
     retained as float64 remain explicitly encoded tensors, including stacked
     and empty results; other float64 results are rejected at construction.
+
+    Samples leaving a CUDA device for CPU results are copied asynchronously
+    into one pinned staging buffer per dtype and land in owned pageable
+    storage before the next sample or any read, so a sample never waits for
+    the device queue.
     """
 
     def __init__(
@@ -78,6 +122,9 @@ class MemorySink:
                         "or save_precision='float32'"
                     )
         self._results: dict[str, list[torch.Tensor]] = {name: [] for name in outputs}
+        self._staging: dict[torch.dtype, torch.Tensor] = {}
+        # (copy event, ((name, staged view), ...)) of the last staged sample.
+        self._staged: tuple[Any, tuple[tuple[str, torch.Tensor], ...]] | None = None
 
     def append(self, dt: Any, values: Mapping[str, torch.Tensor]) -> None:
         # One host check covers every narrowed output of the sample.
@@ -99,9 +146,14 @@ class MemorySink:
                 else checked_narrowing(source, dtype, name=name, flags=flags)
             )
         raise_narrowing_failures(flags)
+        self._land()
         copies = {}
         # Values leaving their device move in one transfer per dtype: a
         # blocking copy per output would wait on the device once per output.
+        # CUDA holds every result dtype, so CUDA samples for CPU results are
+        # widened on the device and staged asynchronously, grouped by result
+        # dtype so that each staging buffer serves one transfer.
+        staging = self.device.type == "cpu"
         moving: dict[torch.dtype, list[str]] = {}
         for name, value in converted.items():
             if isinstance(value, EmulatedTensor):
@@ -112,18 +164,36 @@ class MemorySink:
                     copy=value.dtype == values[name].dtype,
                 )
             else:
-                moving.setdefault(value.dtype, []).append(name)
-        for names in moving.values():
+                staged_here = staging and value.device.type == "cuda"
+                key = self._layouts[name][1] if staged_here else value.dtype
+                moving.setdefault(key, []).append(name)
+        staged: list[tuple[str, torch.Tensor]] = []
+        stream = None
+        for dtype, names in moving.items():
             parts = [converted[name] for name in names]
-            if len(parts) == 1:
-                moved = (parts[0].to(device=self.device),)
-            else:
-                flat = torch.cat([part.reshape(-1) for part in parts])
-                moved = flat.to(device=self.device).split(
-                    [part.numel() for part in parts]
-                )
+            device = parts[0].device
+            if staging and device.type == "cuda":
+                parts = [part.to(dtype=dtype) for part in parts]
+            flat = (
+                parts[0].reshape(-1)
+                if len(parts) == 1
+                else torch.cat([part.reshape(-1) for part in parts])
+            )
+            sizes = [part.numel() for part in parts]
+            if staging and device.type == "cuda":
+                stream = torch.cuda.current_stream(device)
+                for name, part, value in zip(
+                    names, parts, self._stage(flat).split(sizes), strict=True
+                ):
+                    staged.append((name, value.view(part.shape)))
+                continue
+            moved = flat.to(device=self.device).split(sizes)
             for name, part, value in zip(names, parts, moved, strict=True):
                 copies[name] = value.view(part.shape)
+        if staged:
+            event = torch.cuda.Event()
+            event.record(stream)
+            self._staged = (event, tuple(staged))
         for name, value in copies.items():
             # Exact widening follows the move: the sampling device may lack
             # the wider type (MPS has no float64).
@@ -132,9 +202,32 @@ class MemorySink:
                 value if value.dtype == dtype else value.to(dtype)
             )
 
+    def _stage(self, flat: torch.Tensor) -> torch.Tensor:
+        """Enqueue ``flat``'s copy into the pinned buffer of its dtype."""
+
+        buffer = self._staging.get(flat.dtype)
+        if buffer is None or buffer.numel() < flat.numel():
+            buffer = torch.empty(flat.numel(), dtype=flat.dtype, pin_memory=True)
+            self._staging[flat.dtype] = buffer
+        target = buffer[: flat.numel()]
+        target.copy_(flat, non_blocking=True)
+        return target
+
+    def _land(self) -> None:
+        """Move the staged sample into owned results once its copy completed."""
+
+        staged, self._staged = self._staged, None
+        if staged is None:
+            return
+        event, values = staged
+        event.synchronize()
+        for name, value in values:
+            self._results[name].append(value.clone())
+
     def _snapshot(
         self, name: str, selection: slice, *, as_stacked: bool
     ) -> torch.Tensor | list[torch.Tensor]:
+        self._land()
         values = self._results[name][selection]
         if not as_stacked:
             return [
@@ -192,15 +285,18 @@ class MemorySink:
     def pop(self, name: str) -> torch.Tensor | None:
         """Remove and return the newest sample of one output."""
 
+        self._land()
         values = self._results[name]
         return values.pop() if values else None
 
     def reset(self) -> None:
+        self._land()
         for values in self._results.values():
             values.clear()
 
     def flush(self, dt: Any) -> None:
         del dt
+        self._land()
 
     def poll(self, dt: Any) -> None:
         del dt
@@ -209,4 +305,5 @@ class MemorySink:
         del run_id
 
     def close(self) -> None:
-        pass
+        self._land()
+        self._staging.clear()

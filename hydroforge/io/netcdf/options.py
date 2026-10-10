@@ -428,7 +428,7 @@ def normalize_netcdf_variable_options(options: Mapping[str, Any]) -> dict[str, A
     """Validate and detach ``Dataset.createVariable`` keyword options."""
 
     if not isinstance(options, Mapping):
-        raise TypeError("NetCDF variable options must be a mapping")
+        raise ValueError("NetCDF variable options must be a mapping")
     normalized = dict(options)
     try:
         _NETCDF_CREATE_VARIABLE_SIGNATURE.bind(
@@ -443,12 +443,12 @@ def normalize_netcdf_variable_options(options: Mapping[str, Any]) -> dict[str, A
 
     for name in ("zlib", "shuffle", "fletcher32", "contiguous"):
         if name in normalized and type(normalized[name]) is not bool:
-            raise TypeError(f"NetCDF option {name!r} must be an exact bool")
+            raise ValueError(f"NetCDF option {name!r} must be an exact bool")
 
     compression = normalized.get("compression")
     if compression is not None and compression is not False:
         if type(compression) is not str:
-            raise TypeError(
+            raise ValueError(
                 "NetCDF option 'compression' must be an exact str, False, or None"
             )
         if compression not in _NETCDF_COMPRESSION_FILTERS:
@@ -468,7 +468,7 @@ def normalize_netcdf_variable_options(options: Mapping[str, Any]) -> dict[str, A
     chunks = normalized.get("chunksizes")
     if chunks is not None:
         if not isinstance(chunks, Sequence) or isinstance(chunks, (str, bytes)):
-            raise TypeError("NetCDF chunksizes must be a sequence of integers")
+            raise ValueError("NetCDF chunksizes must be a sequence of integers")
         chunks = tuple(chunks)
         if any(type(extent) is not int or extent <= 0 for extent in chunks):
             raise ValueError("NetCDF chunksizes must contain positive exact integers")

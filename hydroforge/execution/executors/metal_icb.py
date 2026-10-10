@@ -455,6 +455,7 @@ class _Fixed:
         # after the whole loop fails the step before ``finish`` can publish any
         # folded statistics, so scatter bodies keep the folded path.
         if fold:
+            step.statistics.fold_weights(count, duration)
             step.statistics.prelaunch()
             launch = step.statistics.launch
             dtype = launch.states[CONTROL_WEIGHT].dtype

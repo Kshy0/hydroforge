@@ -11,6 +11,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Mapping
 from copy import deepcopy
+from functools import partial
 from numbers import Integral, Real
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -128,6 +129,11 @@ def _unique_ids(value: Any) -> np.ndarray:
 
 UniqueIds = Annotated[np.ndarray, BeforeValidator(_unique_ids)]
 """A one-dimensional vector of unique integer IDs, canonicalized to int64."""
+
+IdSelection = Annotated[
+    np.ndarray, BeforeValidator(partial(canonical_ids, label="selected ids"))
+]
+"""Ordered integer ID queries; repeated IDs request repeated source columns."""
 
 
 def finite_float64(value: NumericScalar, *, label: str) -> float:

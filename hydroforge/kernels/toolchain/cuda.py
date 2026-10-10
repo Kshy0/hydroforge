@@ -44,6 +44,12 @@ from hydroforge.kernels.toolchain.cache import (
 )
 from hydroforge.platform import env
 from hydroforge.platform.backend import CUDA
+from hydroforge.platform.driver import (
+    bind_primary_context,
+    driver_error,
+    driver_library,
+    load_first,
+)
 
 # Device code sees fixed-width integers, the <cmath> constants and a portable
 # full-warp mask without any host header; everything else comes from libcu++
@@ -107,9 +113,9 @@ class _Toolkit:
     def __init__(self) -> None:
         self.hip = torch.version.hip is not None
         if self.hip:
-            self.rtc = _load_first(("libhiprtc.so", "libhiprtc.so.7", "libhiprtc.so.6"))
-            self.driver = _load_first(
-                ("libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6")
+            self.rtc = load_first(
+                ("libhiprtc.so", "libhiprtc.so.7", "libhiprtc.so.6"),
+                kind="runtime compiler",
             )
             self._rtc_prefix, self._driver_prefix = "hiprtc", "hip"
         else:
@@ -119,11 +125,9 @@ class _Toolkit:
                 if sys.platform == "win32"
                 else (f"libnvrtc.so.{major}", "libnvrtc.so")
             )
-            self.rtc = _load_first(names)
-            self.driver = ctypes.CDLL(
-                "nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1"
-            )
+            self.rtc = load_first(names, kind="runtime compiler")
             self._rtc_prefix, self._driver_prefix = "nvrtc", "cu"
+        self.driver = driver_library()
         p, s, i, sz = ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_size_t
         self._bind_rtc("CreateProgram", ctypes.POINTER(p), s, s, i, p, p)
         self._bind_rtc("AddNameExpression", p, s)
@@ -165,12 +169,6 @@ class _Toolkit:
                 ctypes.POINTER(sz),
                 alias="param_info",
             )
-        error = getattr(self.driver, f"{self._driver_prefix}GetErrorString")
-        if self.hip:
-            error.argtypes, error.restype = (i,), s
-        else:
-            error.argtypes, error.restype = (i, ctypes.POINTER(s)), i
-        self._driver_error = error
         major, minor = ctypes.c_int(), ctypes.c_int()
         self.check_rtc(self.Version(ctypes.byref(major), ctypes.byref(minor)))
         self.version = (major.value, minor.value)
@@ -200,17 +198,8 @@ class _Toolkit:
             )
 
     def check_driver(self, result: int, action: str) -> None:
-        if result == 0:
-            return
-        if self.hip:
-            message = self._driver_error(result)
-        else:
-            text = ctypes.c_char_p()
-            self._driver_error(result, ctypes.byref(text))
-            message = text.value
-        raise RuntimeError(
-            f"{action} failed: {message.decode() if message else f'error {result}'}"
-        )
+        if result != 0:
+            raise RuntimeError(f"{action} failed: {driver_error(result)}")
 
 
 def _bind(library: ctypes.CDLL, symbol: str, *argtypes: Any) -> Any:
@@ -218,16 +207,6 @@ def _bind(library: ctypes.CDLL, symbol: str, *argtypes: Any) -> Any:
     function = getattr(library, symbol)
     function.argtypes, function.restype = argtypes, ctypes.c_int
     return function
-
-
-def _load_first(names: Sequence[str]) -> ctypes.CDLL:
-    errors = []
-    for name in names:
-        try:
-            return ctypes.CDLL(name)
-        except OSError as error:
-            errors.append(f"{name}: {error}")
-    raise OSError("runtime compiler library unavailable: " + "; ".join(errors))
 
 
 @cache
@@ -537,6 +516,10 @@ def compile_request(request: RtcRequest, device: int) -> _Binary:
         lock = directory / f"{key}.lock"
         try:
             token, binary = acquire_compile_lock(lock, cache_probe=load)
+        except TimeoutError:
+            # A live or abandoned holder is not an unusable cache directory;
+            # the error names the lock and how to recover it.
+            raise
         except OSError as error:
             return _compile_unshared(request, target, device_binary, key, error)
         if binary is None:
@@ -793,7 +776,7 @@ def _function(binary: _Binary, kernel: str, device: int) -> ctypes.c_void_p:
         if module is None:
             module = ctypes.c_void_p()
             with torch.cuda.device(device):
-                torch.cuda.current_stream(device)  # make the primary context current
+                bind_primary_context(device)
                 kit.check_driver(
                     kit.ModuleLoadData(ctypes.byref(module), binary.image),
                     "loading runtime-compiled module",

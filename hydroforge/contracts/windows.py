@@ -8,12 +8,12 @@
 
 from __future__ import annotations
 
-from typing import Literal, Self, cast
+from typing import Literal, Self
 
 from pydantic import Field, model_validator
 
 from hydroforge.core.expr import parse_operation
-from hydroforge.core.time import DateLike, normalize_calendar_dates
+from hydroforge.core.time import DateLike, declared_dates
 from hydroforge.core.validation import HydroForgeModel
 
 CalendarPeriod = Literal["day", "month", "year"]
@@ -52,22 +52,11 @@ class ExplicitWindow(HydroForgeModel):
 
     @model_validator(mode="after")
     def _validate_window(self) -> Self:
-        date_values = {
-            f"explicit window {self.name!r} start": self.start,
-            f"explicit window {self.name!r} end": self.end,
-        }
-        _calendar, normalized, _defaulted = normalize_calendar_dates(
-            date_values,
-            calendar=None,
-            preserve_cftime_declaration=True,
-        )
-        start = cast(
-            DateLike,
-            normalized[f"explicit window {self.name!r} start"],
-        )
-        end = cast(
-            DateLike,
-            normalized[f"explicit window {self.name!r} end"],
+        start, end = declared_dates(
+            {
+                f"explicit window {self.name!r} start": self.start,
+                f"explicit window {self.name!r} end": self.end,
+            }
         )
         if end <= start:
             raise ValueError(f"explicit window {self.name!r} is empty")
@@ -84,35 +73,21 @@ class ExplicitWindows(HydroForgeModel):
         names = tuple(window.name for window in self.windows)
         if len(set(names)) != len(names):
             raise ValueError("explicit statistics window names must be unique")
-        values = {
-            f"explicit window {index} start": window.start
-            for index, window in enumerate(self.windows)
-        } | {
-            f"explicit window {index} end": window.end
-            for index, window in enumerate(self.windows)
-        }
-        _calendar, normalized, _defaulted = normalize_calendar_dates(
-            values,
-            calendar=None,
-            preserve_cftime_declaration=True,
+        dates = declared_dates(
+            {
+                f"explicit window {index} {bound}": getattr(window, bound)
+                for index, window in enumerate(self.windows)
+                for bound in ("start", "end")
+            }
         )
-        windows = []
-        for index, window in enumerate(self.windows):
-            # Each window was validated on construction; joint normalization
-            # only changes the date representation.
-            normalized_window = ExplicitWindow.model_construct(
-                name=window.name,
-                start=cast(
-                    DateLike,
-                    normalized[f"explicit window {index} start"],
-                ),
-                end=cast(
-                    DateLike,
-                    normalized[f"explicit window {index} end"],
-                ),
+        # Each window was validated on construction; joint normalization
+        # only changes the date representation.
+        windows = tuple(
+            ExplicitWindow.model_construct(name=window.name, start=start, end=end)
+            for window, start, end in zip(
+                self.windows, dates[0::2], dates[1::2], strict=True
             )
-            windows.append(normalized_window)
-        windows = tuple(windows)
+        )
         object.__setattr__(self, "windows", windows)
         previous_end: DateLike | None = None
         for window in windows:

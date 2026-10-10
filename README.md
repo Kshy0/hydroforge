@@ -56,8 +56,13 @@ Models can set a backend-specific mixed-precision default through
 `hydroforge.contracts.BackendRequirement(default_mixed_precision=...)`; an explicit
 `mixed_precision=True` or `False` at construction takes precedence.
 
-On Metal, high-precision values use two FP32 components rather than native FP64.
-NetCDF floating outputs default to FP32 independently of mixed precision; set
+Metal has no native FP64. With mixed precision, Metal stores high-precision
+values as two FP32 components (`metal_emulation="auto"` or `"float32x2"`);
+without mixed precision they are FP32.
+Statistics outputs default to FP32 independently of mixed precision; set
+`OutputConfig(save_precision="float64")` to keep FP64 values, or
+`save_precision=None` to keep each statistic's own precision. Integer and
+boolean outputs are never converted.
 
 ## Usage
 
@@ -98,7 +103,8 @@ written to NetCDF.
 
 Kernel specs never read options. Every module receives the model's root
 options as its `options` field (a model-owned field like `opened_modules`,
-never read from inputs or written to checkpoints and outputs) and derives
+never read from inputs; checkpoints and `parameters.nc` record only a
+fingerprint of the options they were built with) and derives
 kernel flags and constants from them; specs bind module fields by exact name
 (`module_flag(...)`, `constant(...)` served by a `kernel_field`):
 
@@ -115,9 +121,10 @@ Registered kernels bind their arguments from the model automatically, and
 launch eagerly, wherever the model runs them: inside `@managed_step` bodies,
 inside `initialize_model_state()` (cold starts, derived state) and inside
 `@between_steps` methods (for example re-deriving parameters after a setter
-copied new values). Kernels that read step fields should be called from
-managed steps, where the step's values are prepared. Elsewhere a registered
-kernel call is an error.
+copied new values). Step fields hold the current step's values inside
+managed steps and the initial clock inside `initialize_model_state()`, where
+`step_seconds` is the first scheduled step's width (unavailable without a
+`simulation_schedule`). Elsewhere a registered kernel call is an error.
 
 ## License
 
