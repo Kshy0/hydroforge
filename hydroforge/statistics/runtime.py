@@ -742,6 +742,22 @@ class StatisticsRuntime:
         self._current_time_index = 0
         self._last_time_number = None
 
+    def restart(self) -> None:
+        """Discard results and partial windows before replaying a timeline.
+
+        Keep captured tensor addresses: first-sample flags initialize the
+        device accumulators when sampling resumes.
+        """
+
+        self.reset_time_index()
+        self._controller.restore_snapshot_state((None, None))
+        state = self.window_state
+        self.window_state = WindowState(
+            state.inner_outputs, state.outer_outputs, state.mean_count_limit
+        )
+        self._step_flags = 0
+        self._window_weight = np.float32(0.0)
+
     def _validate_next_time(
         self,
         dt: datetime | cftime.datetime,

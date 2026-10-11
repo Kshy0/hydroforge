@@ -102,6 +102,9 @@ class AbstractModel(ModelDeclaration, ABC):
         ModelRuntime.of(self).materialize()
         return self
 
+    def reset_clock(self, time: datetime | cftime.datetime | None = None) -> None:
+        ModelRuntime.of(self).reset_clock(time)
+
     def close(self) -> None:
         """Release every runtime resource; only ``materialize()`` rebuilds."""
 
