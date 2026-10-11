@@ -21,14 +21,20 @@ from hydroforge.core.errors import (
     failure_description,
 )
 from hydroforge.core.events import emit
-from hydroforge.core.time import DateLike, timedelta_microseconds
+from hydroforge.core.identity import canonical
+from hydroforge.core.time import (
+    DateLike,
+    normalize_calendar_dates,
+    timedelta_microseconds,
+)
 from hydroforge.declare.module import AbstractModule, construct_module
 from hydroforge.declare.spec import ModuleBinding
 from hydroforge.execution.channel import LocalChannel, ProcessGroupChannel
 from hydroforge.execution.checkpoint import CheckpointRuntime
+from hydroforge.execution.context import managed_step_active
 from hydroforge.execution.inputs import InputBinding, prepare_payloads, shard_inputs
 from hydroforge.execution.namespace import bind_field_owners, bind_namespace
-from hydroforge.execution.progress import ProgressRuntime
+from hydroforge.execution.progress import ProgressRuntime, ProgressState
 from hydroforge.execution.runtime import ModelExecution
 from hydroforge.execution.signatures import compiled_signature, declaration_signature
 from hydroforge.execution.step import compile_step_policies
@@ -610,6 +616,86 @@ class ModelRuntime:
 
         self.require_healthy(f"{type(self.owner).__name__}.update_structure")
         return self.run_structure_hooks()
+
+    def reset_clock(self, time: DateLike | None) -> None:
+        """Validate collectively before discarding the current timeline."""
+
+        if managed_step_active():
+            raise RuntimeError("reset_clock is allowed only between managed steps")
+        plan = self.plan
+        target = plan.initial_time
+        error: BaseException | None = None
+        signature = None
+        try:
+            if plan.schedule is not None and time is not None:
+                raise ValueError("reset_clock with a schedule does not accept time")
+            if plan.parameters:
+                raise ValueError(
+                    "reset_clock does not support scheduled parameter changes"
+                )
+            if (
+                plan.output.declaration is not None
+                and plan.output.config.sink != "memory"
+            ):
+                raise ValueError(
+                    "reset_clock requires in-memory statistics or no statistics"
+                )
+            if time is not None:
+                _, normalized, _ = normalize_calendar_dates(
+                    {"reset time": time}, calendar=plan.calendar
+                )
+                target = normalized["reset time"]
+                if plan.initial_time is None:
+                    raise ValueError(
+                        "reset_clock(time) requires a declared initial_time"
+                    )
+            signature = (self.state, canonical(target))
+        except BaseException as caught:
+            error = caught
+        self.channel.preflight(
+            error,
+            phase="clock.reset.validation",
+            scope="distributed clock reset validation",
+            signature=signature,
+        )
+        error = None
+        try:
+            self.require_healthy(f"{type(self.owner).__name__}.reset_clock")
+        except BaseException as caught:
+            error = caught
+        self.channel.preflight(
+            error,
+            phase="clock.reset.health",
+            scope="distributed clock reset runtime health",
+        )
+        # Preserve the clock/progress owners cached by managed-step policies.
+        error = None
+        try:
+            if self.statistics is not None:
+                self.statistics.restart()
+            self.clock.time = target
+            self.clock.schedule_index = 0
+            self.progress.state = ProgressState()
+        except BaseException as caught:
+            error = caught
+        try:
+            failures = self.channel.gather(error, phase="clock.reset.commit")
+        except BaseException as coordination_error:
+            failure = (
+                coordination_error
+                if error is None
+                else ResourceCleanupError(
+                    "clock reset coordination", (error, coordination_error)
+                )
+            )
+            self.execution.poison(failure, phase="clock reset")
+            raise failure
+        if any(failure is not None for failure in failures):
+            failure = error or distributed_failure_error(
+                "distributed clock reset", failures
+            )
+            self.execution.poison(failure, phase="clock reset")
+            raise failure
 
     def run_structure_hooks(self) -> StructuralUpdateResult | None:
         """Run the structure pass of a runtime already proven healthy."""
