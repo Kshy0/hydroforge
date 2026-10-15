@@ -119,12 +119,52 @@ class Soil(AbstractModule):
 
 Registered kernels bind their arguments from the model automatically, and
 launch eagerly, wherever the model runs them: inside `@managed_step` bodies,
-inside `initialize_model_state()` (cold starts, derived state) and inside
+inside `initialize_model_state()` (initialization) and inside
 `@between_steps` methods (for example re-deriving parameters after a setter
 copied new values). Step fields hold the current step's values inside
 managed steps and the initial clock inside `initialize_model_state()`, where
 `step_seconds` is the first scheduled step's width (unavailable without a
 `simulation_schedule`). Elsewhere a registered kernel call is an error.
+A spec parameter declared `step_field("step_seconds")` (or another calendar
+value) binds the current outer step's value; one declared
+`substep_field("dt")` or `substep_field("index")` binds the enclosing fixed or
+adaptive substep's width in seconds (a fixed loop's is the step width divided
+by the substep count) or its int32 index, and is available only inside a
+substep body.
+
+### Initialization
+
+1. The plan tabulates the fields of the opened modules; the input fields the
+   model input lacks are `model.missing_inputs` (`"module.field"`).
+2. Construction reads the inputs (`param`, `topology`, `init_state`; defaults
+   where absent) and evaluates the computed `topology`, `derived_param` and
+   `state` tensors; buffer virtuals declaring `materialize=` conditions are
+   allocated. Inputs stay as read, so a checkpoint saves the parameters and
+   topology it was built from; prefer adapting a kernel to rewriting one.
+3. `initialize_model_state()` updates state in place, in explicit order, and
+   may run registered kernels. It branches on `missing_inputs`: a checkpoint
+   supplies every `init_state` field, a cold start lacks some.
+4. Computed state declared `after_init=True` is evaluated from the
+   initialized state, for values that simply follow from it.
+
+```python
+class Model(AbstractModel):
+    def initialize_model_state(self) -> None:
+        if self.dam is not None and "base.storage" in self.missing_inputs:
+            self.dam.fill()                     # cold start only
+
+
+class Base(AbstractModule):
+    @computed_tensor_field("Depth", ("n",), category="state", after_init=True)
+    @cached_property
+    def depth(self) -> torch.Tensor:
+        return self.storage / self.area
+```
+
+Computed tensors are made contiguous unless they declare `contiguous=False`.
+An input declared `mode="discard"` is released after construction; derived
+parameters read from it keep their value and cannot be refreshed by a
+parameter change.
 
 ## License
 

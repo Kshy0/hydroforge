@@ -343,6 +343,15 @@ def bind_module_fields(
         reference_targets=MappingProxyType(targets),
         reference_indices=MappingProxyType(indices),
         batched_forcing=frozenset(batched_forcing),
+        materialized=frozenset(
+            name
+            for name in active
+            if (field := spec.tensor_fields.get(name)) is not None
+            and field.tensor.materialize
+            and conditions_satisfied(
+                field.tensor.materialize, opened_modules, conditions
+            )
+        ),
     )
 
 

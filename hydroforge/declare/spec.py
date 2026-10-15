@@ -217,6 +217,8 @@ class ModuleBindingPlan:
     reference_targets: Mapping[str, ReferenceTarget]
     reference_indices: Mapping[str, TensorMetadata]
     batched_forcing: frozenset[str]
+    materialized: frozenset[str] = frozenset()
+    """Active buffer virtuals whose ``materialize`` conditions hold."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,7 +228,8 @@ class ModuleBinding:
     ``references`` holds the already constructed sibling modules declared by
     ``module_ref`` (``None`` when closed); ``prepared`` marks a payload that
     already passed ``prepare_module_input``; ``defaults`` carries default
-    values a payload view already evaluated for its siblings.
+    values a payload view already evaluated for its siblings; ``missing``
+    names the active input tensor fields the model input lacks.
     """
 
     plan: ModuleBindingPlan
@@ -234,3 +237,4 @@ class ModuleBinding:
     event_sink: EventSink
     prepared: bool = False
     defaults: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    missing: frozenset[str] = frozenset()

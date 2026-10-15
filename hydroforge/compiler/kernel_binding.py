@@ -6,7 +6,7 @@
 
 """Static resolution of kernel parameters against one model plan.
 
-A parameter a call site omits binds by name: a step field, an optional value
+A parameter a call site omits binds by name: a step or substep field, an optional value
 or buffer whose feature is off, ``ensemble_size``, a compile-time source, a
 ``batched_<field>`` flag or the field ``<name>`` (without a ``_ptr`` suffix)
 of its one owner.  The plan decides each rule and every value it can know;
@@ -25,7 +25,7 @@ import torch
 from hydroforge.compiler.fields import BindingSource
 from hydroforge.compiler.selection import resolve_block_size
 from hydroforge.contracts.fields import concrete_tensor_dtype, precision_dtype
-from hydroforge.contracts.step_fields import StepField
+from hydroforge.contracts.step_fields import StepField, SubstepField
 from hydroforge.kernels.spec import (
     KernelSpec,
     KernelWorkspace,
@@ -51,6 +51,13 @@ class Fixed:
 @dataclass(frozen=True, slots=True)
 class StepFieldValue:
     field: StepField
+
+
+@dataclass(frozen=True, slots=True)
+class SubstepFieldValue:
+    """A control of the enclosing substep loop, supplied by its recording."""
+
+    field: SubstepField
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +110,7 @@ class Unresolved:
 Source = (
     Fixed
     | StepFieldValue
+    | SubstepFieldValue
     | FieldValue
     | Batched
     | ModuleFlagValue
@@ -166,6 +174,8 @@ class KernelBindingPlan:
             return spec.workspace[name]
         if name in spec.step_fields:
             return StepFieldValue(spec.step_fields[name])
+        if name in spec.substep_fields:
+            return SubstepFieldValue(spec.substep_fields[name])
         if name in spec.optional_values:
             feature, disabled = spec.optional_values[name]
             return self._gate(spec, feature, disabled, name)
@@ -278,6 +288,9 @@ class KernelBindingPlan:
             return precision_dtype(spec.workspace[name].dtype, plan.dtype)
         if name in spec.step_fields:
             return precision_dtype(spec.step_fields[name].dtype, plan.dtype)
+        if name in spec.substep_fields:
+            index = spec.substep_fields[name].source == "index"
+            return torch.int32 if index else plan.dtype
         field = name.removesuffix("_ptr")
         optional = name in spec.optional
         typed = []

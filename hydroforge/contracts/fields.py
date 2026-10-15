@@ -27,6 +27,7 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from hydroforge.contracts.conditions import (
     Condition,
+    always,
     any_condition_satisfied,
     conditions_satisfied,
 )
@@ -345,12 +346,17 @@ class TensorMetadata:
     gt: float | None = None
     le: float | None = None
     lt: float | None = None
+    contiguous: bool = True
+    materialize: _Conditions = ()
+    after_init: bool = False
 
-    @field_validator("depends_on", "required_by", mode="before")
+    @field_validator("depends_on", "required_by", "materialize", mode="before")
     @classmethod
     def _canonical_dependencies(cls, value: Any, info: ValidationInfo) -> Any:
-        if value is None:
+        if value is None or value is False:
             return ()
+        if value is True:
+            return (always,)
         if type(value) is not tuple and type(value) is not list:
             return (value,)
         # A before validator hands JSON arrays on as Python lists.
@@ -405,6 +411,16 @@ class TensorMetadata:
                 )
         if self.expression and self.category != "virtual":
             raise ValueError("expr can only be provided when category is 'virtual'")
+        if self.after_init and self.category not in {"state", "shared_state"}:
+            raise ValueError(
+                "after_init applies to computed state; parameters and "
+                "topology never depend on the initialized state"
+            )
+        if self.materialize and (self.category != "virtual" or self.expression):
+            raise ValueError(
+                "materialize applies to buffer virtuals; stored computed "
+                "tensors are always materialized while active"
+            )
         if self.output_only:
             if self.category == "virtual":
                 raise ValueError("output_only is invalid for virtual fields")

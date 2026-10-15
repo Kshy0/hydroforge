@@ -22,7 +22,6 @@ MODEL_OWNED_MODULE_FIELDS = (
     "mixed_precision",
     "metal_emulation",
     "ensemble_size",
-    "init_mode",
     "options",
 )
 

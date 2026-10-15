@@ -215,8 +215,6 @@ def _regular_overlap_csr(
     y_hi = source.y_bounds[:, 1]
     nx = source.x.size
     geographic = bool(source.is_geographic)
-    periodic_x = geographic and source._periodic_x
-    align_longitude = geographic
     source_center = 0.5 * float(np.min(x_lo)) + 0.5 * float(np.max(x_hi))
 
     target_width = xmax - xmin
@@ -227,7 +225,7 @@ def _regular_overlap_csr(
         (ymin < -90.0) | (ymax > 90.0) if geographic else np.zeros(n_target, bool)
     )
     invalid_width = (
-        target_width > 360.0 + 1e-9 if periodic_x else np.zeros(n_target, bool)
+        target_width > 360.0 + 1e-9 if geographic else np.zeros(n_target, bool)
     )
     failed = np.flatnonzero(invalid_latitude | invalid_width)
     if failed.size:
@@ -238,12 +236,14 @@ def _regular_overlap_csr(
         raise ValueError("geographic target longitude width cannot exceed 360 degrees")
 
     base_shift = np.zeros(n_target, dtype=np.float64)
-    if align_longitude:
+    if geographic:
         target_center = 0.5 * xmin + 0.5 * xmax
         base_shift = 360.0 * np.round((source_center - target_center) / 360.0)
+    # Longitude equivalence also applies to regional grids: a seam-crossing
+    # target can overlap both ends even when the source has an uncovered gap.
     shifts = (
         np.stack((base_shift - 360.0, base_shift, base_shift + 360.0), axis=1)
-        if periodic_x
+        if geographic
         else base_shift[:, None]
     )
     x_start = xmin[:, None] + shifts

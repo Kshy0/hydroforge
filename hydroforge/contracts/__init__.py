@@ -32,7 +32,13 @@ from hydroforge.contracts.runtime import (
     ModuleRequirement,
 )
 from hydroforge.contracts.schedule import SimulationSchedule, SpinupSchedule
-from hydroforge.contracts.step_fields import StepField, StepTime, step_field
+from hydroforge.contracts.step_fields import (
+    StepField,
+    StepTime,
+    SubstepField,
+    step_field,
+    substep_field,
+)
 from hydroforge.contracts.windows import (
     CalendarWindow,
     EveryStep,
@@ -62,6 +68,7 @@ __all__ = [
     "StatisticsPlan",
     "StepField",
     "StepTime",
+    "SubstepField",
     "always",
     "as_condition",
     "build_options_group",
@@ -70,5 +77,6 @@ __all__ = [
     "opt",
     "option",
     "step_field",
+    "substep_field",
     "validate_option_groups",
 ]

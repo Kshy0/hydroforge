@@ -602,7 +602,8 @@ def export_quantiles(
     working set (three arrays on the expanded source time axis, at the
     widest source or output width) exceeds ``max_buffer_mb``, points are
     processed in column batches.  A budget below one column is rejected
-    before reading.  Resident values are reused without new reads.
+    before reading. Resident values are reused without new reads, but their
+    quantile working copies remain subject to the same three-array budget.
     Quantiles describe the unshifted source-time population, not model-step
     resampling. Shifted views must be selected again without time shifts.
     """
@@ -630,8 +631,14 @@ def export_quantiles(
     main_ops = None
     resident = dataset._resident
     if resident is not None:
-        full_size = dataset._cache_nbytes(resident.main)
-        fits = True
+        # NumPy copies resident values for partitioning: never mutate the
+        # cache, and budget these working arrays even though no read is needed.
+        resident_blocks = _named_blocks(resident.main, name)
+        element_bytes = max(
+            np.dtype(dtype).itemsize,
+            *(values.dtype.itemsize for values in resident_blocks.values()),
+        )
+        column_bytes = steps * 3 * element_bytes
     else:
         # The peak read is on the expanded source axis, before aggregation.
         # Reading, concatenation and exact selection can briefly hold three
@@ -647,8 +654,8 @@ def export_quantiles(
         column_bytes = source_rows * element_bytes
         if outputs > 1:
             column_bytes += steps * outputs * (8 + np.dtype(dataset.out_dtype).itemsize)
-        full_size = columns * column_bytes
-        fits = full_size <= budget
+    full_size = columns * column_bytes
+    fits = full_size <= budget
     if not fits:
         if budget < column_bytes:
             raise ValueError(
@@ -668,7 +675,9 @@ def export_quantiles(
                 batch,
             )
 
-    if fits:
+    if resident is not None:
+        first = resident.main
+    elif fits:
         dataset.load_to_memory()
         first = dataset._resident.main
     else:
@@ -723,6 +732,16 @@ def export_quantiles(
             variables[key] = variable
         if fits:
             write_quantiles(variables, blocks, 0, columns, owned=False)
+        elif resident is not None:
+            for start in range(0, columns, batch):
+                stop = min(start + batch, columns)
+                write_quantiles(
+                    variables,
+                    {key: values[:steps, start:stop] for key, values in blocks.items()},
+                    start,
+                    stop,
+                    owned=False,
+                )
         else:
             # Exact quantiles need every time step of each batch of points.
             for start in range(0, columns, batch):

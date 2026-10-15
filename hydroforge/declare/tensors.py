@@ -133,6 +133,8 @@ class ModuleTensors:
     ) -> None:
         self.module = module
         self.batched_fields: set[str] = set(batched_fields)
+        # Set once every module of the model is constructed.
+        self.constructed = False
 
     @classmethod
     def _prepare_payload(
@@ -158,8 +160,9 @@ class ModuleTensors:
             if not field.computed:
                 continue
             if module._is_tensor_field_active(field.name):
-                # Virtual fields stay lazy until output or a kernel needs them.
-                if field.tensor.category != "virtual":
+                # Virtual fields stay lazy until output or a kernel needs them;
+                # after_init tensors wait for the initialized state.
+                if field.tensor.category != "virtual" and not field.tensor.after_init:
                     active_fields.append(field)
             elif isinstance(
                 inspect.getattr_static(type(module), field.name, None), cached_property
@@ -167,7 +170,7 @@ class ModuleTensors:
                 object.__setattr__(module, field.name, None)
             # Plain-property virtual getters return None while inactive.
         for field in active_fields:
-            self._validate_computed_field(field, getattr(module, field.name))
+            self._finish_computed(field, getattr(module, field.name))
         # Derived reference indices are descriptors rather than Pydantic
         # computed fields, but belong to the same stable cold-start phase.
         for name in module._binding.plan.reference_indices:
@@ -368,6 +371,22 @@ class ModuleTensors:
                 f"{values[duplicate][:5].tolist()}"
             )
 
+    def _finish_computed(self, field: Any, value: Any) -> Any:
+        """Validate one evaluated computed tensor, made contiguous unless the
+        field declares ``contiguous=False``; the cached value is replaced."""
+
+        if (
+            isinstance(value, torch.Tensor)
+            and field.tensor.contiguous
+            and value.layout is torch.strided
+            and not value.is_contiguous()
+        ):
+            value = value.contiguous()
+            if field.name in self.module.__dict__:
+                self.module.__dict__[field.name] = value
+        self._validate_computed_field(field, value)
+        return value
+
     def _validate_computed_field(self, field: Any, value: Any) -> None:
         module = self.module
         if value is None and type(None) in get_args(field.annotation):
@@ -389,8 +408,8 @@ class ModuleTensors:
             )
         if not tensor.is_contiguous():
             raise ValueError(
-                f"Computed field {field.name} must be contiguous; computed "
-                "fields are never repaired implicitly"
+                f"Computed field {field.name} must be contiguous; it declares "
+                "contiguous=False, so it is not made contiguous implicitly"
             )
         expected = self._expected_shape(field.name)
         if expected is not None and tuple(tensor.shape) != expected:
@@ -413,7 +432,7 @@ class ModuleTensors:
                 f"dtype {dtype}, got {tensor.dtype}"
             )
 
-    def constraint_violations(self) -> list[str]:
+    def constraint_violations(self, fields: set[str] | None = None) -> list[str]:
         """Describe stored non-forcing values violating ``finite``/bounds."""
 
         module = self.module
@@ -422,6 +441,8 @@ class ModuleTensors:
             metadata = field.tensor
             if (
                 field.computed
+                or fields is not None
+                and field.name not in fields
                 or metadata.category == "forcing"
                 or not metadata.has_value_constraints
                 or not module._is_tensor_field_active(field.name)

@@ -23,7 +23,7 @@ from typing import Annotated, Any, Literal, Self, TypeAlias
 
 from pydantic import Field, PrivateAttr, model_validator
 
-from hydroforge.contracts.step_fields import StepField
+from hydroforge.contracts.step_fields import StepField, SubstepField
 from hydroforge.core.naming import DottedPath, Identifier
 from hydroforge.core.validation import FrozenMapping, HydroForgeModel, frozen_dict
 from hydroforge.platform.backend import backend_named
@@ -101,7 +101,7 @@ CompileTimeSource: TypeAlias = (
     ModuleEnabled | ModuleFlag | OutputRequested | LiteralValue
 )
 Parameter: TypeAlias = (
-    AccessMode | RuntimeKind | Constant | CompileTimeSource | StepField
+    AccessMode | RuntimeKind | Constant | CompileTimeSource | StepField | SubstepField
 )
 
 
@@ -262,6 +262,7 @@ class _Views:
     size_keys: tuple[str, ...]
     buffers: Mapping[str, str]
     step_fields: Mapping[str, StepField]
+    substep_fields: Mapping[str, SubstepField]
     runtime_scalars: Mapping[str, str]
     compile_time: Mapping[str, str]
     compile_time_sources: Mapping[str, CompileTimeSource]
@@ -270,10 +271,14 @@ class _Views:
     @classmethod
     def of(cls, spec: KernelSpec) -> _Views:
         buffers, step_fields, runtime, compile_time, sources = {}, {}, {}, {}, {}
+        substep_fields = {}
         for name, declaration in spec.parameters.items():
             if isinstance(declaration, StepField):
                 buffers[name] = "read"
                 step_fields[name] = declaration
+            elif isinstance(declaration, SubstepField):
+                buffers[name] = "read"
+                substep_fields[name] = declaration
             elif isinstance(declaration, str):
                 (buffers if declaration in _ACCESS_MODES else runtime)[name] = (
                     declaration
@@ -287,6 +292,7 @@ class _Views:
             _size_keys(spec.size),
             MappingProxyType(buffers),
             MappingProxyType(step_fields),
+            MappingProxyType(substep_fields),
             MappingProxyType(runtime),
             MappingProxyType(compile_time),
             MappingProxyType(sources),
@@ -335,8 +341,9 @@ class KernelSpec(HydroForgeModel):
 
     ``parameters`` maps every parameter, in canonical order, to its
     declaration: an access mode for a buffer, a runtime scalar kind, a
-    compile-time value (:func:`constant` or a value source) or a
-    :func:`~hydroforge.contracts.step_field` bound buffer.  ``size`` names the
+    compile-time value (:func:`constant` or a value source), a
+    :func:`~hydroforge.contracts.step_field` bound buffer or a
+    :func:`~hydroforge.contracts.substep_field` bound buffer.  ``size`` names the
     integer scalars whose product is the launch extent.  ``optional`` maps a
     buffer to the bool compile-time feature that enables it (``None``: present
     when its field exists); ``optional_values`` maps a scalar to its feature
@@ -388,6 +395,10 @@ class KernelSpec(HydroForgeModel):
         return self._views.step_fields
 
     @property
+    def substep_fields(self) -> Mapping[str, SubstepField]:
+        return self._views.substep_fields
+
+    @property
     def runtime_scalars(self) -> Mapping[str, str]:
         return self._views.runtime_scalars
 
@@ -417,7 +428,11 @@ class KernelSpec(HydroForgeModel):
     def _validate_spec(self) -> Self:
         parameters = self.parameters
         for name, declaration in self.workspace.items():
-            if name not in self.buffers or name in self.step_fields:
+            if (
+                name not in self.buffers
+                or name in self.step_fields
+                or name in self.substep_fields
+            ):
                 raise ValueError(
                     f"{self.name}: workspace {name!r} must name an ordinary buffer"
                 )
@@ -458,7 +473,7 @@ class KernelSpec(HydroForgeModel):
                 raise ValueError(
                     f"{self.name}: optional {buffer!r} is not a buffer parameter"
                 )
-            if buffer in self.step_fields:
+            if buffer in self.step_fields or buffer in self.substep_fields:
                 raise ValueError(
                     f"{self.name}: step field {buffer!r} cannot be optional"
                 )

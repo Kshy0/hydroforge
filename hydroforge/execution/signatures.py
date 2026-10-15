@@ -175,7 +175,6 @@ def declaration_signature(runtime: ModelRuntime) -> tuple[Any, ...]:
         ("precision", plan.precision, plan.mixed_precision, plan.metal_emulation),
         ("options", signature_value(plan.options)),
         ("field_conditions", tuple(sorted(plan.conditions.items()))),
-        ("init_mode", plan.init_mode),
         ("execution", model.execution_mode, plan.block_size),
         (
             "parallel",

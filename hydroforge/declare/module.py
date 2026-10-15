@@ -51,6 +51,7 @@ from hydroforge.core.errors import UnknownFieldError, error_message
 from hydroforge.core.events import ModelEvent
 from hydroforge.core.naming import Identifier
 from hydroforge.core.validation import HydroForgeModel, require_unique
+from hydroforge.declare.initial import AfterInitProperty
 from hydroforge.declare.kernel_field import _KernelField
 from hydroforge.declare.spec import (
     FieldSpec,
@@ -501,6 +502,9 @@ def computed_tensor_field(
     output: Literal["auto", "full", "disabled"] = "auto",
     output_only: bool = False,
     units: str | None = None,
+    contiguous: bool = True,
+    materialize: TensorDependencies = None,
+    after_init: bool = False,
 ):
     """
     Create a computed tensor field with shape information for AbstractModule.
@@ -520,6 +524,8 @@ def computed_tensor_field(
                     or checkpointed)
                   - 'virtual': Allocated on demand or evaluated as an output
                     expression; buffer fields may be shared or member-batched
+                  All but virtuals are evaluated while the module is
+                  constructed (see :mod:`hydroforge.declare.initial`).
         expr: Expression string for virtual variables
         depends_on: A condition, module identifier or ``options.<bool_path>``
             string, or a tuple of them (AND), resolved before this tensor is
@@ -534,6 +540,14 @@ def computed_tensor_field(
             need an activation guard.
         units: Physical units of the values (e.g. ``"km3"``), recorded in the
             metadata like ``TensorField`` units.
+        contiguous: Make the evaluated tensor contiguous (default). With
+            ``False`` a non-contiguous result is an error instead, for a
+            tensor that must stay a view of another one.
+        materialize: For a buffer virtual, conditions (as ``depends_on``, or
+            ``True``) under which it is allocated at construction instead of
+            on first use, for buffers kernels write.
+        after_init: For computed state, evaluate it from the state that
+            ``initialize_model_state`` initialized instead of at construction.
     """
     if category not in _COMPUTED_CATEGORIES:
         raise ValueError(
@@ -551,6 +565,9 @@ def computed_tensor_field(
         output=output,
         output_only=output_only,
         units=units,
+        contiguous=contiguous,
+        materialize=materialize,
+        after_init=after_init,
     )
     declare = computed_field(description=description)
 
@@ -558,6 +575,12 @@ def computed_tensor_field(
         setattr(_property_function(prop), _TENSOR_METADATA, metadata)
         if isinstance(prop, property) and not isinstance(prop, _ActivatedProperty):
             prop = _ActivatedProperty(prop.fget, prop.fset, prop.fdel, prop.__doc__)
+        if metadata.after_init:
+            if not isinstance(prop, cached_property):
+                raise ValueError(
+                    "after_init tensors must wrap functools.cached_property"
+                )
+            prop = AfterInitProperty(prop.func)
         return declare(prop)
 
     return decorate
@@ -818,13 +841,6 @@ class AbstractModule(HydroForgeModel, ABC):
         strict=True,
         description="Number of parallel simulations (ensemble members)",
     )
-    init_mode: Literal["cold", "restart"] | None = Field(
-        default=None,
-        description=(
-            "The model's declared initialization mode; None leaves restart "
-            "detection to the module"
-        ),
-    )
     options: OptionsConfig = Field(
         default_factory=OptionsConfig,
         exclude=True,
@@ -872,6 +888,16 @@ class AbstractModule(HydroForgeModel, ABC):
         if field is not None:
             return field.tensor
         return self._binding.plan.reference_indices.get(name)
+
+    @property
+    def missing_inputs(self) -> frozenset[str]:
+        """Active input tensor fields the model input lacks.
+
+        Each holds its declared default until ``initialize_model_state``
+        initializes it.
+        """
+
+        return self._binding.missing
 
     def _is_tensor_field_active(self, name: str) -> bool:
         """Return whether a tensor field belongs to this module specialization."""
@@ -1201,7 +1227,7 @@ class AbstractModule(HydroForgeModel, ABC):
                     f"Active field {self.module_name}.{field_name} resolved to None"
                 )
             if field is not None and field.computed:
-                self._tensors._validate_computed_field(field, value)
+                self._tensors._finish_computed(field, value)
 
 
 def construct_module(

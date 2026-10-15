@@ -139,13 +139,24 @@ class AbstractModel(ModelDeclaration, ABC):
 
         return values
 
-    def initialize_model_state(self) -> None:
-        """Initialize ordered model state inside HydroForge's transaction.
+    @property
+    def missing_inputs(self) -> frozenset[str]:
+        """``module.field`` names of the active input fields the input lacks.
 
-        Model subclasses own the complete initialization order.  This hook is
-        called after all modules have been constructed and tensor modes applied,
-        so a controller can explicitly sequence cross-module cold starts and
-        workspace materialization inside HydroForge's transaction.
+        They hold their declared defaults when ``initialize_model_state``
+        runs, which branches on them: a checkpoint supplies every
+        ``init_state`` field, a cold start lacks some.
+        """
+
+        return ModelRuntime.of(self).missing_inputs
+
+    def initialize_model_state(self) -> None:
+        """Initialize the model state once every module is constructed.
+
+        Update state in place, in explicit order, branching on
+        ``missing_inputs``; registered kernels may run here. Parameters and
+        topology stay as read. Computed state declared ``after_init=True`` is
+        evaluated afterwards (see :mod:`hydroforge.declare.initial`).
         """
 
     def release_model_state(self) -> None:

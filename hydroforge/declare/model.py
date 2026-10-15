@@ -551,13 +551,6 @@ class ModelDeclaration(HydroForgeModel):
             "defaults while their relevant_when condition is false"
         ),
     )
-    init_mode: Literal["cold", "restart"] | None = Field(
-        default=None,
-        description=(
-            "Explicit initialization mode passed to every module as "
-            "init_mode; None keeps each module's own restart detection"
-        ),
-    )
 
     # The compiled plan and the runtime that owns every materialized resource.
     _plan: Any = PrivateAttr()

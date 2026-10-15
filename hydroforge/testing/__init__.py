@@ -20,6 +20,7 @@ from hydroforge.contracts.conditions import resolve_conditions
 from hydroforge.contracts.fields import FieldDemandPlan
 from hydroforge.contracts.options import OptionsConfig
 from hydroforge.core.events import EventSink, NullEventSink
+from hydroforge.declare.initial import evaluate_after_init, materialize_declared
 from hydroforge.declare.module import AbstractModule, construct_module
 from hydroforge.declare.spec import ModuleBinding
 from hydroforge.kernels.registry import KernelCall, Launch, intercepting
@@ -104,14 +105,32 @@ def build_module(
     )
     if not (outputs | batched_forcing) <= plan.active:
         raise ValueError("requested output or batched forcing field is inactive")
+    missing = frozenset(
+        name
+        for name, field in spec.tensor_fields.items()
+        if not field.computed and name in plan.active and name not in values
+    )
     binding = ModuleBinding(
         plan=plan,
         references=MappingProxyType(
             {name: siblings.get(name) for name in spec.references}
         ),
         event_sink=NullEventSink() if event_sink is None else event_sink,
+        missing=missing,
     )
-    return construct_module(module_type, values, binding)
+    module = construct_module(module_type, values, binding)
+    # As in a model, without its initialize_model_state: the supplied
+    # siblings already hold their initialized state.
+    module._tensors.constructed = True
+    problems = module._tensors.constraint_violations()
+    if problems:
+        raise ValueError(
+            "module input violates declared field constraints:\n  - "
+            + "\n  - ".join(problems)
+        )
+    materialize_declared((module,))
+    evaluate_after_init((module,))
+    return module
 
 
 @contextmanager

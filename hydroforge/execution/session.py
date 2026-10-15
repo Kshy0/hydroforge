@@ -27,6 +27,7 @@ from hydroforge.core.time import (
     normalize_calendar_dates,
     timedelta_microseconds,
 )
+from hydroforge.declare.initial import evaluate_after_init, materialize_declared
 from hydroforge.declare.module import AbstractModule, construct_module
 from hydroforge.declare.spec import ModuleBinding
 from hydroforge.execution.channel import LocalChannel, ProcessGroupChannel
@@ -160,6 +161,8 @@ class ModelRuntime:
         self.statistics = None
         self.checkpoint = None
         self.parameters = None
+        self.fixed_parameters: Mapping[str, frozenset[str]] = MappingProxyType({})
+        self.missing_inputs: frozenset[str] = frozenset()
         self.progress = None
         self.model_state_entered = False
 
@@ -307,6 +310,7 @@ class ModelRuntime:
         from hydroforge.execution.parameters import (
             LocalParameterCompiler,
             ParameterPlanRuntime,
+            fixed_derived_parameters,
         )
         from hydroforge.execution.partition import PartitionRuntime
 
@@ -357,8 +361,27 @@ class ModelRuntime:
             key=plan.spec.partition_key,
             group=plan.spec.partition_group,
         )
-        self._construct_modules(payloads)
+        missing = {
+            name: frozenset(
+                field
+                for field, spec in plan.spec.modules[name].tensor_fields.items()
+                if not spec.computed
+                and field in plan.fields.modules[name].active
+                and field not in payloads[name]._input_values
+            )
+            for name in plan.module_order
+        }
+        self.missing_inputs = frozenset(
+            f"{name}.{field}" for name, fields in missing.items() for field in fields
+        )
+        self._construct_modules(payloads, missing)
+        modules = tuple(self.modules[name] for name in plan.module_order)
+        for module in modules:
+            module._tensors.constructed = True
+        materialize_declared(modules)
         self._check_field_values()
+        # What derived parameters read is recorded before inputs are discarded.
+        self.fixed_parameters = fixed_derived_parameters(self)
         for name in plan.modules:
             self.modules[name]._tensors._apply_modes()
         self.model_state_entered = True
@@ -369,6 +392,7 @@ class ModelRuntime:
         )
         with routing(execution.kernel_binding):
             owner.initialize_model_state()
+        evaluate_after_init(modules)
         self.checkpoint = CheckpointRuntime(self)
         if plan.output.declaration is not None:
             from hydroforge.execution.outputs import bind_statistics
@@ -443,7 +467,11 @@ class ModelRuntime:
             directory=directory,
         )
 
-    def _construct_modules(self, payloads: Mapping[str, ModulePayload]) -> None:
+    def _construct_modules(
+        self,
+        payloads: Mapping[str, ModulePayload],
+        missing: Mapping[str, frozenset[str]],
+    ) -> None:
         specs = self.plan.spec.modules
         modules = self.modules
         for name in self.plan.module_order:
@@ -463,6 +491,7 @@ class ModelRuntime:
                     event_sink=self.event_sink,
                     prepared=True,
                     defaults=MappingProxyType(view._default_values),
+                    missing=missing[name],
                 ),
             )
         self.input.clear_cache()
