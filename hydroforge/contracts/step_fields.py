@@ -90,6 +90,23 @@ def step_field(source: str, *, dtype: StepFieldDType = "precision") -> StepField
     return StepField(source=source, dtype=dtype)
 
 
+class SubstepField(HydroForgeModel):
+    """Bind one read-only buffer to the enclosing substep loop's control."""
+
+    source: Literal["index", "dt"]
+
+
+def substep_field(source: Literal["index", "dt"]) -> SubstepField:
+    """Declare the enclosing fixed or adaptive substep's ``index`` (int32,
+    from 0) or width ``dt`` in seconds (model precision).
+
+    Bound only inside a substep body; ``dt`` of a fixed loop is the outer
+    step's width divided by the substep count.
+    """
+
+    return SubstepField(source=source)
+
+
 @validate_call(config=ConfigDict(strict=True))
 def validate_step_field_providers(
     providers: Mapping[str, StepFieldProvider],

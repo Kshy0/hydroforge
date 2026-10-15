@@ -88,6 +88,97 @@ class _ReadRecorder:
         return getattr(module, name)
 
 
+def _declared_fields(runtime: Any) -> tuple[dict, dict, dict]:
+    """Qualified names of every declared field, by module identity and by
+    name, and the resident cached derived parameters."""
+
+    fields: dict[int, dict[str, str]] = {}
+    declared: dict[str, tuple[Any, str, Any]] = {}
+    candidates: dict[str, tuple[Any, str, cached_property]] = {}
+    for module_name in runtime.plan.modules:
+        module = runtime.modules[module_name]
+        module_fields = fields.setdefault(id(module), {})
+        for field in module.spec().tensor_fields.values():
+            qualified = f"{module_name}.{field.name}"
+            module_fields[field.name] = qualified
+            declared[qualified] = (module, field.name, field.tensor)
+            if (
+                field.computed
+                and field.tensor.category == "derived_param"
+                and module._is_tensor_field_active(field.name)
+            ):
+                descriptor = getattr(type(module), field.name)
+                if not isinstance(descriptor, cached_property):
+                    raise ValueError(
+                        f"{qualified}: parameter refresh requires a cached derived parameter"
+                    )
+                if isinstance(module.__dict__.get(field.name), torch.Tensor):
+                    candidates[qualified] = (module, field.name, descriptor)
+        for name, metadata in module._binding.plan.reference_indices.items():
+            qualified = f"{module_name}.{name}"
+            module_fields[name] = qualified
+            declared[qualified] = (module, name, metadata)
+    return fields, declared, candidates
+
+
+def _formula_reads(
+    qualified: str, module: Any, descriptor: cached_property, fields: Mapping
+) -> set[str]:
+    reads: set[str] = set()
+    try:
+        # Invoke only the formula: reading the result buffer here would
+        # falsely record a self-dependency.
+        descriptor.func(_ReadRecorder(module, fields, reads))
+    except Exception as error:
+        raise ValueError(
+            f"cannot record parameter dependencies for {qualified}: {error}"
+        ) from error
+    return reads
+
+
+def fixed_derived_parameters(runtime: Any) -> Mapping[str, frozenset[str]]:
+    """Derived parameters computed from an input with ``mode="discard"``.
+
+    Recorded while every input is still resident, each maps to every field
+    it reads, directly or through other fixed derived parameters. A
+    parameter change cannot re-evaluate them once the input is discarded.
+    """
+
+    fields, declared, candidates = _declared_fields(runtime)
+    discarded = {
+        qualified
+        for qualified, (module, name, metadata) in declared.items()
+        if getattr(metadata, "mode", "device") == "discard"
+        and module._is_tensor_field_active(name)
+    }
+    if not discarded:
+        return MappingProxyType({})
+    with torch.inference_mode():
+        reads = {
+            qualified: _formula_reads(qualified, module, descriptor, fields)
+            for qualified, (module, _name, descriptor) in candidates.items()
+        }
+    fixed: dict[str, set[str]] = {}
+    changed = True
+    while changed:
+        changed = False
+        for qualified, direct in reads.items():
+            if qualified in fixed or not (direct & (discarded | fixed.keys())):
+                continue
+            fixed[qualified] = set(direct)
+            changed = True
+    # Close over the fields a fixed parameter reads through another one.
+    for qualified, direct in fixed.items():
+        pending = [name for name in direct if name in fixed]
+        while pending:
+            name = pending.pop()
+            for item in fixed[name] - direct:
+                direct.add(item)
+                if item in fixed:
+                    pending.append(item)
+    return MappingProxyType({name: frozenset(value) for name, value in fixed.items()})
+
+
 @dataclass(frozen=True, slots=True)
 class _ParameterChangePlan:
     """One complete rank-local instruction compiled from public input."""
@@ -688,6 +779,12 @@ class ParameterPlanRuntime:
         current = getattr(module, name)
         fresh = descriptor.func(module)
         if (
+            isinstance(fresh, torch.Tensor)
+            and fresh.layout == torch.strided
+            and module.spec().tensor_fields[name].tensor.contiguous
+        ):
+            fresh = fresh.contiguous()
+        if (
             not isinstance(current, torch.Tensor)
             or not isinstance(fresh, torch.Tensor)
             or fresh.shape != current.shape
@@ -710,49 +807,23 @@ class ParameterPlanRuntime:
         Formulas must be pure and have fixed field dependencies. Scalars and
         configuration remain fixed; this is not a Python control-flow tracer.
         A structural revision requires a fresh graph at the next parameter event.
+        Derived parameters fixed by a discarded input are not re-evaluated.
         """
         revision = self.runtime.execution.structural_revision
         if self._dependency_revision == revision:
             return
-        fields: dict[int, dict[str, str]] = {}
-        declared: dict[str, tuple[Any, str, Any]] = {}
-        candidates = {}
-        for module_name in self.runtime.plan.modules:
-            module = self.runtime.modules[module_name]
-            module_fields = fields.setdefault(id(module), {})
-            for field in module.spec().tensor_fields.values():
-                qualified = f"{module_name}.{field.name}"
-                module_fields[field.name] = qualified
-                declared[qualified] = (module, field.name, field.tensor)
-                if (
-                    field.computed
-                    and field.tensor.category == "derived_param"
-                    and module._is_tensor_field_active(field.name)
-                ):
-                    descriptor = getattr(type(module), field.name)
-                    if not isinstance(descriptor, cached_property):
-                        raise ValueError(
-                            f"{qualified}: parameter refresh requires a cached derived parameter"
-                        )
-                    if isinstance(module.__dict__.get(field.name), torch.Tensor):
-                        candidates[qualified] = (module, field.name, descriptor)
-            for name, metadata in module._binding.plan.reference_indices.items():
-                qualified = f"{module_name}.{name}"
-                module_fields[name] = qualified
-                declared[qualified] = (module, name, metadata)
+        fixed = self.runtime.fixed_parameters
+        fields, declared, candidates = _declared_fields(self.runtime)
+        for name in fixed:
+            candidates.pop(name, None)
         dependencies = {}
         with torch.inference_mode():
-            for qualified, (module, name, descriptor) in candidates.items():
-                reads: set[str] = set()
-                try:
-                    # Invoke only the formula: reading the result buffer here
-                    # would falsely record a self-dependency.
-                    descriptor.func(_ReadRecorder(module, fields, reads))
-                except Exception as error:
-                    raise ValueError(
-                        f"cannot record parameter dependencies for {qualified}: {error}"
-                    ) from error
+            for qualified, (module, _name, descriptor) in candidates.items():
+                reads = _formula_reads(qualified, module, descriptor, fields)
                 for dependency in reads:
+                    if dependency in fixed:
+                        # A fixed derived parameter never changes.
+                        continue
                     source, source_name, metadata = declared[dependency]
                     if metadata.category not in {
                         "param",
@@ -807,6 +878,31 @@ class ParameterPlanRuntime:
         changed.update(
             alias for name in tuple(changed) for alias in self._aliases.get(name, ())
         )
+        problems = []
+        for module_name in self.runtime.plan.modules:
+            fields = {
+                name.split(".", 1)[1]
+                for name in changed
+                if name.startswith(module_name + ".")
+            }
+            if fields:
+                problems.extend(
+                    self.runtime.modules[module_name]._tensors.constraint_violations(
+                        fields
+                    )
+                )
+        if problems:
+            raise ValueError(
+                "parameter change violates declared field constraints:\n  - "
+                + "\n  - ".join(problems)
+            )
+        for name, reads in self.runtime.fixed_parameters.items():
+            stale = sorted(changed.intersection(reads))
+            if stale:
+                raise ValueError(
+                    f"{name} was derived from a discarded input and is fixed; "
+                    f"changing {', '.join(stale)} would leave it stale"
+                )
         with torch.inference_mode():
             for qualified, (module, name, descriptor) in self._derived.items():
                 if changed.isdisjoint(self.dependencies[qualified]):

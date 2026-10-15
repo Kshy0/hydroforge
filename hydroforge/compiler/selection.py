@@ -65,7 +65,6 @@ class Selection:
     local_ensemble_size: int | None
     member_ids: tuple[int, ...] | None
     parallel: EnsembleParallel | None
-    init_mode: Literal["cold", "restart"] | None
 
 
 def resolve_block_size(
@@ -265,5 +264,4 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
         ),
         member_ids=None if parallel is None else parallel.member_ids,
         parallel=parallel,
-        init_mode=declaration.init_mode,
     )

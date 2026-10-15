@@ -597,9 +597,12 @@ class _OperatorRecorder:
         stable_tensors: tuple[torch.Tensor, ...],
         *,
         scope_kind: str,
+        frame: Any = None,
     ) -> None:
         self.execution = execution
         self.scope_kind = scope_kind
+        # The enclosing substep's ``SubstepFrame``, bound to substep fields.
+        self.frame = frame
         self.binder = execution.kernel_binding
         self.operators: list[Any] = []
         self.references: dict[int, _StableRef | _ValueRef] = {
@@ -654,6 +657,9 @@ class _OperatorRecorder:
             pass
 
     def call(self, registry: Any, arguments: dict[str, Any]) -> None:
+        substep_fields = registry.spec_for(self.execution.backend).substep_fields
+        if substep_fields:
+            arguments = self._with_substep_fields(registry, substep_fields, arguments)
         # Explicitly supplied tensors must already belong to model/runtime
         # state or be results produced earlier in this same operator program.
         # Automatically completed values are trusted because KernelBinder
@@ -691,6 +697,28 @@ class _OperatorRecorder:
             )
         )
         self.operators.append(DeferredKernelCall(call, reads, writes, registry))
+
+    def _with_substep_fields(
+        self, registry: Any, fields: Any, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Supply the enclosing substep's controls to its substep fields."""
+
+        supplied = sorted(set(fields).intersection(arguments))
+        if supplied:
+            raise TypeError(
+                f"{registry.name}.{supplied[0]} is already resolved from "
+                "substep_field; omit the redundant call-site value"
+            )
+        frame = self.frame
+        if frame is None:
+            raise ValueError(
+                f"{registry.name} reads substep fields and may be called only "
+                "directly inside a fixed or adaptive substep body"
+            )
+        return {
+            **arguments,
+            **{name: getattr(frame, field.source) for name, field in fields.items()},
+        }
 
     def record_collective_batch(
         self,
@@ -878,6 +906,7 @@ class OperatorRecording:
         arguments: tuple[Any, ...] = (),
         stable_tensors: tuple[torch.Tensor, ...] = (),
         scope_kind: str = "generic",
+        frame: Any = None,
     ) -> None:
         tensor_arguments = tuple(
             value for value in arguments if isinstance(value, torch.Tensor)
@@ -887,6 +916,7 @@ class OperatorRecording:
             execution,
             stable,
             scope_kind=scope_kind,
+            frame=frame,
         )
         self.mode = _TorchOperatorMode(self.recorder)
         self.grad_scope = torch.no_grad()
@@ -979,11 +1009,17 @@ def record_operator_scope(
     arguments: tuple[Any, ...] = (),
     stable_tensors: tuple[torch.Tensor, ...] = (),
     scope_kind: str = "generic",
+    frame: Any = None,
 ) -> OperatorRecording:
-    """Open an operator recording transaction without requiring a callback."""
+    """Open an operator recording transaction without requiring a callback.
+
+    ``frame`` is the ``SubstepFrame`` of a fixed or adaptive substep body,
+    bound to the substep fields of the kernels it calls.
+    """
     return OperatorRecording(
         execution,
         arguments=arguments,
         stable_tensors=stable_tensors,
         scope_kind=scope_kind,
+        frame=frame,
     )

@@ -33,6 +33,7 @@ from hydroforge.compiler.kernel_binding import (
     ModuleFlagValue,
     Source,
     StepFieldValue,
+    SubstepFieldValue,
     Unresolved,
 )
 from hydroforge.contracts.fields import precision_dtype
@@ -236,6 +237,12 @@ class KernelBinder:
                 self.runtime.execution.step_fields.bind(field),
                 "step_field",
                 field.source,
+            )
+        if isinstance(source, SubstepFieldValue):
+            # The recording of a substep body supplies its loop's controls.
+            raise UnboundKernelArgument(
+                f"{name} is substep_field({source.field.source!r}), bound only "
+                "inside a fixed or adaptive substep body"
             )
         if isinstance(source, Gated):
             enabled = self._resolve(

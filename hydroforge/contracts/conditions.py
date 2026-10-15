@@ -865,10 +865,11 @@ def resolve_option_condition(options: OptionsConfig, path: str) -> bool:
 
 
 def field_conditions(field: Any) -> tuple[Condition, ...]:
-    """Return the ``depends_on`` and ``required_by`` conditions of one field."""
+    """Return the ``depends_on``, ``required_by`` and ``materialize``
+    conditions of one field."""
 
     tensor = field.tensor
-    return (*tensor.depends_on, *tensor.required_by)
+    return (*tensor.depends_on, *tensor.required_by, *tensor.materialize)
 
 
 def resolve_conditions(

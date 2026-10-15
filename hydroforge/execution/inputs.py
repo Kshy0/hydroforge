@@ -527,7 +527,6 @@ def prepare_payloads(
                 "mixed_precision": plan.mixed_precision,
                 "metal_emulation": plan.metal_emulation,
                 "ensemble_size": plan.local_ensemble_size,
-                "init_mode": plan.init_mode,
                 "options": plan.options,
             }
         )

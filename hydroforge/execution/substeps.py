@@ -369,6 +369,7 @@ class _FixedScope(InvocationScope):
             execution,
             stable_tensors=controls,
             scope_kind="fixed",
+            frame=loop.frame,
         ) as recording:
             yield loop.frame
             context.require_scopes_closed(depth)
@@ -376,7 +377,10 @@ class _FixedScope(InvocationScope):
         try:
             if self.final is not None:
                 final = record_operator_scope(
-                    execution, stable_tensors=controls, scope_kind="fixed final"
+                    execution,
+                    stable_tensors=controls,
+                    scope_kind="fixed final",
+                    frame=loop.frame,
                 )
                 # The recording rejects an empty final IR on exit.
                 with final:
@@ -453,6 +457,7 @@ class _AdaptiveScope(InvocationScope):
             execution,
             stable_tensors=(loop.counter, loop.time_step),
             scope_kind="adaptive physics",
+            frame=loop.frame,
         )
         with proposal:
             self.proposal()
