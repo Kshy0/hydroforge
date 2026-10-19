@@ -55,7 +55,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import cache, wraps
-from pathlib import Path
 from typing import Any
 
 from hydroforge.kernels.codegen.types import SCALARS
@@ -318,15 +317,9 @@ def adopt(kernel: Any) -> Any:
 
 @cache
 def _toolkit_libdevice() -> str | None:
-    from torch.utils.cpp_extension import CUDA_HOME, include_paths
+    from hydroforge.kernels.toolchain.cuda_toolkit import libdevice_path
 
-    if CUDA_HOME is None:
-        return None
-    for root in include_paths("cuda"):
-        candidate = Path(root).parent / "nvvm" / "libdevice" / "libdevice.10.bc"
-        if candidate.is_file():
-            return str(candidate)
-    return None
+    return libdevice_path()
 
 
 _LAUNCH_OPTIONS = _IdentityCache()

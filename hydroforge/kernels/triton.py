@@ -12,12 +12,13 @@ import inspect
 from collections.abc import Callable, Mapping
 from contextvars import copy_context
 from functools import partial
-from typing import Any, ClassVar, Literal, Self
+from typing import Annotated, Any, ClassVar, Literal, Self
 
 import torch
-from pydantic import model_validator
+from pydantic import AfterValidator, Field, model_validator
 
 from hydroforge.core.naming import Identifier
+from hydroforge.core.validation import FrozenMapping, frozen_dict
 from hydroforge.kernels.codegen.types import SCALARS
 from hydroforge.kernels.registry import (
     KernelCall,
@@ -44,6 +45,24 @@ from hydroforge.platform.backend import TRITON, Backend
 from hydroforge.platform.triton_driver import proven_triton_device, triton_call_device
 
 _FLOAT_KINDS = frozenset(("float32", "float64"))
+
+
+def _compiler_value(value: Any) -> Any:
+    """Detach and freeze compiler data, including nested extern_libs mappings."""
+    if isinstance(value, Mapping):
+        if any(type(key) is not str for key in value):
+            raise ValueError("Triton compiler option mappings require string keys")
+        return frozen_dict({key: _compiler_value(item) for key, item in value.items()})
+    if isinstance(value, (tuple, list)):
+        return tuple(_compiler_value(item) for item in value)
+    if value is None or type(value) in (bool, int, float, str):
+        return value
+    raise ValueError(
+        "Triton compiler options require immutable scalar or container data"
+    )
+
+
+_CompilerOptions = Annotated[FrozenMapping[str, Any], AfterValidator(_compiler_value)]
 
 
 def launch_triton_kernel(
@@ -233,6 +252,15 @@ class _TritonKernelImplementation(KernelImplementation):
         self.batch_layout = declaration.batch_layout
         self.check = declaration.check
         self.check_arguments = _check_arguments(spec, declaration.check)
+        collisions = set(declaration.compiler_options).intersection(
+            (*spec.parameters, "BLOCK_SIZE", "grid", "warmup", "stream")
+        )
+        if collisions:
+            raise ValueError(
+                f"{spec.name}: compiler_options cannot replace launch arguments: "
+                f"{sorted(collisions)}"
+            )
+        self.compiler_options = declaration.compiler_options
 
     def _validate(self, call: KernelCall) -> None:
         if self.check is not None:
@@ -277,7 +305,11 @@ class _TritonKernelImplementation(KernelImplementation):
 
         def build():
             with proven.active():
-                options = {**launch_options(selected, physics=True), **static}
+                options = {
+                    **launch_options(selected, physics=True),
+                    **self.compiler_options,
+                    **static,
+                }
                 return selected.warmup(grid=grid, **options)
 
         return (warmup_request(build),)
@@ -288,7 +320,11 @@ class _TritonKernelImplementation(KernelImplementation):
             return empty_launch
         selected, grid, static = planned
         with proven_triton_device(triton_call_device(static.values())).active():
-            options = {**launch_options(selected, physics=True), **static}
+            options = {
+                **launch_options(selected, physics=True),
+                **self.compiler_options,
+                **static,
+            }
             return partial(selected[grid], **options)
 
 
@@ -299,7 +335,10 @@ class TritonKernel(KernelDeclaration):
     its ``batch_layout`` is ``"flat"`` (one thread per cell and member) or
     ``"loop"`` (one thread per cell looping over members).  ``kernel`` may then
     omit scalars used only by the batched layout.  ``check`` names canonical
-    values and raises on a call the kernels cannot serve.
+    values and raises on a call the kernels cannot serve. ``compiler_options``
+    overrides HydroForge's defaults with target-specific Triton compiler
+    options (for example ``enable_fp_fusion=False``). Warmup and execution use
+    the same options; they cannot replace ABI arguments or launch geometry.
     """
 
     toolchain: ClassVar[str] = "triton"
@@ -309,6 +348,7 @@ class TritonKernel(KernelDeclaration):
     batch_axis: Identifier | None = None
     batch_layout: Literal["flat", "loop"] = "flat"
     check: NamedCallable = None
+    compiler_options: _CompilerOptions = Field(default_factory=dict)
 
     def __init__(self, kernel: Any, /, **fields: Any) -> None:
         super().__init__(kernel=kernel, **fields)
@@ -344,7 +384,11 @@ class _TritonSequenceImplementation(KernelImplementation):
                 size=size,
             )
             components.append(
-                _TritonKernelImplementation(component, backend, TritonKernel(kernel))
+                _TritonKernelImplementation(
+                    component,
+                    backend,
+                    TritonKernel(kernel, compiler_options=declaration.compiler_options),
+                )
             )
         consumed = frozenset().union(
             *(component.spec.parameters for component in components)
@@ -407,12 +451,14 @@ class TritonSequence(KernelDeclaration):
 
     Each step pairs a kernel with the size keys of its launch; a kernel takes
     an exact-name subset of the spec and the steps together take all of it.
+    ``compiler_options`` applies to every step, with TritonKernel's semantics.
     """
 
     toolchain: ClassVar[str] = "triton"
 
     steps: tuple[tuple[Any, Identifier | tuple[Identifier, ...]], ...]
     check: NamedCallable = None
+    compiler_options: _CompilerOptions = Field(default_factory=dict)
 
     def _build(self, spec: KernelSpec, backend: Backend) -> KernelImplementation:
         return _TritonSequenceImplementation(spec, backend, self)

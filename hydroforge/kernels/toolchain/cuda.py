@@ -407,7 +407,11 @@ def _options(program: RtcProgram, target: str) -> tuple[str, ...]:
 
 @cache
 def _toolkit_include_roots() -> tuple[Path, ...]:
-    """The CUDA toolkit's include directories, as PyTorch locates them."""
+    """The selected CUDA/HIP toolkit's include directories."""
+    if not toolkit().hip:
+        from hydroforge.kernels.toolchain.cuda_toolkit import include_roots
+
+        return include_roots()
     from torch.utils.cpp_extension import include_paths
 
     return tuple(dict.fromkeys(Path(path) for path in include_paths("cuda")))

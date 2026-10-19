@@ -166,6 +166,20 @@ An input declared `mode="discard"` is released after construction; derived
 parameters read from it keep their value and cannot be refreshed by a
 parameter change.
 
+### Triton compiler options
+
+`TritonKernel(kernel, compiler_options={"enable_fp_fusion": False})` declares
+target-specific compiler options alongside the kernel ABI. Options override
+the framework math defaults in both precompilation and execution, including
+batched variants. `TritonSequence` applies the same declaration to every step.
+Compiler options cannot replace spec parameters or launch geometry; Triton
+validates the options supported by the active target.
+
+CUDA headers and libdevice use a shared, read-only toolkit discovery. An
+explicit `CUDA_HOME`/`CUDA_PATH` takes precedence, followed by PyTorch's system
+toolkit and NVIDIA CUDA wheels matching PyTorch's CUDA major version. Discovery
+does not modify the environment or PyTorch configuration.
+
 ## License
 
 Apache 2.0
