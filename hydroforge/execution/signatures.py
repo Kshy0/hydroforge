@@ -219,6 +219,7 @@ def declaration_signature(runtime: ModelRuntime) -> tuple[Any, ...]:
         (
             "statistics",
             signature_value(config.variables),
+            signature_value(config.views),
             signature_value(output.windows),
             config.save_precision,
             config.save_kernels,

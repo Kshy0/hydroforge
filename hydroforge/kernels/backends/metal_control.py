@@ -26,7 +26,7 @@ from hydroforge.kernels.backends.loop_control import (
     cell,
     statistics_control,
 )
-from hydroforge.kernels.codegen.c import MSL, identifier, msl_arguments
+from hydroforge.kernels.codegen.c import MSL, msl_arguments, spellings
 from hydroforge.kernels.codegen.ir import (
     Binary,
     Cast,
@@ -63,9 +63,10 @@ def _program(function: KernelFunction) -> MetalProgram:
 def _command(function: KernelFunction, **values: Any) -> MetalCommand:
     """A launch of ``function`` with its parameters bound by name."""
 
+    names = spellings(function)
     return MetalCommand(
         _program(function),
-        {identifier(param): values[param.name] for param in function.params},
+        {names[param.name]: values[param.name] for param in function.params},
     )
 
 

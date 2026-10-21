@@ -25,6 +25,7 @@ from hydroforge.compiler.fields import (
 from hydroforge.compiler.partition import bare, coordinate_identity, coordinate_index
 from hydroforge.compiler.selection import Selection
 from hydroforge.contracts.fields import concrete_tensor_dtype
+from hydroforge.contracts.views import OutputView
 from hydroforge.contracts.windows import EveryStep, StatisticsOutput, StatisticsPlan
 from hydroforge.core.arrays import torch_to_numpy_dtype
 from hydroforge.core.expr import (
@@ -223,10 +224,6 @@ class StatisticsDeclarationCompiler:
             raise ValueError(
                 f"statistics expression {name!r} must have at least one logical dimension"
             )
-        if len(reference[0]) > 2:
-            raise ValueError(
-                f"statistics expression {name!r} has logical rank {len(reference[0])}; only rank <= 2 is supported"
-            )
         shared_categories = {
             self.metadata(dependency)[4]
             for dependency in names
@@ -290,7 +287,7 @@ class StatisticsDeclarationCompiler:
         self, output_name: str, operation: str, field_metadata: tuple[Any, ...]
     ) -> Any:
         parsed = parse_operation(operation)
-        shape, output, coordinate, dtype, _category = field_metadata
+        _shape, _output, _coordinate, dtype, _category = field_metadata
         if dtype not in {"float", "hpfloat"}:
             unsupported = (
                 parsed.inner is None
@@ -309,19 +306,6 @@ class StatisticsDeclarationCompiler:
                 raise ValueError(
                     f"statistics operation {operation!r} for non-floating field {output_name!r} is unsupported"
                 )
-        selected = output == "auto" and coordinate in self.selection_targets
-        if not selected and (parsed.k > 1 or parsed.stores_index):
-            raise ValueError(
-                f"full-output statistics field {output_name!r} does not support top-k or arg operation {operation!r}"
-            )
-        if (
-            selected
-            and len(shape) == 2
-            and (parsed.compound or parsed.k > 1 or parsed.stores_index)
-        ):
-            raise ValueError(
-                f"indexed-level statistics field {output_name!r} does not support compound, top-k, or arg operation {operation!r}"
-            )
         return parsed
 
     def compile_output_options(
@@ -402,9 +386,52 @@ class StatisticsDeclarationCompiler:
             if dependency_tensor.category == "virtual" and dependency_tensor.expression:
                 self.resolve_declared_source(dependency)
 
+    def axis_names(self, metadata: tuple[Any, ...]) -> tuple[str, ...]:
+        """Name every logical axis (see :mod:`hydroforge.contracts.views`)."""
+
+        shape, _output, coordinate, _dtype, _category = metadata
+        grid_axes = self.selection.spec.grid_axes
+        names = []
+        for position, token in enumerate(shape):
+            if position == 0 and coordinate:
+                names.append(coordinate)
+            elif isinstance(token, str):
+                axis = grid_axes.get(token)
+                names.append(token if axis is None else axis.name)
+            else:
+                names.append(f"dim_{position}")
+        return tuple(names)
+
+    def compile_view(self, output: StatisticsOutput, metadata: tuple[Any, ...]) -> None:
+        """Check one output's view against its axes; one view per variable."""
+
+        axes = self.axis_names(metadata)
+        self.variable_axes[output.name] = axes
+        if output.view is None:
+            return
+        view = self.config.views[output.view]
+        coordinate = metadata[2]
+        if coordinate and coordinate in view.axes:
+            raise ValueError(
+                f"view {output.view!r} selects coordinate {coordinate!r} by index; "
+                "select coordinate rows by ID through its SelectionField"
+            )
+        staggered = {
+            axis.name: axis.staggers for axis in self.selection.spec.grid_axes.values()
+        }
+        if not any(
+            axis in view.axes or staggered.get(axis) in view.axes for axis in axes
+        ):
+            raise ValueError(
+                f"view {output.view!r} selects none of the axes {axes} of "
+                f"statistics output {output.name!r}"
+            )
+        self.variable_views[output.name] = view
+
     def compile_dynamic_output(
         self, output: StatisticsOutput, metadata: tuple[Any, ...]
     ) -> None:
+        self.compile_view(output, metadata)
         key = (output.name, output.operation)
         self.compiled_operations[key] = self.compile_operation(
             output.name, output.operation, metadata
@@ -420,14 +447,12 @@ class StatisticsDeclarationCompiler:
         self.outputs: list[StatisticsOutput] = []
         for operation, items in self.config.variables.items():
             for item in items:
-                if isinstance(item, str):
-                    name = item
-                    expression = None
-                else:
-                    name, expression = next(iter(item.items()))
                 self.outputs.append(
                     StatisticsOutput(
-                        name=name, operation=operation, expression=expression
+                        name=item.name,
+                        operation=operation,
+                        expression=item.expression,
+                        view=item.view,
                     )
                 )
         # Inactive output-only fields stay visible so an alias can shadow them.
@@ -452,6 +477,8 @@ class StatisticsDeclarationCompiler:
         self.compiled_operations: dict[tuple[str, str], Any] = {}
         self.compiled_output_metadata: dict[tuple[str, str], tuple[Any, ...]] = {}
         self.compiled_netcdf_options: dict[str, Mapping[str, Any]] = {}
+        self.variable_axes: dict[str, tuple[str, ...]] = {}
+        self.variable_views: dict[str, OutputView] = {}
         for output in self.outputs:
             if output.operation == "static":
                 operation = None
@@ -503,10 +530,6 @@ class StatisticsDeclarationCompiler:
             if output.operation != "static" and (not tensor.shape):
                 raise ValueError(
                     f"statistics field {output.name!r} must have at least one logical dimension"
-                )
-            if output.operation != "static" and len(tensor.shape) > 2:
-                raise ValueError(
-                    f"statistics field {output.name!r} has logical rank {len(tensor.shape)}; only rank <= 2 is supported"
                 )
             if (
                 output.operation != "static"
@@ -649,6 +672,8 @@ class StatisticsDeclarationCompiler:
                 output.name for output in self.outputs if output.operation == "static"
             ),
             netcdf_options=MappingProxyType(dict(self.compiled_netcdf_options)),
+            axes=MappingProxyType(dict(self.variable_axes)),
+            views=MappingProxyType(dict(self.variable_views)),
         )
 
     def compile(self) -> StatisticsDeclaration:

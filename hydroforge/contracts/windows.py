@@ -106,11 +106,12 @@ class StatisticsOutput(HydroForgeModel):
     name: str = Field(min_length=1)
     operation: str = Field(min_length=1)
     expression: str | None = Field(default=None, min_length=1)
+    view: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _validate_output(self) -> Self:
         if self.operation == "static":
-            if self.expression is not None:
+            if self.expression is not None or self.view is not None:
                 raise ValueError("static statistics outputs must name a declared field")
             return self
         parse_operation(self.operation)

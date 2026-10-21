@@ -17,7 +17,12 @@ import torch
 
 from hydroforge.compiler.partition import bare
 from hydroforge.compiler.selection import resolve_block_size
-from hydroforge.contracts.fields import RuntimeTensorMetadata, TensorMetadata
+from hydroforge.contracts.fields import (
+    OutputAxis,
+    RuntimeTensorMetadata,
+    TensorMetadata,
+)
+from hydroforge.contracts.views import view_indices
 from hydroforge.core.arrays import find_indices_in_torch
 from hydroforge.core.events import emit
 from hydroforge.core.expr import ExpressionSource, ScatterSource, TensorSource
@@ -32,6 +37,17 @@ from hydroforge.statistics.runtime import (
 if TYPE_CHECKING:
     from hydroforge.compiler.fields import FieldEntry
     from hydroforge.execution.session import ModelRuntime
+
+
+def _regular_step(indices: tuple[int, ...]) -> int | None:
+    """The common step of evenly spaced increasing indices, else ``None``."""
+
+    if len(indices) == 1:
+        return 1
+    step = indices[1] - indices[0]
+    if any(b - a != step for a, b in zip(indices, indices[1:])):
+        return None
+    return step
 
 
 def bind_output(
@@ -120,13 +136,7 @@ class _StatisticsBinder:
 
     def bind(self, declaration: StatisticsDeclaration) -> StatisticsRuntime:
         adhoc = self.prepare_virtuals(declaration.program)
-        installation = self._compile_installation(
-            declaration.variable_ops,
-            declaration.program,
-            adhoc,
-            declaration.static_names,
-            declaration.netcdf_options,
-        )
+        installation = self._compile_installation(declaration, adhoc)
         runtime = self.runtime
         plan = runtime.plan
         config = plan.output.config
@@ -178,6 +188,8 @@ class _StatisticsBinder:
             if name == coordinate:
                 continue
             output_index = tensors.get(bound.output_index)
+            if output_index is None and tensor is not None and tensor.ndim:
+                tensor = tensor[: self._owned_rows(coordinate, tensor.shape[0])]
             bindings.append(
                 StatisticsStaticBinding(
                     name=name,
@@ -261,13 +273,10 @@ class _StatisticsBinder:
         return ordered
 
     def _compile_installation(
-        self,
-        variable_ops: Mapping[str, tuple[str, ...]],
-        program: StatisticsProgram,
-        adhoc: Mapping[str, Any],
-        static_names: tuple[str, ...],
-        netcdf_options: Mapping[str, Mapping[str, Any]],
+        self, declaration: StatisticsDeclaration, adhoc: Mapping[str, Any]
     ) -> StatisticsInstallation:
+        variable_ops = declaration.variable_ops
+        program = declaration.program
         by_shape: dict[tuple[int, ...], list[str]] = {}
         tensors: dict[str, torch.Tensor] = {}
         fields: dict[str, RuntimeTensorMetadata] = {}
@@ -357,7 +366,9 @@ class _StatisticsBinder:
                 shape=str(shape),
             )
 
-        statics = self._compile_static(static_names)
+        for name in variable_ops:
+            fields[name] = self._bind_axes(name, declaration, program, tensors, fields)
+        statics = self._compile_static(declaration.static_names)
         return StatisticsInstallation(
             variable_ops=MappingProxyType(
                 {name: tuple(operations) for name, operations in variable_ops.items()}
@@ -367,11 +378,110 @@ class _StatisticsBinder:
             fields=MappingProxyType(fields),
             scatter_extents=MappingProxyType(scatter_extents),
             statics=statics,
-            netcdf_options=netcdf_options,
+            netcdf_options=declaration.netcdf_options,
             selection_sources=tuple(
                 (coordinate, selected, tensors.get(f"__selection_idx__{name}", index))
                 for name, (coordinate, selected, index) in self.selections.items()
             ),
+        )
+
+    def _owned_rows(self, coordinate: str | None, rows: int) -> int:
+        """Rows of ``coordinate`` this rank owns: halo ghost rows follow them."""
+
+        partition = self.runtime.partition
+        if coordinate is None or coordinate != partition.partition_key:
+            return rows
+        return rows - partition.ghost_indices(coordinate).size
+
+    def _logical_shape(
+        self,
+        name: str,
+        program: StatisticsProgram,
+        tensors: Mapping[str, torch.Tensor],
+        fields: Mapping[str, RuntimeTensorMetadata],
+    ) -> tuple[int, ...]:
+        info = fields[name]
+        if info.resolved_shape is not None:
+            return tuple(info.resolved_shape)
+        tensor = tensors.get(name)
+        if tensor is not None:
+            return tuple(tensor.shape[tensor.ndim - len(info.tensor.shape) :])
+        source = program.sources[name]
+        dependencies = (
+            source.value.dependencies
+            if isinstance(source, ScatterSource)
+            else cast(ExpressionSource, source).expression.dependencies
+        )
+        return self._logical_shape(dependencies[0], program, tensors, fields)
+
+    def _bind_axes(
+        self,
+        name: str,
+        declaration: StatisticsDeclaration,
+        program: StatisticsProgram,
+        tensors: dict[str, torch.Tensor],
+        fields: Mapping[str, RuntimeTensorMetadata],
+    ) -> RuntimeTensorMetadata:
+        """Resolve one output variable's axes on this rank.
+
+        The view's global indices select local source rows; a partition-key
+        coordinate without a selection keeps the owned rows only, so halo
+        ghost rows are never written.
+        """
+
+        info = fields[name]
+        shape = self._logical_shape(name, program, tensors, fields)
+        names = declaration.axes[name]
+        selected = view_indices(
+            names,
+            shape,
+            declaration.views.get(name),
+            self.runtime.plan.spec.grid_axes,
+        )
+        coordinate = bare(info.tensor.dim_coords)
+        device = self.runtime.plan.device
+        axes = []
+        for position, (axis, extent, indices) in enumerate(
+            zip(names, shape, selected, strict=True)
+        ):
+            if position == 0 and info.output_index is not None:
+                count = tensors[info.output_index].numel()
+                axes.append(
+                    OutputAxis(name=axis, extent=count, table=info.output_index)
+                )
+            elif position == 0 and coordinate:
+                owned = self._owned_rows(coordinate, extent)
+                axes.append(OutputAxis(name=axis, extent=owned))
+                if owned != extent and info.output_coord in tensors:
+                    tensors[info.output_coord] = tensors[info.output_coord][:owned]
+            elif indices is None:
+                axes.append(OutputAxis(name=axis, extent=extent))
+            elif (step := _regular_step(indices)) is not None:
+                # A regular range addresses its rows without a table.
+                axes.append(
+                    OutputAxis(
+                        name=axis,
+                        extent=len(indices),
+                        start=indices[0],
+                        step=step,
+                        indices=indices,
+                    )
+                )
+            else:
+                table = f"__view__{name}__{position}"
+                tensors[table] = torch.tensor(indices, dtype=torch.int64, device=device)
+                axes.append(
+                    OutputAxis(
+                        name=axis, extent=len(indices), table=table, indices=indices
+                    )
+                )
+        return RuntimeTensorMetadata(
+            tensor=info.tensor,
+            description=info.description,
+            output_index=info.output_index,
+            output_coord=info.output_coord,
+            resolved_shape=info.resolved_shape,
+            output_axes=tuple(axes),
         )
 
     def _field_metadata(

@@ -10,6 +10,11 @@ Every collective goes through one batched path: a batch costs a single
 managed-step handshake and, when the communication backend supports it, one
 coalescing group rather than one of each per tensor. ``reduce_`` and
 ``all_reduce_`` are its one-tensor spellings.
+
+A recorded ``all_reduce_`` of model tensors on CUDA ranks runs as a
+registered kernel instead, over the fastest transport of its process group
+(:mod:`hydroforge.parallel.reduce`): capturable, with no handshake before
+each launch. Eagerly, only the peer-to-peer kernels replace the collective.
 """
 
 from __future__ import annotations
@@ -276,8 +281,13 @@ def _run_validated_batch(
     reduction: Reduction,
     destination: int | None,
     scope: ParallelAxis = "spatial",
+    device: tuple[Any, str] | None = None,
 ) -> None:
-    """Synchronize once and launch one already validated batch."""
+    """Synchronize once and launch one already validated batch.
+
+    ``device`` (a reducer and transport) reduces the batch on the device
+    instead of the process group.
+    """
 
     step = ACTIVE_STEP.get()
     if step is None:
@@ -302,6 +312,11 @@ def _run_validated_batch(
     )
     if not tensors or environment.group_size == 1:
         return
+    if device is not None:
+        reducer, transport = device
+        for tensor in tensors:
+            reducer.all_reduce(tensor, reduction, transport)
+        return
     group = environment.group
     group_kwargs = {} if group is None else {"group": group}
     with _coalescing_group(tensors[0].device, environment.backend, **group_kwargs):
@@ -321,8 +336,52 @@ def _run_validated_batch(
                 tensor.copy_(staging)
 
 
+def _device_reduction(request: _CollectiveRequest) -> tuple[Any, str] | None:
+    """The reducer and transport serving ``request`` as a kernel, or ``None``."""
+
+    step = ACTIVE_STEP.get()
+    tensors = request.tensors
+    if (
+        step is None
+        or request.operation != "all_reduce"
+        or not tensors
+        or tensors[0].device.type != "cuda"
+    ):
+        return None
+    recording = recording_sink() is not None
+    if recording and not all(
+        step.execution.is_model_tensor(tensor) for tensor in tensors
+    ):
+        # A recorded kernel binds model tensors; temporaries keep the
+        # recorded collective.
+        return None
+    environment = _batch_environment(
+        step.mesh,
+        scope=request.scope,
+        operation=request.operation,
+        destination=None,
+        device=tensors[0].device,
+    )
+    group = environment.group if environment.group is not None else dist.group.WORLD
+    if environment.group_size == 1 or dist.get_world_size(group) == 1:
+        return None
+    reducer = step.execution.reducer(group, tensors[0].device)
+    transport = reducer.transport(tensors, request.reduction)
+    if transport is None or (transport == "nccl" and not recording):
+        # Eagerly, NCCL is the process-group collective itself.
+        return None
+    return reducer, transport
+
+
 def _submit_collective(request: _CollectiveRequest) -> None:
+    device = _device_reduction(request)
     recorder = recording_sink()
+    if recorder is not None and device is not None:
+        # A kernel per tensor: the recorded loop stays capturable.
+        reducer, transport = device
+        for tensor in request.tensors:
+            reducer.all_reduce(tensor, request.reduction, transport)
+        return
     if recorder is not None:
         recorder.record_collective_batch(
             request.tensors,
@@ -340,6 +399,7 @@ def _submit_collective(request: _CollectiveRequest) -> None:
         reduction=request.reduction,
         destination=request.destination,
         scope=request.scope,
+        device=device,
     )
 
 

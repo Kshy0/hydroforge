@@ -40,6 +40,7 @@ import ``libdevice`` from this module for the same reason.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -73,15 +74,32 @@ if INTERPRET:
         """
 
         _FUNCTIONS = {
+            "acos": np.arccos,
+            "add_rn": np.add,
+            "asin": np.arcsin,
+            "atan": np.arctan,
+            "atan2": np.arctan2,
             "cbrt": np.cbrt,
+            "copysign": np.copysign,
             "cos": np.cos,
+            "erf": np.vectorize(math.erf, otypes=[np.float64]),
             "exp": np.exp,
+            "floor": np.floor,
             "fmod": np.fmod,
+            "hypot": np.hypot,
             "log": np.log,
+            "log10": np.log10,
+            "mul_rn": np.multiply,
             "pow": np.power,
+            "round": lambda x: (
+                np.trunc(x) + np.where(np.abs(x - np.trunc(x)) >= 0.5, np.sign(x), 0)
+            ),
             "sin": np.sin,
+            "signbit": np.signbit,
             "sqrt": np.sqrt,
+            "sub_rn": np.subtract,
             "tan": np.tan,
+            "tanh": np.tanh,
         }
 
         def __getattr__(self, name: str) -> Any:
@@ -100,6 +118,15 @@ if INTERPRET:
                     (arg.type for arg in args if arg.type.is_block()), first.type
                 )
                 data = np.asarray(op(*(arg.handle.data for arg in args)))
+                if name == "signbit":
+                    result = (
+                        tl.block_type(tl.int32, result.shape)
+                        if result.is_block()
+                        else tl.int32
+                    )
+                    return tl.tensor(
+                        TensorHandle(data.astype(np.int32), tl.int32), result
+                    )
                 data = data.astype(first.handle.data.dtype, copy=False)
                 return tl.tensor(TensorHandle(data, first.handle.dtype.scalar), result)
 
@@ -231,6 +258,164 @@ def cbrt(value):
 
 
 @triton.jit
+def _common(first, second):
+    """Both operands in one dtype, as libdevice's two-operand functions need:
+    numbers take the tensor's dtype and mixed FP32/FP64 promote to FP64."""
+    first = constant(first, second)
+    second = constant(second, first)
+    if first.dtype == tl.float64:
+        second = second.to(tl.float64)
+    elif second.dtype == tl.float64:
+        first = first.to(tl.float64)
+    return first, second
+
+
+@triton.jit
+def sin(value):
+    """libdevice sine."""
+    return libdevice.sin(value)
+
+
+@triton.jit
+def cos(value):
+    """libdevice cosine."""
+    return libdevice.cos(value)
+
+
+@triton.jit
+def asin(value):
+    """libdevice arcsine."""
+    return libdevice.asin(value)
+
+
+@triton.jit
+def atan(value):
+    """libdevice arctangent."""
+    return libdevice.atan(value)
+
+
+@triton.jit
+def tanh(value):
+    """libdevice hyperbolic tangent."""
+    return libdevice.tanh(value)
+
+
+@triton.jit
+def erf(value):
+    """libdevice error function."""
+    return libdevice.erf(value)
+
+
+@triton.jit
+def log10(value):
+    """libdevice base-10 logarithm."""
+    return libdevice.log10(value)
+
+
+@triton.jit
+def floor(value):
+    """libdevice floor."""
+    return libdevice.floor(value)
+
+
+@triton.jit
+def round(value):
+    """C ``round``: halves go away from zero (``rint`` ties to even)."""
+    return libdevice.round(value)
+
+
+@triton.jit
+def atan2(y, x):
+    """libdevice two-argument arctangent."""
+    y, x = _common(y, x)
+    return libdevice.atan2(y, x)
+
+
+@triton.jit
+def hypot(first, second):
+    """libdevice ``sqrt(first**2 + second**2)`` without intermediate overflow."""
+    first, second = _common(first, second)
+    return libdevice.hypot(first, second)
+
+
+@triton.jit
+def fmod(numerator, denominator):
+    """C ``fmod``: the remainder takes the sign of the numerator."""
+    numerator, denominator = _common(numerator, denominator)
+    return libdevice.fmod(numerator, denominator)
+
+
+@triton.jit
+def copysign(magnitude, sign):
+    """``magnitude`` with the sign bit of ``sign``."""
+    magnitude, sign = _common(magnitude, sign)
+    return libdevice.copysign(magnitude, sign)
+
+
+@triton.jit
+def _uncontracted(first, second, NVIDIA_OP: tl.constexpr, AMD_OP: tl.constexpr):
+    """``first AMD_OP second`` as one instruction the compiler cannot fuse.
+
+    NVIDIA libdevice has round-to-nearest forms; ROCm's does not, so AMD gets
+    the VALU instruction itself as inline assembly, which LLVM never contracts.
+    """
+    first, second = _common(first, second)
+    if is_hip():
+        if first.dtype == tl.float32:
+            return tl.inline_asm_elementwise(
+                AMD_OP + "_f32 $0, $1, $2",
+                "=v,v,v",
+                [first, second],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
+        elif NVIDIA_OP == "sub":
+            # There is no v_sub_f64; negating the source operand is exact.
+            return tl.inline_asm_elementwise(
+                "v_add_f64 $0, $1, -$2",
+                "=v,v,v",
+                [first, second],
+                dtype=tl.float64,
+                is_pure=True,
+                pack=1,
+            )
+        else:
+            return tl.inline_asm_elementwise(
+                AMD_OP + "_f64 $0, $1, $2",
+                "=v,v,v",
+                [first, second],
+                dtype=tl.float64,
+                is_pure=True,
+                pack=1,
+            )
+    elif NVIDIA_OP == "add":
+        return libdevice.add_rn(first, second)
+    elif NVIDIA_OP == "sub":
+        return libdevice.sub_rn(first, second)
+    else:
+        return libdevice.mul_rn(first, second)
+
+
+@triton.jit
+def add_rn(first, second):
+    """Addition that the compiler cannot contract into a fused multiply-add."""
+    return _uncontracted(first, second, "add", "v_add")
+
+
+@triton.jit
+def sub_rn(first, second):
+    """Subtraction that the compiler cannot contract into a fused multiply-add."""
+    return _uncontracted(first, second, "sub", "v_sub")
+
+
+@triton.jit
+def mul_rn(first, second):
+    """Product that the compiler cannot contract into a fused multiply-add."""
+    return _uncontracted(first, second, "mul", "v_mul")
+
+
+@triton.jit
 def to_compute(hp_value, like):
     """Storage-precision ``hp_value`` narrowed to ``like``'s compute dtype."""
     return hp_value.to(like.dtype)
@@ -262,17 +447,33 @@ def clamp(value, lower, upper):
 
 __all__ = [
     "FAST_MATH",
+    "add_rn",
+    "asin",
     "at_least",
     "at_most",
+    "atan",
+    "atan2",
     "cbrt",
     "clamp",
     "constant",
+    "copysign",
+    "cos",
     "divide",
+    "erf",
     "exp",
+    "floor",
+    "fmod",
+    "hypot",
     "is_hip",
     "log",
+    "log10",
+    "mul_rn",
     "pow",
+    "round",
+    "sin",
     "sqrt",
+    "sub_rn",
+    "tanh",
     "to_compute",
     "to_index",
 ]

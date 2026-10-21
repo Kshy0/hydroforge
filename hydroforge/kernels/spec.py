@@ -36,6 +36,9 @@ AccessMode = Literal[
     "atomic_add",
     "atomic_min",
     "atomic_max",
+    # Written by other ranks (symmetric memory). Ordered like read_write, but
+    # never snapshotted or restored: a rollback would erase peers' writes.
+    "remote",
 ]
 RuntimeKind = Literal[
     "bool", "int32", "uint32", "index", "float32", "float64", "precision"
@@ -166,6 +169,7 @@ _BUFFER_ACCESS_SEMANTICS = MappingProxyType(
             ("atomic_add", True, True, True, "read_write"),
             ("atomic_min", True, True, True, "read_write"),
             ("atomic_max", True, True, True, "read_write"),
+            ("remote", True, False, False, "read_write"),
         )
     }
 )

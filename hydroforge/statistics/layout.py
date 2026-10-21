@@ -26,6 +26,20 @@ from hydroforge.statistics.ir import StatisticsProgram
 
 
 @dataclass(frozen=True, slots=True)
+class AxisMap:
+    """Output row ``o`` of an axis reads source row ``table[o]``, or
+    ``start + step * o`` without a table."""
+
+    table: str | None = None
+    start: int = 0
+    step: int = 1
+
+    @property
+    def identity(self) -> bool:
+        return self.table is None and self.start == 0 and self.step == 1
+
+
+@dataclass(frozen=True, slots=True)
 class StatisticsVariableLayout:
     """Fully resolved storage and source addressing for one output variable."""
 
@@ -35,6 +49,10 @@ class StatisticsVariableLayout:
     stride_input: int
     scatter_extent: int | None = None
     scatter_source_size: int | None = None
+    # Logical source shape and how each logical axis reads it; ``axes`` is
+    # None when the output is the whole source.
+    source_shape: tuple[int, ...] = ()
+    axes: tuple[AxisMap, ...] | None = None
 
     @property
     def actual_ndim(self) -> int:
@@ -240,21 +258,36 @@ class _StatisticsLayoutCompiler:
             scatter_source_size=value.logical_extent,
         )
 
-    def _selection(self, name: str) -> torch.Tensor | None:
-        output_index = self.fields[name].output_index
-        if output_index is None:
-            return None
-        return self.tensors[output_index]
-
     def _selected_layout(self, name: str) -> StatisticsVariableLayout:
         source = self._source_layout(name)
-        selection = self._selection(name)
-        if selection is None:
+        source_shape = source.shape[int(source.batched) :]
+        output_axes = self.fields[name].output_axes
+        axes = None
+        if output_axes is None:
             actual_shape = source.shape
         else:
-            values = list(source.shape)
-            values[source.logical_axis] = int(selection.numel())
-            actual_shape = tuple(values)
+            if len(output_axes) != len(source_shape):
+                raise ValueError(
+                    f"statistics output {name!r} has {len(output_axes)} output axes "
+                    f"for logical shape {source_shape}"
+                )
+            for axis, extent in zip(output_axes, source_shape, strict=True):
+                last = axis.start + axis.step * (axis.extent - 1)
+                if axis.table is None and axis.extent and last >= extent:
+                    raise ValueError(
+                        f"statistics output {name!r} axis {axis.name!r} exceeds "
+                        f"its source extent {extent}"
+                    )
+            maps = tuple(
+                AxisMap(axis.table, axis.start, axis.step) for axis in output_axes
+            )
+            extents = tuple(axis.extent for axis in output_axes)
+            if not all(item.identity for item in maps) or extents != source_shape:
+                axes = maps
+            actual_shape = (
+                *source.shape[: int(source.batched)],
+                *(axis.extent for axis in output_axes),
+            )
         return StatisticsVariableLayout(
             actual_shape=actual_shape,
             dtype=source.dtype,
@@ -262,6 +295,8 @@ class _StatisticsLayoutCompiler:
             stride_input=source.logical_extent if source.batched else 0,
             scatter_extent=source.scatter_extent,
             scatter_source_size=source.scatter_source_size,
+            source_shape=source_shape,
+            axes=axes,
         )
 
 

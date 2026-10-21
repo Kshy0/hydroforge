@@ -259,6 +259,7 @@ class NetCDFSchema:
     dimensions: tuple[tuple[str, int], ...]
     data_dimensions: tuple[str, ...]
     create_options: Mapping[str, Any]
+    axis_indices: tuple[tuple[str, tuple[int, ...]], ...] = ()
 
     @classmethod
     def compile(
@@ -306,27 +307,29 @@ class NetCDFSchema:
             data_dimensions.append("ensemble")
             used_dimensions.add("ensemble")
             dimensions.append(("ensemble", ensemble_size))
-        if full_output:
-            logical_dimensions = list(tensor_shape)
-            if coordinate_name and logical_actual_shape:
-                logical_dimensions[0] = POINT_DIM
-            for axis, (name, extent) in enumerate(
-                zip(
-                    logical_dimensions,
-                    logical_actual_shape,
-                    strict=True,
-                )
-            ):
-                logical_name = f"dim_{axis}" if type(name) is int else name
-                add_dimension(logical_name, extent, axis=axis)
-        else:
-            data_dimensions.append(POINT_DIM)
-            used_dimensions.add(POINT_DIM)
-            dimensions.append((POINT_DIM, logical_actual_shape[0]))
-            if len(logical_actual_shape) == 2:
-                data_dimensions.append("levels")
-                used_dimensions.add("levels")
-                dimensions.append(("levels", logical_actual_shape[1]))
+        # Axis names (grid axes, symbols or dim_{axis}); a coordinate axis
+        # is the saved points.
+        axes = metadata.get("axes") or ()
+        logical_dimensions = [name for name, _indices in axes] or [
+            f"dim_{axis}" if type(name) is int else name
+            for axis, name in enumerate(tensor_shape)
+        ]
+        if (coordinate_name or not full_output) and logical_actual_shape:
+            logical_dimensions[0] = POINT_DIM
+        axis_indices = []
+        for axis, (name, extent) in enumerate(
+            zip(logical_dimensions, logical_actual_shape, strict=True)
+        ):
+            if name == POINT_DIM:
+                data_dimensions.append(POINT_DIM)
+                used_dimensions.add(POINT_DIM)
+                dimensions.append((POINT_DIM, extent))
+            else:
+                add_dimension(name, extent, axis=axis)
+            indices = axes[axis][1] if axes else None
+            if indices is not None:
+                # The global indices a subset grid axis holds.
+                axis_indices.append((data_dimensions[-1], tuple(indices)))
         if netcdf_options.get("contiguous") is True:
             raise ValueError(
                 f"streaming NetCDF output {variable!r} has an unlimited time "
@@ -384,4 +387,5 @@ class NetCDFSchema:
             dimensions=tuple(dimensions),
             data_dimensions=tuple(data_dimensions),
             create_options=MappingProxyType(create_options),
+            axis_indices=tuple(axis_indices),
         )

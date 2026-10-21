@@ -39,7 +39,10 @@ from hydroforge.platform.backend import Backend
 from hydroforge.platform.devices import float64_supported
 from hydroforge.statistics.compiler import compile_statistics_program
 from hydroforge.statistics.ir import StatisticsProgram, build_statistics_ir
-from hydroforge.statistics.kernel_plan import StatisticsCompileContext
+from hydroforge.statistics.kernel_plan import (
+    StatisticsCompileContext,
+    scatter_topology,
+)
 from hydroforge.statistics.layout import (
     StatisticsCompilation,
     StatisticsVariableLayout,
@@ -197,6 +200,7 @@ class StatisticsRuntime:
 
         self._variable_ops: dict[str, list[str]] = {}  # var -> list[ops]
         self._storage: dict[str, torch.Tensor] = {}  # out_name -> tensor
+        self._scatter_topology: dict[str, torch.Tensor] = {}
         self._output_keys: list[str] = []  # list of keys in storage that are outputs
         self._output_metadata: dict[str, dict[str, Any]] = {}  # out_name -> meta
         self._coord_cache: dict[str, np.ndarray] = {}
@@ -281,9 +285,14 @@ class StatisticsRuntime:
                 bind_model(dependency)
         for scatter in scatters:
             bind_model(scatter.source.index)
+        # The needed targets and contributing sources of restricted scatters.
+        required_tensors.update(self._scatter_topology)
         for variable in ir.variables:
             if variable.output_group != "__full__":
                 bind_model(variable.output_group)
+            for item in self._statistics_layouts[variable.name].axes or ():
+                if item.table is not None:
+                    bind_model(item.table)
             for dim_name in variable.tensor_shape:
                 if isinstance(dim_name, str) and dim_name in self._tensor_registry:
                     bind_model(dim_name)
@@ -500,6 +509,10 @@ class StatisticsRuntime:
                     "batched": layout.batched,
                     "output_coord": output_coord,
                     "dim_coords": dim_coords,
+                    "axes": tuple(
+                        (axis.name, axis.indices)
+                        for axis in field_info.output_axes or ()
+                    ),
                     "description": f"{description} ({op})",
                     "k": operation.k,
                 }
@@ -875,15 +888,28 @@ class StatisticsRuntime:
         self._publish_launch()
 
     def content_requires_rebind(self, tensors) -> bool:
-        """Address-stable index edits invalidate cold Metal CSR topology too."""
-        if self.backend.name != "metal":
-            return False
-        sources = {
-            self._tensor_registry[scatter.source.index].untyped_storage()._cdata
-            for scatter in self._statistics_ir.ordered_scatters()
-            if self._storage[StoragePlan.scatter_buffer(scatter.name)].dtype
-            == torch.float64
-        }
+        """Address-stable edits invalidating cold topology: Metal CSR, and the
+        needed targets and sources of restricted scatters."""
+        sources = set()
+        if self.backend.name == "metal":
+            sources.update(
+                self._tensor_registry[scatter.source.index].untyped_storage()._cdata
+                for scatter in self._statistics_ir.ordered_scatters()
+                if self._storage[StoragePlan.scatter_buffer(scatter.name)].dtype
+                == torch.float64
+            )
+        if self._scatter_topology:
+            # Their index, and every selection (whose rows move with its
+            # coordinate), decide the topology.
+            sources.update(
+                self._tensor_registry[scatter.source.index].untyped_storage()._cdata
+                for scatter in self._statistics_ir.ordered_scatters()
+            )
+            sources.update(
+                tensor.untyped_storage()._cdata
+                for selection in self.installation.selection_sources
+                for tensor in selection
+            )
         return any(tensor.untyped_storage()._cdata in sources for tensor in tensors)
 
     def prepare_selection_update(
@@ -921,6 +947,24 @@ class StatisticsRuntime:
             layouts=layouts,
             symbol_names=self._safe_name_cache,
         )
+        topology = scatter_topology(
+            ir,
+            self._tensor_registry,
+            {
+                scatter.name: self._storage[
+                    StoragePlan.scatter_buffer(scatter.name)
+                ].shape[-1]
+                for scatter in ir.ordered_scatters()
+            },
+            self._get_safe_name,
+        )
+        collision = set(topology).intersection(self._tensor_registry, self._storage)
+        if collision:
+            raise ValueError(
+                f"statistics scatter topology names collide with buffers {sorted(collision)}"
+            )
+        previous_topology = self._scatter_topology
+        self._scatter_topology = topology
         context = StatisticsCompileContext(
             device=self.device,
             rank=self.rank,
@@ -930,15 +974,22 @@ class StatisticsRuntime:
             variables=frozenset(self._variable_ops),
             layouts=MappingProxyType(dict(layouts)),
             storage=MappingProxyType(dict(self._storage)),
-            tensors=MappingProxyType(dict(self._tensor_registry)),
+            tensors=MappingProxyType({**self._tensor_registry, **topology}),
             symbol_names=MappingProxyType(dict(self._safe_name_cache)),
             control_dtype=self._statistics_control_dtype(),
         )
-        result = compile_statistics_program(context, ir, dialect=self.backend.dialect)
+        try:
+            result = compile_statistics_program(
+                context, ir, dialect=self.backend.dialect
+            )
+        except BaseException:
+            self._scatter_topology = previous_topology
+            raise
         try:
             self._prepare_kernel_states(result.lowering.ir)
             self._cleanup_generated_modules()
         except BaseException:
+            self._scatter_topology = previous_topology
             with cleanup_on_exit(
                 "uninstalled statistics program",
                 (

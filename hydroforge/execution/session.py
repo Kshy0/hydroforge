@@ -161,6 +161,7 @@ class ModelRuntime:
         self.statistics = None
         self.checkpoint = None
         self.parameters = None
+        self.halo = None
         self.fixed_parameters: Mapping[str, frozenset[str]] = MappingProxyType({})
         self.missing_inputs: frozenset[str] = frozenset()
         self.progress = None
@@ -353,6 +354,15 @@ class ModelRuntime:
             rank=plan.rank,
             modules=plan.modules,
         )
+        balance = {}
+        if plan.spatial_world_size > 1 and plan.spec.partition_key is not None:
+            pieces = self.partition.pieces
+            balance = {
+                "split": pieces.split,
+                "pieces": pieces.pieces,
+                "imbalance": round(pieces.imbalance, 4),
+                "cut": pieces.cut,
+            }
         emit(
             self,
             "info",
@@ -360,6 +370,7 @@ class ModelRuntime:
             "Using partition root",
             key=plan.spec.partition_key,
             group=plan.spec.partition_group,
+            **balance,
         )
         missing = {
             name: frozenset(
@@ -375,6 +386,29 @@ class ModelRuntime:
             f"{name}.{field}" for name, fields in missing.items() for field in fields
         )
         self._construct_modules(payloads, missing)
+        halo = self.partition.halo_rows()
+        if halo is not None:
+            import torch.distributed as dist
+
+            from hydroforge.parallel.halo import HaloPlan, HaloRuntime
+
+            self.halo = HaloRuntime(
+                HaloPlan(plan.spatial_rank, *halo),
+                plan.device,
+                plan.backend.name,
+                dist.group.WORLD,
+            )
+            emit(
+                self,
+                "info",
+                "model.halo",
+                "Partition groups split references; ranks exchange halo ghost rows",
+                rank=plan.rank,
+                ghosts=self.halo.plan.n_ghosts,
+                ghosts_total=self.halo.plan.total_ghosts,
+                transport=self.halo.transport,
+                skipped=dict(self.halo.skipped),
+            )
         modules = tuple(self.modules[name] for name in plan.module_order)
         for module in modules:
             module._tensors.constructed = True
@@ -474,6 +508,9 @@ class ModelRuntime:
     ) -> None:
         specs = self.plan.spec.modules
         modules = self.modules
+        key = self.plan.spec.partition_key
+        count = 0 if key is None else self.partition.ghost_indices(key).size
+        ghosts = MappingProxyType({key: count} if count else {})
         for name in self.plan.module_order:
             spec = specs[name]
             view = payloads[name]
@@ -492,6 +529,7 @@ class ModelRuntime:
                     prepared=True,
                     defaults=MappingProxyType(view._default_values),
                     missing=missing[name],
+                    ghosts=ghosts,
                 ),
             )
         self.input.clear_cache()

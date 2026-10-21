@@ -569,11 +569,33 @@ class PartitionSchema(HydroForgeModel):
     selections: FrozenMapping[str, str]
 
 
+class OutputAxis(HydroForgeModel):
+    """How one logical axis of an output reads its source axis on a rank.
+
+    ``extent`` output rows read source rows ``table[o]`` (an int64 tensor of
+    local indices) or, without a table, the regular rows ``start + step * o``.
+    ``indices`` are the global logical indices written as the axis coordinate
+    of a subset grid axis.
+    """
+
+    name: str
+    extent: int = Field(ge=0)
+    table: str | None = None
+    start: int = Field(default=0, ge=0)
+    step: int = Field(default=1, ge=1)
+    indices: tuple[int, ...] | None = None
+
+
 class RuntimeTensorMetadata(HydroForgeModel):
-    """Typed tensor metadata with per-model output bindings attached."""
+    """Typed tensor metadata with per-model output bindings attached.
+
+    ``output_axes`` describe a statistics variable's output over its logical
+    axes; ``None`` writes every element.
+    """
 
     tensor: TensorMetadata
     description: str
     output_index: str | None = None
     output_coord: str | None = None
     resolved_shape: tuple[int, ...] | None = None
+    output_axes: tuple[OutputAxis, ...] | None = None

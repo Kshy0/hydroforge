@@ -188,11 +188,25 @@ class CheckpointRuntime:
 
         return self.runtime.input.read_local(name, self._local_indices(name))
 
+    def _owned(self, name: str, value: Any, rank: int | None = None) -> Any:
+        """Drop the halo ghost rows another rank owns and saves."""
+
+        group = self.runtime.plan.fields.variable_groups.get(name)
+        if group is None or not isinstance(value, torch.Tensor):
+            return value
+        ghosts = self.runtime.partition.ghost_indices(group).size
+        if not ghosts:
+            return value
+        axis = value.ndim - (value.ndim if rank is None else rank)
+        return value.narrow(axis, 0, value.shape[axis] - ghosts)
+
     def _field_value(self, field: _InputField) -> Any:
         value = getattr(field.module, field.name)
         if value is None:
-            value = self._local_input_value(field.name)
-        return value
+            return self._local_input_value(field.name)
+        if field.info.tensor is None:
+            return value
+        return self._owned(field.name, value, len(field.info.tensor.shape))
 
     def _compile_input_fields(self) -> tuple[_InputField, ...]:
         """Compile every current value needed by a fresh model construction."""
@@ -211,6 +225,8 @@ class CheckpointRuntime:
             if name in module.nc_excluded_fields or info.excluded:
                 continue
             value = getattr(module, name)
+            if tensor is not None:
+                value = self._owned(name, value, len(tensor.shape))
             if (
                 tensor is None
                 and not info.required
@@ -309,7 +325,8 @@ class CheckpointRuntime:
                 continue
             entry = runtime.namespace[coordinate]
             values[coordinate] = _host_copy(
-                coordinate, getattr(entry.module, entry.field_name)
+                coordinate,
+                self._owned(coordinate, getattr(entry.module, entry.field_name), 1),
             )
             groups[coordinate] = coordinate
             distributed.append(coordinate)

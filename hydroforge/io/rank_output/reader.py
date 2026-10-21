@@ -156,7 +156,7 @@ class MultiRankStatsReader(HydroForgeModel):
     """Read point series by ID from ``{var_name}_rank{rank}[_{year}].nc`` files.
 
     Variables must use the ``('time', ['ensemble'], 'saved_points',
-    [value_axis])`` layout of the rank-output schema.  The saved-point
+    [value axes...])`` layout of the rank-output schema.  The saved-point
     coordinate is the file's ``hydroforge_coordinate``; files written without
     that attribute need an explicit ``coord_name``.  ``time_range`` is a
     closed interval selecting the reader's view of the common committed
@@ -304,12 +304,16 @@ class MultiRankStatsReader(HydroForgeModel):
         self,
         ids: _PointIds,
         *,
-        level: _Index | None = None,
+        level: _Index | tuple[_Index, ...] | None = None,
         member: _Index = 0,
         dtype: _ResultDType = None,
         time_slice: _TimeSlice = None,
     ) -> np.ndarray:
-        """Return ``(time, len(ids))`` values over a half-open view slice."""
+        """Return ``(time, len(ids))`` values over a half-open view slice.
+
+        ``level`` indexes the value axes after the saved points: an int for
+        one, a tuple for several, ``None`` for none.
+        """
 
         layout = self._catalog.layout
         if layout.member_count is not None:
@@ -317,21 +321,20 @@ class MultiRankStatsReader(HydroForgeModel):
                 raise IndexError(f"member out of range [0, {layout.member_count - 1}]")
         elif member != 0:
             raise ValueError("member must be 0 for an output without a member axis")
-        if layout.level_dimension is not None:
-            if level is None:
-                raise TypeError(
-                    "level must be an exact int for output dimension "
-                    f"{layout.level_dimension!r}"
-                )
-            if level >= layout.level_count:
-                raise IndexError(
-                    f"level for dimension {layout.level_dimension!r} is out "
-                    f"of range [0, {layout.level_count - 1}]"
-                )
-        elif level is not None:
+        levels = () if level is None else (level,) if isinstance(level, int) else level
+        if len(levels) != len(layout.level_dimensions):
             raise ValueError(
-                "level must be None for an output without a trailing value dimension"
+                f"level must give {len(layout.level_dimensions)} index(es) for the "
+                f"value dimensions {layout.level_dimensions}"
             )
+        for value, name, count in zip(
+            levels, layout.level_dimensions, layout.level_counts, strict=True
+        ):
+            if value >= count:
+                raise IndexError(
+                    f"level for dimension {name!r} is out of range [0, {count - 1}]"
+                )
+        level = levels
         source_dtype = layout.decoded_dtype
         if dtype is None:
             dtype = source_dtype
@@ -387,15 +390,14 @@ class MultiRankStatsReader(HydroForgeModel):
         self._files.close()
 
     def _selection(
-        self, time: Any, member: int, points: Any, level: int | None
+        self, time: Any, member: int, points: Any, level: tuple[int, ...]
     ) -> tuple:
         layout = self._catalog.layout
         indices = [time]
         if layout.member_count is not None:
             indices.append(member)
         indices.append(points)
-        if layout.level_dimension is not None:
-            indices.append(level)
+        indices.extend(level)
         return tuple(indices)
 
     def _columns(self, ids: np.ndarray) -> dict[int, tuple[np.ndarray, np.ndarray]]:
@@ -494,7 +496,7 @@ class MultiRankStatsReader(HydroForgeModel):
         *,
         rows: tuple[int, int],
         member: int,
-        level: int | None,
+        level: tuple[int, ...],
         dtype: np.dtype,
     ) -> None:
         """Copy catalog rows ``[rows)`` of ``points`` into ``out``."""

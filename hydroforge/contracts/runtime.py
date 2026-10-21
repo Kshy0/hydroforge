@@ -109,11 +109,15 @@ class ModuleRequirement(HydroForgeModel):
     """Restrictions introduced only when one optional module is open.
 
     ``clock`` marks a module that records absolute times and therefore needs
-    a ``simulation_schedule`` or an ``initial_time``.
+    a ``simulation_schedule`` or an ``initial_time``. ``halo`` states that the
+    model's managed steps exchange this module's halo ghost rows (see
+    :mod:`hydroforge.parallel.halo`): partition groups may split references to
+    the partition key only while every open module declares it.
     """
 
     ensemble: bool = True
     clock: bool = False
+    halo: bool = False
 
 
 DEFAULT_BACKEND_REQUIREMENT = BackendRequirement()

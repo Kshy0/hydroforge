@@ -333,35 +333,34 @@ def _top(
     insert = Logical(
         "and", (Unary("not", _isnan(new)), Logical("or", (_isnan(old), precedes)))
     )
+    # A new outer window reads its entries as missing instead of storing
+    # them first: a backend need not order a store before a load of the same
+    # element from another lane, so no entry is read back after a store.
     return (
         Let(base, Binary("*", ctx.offset, Const(k, INDEX_DTYPE))),
         *(Let(carried, start) for _slot, carried, _stored, start, _missing in lanes),
-        If(
-            OUTER_FIRST,
-            (
-                ForK(
-                    rank,
-                    k,
-                    tuple(Store(slot, entry, missing) for slot, *_, missing in lanes),
-                ),
-            ),
-        ),
         ForK(
             rank,
             k,
             (
                 *(
-                    Let(stored, Load(slot, entry, stored.type))
-                    for slot, _carried, stored, _start, _missing in lanes
+                    Let(
+                        stored,
+                        Select(OUTER_FIRST, missing, Load(slot, entry, stored.type)),
+                    )
+                    for slot, _carried, stored, _start, missing in lanes
+                ),
+                If(
+                    Logical("or", (insert, OUTER_FIRST)),
+                    tuple(
+                        Store(slot, entry, Select(insert, carried, stored))
+                        for slot, carried, stored, *_ in lanes
+                    ),
                 ),
                 If(
                     insert,
-                    (
-                        *(Store(slot, entry, carried) for slot, carried, *_ in lanes),
-                        *(
-                            Assign(carried, stored)
-                            for _slot, carried, stored, *_ in lanes
-                        ),
+                    tuple(
+                        Assign(carried, stored) for _slot, carried, stored, *_ in lanes
                     ),
                 ),
             ),

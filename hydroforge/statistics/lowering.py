@@ -31,6 +31,8 @@ class OutputLayout(StrEnum):
 
     FULL = "full"
     INDEXED_VECTOR = "indexed_vector"
+    # Selected points of a field of rank two or more: every point's trailing
+    # axes form its ``levels``.
     INDEXED_LEVEL = "indexed_level"
 
 
@@ -149,7 +151,7 @@ class StatisticsLowering:
 def _layout(variable: StatisticVariable) -> OutputLayout:
     if variable.output_group == "__full__":
         return OutputLayout.FULL
-    if len(variable.tensor_shape) == 2:
+    if len(variable.tensor_shape) >= 2:
         return OutputLayout.INDEXED_LEVEL
     return OutputLayout.INDEXED_VECTOR
 

@@ -445,6 +445,12 @@ def shard_inputs(runtime: ModelRuntime) -> dict[str, Any]:
             continue
         indices = group_indices[group]
         local = source.read_local(name, indices)
+        ghosts = partition.ghost_indices(group)
+        if ghosts.size:
+            # Ghost rows follow the owned rows on the spatial axis.
+            local = torch.cat(
+                (local, source.read_local(name, ghosts)), dim=source.axes.get(name, 0)
+            )
         result[name] = local
         if indices.size == 0:
             empty.setdefault(group, []).append(name)
@@ -506,6 +512,9 @@ def prepare_payloads(
         raise TypeError("prepare_model_input must return a Mapping")
     plan = runtime.plan
     prepared: dict[str, ModulePayload] = {}
+    key = plan.spec.partition_key
+    count = 0 if key is None else runtime.partition.ghost_indices(key).size
+    ghosts = MappingProxyType({key: count} if count else {})
     for name in plan.module_order:
         spec = plan.spec.modules[name]
         module_type = spec.module_type
@@ -548,6 +557,7 @@ def prepare_payloads(
                     },
                     event_sink=runtime.event_sink,
                     prepared=True,
+                    ghosts=ghosts,
                 ),
                 defer_defaults=True,
             )

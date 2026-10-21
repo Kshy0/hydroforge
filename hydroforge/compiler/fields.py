@@ -451,8 +451,8 @@ def _field_demand(
         visit(field)
     for items in output.variables.values():
         for item in items:
-            direct = isinstance(item, str)
-            name = item if direct else next(iter(item))
+            direct = item.expression is None
+            name = item.name
             field = resolve(name)
             if direct:
                 if field is None:
@@ -476,7 +476,7 @@ def _field_demand(
                         tensor, opened, output_required=False, conditions=conditions
                     ):
                         continue
-            source = parse_value_source(next(iter(item.values())), known)
+            source = parse_value_source(item.expression, known)
             for dependency in source_dependencies(source):
                 dependency_field = resolve(dependency)
                 if dependency_field is not None:

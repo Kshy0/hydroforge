@@ -39,6 +39,7 @@ from hydroforge.contracts.step_fields import (
     compile_step_field_expressions,
     validate_step_field_providers,
 )
+from hydroforge.contracts.views import GridAxis, Out, OutputView
 from hydroforge.contracts.windows import StatisticsPlan
 from hydroforge.core.events import ConsoleEventSink, EventSink
 from hydroforge.core.expr import parse_operation, parse_value_source
@@ -70,6 +71,26 @@ _MODULE_REQUIREMENTS = TypeAdapter(
 )
 _PARTITION_KEY = TypeAdapter(Identifier | None, config=_STRICT)
 _PARTITION_GROUP = TypeAdapter(Identifier, config=_STRICT)
+_GRID_AXES = TypeAdapter(FrozenMapping[Identifier, GridAxis], config=_STRICT)
+
+
+def _grid_axes(cls: type[ModelDeclaration]) -> Mapping[str, GridAxis]:
+    """Validate the axis names a model gives its symbolic dimensions."""
+
+    axes = _GRID_AXES.validate_python(cls.grid_axes)
+    names = [axis.name for axis in axes.values()]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"grid_axes repeat axis names {duplicates}")
+    for symbol, axis in axes.items():
+        if axis.staggers is not None and (
+            axis.staggers not in names or axis.staggers == axis.name
+        ):
+            raise ValueError(
+                f"grid axis {axis.name!r} of {symbol!r} staggers {axis.staggers!r}, "
+                "which is not another declared axis"
+            )
+    return axes
 
 
 def _contract_errors(
@@ -150,6 +171,7 @@ def _model_spec(cls: type[ModelDeclaration]) -> ModelSpec:
         module_requirements=module_requirements,
         partition_key=_PARTITION_KEY.validate_python(cls.partition_key),
         partition_group=_PARTITION_GROUP.validate_python(cls.partition_group),
+        grid_axes=_grid_axes(cls),
         step_fields=StepFieldPlan(
             providers=providers,
             expressions=compile_step_field_expressions(
@@ -233,10 +255,18 @@ class OutputConfig(HydroForgeModel):
         default="experiment",
         description="Experiment directory name beneath dir",
     )
-    variables: FrozenMapping[str, tuple[str | FrozenMapping[str, str], ...]] = Field(
+    variables: FrozenMapping[str, tuple[Out, ...]] = Field(
         default_factory=dict,
         description=(
-            "Statistics outputs as {operation: [field or {alias: expression}]}."
+            "Statistics outputs as {operation: [field, {alias: expression} or "
+            "Out(name, expression=..., view=...)]}."
+        ),
+    )
+    views: FrozenMapping[Identifier, OutputView] = Field(
+        default_factory=dict,
+        description=(
+            "Named spatial extents of outputs over global grid-axis indices, "
+            "referenced by Out(..., view=name)."
         ),
     )
     statistics_plan: InstanceOf[StatisticsPlan] | None = Field(
@@ -337,7 +367,7 @@ class OutputConfig(HydroForgeModel):
         # stores, so a validated configuration can be passed on again.
         if not isinstance(value, Mapping):
             raise ValueError("variables must be a mapping")
-        normalized: dict[str, tuple[str | Mapping[str, str], ...]] = {}
+        normalized: dict[str, tuple[Out, ...]] = {}
         for operation, items in value.items():
             if type(operation) is not str or not operation:
                 raise ValueError(
@@ -354,47 +384,59 @@ class OutputConfig(HydroForgeModel):
                 raise ValueError(
                     f"variables[{operation!r}] must be an exact list or tuple"
                 )
-            compiled_items: list[str | Mapping[str, str]] = []
+            compiled_items: list[Out] = []
             for item in items:
                 if type(item) is str:
                     if not item:
                         raise ValueError("statistics field names must be non-empty")
-                    compiled_items.append(item)
+                    compiled_items.append(Out(item))
                     continue
-                if not isinstance(item, Mapping) or len(item) != 1:
+                if isinstance(item, Out):
+                    output = item
+                elif isinstance(item, Mapping) and len(item) == 1:
+                    alias, expression = next(iter(item.items()))
+                    if (
+                        type(alias) is not str
+                        or not alias
+                        or type(expression) is not str
+                        or not expression
+                    ):
+                        raise ValueError(
+                            "statistics aliases and expressions must be "
+                            "non-empty exact strings"
+                        )
+                    output = Out(alias, expression=expression)
+                else:
                     raise ValueError(
-                        "variables items must be field names or "
-                        "one-item {alias: expression} dicts"
+                        "variables items must be field names, one-item "
+                        "{alias: expression} dicts or Out(...)"
                     )
-                alias, expression = next(iter(item.items()))
-                if canonical == "static":
-                    raise ValueError("static output does not accept expressions")
-                if (
-                    type(alias) is not str
-                    or not alias
-                    or type(expression) is not str
-                    or not expression
+                if canonical == "static" and (
+                    output.expression is not None or output.view is not None
                 ):
-                    raise ValueError(
-                        "statistics aliases and expressions must be "
-                        "non-empty exact strings"
-                    )
-                compiled_items.append({alias: expression})
-                parse_value_source(expression)
+                    raise ValueError("static output names a declared field only")
+                if output.expression is not None:
+                    parse_value_source(output.expression)
+                compiled_items.append(output)
             normalized[canonical] = tuple(compiled_items)
         pairs = set()
-        expressions = {}
+        declared: dict[str, tuple[str | None, str | None]] = {}
         for operation, items in normalized.items():
             for item in items:
-                name, expression = (
-                    (item, None) if isinstance(item, str) else next(iter(item.items()))
-                )
-                if (name, operation) in pairs:
+                if (item.name, operation) in pairs:
                     raise ValueError("variables must not repeat a field/operation")
-                pairs.add((name, operation))
-                if expressions.setdefault(name, expression) != expression:
+                pairs.add((item.name, operation))
+                if operation == "static":
+                    continue
+                # One variable has one expression and one view: alias a field
+                # to output it under another view.
+                if declared.setdefault(item.name, (item.expression, item.view)) != (
+                    item.expression,
+                    item.view,
+                ):
                     raise ValueError(
-                        f"statistics output {name!r} has conflicting expressions"
+                        f"statistics output {item.name!r} has conflicting "
+                        "expressions or views"
                     )
         if normalized and not any(
             operation != "static" and items for operation, items in normalized.items()
@@ -404,6 +446,16 @@ class OutputConfig(HydroForgeModel):
 
     @model_validator(mode="after")
     def _validate_destination(self) -> Self:
+        unknown = sorted(
+            {
+                item.view
+                for items in self.variables.values()
+                for item in items
+                if item.view is not None and item.view not in self.views
+            }
+        )
+        if unknown:
+            raise ValueError(f"variables name undeclared views {unknown}")
         if self.save_kernels and self.dir is None:
             raise ValueError("save_kernels requires OutputConfig(dir=...)")
         if self.statistics_plan is not None and not self.variables:
@@ -439,6 +491,11 @@ class ModelDeclaration(HydroForgeModel):
     )
     partition_key: ClassVar[str | None] = None
     partition_group: ClassVar[str] = "group_id"
+    grid_axes: ClassVar[Mapping[str, GridAxis]] = MappingProxyType({})
+    """Names of symbolic dimensions as grid axes (``{"num_i": GridAxis(name=
+    "west_east")}``); outputs name their dimensions and views select by them.
+    Undeclared symbols name themselves (see :mod:`hydroforge.contracts.views`).
+    """
     step_field_providers: ClassVar[Mapping[str, StepFieldProvider]] = MappingProxyType(
         {}
     )
@@ -542,6 +599,15 @@ class ModelDeclaration(HydroForgeModel):
     output: OutputConfig = Field(
         default_factory=OutputConfig,
         description="Statistics, checkpoint and output-file configuration",
+    )
+    partition_imbalance: float | None = Field(
+        default=0.05,
+        ge=0,
+        description=(
+            "Fraction by which a rank's partition-key rows may exceed the mean "
+            "before partition groups are cut along their references (only when "
+            "the model exchanges the halo); None keeps every group whole"
+        ),
     )
     strict_options: bool = Field(
         default=False,

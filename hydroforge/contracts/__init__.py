@@ -39,6 +39,13 @@ from hydroforge.contracts.step_fields import (
     step_field,
     substep_field,
 )
+from hydroforge.contracts.views import (
+    GridAxis,
+    Indices,
+    Out,
+    OutputView,
+    Range,
+)
 from hydroforge.contracts.windows import (
     CalendarWindow,
     EveryStep,
@@ -57,12 +64,17 @@ __all__ = [
     "ExplicitWindows",
     "FieldDemandPlan",
     "ForcingOptionField",
+    "GridAxis",
     "HydroForgeOptionWarning",
+    "Indices",
     "ModuleRequirement",
     "OptionField",
     "OptionRef",
     "OptionsConfig",
+    "Out",
+    "OutputView",
     "ParameterChange",
+    "Range",
     "SimulationSchedule",
     "SpinupSchedule",
     "StatisticsPlan",

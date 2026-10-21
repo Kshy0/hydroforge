@@ -16,12 +16,13 @@ import torch
 from numba import njit
 from pydantic import model_validator
 
-from hydroforge.compiler.partition import bare
+from hydroforge.compiler.partition import bare, coordinate_is_partitioned
 from hydroforge.core.arrays import immutable_array
 from hydroforge.core.validation import HydroForgeModel
 
 if TYPE_CHECKING:
     from hydroforge.compiler.plan import ModelPlan
+    from hydroforge.execution.balance import Pieces
     from hydroforge.execution.inputs import InputBinding
 
 
@@ -197,6 +198,9 @@ class PartitionRuntime:
         self._rank_indices: dict[str, np.ndarray] = {}
         self._sorted_keys: dict[str, tuple[np.ndarray, np.ndarray, bool]] = {}
         self._group_ranks: GroupRankLookup | None = None
+        self._pieces: Pieces | None = None
+        self.plan = plan
+        self._halo: tuple[list[np.ndarray], list[np.ndarray]] | None | bool = False
         self._validate_global_reference_integrity()
         self._validate_inverse_reference_integrity(plan.fields.inverse_sources)
 
@@ -296,7 +300,11 @@ class PartitionRuntime:
             return cached
         metadata = self.schema.fields[coordinate]
         if coordinate == self.partition_key:
-            groups = _host_ids(self.source.value(self.partition_group))
+            groups = (
+                _host_ids(self.source.value(self.partition_group))
+                if self.spatial_world_size == 1
+                else self.pieces.ids
+            )
         else:
             via = bare(metadata.partition_by)
             if via:
@@ -311,15 +319,202 @@ class PartitionRuntime:
 
     @property
     def group_ranks(self) -> GroupRankLookup:
+        """Rank of every partition id (:attr:`pieces`)."""
+
         cached = self._group_ranks
         if cached is None:
-            ids, ranks = compute_group_to_rank(
-                self.spatial_world_size,
-                _host_ids(self.source.value(self.partition_group)),
-            )
+            if self.spatial_world_size == 1:
+                ids, ranks = compute_group_to_rank(
+                    1, _host_ids(self.source.value(self.partition_group))
+                )
+            else:
+                ids, ranks = self.pieces.piece_ids, self.pieces.ranks
             cached = GroupRankLookup(group_ids=ids, ranks=ranks)
             self._group_ranks = cached
         return cached
+
+    @property
+    def pieces(self) -> Pieces:
+        """The partition ids of the key rows, derived before any slicing.
+
+        The partition group when the groups balance over the ranks (or the
+        halo is not exchanged, or ``partition_imbalance`` is ``None``), else
+        pieces of groups cut along the crossing references
+        (:mod:`hydroforge.execution.balance`). Every rank derives them alike
+        from the global partition group and reference fields; they are not a
+        model field.
+        """
+
+        if self._pieces is None:
+            from hydroforge.execution.balance import balance
+
+            groups = _host_ids(self.source.value(self.partition_group)).reshape(-1)
+            tolerance = self.plan.partition_imbalance
+            tree = edges = (np.zeros(0, np.int64), np.zeros(0, np.int64))
+            if tolerance is not None and self.halo_problem() is None:
+                tree, edges = self._key_edges()
+            else:
+                tolerance = None
+            self._pieces = balance(
+                self.spatial_world_size, groups, tree, edges, tolerance
+            )
+        return self._pieces
+
+    def _key_rows(self, coordinate: str) -> np.ndarray:
+        """The partition-key row that owns each row of ``coordinate``."""
+
+        if coordinate == self.partition_key:
+            return np.arange(_host_ids(self.source.value(coordinate)).size)
+        metadata = self.schema.fields[coordinate]
+        via = bare(metadata.partition_by)
+        name = via or coordinate
+        target = bare(self.schema.fields[name].references)
+        return self._key_rows(target)[self._reference_index(name)].reshape(-1)
+
+    def _key_edges(self) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
+        """Key-row pairs of the crossing references: ``(tree, edges)``.
+
+        ``tree`` holds the references within the key coordinate with one
+        target per row (``downstream``), along which groups are cut;
+        ``edges`` every crossing reference.
+        """
+
+        tree: list[tuple[np.ndarray, np.ndarray]] = []
+        edges: list[tuple[np.ndarray, np.ndarray]] = []
+        for name in self.crossing_references():
+            coordinate = self.variable_groups[name]
+            targets = self._reference_index(name)
+            sources = self._key_rows(coordinate)
+            width = targets.size // max(sources.size, 1)
+            pair = (np.repeat(sources, width), targets.reshape(-1).astype(np.int64))
+            edges.append(pair)
+            if coordinate == self.partition_key and width == 1:
+                tree.append(pair)
+
+        def joined(pairs):
+            if not pairs:
+                return np.zeros(0, np.int64), np.zeros(0, np.int64)
+            return tuple(np.concatenate(side) for side in zip(*pairs))
+
+        return joined(tree), joined(edges)
+
+    def crossing_references(self) -> tuple[str, ...]:
+        """Reference fields to the partition key that may cross ranks.
+
+        Every reference to a partition-key row except the ones that define a
+        coordinate's ownership (``partition_by`` or a referencing coordinate),
+        which keep their rows on the target's rank by construction.
+        """
+
+        key = self.partition_key
+        fields = self.schema.fields
+        owning = {
+            bare(fields[coordinate].partition_by) or coordinate
+            for coordinate in self.schema.coordinates
+            if coordinate != key
+        }
+        return tuple(
+            name
+            for name, metadata in fields.items()
+            if bare(metadata.references) == key
+            and name not in owning
+            and name in self.variable_groups
+            and name in self.source
+            and coordinate_is_partitioned(self.schema, key, self.variable_groups[name])
+        )
+
+    def halo_rows(self) -> tuple[list[np.ndarray], list[np.ndarray]] | None:
+        """Every rank's owned and ghost global rows of the partition key.
+
+        ``None`` when every partition group is closed under the crossing
+        references (always on one rank): no rank then holds ghost rows and
+        nothing is exchanged. A group that is not closed needs the model to
+        exchange the halo of every open module (``ModuleRequirement(halo=True)``).
+        """
+
+        if self._halo is not False:
+            return self._halo
+        self._halo = None
+        if self.spatial_world_size == 1 or self.partition_key is None:
+            return None
+        references = self.crossing_references()
+        if not references:
+            return None
+        from hydroforge.parallel.halo import ghost_rows
+
+        world = self.spatial_world_size
+        lookup = self.group_ranks._lookup_trusted
+
+        def rows(coordinate: str) -> list[np.ndarray]:
+            ranks = lookup(self._coordinate_group_values(coordinate))
+            return [np.nonzero(ranks == r)[0] for r in range(world)]
+
+        owned = rows(self.partition_key)
+        crossing = {
+            name: (
+                self._reference_index(name).reshape(-1),
+                rows(self.variable_groups[name]),
+            )
+            for name in references
+        }
+        ghosts = ghost_rows(owned, tuple(crossing.values()))
+        if not any(rows.size for rows in ghosts):
+            return None
+        self._require_halo(crossing, owned)
+        self._halo = (owned, ghosts)
+        return self._halo
+
+    def halo_problem(self) -> str | None:
+        """Why this model cannot exchange a halo, or ``None``."""
+
+        from hydroforge.contracts.runtime import DEFAULT_MODULE_REQUIREMENT
+
+        plan = self.plan
+        requirements = plan.spec.module_requirements
+        unsupported = [
+            name
+            for name in plan.modules
+            if not requirements.get(name, DEFAULT_MODULE_REQUIREMENT).halo
+        ]
+        if unsupported:
+            return f"the model does not exchange the halo of modules {unsupported}"
+        if plan.ensemble_size is not None:
+            return "halo exchange supports one ensemble member"
+        if plan.device.type != "cuda" or plan.backend.name not in ("cuda", "triton"):
+            return "halo exchange needs the cuda or triton backend on CUDA devices"
+        return None
+
+    def _require_halo(self, crossing, owned) -> None:
+        """Reject a split partition the model does not exchange."""
+
+        problem = self.halo_problem()
+        if problem is None:
+            return
+        owner = np.empty(sum(rows.size for rows in owned), np.int64)
+        for rank, rows in enumerate(owned):
+            owner[rows] = rank
+        split = {
+            name: int(
+                sum(
+                    np.count_nonzero(owner[targets[rows]] != rank)
+                    for rank, rows in enumerate(sources)
+                )
+            )
+            for name, (targets, sources) in crossing.items()
+        }
+        raise ValueError(
+            f"partition groups {self.partition_group!r} split references across "
+            f"ranks ({', '.join(f'{n}: {c} rows' for n, c in split.items() if c)}), "
+            f"but {problem}; keep connected structure in one group"
+        )
+
+    def ghost_indices(self, coordinate: str) -> np.ndarray:
+        """Global rows this rank holds as ghosts of ``coordinate``."""
+
+        halo = self.halo_rows() if coordinate == self.partition_key else None
+        if halo is None:
+            return np.zeros(0, dtype=np.int64)
+        return halo[1][self.spatial_rank]
 
     def rank_indices(self, coordinate: str) -> np.ndarray:
         cached = self._rank_indices.get(coordinate)

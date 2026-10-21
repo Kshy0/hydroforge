@@ -224,6 +224,13 @@ class ModuleTensors:
                     f"module {module.module_name!r}"
                 ) from error
         shape = tuple(values[dimension] for dimension in schema.tensor.shape)
+        # Halo ghost rows follow the owned rows of their coordinate.
+        coordinate = schema.tensor.dim_coords or (
+            field_name if schema.tensor.is_coordinate else None
+        )
+        if coordinate and shape:
+            ghosts = module._binding.ghosts.get(coordinate.rsplit(".", 1)[-1], 0)
+            shape = (shape[0] + ghosts, *shape[1:])
         for dimension, size in zip(schema.tensor.shape, shape, strict=True):
             if isinstance(size, bool) or not isinstance(size, Integral):
                 raise ValueError(

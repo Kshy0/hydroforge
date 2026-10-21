@@ -24,6 +24,7 @@ from hydroforge.statistics.storage import StoragePlan
 
 if TYPE_CHECKING:
     from hydroforge.contracts.fields import RuntimeTensorMetadata
+    from hydroforge.contracts.views import OutputView
     from hydroforge.statistics.layout import StatisticsVariableLayout
 
 
@@ -75,6 +76,9 @@ class StatisticsDeclaration:
     program: StatisticsProgram
     static_names: tuple[str, ...]
     netcdf_options: Mapping[str, Mapping[str, Any]]
+    # Logical axis names of every output variable, and its view if any.
+    axes: Mapping[str, tuple[str, ...]] = MappingProxyType({})
+    views: Mapping[str, OutputView] = MappingProxyType({})
 
     @property
     def variable_ops(self) -> Mapping[str, tuple[str, ...]]:

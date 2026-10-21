@@ -16,6 +16,7 @@ from typing import Any, TypeAlias
 from hydroforge.contracts.fields import TensorMetadata
 from hydroforge.contracts.runtime import BackendRequirement, ModuleRequirement
 from hydroforge.contracts.step_fields import StepFieldProvider
+from hydroforge.contracts.views import GridAxis
 from hydroforge.core.events import EventSink
 from hydroforge.core.expr import Expression
 
@@ -130,6 +131,7 @@ class ModelSpec:
     module_requirements: Mapping[str, ModuleRequirement]
     partition_key: str | None
     partition_group: str
+    grid_axes: Mapping[str, GridAxis]
     step_fields: StepFieldPlan
     kernel_fields: tuple[str, ...]
     authored_fields: tuple[str, ...]
@@ -229,7 +231,8 @@ class ModuleBinding:
     ``module_ref`` (``None`` when closed); ``prepared`` marks a payload that
     already passed ``prepare_module_input``; ``defaults`` carries default
     values a payload view already evaluated for its siblings; ``missing``
-    names the active input tensor fields the model input lacks.
+    names the active input tensor fields the model input lacks; ``ghosts``
+    counts the halo ghost rows appended to each coordinate (by bare name).
     """
 
     plan: ModuleBindingPlan
@@ -238,3 +241,4 @@ class ModuleBinding:
     prepared: bool = False
     defaults: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     missing: frozenset[str] = frozenset()
+    ghosts: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))

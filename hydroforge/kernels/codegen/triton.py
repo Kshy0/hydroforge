@@ -40,7 +40,7 @@ from collections.abc import Sequence
 
 import torch
 
-from hydroforge.kernels.codegen.c import _word, identifier
+from hydroforge.kernels.codegen.c import _word, spellings
 from hydroforge.kernels.codegen.ir import (
     PHASE,
     Assign,
@@ -364,7 +364,8 @@ class _Kernel(TritonPrinter):
 
     def __init__(self, function: KernelFunction) -> None:
         self.function = function
-        params = [identifier(param) for param in function.params]
+        spelled = spellings(function)
+        params = list(spelled.values())
         touched = effects(function.body)
         taken = touched.uses | touched.defines
         clashes = (set(params) & touched.defines) | ((set(params) | taken) & _GLOBALS)
@@ -375,7 +376,7 @@ class _Kernel(TritonPrinter):
                 f"names taken by parameters or the prelude: {sorted(clashes)}"
             )
         self.names = Names((*params, *taken, *_GLOBALS))
-        self.buffers = {param.name: identifier(param) for param in function.params}
+        self.buffers = spelled
         self.varying: set[str] = set()
         self.atoms = _lane_atoms(function.body)
         self.mask: str | None = None
@@ -383,9 +384,9 @@ class _Kernel(TritonPrinter):
 
     def lines(self) -> list[str]:
         params = [
-            identifier(param)
+            self.buffers[param.name]
             if param.access is not None
-            else f"{identifier(param)}: tl.constexpr"
+            else f"{self.buffers[param.name]}: tl.constexpr"
             for param in self.function.params
         ]
         return [

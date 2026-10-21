@@ -899,6 +899,20 @@ class AbstractModule(HydroForgeModel, ABC):
 
         return self._binding.missing
 
+    def owned_rows(self, coordinate: str) -> int:
+        """Rows of ``coordinate`` this rank owns, before its halo ghost rows.
+
+        Size scalars of a halo coordinate return this count, the extent
+        kernels iterate; fields aligned to the coordinate hold the ghost
+        rows after it (see :mod:`hydroforge.parallel.halo`).
+        """
+
+        name = coordinate.rsplit(".", 1)[-1]
+        owner = self
+        if "." in coordinate:
+            owner = getattr(self, coordinate.split(".", 1)[0])
+        return getattr(owner, name).shape[0] - self._binding.ghosts.get(name, 0)
+
     def _is_tensor_field_active(self, name: str) -> bool:
         """Return whether a tensor field belongs to this module specialization."""
 

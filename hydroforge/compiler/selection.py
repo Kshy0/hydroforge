@@ -65,6 +65,7 @@ class Selection:
     local_ensemble_size: int | None
     member_ids: tuple[int, ...] | None
     parallel: EnsembleParallel | None
+    partition_imbalance: float | None
 
 
 def resolve_block_size(
@@ -264,4 +265,5 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
         ),
         member_ids=None if parallel is None else parallel.member_ids,
         parallel=parallel,
+        partition_imbalance=declaration.partition_imbalance,
     )

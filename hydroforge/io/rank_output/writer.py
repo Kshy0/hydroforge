@@ -498,6 +498,13 @@ def _create_output_files(
                 ensemble_coordinate[:] = member_ids
 
             write_point_coordinate(ncfile, schema.coordinate_name, coordinate_values)
+            for dimension, indices in schema.axis_indices:
+                axis_coordinate = ncfile.createVariable(dimension, "i8", (dimension,))
+                axis_coordinate.setncattr(COMPLETE_DATA_ATTR, "true")
+                axis_coordinate.setncattr(
+                    "long_name", f"global logical index of {dimension}"
+                )
+                axis_coordinate[:] = indices
 
             # Write user-supplied static per-point variables. Coordinate scope
             # decides applicability; once applicable, dimension mismatch is a

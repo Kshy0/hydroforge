@@ -33,8 +33,9 @@ class RankLayout:
 
     dimensions: tuple[str, ...]
     member_count: int | None
-    level_dimension: str | None
-    level_count: int
+    # Trailing value axes after the saved points, and their extents.
+    level_dimensions: tuple[str, ...]
+    level_counts: tuple[int, ...]
     dtype: np.dtype
     decoded_dtype: np.dtype
     logical_dtype: str | None
@@ -113,25 +114,15 @@ def _file_layout(
         )
         raise ValueError(
             f"variable {var_name!r} has dimensions {dimensions}, expected "
-            f"('time', ['ensemble'], 'saved_points', [value_axis]){detail}"
+            f"('time', ['ensemble'], 'saved_points', [value axes...]){detail}"
         )
     trailing = dimensions[cursor + 1 :]
-    if len(trailing) > 1:
-        raise ValueError(
-            f"variable {var_name!r} has multiple trailing value dimensions "
-            f"{trailing}; the reader's level API supports at most one"
-        )
-    level_dimension = trailing[0] if trailing else None
     coord_name, coordinate = read_point_coordinate(dataset, name=coord_name, path=path)
     layout = RankLayout(
         dimensions=dimensions,
         member_count=member_count,
-        level_dimension=level_dimension,
-        level_count=(
-            0
-            if level_dimension is None
-            else int(dataset.dimensions[level_dimension].size)
-        ),
+        level_dimensions=trailing,
+        level_counts=tuple(int(dataset.dimensions[name].size) for name in trailing),
         dtype=np.dtype(variable.dtype),
         decoded_dtype=decoded_dtype(variable),
         logical_dtype=logical_dtype,

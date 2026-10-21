@@ -30,6 +30,7 @@ namespaces = false
 [tool.setuptools.package-data]
 "hydroforge.kernels.toolchain" = ["*.mm"]
 "hydroforge.kernels" = ["float32x2.metal", "emulated.metal"]
+"hydroforge.parallel" = ["*.cu", "*.cuh"]
 
 [tool.setuptools.exclude-package-data]
 "*" = ["__pycache__/*", "*.py[cod]"]

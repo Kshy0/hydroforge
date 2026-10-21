@@ -10,8 +10,9 @@ Both dialects share statement and expression spelling; a trait supplies what
 differs: the entry and its argument ABI, type names and conversions, atomic
 addition, the thread index, the intrinsics (``set_conditional`` is CUDA's
 ``cudaGraphSetConditional``) and the helper prelude.  Buffer parameters are
-spelled ``p_<name>`` and scalar parameters by name, with non-word characters
-replaced.
+spelled ``p_<name>`` (suffixed past any local of the same spelling, so a
+field may take any name) and scalar parameters by name, with non-word
+characters replaced.
 
 The prelude helpers are the dialects' NaN rules: ``nan_max``/``nan_min``
 ignore one NaN operand and otherwise select ``a > b ? a : b``,
@@ -182,6 +183,29 @@ def identifier(param: Param) -> str:
     return _word(param.name) if param.access is None else f"p_{_word(param.name)}"
 
 
+def spellings(function: KernelFunction) -> dict[str, str]:
+    """Each parameter's spelling in ``function``, by parameter name.
+
+    A buffer is ``p_<name>`` unless a local or another parameter already
+    takes that spelling (a field ``offset`` beside a variable ``p``'s local
+    ``p_offset``); it then takes the first free ``p_<name>_<k>``.
+    """
+
+    touched = effects(function.body)
+    taken = {_word(name) for name in touched.uses | touched.defines}
+    taken.update(identifier(param) for param in function.params if param.access is None)
+    spelled = {}
+    for param in function.params:
+        name = identifier(param)
+        if param.access is not None:
+            base, suffix = name, 2
+            while name in taken:
+                name, suffix = f"{base}_{suffix}", suffix + 1
+            taken.add(name)
+        spelled[param.name] = name
+    return spelled
+
+
 def _spelling(dtype: torch.dtype, dialect: str) -> str:
     """A tensor element's spelling, else the scalar kind's (``uint32``)."""
 
@@ -211,13 +235,14 @@ class _Trait:
 
 def _cuda_entry(function: KernelFunction, body: Sequence[str]) -> list[str]:
     params = []
+    names = spellings(function)
     for param in function.params:
         spelled = _spelling(param.type, "cuda")
         if param.access is None:
-            params.append(f"{spelled} {identifier(param)}")
+            params.append(f"{spelled} {names[param.name]}")
         else:
             const = "const " if param.access == "read" else ""
-            params.append(f"{const}{spelled}* {identifier(param)}")
+            params.append(f"{const}{spelled}* {names[param.name]}")
     return [
         f"__global__ void {function.name}(",
         _INDENT + f",\n{_INDENT}".join(params),
@@ -267,9 +292,10 @@ def msl_arguments(
     """
 
     fields = []
+    names = spellings(function)
     for param in function.params:
         if param.access is None:
-            fields.append((identifier(param), None, scalar_kind(param.type)))
+            fields.append((names[param.name], None, scalar_kind(param.type)))
             continue
         native = (
             "hf_hp"
@@ -282,7 +308,7 @@ def msl_arguments(
                     "encoded Metal accumulation requires destination-owned writes"
                 )
             native = f"atomic_{native}"
-        fields.append((identifier(param), param.access, native))
+        fields.append((names[param.name], param.access, native))
     return tuple(fields)
 
 
@@ -293,6 +319,8 @@ class CPrinter:
         self.trait = trait
         # Atomic buffers of the kernel being printed (``atomic_load`` only).
         self.atomics: frozenset[str] = frozenset()
+        # Buffer spellings of the kernel being printed.
+        self.buffers: Mapping[str, str] = {}
 
     def type(self, dtype: torch.dtype) -> str:
         return _spelling(dtype, self.trait.dialect)
@@ -315,7 +343,7 @@ class CPrinter:
         return self.cast(repr(value), node.type)
 
     def buffer(self, name: str) -> str:
-        return f"p_{_word(name)}"
+        return self.buffers.get(name) or f"p_{_word(name)}"
 
     def operand(self, node: Expr, context: Iterable[Expr]) -> str:
         """``node`` spelled next to ``context``: an untyped floating literal
@@ -443,7 +471,8 @@ class CPrinter:
         return lines
 
     def kernel(self, function: KernelFunction) -> str:
-        names = [identifier(param) for param in function.params]
+        spelled = spellings(function)
+        names = list(spelled.values())
         defines = effects(function.body).defines
         shadowed = set(names).intersection(defines)
         if len(set(names)) != len(names) or shadowed:
@@ -459,12 +488,12 @@ class CPrinter:
                 f"{function.name}: names reserved by {self.trait.dialect}: "
                 f"{sorted(reserved)}"
             )
-        printer = self
+        printer = copy.copy(self)
+        printer.buffers = spelled
         atomics = frozenset(
             param.name for param in function.params if param.access == "atomic_add"
         )
-        if self.trait.atomic_load is not None and atomics:
-            printer = copy.copy(self)
+        if self.trait.atomic_load is not None:
             printer.atomics = atomics
         body = printer.stmts(function.body)
         return "\n".join(self.trait.entry(function, body))

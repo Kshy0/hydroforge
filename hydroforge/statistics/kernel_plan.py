@@ -79,6 +79,7 @@ from hydroforge.kernels.codegen.ir import (
     Var,
     cast,
 )
+from hydroforge.statistics.layout import AxisMap
 from hydroforge.statistics.lowering import (
     LoweredVariable,
     OutputLayout,
@@ -100,6 +101,7 @@ from hydroforge.statistics.reductions import (
 from hydroforge.statistics.storage import COUNT_DTYPE, StoragePlan, variable_slots
 
 if TYPE_CHECKING:
+    from hydroforge.statistics.ir import StatisticsIR
     from hydroforge.statistics.layout import StatisticsVariableLayout
 
 _INDEX = torch.int64
@@ -116,6 +118,10 @@ SOURCE_SIZE = Var("source_size", _INDEX)
 TARGET_SIZE = Var("target_size", _INDEX)
 _SCATTER_SOURCE = Var("src", _INDEX)
 _SCATTER_TARGET = Var("dst", _INDEX)
+# Position in a scatter's contributing sources, and the buffer element of a
+# needed target.
+_SCATTER_SLOT = Var("slot", _INDEX)
+_SCATTER_ELEMENT = Var("element", _INDEX)
 _CONTROL_NAMES = {
     CONTROL_WEIGHT: "weight",
     CONTROL_MACRO_STEPS: "num_macro_steps",
@@ -128,6 +134,8 @@ _RESERVED = (
     *(var.name for var in (TOTAL, SOURCE_SIZE, TARGET_SIZE)),
     _SCATTER_SOURCE.name,
     _SCATTER_TARGET.name,
+    _SCATTER_SLOT.name,
+    _SCATTER_ELEMENT.name,
     *_CONTROL_NAMES.values(),
 )
 
@@ -391,6 +399,104 @@ def _member_offset(stride: int, index: Expr) -> Expr:
     return Binary("+", Binary("*", MEMBER, Const(stride, _INDEX)), index)
 
 
+def _view_source(
+    element: Expr,
+    output_shape: tuple[int, ...],
+    source_shape: tuple[int, ...],
+    maps: tuple[AxisMap, ...],
+    names: Names,
+    prefix: str,
+    statements: list[Stmt],
+) -> Expr:
+    """The source offset of a row-major output ``element``.
+
+    Output axis ``d`` index ``o`` reads source row ``table_d[o]`` or, for a
+    regular axis, ``start_d + step_d * o`` with no table load; the result is
+    in the source's row-major strides.
+    """
+
+    source: Expr | None = None
+    remaining = element
+    for axis in range(len(output_shape) - 1, -1, -1):
+        extent = Const(output_shape[axis], _INDEX)
+        index = names.var(f"{prefix}_axis{axis}", _INDEX)
+        statements.append(
+            Let(index, remaining if axis == 0 else Binary("%", remaining, extent))
+        )
+        if axis:
+            remaining = Binary("/", remaining, extent)
+        item = maps[axis]
+        row: Expr = index
+        if item.table is not None:
+            row = cast(Load(item.table, index, _INDEX), _INDEX)
+        else:
+            if item.step != 1:
+                row = Binary("*", row, Const(item.step, _INDEX))
+            if item.start:
+                row = Binary("+", row, Const(item.start, _INDEX))
+        stride = prod(source_shape[axis + 1 :])
+        term = row if stride == 1 else Binary("*", row, Const(stride, _INDEX))
+        source = term if source is None else Binary("+", term, source)
+    return source if source is not None else Const(0, _INDEX)
+
+
+def scatter_topology_names(symbol: str) -> tuple[str, str]:
+    """Buffers of a scatter's needed targets and contributing sources."""
+
+    return f"__hf_scatter_targets_{symbol}", f"__hf_scatter_sources_{symbol}"
+
+
+def scatter_topology(
+    ir: StatisticsIR,
+    tensors: Mapping[str, torch.Tensor],
+    widths: Mapping[str, int],
+    symbol: Callable[[str], str],
+) -> dict[str, torch.Tensor]:
+    """The targets each scatter must produce and the sources reaching them.
+
+    A scatter read only through one output selection needs just the
+    selected targets: its zero and divide pre-kernels visit those, and its
+    add visits the sources whose index reaches one of them. The topology is
+    a cold-path product of the index and the selection, rebuilt whenever a
+    structural update changes either. A scatter that another scatter reads,
+    or an output reads whole, keeps every target.
+    """
+
+    topology: dict[str, torch.Tensor] = {}
+    scatters = ir.ordered_scatters()
+    for scatter in scatters:
+        buffer = StoragePlan.scatter_buffer(scatter.name)
+        if any(
+            buffer in ir.scatter_inputs(other.name)
+            for other in scatters
+            if other.name != scatter.name
+        ):
+            continue
+        groups = {
+            variable.output_group
+            for variable in ir.variables
+            if buffer in ir.materialized_inputs(variable.name)
+        }
+        if len(groups) != 1 or "__full__" in groups:
+            continue
+        width = widths[scatter.name]
+        selected = tensors[next(iter(groups))].detach().cpu().flatten().to(torch.int64)
+        targets = torch.unique(selected[(selected >= 0) & (selected < width)])
+        if targets.numel() >= width:
+            continue
+        index = tensors[scatter.source.index].detach().cpu().flatten().to(torch.int64)
+        needed = torch.zeros(width, dtype=torch.bool)
+        needed[targets] = True
+        valid = (index >= 0) & (index < width)
+        reaching = valid.clone()
+        reaching[valid] = needed[index[valid]]
+        device = tensors[scatter.source.index].device
+        targets_name, sources_name = scatter_topology_names(symbol(scatter.name))
+        topology[targets_name] = targets.to(device)
+        topology[sources_name] = torch.nonzero(reaching).flatten().to(device)
+    return topology
+
+
 def _scatter(
     context: StatisticsCompileContext,
     lowering: StatisticsLowering,
@@ -411,6 +517,34 @@ def _scatter(
     symbol = context.symbol(name)
     total = Param(TOTAL.name, _INDEX)
     head = (*gate, Let(LINEAR, ThreadIndex()), Guard(Compare("<", LINEAR, TOTAL)))
+    targets_name, sources_name = scatter_topology_names(symbol)
+    compact = targets_name in context.tensors
+    if compact:
+        # Only the targets the outputs read, and the sources reaching them.
+        targets = context.tensors[targets_name]
+        needed = targets.numel()
+        sources = context.tensors[sources_name].numel()
+        target_params = (Param(targets_name, targets.dtype, "read"),)
+        source_params = (Param(sources_name, torch.int64, "read"),)
+    else:
+        needed = target_width
+        target_params = source_params = ()
+
+    def target_row(slot: Expr) -> Expr:
+        """The full-buffer element of the ``slot``-th written target."""
+
+        if not compact:
+            return LINEAR
+        member = Binary("/", slot, Const(needed, _INDEX))
+        row = Binary("-", slot, Binary("*", member, Const(needed, _INDEX)))
+        return Binary(
+            "+",
+            Binary("*", member, Const(target_width, _INDEX)),
+            Load(targets_name, row, _INDEX),
+        )
+
+    element = _SCATTER_ELEMENT
+    targeted = (*head, Let(element, target_row(LINEAR)))
 
     def kernel(role, params, body, extent, **scalars) -> StatisticsKernel:
         return StatisticsKernel(
@@ -426,15 +560,16 @@ def _scatter(
         (
             Param(buffer, dtype, "write"),
             *(Param(item, COUNT_DTYPE, "write") for item in counts),
+            *target_params,
             *gate_params,
             total,
         ),
         (
-            *head,
-            Store(buffer, LINEAR, Const(0, dtype)),
-            *(Store(item, LINEAR, Const(0, COUNT_DTYPE)) for item in counts),
+            *targeted,
+            Store(buffer, element, Const(0, dtype)),
+            *(Store(item, element, Const(0, COUNT_DTYPE)) for item in counts),
         ),
-        target_width * members,
+        needed * members,
     )
 
     names = Names(_RESERVED)
@@ -456,10 +591,22 @@ def _scatter(
         Param(source.index, index_dtype, "read"),
         *(Param(item, COUNT_DTYPE, "atomic_add") for item in counts),
         *(Param(key, context.buffer(key).dtype, "read") for key in leaves),
+        *source_params,
         *gate_params,
         Param(SOURCE_SIZE.name, _INDEX),
         Param(TARGET_SIZE.name, _INDEX),
     )
+
+    def source_row(position: Expr) -> tuple[Stmt, ...]:
+        """Bind the source row of the ``position``-th contributor."""
+
+        if not compact:
+            return (Let(_SCATTER_SOURCE, position),)
+        return (
+            Let(_SCATTER_SLOT, position),
+            Let(_SCATTER_SOURCE, Load(sources_name, _SCATTER_SLOT, _INDEX)),
+        )
+
     target = (
         Let(
             _SCATTER_TARGET,
@@ -487,10 +634,7 @@ def _scatter(
         (
             *head,
             Let(MEMBER, Binary("/", LINEAR, SOURCE_SIZE)),
-            Let(
-                _SCATTER_SOURCE,
-                Binary("-", LINEAR, Binary("*", MEMBER, SOURCE_SIZE)),
-            ),
+            *source_row(Binary("-", LINEAR, Binary("*", MEMBER, SOURCE_SIZE))),
             *target,
             *contribution,
         ),
@@ -503,8 +647,9 @@ def _scatter(
             add_params,
             (
                 *gate,
-                Let(_SCATTER_SOURCE, ThreadIndex()),
-                Guard(Compare("<", _SCATTER_SOURCE, SOURCE_SIZE)),
+                Let(LINEAR, ThreadIndex()),
+                Guard(Compare("<", LINEAR, SOURCE_SIZE)),
+                *source_row(LINEAR),
                 *target,
                 ForK(MEMBER, members, contribution),
             ),
@@ -516,21 +661,22 @@ def _scatter(
     if count is None:
         return ScatterKernels(zero, add, add_members, None)
     number = Var("count", COUNT_DTYPE)
-    mean = Binary("/", Load(buffer, LINEAR, dtype), cast(number, dtype))
+    mean = Binary("/", Load(buffer, element, dtype), cast(number, dtype))
     divide = kernel(
         "divide",
         (
             Param(buffer, dtype, "read_write"),
             Param(count, COUNT_DTYPE, "read"),
+            *target_params,
             *gate_params,
             total,
         ),
         (
-            *head,
-            Let(number, Load(count, LINEAR, COUNT_DTYPE)),
+            *targeted,
+            Let(number, Load(count, element, COUNT_DTYPE)),
             Store(
                 buffer,
-                LINEAR,
+                element,
                 Select(
                     Compare(">", number, Const(0, COUNT_DTYPE)),
                     mean,
@@ -538,7 +684,7 @@ def _scatter(
                 ),
             ),
         ),
-        target_width * members,
+        needed * members,
     )
     return ScatterKernels(zero, add, add_members, divide)
 
@@ -556,7 +702,47 @@ def _variable(
     prefix = context.symbol(name)
     levels = 1
     statements: list[Stmt] = []
+    addressing: list[Stmt] = []
+    source_shape = layout.source_shape
+    output_shape = layout.actual_shape[int(layout.batched) :]
+    rank = len(source_shape)
+
+    def batched_key(key: str) -> bool:
+        return context.member_stride(key, rank) != 0
+
     match variable.layout:
+        case OutputLayout.FULL if layout.axes is not None:
+            # A view or the owned rows: decompose the output element and
+            # read each axis through its rows.
+            offset = LINEAR
+            plane = prod(output_shape)
+            element: Expr = LINEAR
+            member: Expr | None = None
+            if layout.batched:
+                member = names.var(f"{prefix}_member", _INDEX)
+                element = names.var(f"{prefix}_element", _INDEX)
+                addressing.append(
+                    Let(member, Binary("/", LINEAR, Const(plane, _INDEX)))
+                )
+                addressing.append(
+                    Let(element, Binary("%", LINEAR, Const(plane, _INDEX)))
+                )
+            source = _view_source(
+                element,
+                output_shape,
+                source_shape,
+                layout.axes,
+                names,
+                prefix,
+                addressing,
+            )
+            source_plane = Const(prod(source_shape), _INDEX)
+
+            def source_offset(key: str) -> Expr:
+                if member is None or not batched_key(key):
+                    return source
+                return Binary("+", Binary("*", member, source_plane), source)
+
         case OutputLayout.FULL:
             offset = LINEAR
 
@@ -574,14 +760,33 @@ def _variable(
                 return _member_offset(context.member_stride(key), SOURCE)
 
         case _:
-            levels = layout.actual_shape[-1]
+            levels = prod(output_shape[1:])
             width = Const(levels, _INDEX)
             offset = names.var(f"{prefix}_offset", _INDEX)
             statements.append(Let(offset, _level_offset(_saved_offset(), width)))
+            inner_axes = (
+                (AxisMap(),) * len(output_shape[1:])
+                if layout.axes is None
+                else layout.axes[1:]
+            )
+            inner: Expr = LEVEL
+            if not all(item.identity for item in inner_axes) or tuple(
+                output_shape[1:]
+            ) != tuple(source_shape[1:]):
+                inner = _view_source(
+                    LEVEL,
+                    output_shape[1:],
+                    source_shape[1:],
+                    inner_axes,
+                    names,
+                    prefix,
+                    addressing,
+                )
+            row = Const(prod(source_shape[1:]), _INDEX)
 
             def source_offset(key: str) -> Expr:
-                point = _member_offset(context.member_stride(key, 2), SOURCE)
-                return _level_offset(point, width)
+                point = _member_offset(context.member_stride(key, rank), SOURCE)
+                return Binary("+", Binary("*", point, row), inner)
 
     weights = (
         StoragePlan.sample_weight(name),
@@ -604,6 +809,7 @@ def _variable(
         ),
     )
     head = tuple(statements)
+    statements.extend(addressing)
     values = _Values(context, lowering, names, prefix, dtype, source_offset)
     value = values.value(name)
     statements.extend(values.statements)
@@ -647,6 +853,13 @@ def _group(
     )
     for key in inputs:
         buffers.setdefault(key, Param(key, context.buffer(key).dtype, "read"))
+    for variable in variables:
+        for item in context.layouts[variable.variable.name].axes or ():
+            if item.table is not None:
+                buffers.setdefault(
+                    item.table,
+                    Param(item.table, context.buffer(item.table).dtype, "read"),
+                )
     for variable in variables:
         name = variable.variable.name
         for slot in variable_slots(
