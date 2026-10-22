@@ -31,7 +31,7 @@ Python 3.11+ is required. Install the appropriate PyTorch build for your device,
 then install HydroForge:
 
 ```bash
-pip install git+https://github.com/Kshy0/hydroforge.git
+pip install hydroforge==0.3.0
 ```
 
 For local development:

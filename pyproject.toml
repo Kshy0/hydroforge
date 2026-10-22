@@ -1,11 +1,14 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hydroforge"
 version = "0.3.0"
 description = "Generic framework for GPU-accelerated hydrological modelling"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [
     {name = "Shengyu Kang", email = "kshy0204@whu.edu.cn"}
@@ -21,6 +24,11 @@ dependencies = [
     "scipy",
     "ninja; sys_platform == 'darwin'",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Kshy0/hydroforge"
+Repository = "https://github.com/Kshy0/hydroforge"
+Issues = "https://github.com/Kshy0/hydroforge/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
