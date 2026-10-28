@@ -19,6 +19,8 @@ MODEL_OWNED_MODULE_FIELDS = (
     "rank",
     "device",
     "precision",
+    "storage_precision",
+    "matmul_tf32",
     "mixed_precision",
     "metal_emulation",
     "ensemble_size",
@@ -39,9 +41,12 @@ class BackendRequirement(HydroForgeModel):
     backend remain facts of :class:`hydroforge.platform.Backend`.
     """
 
-    precision: frozenset[Literal["float32", "float64"]] | None = Field(
-        default=None, min_length=1
-    )
+    precision: (
+        frozenset[Literal["float64", "float32", "tf32", "bfloat16", "float16"]] | None
+    ) = Field(default=None, min_length=1)
+    """Precision tiers the model's kernels serve on this backend, compute
+    and storage alike; ``None`` serves float64, float32 and tf32. 16-bit
+    tiers must be named: kernels then read and write 16-bit elements."""
     mixed_precision: bool = True
     default_mixed_precision: bool | None = None
     ensemble: bool = True
@@ -89,19 +94,43 @@ class BackendRequirement(HydroForgeModel):
 
     def validate_precision(
         self,
-        precision: str,
-        mixed_precision: bool,
+        precisions: Any,
+        mixed_precision: bool | None = None,
         *,
         backend: str,
     ) -> None:
-        """Validate model precision against one runtime or model restriction."""
+        """Validate the model's tiers (:class:`~hydroforge.contracts.precision.
+        Precisions`, or a compute tier with ``mixed_precision``) against this
+        model restriction."""
 
-        if self.precision is not None and precision not in self.precision:
-            raise ValueError(
-                f"backend {backend!r} requires precision in {self.precision}, "
-                f"got {precision!r}"
-            )
-        if not self.mixed_precision and mixed_precision:
+        if isinstance(precisions, str):
+            # A bare compute tier: the tier and the promotion request.
+            if self.precision is not None and precisions not in self.precision:
+                raise ValueError(
+                    f"backend {backend!r} requires precision in "
+                    f"{sorted(self.precision)}, got {precisions!r}"
+                )
+            if not self.mixed_precision and mixed_precision:
+                raise ValueError(
+                    f"backend {backend!r} does not support mixed precision"
+                )
+            return
+
+        served = (
+            frozenset(("float64", "float32", "tf32"))
+            if self.precision is None
+            else self.precision
+        )
+        for role, tier in (
+            ("precision", precisions.compute),
+            ("storage_precision", precisions.storage),
+        ):
+            if tier not in served:
+                raise ValueError(
+                    f"backend {backend!r} requires precision in "
+                    f"{sorted(served)} for this model, got {role}={tier!r}"
+                )
+        if not self.mixed_precision and precisions.mixed:
             raise ValueError(f"backend {backend!r} does not support mixed precision")
 
 

@@ -41,7 +41,7 @@ AccessMode = Literal[
     "remote",
 ]
 RuntimeKind = Literal[
-    "bool", "int32", "uint32", "index", "float32", "float64", "precision"
+    "bool", "int32", "uint32", "index", "float32", "float64", "precision", "halo"
 ]
 ConstantKind = Literal["bool", "int32", "float32", "float64", "precision"]
 Precision = Literal["float32", "float64"]
@@ -210,6 +210,8 @@ def host_scalar_is_valid(value: Any, kind: str) -> bool:
         return value == 0.0 or encoded != 0.0
     if kind == "float64":
         return type(value) is float and math.isfinite(value)
+    if kind == "halo":
+        return type(value) is HaloArgument
     raise RuntimeError(f"unknown host scalar kind {kind!r}")
 
 
@@ -218,6 +220,8 @@ def expected_host_scalar(kind: str) -> str:
 
     if kind == "precision":
         return "exact finite float32-representable precision host scalar"
+    if kind == "halo":
+        return "HaloArgument (the framework binds it)"
     return f"exact finite {kind} host scalar"
 
 
@@ -238,6 +242,72 @@ def launch_extent(name: str, keys: tuple[str, ...], values: Mapping[str, Any]) -
         if extent >= 2**63:
             raise OverflowError(f"{name} launch extent exceeds signed int64 range")
     return extent
+
+
+# The parameter a ``halo``/``publishes`` declaration adds (kind ``halo``).
+HALO_PARAMETER = "halo"
+# Fields a halo argument describes: reads and publications each.
+HALO_FIELDS = 8
+
+
+@dataclass(slots=True, eq=False)
+class HaloArgument:
+    """The value of a ``halo`` parameter: the int64 words of the by-value
+    ``HfHalo`` struct of ``hydroforge/parallel/halo_access.cuh`` (prepared
+    once per call site, so kernels compare against parameters instead of
+    loading tables), and the tensors its addresses point into. The halo
+    exchange takes its site the same way.
+
+    A recording binds it before its schedule knows every word, and fills it
+    in when the recording ends (before anything compiles); arguments with
+    equal words are equal."""
+
+    words: tuple[int, ...]
+    keep: tuple[Any, ...] = ()
+
+    @classmethod
+    def quiet(cls) -> HaloArgument:
+        """An argument describing no halo work: every row is interior."""
+
+        return cls(HALO_QUIET_WORDS)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, HaloArgument) and self.words == other.words
+
+    def __hash__(self) -> int:
+        return hash(self.words)
+
+
+def halo_work(value: HaloArgument) -> tuple[bool, bool, bool]:
+    """Whether a halo argument reads any ring, publishes, and returns slots
+    in its prologue."""
+
+    words = value.words
+    return halo_read_mask(value) != 0, words[7] != 0, words[8] != 0
+
+
+def halo_checks(value: HaloArgument) -> bool:
+    """Whether a halo argument's publication waits for slot credits (not
+    in a loop body whose schedule proved every slot free)."""
+
+    return value.words[11] != 0
+
+
+def halo_read_mask(value: HaloArgument) -> int:
+    """The declared read fields of a halo argument that may come from a
+    ring (bit k: field k)."""
+
+    words = value.words
+    return sum(
+        1 << k for k in range(HALO_FIELDS) if words[HALO_HEADER_WORDS + 4 * k + 2]
+    )
+
+
+# HfHalo: 12 header words, then 4 per read and 4 per published field, each
+# opening with its interior band [lo, hi).
+HALO_HEADER_WORDS = 12
+HALO_INTERIOR = (0, 2**62)
+HALO_QUIET_WORDS = (0,) * HALO_HEADER_WORDS + (*HALO_INTERIOR, 0, 0) * (2 * HALO_FIELDS)
 
 
 def _size_keys(size: str | tuple[str, ...]) -> tuple[str, ...]:
@@ -357,6 +427,25 @@ class KernelSpec(HydroForgeModel):
     ``workspace`` binds ordinary buffer parameters to model-owned scratch,
     shared by declaration key across kernels. Its dtype is explicit even when
     a conditional workspace is disabled; access modes still govern dependencies.
+
+    ``halo`` declares the buffers the kernel reads across the model's
+    decomposed axis (slab rows or partition-key ghosts), each with the
+    farthest row it reads; ``publishes`` the buffers whose writes it
+    publishes to the peers holding their rows as ghosts. Either adds one
+    parameter, ``halo`` (kind ``halo``), after the declared ones; the
+    framework binds it and schedules exchanges so a kernel finds current
+    ghost rows (see :mod:`hydroforge.kernels.halo` and
+    :mod:`hydroforge.execution.halo_schedule`). Triton kernels leave it out.
+
+    ``contributes`` declares the buffers the kernel adds contributions to,
+    on any stored row: what it adds to a ghost row belongs to that row's
+    owner. The framework sums them into the owners before anything else
+    reads the buffer (and mirrors the sums to a ``halo`` reader), and
+    zeroes the ghost rows before contributions when they hold anything
+    else. Other writes of such a buffer touch owned rows only. A contributed
+    storage cannot also be a halo input or publication of the same call:
+    its ghost rows hold contributions, not copies of the owner's values.
+    It adds no parameter.
     """
 
     name: Identifier
@@ -370,6 +459,11 @@ class KernelSpec(HydroForgeModel):
         Literal["cuda", "triton", "metal"], Annotated[int, Field(ge=1, le=1024)]
     ] = Field(default_factory=dict)
     workspace: FrozenMapping[Identifier, KernelWorkspace] = Field(default_factory=dict)
+    halo: FrozenMapping[Identifier, Annotated[int, Field(ge=1)]] = Field(
+        default_factory=dict
+    )
+    publishes: tuple[Identifier, ...] = ()
+    contributes: tuple[Identifier, ...] = ()
     _precision_parameters: frozenset[str] = PrivateAttr(default_factory=frozenset)
     _derived: _Views | None = PrivateAttr(default=None)
 
@@ -429,8 +523,64 @@ class KernelSpec(HydroForgeModel):
         return self._precision_parameters
 
     @model_validator(mode="after")
+    def _add_halo_access(self) -> Self:
+        """Append the ``halo`` parameter a halo or publishes declaration
+        implies (framework-bound), after field validation.
+
+        A before validator would turn JSON arrays into Python lists before
+        the strict tuple fields can accept them as JSON.
+        """
+
+        if not (self.halo or self.publishes):
+            return self
+        parameters = self.parameters
+        if parameters.get(HALO_PARAMETER, "halo") != "halo":
+            raise ValueError(f"{HALO_PARAMETER} is the framework-bound halo parameter")
+        if HALO_PARAMETER not in parameters:
+            object.__setattr__(
+                self, "parameters", frozen_dict({**parameters, HALO_PARAMETER: "halo"})
+            )
+            self._derived = None
+        return self
+
+    @model_validator(mode="after")
     def _validate_spec(self) -> Self:
         parameters = self.parameters
+        for name in self.halo:
+            if name not in self.buffers:
+                raise ValueError(f"{self.name}: halo {name!r} must name a buffer")
+        if len(self.halo) > HALO_FIELDS:
+            raise ValueError(f"{self.name}: halo names up to {HALO_FIELDS} buffers")
+        if (
+            len(set(self.publishes)) != len(self.publishes)
+            or len(self.publishes) > HALO_FIELDS
+        ):
+            raise ValueError(
+                f"{self.name}: publishes names up to {HALO_FIELDS} unique buffers"
+            )
+        for name in self.publishes:
+            if self.buffers.get(name) not in ("write", "read_write"):
+                raise ValueError(
+                    f"{self.name}: published {name!r} must be a written buffer"
+                )
+        if len(set(self.contributes)) != len(self.contributes):
+            raise ValueError(f"{self.name}: contributes names unique buffers")
+        for name in self.contributes:
+            # Owners sum what every rank adds: the kernel adds too.
+            if self.buffers.get(name) not in ("atomic_add", "read_write"):
+                raise ValueError(
+                    f"{self.name}: contributed {name!r} must be an atomic_add "
+                    "or read_write buffer"
+                )
+            if name in self.publishes:
+                raise ValueError(
+                    f"{self.name}: {name!r} is contributed and published"
+                )
+            if name in self.halo:
+                raise ValueError(
+                    f"{self.name}: {name!r} is contributed and halo; ghost "
+                    "rows cannot hold contributions and owner copies together"
+                )
         for name, declaration in self.workspace.items():
             if (
                 name not in self.buffers
@@ -661,10 +811,14 @@ class KernelSpec(HydroForgeModel):
 
 
 __all__ = [
+    "HaloArgument",
     "KernelSpec",
     "KernelWorkspace",
     "buffer_access_semantics",
     "constant",
+    "halo_checks",
+    "halo_read_mask",
+    "halo_work",
     "literal_value",
     "module_enabled",
     "module_flag",

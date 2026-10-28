@@ -13,8 +13,10 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
+import numpy as np
 import torch
 
+from hydroforge.contracts.precision import precisions_of
 from hydroforge.core.errors import (
     ResourceCleanupError,
     distributed_failure_error,
@@ -32,7 +34,7 @@ from hydroforge.declare.module import AbstractModule, construct_module
 from hydroforge.declare.spec import ModuleBinding
 from hydroforge.execution.channel import LocalChannel, ProcessGroupChannel
 from hydroforge.execution.checkpoint import CheckpointRuntime
-from hydroforge.execution.context import managed_step_active
+from hydroforge.execution.context import managed_step_active, model_call
 from hydroforge.execution.inputs import InputBinding, prepare_payloads, shard_inputs
 from hydroforge.execution.namespace import bind_field_owners, bind_namespace
 from hydroforge.execution.progress import ProgressRuntime, ProgressState
@@ -45,7 +47,7 @@ from hydroforge.execution.structure import (
 )
 from hydroforge.io.construction_input import check_options_fingerprint
 from hydroforge.io.manifest import write_model_manifest
-from hydroforge.kernels.calls import routing
+from hydroforge.kernels.spec import HaloArgument
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -162,10 +164,170 @@ class ModelRuntime:
         self.checkpoint = None
         self.parameters = None
         self.halo = None
+        self.slab = None
+        self.topology = None
+        self._halo_layouts: dict[int, tuple[Any, Any]] = {}
+        # The halo argument of calls with no halo work.
+        self.halo_quiet: HaloArgument | None = None
         self.fixed_parameters: Mapping[str, frozenset[str]] = MappingProxyType({})
         self.missing_inputs: frozenset[str] = frozenset()
         self.progress = None
         self.model_state_entered = False
+
+    def halo_layout(self, tensor: torch.Tensor):
+        """Where a module tensor's decomposed axis is: a field whose shape names
+        the slab axis (cells or faces), or one aligned to the partition key
+        (its leading axis holds the key's owned and ghost rows)."""
+
+        from hydroforge.parallel.halo import CELL, FACE, KEY, FieldLayout
+
+        found = self._halo_layouts.get(id(tensor))
+        if found is not None and found[0] is tensor:
+            return found[1]
+        layout = None
+        for qualified, info in self.plan.fields.slab.items():
+            if info.kind == "interior":
+                continue
+            entry = self.plan.fields.entries[qualified]
+            module = self.modules.get(entry.module)
+            if module is not None and module.__dict__.get(entry.name) is tensor:
+                axis = len(entry.tensor.shape) - 1 - info.position
+                layout = FieldLayout(FACE if info.face else CELL, axis)
+                break
+        halo = self.halo
+        if (
+            layout is None
+            and halo is not None
+            and KEY in halo.plan.kinds
+            and tensor.dim() >= 1
+            and tensor.shape[0] == halo.plan.extent(KEY)
+        ):
+            layout = FieldLayout(KEY, tensor.dim() - 1)
+        if layout is None:
+            raise ValueError(
+                "halo_exchange_ takes module tensors whose shape names the slab "
+                "axis, or whose leading axis holds the partition key's rows"
+            )
+        self._halo_layouts[id(tensor)] = (tensor, layout)
+        return layout
+
+    def spatial_group(self) -> Any:
+        """The process group of this rank's spatial partitions: the mesh's
+        spatial group, or WORLD when the spatial ranks are every rank.
+        Halo and topology ranks are ranks of this group."""
+
+        import torch.distributed as dist
+
+        parallel = self.plan.parallel
+        group = None if parallel is None else parallel.group("spatial")
+        return dist.group.WORLD if group is None else group
+
+    def halo_depth(self, layout: Any) -> int:
+        """Ghost rows on each side of a slab field's rows; 0 for partition
+        key fields (their ghosts are whole rows, read or not)."""
+
+        from hydroforge.parallel.halo import KEY
+
+        return 0 if layout.kind == KEY or self.slab is None else self.slab.halo
+
+    def _build_halo(self) -> None:
+        """Create the halo of the partition's ghost rows and the slab's
+        (collective over the spatial group), its message slots sized for the
+        largest declared or materialized fields."""
+
+        from hydroforge.declare.tensors import ModuleTensors
+        from hydroforge.kernels.halo import attach
+        from hydroforge.parallel.halo import (
+            CELL,
+            FACE,
+            KEY,
+            HaloPlan,
+            HaloRuntime,
+            partition_layouts,
+        )
+        from hydroforge.parallel.slab import slab_layouts
+
+        plan, slab = self.plan, self.slab
+        layouts = {}
+        row_bytes = {}
+        rows = self.partition.halo_rows()
+        if rows is not None:
+            layouts[KEY] = partition_layouts(*rows)
+            extent = layouts[KEY][plan.spatial_rank].extent
+            widths = [
+                value.numel() // extent * value.element_size()
+                for module in self.modules.values()
+                for value in module.__dict__.values()
+                if isinstance(value, torch.Tensor)
+                and value.dim() >= 1
+                and value.shape[0] == extent
+            ]
+            # Declared fields too, computed ones not yet materialized
+            # included, at the widest element.
+            for module in self.modules.values():
+                tensors = ModuleTensors(module)
+                for name in module.spec().tensor_fields:
+                    try:
+                        shape = tensors._expected_shape(name)
+                    except ValueError:
+                        continue
+                    if shape and shape[0] == extent:
+                        widths.append(8 * int(np.prod(shape[1:], dtype=np.int64)))
+            row_bytes[KEY] = max(widths or [8])
+        if slab is not None and slab.world > 1:
+            positions = self.topology.positions()
+            slabs = [
+                type(slab).build(
+                    rank,
+                    slab.world,
+                    slab.total,
+                    slab.halo,
+                    slab.periodic,
+                    positions[rank],
+                )
+                for rank in range(slab.world)
+            ]
+            layouts[CELL] = slab_layouts(slabs, CELL)
+            layouts[FACE] = slab_layouts(slabs, FACE)
+            for qualified, info in plan.fields.slab.items():
+                entry = plan.fields.entries[qualified]
+                module = self.modules.get(entry.module)
+                if module is None or info.kind == "interior":
+                    continue
+                shape = ModuleTensors(module)._expected_shape(entry.name)
+                if shape is None:
+                    continue
+                kind = FACE if info.face else CELL
+                width = 8 * (
+                    int(np.prod(shape, dtype=np.int64)) // max(shape[info.position], 1)
+                )
+                row_bytes[kind] = max(row_bytes.get(kind, 8), width)
+        if not layouts:
+            return
+        self.halo = attach(
+            HaloRuntime(
+                HaloPlan(plan.spatial_rank, layouts),
+                plan.device,
+                plan.backend.name,
+                self.spatial_group(),
+                row_bytes,
+            )
+        )
+        summary = self.halo.summary()
+        emit(
+            self,
+            "info",
+            "model.halo",
+            "Ranks exchange ghost rows of the decomposed axis",
+            rank=plan.rank,
+            kinds=summary["kinds"],
+            ghosts=summary["ghosts"],
+            ghosts_total=summary["ghosts_total"],
+            ghosts_across_nodes=summary["ghosts_across_nodes"],
+            links=summary["links"],
+            skipped=summary["skipped"],
+            **({} if slab is None else {"slab_rows": (slab.start, slab.stop)}),
+        )
 
     def _release(self) -> list[BaseException]:
         """Attempt every release of one materialization; return the failures.
@@ -177,7 +339,7 @@ class ModelRuntime:
 
         releases = [
             resource.close
-            for resource in (self.statistics, self.execution)
+            for resource in (self.statistics, self.execution, self.halo)
             if resource is not None
         ]
         if self.model_state_entered:
@@ -322,7 +484,20 @@ class ModelRuntime:
         )
         if self.input is None:
             self.input = InputBinding(plan, owner.input_proxy, self.event_sink)
-        self.partition = PartitionRuntime(plan, self.input)
+        from hydroforge.parallel.topology import Topology, gather_topology
+
+        # Placement prefers links within a node; every rank knows every node.
+        self.topology = (
+            gather_topology(self.spatial_group())
+            if plan.spatial_world_size > 1
+            else Topology.single(plan.spatial_world_size)
+        )
+        self.partition = PartitionRuntime(plan, self.input, self.topology)
+        # The halo argument of calls with no halo work.
+        self.halo_quiet = HaloArgument.quiet()
+        from hydroforge.execution.slab import build_slab
+
+        self.slab = build_slab(plan, self.input, self.topology)
         # Every input-dependent check completes before any output side effect.
         payloads = prepare_payloads(self, owner.prepare_model_input(shard_inputs(self)))
         changes = LocalParameterCompiler(self, payloads).compile(plan.parameters)
@@ -339,7 +514,8 @@ class ModelRuntime:
                 experiment_name=plan.output.config.experiment,
                 backend=execution.backend.name,
                 device=str(plan.device),
-                precision=plan.precision,
+                precision=precisions_of(plan).compute,
+                storage_precision=precisions_of(plan).storage,
                 mixed_precision=plan.mixed_precision,
                 metal_emulation=plan.metal_emulation,
                 opened_modules=plan.modules,
@@ -386,29 +562,7 @@ class ModelRuntime:
             f"{name}.{field}" for name, fields in missing.items() for field in fields
         )
         self._construct_modules(payloads, missing)
-        halo = self.partition.halo_rows()
-        if halo is not None:
-            import torch.distributed as dist
-
-            from hydroforge.parallel.halo import HaloPlan, HaloRuntime
-
-            self.halo = HaloRuntime(
-                HaloPlan(plan.spatial_rank, *halo),
-                plan.device,
-                plan.backend.name,
-                dist.group.WORLD,
-            )
-            emit(
-                self,
-                "info",
-                "model.halo",
-                "Partition groups split references; ranks exchange halo ghost rows",
-                rank=plan.rank,
-                ghosts=self.halo.plan.n_ghosts,
-                ghosts_total=self.halo.plan.total_ghosts,
-                transport=self.halo.transport,
-                skipped=dict(self.halo.skipped),
-            )
+        self._build_halo()
         modules = tuple(self.modules[name] for name in plan.module_order)
         for module in modules:
             module._tensors.constructed = True
@@ -424,7 +578,7 @@ class ModelRuntime:
         execution.step_fields.prepare_initial(
             self.clock.current_time, self.clock.next_step_seconds
         )
-        with routing(execution.kernel_binding):
+        with model_call(execution):
             owner.initialize_model_state()
         evaluate_after_init(modules)
         self.checkpoint = CheckpointRuntime(self)
@@ -530,6 +684,7 @@ class ModelRuntime:
                     defaults=MappingProxyType(view._default_values),
                     missing=missing[name],
                     ghosts=ghosts,
+                    slab=self.slab,
                 ),
             )
         self.input.clear_cache()

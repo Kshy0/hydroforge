@@ -262,7 +262,7 @@ class ModuleTensors:
         return concrete_tensor_dtype(
             metadata.dtype,
             module.precision,
-            module.mixed_precision,
+            module.storage_dtype,
         )
 
     def _initialize_optional(self) -> None:

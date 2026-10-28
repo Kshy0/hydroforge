@@ -231,16 +231,21 @@ class RtcProgram:
 def program_options(options: tuple[str, ...], *, physics: bool) -> tuple[str, ...]:
     """Runtime-compiler options of a program under the math policy.
 
-    Physics programs follow the math mode.  Framework programs (statistics,
-    step fields, loop control) never contract multiplies and adds, so their
-    results do not depend on how the generated code is structured.
+    No program contracts multiplies and adds unless asked to, so results do
+    not depend on how the generated code around an expression is structured
+    (a kernel compiled with or without halo work, say). Framework programs
+    (statistics, step fields, loop control) never do; physics programs do
+    under fast math (``HYDROFORGE_FAST_MATH``) or when their source options
+    choose ``--fmad`` themselves.
     """
 
     if not physics:
         return ("--fmad=false", *options)
     if CUDA.math.physics_fast_math and "--use_fast_math" not in options:
         return ("--use_fast_math", *options)
-    return options
+    if "--use_fast_math" in options or any(o.startswith("--fmad=") for o in options):
+        return options
+    return ("--fmad=false", *options)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1079,13 +1084,12 @@ class _GraphDriver:
                 "cuGraphAddNode_v2",
                 (pointer(p), p, p, p, ctypes.c_size_t, pointer(_GraphNodeParams)),
             ),
-            ("begin", "cuStreamBeginCapture_v2", (p, i)),
-            ("end", "cuStreamEndCapture", (p, pointer(p))),
             (
-                "add_child",
-                "cuGraphAddChildGraphNode",
-                (pointer(p), p, p, ctypes.c_size_t, p),
+                "begin",
+                "cuStreamBeginCaptureToGraph",
+                (p, p, p, p, ctypes.c_size_t, i),
             ),
+            ("end", "cuStreamEndCapture", (p, pointer(p))),
             (
                 "instantiate",
                 "cuGraphInstantiateWithFlags",
@@ -1131,16 +1135,24 @@ def conditional_graphs(device: torch.device) -> bool:
 class ConditionalWhileGraph:
     """Owns one CUDA conditional-graph ``WHILE`` node and its instantiation.
 
-    The loop body is captured into the node's body graph by
+    The loop body is captured straight into the node's body graph by
     :meth:`begin_capture` / :meth:`end_capture`; the body sets the condition
     through :attr:`handle`.  :meth:`launch` then runs the whole loop from a
     single host launch, and the body runs at least once per launch.
+
+    The body is not a child graph inside the node: the WSL driver (617.42,
+    CUDA 13.2, 2026-10-28) crashes instantiating a WHILE body whose child
+    graph holds a device-to-device copy. When a capture into the body fails
+    (``cuStreamEndCapture`` returns an error and no graph), the same driver
+    crashes destroying the node or its graph, so such a graph and its
+    context retain are left to the process (:meth:`destroy` skips them).
     """
 
     def __init__(self) -> None:
         api = _graph_driver()
         self._device = torch.cuda.current_device()
         self._graph = self._exec = None
+        self._abandoned = False
         # The primary context is the one PyTorch launches into; retaining it
         # keeps the conditional handle's context alive for this graph's life.
         cu_device = ctypes.c_int()
@@ -1193,7 +1205,14 @@ class ConditionalWhileGraph:
         api = _graph_driver()
         with torch.cuda.device(self._device):
             api.check(
-                api.begin(stream_ptr, _CU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
+                api.begin(
+                    stream_ptr,
+                    self._body,
+                    None,
+                    None,
+                    0,
+                    _CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                ),
                 "stream capture begin",
             )
 
@@ -1201,20 +1220,11 @@ class ConditionalWhileGraph:
         api = _graph_driver()
         with torch.cuda.device(self._device):
             captured = ctypes.c_void_p()
-            api.check(api.end(stream_ptr, ctypes.byref(captured)), "stream capture end")
-            with cleanup_on_exit(
-                "captured graph insertion",
-                (
-                    lambda: api.check(
-                        api.destroy(captured), "captured graph destruction"
-                    ),
-                ),
-            ):
-                node = ctypes.c_void_p()
-                api.check(
-                    api.add_child(ctypes.byref(node), self._body, None, 0, captured),
-                    "loop body insertion",
-                )
+            result = api.end(stream_ptr, ctypes.byref(captured))
+            if result:
+                # An invalidated capture into the body (class docstring).
+                self._abandoned = True
+                api.check(result, "stream capture end")
 
     def instantiate(self) -> None:
         api = _graph_driver()
@@ -1242,6 +1252,8 @@ class ConditionalWhileGraph:
         api = _graph_driver()
         executable, graph = self._exec, self._graph
         self._exec = self._graph = self._context = None
+        if getattr(self, "_abandoned", False):
+            return  # left to the process (class docstring)
         with cleanup_on_exit(
             "conditional graph",
             (

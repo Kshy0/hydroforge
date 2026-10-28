@@ -30,9 +30,10 @@ Compile policy
     compile unchanged; so does everything when the required compiler APIs are
     absent or the target is not NVIDIA.
 Launch options
-    :func:`launch_options` resolves a kernel's math options once: physics
-    kernels follow ``HYDROFORGE_FAST_MATH``, framework kernels keep IEEE
-    subnormals.
+    :func:`launch_options` resolves a kernel's math options once: no kernel
+    contracts multiplies and adds into FMA, and framework kernels keep IEEE
+    subnormals, unless ``HYDROFORGE_FAST_MATH`` (physics kernels only) or the
+    launch's own options say otherwise.
 Precision variants
     Triton treats an unannotated Python ``float`` as fp32. A precision-
     dependent scalar is lowered to a typed runtime scalar by rebuilding the
@@ -335,11 +336,14 @@ _LAUNCH_OPTIONS = _IdentityCache()
 def launch_options(kernel: Any, *, physics: bool) -> Mapping[str, Any]:
     """Math options of one JIT kernel, resolved once per active driver.
 
-    Physics kernels follow the math mode; framework kernels always preserve
-    subnormals and never contract multiplies and adds, so their results do
-    not depend on how the generated code is structured. Already lowered
-    launch adapters have no JIT parameters or compiler options. Resolving a
-    kernel's options adopts it into the compile policy.
+    No kernel contracts multiplies and adds unless asked to, so its results
+    do not depend on how the generated code around an expression is
+    structured (as CUDA programs, ``program_options``). Framework kernels
+    never do and always preserve subnormals; physics kernels do under fast
+    math (``HYDROFORGE_FAST_MATH``) or when their launch passes
+    ``enable_fp_fusion`` itself (launch options override these). Already
+    lowered launch adapters have no JIT parameters or compiler options.
+    Resolving a kernel's options adopts it into the compile policy.
     """
 
     if not hasattr(kernel, "params"):
@@ -351,15 +355,15 @@ def launch_options(kernel: Any, *, physics: bool) -> Mapping[str, Any]:
     if cached is not _MISSING and cached[0] is active:
         return cached[1]
     adopt(kernel)
-    options: dict[str, Any] = {} if physics else {"enable_fp_fusion": False}
+    fast = physics and TRITON.math.physics_fast_math
+    options: dict[str, Any] = {"enable_fp_fusion": fast}
     target = active.get_current_target().backend
     if target == "cpu":
-        fast = physics and TRITON.math.physics_fast_math
-        options.update(enable_fast_math=fast, enable_fp_fusion=fast)
+        options["enable_fast_math"] = fast
     if target == "cuda":
         from triton import knobs
 
-        options["enable_reflect_ftz"] = physics and TRITON.math.physics_fast_math
+        options["enable_reflect_ftz"] = fast
         if not knobs.nvidia.libdevice_path:
             libdevice = _toolkit_libdevice()
             if libdevice is not None:

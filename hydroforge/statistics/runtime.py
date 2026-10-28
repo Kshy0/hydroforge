@@ -158,6 +158,7 @@ class StatisticsRuntime:
     on_write_failure: Callable[[BaseException], None] = field(repr=False)
     block_size: int
     base_dtype: torch.dtype = torch.float32
+    storage_dtype: torch.dtype | None = None
     mixed_precision: bool = False
     output_dir: Path | None = None
     rank: int = 0
@@ -868,6 +869,7 @@ class StatisticsRuntime:
             scatter_extents=self.installation.scatter_extents,
             ensemble_size=self.ensemble_size,
             base_dtype=self.base_dtype,
+            storage_dtype=self.storage_dtype,
             mixed_precision=self.mixed_precision,
         )
         for name in self._variable_ops:
@@ -1104,6 +1106,7 @@ class StatisticsRuntime:
             scatter_extents=installation.scatter_extents,
             ensemble_size=self.ensemble_size,
             base_dtype=self.base_dtype,
+            storage_dtype=self.storage_dtype,
             mixed_precision=self.mixed_precision,
         )
         self._activate_compilation(compilation)

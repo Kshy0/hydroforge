@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from hydroforge.compiler.plan import ModelPlan
     from hydroforge.execution.balance import Pieces
     from hydroforge.execution.inputs import InputBinding
+    from hydroforge.parallel.topology import Topology
 
 
 class GroupRankLookup(HydroForgeModel):
@@ -185,8 +186,11 @@ class PartitionRuntime:
     references that are not one-to-one.
     """
 
-    def __init__(self, plan: ModelPlan, source: InputBinding) -> None:
+    def __init__(
+        self, plan: ModelPlan, source: InputBinding, topology: Topology | None = None
+    ) -> None:
         self.schema = plan.fields.partition
+        self.topology = topology
         self.variable_groups = plan.fields.variable_groups
         self.partition_key = plan.spec.partition_key
         self.partition_group = plan.spec.partition_group
@@ -355,8 +359,9 @@ class PartitionRuntime:
                 tree, edges = self._key_edges()
             else:
                 tolerance = None
+            nodes = None if self.topology is None else self.topology.nodes
             self._pieces = balance(
-                self.spatial_world_size, groups, tree, edges, tolerance
+                self.spatial_world_size, groups, tree, edges, tolerance, nodes
             )
         return self._pieces
 
@@ -480,8 +485,6 @@ class PartitionRuntime:
             return f"the model does not exchange the halo of modules {unsupported}"
         if plan.ensemble_size is not None:
             return "halo exchange supports one ensemble member"
-        if plan.device.type != "cuda" or plan.backend.name not in ("cuda", "triton"):
-            return "halo exchange needs the cuda or triton backend on CUDA devices"
         return None
 
     def _require_halo(self, crossing, owned) -> None:

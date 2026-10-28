@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 from abc import ABC
 from collections.abc import Mapping
 from datetime import datetime
@@ -24,10 +25,16 @@ from hydroforge.data.input import InputProxy
 from hydroforge.declare.model import ModelDeclaration
 from hydroforge.execution.context import managed_step_active
 from hydroforge.execution.session import ModelRuntime
+from hydroforge.kernels.calls import recording_sink
 from hydroforge.model.results import ModelResults
 
 if TYPE_CHECKING:
     from hydroforge.execution.partition import GroupRankLookup
+    from hydroforge.parallel.slab import Slab
+
+
+# HYDROFORGE_HALO_PRUNE=0 keeps every requested mirror (for comparisons).
+_PRUNE = os.environ.get("HYDROFORGE_HALO_PRUNE", "1") != "0"
 
 
 class AbstractModel(ModelDeclaration, ABC):
@@ -163,9 +170,10 @@ class AbstractModel(ModelDeclaration, ABC):
 
     @property
     def halo_enabled(self) -> bool:
-        """Whether partition groups split references, so ranks hold ghost rows.
+        """Whether ranks hold ghost rows: partition groups split references,
+        or several ranks share the slab axis.
 
-        ``False`` whenever every group is closed, including on one rank.
+        ``False`` on one rank and whenever every partition group is closed.
         """
 
         return ModelRuntime.of(self).halo is not None
@@ -173,20 +181,83 @@ class AbstractModel(ModelDeclaration, ABC):
     def halo_exchange_(
         self,
         *fields: torch.Tensor,
-        mode: Literal["mirror", "accumulate"],
+        mode: Literal["mirror", "accumulate"] = "mirror",
         clear: torch.Tensor | None = None,
     ) -> None:
-        """Exchange up to three fields of the halo coordinate in a managed step.
+        """Exchange the ghost rows of up to eight fields in a managed step.
 
-        ``"mirror"`` copies owned values to their ghost rows on other ranks;
-        ``"accumulate"`` adds the values on ghost rows to their owners and
-        zeroes the ghosts, and those of ``clear`` too. Recorded like a
-        kernel; a no-op without ghosts. See :mod:`hydroforge.parallel.halo`.
+        Fields are module tensors whose shape names the slab axis (cells or
+        its staggered faces), or whose leading axis holds the partition
+        key's rows; one call may mix them. ``"mirror"`` gives every ghost row
+        its owner's value; ``"accumulate"`` adds the values on ghost rows to
+        their owners and zeroes the ghosts, and those of ``clear`` too.
+        Values travel bit for bit. Recorded like a kernel; a no-op without
+        ghosts. Inside a recorded program a mirror skips the fields whose
+        ghost rows are already current there (nothing wrote them since
+        their last mirror) and receives those a kernel published
+        (``HYDROFORGE_HALO_PRUNE=0`` exchanges every field). Kernels that
+        declare ``halo`` in their spec need no explicit mirror at all. See
+        :mod:`hydroforge.parallel.halo` and
+        :mod:`hydroforge.execution.halo_schedule`.
         """
 
-        halo = ModelRuntime.of(self).halo
-        if halo is not None:
-            halo.exchange(fields, mode, clear)
+        runtime = ModelRuntime.of(self)
+        halo = runtime.halo
+        if halo is None:
+            return
+        schedule = getattr(recording_sink(), "halo_schedule", None)
+        if schedule is not None and not schedule.busy:
+            if mode == "mirror":
+                if _PRUNE:
+                    schedule.request_mirror(fields)
+                else:
+                    halo.mirrors_requested += len(fields)
+                    schedule.mirror(tuple(fields))
+                return
+            schedule.other_exchange(
+                tuple(fields),
+                lambda site: self._halo_exchange(fields, mode, clear, site),
+                mode=mode,
+                clear=clear,
+            )
+            return
+        self._halo_exchange(fields, mode, clear)
+
+    def _halo_exchange(self, fields, mode, clear, site=None) -> None:
+        runtime = ModelRuntime.of(self)
+        layouts = [runtime.halo_layout(tensor) for tensor in fields]
+        runtime.halo.exchange(
+            fields,
+            layouts,
+            mode,
+            clear,
+            None if clear is None else runtime.halo_layout(clear),
+            site=site,
+        )
+
+    @property
+    def slab(self) -> Slab | None:
+        """This rank's rows of the slab axis (``None`` without a ``slab``).
+
+        Its ghost rows exist only with several ranks (:attr:`halo_enabled`);
+        modules read the same geometry as ``module.slab``. Available from
+        ``prepare_model_input`` on.
+        """
+
+        return ModelRuntime.of(self).slab
+
+    def checkpoint_inputs(self) -> Mapping[str, Any]:
+        """Construction values a checkpoint saves instead of the live ones.
+
+        A model whose ``prepare_model_input`` gives each rank only its share
+        of a global table (the point sources inside a slab, say) returns the
+        complete tables by field name, identical on every rank, so a
+        checkpoint restarts on any number of ranks. Called once per
+        materialization, after the model initialized; every save then writes
+        the current values of the returned tensors and arrays.
+        """
+
+        return MappingProxyType({})
 
     def initialize_model_state(self) -> None:
         """Initialize the model state once every module is constructed.

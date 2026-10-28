@@ -26,6 +26,8 @@ import torch
 
 from hydroforge.compiler.partition import bare, coordinate_is_partitioned
 from hydroforge.contracts.fields import cast_declared_tensor
+from hydroforge.contracts.precision import precisions_of
+from hydroforge.contracts.slab import CELL, FACE, INTERIOR
 from hydroforge.core.errors import error_message
 from hydroforge.core.events import EventSink, ModelEvent, emit
 from hydroforge.data.input import select_values
@@ -194,6 +196,7 @@ class InputBinding:
         self._validate_inventory()
         self._validate_declared_sources()
         self.axes = self._compile_axes()
+        self.slab_axes = self._compile_slab_axes()
 
     def _validate_inventory(self) -> None:
         injected = self.proxy.injected_vars
@@ -304,6 +307,17 @@ class InputBinding:
                 )
         return MappingProxyType(axes)
 
+    def _compile_slab_axes(self) -> Mapping[str, tuple[int, str]]:
+        """Stored axis of the slab dimension of each present input field,
+        and its kind (cells, faces or interior rows)."""
+
+        slab: dict[str, tuple[int, str]] = {}
+        for qualified, info in self.plan.fields.slab.items():
+            name = qualified.rsplit(".", 1)[-1]
+            if name in self.proxy and name in self.fields:
+                slab[name] = (self.axes[name] + info.position, info.kind)
+        return MappingProxyType(slab)
+
     def __contains__(self, name: str) -> bool:
         return name in self.proxy
 
@@ -331,6 +345,14 @@ class InputBinding:
         axis = self.axes.get(name, 0)
         mesh = self.plan.parallel
         members = slice(None) if mesh is None else mesh.member_slice
+        if spatial_indices is not None and name in self.slab_axes:
+            # Rows of the slab axis, wherever it sits in the stored shape.
+            selector = [slice(None)] * self.slab_axes[name][0]
+            if axis == 1:
+                selector[0] = members
+            return normalize_selection(
+                (*selector, spatial_indices), self.proxy._shape(name)
+            )
         if spatial_indices is not None:
             selector = (members, spatial_indices) if axis == 1 else spatial_indices
         elif axis == 1:
@@ -434,11 +456,22 @@ def shard_inputs(runtime: ModelRuntime) -> dict[str, Any]:
         group = groups.get(name)
         return (0, "", name) if group is None else (1, group, name)
 
+    slab = runtime.slab
+    rows_of: dict[str, Any] = (
+        {}
+        if slab is None
+        else {kind: slab.rows_of(kind) for kind in (CELL, FACE, INTERIOR)}
+    )
+    sliced: list[str] = []
     for name in sorted(source.fields, key=field_order):
         if name not in source:
             missing.append(name)
             continue
         group = groups.get(name)
+        if group is None and slab is not None and name in source.slab_axes:
+            result[name] = source.read_local(name, rows_of[source.slab_axes[name][1]])
+            sliced.append(name)
+            continue
         if group is None:
             result[name] = source.read_local(name)
             full.append(name)
@@ -477,6 +510,17 @@ def shard_inputs(runtime: ModelRuntime) -> dict[str, Any]:
             fields=tuple(names),
             shape=shape,
             coordinate=group,
+        )
+    if sliced:
+        emit(
+            runtime,
+            "info",
+            "model.data_slab",
+            "Loaded slab rows of grid fields",
+            rank=plan.rank,
+            fields=tuple(sliced),
+            rows=slab.rows,
+            owned=(slab.start, slab.stop),
         )
     if full:
         emit(
@@ -532,7 +576,9 @@ def prepare_payloads(
                 "opened_modules": plan.modules,
                 "rank": plan.spatial_rank,
                 "device": plan.device,
-                "precision": plan.dtype,
+                "precision": precisions_of(plan).field_dtype,
+                "storage_precision": precisions_of(plan).storage_dtype,
+                "matmul_tf32": precisions_of(plan).tf32,
                 "mixed_precision": plan.mixed_precision,
                 "metal_emulation": plan.metal_emulation,
                 "ensemble_size": plan.local_ensemble_size,
@@ -558,6 +604,7 @@ def prepare_payloads(
                     event_sink=runtime.event_sink,
                     prepared=True,
                     ghosts=ghosts,
+                    slab=runtime.slab,
                 ),
                 defer_defaults=True,
             )

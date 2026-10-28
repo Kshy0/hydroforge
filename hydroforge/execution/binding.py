@@ -58,6 +58,34 @@ class BindingResolution:
     owner: str | None = None
 
 
+def _contributions(spec: KernelSpec, arguments: Mapping[str, Any]) -> tuple[torch.Tensor, ...]:
+    """One field per contributed storage, disjoint from this call's copies.
+
+    Like the halo schedule, this contract covers whole storages: different
+    ABI names and views must not give one storage incompatible ghost states.
+    """
+
+    fields: dict[int, tuple[str, torch.Tensor]] = {}
+    for name in spec.contributes:
+        tensor = arguments.get(name)
+        if isinstance(tensor, torch.Tensor):
+            fields.setdefault(tensor.untyped_storage().data_ptr(), (name, tensor))
+    if fields:
+        for name in (*spec.halo, *spec.publishes):
+            tensor = arguments.get(name)
+            if not isinstance(tensor, torch.Tensor) or not tensor.numel():
+                continue
+            found = fields.get(tensor.untyped_storage().data_ptr())
+            if found is not None and found[1].numel():
+                declaration = "halo" if name in spec.halo else "published"
+                raise ValueError(
+                    f"{spec.name}: contributed {found[0]!r} aliases {declaration} "
+                    f"{name!r}; ghost rows cannot hold contributions and owner "
+                    "copies together"
+                )
+    return tuple(tensor for _, tensor in fields.values())
+
+
 class KernelBinder:
     """Complete kernel calls from one model and launch them outside recordings."""
 
@@ -89,8 +117,53 @@ class KernelBinder:
         return any(id(tensor) in self._workspace_sources for tensor in tensors)
 
     def call(self, registry: BackendRegistry, supplied: dict[str, Any]) -> None:
-        """Launch one call of a managed step outside any recording."""
+        """Launch one call of a managed step outside any recording.
 
+        A kernel declaring ``halo`` gets its fields mirrored first, and one
+        declaring ``halo``/``publishes`` an argument describing no ring work:
+        outside a recording nothing tracks which ghost rows are current.
+        One declaring ``contributes`` finds those fields' ghost rows zeroed,
+        and its contributions are summed into their owners after it.
+        """
+
+        spec = registry.spec_for(self.runtime.plan.backend)
+        halo = self.runtime.halo if spec.contributes else None
+        if halo is not None:
+            from hydroforge.kernels.spec import HALO_PARAMETER
+
+            values = dict(supplied)
+            if spec.halo or spec.publishes:
+                values.setdefault(HALO_PARAMETER, self.runtime.halo_quiet)
+            bound, _ = self.arguments(registry, values)
+            sums = _contributions(spec, bound)
+            for tensor in sums:
+                layout = self.runtime.halo_layout(tensor)
+                halo.exchange((), [], "accumulate", tensor, layout)
+            self._launch(registry, spec, supplied)
+            for start in range(0, len(sums), 8):
+                chunk = sums[start : start + 8]
+                halo.exchange(
+                    chunk, [self.runtime.halo_layout(t) for t in chunk], "accumulate"
+                )
+            return
+        self._launch(registry, spec, supplied)
+
+    def _launch(
+        self, registry: BackendRegistry, spec: Any, supplied: dict[str, Any]
+    ) -> None:
+        if spec.halo or spec.publishes:
+            from hydroforge.kernels.spec import HALO_PARAMETER
+
+            supplied = {HALO_PARAMETER: self.runtime.halo_quiet, **supplied}
+            halo = self.runtime.halo
+            if spec.halo and halo is not None:
+                bound, _ = self.arguments(registry, supplied)
+                fields = [bound[name] for name in spec.halo]
+                for start in range(0, len(fields), 8):
+                    chunk = fields[start : start + 8]
+                    halo.exchange(
+                        chunk, [self.runtime.halo_layout(t) for t in chunk], "mirror"
+                    )
         if not supplied:
             cached = self._launch_cache.get(id(registry))
             if cached is not None:
@@ -215,6 +288,7 @@ class KernelBinder:
                 )
             else:
                 result[name] = declared
+        _contributions(spec, arguments)
         return MappingProxyType(result)
 
     def resolve(self, binding: KernelBinding, name: str) -> BindingResolution:

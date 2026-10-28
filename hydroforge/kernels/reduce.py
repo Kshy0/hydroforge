@@ -43,6 +43,7 @@ from typing import Any
 
 import torch
 
+import hydroforge.parallel
 from hydroforge.kernels.cuda import (
     CudaKernel,
     CudaLaunch,
@@ -88,7 +89,8 @@ _SPEC = KernelSpec(
     },
 )
 
-_DIR = Path(__file__).resolve().parent
+# all_reduce.cu and peer.cuh ship with hydroforge.parallel.
+_DIR = Path(hydroforge.parallel.__file__).resolve().parent
 
 
 # --------------------------------------------------------------------------- #
@@ -329,7 +331,7 @@ def _nccl_all_reduce(group: Any) -> BackendRegistry:
         del numel
         dist.all_reduce(values, op=operations[op], group=group)
 
-    kernel = TorchKernel(nccl_all_reduce, compile=False)
+    kernel = TorchKernel(nccl_all_reduce, compile=False, communicates=True)
     return BackendRegistry(
         _NCCL_SPEC, {"cuda": kernel, "triton": kernel, "torch": kernel}
     )

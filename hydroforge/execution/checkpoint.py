@@ -18,12 +18,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, NoReturn
 from uuid import uuid4
 
 import numpy as np
 import torch
 
+from hydroforge.compiler.slab import SlabField
 from hydroforge.core.errors import (
     ResourceCleanupError,
     distributed_failure_error,
@@ -32,6 +34,7 @@ from hydroforge.core.errors import (
 from hydroforge.core.events import emit
 from hydroforge.data.input import InputProxy
 from hydroforge.io.construction_input import (
+    SLAB_COORDINATES,
     merge_construction_parts,
     write_construction_input,
 )
@@ -72,8 +75,11 @@ class _CheckpointSaveStage:
 
 
 def _torch_numpy_dtype(name: str, dtype: torch.dtype) -> np.dtype:
-    """Return the NetCDF-writable NumPy dtype of one Torch dtype."""
+    """Return the NetCDF-writable NumPy dtype of one Torch dtype; 16-bit
+    floats (NetCDF has none) are written as float32, exactly."""
 
+    if dtype in (torch.float16, torch.bfloat16):
+        return np.dtype(np.float32)
     try:
         return torch.empty(0, dtype=dtype, device="cpu").numpy().dtype
     except TypeError as error:
@@ -87,8 +93,11 @@ def _host_copy(name: str, value: Any) -> Any:
     """Detach one construction value into host storage owned by the snapshot."""
 
     if isinstance(value, torch.Tensor):
-        _torch_numpy_dtype(name, value.dtype)
-        return value.detach().to(device="cpu", copy=True).numpy()
+        dtype = _torch_numpy_dtype(name, value.dtype)
+        value = value.detach().to(device="cpu", copy=True)
+        if value.dtype in (torch.float16, torch.bfloat16):
+            value = value.to(torch.float32)
+        return value.numpy().astype(dtype, copy=False)
     if isinstance(value, np.ndarray):
         return np.array(value, order="K", copy=True, subok=False)
     if isinstance(value, np.generic):
@@ -106,6 +115,9 @@ class CheckpointRuntime:
 
     def __init__(self, runtime: Any) -> None:
         self.runtime = runtime
+        # Asked once per materialization, after initialization; every save
+        # reads the current values of what it returned.
+        self.overrides = MappingProxyType(dict(runtime.owner.checkpoint_inputs()))
         fields = self._compile_input_fields()
         self.plan = _CheckpointPlan(
             fields=fields,
@@ -178,8 +190,23 @@ class CheckpointRuntime:
             return _torch_numpy_dtype(name, value.dtype)
         return np.asarray(value).dtype
 
+    def _slab_field(self, name: str) -> SlabField | None:
+        """The slab axis of a field of a multi-rank slab model, by bare name."""
+
+        runtime = self.runtime
+        slab = runtime.slab
+        if slab is None or slab.world == 1:
+            return None
+        for qualified, info in runtime.plan.fields.slab.items():
+            if qualified.rsplit(".", 1)[-1] == name:
+                return info
+        return None
+
     def _local_indices(self, name: str) -> np.ndarray | None:
         runtime = self.runtime
+        info = self._slab_field(name)
+        if info is not None:
+            return runtime.slab.global_rows(info.kind)
         group = runtime.plan.fields.variable_groups.get(name)
         return None if group is None else runtime.partition.rank_indices(group)
 
@@ -191,6 +218,12 @@ class CheckpointRuntime:
     def _owned(self, name: str, value: Any, rank: int | None = None) -> Any:
         """Drop the halo ghost rows another rank owns and saves."""
 
+        info = self._slab_field(name)
+        if info is not None and isinstance(value, torch.Tensor) and rank is not None:
+            rows = self.runtime.slab.owned_slice(info.kind)
+            return value.narrow(
+                value.ndim - rank + info.position, rows.start, rows.stop - rows.start
+            )
         group = self.runtime.plan.fields.variable_groups.get(name)
         if group is None or not isinstance(value, torch.Tensor):
             return value
@@ -201,6 +234,9 @@ class CheckpointRuntime:
         return value.narrow(axis, 0, value.shape[axis] - ghosts)
 
     def _field_value(self, field: _InputField) -> Any:
+        overrides = self.overrides
+        if field.name in overrides:
+            return overrides[field.name]
         value = getattr(field.module, field.name)
         if value is None:
             return self._local_input_value(field.name)
@@ -214,6 +250,7 @@ class CheckpointRuntime:
         runtime = self.runtime
         source = runtime.input
         groups = runtime.plan.fields.variable_groups
+        overrides = self.overrides
         fields: dict[str, _InputField] = {}
         for name, spec in source.fields.items():
             info = spec.field
@@ -224,8 +261,8 @@ class CheckpointRuntime:
             module = runtime.modules[info.module_name]
             if name in module.nc_excluded_fields or info.excluded:
                 continue
-            value = getattr(module, name)
-            if tensor is not None:
+            value = overrides[name] if name in overrides else getattr(module, name)
+            if tensor is not None and name not in overrides:
                 value = self._owned(name, value, len(tensor.shape))
             if (
                 tensor is None
@@ -254,6 +291,9 @@ class CheckpointRuntime:
                 shape = metadata[0]
                 dtype = self._numpy_dtype(name, metadata[1])
             coordinate = groups.get(name)
+            slab_info = self._slab_field(name)
+            if slab_info is not None:
+                coordinate = SLAB_COORDINATES[slab_info.kind]
             fields[name] = _InputField(
                 name=name,
                 module_name=info.module_name,
@@ -263,9 +303,11 @@ class CheckpointRuntime:
                 numpy_dtype=dtype,
                 coordinate=coordinate,
                 partition_axis=(
-                    len(shape) - len(info.tensor.shape)
-                    if coordinate is not None
-                    else None
+                    None
+                    if coordinate is None
+                    else len(shape)
+                    - len(info.tensor.shape)
+                    + (0 if slab_info is None else slab_info.position)
                 ),
             )
         return tuple(fields[name] for name in sorted(fields))
@@ -320,6 +362,14 @@ class CheckpointRuntime:
             groups[group_name] = coordinate
             distributed.append(group_name)
 
+        slab = runtime.slab
+        for kind, coordinate in SLAB_COORDINATES.items():
+            if coordinate in set(groups.values()):
+                # The owned global rows identify every part's rows; the merge
+                # joins parts by them and does not keep them.
+                values[coordinate] = slab.global_rows(kind)
+                groups[coordinate] = coordinate
+                distributed.append(coordinate)
         for coordinate in sorted(set(groups.values())):
             if coordinate in values:
                 continue
@@ -482,7 +532,11 @@ class CheckpointRuntime:
             runtime.require_healthy(f"{type(runtime.owner).__name__}.save_state")
             # Validate the layout before any side effect (statistics flush).
             for field in self.plan.fields:
-                if field.coordinate is not None and field.partition_axis != 0:
+                if (
+                    field.coordinate is not None
+                    and field.partition_axis != 0
+                    and field.coordinate not in SLAB_COORDINATES.values()
+                ):
                     raise ValueError(
                         f"checkpoint field {field.name!r} is partitioned on axis "
                         f"{field.partition_axis}; construction inputs partition "
@@ -511,6 +565,11 @@ class CheckpointRuntime:
         part = parts[plan.rank]
         options = plan.output.config.checkpoint_netcdf
         single = plan.world_size == 1
+        axes = {
+            field.name: field.partition_axis
+            for field in self.plan.fields
+            if field.coordinate is not None and field.partition_axis
+        }
         # Restarts compare the model's parameter options with these.
         fingerprint = {"options": plan.options, "opened_modules": plan.modules}
 
@@ -532,6 +591,7 @@ class CheckpointRuntime:
                 part,
                 stage.values,
                 partitions=stage.groups,
+                axes=axes,
                 netcdf_options=options if single else {},
                 **(fingerprint if single else {}),
             )
@@ -547,6 +607,7 @@ class CheckpointRuntime:
                     temporary,
                     parts,
                     partitions=stage.groups,
+                    axes=axes,
                     netcdf_options=options,
                     **fingerprint,
                 )

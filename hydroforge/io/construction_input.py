@@ -189,10 +189,23 @@ def check_options_fingerprint(
         )
 
 
+# Row coordinates of slab-decomposed grid fields: a part's global rows join
+# the parts along the field's slab axis and are not kept in the merged file.
+SLAB_COORDINATES = {
+    "cell": "hf_slab_rows",
+    "face": "hf_slab_faces",
+    "interior": "hf_slab_interior",
+}
+TRANSIENT_COORDINATES = frozenset(SLAB_COORDINATES.values())
+
+
 def construction_dims(
-    name: str, ndim: int, *, partition: str | None
+    name: str, ndim: int, *, partition: str | None, axis: int = 0
 ) -> tuple[str, ...]:
-    """Return the dimension names of one construction-input variable."""
+    """Return the dimension names of one construction-input variable.
+
+    A partitioned variable names its ``axis`` after the group.
+    """
 
     dims = [f"{name}_dim{axis}" for axis in range(ndim)]
     if partition is not None:
@@ -201,7 +214,7 @@ def construction_dims(
                 f"construction input {name!r} is partitioned by {partition!r} "
                 "but has no axis"
             )
-        dims[0] = partition
+        dims[axis] = partition
     return tuple(dims)
 
 
@@ -219,8 +232,11 @@ def _plan_variables(
     layouts: Mapping[str, tuple[np.dtype, tuple[int, ...]]],
     partitions: Mapping[str, str],
     netcdf_options: Mapping[str, Any],
+    axes: Mapping[str, int] | None = None,
 ) -> dict[str, _VariablePlan]:
     """Bind the entire file schema before opening a destructive write handle."""
+
+    axes = axes or {}
 
     missing = set(partitions).union(partitions.values()).difference(layouts)
     if missing:
@@ -257,7 +273,9 @@ def _plan_variables(
             raise TypeError(
                 f"construction input {name!r} has unsupported NetCDF dtype {dtype}"
             )
-        dims = construction_dims(name, len(shape), partition=partitions.get(name))
+        dims = construction_dims(
+            name, len(shape), partition=partitions.get(name), axis=axes.get(name, 0)
+        )
         for dim, size in zip(dims, shape, strict=True):
             validate_netcdf_name(dim)
             canonical = normalize("NFC", dim)
@@ -316,8 +334,11 @@ def write_construction_input(
     netcdf_options: NetCDFOptions,
     options: InstanceOf[OptionsConfig] | None = None,
     opened_modules: tuple[str, ...] | None = None,
+    axes: Mapping[str, int] | None = None,
 ) -> None:
     """Write host arrays and scalars as one construction-input file.
+
+    ``axes`` gives the partitioned axis of a variable when it is not the first.
 
     ``partitions`` maps each partitioned variable, including the group's
     coordinate variable, to its coordinate group; ``netcdf_options`` are
@@ -337,6 +358,7 @@ def write_construction_input(
         {name: (value.dtype, value.shape) for name, value in arrays.items()},
         partitions,
         netcdf_options,
+        axes,
     )
     ensure_hdf5_plugins()
     if options is None and opened_modules is not None:
@@ -366,12 +388,16 @@ def _read(part: Path, variable: Any, name: str) -> np.ndarray:
     return values
 
 
-def _same_layout(values: np.ndarray, plan: _VariablePlan) -> bool:
+def _same_layout(values: np.ndarray, plan: _VariablePlan, axis: int = 0) -> bool:
     # A string's width is a property of its values, not of the variable.
     same_dtype = (
         values.dtype == plan.dtype or values.dtype.kind == plan.dtype.kind == "U"
     )
-    return same_dtype and values.shape[1:] == plan.shape[1:]
+    return (
+        same_dtype
+        and values.shape[:axis] == plan.shape[:axis]
+        and values.shape[axis + 1 :] == plan.shape[axis + 1 :]
+    )
 
 
 @validate_call(config=HydroForgeModel.model_config)
@@ -383,16 +409,22 @@ def merge_construction_parts(
     netcdf_options: NetCDFOptions,
     options: InstanceOf[OptionsConfig] | None = None,
     opened_modules: tuple[str, ...] | None = None,
+    axes: Mapping[str, int] | None = None,
 ) -> None:
     """Concatenate rank-local construction parts into one file.
 
     Every partitioned variable occurs in every part and is concatenated along
-    its group axis in part order; the other variables come from part zero
-    only, whose variable order the merged file keeps.  Coordinate IDs must be
-    unique across the parts. ``options`` and ``opened_modules`` record the
-    merged file's option fingerprint as in :func:`write_construction_input`.
+    its group axis (the first unless ``axes`` says otherwise) in part order,
+    or, along a slab coordinate (:data:`SLAB_COORDINATES`), in the order of
+    that coordinate's global rows, which must cover the axis exactly;
+    the other variables come from part zero only, whose variable order the
+    merged file keeps.  Coordinate IDs must be unique across the parts, and
+    the slab row coordinates (:data:`TRANSIENT_COORDINATES`) are not kept.
+    ``options`` and ``opened_modules`` record the merged file's option
+    fingerprint as in :func:`write_construction_input`.
     """
 
+    axes = axes or {}
     input_identities = set()
     for part in parts:
         status = part.stat()
@@ -439,7 +471,12 @@ def merge_construction_parts(
                             f"boolean NetCDF variable {name!r} must use i1/u1 storage"
                         )
                     dtype = np.dtype(bool)
-                signature = (dtype, variable.shape[1:], logical)
+                cut = axes.get(name, 0) if name in partitions else 0
+                signature = (
+                    dtype,
+                    (*variable.shape[:cut], *variable.shape[cut + 1 :]),
+                    logical,
+                )
                 if index == 0:
                     signatures[name] = signature
                     layouts[name] = (dtype, variable.shape)
@@ -459,26 +496,48 @@ def merge_construction_parts(
             for name, group in partitions.items():
                 shape = dataset.variables[name].shape
                 length = coordinates[group][index].size
-                if not shape or shape[0] != length:
+                if (
+                    len(shape) <= axes.get(name, 0)
+                    or shape[axes.get(name, 0)] != length
+                ):
                     raise ValueError(
                         f"construction part {str(part)!r} variable {name!r} does "
                         f"not match the length {length} of coordinate group {group!r}"
                     )
+        # Slab blocks follow node order, not rank order: each slab
+        # coordinate joins its parts by its own global rows, which must then
+        # cover the axis in order; other groups keep part order.
+        orders = {}
         for group, pieces in coordinates.items():
+            order = list(range(len(parts)))
+            if group in TRANSIENT_COORDINATES:
+                order.sort(key=lambda i: int(pieces[i][0]) if pieces[i].size else -1)
+                ids = np.concatenate([pieces[i] for i in order])
+                if not np.array_equal(ids, np.arange(ids.size)):
+                    raise ValueError(
+                        f"construction slab coordinate {group!r} does not cover "
+                        f"rows 0..{ids.size - 1} exactly once in block order"
+                    )
             ids = np.concatenate(pieces)
             if np.unique(ids).size != ids.size:
                 raise ValueError(
                     f"construction coordinate {group!r} contains duplicate IDs "
                     "across parts"
                 )
+            orders[group] = order
 
         for name, group in partitions.items():
             dtype, shape = layouts[name]
+            cut = axes.get(name, 0)
             layouts[name] = (
                 dtype,
-                (sum(piece.size for piece in coordinates[group]), *shape[1:]),
+                (
+                    *shape[:cut],
+                    sum(piece.size for piece in coordinates[group]),
+                    *shape[cut + 1 :],
+                ),
             )
-        plans = _plan_variables(layouts, partitions, netcdf_options)
+        plans = _plan_variables(layouts, partitions, netcdf_options, axes)
         if options is None and opened_modules is not None:
             raise ValueError("opened_modules requires options")
         attributes = (
@@ -491,6 +550,8 @@ def merge_construction_parts(
                 merged.setncattr(name, value)
             for name, plan in plans.items():
                 group = partitions.get(name)
+                if name in TRANSIENT_COORDINATES:
+                    continue
                 if group is None:
                     _write(
                         merged,
@@ -501,19 +562,21 @@ def merge_construction_parts(
                     continue
                 variable = _create(merged, name, plan)
                 offset = 0
-                for index, (part, dataset) in enumerate(
-                    zip(parts, datasets, strict=True)
-                ):
+                for index in orders[group]:
+                    part, dataset = parts[index], datasets[index]
                     values = (
                         coordinates[name][index]
                         if name == group
                         else _read(part, dataset.variables[name], name)
                     )
                     # Actual decode is a new value boundary even after schema preflight.
-                    if not _same_layout(values, plan):
+                    if not _same_layout(values, plan, axes.get(name, 0)):
                         raise TypeError(
                             f"construction part {str(part)!r} variable {name!r} changed decoded layout"
                         )
-                    end = offset + values.shape[0]
-                    variable[offset:end, ...] = values.astype(plan.storage, copy=False)
+                    cut = axes.get(name, 0)
+                    end = offset + values.shape[cut]
+                    variable[(slice(None),) * cut + (slice(offset, end),)] = (
+                        values.astype(plan.storage, copy=False)
+                    )
                     offset = end

@@ -32,6 +32,7 @@ from hydroforge.contracts.runtime import (
     ModuleRequirement,
 )
 from hydroforge.contracts.schedule import SimulationSchedule, SpinupSchedule
+from hydroforge.contracts.slab import SlabAxis
 from hydroforge.contracts.step_fields import (
     StepField,
     StepTime,
@@ -65,6 +66,7 @@ __all__ = [
     "FieldDemandPlan",
     "ForcingOptionField",
     "GridAxis",
+    "SlabAxis",
     "HydroForgeOptionWarning",
     "Indices",
     "ModuleRequirement",

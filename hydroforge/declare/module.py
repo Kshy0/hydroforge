@@ -823,16 +823,28 @@ class AbstractModule(HydroForgeModel, ABC):
     )
     precision: torch.dtype = Field(
         default=torch.float32,
-        description="Data type for tensors",
+        description="Elements of float tensors (the compute tier)",
+    )
+    storage_precision: torch.dtype | None = Field(
+        default=None,
+        description=(
+            "Elements of hpfloat tensors (the storage tier); None promotes "
+            "them as mixed_precision says"
+        ),
+    )
+    matmul_tf32: bool = Field(
+        default=False,
+        strict=True,
+        description="Torch matrix products and convolutions run on TF32",
     )
     metal_emulation: Literal["native", "float32x2"] = "native"
     mixed_precision: bool = Field(
         default=True,
         strict=True,
         description=(
-            "Enable mixed precision for hpfloat tensors (storage variables).\n"
-            "When True, hpfloat tensors are promoted one level above base precision:\n"
-            "  float32 → float64, float64 → float64 (no promotion)."
+            "Whether hpfloat tensors hold more than float tensors. Without "
+            "storage_precision they are promoted one level above the compute "
+            "tier: 16-bit → float32, float32 → float64, float64 → float64."
         ),
     )
     ensemble_size: int | None = Field(
@@ -853,6 +865,17 @@ class AbstractModule(HydroForgeModel, ABC):
 
     _binding: ModuleBinding = PrivateAttr()
     _tensors: ModuleTensors = PrivateAttr()
+
+    @property
+    def storage_dtype(self) -> torch.dtype:
+        """Elements of this module's hpfloat tensors."""
+
+        if self.storage_precision is not None:
+            return self.storage_precision
+        from hydroforge.contracts.precision import resolve_precisions, tier_of
+
+        tiers = resolve_precisions(tier_of(self.precision), None, self.mixed_precision)
+        return tiers.storage_dtype
 
     @classmethod
     def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
@@ -898,6 +921,17 @@ class AbstractModule(HydroForgeModel, ABC):
         """
 
         return self._binding.missing
+
+    @property
+    def slab(self) -> Any:
+        """This rank's rows of the model's slab axis, or ``None``.
+
+        A :class:`~hydroforge.parallel.slab.Slab`: the owned and ghost rows
+        and the global row each stored row holds, for kernels whose logic
+        depends on the position in the whole domain.
+        """
+
+        return self._binding.slab
 
     def owned_rows(self, coordinate: str) -> int:
         """Rows of ``coordinate`` this rank owns, before its halo ghost rows.

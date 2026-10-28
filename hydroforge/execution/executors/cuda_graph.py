@@ -22,8 +22,12 @@ from hydroforge.execution.executors.eager import (
     EagerAdaptive,
     EagerFixed,
     EagerPredicate,
+    host_adaptive,
 )
-from hydroforge.execution.loops import distributed_capture_safe
+from hydroforge.execution.loops import (
+    conditional_capture_safe,
+    distributed_capture_safe,
+)
 from hydroforge.execution.operators import launch_operators, rollback_tensors
 from hydroforge.kernels.backends.cuda_control import (
     StatisticsControls,
@@ -94,6 +98,9 @@ class CudaGraphExecutor(LoopExecutor):
         self._capture_stream: torch.cuda.Stream | None = None
         self._statistics_graph: tuple[Any, torch.cuda.CUDAGraph] | None = None
         self._requested: set[str] = set()
+        # How each kind of loop last ran: "device" (conditional graph),
+        # "graph" (replayed batches), "host" (driven per launch).
+        self.loop_modes: dict[str, str] = {}
 
     def compile_requests(self, statistics: bool) -> tuple[CompileRequest, ...]:
         """The loop control programs not yet requested; statistics folding
@@ -171,6 +178,7 @@ class CudaGraphExecutor(LoopExecutor):
                         body()
                 current.wait_stream(side)
                 self._restore(state, snapshot)
+                self._refresh_halo()
             except BaseException as primary:
                 self._abort_capture(
                     primary,
@@ -251,6 +259,7 @@ class CudaGraphExecutor(LoopExecutor):
                 graph.instantiate()
             current.wait_stream(side)
             self._restore(state, snapshot)
+            self._refresh_halo()
         except BaseException as primary:
             self._abort_capture(
                 primary,
@@ -265,6 +274,13 @@ class CudaGraphExecutor(LoopExecutor):
             finalizer=partial(self._destroy_pooled, graph, device_index, pool, True),
         )
         return graph
+
+    def _refresh_halo(self) -> None:
+        """Warm-ups ran a loop body whose rings carry over: send them
+        again from the restored state (``halo_refresh``)."""
+
+        if self.halo_refresh is not None and self.warmup_iterations:
+            self.halo_refresh()
 
     @staticmethod
     def _destroy_pooled(
@@ -337,19 +353,33 @@ class CudaGraphExecutor(LoopExecutor):
 
     def fixed(self, loop: Any) -> Any:
         if self._eager_fallback(*loop.programs):
+            self.loop_modes["fixed"] = "host"
             return EagerFixed(loop)
+        self.loop_modes["fixed"] = "graph"
         if not all(program.cuda_graph_capture_safe for program in loop.programs):
             return _SegmentedFixed(self, loop)
         return _Fixed(self, loop)
 
     def adaptive(self, loop: Any) -> Any:
-        if self._eager_fallback(*loop.programs):
+        programs = loop.programs
+        if self._eager_fallback(*programs):
+            self.loop_modes["adaptive"] = "host"
             return EagerAdaptive(loop)
+        if not conditional_capture_safe(*programs):
+            if all(program.cuda_graph_capture_safe for program in programs):
+                # Process-group kernels (NCCL) replay in ordinary graphs.
+                self.loop_modes["adaptive"] = "graph"
+                return _HostAdaptive(self, loop)
+            self.loop_modes["adaptive"] = "host"
+            return EagerAdaptive(loop)
+        self.loop_modes["adaptive"] = "device"
         return _Adaptive(self, loop)
 
     def predicate(self, loop: Any) -> Any:
-        if self._eager_fallback(loop.body):
+        if self._eager_fallback(loop.body) or not conditional_capture_safe(loop.body):
+            self.loop_modes["predicate"] = "host"
             return EagerPredicate(loop)
+        self.loop_modes["predicate"] = "device"
         return _Predicate(self, loop)
 
     def outer(self, program: Any) -> Any:
@@ -683,6 +713,42 @@ class _Adaptive:
         graphs = tuple(graph for _launch, graph in self.graphs.values())
         self.graphs.clear()
         self.executor.release_all(graphs, scope="adaptive loop graphs")
+
+
+class _HostAdaptive:
+    """An adaptive loop the host drives, one captured graph per iteration.
+
+    Kernels that communicate through a process group (NCCL send/receive or
+    all-reduce) can be captured in an ordinary graph but not in a
+    conditional one, so the host keeps the WHILE: it replays the iteration
+    (proposal, width controls and body) and reads the status word after
+    each, as :class:`EagerAdaptive` does after its operator launches.
+    """
+
+    def __init__(self, executor: CudaGraphExecutor, loop: Any) -> None:
+        self.executor = executor
+        self.loop = loop
+        self.graph: Any = None
+
+    def run(self, duration: float, step: Any) -> int:
+        loop = self.loop
+        if self.graph is None:
+            # Warm-ups and capture start from a reset loop, as every run does.
+            loop.reset()
+            self.graph = self.executor.capture(
+                loop.iterate,
+                mutated_state=(
+                    *loop.control_state,
+                    *loop.proposal.rollback_tensors,
+                    *loop.body.rollback_tensors,
+                ),
+            )
+        return host_adaptive(loop, step, self.graph.replay, loop.status_sources)
+
+    def close(self) -> None:
+        graph, self.graph = self.graph, None
+        if graph is not None:
+            self.executor.release(graph)
 
 
 class _Predicate:

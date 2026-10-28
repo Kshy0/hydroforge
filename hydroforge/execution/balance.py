@@ -18,6 +18,11 @@ one crossing the fewest references per moved row, so a rank fills with a few
 cheap sub-basins. The rank keeps receiving pieces of the group until it is
 full; the rest of the group continues on the next one. Every rank computes
 the same pieces from the same global inputs.
+
+Ranks on several nodes are filled node first: the groups (cut only if they
+do not balance over the nodes, each weighted by its ranks) are placed on
+nodes, then each node's rows on its ranks, so a group cut to balance the
+ranks of a node exchanges its halo within that node, over its fastest links.
 """
 
 from __future__ import annotations
@@ -64,13 +69,15 @@ def _groups(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 @njit(cache=True)
-def _greedy(world: int, sizes: np.ndarray) -> np.ndarray:
+def _greedy(weights: np.ndarray, sizes: np.ndarray) -> np.ndarray:
+    """Largest group first on the least loaded bin (load per weight)."""
+
     order = np.argsort(sizes, kind="mergesort")
-    loads = np.zeros(world, np.int64)
+    loads = np.zeros(weights.size, np.float64)
     ranks = np.empty(sizes.size, np.int64)
     for position in range(order.size - 1, -1, -1):
         item = order[position]
-        rank = int(np.argmin(loads))
+        rank = int(np.argmin(loads / weights))
         ranks[item] = rank
         loads[rank] += sizes[item]
     return ranks
@@ -236,7 +243,7 @@ def _cheaper(cost: int, size: int, best_cost: int, best_size: int) -> bool:
 
 @njit(cache=True)
 def _split(
-    world: int,
+    weights: np.ndarray,
     dense: np.ndarray,
     sizes: np.ndarray,
     parent: np.ndarray,
@@ -262,9 +269,11 @@ def _split(
 
     n = dense.size
     groups = sizes.size
-    mean = n / world
+    world = weights.size
+    # Each bin's share of the rows follows its weight.
+    mean = n * weights / weights.sum()
     capacity = mean * (1.0 + tolerance)
-    window = max(1.0, 0.5 * tolerance * mean)
+    window = np.maximum(1.0, 0.5 * tolerance * mean)
     # Rows of each group in Euler order, and its edges.
     first = np.zeros(groups + 1, np.int64)
     for v in range(n):
@@ -304,7 +313,7 @@ def _split(
     piece = dense.copy()
     taken = np.zeros(n, np.bool_)
     ranks = np.full(groups + 2 * n, -1, np.int64)
-    loads = np.zeros(world, np.int64)
+    loads = np.zeros(world, np.float64)
     pieces = groups
     slots = 8
     above = np.empty(slots, np.int64)
@@ -313,13 +322,13 @@ def _split(
         r = -1
         while True:
             # A rank keeps receiving pieces of the group until it is full.
-            if r < 0 or loads[r] >= mean - window:
-                r = int(np.argmin(loads))
-            if loads[r] + left <= capacity or left <= 1:
+            if r < 0 or loads[r] >= mean[r] - window[r]:
+                r = int(np.argmin(loads / weights))
+            if loads[r] + left <= capacity[r] or left <= 1:
                 ranks[g] = r
                 loads[r] += left
                 break
-            limit = capacity - loads[r]
+            limit = capacity[r] - loads[r]
             for position in range(first[g], first[g + 1]):
                 cross[members[position]] = 0
             for e in range(edge_first[g], edge_first[g + 1]):
@@ -407,9 +416,47 @@ def _split(
     return piece, ranks[:pieces]
 
 
-def _imbalance(world: int, ranks: np.ndarray, sizes: np.ndarray) -> float:
-    loads = np.bincount(ranks, weights=sizes, minlength=world)
-    return float(loads.max() / loads.mean() - 1.0) if loads.sum() else 0.0
+def _imbalance(weights: np.ndarray, ranks: np.ndarray, sizes: np.ndarray) -> float:
+    """How far the heaviest bin's load per weight exceeds the mean: all
+    rows over all weight (a node of three ranks weighs three)."""
+
+    loads = np.bincount(ranks, weights=sizes, minlength=weights.size)
+    total = loads.sum()
+    if not total:
+        return 0.0
+    return float((loads / weights).max() / (total / weights.sum()) - 1.0)
+
+
+def _place(
+    weights: np.ndarray,
+    dense: np.ndarray,
+    sizes: np.ndarray,
+    tree: tuple[np.ndarray, np.ndarray],
+    a: np.ndarray,
+    b: np.ndarray,
+    tolerance: float | None,
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Piece of every row (dense), bin of every piece, and whether any group
+    was cut: whole groups when they balance, else cut groups."""
+
+    ranks = _greedy(weights, sizes)
+    if tolerance is None or _imbalance(weights, ranks, sizes) <= tolerance:
+        return dense, ranks, False
+    parent, enter, leave, rows = _forest(dense, *tree, a, b)
+    piece, ranks = _split(
+        weights, dense, sizes, parent, enter, leave, rows, a, b, float(tolerance)
+    )
+    return piece, ranks, True
+
+
+def _within(rows: np.ndarray, pairs: tuple[np.ndarray, np.ndarray], size: int):
+    """The pairs with both ends in ``rows``, renumbered to positions in it."""
+
+    local = np.full(size, -1, np.int64)
+    local[rows] = np.arange(rows.size)
+    left, right = local[pairs[0]], local[pairs[1]]
+    keep = (left >= 0) & (right >= 0)
+    return left[keep], right[keep]
 
 
 def balance(
@@ -418,6 +465,7 @@ def balance(
     tree: tuple[np.ndarray, np.ndarray],
     edges: tuple[np.ndarray, np.ndarray],
     tolerance: float | None,
+    nodes: tuple[int, ...] | None = None,
 ) -> Pieces:
     """Partition ids of the key rows over ``world`` ranks.
 
@@ -426,21 +474,48 @@ def balance(
     (``downstream``), along which groups are cut; ``edges`` the row pairs of
     every crossing reference, which a cut separates at a cost.
     ``tolerance`` is the allowed fraction above the mean load; ``None``
-    never cuts a group.
+    never cuts a group. ``nodes`` holds the node of every rank: groups are
+    then placed on nodes first, and cut within a node where they can.
     """
 
     dense, sizes = _groups(groups)
-    ranks = _greedy(world, sizes)
     a, b = edges
     keep = a != b
     a, b = a[keep], b[keep]
-    if tolerance is None or _imbalance(world, ranks, sizes) <= tolerance:
-        return _pieces(world, groups, dense, ranks, a, b, split=False)
-    parent, enter, leave, rows = _forest(dense, *tree, a, b)
-    piece, ranks = _split(
-        world, dense, sizes, parent, enter, leave, rows, a, b, float(tolerance)
-    )
-    return _pieces(world, piece, piece, ranks, a, b, split=True)
+    ones = np.ones(world, np.float64)
+    if nodes is None or len(set(nodes)) == 1:
+        piece, ranks, split = _place(ones, dense, sizes, tree, a, b, tolerance)
+        ids = groups if not split else piece
+        return _pieces(world, ids, piece, ranks, a, b, split=split)
+    if tolerance is None or _imbalance(ones, _greedy(ones, sizes), sizes) <= tolerance:
+        # Whole groups balance the ranks: no halo, nothing to keep in a node.
+        return _pieces(world, groups, dense, _greedy(ones, sizes), a, b, split=False)
+    labels = sorted(set(nodes))
+    members = [[r for r in range(world) if nodes[r] == label] for label in labels]
+    weights = np.array([len(m) for m in members], np.float64)
+    piece, node_of, split = _place(weights, dense, sizes, tree, a, b, tolerance)
+    final = np.empty(dense.size, np.int64)
+    ranks: list[int] = []
+    for node, ranks_of_node in enumerate(members):
+        rows = np.flatnonzero(node_of[piece] == node)
+        if rows.size == 0:
+            continue
+        local_dense, local_sizes = _groups(piece[rows])
+        local_tree = _within(rows, tree, dense.size)
+        local_a, local_b = _within(rows, (a, b), dense.size)
+        local_piece, local_ranks, cut = _place(
+            np.ones(len(ranks_of_node), np.float64),
+            local_dense,
+            local_sizes,
+            local_tree,
+            local_a,
+            local_b,
+            tolerance,
+        )
+        split = split or cut
+        final[rows] = len(ranks) + local_piece
+        ranks.extend(ranks_of_node[int(r)] for r in local_ranks)
+    return _pieces(world, final, final, np.array(ranks, np.int64), a, b, split=split)
 
 
 def _pieces(
@@ -462,6 +537,6 @@ def _pieces(
         ranks=np.ascontiguousarray(ranks[dense[order]], dtype=np.int64),
         split=split,
         pieces=int(ranks.size),
-        imbalance=_imbalance(world, ranks, sizes),
+        imbalance=_imbalance(np.ones(world, np.float64), ranks, sizes),
         cut=int(np.count_nonzero(row_ranks[a] != row_ranks[b])),
     )

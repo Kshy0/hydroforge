@@ -25,6 +25,7 @@ from hydroforge.compiler.fields import (
 from hydroforge.compiler.partition import bare, coordinate_identity, coordinate_index
 from hydroforge.compiler.selection import Selection
 from hydroforge.contracts.fields import concrete_tensor_dtype
+from hydroforge.contracts.precision import precisions_of
 from hydroforge.contracts.views import OutputView
 from hydroforge.contracts.windows import EveryStep, StatisticsOutput, StatisticsPlan
 from hydroforge.core.arrays import torch_to_numpy_dtype
@@ -41,6 +42,7 @@ from hydroforge.core.expr import (
 from hydroforge.core.graph import dependency_order
 from hydroforge.core.naming import sanitize_symbol
 from hydroforge.io.netcdf.encoding import netcdf_dtype_encoding
+from hydroforge.io.netcdf.encoding import saved_dtype as saved_dtype_of
 from hydroforge.io.netcdf.options import prepare_netcdf_variable_options
 from hydroforge.statistics.ir import StatisticsDeclaration, StatisticsProgram
 from hydroforge.statistics.phases import CONTROL_STATE
@@ -277,8 +279,8 @@ class StatisticsDeclarationCompiler:
                 value_expression,
                 concrete_tensor_dtype(
                     reference[3] if target_metadata is None else target_metadata[3],
-                    self.selection.dtype,
-                    self.selection.mixed_precision,
+                    precisions_of(self.selection).field_dtype,
+                    precisions_of(self.selection).storage_dtype,
                 ),
             )
         return reference if target_metadata is None else target_metadata
@@ -330,12 +332,14 @@ class StatisticsDeclarationCompiler:
             f"axis_{index}" for index in range(1 + len(shape) + int(batched))
         )
         tensor_dtype = concrete_tensor_dtype(
-            dtype, self.selection.dtype, self.selection.mixed_precision
+            dtype,
+            precisions_of(self.selection).field_dtype,
+            precisions_of(self.selection).storage_dtype,
         )
-        saved_dtype = tensor_dtype
         precision = self.config.save_precision
-        if tensor_dtype.is_floating_point and precision:
-            saved_dtype = _SAVE_DTYPES[precision]
+        saved_dtype = saved_dtype_of(
+            tensor_dtype, None if not precision else _SAVE_DTYPES[precision]
+        )
         storage_dtype, logical_dtype = netcdf_dtype_encoding(
             torch_to_numpy_dtype(saved_dtype)
         )

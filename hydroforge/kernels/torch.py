@@ -56,6 +56,16 @@ class _TorchImplementation(KernelImplementation):
             if declaration.compile
             else declaration.function
         )
+        self._communicates = declaration.communicates
+        self._capturable = declaration.capturable
+
+    @property
+    def communicates(self) -> bool:
+        return self._communicates
+
+    @property
+    def capturable(self) -> bool:
+        return self._capturable
 
     def _compile(self, call: KernelCall) -> Launch:
         function = self.function
@@ -76,6 +86,12 @@ class TorchKernel(KernelDeclaration):
 
     function: Callable[..., Any]
     compile: bool = True
+    communicates: bool = False
+    """The function issues process-group communication; recorded loops that
+    hold it are driven from the host rather than a conditional graph."""
+    capturable: bool = True
+    """A CUDA graph can capture the function; ``False`` (host work at every
+    call) keeps every program holding it eager."""
 
     def __init__(self, function: Callable[..., Any], /, **fields: Any) -> None:
         super().__init__(function=function, **fields)

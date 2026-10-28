@@ -146,15 +146,10 @@ COMPILED_ATEN = frozenset(
     for overload in contract.overloads
 )
 
-COMPILED_ATEN_DTYPES = frozenset(
-    {
-        torch.bool,
-        torch.float32,
-        torch.float64,
-        torch.int32,
-        torch.int64,
-    }
-)
+# Floating elements of recorded operators: every precision tier (Metal,
+# which lowers them, holds float32 tensors only).
+FLOATING = frozenset({torch.float64, torch.float32, torch.bfloat16, torch.float16})
+COMPILED_ATEN_DTYPES = frozenset({torch.bool, torch.int32, torch.int64, *FLOATING})
 
 
 def preallocated_replay_overload(function: Any) -> Any | None:
@@ -220,9 +215,9 @@ def normalize_floating_scalar(
     value: Any,
     dtype: torch.dtype,
 ) -> float:
-    """Normalize a scalar for a declared float32/float64 tensor contract."""
+    """Normalize a scalar for a declared floating tensor contract."""
 
-    if dtype not in {torch.float32, torch.float64}:
+    if dtype not in FLOATING:
         _error(f"Compiled ATen {name} requires a floating tensor dtype")
     precision = str(dtype).removeprefix("torch.")
     if type(value) not in {int, float}:
@@ -236,7 +231,7 @@ def normalize_floating_scalar(
             f"Compiled ATen {name} scalar must be finite and within {precision} range"
         )
     encoded = (
-        torch.tensor(result, dtype=dtype).item() if dtype == torch.float32 else result
+        result if dtype == torch.float64 else torch.tensor(result, dtype=dtype).item()
     )
     if result != 0.0 and encoded == 0.0:
         _error(f"Compiled ATen {name} scalar underflows {precision} storage")
@@ -251,7 +246,7 @@ def normalize_floating_scalar(
 def normalize_fill_scalar(dtype: torch.dtype, value: Any) -> bool | int | float:
     """Normalize ``fill_`` exactly once before backend lowering."""
 
-    if dtype in {torch.float32, torch.float64}:
+    if dtype in FLOATING:
         return normalize_floating_scalar("fill_", value, dtype)
     if dtype == torch.bool:
         if type(value) is not bool:
@@ -294,8 +289,8 @@ def _validate_lerp(
         _error("Compiled ATen lerp requires tensor weight and output")
     _require_contiguous("lerp", *tensors)
     _require_same_shape("lerp", start, end, destination)
-    if start.dtype not in {torch.float32, torch.float64}:
-        _error("Compiled ATen lerp requires float32 or float64 tensors")
+    if start.dtype not in FLOATING:
+        _error("Compiled ATen lerp requires floating tensors")
     if any(value.dtype != start.dtype for value in tensors):
         _error("Compiled ATen lerp requires one identical floating dtype")
     if weight.numel() != 1:
@@ -341,8 +336,8 @@ def _validate_binary(
         _error(f"Compiled ATen {name} requires tensor input and output")
     _require_contiguous(name, left, destination)
     _require_same_shape(name, left, destination)
-    if left.dtype not in {torch.float32, torch.float64}:
-        _error(f"Compiled ATen {name} requires float32 or float64 input")
+    if left.dtype not in FLOATING:
+        _error(f"Compiled ATen {name} requires floating input")
     expected = torch.bool if name == "lt" else left.dtype
     if destination.dtype != expected:
         _error(f"Compiled ATen {name} output must be {expected}")

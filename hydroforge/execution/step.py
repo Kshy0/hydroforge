@@ -35,6 +35,7 @@ from hydroforge.execution.channel import StagedPreflight, StepEvent
 from hydroforge.execution.context import (
     ACTIVE_STEP,
     is_between_steps_api,
+    model_call,
     validate_synchronous_function,
 )
 from hydroforge.execution.outer import outer_scope
@@ -44,7 +45,7 @@ from hydroforge.execution.substeps import (
     fixed_scope,
     predicate_scope,
 )
-from hydroforge.kernels.calls import recording_sink, routing
+from hydroforge.kernels.calls import recording_sink
 
 if TYPE_CHECKING:
     from hydroforge.execution.session import ModelRuntime
@@ -606,7 +607,7 @@ class _StepPolicy:
                 token = ACTIVE_STEP.set(context)
                 context.invocation = managed
                 try:
-                    with routing(execution.kernel_binding):
+                    with model_call(execution):
                         # From here onward model-authored outer Torch work and
                         # compiled physics may mutate address-stable state.
                         # There is no affordable generic rollback proof for an

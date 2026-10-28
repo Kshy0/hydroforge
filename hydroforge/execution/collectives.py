@@ -13,7 +13,7 @@ coalescing group rather than one of each per tensor. ``reduce_`` and
 
 A recorded ``all_reduce_`` of model tensors on CUDA ranks runs as a
 registered kernel instead, over the fastest transport of its process group
-(:mod:`hydroforge.parallel.reduce`): capturable, with no handshake before
+(:mod:`hydroforge.kernels.reduce`): capturable, with no handshake before
 each launch. Eagerly, only the peer-to-peer kernels replace the collective.
 """
 

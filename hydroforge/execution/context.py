@@ -187,3 +187,15 @@ def is_between_steps_api(value: Any) -> bool:
     except AttributeError:
         return False
     return marker is True
+
+
+def model_call(execution: Any) -> Any:
+    """The scope model code runs in (:meth:`ModelExecution.model_call`); an
+    execution without one binds registered kernels only."""
+
+    scope = getattr(execution, "model_call", None)
+    if scope is not None:
+        return scope()
+    from hydroforge.kernels.calls import routing
+
+    return routing(execution.kernel_binding)

@@ -13,6 +13,7 @@ from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
+import numpy as np
 import torch
 
 from hydroforge.compiler.partition import bare
@@ -22,6 +23,7 @@ from hydroforge.contracts.fields import (
     RuntimeTensorMetadata,
     TensorMetadata,
 )
+from hydroforge.contracts.precision import precisions_of
 from hydroforge.contracts.views import view_indices
 from hydroforge.core.arrays import find_indices_in_torch
 from hydroforge.core.events import emit
@@ -150,8 +152,8 @@ class _StatisticsBinder:
             on_write_failure=partial(
                 runtime.execution.poison, phase="statistics background write"
             ),
-            base_dtype=plan.dtype,
-            mixed_precision=plan.mixed_precision,
+            base_dtype=precisions_of(plan).field_dtype,
+            storage_dtype=precisions_of(plan).storage_dtype,
             output_dir=plan.output.directory,
             rank=plan.spatial_rank,
             world_size=plan.spatial_world_size,
@@ -385,6 +387,62 @@ class _StatisticsBinder:
             ),
         )
 
+    def _slab_axis(self, tensor: TensorMetadata) -> tuple[int, str] | None:
+        """Position and kind of the slab axis in ``tensor``'s shape."""
+
+        slab = self.runtime.slab
+        if slab is None:
+            return None
+        from hydroforge.compiler.slab import slab_tokens
+
+        plan = self.runtime.plan
+        tokens = slab_tokens(plan.spec.slab, plan.spec.grid_axes)
+        for position, token in enumerate(tensor.shape):
+            if isinstance(token, str) and bare(token) in tokens:
+                return position, tokens[bare(token)]
+        return None
+
+    def _slab_output_axis(
+        self,
+        name: str,
+        axis: str,
+        indices: tuple[int, ...] | None,
+        kind: str,
+        tensors: dict[str, torch.Tensor],
+    ) -> OutputAxis:
+        """The owned rows of the slab axis, selected by the view's global rows.
+
+        A rank writes only the rows it owns (never ghost rows); the output
+        coordinate holds their global indices, so ranks' files join along the
+        axis.
+        """
+
+        slab = self.runtime.slab
+        owned = slab.global_rows(kind)
+        stored = slab.owned_slice(kind).start
+        if indices is not None:
+            owned = owned[np.isin(owned, np.asarray(indices, dtype=np.int64))]
+        local = stored + (owned - slab.global_rows(kind)[0] if owned.size else owned)
+        values = tuple(int(row) for row in owned)
+        if local.size == 0:
+            return OutputAxis(name=axis, extent=0, start=0, step=1, indices=())
+        step = _regular_step(tuple(int(row) for row in local))
+        if step is not None:
+            return OutputAxis(
+                name=axis,
+                extent=int(local.size),
+                start=int(local[0]),
+                step=step,
+                indices=values,
+            )
+        table = f"__view__{name}__slab"
+        tensors[table] = torch.as_tensor(
+            local, dtype=torch.int64, device=self.runtime.plan.device
+        )
+        return OutputAxis(
+            name=axis, extent=int(local.size), table=table, indices=values
+        )
+
     def _owned_rows(self, coordinate: str | None, rows: int) -> int:
         """Rows of ``coordinate`` this rank owns: halo ghost rows follow them."""
 
@@ -432,9 +490,14 @@ class _StatisticsBinder:
         info = fields[name]
         shape = self._logical_shape(name, program, tensors, fields)
         names = declaration.axes[name]
+        slab_axis = self._slab_axis(info.tensor)
+        # Views select by global row, so the slab axis has its global extent.
+        extents = list(shape)
+        if slab_axis is not None:
+            extents[slab_axis[0]] = self.runtime.slab.total_of(slab_axis[1])
         selected = view_indices(
             names,
-            shape,
+            tuple(extents),
             declaration.views.get(name),
             self.runtime.plan.spec.grid_axes,
         )
@@ -444,7 +507,11 @@ class _StatisticsBinder:
         for position, (axis, extent, indices) in enumerate(
             zip(names, shape, selected, strict=True)
         ):
-            if position == 0 and info.output_index is not None:
+            if slab_axis is not None and position == slab_axis[0]:
+                axes.append(
+                    self._slab_output_axis(name, axis, indices, slab_axis[1], tensors)
+                )
+            elif position == 0 and info.output_index is not None:
                 count = tensors[info.output_index].numel()
                 axes.append(
                     OutputAxis(name=axis, extent=count, table=info.output_index)

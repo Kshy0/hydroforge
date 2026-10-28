@@ -5,7 +5,7 @@
 //
 
 // Minimum, maximum or sum of a few values over ranks mapped peer-to-peer
-// (hydroforge.parallel.reduce). One block stores this rank's values into
+// (hydroforge.kernels.reduce). One block stores this rank's values into
 // slot ``rank`` of every rank, signals each of them, waits for every rank's
 // arrival and reduces the slots in rank order, so every rank holds the same
 // result. Successive calls alternate two slot sets: a rank can run at most

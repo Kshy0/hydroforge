@@ -4,73 +4,432 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 //
 
-// Halo exchange of the CUDA backend (hydroforge.parallel.halo): senders
-// store straight into the receiving peer's buffer and signal its arrival.
-// grid.x is the chunk of a message, grid.y the message: sends, then receives.
+// Halo exchange of the CUDA backend (hydroforge.parallel.halo, launched by
+// hydroforge.kernels.halo).
+//
+// A message to one peer carries the rows of up to eight fields, field after
+// field, each element in its own bits (no conversion). A field is viewed as
+// (outer, extent, inner) around its decomposed axis; a message holds, for
+// each outer index, the listed rows of that axis with all their inner
+// elements. grid.x is a chunk of a message, grid.y the message.
+//
+// Peers NCCL (or CUDA IPC) maps take stores straight into their receive
+// ring: every directed pair owns DEPTH slots, message n of the pair using
+// slot n % DEPTH. The sender stores, then counts an arrival in the
+// receiver's window; the receiver waits for it and reads; once the
+// receiver finished with it, it counts a credit in the sender's window;
+// the sender of message n first waits for the credit of message n - DEPTH.
+// So a message never overwrites one its receiver has not finished reading,
+// however far the sender runs ahead. Other peers go through NCCL
+// send/receive between the two kernels, from and into local staging slots.
+//
+// Kernels publish into the same rings and read from them
+// (halo_access.cuh), so a receiver may finish with a message long after it
+// arrived: each exchange gets a site table from the recorded schedule
+// (hydroforge.execution.halo_schedule). Per peer, ``skip`` places the
+// message it receives past ``received`` (messages before it still pending),
+// ``settle`` counts how many messages its receive finishes (``received``
+// advances: its own, those before it read since, or none while one before
+// it is still pending) and ``post`` credits as many. Its first launch also
+// runs the prologue of halo_access.cuh (counts and credits of messages
+// earlier launches finished with), before any wait of its own.
+//
+// In a loop body whose schedule proved every slot free when stored, sends
+// wait for no credit (``checks`` 0) and nothing returns any: halo_drain
+// first waits until every message sent before the loop is credited, and
+// halo_flush afterwards sets each peer's credits to what this rank counted.
+//
+// An accumulate message may list one owned row twice (a periodic slab over
+// two ranks): REPEATS marks it, and its receive runs once per pass, pass p
+// adding the entries the row table ranks p-th for their row, so no two
+// threads of a launch add into one element.
 
 #include "peer.cuh"
 
-template <typename T0, typename T1, typename T2, typename TC, int NF,
-          bool ACCUMULATE, bool HAS_CLEAR>
-__global__ void halo_exchange(
-    T0* f0, T1* f1, T2* f2, TC* clear, const int32_t* index, double* recv,
-    int64_t* signals, int64_t* expected, const int64_t* recv_peers,
-    const int64_t* signal_peers, int32_t out_peer, int32_t out_start,
-    int32_t out_dst, int32_t out_idx, int32_t in_peer, int32_t in_start,
-    int32_t in_off, int32_t in_idx, int32_t slot_offset, int32_t signal_offset,
-    int32_t n_out, int32_t my_pe, int32_t max_chunks, int32_t chunk) {
-    const int32_t c = blockIdx.x;
-    const int32_t m = blockIdx.y;
-    if (m < n_out) {
-        const int32_t peer = index[out_peer + m];
-        const int32_t base = index[out_start + m];
-        const int32_t start = base + c * chunk;
-        const int32_t end = min(index[out_start + m + 1], start + chunk);
-        if (start >= end) return;
-        double* out = reinterpret_cast<double*>(recv_peers[peer]) + slot_offset
-                      + int64_t(index[out_dst + m] - base) * NF;
-        for (int32_t i = start + threadIdx.x; i < end; i += blockDim.x) {
-            const int32_t row = index[out_idx + i];
-            double* slot = out + int64_t(i) * NF;
-            slot[0] = double(f0[row]);
-            if (ACCUMULATE) f0[row] = T0(0);
-            if (NF > 1) {
-                slot[1] = double(f1[row]);
-                if (ACCUMULATE) f1[row] = T1(0);
-            }
-            if (NF > 2) {
-                slot[2] = double(f2[row]);
-                if (ACCUMULATE) f2[row] = T2(0);
-            }
-            if (HAS_CLEAR) clear[row] = TC(0);
-        }
-        hf_peer_arrive(reinterpret_cast<int64_t*>(signal_peers[peer]) + signal_offset
-                       + my_pe * max_chunks + c);
-        return;
+namespace hf_halo {
+
+constexpr int SLOTS = 9;  // eight exchanged fields and the accumulate's clear field
+constexpr int KINDS = 3;
+constexpr int RECORD = 4 + 2 * KINDS;
+constexpr int LINK_PEER = 0;
+constexpr int REPEATS = 32;  // flag of the link word: some row is listed twice
+constexpr int LINK = 15;  // the link code bits
+
+}  // namespace hf_halo
+
+struct HaloFields {
+    char* data[hf_halo::SLOTS];
+    int64_t outer[hf_halo::SLOTS];
+    int64_t extent[hf_halo::SLOTS];
+    int64_t inner[hf_halo::SLOTS];
+    int32_t size[hf_halo::SLOTS];  // bytes per element
+    int32_t type[hf_halo::SLOTS];  // accumulate: 1 f32, 2 f64, 3 i32, 4 i64
+    int32_t kind[hf_halo::SLOTS];
+    int32_t count;                 // exchanged fields
+    int32_t clear;                 // slot 8 is a field to zero
+    int32_t written;               // receives: bit k set writes field k
+};
+
+// Message record: peer, link (and REPEATS), ring slot (the sender's slot in
+// the receiver's ring), staging slot, then the row-table offset and row
+// count of every kind.
+struct HaloRing {
+    char* window;          // arrivals[world], credits[world], ring
+    const int64_t* peers;  // every rank's window as this process maps it
+    int64_t* state;        // sent[world], received[world], sends done, receives done
+    char* send_stage;
+    const char* recv_stage;
+    const int32_t* rows;   // every entry's row, then its pass
+    const int32_t* messages;
+    int64_t capacity;      // bytes of one message slot
+    int64_t ring;          // byte offset of the ring in a window
+    int64_t entries;       // entries of the row table (where passes start)
+    // The site table: skip[world], settle[world], post[world], then the
+    // prologue: n, n (peer, credits, counted).
+    const int64_t* site;
+    int32_t world;
+    int32_t rank;
+    int32_t depth;
+    int32_t chunk;         // elements one block moves
+    int32_t checks;        // sends wait for their slot's credit
+};
+
+namespace hf_halo {
+
+struct Layout {
+    int64_t count[SLOTS];   // elements of each field in the message
+    int64_t offset[SLOTS];  // byte offset of each field's segment
+    int32_t first[SLOTS];   // the field's rows in the row table
+    int32_t rows[SLOTS];
+    int64_t packed;         // elements of the exchanged fields
+    int64_t blocks;         // blocks the message needs
+};
+
+__device__ __forceinline__ int64_t aligned(int64_t bytes) { return (bytes + 15) & ~int64_t(15); }
+
+// The message's layout, by the whole block: one thread per field reads its
+// rows, thread 0 then lays the segments out.
+__device__ void layout(const HaloFields& f, const HaloRing& r, const int32_t* rec, Layout& out) {
+    const int k = threadIdx.x;
+    if (k < SLOTS && (k < f.count || (k == SLOTS - 1 && f.clear))) {
+        out.first[k] = __ldg(rec + 4 + f.kind[k]);
+        out.rows[k] = __ldg(rec + 4 + KINDS + f.kind[k]);
+        out.count[k] = int64_t(out.rows[k]) * f.outer[k] * f.inner[k];
     }
-    const int32_t j = m - n_out;
-    const int32_t peer = index[in_peer + j];
-    const int32_t base = index[in_start + j];
-    const int32_t start = base + c * chunk;
-    const int32_t end = min(index[in_start + j + 1], start + chunk);
-    if (start >= end) return;
-    int64_t* count = expected + signal_offset + peer * max_chunks + c;
-    const int64_t arrivals = *count + 1;
-    hf_peer_wait(signals + signal_offset + peer * max_chunks + c, arrivals);
-    if (threadIdx.x == 0) *count = arrivals;
-    const double* in = recv + slot_offset + int64_t(index[in_off + j] - base) * NF;
-    for (int32_t i = start + threadIdx.x; i < end; i += blockDim.x) {
-        const int32_t row = index[in_idx + i];
-        // Written by a peer during this kernel: bypass the caches.
-        const double* slot = in + int64_t(i) * NF;
-        if (ACCUMULATE) {
-            atomicAdd(f0 + row, T0(__ldcv(slot)));
-            if (NF > 1) atomicAdd(f1 + row, T1(__ldcv(slot + 1)));
-            if (NF > 2) atomicAdd(f2 + row, T2(__ldcv(slot + 2)));
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int64_t bytes = 0;
+        out.packed = 0;
+        for (int j = 0; j < f.count; ++j) {
+            out.offset[j] = bytes;
+            bytes += aligned(out.count[j] * f.size[j]);
+            out.packed += out.count[j];
+        }
+        const int64_t cleared = f.clear ? out.count[SLOTS - 1] : 0;
+        const int64_t longest = out.packed > cleared ? out.packed : cleared;
+        out.blocks = (longest + r.chunk - 1) / r.chunk;
+    }
+    __syncthreads();
+}
+
+// Field element of element e (field-local) of field k in the message: the
+// message holds, for each outer index, the field's rows with their inner
+// elements. Message elements fit 32 bits; field offsets need not. ``entry``
+// receives the element's entry in the row table.
+__device__ __forceinline__ int64_t element(const HaloFields& f, const Layout& s,
+                                           const int32_t* rows, int k, int64_t e,
+                                           int32_t* entry = nullptr) {
+    const uint32_t inner = uint32_t(f.inner[k]);
+    const uint32_t plane = uint32_t(s.rows[k]) * inner;
+    const uint32_t local = uint32_t(e);
+    const uint32_t o = local / plane;
+    const uint32_t rest = local - o * plane;
+    const uint32_t i = rest / inner;
+    if (entry) *entry = s.first[k] + int32_t(i);
+    const int64_t row = __ldg(rows + s.first[k] + i);
+    return (int64_t(o) * f.extent[k] + row) * inner + (rest - i * inner);
+}
+
+// Element bits of 1, 2, 4 or 8 bytes. A peer wrote the ring during this
+// kernel: ``bypass`` loads skip the caches.
+__device__ __forceinline__ unsigned long long load_bits(const char* from, int size, bool bypass) {
+    switch (size) {
+        case 8: {
+            const long long* p = reinterpret_cast<const long long*>(from);
+            return (unsigned long long)(bypass ? __ldcv(p) : *p);
+        }
+        case 4: {
+            const unsigned int* p = reinterpret_cast<const unsigned int*>(from);
+            return bypass ? __ldcv(p) : *p;
+        }
+        case 2: {
+            const unsigned short* p = reinterpret_cast<const unsigned short*>(from);
+            return bypass ? __ldcv(p) : *p;
+        }
+        default: {
+            const unsigned char* p = reinterpret_cast<const unsigned char*>(from);
+            return bypass ? __ldcv(p) : *p;
+        }
+    }
+}
+
+__device__ __forceinline__ void store_bits(char* to, unsigned long long bits, int size) {
+    switch (size) {
+        case 8: *reinterpret_cast<unsigned long long*>(to) = bits; break;
+        case 4: *reinterpret_cast<unsigned int*>(to) = (unsigned int)bits; break;
+        case 2: *reinterpret_cast<unsigned short*>(to) = (unsigned short)bits; break;
+        default: *reinterpret_cast<unsigned char*>(to) = (unsigned char)bits;
+    }
+}
+
+__device__ __forceinline__ void add_bits(char* to, unsigned long long bits, int type) {
+    switch (type) {
+        case 1: *reinterpret_cast<float*>(to) += __int_as_float(int(bits)); break;
+        case 2: *reinterpret_cast<double*>(to) += __longlong_as_double((long long)bits); break;
+        case 3: *reinterpret_cast<int*>(to) += int(bits); break;
+        default: *reinterpret_cast<long long*>(to) += (long long)bits; break;
+    }
+}
+
+// Moves elements [begin, end) of a message between the fields and the wire,
+// UNROLL elements per thread with their loads in flight together. PASSES
+// moves only the entries ``passes`` ranks ``pass`` for their row.
+template <bool SEND, bool ACCUMULATE, bool PASSES = false>
+__device__ __forceinline__ void move(const HaloFields& f, const Layout& s, const int32_t* rows,
+                                     char* wire, int64_t begin, int64_t end, bool bypass,
+                                     const int32_t* passes = nullptr, int32_t pass = 0) {
+    constexpr int UNROLL = 4;
+    for (int64_t e0 = begin + threadIdx.x; e0 < end; e0 += int64_t(blockDim.x) * UNROLL) {
+        char* field[UNROLL];
+        char* message[UNROLL];
+        int size[UNROLL], type[UNROLL];
+        bool live[UNROLL];
+#pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const int64_t e = e0 + int64_t(u) * blockDim.x;
+            live[u] = e < end;
+            if (!live[u]) continue;
+            int k = 0;
+            int64_t local = e;
+            while (local >= s.count[k]) local -= s.count[k++];
+            if (!SEND && !(f.written >> k & 1)) {
+                live[u] = false;
+                continue;
+            }
+            size[u] = f.size[k];
+            type[u] = f.type[k];
+            int32_t entry;
+            field[u] = f.data[k] + element(f, s, rows, k, local, PASSES ? &entry : nullptr) * size[u];
+            if (PASSES && __ldg(passes + entry) != pass) {
+                live[u] = false;
+                continue;
+            }
+            message[u] = wire + s.offset[k] + local * size[u];
+        }
+        unsigned long long bits[UNROLL];
+#pragma unroll
+        for (int u = 0; u < UNROLL; ++u)
+            if (live[u]) bits[u] = load_bits(SEND ? field[u] : message[u], size[u], !SEND && bypass);
+#pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            if (!live[u]) continue;
+            if (SEND) {
+                store_bits(message[u], bits[u], size[u]);
+                if (ACCUMULATE) store_bits(field[u], 0, size[u]);
+            } else if (ACCUMULATE) {
+                add_bits(field[u], bits[u], type[u]);
+            } else {
+                store_bits(field[u], bits[u], size[u]);
+            }
+        }
+    }
+}
+
+// The slot message n of the pair uses in the receiver's ring.
+__device__ __forceinline__ int64_t ring_slot(const HaloRing& r, const int32_t* rec, int64_t n) {
+    return r.ring + (int64_t(rec[2]) * r.depth + n % r.depth) * r.capacity;
+}
+
+// Called by thread 0 once its block is done with a message (after a block
+// barrier): whether it is the last of the message's ``blocks``. Each block of
+// a multi-block message fences its work before counting it.
+__device__ __forceinline__ bool last_block(int64_t* done, int64_t blocks) {
+    if (blocks == 1) return true;
+    __threadfence_system();
+    const unsigned long long previous =
+        atomicAdd(reinterpret_cast<unsigned long long*>(done), 1ull);
+    if (int64_t(previous) != blocks - 1) return false;
+    *done = 0;
+    return true;
+}
+
+// ``amount`` counts in a peer's window, released at system scope: the
+// stores of every block that counted before it are visible first.
+__device__ __forceinline__ void count(const int64_t* window, int64_t index,
+                                      int64_t amount = 1) {
+    unsigned long long* word =
+        reinterpret_cast<unsigned long long*>(const_cast<int64_t*>(window) + index);
+    asm volatile("red.release.sys.global.add.u64 [%0], %1;" ::"l"(word), "l"(amount) : "memory");
+}
+
+// ``amount`` credits in a sender's window. A credit only says the slot's
+// reads are over; they returned their values before it is issued (earlier
+// launches, or this launch's blocks before their barrier and done count),
+// so no fence orders anything before it.
+__device__ __forceinline__ void credit(const int64_t* window, int64_t index, int64_t amount) {
+    unsigned long long* word =
+        reinterpret_cast<unsigned long long*>(const_cast<int64_t*>(window) + index);
+    asm volatile("red.relaxed.sys.global.add.u64 [%0], %1;" ::"l"(word), "l"(amount) : "memory");
+}
+
+// The prologue of an exchange's first launch (block 0, thread 0, before
+// any wait): counts and credits of messages earlier launches finished with.
+__device__ __forceinline__ void prologue(const HaloRing& r) {
+    if ((threadIdx.x | blockIdx.x | blockIdx.y) != 0) return;
+    const int64_t* list = r.site + 3 * r.world;
+    for (int64_t e = 0, n = list[0]; e < n; ++e) {
+        const int64_t peer = list[1 + 3 * e], credits = list[2 + 3 * e];
+        const int64_t counted = list[3 + 3 * e];
+        if (counted) r.state[r.world + peer] += counted;
+        if (credits)
+            credit(reinterpret_cast<const int64_t*>(r.peers[peer]), r.world + r.rank, credits);
+    }
+}
+
+template <bool ACCUMULATE>
+__device__ void send(const HaloFields& f, const HaloRing& r, int32_t m) {
+    const int32_t* rec = r.messages + m * RECORD;
+    __shared__ Layout s;
+    layout(f, r, rec, s);
+    if (int64_t(blockIdx.x) >= s.blocks) return;
+    const int32_t peer = rec[0];
+    const bool direct = (rec[1] & LINK) == LINK_PEER;
+    int64_t* sent = r.state + peer;
+    const int64_t n = *sent;
+    char* out = nullptr;
+    if (s.packed > 0) {
+        if (direct) {
+            // Message n - DEPTH left this slot once its credit arrived.
+            if (r.checks)
+                hf_peer_wait(reinterpret_cast<const int64_t*>(r.window) + r.world + peer,
+                             n - r.depth + 1);
+            out = reinterpret_cast<char*>(r.peers[peer]) + ring_slot(r, rec, n);
         } else {
-            f0[row] = T0(__ldcv(slot));
-            if (NF > 1) f1[row] = T1(__ldcv(slot + 1));
-            if (NF > 2) f2[row] = T2(__ldcv(slot + 2));
+            out = r.send_stage + int64_t(rec[3]) * r.capacity;
         }
     }
+    const int64_t begin = int64_t(blockIdx.x) * r.chunk;
+    const int64_t stop = begin + r.chunk < s.packed ? begin + r.chunk : s.packed;
+    move<true, ACCUMULATE>(f, s, r.rows, out, begin, stop, false);
+    if (ACCUMULATE && f.clear) {
+        const int k = SLOTS - 1;
+        const int64_t end = begin + r.chunk < s.count[k] ? begin + r.chunk : s.count[k];
+        for (int64_t e = begin + threadIdx.x; e < end; e += blockDim.x)
+            store_bits(f.data[k] + element(f, s, r.rows, k, e) * f.size[k], 0, f.size[k]);
+    }
+    if (s.packed == 0) return;
+    __syncthreads();
+    if (threadIdx.x == 0 && last_block(r.state + 2 * r.world + peer, s.blocks)) {
+        *sent = n + 1;
+        // The arrival in the receiver's window.
+        if (direct) count(reinterpret_cast<const int64_t*>(r.peers[peer]), r.rank);
+    }
+}
+
+// Pass ``pass`` of the message's receive; the ``last`` pass counts it read.
+template <bool ACCUMULATE>
+__device__ void receive(const HaloFields& f, const HaloRing& r, int32_t m, int32_t pass,
+                        bool last) {
+    const int32_t* rec = r.messages + m * RECORD;
+    __shared__ Layout s;
+    layout(f, r, rec, s);
+    // Receivers move the exchanged fields only (no clear).
+    if (int64_t(blockIdx.x) >= (s.packed + r.chunk - 1) / r.chunk) return;
+    const int32_t peer = rec[0];
+    const bool direct = (rec[1] & LINK) == LINK_PEER;
+    const int32_t* passes = ACCUMULATE && (rec[1] & REPEATS) ? r.rows + r.entries : nullptr;
+    int64_t* received = r.state + r.world + peer;
+    // Messages of this peer still pending precede this one.
+    const int64_t n = *received + r.site[peer];
+    char* in;
+    if (direct) {
+        hf_peer_wait(reinterpret_cast<const int64_t*>(r.window) + peer, n + 1);
+        in = r.window + ring_slot(r, rec, n);
+    } else {
+        in = const_cast<char*>(r.recv_stage) + int64_t(rec[3]) * r.capacity;
+    }
+    const int64_t begin = int64_t(blockIdx.x) * r.chunk;
+    const int64_t stop = begin + r.chunk < s.packed ? begin + r.chunk : s.packed;
+    if (ACCUMULATE && passes)
+        move<false, ACCUMULATE, true>(f, s, r.rows, in, begin, stop, direct, passes, pass);
+    else
+        move<false, ACCUMULATE>(f, s, r.rows, in, begin, stop, direct);
+    __syncthreads();
+    if (threadIdx.x == 0 &&
+        last_block(r.state + 3 * r.world + peer, (s.packed + r.chunk - 1) / r.chunk) && last) {
+        *received += r.site[r.world + peer];
+        // The credits in the sender's window: the slots are free again.
+        const int64_t credits = r.site[2 * r.world + peer];
+        if (direct && credits)
+            credit(reinterpret_cast<const int64_t*>(r.peers[peer]), r.world + r.rank, credits);
+    }
+}
+
+}  // namespace hf_halo
+
+// Messages first .. first + gridDim.y of the record table; ``begin``: the
+// exchange's first launch (it runs the prologue).
+template <bool ACCUMULATE>
+__global__ void halo_send(HaloFields f, HaloRing r, int32_t first, int32_t begin) {
+    if (begin) hf_halo::prologue(r);
+    hf_halo::send<ACCUMULATE>(f, r, first + blockIdx.y);
+}
+
+// A message with repeated rows (accumulate) launches once per pass.
+template <bool ACCUMULATE>
+__global__ void halo_receive(HaloFields f, HaloRing r, int32_t first, int32_t pass,
+                             int32_t last, int32_t begin) {
+    if (begin) hf_halo::prologue(r);
+    hf_halo::receive<ACCUMULATE>(f, r, first + blockIdx.y, pass, last != 0);
+}
+
+// Only the prologue: messages finished with, counted and credited.
+__global__ void halo_book(HaloRing r) { hf_halo::prologue(r); }
+
+// Before a loop storing without credits: every message this rank sent so
+// far is credited (its receiver finished with it), so the loop reuses no
+// slot still unread.
+__global__ void halo_drain(HaloRing r) {
+    for (int32_t peer = threadIdx.x; peer < r.world; peer += blockDim.x) {
+        const int64_t sent = r.state[peer];
+        while (hf_peer_acquire(reinterpret_cast<const int64_t*>(r.window) + r.world + peer) <
+               sent) {
+        }
+    }
+}
+
+// After it: the prologue's counts, then each peer's credits set to every
+// message of it this rank counted (finished with). This rank alone writes
+// them, its earlier launches' credits are complete, and the slots' reads
+// returned before.
+__global__ void halo_flush(HaloRing r) {
+    if ((threadIdx.x | blockIdx.x | blockIdx.y) != 0) return;
+    hf_halo::prologue(r);
+    for (int32_t peer = 0; peer < r.world; ++peer) {
+        const int64_t received = r.state[r.world + peer];
+        if (peer == r.rank || received == 0) continue;
+        int64_t* word = reinterpret_cast<int64_t*>(r.peers[peer]) + r.world + r.rank;
+        asm volatile("st.relaxed.sys.global.u64 [%0], %1;" ::"l"(word), "l"(received) : "memory");
+    }
+}
+
+// A mirror whose messages all go to mapped peers: sends (lower blocks,
+// dispatched first) then receives, in one launch.
+__global__ void halo_mirror(HaloFields f, HaloRing r, int32_t sends, int32_t count,
+                            int32_t receives) {
+    hf_halo::prologue(r);
+    if (int32_t(blockIdx.y) < count)
+        hf_halo::send<false>(f, r, sends + blockIdx.y);
+    else
+        hf_halo::receive<false>(f, r, receives + blockIdx.y - count, 0, true);
 }

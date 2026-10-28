@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from hydroforge.compiler.partition import compile_partition
 from hydroforge.compiler.selection import Selection
+from hydroforge.compiler.slab import SlabField, compile_slab
 from hydroforge.contracts.conditions import conditions_satisfied
 from hydroforge.contracts.fields import (
     FieldDemandPlan,
@@ -26,6 +27,7 @@ from hydroforge.contracts.fields import (
     concrete_tensor_dtype,
     tensor_is_active,
 )
+from hydroforge.contracts.precision import precisions_of
 from hydroforge.core.expr import ExpressionSource, TensorSource, parse_value_source
 from hydroforge.declare.spec import (
     FieldSpec,
@@ -160,6 +162,7 @@ class FieldPlan:
     modules: Mapping[str, ModuleBindingPlan]
     partition: PartitionSchema
     variable_groups: Mapping[str, str]
+    slab: Mapping[str, SlabField]
     inverse_sources: frozenset[str]
     inputs: Mapping[str, InputFieldSpec]
     binding: Mapping[str, tuple[BindingSource, ...]]
@@ -588,7 +591,9 @@ def plan_fields(
                     None
                     if tensor is None
                     else concrete_tensor_dtype(
-                        tensor.dtype, selection.dtype, selection.mixed_precision
+                        tensor.dtype,
+                        precisions_of(selection).field_dtype,
+                        precisions_of(selection).storage_dtype,
                     ),
                 )
         for name, metadata in binding.reference_indices.items():
@@ -637,6 +642,15 @@ def plan_fields(
         modules=modules,
         partition=partition,
         variable_groups=variable_groups,
+        slab=compile_slab(
+            (
+                entry
+                for entry in entries.values()
+                if entry.active and not entry.reference_index
+            ),
+            spec.slab,
+            spec.grid_axes,
+        ),
         inverse_sources=frozenset(
             index.reference
             for name, binding in modules.items()

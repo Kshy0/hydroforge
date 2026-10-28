@@ -8,10 +8,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import torch
 
+from hydroforge.contracts.precision import matmul_scope, precisions_of
 from hydroforge.core.errors import (
     cleanup_on_exit,
     failure_description,
@@ -20,6 +23,7 @@ from hydroforge.core.events import emit
 from hydroforge.execution.binding import KernelBinder
 from hydroforge.execution.executors import EagerExecutor, select_executor
 from hydroforge.execution.step_fields import StepFieldRuntime
+from hydroforge.kernels.calls import routing
 from hydroforge.kernels.toolchain import CompileRequest
 
 if TYPE_CHECKING:
@@ -53,6 +57,7 @@ class ModelExecution:
                 device=str(plan.device),
             )
         self.kernel_binding = KernelBinder(runtime)
+        self.tf32 = precisions_of(plan).tf32
         self.step_fields = StepFieldRuntime(plan, executor=self.executor)
         self.step_policies: dict[Any, Any] = {}
         self.programs: dict[Any, Any] = {}
@@ -67,6 +72,16 @@ class ModelExecution:
         self.step: Any = None
         self._failure: tuple[str, str, str] | None = None
         self.closed = False
+
+    @contextmanager
+    def model_call(self) -> Iterator[None]:
+        """The scope of model code: initialization, managed steps and
+        between-steps methods. Registered kernels bind to this model, and
+        torch float32 matrix products follow its compute tier (TF32 for
+        ``tf32``, IEEE otherwise)."""
+
+        with routing(self.kernel_binding), matmul_scope(self.tf32):
+            yield
 
     def take_pending(self) -> list[CompileRequest]:
         """Programs the model will launch that no compile batch has taken.
@@ -184,13 +199,13 @@ class ModelExecution:
 
     def reducer(self, group: Any, device: torch.device) -> Any:
         """The all-reduce transports of ``group``, chosen collectively on
-        first use (see :mod:`hydroforge.parallel.reduce`)."""
+        first use (see :mod:`hydroforge.kernels.reduce`)."""
 
         key = group.group_name
         if key not in self.reducers:
             from torch.utils._python_dispatch import _disable_current_modes
 
-            from hydroforge.parallel.reduce import ReduceRuntime
+            from hydroforge.kernels.reduce import ReduceRuntime
 
             # First use may come while a substep is being recorded; the
             # collective setup runs outside the recorder.

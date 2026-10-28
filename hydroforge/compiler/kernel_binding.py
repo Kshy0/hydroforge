@@ -25,6 +25,7 @@ import torch
 from hydroforge.compiler.fields import BindingSource
 from hydroforge.compiler.selection import resolve_block_size
 from hydroforge.contracts.fields import concrete_tensor_dtype, precision_dtype
+from hydroforge.contracts.precision import precisions_of
 from hydroforge.contracts.step_fields import StepField, SubstepField
 from hydroforge.kernels.spec import (
     KernelSpec,
@@ -276,7 +277,9 @@ class KernelBindingPlan:
 
     def _concrete(self, kind: str) -> torch.dtype:
         plan = self.plan
-        return concrete_tensor_dtype(kind, plan.dtype, plan.mixed_precision)
+        return concrete_tensor_dtype(
+            kind, precisions_of(plan).field_dtype, precisions_of(plan).storage_dtype
+        )
 
     def _declared_dtype(
         self, spec: KernelSpec, name: str

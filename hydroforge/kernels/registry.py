@@ -106,6 +106,20 @@ class KernelImplementation(ABC):
         self.spec = spec
         self.backend = backend
 
+    @property
+    def communicates(self) -> bool:
+        """Whether the kernel issues process-group communication (NCCL),
+        which a device-side conditional graph cannot hold."""
+
+        return False
+
+    @property
+    def capturable(self) -> bool:
+        """Whether a CUDA graph can capture and replay the kernel's launches;
+        host work (a Gloo exchange staged through host memory) cannot be."""
+
+        return True
+
     def call(
         self,
         arguments: Mapping[str, Any],
@@ -295,7 +309,9 @@ class KernelDeclaration(HydroForgeModel, ABC):
                     *spec.compile_time.items(),
                     *spec.runtime_scalars.items(),
                 )
-                if kind != "precision"
+                # precision resolves later; a halo argument is no number
+                # (CUDA passes it by value, Torch hands it over, others omit it).
+                if kind not in ("precision", "halo")
             },
         )
         return self._build(spec, backend)

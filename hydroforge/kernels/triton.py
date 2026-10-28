@@ -28,7 +28,7 @@ from hydroforge.kernels.registry import (
     empty_launch,
     named_parameters,
 )
-from hydroforge.kernels.spec import KernelSpec
+from hydroforge.kernels.spec import HALO_PARAMETER, KernelSpec
 from hydroforge.kernels.toolchain import CompileRequest
 from hydroforge.kernels.toolchain.triton import (
     active_triton_precision,
@@ -136,7 +136,9 @@ def _validate_kernel(
             f"{spec.name}: {label} Triton kernel has parameters outside "
             f"KernelSpec: {sorted(extra)}"
         )
-    missing = set(spec.parameters).difference(observed)
+    # The halo argument serves CUDA kernels only: Triton kernels leave it
+    # out (their halo work is the scheduled mirrors).
+    missing = set(spec.parameters).difference(observed, (HALO_PARAMETER,))
     if missing.intersection(spec.buffers):
         raise TypeError(
             f"{spec.name}: {label} Triton kernel omits canonical buffers: "

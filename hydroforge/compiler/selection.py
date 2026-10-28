@@ -17,6 +17,7 @@ import torch
 from hydroforge.contracts.conditions import resolve_conditions
 from hydroforge.contracts.fields import tensor_is_active
 from hydroforge.contracts.options import OptionsConfig, check_option_contracts
+from hydroforge.contracts.precision import Precisions, resolve_precisions
 from hydroforge.contracts.runtime import (
     DEFAULT_BACKEND_REQUIREMENT,
     DEFAULT_MODULE_REQUIREMENT,
@@ -48,8 +49,10 @@ class Selection:
     backend: Backend
     device: torch.device
     precision: Literal["float32", "float64"]
+    """The scalar precision: host scalars, step fields, workspaces."""
     dtype: torch.dtype
     mixed_precision: bool
+    precisions: Precisions
     metal_emulation: Literal["native", "float32x2"]
     backend_requirement: BackendRequirement
     block_size: int | None
@@ -66,6 +69,19 @@ class Selection:
     member_ids: tuple[int, ...] | None
     parallel: EnsembleParallel | None
     partition_imbalance: float | None
+    slab_periodic: bool
+
+    @property
+    def field_dtype(self) -> torch.dtype:
+        """Elements of ``float`` tensors (the compute tier)."""
+
+        return self.precisions.field_dtype
+
+    @property
+    def storage_dtype(self) -> torch.dtype:
+        """Elements of ``hpfloat`` tensors (the storage tier)."""
+
+        return self.precisions.storage_dtype
 
 
 def resolve_block_size(
@@ -180,15 +196,27 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
     model_rule = spec.backend_requirements.get(
         backend.name, DEFAULT_BACKEND_REQUIREMENT
     )
-    precision = declaration.precision
     mixed_precision = declaration.mixed_precision
-    if mixed_precision is None:
-        mixed_precision = model_rule.default_mixed_precision
+    if declaration.storage_precision is None:
         if mixed_precision is None:
-            mixed_precision = backend.default_mixed_precision(device)
+            mixed_precision = model_rule.default_mixed_precision
+            if mixed_precision is None:
+                mixed_precision = backend.default_mixed_precision(device)
+        precisions = resolve_precisions(declaration.precision, None, mixed_precision)
+    else:
+        precisions = resolve_precisions(
+            declaration.precision, declaration.storage_precision, False
+        )
+        if mixed_precision is not None and mixed_precision != precisions.mixed:
+            raise ValueError(
+                f"mixed_precision={mixed_precision} contradicts precision="
+                f"{declaration.precision!r} with storage_precision="
+                f"{declaration.storage_precision!r}"
+            )
+    mixed_precision = precisions.mixed
     if (
         device.type == "xpu"
-        and (precision == "float64" or mixed_precision)
+        and "float64" in (precisions.compute, precisions.storage)
         and not float64_supported(device)
     ):
         raise ValueError(
@@ -216,14 +244,14 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
             raise ValueError("Metal emulation requires HYDROFORGE_FAST_MATH=0")
         if (
             backend.name != "metal"
-            or precision != "float32"
-            or mixed_precision is not True
+            or precisions.compute != "float32"
+            or precisions.storage != "float64"
         ):
             raise ValueError(
                 "metal_emulation requires Metal, float32 compute and mixed_precision=True"
             )
-    backend.validate_precision(precision, mixed_precision and emulation == "native")
-    model_rule.validate_precision(precision, mixed_precision, backend=backend.name)
+    backend.validate_precision(precisions, emulated=emulation != "native")
+    model_rule.validate_precision(precisions, backend=backend.name)
     options.validate_backend(backend.name)
     block_size = declaration.block_size
     if block_size is None:
@@ -233,6 +261,15 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
     if not model_rule.ensemble and ensemble_size is not None:
         raise ValueError(f"backend {backend.name!r} does not support ensemble members")
 
+    slab_periodic = False
+    if spec.slab is not None and spec.slab.periodic is not None:
+        from hydroforge.contracts.conditions import ConditionContext
+
+        slab_periodic = bool(
+            spec.slab.periodic.evaluate(
+                ConditionContext(frozenset(opened), options=options)
+            )
+        )
     topology = ProcessTopology.capture()
     return Selection(
         model=f"{spec.model_type.__module__}.{spec.model_type.__qualname__}",
@@ -243,9 +280,10 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
         conditions=conditions,
         backend=backend,
         device=device,
-        precision=precision,
-        dtype=torch.float32 if precision == "float32" else torch.float64,
+        precision=precisions.scalar,
+        dtype=precisions.scalar_dtype,
         mixed_precision=mixed_precision,
+        precisions=precisions,
         metal_emulation=emulation,
         backend_requirement=model_rule,
         block_size=block_size,
@@ -266,4 +304,5 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
         member_ids=None if parallel is None else parallel.member_ids,
         parallel=parallel,
         partition_imbalance=declaration.partition_imbalance,
+        slab_periodic=slab_periodic,
     )

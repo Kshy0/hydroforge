@@ -19,6 +19,7 @@ from hydroforge.compiler.partition import coordinate_identity, coordinate_index
 from hydroforge.compiler.selection import Selection
 from hydroforge.contracts.fields import concrete_tensor_dtype
 from hydroforge.contracts.parameters import ParameterChange, validate_parameter_scalar
+from hydroforge.contracts.precision import precisions_of
 from hydroforge.core.time import DateLike, normalize_calendar_dates
 
 if TYPE_CHECKING:
@@ -156,7 +157,9 @@ def _target(
         validate_parameter_scalar(
             value,
             dtype=concrete_tensor_dtype(
-                tensor.dtype, selection.dtype, selection.mixed_precision
+                tensor.dtype,
+                precisions_of(selection).field_dtype,
+                precisions_of(selection).storage_dtype,
             ),
             variable_name=change.variable,
             is_set=is_set,

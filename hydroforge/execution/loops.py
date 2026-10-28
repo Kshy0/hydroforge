@@ -21,6 +21,7 @@ import torch
 from torch.utils._python_dispatch import _disable_current_modes
 
 from hydroforge.execution.context import SubstepFrame, close_runner
+from hydroforge.execution.halo_schedule import LoopHalo
 from hydroforge.execution.operators import PredicateLoopOperator
 
 if TYPE_CHECKING:
@@ -49,6 +50,30 @@ def distributed_capture_safe(*programs: Any) -> bool:
     return True
 
 
+def conditional_capture_safe(*programs: Any) -> bool:
+    """Return whether recorded loop programs may run in a device-side
+    conditional graph: kernels issuing process-group communication cannot be
+    instantiated there, so their loops stay host-driven (each launch may still
+    replay a captured graph)."""
+
+    from hydroforge.execution.operators import CompiledKernelCall
+
+    pending = [program for program in programs if program is not None]
+    while pending:
+        program = pending.pop()
+        for operator in program.operators:
+            if isinstance(operator, PredicateLoopOperator):
+                body = operator.loop.body
+                if body is None:
+                    return False
+                pending.append(body)
+            elif isinstance(operator, CompiledKernelCall) and getattr(
+                getattr(operator.call, "implementation", None), "communicates", False
+            ):
+                return False
+    return True
+
+
 class FixedLoop:
     """Fixed-width loop over one recorded body and an optional final tail."""
 
@@ -68,6 +93,7 @@ class FixedLoop:
         self.frame = SubstepFrame(index=self.counter, dt=self.weight)
         self.body: Any = None
         self.final: Any = None
+        self.halo_entry = LoopHalo()
         self.controlled = False
         self.weighted = False
         self.runner: Any = None
@@ -83,12 +109,21 @@ class FixedLoop:
             program for program in (self.body, self.final) if program is not None
         )
 
-    def bind(self, body: Any, final: Any | None = None) -> FixedLoop:
+    def bind(
+        self,
+        body: Any,
+        final: Any | None = None,
+        *,
+        halo_entry: LoopHalo | None = None,
+    ) -> FixedLoop:
         """Attach the recorded body and build its backend runner.
 
         Recordings reject an empty operator IR before any loop binds it.
+        ``halo_entry``: what the loop exchanges before and after every run
+        (:class:`~hydroforge.execution.halo_schedule.LoopHalo`).
         """
 
+        self.halo_entry = halo_entry or LoopHalo()
         self.body = body
         self.final = final
         programs = self.programs
@@ -228,6 +263,7 @@ class AdaptiveLoop:
         self.frame = SubstepFrame(index=self.counter, dt=dt)
         self.proposal: Any = None
         self.body: Any = None
+        self.halo_entry = LoopHalo()
         self.runner: Any = None
 
     def _allocate(
@@ -298,9 +334,17 @@ class AdaptiveLoop:
             self.one_count,
         )
 
-    def bind(self, proposal: Any, body: Any) -> AdaptiveLoop:
-        """Attach the recorded proposal and physics body; build the runner."""
+    def bind(
+        self,
+        proposal: Any,
+        body: Any,
+        *,
+        halo_entry: LoopHalo | None = None,
+    ) -> AdaptiveLoop:
+        """Attach the recorded proposal and physics body; build the runner
+        (``halo_entry`` as for :meth:`FixedLoop.bind`)."""
 
+        self.halo_entry = halo_entry or LoopHalo()
         self.proposal = proposal
         self.body = body
         self.runner = self.executor.adaptive(self)

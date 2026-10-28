@@ -32,11 +32,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cache
 from types import MappingProxyType
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 from pydantic import validate_call
 
+from hydroforge.contracts.precision import tier_of
 from hydroforge.core.validation import HydroForgeModel
 from hydroforge.platform import env
 from hydroforge.platform.devices import float64_supported
@@ -46,7 +47,7 @@ BackendName = Literal["torch", "triton", "cuda", "metal"]
 Dialect = Literal["torch", "triton", "cuda", "msl"]
 Toolchain = Literal["python", "triton", "rtc", "metal"]
 Capture = Literal["cuda_graph", "metal_icb"]
-Precision = Literal["float32", "float64"]
+Precision = Literal["float32", "float64", "bfloat16", "float16"]
 ScalarKind = Literal["bool", "int32", "uint32", "index", "float32", "float64"]
 
 _ALL_SCALARS: frozenset[ScalarKind] = frozenset(
@@ -154,14 +155,40 @@ class Backend:
             return False
         return device.type != "xpu" or float64_supported(device)
 
-    def validate_precision(self, precision: Precision, mixed: bool) -> None:
-        if precision not in self.precisions:
+    def validate_precision(
+        self, precisions: Any, mixed: bool | None = None, *, emulated: bool = False
+    ) -> None:
+        """Reject tiers whose elements this backend's framework kernels do
+        not handle; ``emulated`` storage (Metal float32x2) is not native.
+
+        ``precisions`` is a :class:`~hydroforge.contracts.precision.Precisions`,
+        or a compute tier with ``mixed`` (whether hpfloat is promoted)."""
+
+        if isinstance(precisions, str):
+            # A bare compute tier and whether hpfloat is promoted.
+            if precisions not in self.precisions:
+                raise ValueError(
+                    f"backend {self.name!r} requires precision in "
+                    f"{sorted(self.precisions)}, got {precisions!r}"
+                )
+            if mixed and not self.mixed_precision:
+                raise ValueError(
+                    f"backend {self.name!r} does not support mixed precision"
+                )
+            return
+        compute = tier_of(precisions.field_dtype)
+        if compute not in self.precisions:
             raise ValueError(
                 f"backend {self.name!r} requires precision in "
-                f"{sorted(self.precisions)}, got {precision!r}"
+                f"{sorted(self.precisions)}, got {compute!r}"
             )
-        if mixed and not self.mixed_precision:
+        if precisions.mixed and not emulated and not self.mixed_precision:
             raise ValueError(f"backend {self.name!r} does not support mixed precision")
+        if not emulated and precisions.storage not in self.precisions:
+            raise ValueError(
+                f"backend {self.name!r} requires storage_precision in "
+                f"{sorted(self.precisions)}, got {precisions.storage!r}"
+            )
 
     def validate_scalars(self, kernel: str, kinds: Mapping[str, str]) -> None:
         """Reject scalar kinds this backend cannot represent exactly."""
@@ -201,7 +228,7 @@ TORCH = Backend(
     block=BlockWidth(),
     max_extent=None,
     scalars=_ALL_SCALARS - {"uint32"},
-    precisions=frozenset(("float32", "float64")),
+    precisions=frozenset(("float32", "float64", "bfloat16", "float16")),
     mixed_precision=True,
     mixed_precision_default=frozenset(),
 )
@@ -215,7 +242,7 @@ TRITON = Backend(
     block=BlockWidth(power_of_two=True),
     max_extent=2**31 - 1,
     scalars=_ALL_SCALARS - {"uint32"},
-    precisions=frozenset(("float32", "float64")),
+    precisions=frozenset(("float32", "float64", "bfloat16", "float16")),
     mixed_precision=True,
     mixed_precision_default=frozenset(("cuda", "xpu")),
 )

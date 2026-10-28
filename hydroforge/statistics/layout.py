@@ -39,6 +39,19 @@ class AxisMap:
         return self.table is None and self.start == 0 and self.step == 1
 
 
+def storage_dtype_of(
+    base_dtype: torch.dtype, storage_dtype: torch.dtype | None, mixed_precision: bool
+) -> torch.dtype:
+    """The hpfloat dtype: ``storage_dtype``, else ``base_dtype`` promoted as
+    ``mixed_precision`` says (see :mod:`hydroforge.contracts.precision`)."""
+
+    if storage_dtype is not None:
+        return storage_dtype
+    from hydroforge.contracts.precision import resolve_precisions, tier_of
+
+    return resolve_precisions(tier_of(base_dtype), None, mixed_precision).storage_dtype
+
+
 @dataclass(frozen=True, slots=True)
 class StatisticsVariableLayout:
     """Fully resolved storage and source addressing for one output variable."""
@@ -96,7 +109,8 @@ class _StatisticsLayoutCompiler:
         scatter_extents: Mapping[str, int],
         ensemble_size: int,
         base_dtype: torch.dtype,
-        mixed_precision: bool,
+        storage_dtype: torch.dtype | None = None,
+        mixed_precision: bool = False,
     ) -> None:
         self.program = program
         self.tensors = tensors
@@ -104,7 +118,9 @@ class _StatisticsLayoutCompiler:
         self.scatter_extents = scatter_extents
         self.ensemble_size = ensemble_size
         self.base_dtype = base_dtype
-        self.mixed_precision = mixed_precision
+        self.storage_dtype = storage_dtype_of(
+            base_dtype, storage_dtype, mixed_precision
+        )
         self.sources: dict[str, _SourceLayout] = {}
 
     def compile(
@@ -163,7 +179,7 @@ class _StatisticsLayoutCompiler:
         return concrete_tensor_dtype(
             metadata.dtype,
             self.base_dtype,
-            self.mixed_precision,
+            self.storage_dtype,
         )
 
     def _source_layout(self, name: str) -> _SourceLayout:
@@ -290,7 +306,12 @@ class _StatisticsLayoutCompiler:
             )
         return StatisticsVariableLayout(
             actual_shape=actual_shape,
-            dtype=source.dtype,
+            # 16-bit fields accumulate (and are saved) in float32.
+            dtype=(
+                torch.float32
+                if source.dtype in (torch.float16, torch.bfloat16)
+                else source.dtype
+            ),
             batched=source.batched,
             stride_input=source.logical_extent if source.batched else 0,
             scatter_extent=source.scatter_extent,
@@ -309,7 +330,8 @@ def compile_statistics(
     scatter_extents: Mapping[str, int],
     ensemble_size: int,
     base_dtype: torch.dtype,
-    mixed_precision: bool,
+    storage_dtype: torch.dtype | None = None,
+    mixed_precision: bool = False,
 ) -> StatisticsCompilation:
     """Compile exact layouts from construction-time validated semantics."""
 
@@ -325,7 +347,7 @@ def compile_statistics(
         scatter_extents=scatter_extents,
         ensemble_size=ensemble_size,
         base_dtype=base_dtype,
-        mixed_precision=mixed_precision,
+        storage_dtype=storage_dtype_of(base_dtype, storage_dtype, mixed_precision),
     ).compile(immutable_ops)
     return StatisticsCompilation(immutable_ops, program, layouts)
 

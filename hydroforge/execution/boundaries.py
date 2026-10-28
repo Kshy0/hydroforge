@@ -23,10 +23,10 @@ from hydroforge.core.errors import (
 from hydroforge.core.validation import HydroForgeModel
 from hydroforge.execution.context import (
     managed_step_active,
+    model_call,
     validate_synchronous_function,
 )
 from hydroforge.execution.session import ModelRuntime
-from hydroforge.kernels.calls import routing
 
 _F = TypeVar("_F", bound=Callable[..., Any])
 
@@ -158,11 +158,7 @@ def between_steps(function: _F) -> _F:
         # Registered kernels called by the body bind like inside a step.
         execution = runtime.execution
         try:
-            with (
-                nullcontext()
-                if execution is None
-                else routing(execution.kernel_binding)
-            ):
+            with nullcontext() if execution is None else model_call(execution):
                 result = function(self, *args, **kwargs)
         except BaseException as error:
             body_error = error

@@ -32,8 +32,10 @@ from hydroforge.contracts.conditions import (
 )
 from hydroforge.contracts.options import OptionsConfig, reject_rules_declaration
 from hydroforge.contracts.parameters import ParameterChange
+from hydroforge.contracts.precision import PrecisionTier, StorageTier
 from hydroforge.contracts.runtime import BackendRequirement, ModuleRequirement
 from hydroforge.contracts.schedule import SimulationSchedule
+from hydroforge.contracts.slab import SlabAxis
 from hydroforge.contracts.step_fields import (
     StepFieldProvider,
     compile_step_field_expressions,
@@ -72,6 +74,7 @@ _MODULE_REQUIREMENTS = TypeAdapter(
 _PARTITION_KEY = TypeAdapter(Identifier | None, config=_STRICT)
 _PARTITION_GROUP = TypeAdapter(Identifier, config=_STRICT)
 _GRID_AXES = TypeAdapter(FrozenMapping[Identifier, GridAxis], config=_STRICT)
+_SLAB = TypeAdapter(SlabAxis | None, config=_STRICT)
 
 
 def _grid_axes(cls: type[ModelDeclaration]) -> Mapping[str, GridAxis]:
@@ -159,6 +162,12 @@ def _model_spec(cls: type[ModelDeclaration]) -> ModelSpec:
         raise ValueError(
             f"{cls.__name__} declares invalid contracts:\n  - " + "\n  - ".join(errors)
         )
+    slab = _SLAB.validate_python(cls.slab_axis)
+    if slab is not None and cls.partition_key is not None:
+        raise ValueError(
+            "a model declares either a partition_key (row-wise partition groups) "
+            "or a slab axis (contiguous row blocks of a structured grid), not both"
+        )
     return ModelSpec(
         model_type=cls,
         modules=MappingProxyType(modules),
@@ -172,6 +181,7 @@ def _model_spec(cls: type[ModelDeclaration]) -> ModelSpec:
         partition_key=_PARTITION_KEY.validate_python(cls.partition_key),
         partition_group=_PARTITION_GROUP.validate_python(cls.partition_group),
         grid_axes=_grid_axes(cls),
+        slab=slab,
         step_fields=StepFieldPlan(
             providers=providers,
             expressions=compile_step_field_expressions(
@@ -491,6 +501,10 @@ class ModelDeclaration(HydroForgeModel):
     )
     partition_key: ClassVar[str | None] = None
     partition_group: ClassVar[str] = "group_id"
+    slab_axis: ClassVar[SlabAxis | None] = None
+    """Row-slab decomposition of one structured-grid axis over the spatial
+    ranks (:class:`~hydroforge.contracts.slab.SlabAxis`); a staggered axis of
+    it is a ``grid_axes`` entry that ``staggers`` the cell axis."""
     grid_axes: ClassVar[Mapping[str, GridAxis]] = MappingProxyType({})
     """Names of symbolic dimensions as grid axes (``{"num_i": GridAxis(name=
     "west_east")}``); outputs name their dimensions and views select by them.
@@ -516,9 +530,21 @@ class ModelDeclaration(HydroForgeModel):
         default=torch.device("cpu"),
         description="Device for tensors (e.g., 'cuda:0', 'xpu:0', 'cpu')",
     )
-    precision: Literal["float32", "float64"] = Field(
+    precision: PrecisionTier = Field(
         default="float32",
-        description="Base precision of the model",
+        description=(
+            "Compute tier: elements of float tensors (float64, float32, "
+            "bfloat16, float16), or tf32: float32 elements whose torch matrix "
+            "products and convolutions run on TF32 (see "
+            "hydroforge.contracts.precision)"
+        ),
+    )
+    storage_precision: StorageTier | None = Field(
+        default=None,
+        description=(
+            "Storage tier: elements of hpfloat tensors, at least as precise as "
+            "the compute tier. Omitted, mixed_precision decides"
+        ),
     )
     metal_emulation: Literal["auto", "native", "float32x2"] = Field(
         default="auto",
@@ -529,8 +555,9 @@ class ModelDeclaration(HydroForgeModel):
         strict=True,
         description=(
             "Enable mixed precision for hpfloat (storage) tensors.\n"
-            "When True, hpfloat tensors are promoted one level above base precision:\n"
-            "  float32 → float64, float64 → float64 (no promotion).\n"
+            "When True, hpfloat tensors are promoted one level above the compute tier:\n"
+            "  16-bit → float32, float32/tf32 → float64, float64 → float64.\n"
+            "With storage_precision it may be omitted, or must agree with it.\n"
             "If omitted, uses the model's backend-specific default when declared; "
             "otherwise defaults to enabled for CUDA/ROCm and for XPU "
             "Triton devices that report FP64 support; it is disabled for "

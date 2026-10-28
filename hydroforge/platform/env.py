@@ -13,7 +13,10 @@ unrecognized value is an error.
 ``HYDROFORGE_BACKEND`` (torch, triton, cuda or metal)
     Kernel backend; by default the model device selects it.
 ``HYDROFORGE_FAST_MATH`` (flag, off)
-    Physics kernels use each backend's fast math.
+    Physics kernels use each backend's fast math (on CUDA and Triton,
+    contracting multiplies and adds into FMA as well; off, their physics
+    kernels do not contract unless CUDA source options pass ``--fmad`` or a
+    Triton launch passes ``enable_fp_fusion``).
 ``HYDROFORGE_PRECOMPILE_JOBS`` (positive int)
     Concurrent compilations; 6 on local rank 0 and 1 elsewhere by default.
 ``HYDROFORGE_CUDA_REBUILD`` (flag, off)

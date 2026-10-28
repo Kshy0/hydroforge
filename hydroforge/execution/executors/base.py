@@ -40,6 +40,11 @@ class LoopExecutor:
             device = torch.device("cuda", torch.cuda.current_device())
         self.device = device
         self.world_size = world_size
+        # Set while a loop whose body carries halo messages across its
+        # iterations runs: warm-up runs of a capture leave its rings
+        # holding what they published, so a capture calls it after
+        # restoring the state (hydroforge.execution.halo_schedule.LoopHalo).
+        self.halo_refresh: Callable[[], None] | None = None
         self._resources: list[tuple[Any, Callable[[], None]]] = []
 
     @staticmethod

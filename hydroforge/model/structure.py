@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from hydroforge.compiler.partition import bare
+from hydroforge.contracts.precision import precisions_of
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -748,6 +749,7 @@ def model_structure(model: AbstractModel) -> dict[str, Any]:
         "spatial_world_size": plan.spatial_world_size,
         "imbalance_tolerance": plan.partition_imbalance,
         "balance": None,
+        "slab": None,
         "halo": None,
         "reduce": {},
     }
@@ -764,6 +766,18 @@ def model_structure(model: AbstractModel) -> dict[str, Any]:
             "imbalance": round(pieces.imbalance, 4),
             "cut": pieces.cut,
         }
+    slab = None if live is None else getattr(live, "slab", None)
+    if slab is not None:
+        declared = spec.slab
+        partition["slab"] = {
+            "axis": declared.dim,
+            "halo": declared.halo,
+            "periodic": plan.slab_periodic,
+            "rows": slab.total,
+            "owned": [slab.start, slab.stop],
+            "ghosts": [slab.lower, slab.upper],
+            "position": slab.position,
+        }
     execution = None if live is None else getattr(live, "execution", None)
     for name, reducer in getattr(execution, "reducers", {}).items():
         partition["reduce"][name] = {
@@ -771,27 +785,10 @@ def model_structure(model: AbstractModel) -> dict[str, Any]:
             "skipped": dict(reducer.skipped),
         }
     if live is not None and getattr(live, "halo", None) is not None:
-        halo = live.halo
-        counts = halo.plan.counts
-        rank = halo.plan.rank
-        partition["halo"] = {
-            "owned": halo.plan.n_owned,
-            "ghosts": halo.plan.n_ghosts,
-            "ghosts_total": halo.plan.total_ghosts,
-            "transport": halo.transport,
-            "skipped": dict(halo.skipped),
-            "direct": halo.direct,
-            "sends": {
-                str(p): int(counts[rank, p])
-                for p in range(halo.plan.world)
-                if counts[rank, p]
-            },
-            "receives": {
-                str(q): int(counts[q, rank])
-                for q in range(halo.plan.world)
-                if counts[q, rank]
-            },
-        }
+        partition["halo"] = live.halo.summary()
+    topology = None if live is None else getattr(live, "topology", None)
+    if topology is not None and topology.world > 1:
+        partition["nodes"] = list(topology.nodes)
 
     output = plan.output
     config = output.config
@@ -835,7 +832,8 @@ def model_structure(model: AbstractModel) -> dict[str, Any]:
         "state": runtime.state,
         "backend": plan.backend.name,
         "device": str(plan.device),
-        "precision": plan.precision,
+        "precision": precisions_of(plan).compute,
+        "storage_precision": precisions_of(plan).storage,
         "mixed_precision": plan.mixed_precision,
         "ensemble_size": plan.ensemble_size,
         "opened_modules": list(plan.modules),
@@ -1147,8 +1145,10 @@ function partitionView(){const div=$('div'),P=D.partition;
  div.append(card('Coordinate ownership (arrow: rows live with)',graph(nodes,D.coordinates.filter(c=>c.target).map(c=>[c.name,c.target])),$('div',{class:'legend'},'highlighted: the partition key; every partitioned coordinate follows it')));
  div.append(card('Partition',kv({key:P.key,group:P.group,rank:P.spatial_world_size>1?P.spatial_rank+' of '+P.spatial_world_size:'single rank','imbalance tolerance':P.imbalance_tolerance}),
   P.balance?[$('h3',{},'balance'),kv({'groups cut':P.balance.split?'yes':'no',pieces:P.balance.pieces,'imbalance':(100*P.balance.imbalance).toFixed(2)+' %','edges between ranks':P.balance.cut})]:null,
-  P.halo?[$('h3',{},'halo'),kv({transport:P.halo.transport,skipped:P.halo.skipped,owned:P.halo.owned,ghosts:P.halo.ghosts,'ghosts (all ranks)':P.halo.ghosts_total,sends:P.halo.sends,receives:P.halo.receives})]
-   :$('div',{class:'muted'},'No halo: every partition group is closed.'),
+  P.nodes?kv({'node of each rank':P.nodes}):null,
+  P.slab?[$('h3',{},'slab rows of axis '+P.slab.axis),kv({rows:P.slab.rows,owned:P.slab.owned,ghosts:P.slab.ghosts,halo:P.slab.halo,periodic:P.slab.periodic,'block position':P.slab.position})]:null,
+  P.halo?[$('h3',{},'halo'),kv({kinds:P.halo.kinds,'links (peer: link)':P.halo.links,skipped:P.halo.skipped,'peer memory':P.halo.memory,nccl:P.halo.nccl,gin:P.halo.gin,ghosts:P.halo.ghosts,'ghosts (all ranks)':P.halo.ghosts_total,'message slot bytes':P.halo.message_bytes,sends:P.halo.sends,receives:P.halo.receives})]
+   :$('div',{class:'muted'},'No halo: one rank, or every partition group is closed.'),
   Object.keys(P.reduce||{}).length?[$('h3',{},'all-reduce transports'),Object.entries(P.reduce).map(([g,r])=>kv({group:g,transports:r.transports,skipped:r.skipped}))]:null));
  const refs=D.fields.filter(f=>f.references&&!f.coordinate);
  if(refs.length)div.append(card('Reference fields',table([['field',f=>link('field',f.module+'.'+f.name,f.module+'.'+f.name)],['on',f=>f.dim_coords],['references',f=>f.references],

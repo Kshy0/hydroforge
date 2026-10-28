@@ -212,26 +212,35 @@ def offending_indices(mask: torch.Tensor, limit: int = 5) -> list[Any]:
 def concrete_tensor_dtype(
     kind: str,
     base_dtype: torch.dtype,
-    mixed_precision: bool,
+    storage_dtype: torch.dtype | bool,
 ) -> torch.dtype:
-    """Resolve one semantic TensorField dtype without intermediate casting."""
+    """Resolve one semantic TensorField dtype without intermediate casting:
+    ``float`` holds ``base_dtype`` (the compute tier's elements), ``hpfloat``
+    ``storage_dtype`` (the storage tier's; see
+    :mod:`hydroforge.contracts.precision`)."""
 
-    if base_dtype not in {torch.float32, torch.float64}:
-        raise TypeError(
-            f"base tensor precision must be float32 or float64, got {base_dtype}"
-        )
-    if type(mixed_precision) is not bool:
-        raise TypeError("mixed_precision must be an exact bool")
+    if type(storage_dtype) is bool:
+        # The mixed_precision flag: float32 promotes to float64.
+        storage_dtype = torch.float64 if storage_dtype else base_dtype
+    for name, dtype in (("base", base_dtype), ("storage", storage_dtype)):
+        if dtype not in _TIER_DTYPES:
+            raise TypeError(
+                f"{name} tensor precision must be float64, float32, bfloat16 "
+                f"or float16, got {dtype}"
+            )
     try:
         return {
             "float": base_dtype,
-            "hpfloat": torch.float64 if mixed_precision else base_dtype,
+            "hpfloat": storage_dtype,
             "int": torch.int64,
             "idx": torch.int32,
             "bool": torch.bool,
         }[kind]
     except KeyError as error:
         raise TypeError(f"unsupported tensor dtype declaration {kind!r}") from error
+
+
+_TIER_DTYPES = frozenset((torch.float64, torch.float32, torch.bfloat16, torch.float16))
 
 
 def precision_dtype(name: str, precision: torch.dtype) -> torch.dtype:
@@ -254,19 +263,23 @@ def cast_declared_tensor(
 
     if tensor.dtype == target:
         return tensor
-    if target in {torch.float32, torch.float64}:
+    narrowing = False
+    if target in _TIER_DTYPES:
         if not tensor.is_floating_point():
             raise TypeError(
                 f"{name} declares {target} but received non-floating "
                 f"dtype {tensor.dtype}"
             )
-        if target == torch.float32 and tensor.numel():
+        narrowing = torch.finfo(target).max < torch.finfo(tensor.dtype).max or (
+            torch.finfo(target).tiny > torch.finfo(tensor.dtype).tiny
+        )
+        if narrowing and tensor.numel():
             finite = torch.isfinite(tensor)
-            outside = finite & (torch.abs(tensor) > torch.finfo(torch.float32).max)
+            outside = finite & (torch.abs(tensor) > torch.finfo(target).max)
             if bool(outside.any().item()):
                 raise OverflowError(
                     f"{name} cannot convert {tensor.dtype} to {target}: "
-                    "finite values exceed the float32 range"
+                    f"finite values exceed the {target} range"
                 )
     elif target in {torch.int32, torch.int64}:
         if tensor.dtype not in TORCH_INTEGER_DTYPES:
@@ -294,7 +307,7 @@ def cast_declared_tensor(
         raise TypeError(f"{name} has unsupported declared dtype {target}")
     converted = tensor.to(target)
     if (
-        target == torch.float32
+        narrowing
         and tensor.numel()
         and bool(
             (torch.isfinite(tensor) & (tensor != 0) & (converted == 0)).any().item()

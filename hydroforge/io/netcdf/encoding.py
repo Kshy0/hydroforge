@@ -69,11 +69,14 @@ def decode_netcdf_logical_array(
 def saved_dtype(dtype: torch.dtype, save_precision: torch.dtype | None) -> torch.dtype:
     """Return the dtype an output of ``dtype`` is saved in.
 
-    ``save_precision`` applies to floating-point outputs only.
+    ``save_precision`` applies to floating-point outputs only; NetCDF holds
+    no 16-bit floats, so those are saved as float32 at least.
     """
 
     if save_precision is not None and dtype.is_floating_point:
         return save_precision
+    if dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
     return dtype
 
 

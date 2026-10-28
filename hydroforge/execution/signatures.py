@@ -12,6 +12,7 @@ import json
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 
+from hydroforge.contracts.precision import precisions_of
 from hydroforge.contracts.schedule import SimulationSchedule
 from hydroforge.core.identity import canonical, tensor_content
 
@@ -172,7 +173,12 @@ def declaration_signature(runtime: ModelRuntime) -> tuple[Any, ...]:
         ("partition", plan.spec.partition_key, plan.spec.partition_group),
         ("backend", plan.backend.name),
         ("device_type", plan.device.type),
-        ("precision", plan.precision, plan.mixed_precision, plan.metal_emulation),
+        (
+            "precision",
+            precisions_of(plan).compute,
+            precisions_of(plan).storage,
+            plan.metal_emulation,
+        ),
         ("options", signature_value(plan.options)),
         ("field_conditions", tuple(sorted(plan.conditions.items()))),
         ("execution", model.execution_mode, plan.block_size),

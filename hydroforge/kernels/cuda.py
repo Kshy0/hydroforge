@@ -70,8 +70,13 @@ from hydroforge.kernels.registry import (
     named_parameters,
 )
 from hydroforge.kernels.spec import (
+    HALO_PARAMETER,
+    HaloArgument,
     KernelSpec,
     expected_host_scalar,
+    halo_checks,
+    halo_read_mask,
+    halo_work,
     host_scalar_is_valid,
     launch_extent,
 )
@@ -495,6 +500,31 @@ def compile_time_source(spec: KernelSpec, values: Mapping[str, Any]) -> str:
     )
 
 
+def _halo_defines(spec: KernelSpec, values: Mapping[str, Any]) -> str:
+    """Which halo work a call's ``halo`` argument holds, as the defines of
+    halo_access.cuh: a call reading no ring, publishing nothing, returning
+    no slots or storing into slots proven free compiles those paths away
+    (kernels then match their plain form)."""
+
+    if spec.runtime_scalars.get(HALO_PARAMETER) != "halo":
+        return ""
+    argument = values[HALO_PARAMETER]
+    _, publishes, commits = halo_work(argument)
+    return (
+        f"#define HF_HALO_READS {halo_read_mask(argument)}\n"
+        f"#define HF_HALO_PUBLISHES {int(publishes)}\n"
+        f"#define HF_HALO_COMMITS {int(commits)}\n"
+        f"#define HF_HALO_CREDITS {int(halo_checks(argument))}\n"
+    )
+
+
+def halo_struct(value: HaloArgument) -> rtc.KernelArgument:
+    """The by-value ``HfHalo`` of a halo argument (int64 words, natural C
+    layout: halo_access.cuh declares int64 and pointer members only)."""
+
+    return struct(*(int64(word) for word in value.words))
+
+
 def _scalar_kind(spec: KernelSpec, name: str) -> str:
     return spec.runtime_scalars.get(name) or spec.compile_time[name]
 
@@ -566,13 +596,19 @@ class _Rendering:
             if value is not None and value.is_meta:
                 return rtc.KernelArgument(ctypes.c_void_p, None, value.dtype)
             return pointer(value)
-        return scalar(self.values[name], SCALARS[_scalar_kind(self.spec, name)].dtype)
+        kind = _scalar_kind(self.spec, name)
+        if kind == "halo":
+            return halo_struct(self.values[name])
+        return scalar(self.values[name], SCALARS[kind].dtype)
 
     def declaration(self, name: str | None, position: int) -> str:
         if name is None:
             return f"decltype(nullptr) hydroforge_null_{position}"
         if name not in self.buffers:
-            return f"{native_scalar(_scalar_kind(self.spec, name), 'cuda')} {name}"
+            kind = _scalar_kind(self.spec, name)
+            if kind == "halo":
+                return f"HfHalo {name}"
+            return f"{native_scalar(kind, 'cuda')} {name}"
         value = self.values[name]
         dtype = (
             value.dtype if value is not None else (self.buffer_dtypes or {}).get(name)
@@ -580,7 +616,9 @@ class _Rendering:
         # An absent buffer without a declared dtype converts to any pointer.
         return f"{ctype(dtype)}* {name}" if dtype else f"decltype(nullptr) {name}"
 
-    def launch(self, step: _CallStep, entry: str) -> tuple[CudaLaunch | None, str]:
+    def launch(
+        self, step: _CallStep, entry: str, begin: bool = False
+    ) -> tuple[CudaLaunch | None, str]:
         declared = step.declaration
         block_size = self.values["BLOCK_SIZE"]
         extent = launch_extent(self.spec.name, step.size, self.values)
@@ -615,13 +653,18 @@ class _Rendering:
         )
         if declared.device is None:
             return CudaLaunch(expression, grid, threads, tuple(arguments), shared), ""
-        source = self.entry(step, entry, expression, batched)
+        source = self.entry(step, entry, expression, batched, begin)
         return (
             CudaLaunch(entry, grid, threads, (*arguments, int64(extent)), shared),
             source,
         )
 
-    def entry(self, step: _CallStep, entry: str, call: str, batched: bool) -> str:
+    def entry(
+        self, step: _CallStep, entry: str, call: str, batched: bool, begin: bool = False
+    ) -> str:
+        """The ``__global__`` entry of a device function; ``begin``: the
+        call's first launch taking its ``halo`` argument, which runs the
+        halo prologue (``hf_halo_begin``) before anything else."""
         declared = step.declaration
         declarations = [
             self.declaration(name, position)
@@ -659,9 +702,14 @@ class _Rendering:
         if batched:
             forwarded = [*forwarded, "int64_t(blockIdx.y)"]
         signature = ", ".join([*parameters, "int64_t hydroforge_extent"])
+        prologue = ""
+        if begin:
+            argument = "args." if declared.pack == "struct" else ""
+            prologue = f"    hf_halo_begin({argument}{HALO_PARAMETER});\n"
         return (
             f"\n{prefix}__global__ void {entry}({signature}) {{\n"
-            f"    const int64_t hydroforge_index = {index};\n"
+            + prologue
+            + f"    const int64_t hydroforge_index = {index};\n"
             + (
                 "    if (hydroforge_index < 0 || hydroforge_index >= hydroforge_extent) "
                 "return;\n"
@@ -690,6 +738,11 @@ def _render_steps(
     )
     launches: list[rtc.LaunchStep] = []
     sources: list[str] = []
+    # The halo prologue runs once per call, in its first launch taking the
+    # halo argument (halo_access.cuh): a generated entry calls it, a
+    # hand-written one (``own``) must.
+    begin = spec.runtime_scalars.get(HALO_PARAMETER) == "halo"
+    own = None
     for position, step in enumerate(steps):
         if not rendering.enabled(step.condition):
             continue
@@ -698,11 +751,55 @@ def _render_steps(
             if target is not None:
                 launches.append(partial(target.fill_, step.value))
             continue
-        launch, source = rendering.launch(step, f"hydroforge_entry_{position}")
+        first = begin and HALO_PARAMETER in step.arguments
+        launch, source = rendering.launch(step, f"hydroforge_entry_{position}", first)
         if launch is not None:
             launches.append(launch)
             sources.append(source)
-    return tuple(launches), "".join(sources)
+            if first and not source:
+                own = launch.kernel
+            begin = begin and not first
+    return tuple(launches), "".join(sources), own
+
+
+_COMMENTS = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
+
+
+def _matching(text: str, start: int, open_: str, close: str) -> int:
+    """The index past the bracket closing the one at ``start`` (-1: none)."""
+
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == open_:
+            depth += 1
+        elif text[index] == close:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return -1
+
+
+def calls_halo_begin(source: str, kernel: str) -> bool:
+    """Whether every ``__global__`` definition of ``kernel`` (a launch
+    expression: its name, template arguments aside) in ``source`` calls
+    ``hf_halo_begin`` in its body, comments aside. The header defining
+    ``hf_halo_begin`` itself, or a definition nowhere found, does not count."""
+
+    name = kernel.split("<", 1)[0].strip()
+    text = _COMMENTS.sub(" ", source)
+    found = False
+    head = re.compile(r"__global__\b[^;{}]*?\b" + re.escape(name) + r"\s*\(")
+    for match in head.finditer(text):
+        end = _matching(text, match.end() - 1, "(", ")")
+        rest = text[end:].lstrip() if end > 0 else ""
+        if not rest.startswith("{"):
+            continue  # a declaration
+        start = len(text) - len(rest)
+        body = text[start : _matching(text, start, "{", "}")]
+        if "hf_halo_begin(" not in body:
+            return False
+        found = True
+    return found
 
 
 def _launch_device(values: Mapping[str, Any]) -> int:
@@ -813,6 +910,16 @@ class _CudaImplementation(KernelImplementation):
         )
         self.options = rtc.program_options(declaration.source.options, physics=True)
         self._programs: dict[tuple[str, ...], rtc.RtcProgram] = {}
+        # Hand-written entries found calling hf_halo_begin, by program source.
+        self._begins: set[tuple[str, str]] = set()
+
+    @property
+    def communicates(self) -> bool:
+        return self.declaration.communicates
+
+    @property
+    def capturable(self) -> bool:
+        return self.declaration.capturable
 
     def _validate(self, call: KernelCall) -> None:
         values = call.arguments
@@ -890,9 +997,10 @@ class _CudaImplementation(KernelImplementation):
             program = self._programs[key] = rtc.RtcProgram(
                 source, self.options, spec.name
             )
-        if not declaration.masks and not entries:
+        halo = _halo_defines(spec, values)
+        if not declaration.masks and not entries and not halo:
             return program
-        prefix = "".join(
+        prefix = halo + "".join(
             f"#define HYDROFORGE_{name} {_mask(members, values)}u\n"
             for name, members in declaration.masks.items()
         )
@@ -911,7 +1019,7 @@ class _CudaImplementation(KernelImplementation):
             workspace = _allocate_workspace(
                 self.declaration.workspace, values, device, materialize=materialize
             )
-            steps, entries = _render_steps(
+            steps, entries, own = _render_steps(
                 self.spec, self.steps, values, workspace, call.buffer_dtypes
             )
         else:
@@ -920,11 +1028,22 @@ class _CudaImplementation(KernelImplementation):
                     **{name: values[name] for name in self.plan_names}
                 )
             )
-        request = (
-            rtc.request_for(self._program(values, entries), steps)
-            if any(isinstance(step, CudaLaunch) for step in steps)
-            else None
-        )
+            # A launch plan's first launch runs the halo prologue itself.
+            own = next(
+                (s.kernel for s in steps if isinstance(s, CudaLaunch)), None
+            ) if self.spec.runtime_scalars.get(HALO_PARAMETER) == "halo" else None
+        request = None
+        if any(isinstance(step, CudaLaunch) for step in steps):
+            program = self._program(values, entries)
+            if own is not None and (own, program.source) not in self._begins:
+                if not calls_halo_begin(program.source, own):
+                    raise ValueError(
+                        f"{self.spec.name}: its entry {own} must call "
+                        "hf_halo_begin(halo) before anything else (entries "
+                        "generated for device functions do)"
+                    )
+                self._begins.add((own, program.source))
+            request = rtc.request_for(program, steps)
         return request, steps, device, workspace
 
     def source(self, call: KernelCall) -> str:
@@ -953,6 +1072,13 @@ class _CudaImplementation(KernelImplementation):
         return launch
 
 
+def takes_halo(implementation: Any) -> bool:
+    """Whether a built implementation is a CUDA kernel of this backend (it
+    takes a ``halo`` argument by value and runs its prologue)."""
+
+    return isinstance(implementation, _CudaImplementation)
+
+
 class CudaKernel(KernelDeclaration):
     """One kernel of a runtime-compiled :class:`CudaSource`.
 
@@ -964,8 +1090,9 @@ class CudaKernel(KernelDeclaration):
     steps; ``ignore`` lists canonical values no declared launch takes;
     ``fixed`` requires the value of canonical inputs a launch plan omits;
     ``check``, named like a plan's parameters, raises on canonical inputs the
-    kernels cannot serve.  ``constants`` and ``masks`` are described in the
-    module documentation.
+    kernels cannot serve; ``communicates`` marks a plan whose callables issue
+    process-group communication.  ``constants`` and ``masks`` are described
+    in the module documentation.
     """
 
     toolchain: ClassVar[str] = "rtc"
@@ -984,6 +1111,12 @@ class CudaKernel(KernelDeclaration):
         default_factory=dict
     )
     check: NamedCallable = None
+    communicates: bool = False
+    """A launch plan step issues process-group communication; recorded
+    loops that hold the kernel are driven from the host."""
+    capturable: bool = True
+    """A CUDA graph can capture the plan's steps; ``False`` (host work at
+    every launch) keeps every program holding the kernel eager."""
 
     def __init__(self, source: CudaSource, /, **fields: Any) -> None:
         super().__init__(source=source, **fields)
@@ -1018,6 +1151,8 @@ __all__ = [
     "ctype",
     "float32",
     "float64",
+    "halo_struct",
+    "takes_halo",
     "int32",
     "int64",
     "pointer",
