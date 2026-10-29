@@ -23,6 +23,7 @@ from torch.utils._python_dispatch import _disable_current_modes
 from hydroforge.execution.context import SubstepFrame, close_runner
 from hydroforge.execution.halo_schedule import LoopHalo
 from hydroforge.execution.operators import PredicateLoopOperator
+from hydroforge.kernels.backends.loop_control import TICK, TICKS_PER_SECOND, clock_ticks
 
 if TYPE_CHECKING:
     from hydroforge.execution.runtime import ModelExecution
@@ -278,16 +279,22 @@ class AdaptiveLoop:
         with torch.inference_mode(False):
             options = dict(device=candidate_dt.device, dtype=candidate_dt.dtype)
             counts = dict(device=candidate_dt.device, dtype=torch.int32)
-            self.duration = torch.zeros(1, **options)
-            self.elapsed = torch.zeros(1, **options)
+            # The clock counts int64 ticks (loop_control.TICK), not seconds.
+            ticks = dict(device=candidate_dt.device, dtype=torch.int64)
+            self.duration = torch.zeros(1, **ticks)
+            self.elapsed = torch.zeros(1, **ticks)
+            self.step = torch.zeros(1, **ticks)
             self.counter = torch.zeros(1, **counts)
             self.continue_flag = torch.zeros_like(self.counter)
             self.error_flag = torch.zeros_like(self.counter)
             # Stable scalar scratch belongs to the loop, not to an iteration.
             # CUDA captures these addresses and eager execution performs no
             # per-substep tensor allocation.
-            self.remaining = torch.zeros(1, **options)
-            self.accepted = torch.zeros(1, **options)
+            self.remaining = torch.zeros(1, **ticks)
+            self.whole = torch.zeros(1, **ticks)
+            self.zero_ticks = torch.zeros(1, **ticks)
+            self.width = torch.zeros(1, **options)
+            self.scaled = torch.zeros(1, **options)
             self.predicate_a = torch.zeros(
                 1, device=candidate_dt.device, dtype=torch.bool
             )
@@ -320,11 +327,15 @@ class AdaptiveLoop:
             self.time_step,
             self.duration,
             self.elapsed,
+            self.step,
             self.counter,
             self.continue_flag,
             self.error_flag,
             self.remaining,
-            self.accepted,
+            self.whole,
+            self.zero_ticks,
+            self.width,
+            self.scaled,
             self.predicate_a,
             self.predicate_b,
             self.predicate_c,
@@ -359,25 +370,32 @@ class AdaptiveLoop:
     def iterate(self) -> None:
         self.candidate.copy_(self.maximum_value)
         self.proposal.launch()
-        self.remaining.copy_(self.duration).sub_(self.elapsed)
-        torch.minimum(self.candidate, self.remaining, out=self.accepted)
-        # ``accepted != accepted`` is exactly the NaN test needed here.  A
-        # positive infinity cannot survive minimum(candidate, finite
-        # remaining), while negative infinity is caught by <= 0.
-        torch.eq(self.accepted, self.accepted, out=self.predicate_a)
-        torch.logical_not(self.predicate_a, out=self.predicate_a)
-        torch.le(self.accepted, self.zero_value, out=self.predicate_b)
+        # loop_control.adaptive_accept: the remainder in ticks and seconds.
+        torch.sub(self.duration, self.elapsed, out=self.remaining)
+        self.width.copy_(self.remaining).mul_(TICK)
+        # A NaN or non-positive proposal is invalid; it and a proposal
+        # reaching the remainder close the interval.
+        torch.ne(self.candidate, self.candidate, out=self.predicate_a)
+        torch.le(self.candidate, self.zero_value, out=self.predicate_b)
         torch.logical_or(self.predicate_a, self.predicate_b, out=self.predicate_a)
-        # A bad proposal must terminate the device WHILE node.  Substitute the
-        # finite positive remainder so the already-captured physics tail does
-        # not receive zero/NaN before the host reports the strict error.
-        torch.where(self.predicate_a, self.remaining, self.accepted, out=self.time_step)
-        # A width clipped to the remainder closes the interval exactly;
-        # ``elapsed + (duration - elapsed)`` may round below ``duration``.
-        torch.eq(self.time_step, self.remaining, out=self.predicate_c)
+        torch.ge(self.candidate, self.width, out=self.predicate_b)
+        torch.logical_or(self.predicate_a, self.predicate_b, out=self.predicate_b)
+        # The whole ticks of a proposal below the remainder (finite there;
+        # the conversion truncates).
+        torch.where(self.predicate_b, self.zero_value, self.candidate, out=self.scaled)
+        self.whole.copy_(self.scaled.mul_(TICKS_PER_SECOND))
+        torch.minimum(self.whole, self.remaining, out=self.whole)
+        torch.where(self.predicate_b, self.remaining, self.whole, out=self.step)
+        # Under one tick is invalid too. The remainder replaces an invalid
+        # width, so the already-captured physics tail does not receive
+        # zero/NaN before the host reports the strict error.
+        torch.le(self.step, self.zero_ticks, out=self.predicate_c)
+        torch.logical_or(self.predicate_a, self.predicate_c, out=self.predicate_a)
+        torch.where(self.predicate_a, self.remaining, self.step, out=self.step)
+        self.time_step.copy_(self.step).mul_(TICK)
         self.body.launch()
-        self.elapsed.add_(self.time_step)
-        torch.where(self.predicate_c, self.duration, self.elapsed, out=self.elapsed)
+        # loop_control.adaptive_end: exact ticks reach the duration.
+        self.elapsed.add_(self.step)
         self.counter.add_(self.one_count)
         torch.ge(self.counter, self.maximum_count, out=self.predicate_b)
         torch.lt(self.elapsed, self.duration, out=self.predicate_c)
@@ -409,7 +427,7 @@ class AdaptiveLoop:
         return host.tolist()
 
     def execute(self, duration: float, step: Any) -> int:
-        self.duration.fill_(duration)
+        self.duration.fill_(clock_ticks(duration))
         return self.runner.run(duration, step)
 
     def close(self) -> None:

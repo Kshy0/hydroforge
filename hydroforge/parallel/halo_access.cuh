@@ -12,11 +12,12 @@
 //   __global__ void flux(..., const HfHalo halo)
 //
 // The framework prepares it once per call site (when the program is
-// recorded): every element-wise decision compares against its members,
-// which live in the kernel's parameter space, so interior rows load no
-// tables and wait for nothing. Calls with no halo work (another link or
-// backend, one rank, eager calls) get a struct whose interior covers every
-// row.
+// recorded). The descriptors of the first HF_HALO_INLINE reads and
+// publications live in the struct, in the kernel's parameter space, so their
+// interior rows compare against parameters, load no tables and wait for
+// nothing; a kernel declaring more fields finds the rest in a table. Calls
+// with no halo work (another link or backend, one rank, eager calls) get a
+// struct whose interior covers every row.
 //
 // Every launch first calls ``hf_halo_begin(halo)`` (generated entries do;
 // a hand-written kernel calls it before anything else, or its call is
@@ -69,11 +70,11 @@
 #pragma once
 
 // The CUDA backend defines these per call from its argument: a field this
-// call reads from no ring (bit k of HF_HALO_READS clear for field k), a call
+// call reads from no ring (HF_HALO_READS(k) false for field k), a call
 // publishing nothing, returning no slots or storing into slots proven free
 // compiles that path away.
 #ifndef HF_HALO_READS
-#define HF_HALO_READS 0xff
+#define HF_HALO_READS(k) true
 #endif
 #ifndef HF_HALO_PUBLISHES
 #define HF_HALO_PUBLISHES 1
@@ -84,6 +85,9 @@
 #ifndef HF_HALO_CREDITS
 #define HF_HALO_CREDITS 1
 #endif
+
+// Reads and publications whose descriptors sit in the struct itself.
+#define HF_HALO_INLINE 8
 
 struct HfHaloRead {
     int64_t lo, hi;          // rows read from the field without further checks
@@ -109,11 +113,22 @@ struct HfHalo {
     const int64_t* targets;  // the peers a publishing launch sends to
     int64_t messages;        // how many
     int64_t checks;          // publishing waits for slot credits (HF_HALO_CREDITS)
-    HfHaloRead read[8];
-    HfHaloPublish publish[8];
+    HfHaloRead read[HF_HALO_INLINE];        // slots below HF_HALO_INLINE
+    HfHaloPublish publish[HF_HALO_INLINE];
+    const HfHaloRead* more_reads;           // slots from HF_HALO_INLINE on, or null
+    const HfHaloPublish* more_publishes;
 };
 
 namespace hf_halo_access {
+// Descriptor of declaration slot k (a constant at call sites, so the choice
+// folds away); a slot past the inline ones needs its table.
+__device__ __forceinline__ const HfHaloRead& read_slot(const HfHalo& h, int k) {
+    return k < HF_HALO_INLINE ? h.read[k] : h.more_reads[k - HF_HALO_INLINE];
+}
+__device__ __forceinline__ const HfHaloPublish& publish_slot(const HfHalo& h, int f) {
+    return f < HF_HALO_INLINE ? h.publish[f] : h.more_publishes[f - HF_HALO_INLINE];
+}
+
 __device__ __forceinline__ long long acquire(const int64_t* word) {
     long long value;
     asm volatile("ld.acquire.sys.global.s64 %0, [%1];" : "=l"(value) : "l"(word) : "memory");
@@ -276,18 +291,28 @@ __device__ __forceinline__ T hf_halo_load(const HfHalo& h, int k, T* field, int6
                                           int64_t o, int64_t row, int64_t i) {
     // A field no ring holds in this call: a plain load (k is a constant at
     // the call site, so the test folds away).
-    if (!((HF_HALO_READS >> k) & 1)) return field[index];
-    const HfHaloRead& r = h.read[k];
+    if (!HF_HALO_READS(k) || (k >= HF_HALO_INLINE && h.more_reads == nullptr))
+        return field[index];
+    const HfHaloRead& r = hf_halo_access::read_slot(h, k);
     // Interior rows: two compares against kernel parameters.
     if (row >= r.lo && row < r.hi) return field[index];
     return hf_halo_access::ring_read(h, r, field, index, o, row, i);
+}
+
+// The read descriptor of declaration slot k, by value: interior everywhere
+// when no ring holds the field in this call.
+__device__ __forceinline__ HfHaloRead hf_halo_read(const HfHalo& h, int k) {
+    if (k >= HF_HALO_INLINE && h.more_reads == nullptr)
+        return HfHaloRead{0, int64_t(1) << 62, nullptr, nullptr};
+    return hf_halo_access::read_slot(h, k);
 }
 
 template <class T>
 __device__ __forceinline__ void hf_publish(const HfHalo& h, int& stored, int f, int64_t o,
                                            int64_t row, int64_t i, T value) {
 #if HF_HALO_PUBLISHES
-    const HfHaloPublish& p = h.publish[f];
+    if (f >= HF_HALO_INLINE && h.more_publishes == nullptr) return;
+    const HfHaloPublish& p = hf_halo_access::publish_slot(h, f);
     // Rows published nowhere: two compares against kernel parameters.
     if (row >= p.lo && row < p.hi) return;
     stored += hf_halo_access::ring_store(h, p, o, row, i, value);
@@ -300,7 +325,8 @@ __device__ __forceinline__ void hf_publish(const HfHalo& h, int& stored, int f, 
 // rows published nowhere load nothing.
 __device__ __forceinline__ bool hf_publishes_row(const HfHalo& h, int f, int64_t row) {
 #if HF_HALO_PUBLISHES
-    const HfHaloPublish& p = h.publish[f];
+    if (f >= HF_HALO_INLINE && h.more_publishes == nullptr) return false;
+    const HfHaloPublish& p = hf_halo_access::publish_slot(h, f);
     return row < p.lo || row >= p.hi;
 #else
     return false;

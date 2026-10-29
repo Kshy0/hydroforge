@@ -522,6 +522,7 @@ class _Adaptive:
             maximum=loop.maximum,
             duration=loop.duration,
             elapsed=loop.elapsed,
+            step=loop.step,
             dt=loop.time_step,
             counter=loop.counter,
             continue_flag=loop.continue_flag,

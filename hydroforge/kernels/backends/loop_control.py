@@ -25,19 +25,29 @@ Sample position
     the continue flag is zero.  A sample's controls are the weight in the
     aggregation's type and the phase its step bits take at that position.
 Adaptive iteration
-    ``begin`` proposes the maximum width and the model's proposal may lower
-    it.  ``accept`` clips the proposal to the remaining interval with NaN
-    propagation (the ``torch.minimum`` contract).  An invalid (NaN or
-    non-positive) width sets the error flag and is replaced by the remainder,
-    so the loop body stays finite while the error ends the loop.  ``end``
-    advances the elapsed time (to exactly the duration after a step clipped
-    to the remainder) and the counter, flags an interval not complete
-    after ``maximum_steps`` iterations, and continues while time remains and
-    no error is set.
+    The clock (``duration``, ``elapsed`` and the accepted ``step``) counts
+    int64 ticks of :data:`TICK` seconds, whatever the model's precision: a
+    floating clock rounds every ``elapsed + dt`` (FP32 near a day: to 1/128
+    s), so it drifts from the widths the physics took and ends the interval
+    early or late.  ``begin`` proposes the maximum width and the model's
+    proposal may lower it.  ``accept`` takes the remainder when the proposal
+    reaches it, else the proposal's whole ticks (truncated: never wider than
+    proposed); the physics width ``dt`` is those ticks in seconds, which a
+    proposal at least ``2**(mantissa bits - CLOCK_BITS)`` seconds wide keeps
+    unchanged and every other width represents exactly, so the ticks the
+    clock adds are the width the physics took.  Only the closing width rounds
+    (to the nearest of its precision).  An invalid proposal (NaN, not
+    positive, or under one tick) sets the error flag and is replaced by the
+    remainder, so the loop body stays finite while the error ends the loop.
+    ``end`` adds the step to the elapsed ticks, which reach ``duration``
+    exactly, advances the counter, flags an interval not complete after
+    ``maximum_steps`` iterations, and continues while ticks remain and no
+    error is set.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 
 import torch
@@ -66,6 +76,27 @@ from hydroforge.kernels.codegen.ir import (
 SamplePhase = Callable[[Expr, Expr, Expr], Expr]
 
 _INT = torch.int32
+_TICKS = torch.int64
+# The adaptive clock's tick: 2**-30 s (under a nanosecond), so an interval
+# of up to 2**32 s (136 years) fits int64 with every intermediate product.
+CLOCK_BITS = 30
+TICK = 2.0**-CLOCK_BITS
+TICKS_PER_SECOND = 2.0**CLOCK_BITS
+MAXIMUM_TICKS = 2**62
+
+
+def clock_ticks(seconds: float) -> int:
+    """The adaptive clock's ticks in an interval of ``seconds``."""
+
+    ticks = round(seconds * TICKS_PER_SECOND) if math.isfinite(seconds) else 0
+    if not 0 < ticks <= MAXIMUM_TICKS:
+        raise ValueError(
+            f"an adaptive interval must last from {TICK} to "
+            f"{MAXIMUM_TICKS * TICK:.0f} seconds, not {seconds}"
+        )
+    return ticks
+
+
 NEXT = Var("next", _INT)
 """The advanced counter (fixed) or continue value (adaptive) a rule declares."""
 
@@ -127,39 +158,75 @@ def _sample_controls(
 
 
 def adaptive_accept(
-    *, candidate: Expr, duration: Load, elapsed: Load, dt: Load, error: Load
+    *,
+    candidate: Expr,
+    duration: Load,
+    elapsed: Load,
+    step: Load,
+    dt: Load,
+    error: Load,
 ) -> tuple[Stmt, ...]:
-    """Clip the proposal ``candidate`` into ``dt`` and set ``error``."""
+    """Accept the proposal ``candidate``: the ``step`` ticks and the physics
+    width ``dt``; set ``error``."""
 
     real = dt.type
     proposal = Var("candidate", real)
-    remaining = Var("remaining", real)
-    accepted = Var("accepted", real)
+    remaining = Var("remaining", _TICKS)
+    width = Var("width", real)
     invalid = Var("invalid", torch.bool)
+    closes = Var("closes", torch.bool)
+    whole = Var("whole", _TICKS)
+    ticks = Var("ticks", _TICKS)
+    failed = Var("failed", torch.bool)
+    accepted = Var("accepted", _TICKS)
     return (
         Let(proposal, candidate),
         Let(remaining, Binary("-", duration, elapsed)),
-        Let(accepted, Select(Compare("<", remaining, proposal), remaining, proposal)),
+        Let(width, Binary("*", Cast(remaining, real), Const(TICK, real))),
         Let(
             invalid,
             Logical(
                 "or",
                 (
                     Call("isnan", (proposal,), torch.bool),
-                    Call("isnan", (remaining,), torch.bool),
-                    Compare("<=", accepted, Const(0.0, real)),
+                    Compare("<=", proposal, Const(0.0, real)),
                 ),
             ),
         ),
-        _store(error, Cast(invalid, error.type)),
-        _store(dt, Select(invalid, remaining, accepted)),
+        Let(closes, Logical("or", (invalid, Compare(">=", proposal, width)))),
+        # Below the remainder the proposal is finite; scaling by a power of
+        # two is exact, and the conversion truncates.
+        Let(
+            whole,
+            Cast(
+                Binary(
+                    "*",
+                    Select(closes, Const(0.0, real), proposal),
+                    Const(TICKS_PER_SECOND, real),
+                ),
+                _TICKS,
+            ),
+        ),
+        Let(
+            ticks,
+            Select(
+                closes,
+                remaining,
+                Select(Compare("<", whole, remaining), whole, remaining),
+            ),
+        ),
+        Let(failed, Logical("or", (invalid, Compare("<=", ticks, Const(0, _TICKS))))),
+        Let(accepted, Select(failed, remaining, ticks)),
+        _store(error, Cast(failed, error.type)),
+        _store(step, accepted),
+        _store(dt, Binary("*", Cast(accepted, real), Const(TICK, real))),
     )
 
 
 def adaptive_end(
     *,
     duration: Load,
-    dt: Load,
+    step: Load,
     elapsed: Load,
     counter: Load,
     continue_flag: Load,
@@ -168,17 +235,10 @@ def adaptive_end(
 ) -> tuple[Stmt, ...]:
     """Advance an adaptive loop; declares :data:`NEXT` (the continue value)."""
 
-    time = Var("time", elapsed.type)
-    remaining = Var("remaining", elapsed.type)
+    time = Var("time", _TICKS)
     count = Var("count", counter.type)
     return (
-        # ``elapsed + (duration - elapsed)`` can round one ulp short of
-        # ``duration``; a step clipped to the remainder ends the interval.
-        Let(remaining, Binary("-", duration, elapsed)),
-        Let(
-            time,
-            Select(Compare(">=", dt, remaining), duration, Binary("+", elapsed, dt)),
-        ),
+        Let(time, Binary("+", elapsed, step)),
         _store(elapsed, time),
         Let(count, Binary("+", counter, Const(1, _INT))),
         _store(counter, count),

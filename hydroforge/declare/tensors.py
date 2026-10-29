@@ -11,7 +11,6 @@ from __future__ import annotations
 import inspect
 import math
 from collections.abc import Mapping
-from functools import cached_property
 from numbers import Integral
 from typing import Any, get_args
 
@@ -164,11 +163,9 @@ class ModuleTensors:
                 # after_init tensors wait for the initialized state.
                 if field.tensor.category != "virtual" and not field.tensor.after_init:
                     active_fields.append(field)
-            elif isinstance(
-                inspect.getattr_static(type(module), field.name, None), cached_property
-            ):
+            else:
+                # Every computed field caches its getter: inactive reads None.
                 object.__setattr__(module, field.name, None)
-            # Plain-property virtual getters return None while inactive.
         for field in active_fields:
             self._finish_computed(field, getattr(module, field.name))
         # Derived reference indices are descriptors rather than Pydantic

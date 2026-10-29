@@ -58,7 +58,9 @@ class BindingResolution:
     owner: str | None = None
 
 
-def _contributions(spec: KernelSpec, arguments: Mapping[str, Any]) -> tuple[torch.Tensor, ...]:
+def _contributions(
+    spec: KernelSpec, arguments: Mapping[str, Any]
+) -> tuple[torch.Tensor, ...]:
     """One field per contributed storage, disjoint from this call's copies.
 
     Like the halo schedule, this contract covers whole storages: different
@@ -157,12 +159,26 @@ class KernelBinder:
             supplied = {HALO_PARAMETER: self.runtime.halo_quiet, **supplied}
             halo = self.runtime.halo
             if spec.halo and halo is not None:
+                from dataclasses import replace
+
+                from hydroforge.parallel.halo import read_depth
+
                 bound, _ = self.arguments(registry, supplied)
-                fields = [bound[name] for name in spec.halo]
+                fields, layouts = [], []
+                # Each field within its read distance.
+                for name, distance in spec.halo.items():
+                    tensor = bound[name]
+                    if tensor is None:
+                        continue
+                    if isinstance(distance, str):
+                        distance = bound[distance]
+                    layout = self.runtime.halo_layout(tensor)
+                    limit = self.runtime.halo_depth(layout)
+                    fields.append(tensor)
+                    layouts.append(replace(layout, depth=read_depth(distance, limit)))
                 for start in range(0, len(fields), 8):
-                    chunk = fields[start : start + 8]
                     halo.exchange(
-                        chunk, [self.runtime.halo_layout(t) for t in chunk], "mirror"
+                        fields[start : start + 8], layouts[start : start + 8], "mirror"
                     )
         if not supplied:
             cached = self._launch_cache.get(id(registry))

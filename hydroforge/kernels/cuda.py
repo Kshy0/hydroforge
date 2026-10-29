@@ -493,7 +493,18 @@ def compile_time_source(spec: KernelSpec, values: Mapping[str, Any]) -> str:
         for name, kind in spec.compile_time.items()
     )
     members = "\n".join(
-        f"    static constexpr auto {name} = ::{name};" for name in spec.compile_time
+        (
+            *(
+                f"    static constexpr auto {name} = ::{name};"
+                for name in spec.compile_time
+            ),
+            # Declaration slots of the halo argument's reads and publications.
+            *(
+                f"    static constexpr int HF_{kind}_{name} = {index};"
+                for kind, fields in (("HALO", spec.halo), ("PUBLISH", spec.publishes))
+                for index, name in enumerate(fields)
+            ),
+        )
     )
     return declarations + (
         f"\nnamespace hydroforge {{\nstruct KernelParameters {{\n{members}\n}};\n}}\n"
@@ -510,8 +521,17 @@ def _halo_defines(spec: KernelSpec, values: Mapping[str, Any]) -> str:
         return ""
     argument = values[HALO_PARAMETER]
     _, publishes, commits = halo_work(argument)
+    mask = halo_read_mask(argument)
+    reads = (
+        " || ".join(
+            f"((k) == {index})"
+            for index in range(mask.bit_length())
+            if mask & (1 << index)
+        )
+        or "0"
+    )
     return (
-        f"#define HF_HALO_READS {halo_read_mask(argument)}\n"
+        f"#define HF_HALO_READS(k) ({reads})\n"
         f"#define HF_HALO_PUBLISHES {int(publishes)}\n"
         f"#define HF_HALO_COMMITS {int(commits)}\n"
         f"#define HF_HALO_CREDITS {int(halo_checks(argument))}\n"
@@ -1029,9 +1049,11 @@ class _CudaImplementation(KernelImplementation):
                 )
             )
             # A launch plan's first launch runs the halo prologue itself.
-            own = next(
-                (s.kernel for s in steps if isinstance(s, CudaLaunch)), None
-            ) if self.spec.runtime_scalars.get(HALO_PARAMETER) == "halo" else None
+            own = (
+                next((s.kernel for s in steps if isinstance(s, CudaLaunch)), None)
+                if self.spec.runtime_scalars.get(HALO_PARAMETER) == "halo"
+                else None
+            )
         request = None
         if any(isinstance(step, CudaLaunch) for step in steps):
             program = self._program(values, entries)

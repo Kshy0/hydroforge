@@ -8,16 +8,14 @@
 
 from __future__ import annotations
 
-import os
 from abc import ABC
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType, TracebackType
-from typing import TYPE_CHECKING, Any, Literal, Self
+from typing import TYPE_CHECKING, Any, Self
 
 import cftime
-import torch
 
 from hydroforge.compiler.plan import ModelPlan, compile_model
 from hydroforge.core.errors import ResourceCleanupError
@@ -25,16 +23,11 @@ from hydroforge.data.input import InputProxy
 from hydroforge.declare.model import ModelDeclaration
 from hydroforge.execution.context import managed_step_active
 from hydroforge.execution.session import ModelRuntime
-from hydroforge.kernels.calls import recording_sink
 from hydroforge.model.results import ModelResults
 
 if TYPE_CHECKING:
     from hydroforge.execution.partition import GroupRankLookup
     from hydroforge.parallel.slab import Slab
-
-
-# HYDROFORGE_HALO_PRUNE=0 keeps every requested mirror (for comparisons).
-_PRUNE = os.environ.get("HYDROFORGE_HALO_PRUNE", "1") != "0"
 
 
 class AbstractModel(ModelDeclaration, ABC):
@@ -177,63 +170,6 @@ class AbstractModel(ModelDeclaration, ABC):
         """
 
         return ModelRuntime.of(self).halo is not None
-
-    def halo_exchange_(
-        self,
-        *fields: torch.Tensor,
-        mode: Literal["mirror", "accumulate"] = "mirror",
-        clear: torch.Tensor | None = None,
-    ) -> None:
-        """Exchange the ghost rows of up to eight fields in a managed step.
-
-        Fields are module tensors whose shape names the slab axis (cells or
-        its staggered faces), or whose leading axis holds the partition
-        key's rows; one call may mix them. ``"mirror"`` gives every ghost row
-        its owner's value; ``"accumulate"`` adds the values on ghost rows to
-        their owners and zeroes the ghosts, and those of ``clear`` too.
-        Values travel bit for bit. Recorded like a kernel; a no-op without
-        ghosts. Inside a recorded program a mirror skips the fields whose
-        ghost rows are already current there (nothing wrote them since
-        their last mirror) and receives those a kernel published
-        (``HYDROFORGE_HALO_PRUNE=0`` exchanges every field). Kernels that
-        declare ``halo`` in their spec need no explicit mirror at all. See
-        :mod:`hydroforge.parallel.halo` and
-        :mod:`hydroforge.execution.halo_schedule`.
-        """
-
-        runtime = ModelRuntime.of(self)
-        halo = runtime.halo
-        if halo is None:
-            return
-        schedule = getattr(recording_sink(), "halo_schedule", None)
-        if schedule is not None and not schedule.busy:
-            if mode == "mirror":
-                if _PRUNE:
-                    schedule.request_mirror(fields)
-                else:
-                    halo.mirrors_requested += len(fields)
-                    schedule.mirror(tuple(fields))
-                return
-            schedule.other_exchange(
-                tuple(fields),
-                lambda site: self._halo_exchange(fields, mode, clear, site),
-                mode=mode,
-                clear=clear,
-            )
-            return
-        self._halo_exchange(fields, mode, clear)
-
-    def _halo_exchange(self, fields, mode, clear, site=None) -> None:
-        runtime = ModelRuntime.of(self)
-        layouts = [runtime.halo_layout(tensor) for tensor in fields]
-        runtime.halo.exchange(
-            fields,
-            layouts,
-            mode,
-            clear,
-            None if clear is None else runtime.halo_layout(clear),
-            site=site,
-        )
 
     @property
     def slab(self) -> Slab | None:

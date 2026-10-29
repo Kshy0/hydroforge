@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import Field, InstanceOf, field_validator, model_validator
 
@@ -29,8 +29,9 @@ class SlabAxis(HydroForgeModel):
     ``grid_axes`` (``GridAxis(name="south_north_stag", staggers="south_north")``,
     one more entry than the cells), holds this rank's rows of that axis only.
     ``halo`` ghost rows on each side follow from the neighbouring blocks: a
-    stencil that reads up to ``halo`` rows away from an owned row finds them
-    after :meth:`AbstractModel.halo_exchange_`. A ``periodic`` axis wraps its
+    kernel declaring ``KernelSpec.halo`` reads up to that many rows away
+    from an owned row of fields declared ``halo=True``, and the framework
+    exchanges them (:mod:`hydroforge.execution.halo_schedule`). A ``periodic`` axis wraps its
     ghost rows around the domain across ranks; one rank keeps neither ghost
     rows nor wrapping, and its kernels close a periodic axis themselves.
 
@@ -42,7 +43,9 @@ class SlabAxis(HydroForgeModel):
     """
 
     dim: Identifier
-    halo: int = Field(ge=1, strict=True)
+    halo: Annotated[int, Field(ge=1, strict=True)] | Identifier
+    """Ghost depth, or an integer attribute of the validated model options.
+    The attribute may derive the depth from the selected physical schemes."""
     periodic: InstanceOf[Condition] | None = None
     interior: tuple[Identifier, ...] = ()
     """Axes holding only the interior rows: a grid padded by one perimeter row

@@ -17,12 +17,22 @@ and both give every rank read-only *ghost* rows of rows other ranks own:
   contiguous row blocks with ``halo`` ghost rows on each side
   (kinds ``cell`` and ``face`` for its staggered axis).
 
-:meth:`AbstractModel.halo_exchange_` exchanges up to :data:`MAX_FIELDS`
-fields of any of these kinds in one call: ``"mirror"`` gives ghost rows
+:meth:`HaloRuntime.exchange` exchanges fields of any of these kinds in
+one call, recorded by the schedule for kernels declaring ``halo``,
+``publishes`` or ``contributes`` on fields declared ``halo=True``
+(:mod:`hydroforge.execution.halo_schedule`): ``"mirror"`` gives ghost rows
 their owners' values, ``"accumulate"`` adds what ghost rows hold to their
 owners (zeroing the ghosts, and those of ``clear``). Each element travels in
 its own bits, so integers and floats arrive exactly. It is a registered
 kernel, recorded and CUDA-graph capturable.
+
+A slab mirror may carry fewer rows than the slab's ghost rows: a field's
+layout ``depth`` sends only the ghost rows within that many rows of the
+receiver's owned rows (:meth:`HaloPlan.distances`), and rows beyond keep
+whatever they held. Mirror messages list their rows nearest first, so the
+rows of every depth lead the message and both ends agree on them; a field's
+depth picks how many it carries. Accumulates always carry every row.
+``HYDROFORGE_HALO_DEPTH=full`` carries every ghost row (for comparisons).
 
 Every pair of ranks exchanging rows takes its fastest link (``links``):
 
@@ -75,6 +85,8 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
+# Preferred batch width for independent mirrors and contributions. Logical
+# kernel declarations and publication messages have no field-count limit.
 MAX_FIELDS = 8
 # Ring slots of a directed pair (a power of two): a sender may run this many
 # messages ahead of the receiver's credits.
@@ -92,10 +104,39 @@ _REPEATS = 32  # halo.cu: an accumulate receive adds into some row twice
 # for every credit of what was sent before it, and the prologue's counts
 # then every credit set to what was counted.
 PHASES = ("both", "send", "receive", "book", "drain", "flush")
+# A message record (halo.cu): peer, link, ring slot, staging slot, the row
+# table offset and row count of every kind, then (HaloPlan.levels per kind)
+# its rows within each depth.
 _RECORD = 4 + 2 * len(KINDS)
 _HEADER_ALIGN = 256
 # halo.cu accumulates these element types.
 _ADD_TYPES = {torch.float32: 1, torch.float64: 2, torch.int32: 3, torch.int64: 4}
+
+
+# HYDROFORGE_HALO_DEPTH=full mirrors and publishes every ghost row.
+_FULL_DEPTH = os.environ.get("HYDROFORGE_HALO_DEPTH", "declared") == "full"
+
+
+def read_depth(distance: int, limit: int) -> int:
+    """The ghost rows a read ``distance`` rows away needs of a field whose
+    layout holds ``limit`` on each side (0, a partition key: every one)."""
+
+    if _FULL_DEPTH or not limit or distance >= limit:
+        return 0
+    return int(distance)
+
+
+def covers(depth: int, need: int) -> bool:
+    """Whether ghost rows current within ``depth`` serve a read needing
+    ``need`` (0: every row)."""
+
+    return depth == 0 or (need != 0 and need <= depth)
+
+
+def deeper(a: int, b: int) -> int:
+    """The depth covering both."""
+
+    return 0 if a == 0 or b == 0 else max(a, b)
 
 
 # --------------------------------------------------------------------------- #
@@ -159,6 +200,12 @@ class HaloPlan:
     that ``q`` owns: ``(q-local owned rows, p-local ghost rows)`` in ``p``'s
     stored order. A mirror sends the first to ``p``'s second; an accumulate
     the reverse. ``neighbours[r]`` are the ranks ``r`` exchanges with.
+
+    Slab ghost rows lie some distance from the owned rows
+    (:meth:`distances`): ``levels`` is the farthest, ``depth_counts[k, q,
+    p, d - 1]`` how many rows of ``(q, p)`` lie within ``d`` (``levels`` 1
+    and every row at depth 1 without a slab), and :meth:`rows` lists mirror
+    rows nearest first.
     """
 
     def __init__(self, rank: int, layouts: Mapping[str, Sequence[RowLayout]]) -> None:
@@ -169,6 +216,8 @@ class HaloPlan:
         self.world = len(next(iter(layouts.values())))
         self.layouts = dict(layouts)
         self.pairs: dict[str, dict[tuple[int, int], tuple[np.ndarray, np.ndarray]]] = {}
+        # Per kind and pair: the ghost rows' distances, in pair order.
+        spans: dict[str, dict[tuple[int, int], np.ndarray]] = {}
         world = self.world
         self.counts = np.zeros((len(KINDS), world, world), np.int64)
         for kind, ranks in layouts.items():
@@ -180,7 +229,7 @@ class HaloPlan:
                 rows = np.flatnonzero(layout.owned)
                 owner[layout.stored[rows]] = r
                 local[layout.stored[rows]] = rows
-            pairs = {}
+            pairs, spans[kind] = {}, {}
             for p, layout in enumerate(ranks):
                 ghosts = np.flatnonzero(~layout.owned)
                 globals_ = layout.stored[ghosts]
@@ -188,6 +237,7 @@ class HaloPlan:
                 if (owners < 0).any():
                     missing = globals_[owners < 0][:5].tolist()
                     raise ValueError(f"{kind} ghost rows {missing} have no owner")
+                distance = self.distances(kind, layout)[ghosts]
                 for q in np.unique(owners):
                     if q == p:
                         raise ValueError(
@@ -195,13 +245,64 @@ class HaloPlan:
                         )
                     pick = owners == q
                     pairs[(int(q), p)] = (local[globals_[pick]], ghosts[pick])
+                    spans[kind][(int(q), p)] = distance[pick]
                     self.counts[k, q, p] = int(pick.sum())
             self.pairs[kind] = pairs
+        self.levels = max(
+            (
+                int(d.max())
+                for found in spans.values()
+                for d in found.values()
+                if d.size
+            ),
+            default=1,
+        )
+        self.depth_counts = np.zeros((len(KINDS), world, world, self.levels), np.int64)
+        # Mirror rows of each pair nearest first (stable: stored order
+        # within a distance).
+        self.order: dict[str, dict[tuple[int, int], np.ndarray]] = {}
+        for kind, found in spans.items():
+            k = KINDS.index(kind)
+            self.order[kind] = {}
+            for (q, p), distance in found.items():
+                self.order[kind][(q, p)] = np.argsort(distance, kind="stable")
+                within = np.arange(1, self.levels + 1)[:, None] >= distance[None, :]
+                self.depth_counts[k, q, p] = within.sum(1)
         linked = self.counts.sum(0)
         linked = (linked + linked.T) > 0
         self.neighbours = tuple(
             tuple(np.flatnonzero(linked[r]).tolist()) for r in range(world)
         )
+
+    @staticmethod
+    def distances(kind: str, layout: RowLayout) -> np.ndarray:
+        """How far each stored row lies from the rank's owned rows (0 for
+        owned ones), in rows of the decomposed axis: a field read ``d`` rows
+        away needs its ghost rows within ``d``. A face above the owned faces
+        counts one row nearer, past the first: the faces bounding the ghost
+        cells within ``d`` lie within ``d``, as below. Partition key ghosts
+        all lie at 1 (they carry no slab rows to trim)."""
+
+        stored = np.arange(layout.extent)
+        owned = np.flatnonzero(layout.owned)
+        if kind == KEY or not owned.size:
+            return np.where(layout.owned, 0, 1).astype(np.int64)
+        at = np.clip(np.searchsorted(owned, stored), 1, owned.size) - 1
+        below, above = owned[at], owned[np.minimum(at + 1, owned.size - 1)]
+        distance = np.minimum(np.abs(stored - below), np.abs(stored - above))
+        if kind == FACE:
+            upper = stored > owned[-1]
+            distance[upper] = np.maximum(distance[upper] - 1, 1)
+        return distance.astype(np.int64)
+
+    def depth_rows(self, kind: str, depth: int) -> np.ndarray:
+        """Rows of ``kind`` every (sender, receiver) mirror carries at
+        ``depth`` (0: every ghost row)."""
+
+        k = KINDS.index(kind)
+        if not depth or depth >= self.levels:
+            return self.counts[k]
+        return self.depth_counts[k, :, :, depth - 1]
 
     @property
     def kinds(self) -> tuple[str, ...]:
@@ -225,20 +326,45 @@ class HaloPlan:
         self, direction: Literal["send", "receive"], mode: str, peer: int
     ) -> dict[str, np.ndarray]:
         """This rank's local rows of the message to (send) or from
-        (receive) ``peer``, by kind, in the order both ends agree on."""
+        (receive) ``peer``, by kind, in the order both ends agree on:
+        mirrors nearest first, accumulates in the ghosts' stored order."""
 
         me = self.rank
         mirror = mode == "mirror"
         out = {}
         for kind, pairs in self.pairs.items():
-            if (direction == "send") == mirror:
-                entry = pairs.get((me, peer))  # my owned rows peer ghosts
-                rows = None if entry is None else entry[0]
-            else:
-                entry = pairs.get((peer, me))  # my ghosts peer owns
-                rows = None if entry is None else entry[1]
-            if rows is not None and rows.size:
+            pair = (me, peer) if (direction == "send") == mirror else (peer, me)
+            entry = pairs.get(pair)
+            if entry is None:
+                continue
+            # The owner's rows (mirror sends, accumulate receives) or the
+            # holder's ghosts.
+            rows = entry[0] if pair[0] == me else entry[1]
+            if mirror:
+                rows = rows[self.order[kind][pair]]
+            if rows.size:
                 out[kind] = rows
+        return out
+
+    def levels_of(
+        self, direction: Literal["send", "receive"], mode: str, peer: int
+    ) -> dict[str, np.ndarray]:
+        """Rows of the message :meth:`rows` lists within each depth ``1 ..
+        levels``, by kind (accumulates: every row at every depth)."""
+
+        me = self.rank
+        mirror = mode == "mirror"
+        pair = (me, peer) if (direction == "send") == mirror else (peer, me)
+        out = {}
+        for kind in self.pairs:
+            k = KINDS.index(kind)
+            if not self.counts[k][pair]:
+                continue
+            out[kind] = (
+                self.depth_counts[k][pair]
+                if mirror
+                else np.full(self.levels, self.counts[k][pair], np.int64)
+            )
         return out
 
     def ring_slot(self, sender: int, receiver: int) -> int:
@@ -341,10 +467,26 @@ def _open_peer_memory(
 @dataclass(frozen=True)
 class FieldLayout:
     """Where an exchanged field's decomposed axis is: its kind and its axis
-    counted from the last dimension."""
+    counted from the last dimension; and how many ghost rows of it a mirror
+    carries (``depth``: those within that many rows of the owned ones, 0
+    every one)."""
 
     kind: str
     axis: int
+    depth: int = 0
+
+
+def layout_code(layout: FieldLayout) -> int:
+    """One field's layout as an int32 compile-time constant."""
+
+    if not 0 <= layout.depth < 2**15:
+        raise ValueError(f"halo depth out of range: {layout.depth}")
+    return pack_layouts([layout])[0] | layout.depth << 8
+
+
+def code_layout(code: int) -> FieldLayout:
+    (layout,) = unpack_layouts(code & 0xFF, 0, 1)
+    return FieldLayout(layout.kind, layout.axis, code >> 8)
 
 
 def pack_layouts(layouts: Sequence[FieldLayout]) -> tuple[int, int]:
@@ -377,6 +519,7 @@ class _View:
     outer: int
     extent: int
     inner: int
+    depth: int = 0  # the layout's: ghost rows a mirror carries (0 every one)
 
     @classmethod
     def of(cls, tensor: torch.Tensor, layout: FieldLayout) -> _View:
@@ -388,6 +531,7 @@ class _View:
             int(np.prod(shape[:position], dtype=np.int64)),
             shape[position],
             int(np.prod(shape[position + 1 :], dtype=np.int64)),
+            layout.depth,
         )
 
     @property
@@ -412,13 +556,24 @@ class _Message:
     ring: int  # the sender's slot in the receiver's ring
     stage: int  # its staging slot (non-peer links)
     passes: int = 1  # accumulate receives: entries of its most listed row
+    # Rows within each depth 1 .. levels (HaloPlan.levels_of), by kind.
+    levels: dict[str, np.ndarray] = field(default_factory=dict)
 
-    def count(self, kind: str) -> int:
+    def count(self, kind: str, depth: int = 0) -> int:
+        """Rows of ``kind`` it carries for a field of ``depth``."""
+
         rows = self.rows.get(kind)
-        return 0 if rows is None else int(rows.size)
+        if rows is None:
+            return 0
+        within = self.levels.get(kind)
+        if not depth or within is None or depth > within.size:
+            return int(rows.size)
+        return int(within[depth - 1])
 
     def nbytes(self, views: Sequence[_View]) -> int:
-        return sum(_aligned(v.elements(self.count(v.kind)) * v.size) for v in views)
+        return sum(
+            _aligned(v.elements(self.count(v.kind, v.depth)) * v.size) for v in views
+        )
 
 
 def occurrences(rows: np.ndarray) -> np.ndarray:
@@ -435,7 +590,8 @@ def occurrences(rows: np.ndarray) -> np.ndarray:
 
 
 def message_capacity(plan: HaloPlan, row_bytes: Mapping[str, int]) -> int:
-    """Bytes of one message slot: the largest message of any pair."""
+    """Bytes of one message slot: the largest message of any pair
+    (:data:`MAX_FIELDS` fields of the widest row, every ghost row)."""
 
     largest = 1
     for a in range(plan.world):
@@ -460,7 +616,7 @@ def window_layout(plan: HaloPlan, capacity: int) -> tuple[int, int]:
 def site_words(
     world: int,
     phase: str = "both",
-    written: int = (1 << MAX_FIELDS) - 1,
+    written: int = -1,
     skip: Mapping[int, int] | None = None,
     settle: Mapping[int, int] | None = None,
     post: Mapping[int, int] | None = None,
@@ -500,7 +656,10 @@ class HaloRuntime:
 
     Construction is collective over ``group``. ``row_bytes[kind]`` bounds the
     bytes of one row of any field of that kind (every element of the field
-    at one index of its decomposed axis); it sizes the message slots.
+    at one index of its decomposed axis). A message slot holds
+    :data:`MAX_FIELDS` such fields with every ghost row (``capacity``), the
+    widest exchange the framework batches; a publication must fit too
+    (:meth:`fits`): mirrors that carry fewer rows leave room for more fields.
     """
 
     def __init__(
@@ -521,15 +680,19 @@ class HaloRuntime:
         self.group = group
         self.details: dict[str, Any] = {}
         self.skipped: dict[str, str] = {}
-        # Fields recorded mirrors asked for, and those pruned as unchanged;
-        # recorded publications, ghost reads from rings and ring receipts
+        # Recorded publications, ghost reads from rings and ring receipts
         # (hydroforge.execution.halo_schedule).
-        self.mirrors_requested = 0
-        self.mirrors_pruned = 0
         self.publications = 0
         self.fused_reads = 0
         self.receipts = 0
         self.credit_free = 0  # loop bodies proven to need no slot credits
+        # Mirrors deepening fields current to fewer rows than a reader's
+        # distance, reads farther than a publication's depth (received,
+        # then mirrored deeper), and published fields left out of their
+        # publication for its slot (mirrored when read).
+        self.mirrors_deepened = 0
+        self.shallow_reads = 0
+        self.unpublished = 0
         rank, world = plan.rank, plan.world
         if dist.get_world_size(group) != world or dist.get_rank(group) != rank:
             raise ValueError(
@@ -608,6 +771,8 @@ class HaloRuntime:
         # The registered exchange kernel (hydroforge.kernels.halo.attach),
         # attached by the layer that owns kernels.
         self.registry: Any = None
+        self.registry_factory: Any = None
+        self.registries: dict[int, Any] = {}
 
     # ------------------------------------------------------------------ #
     def _build_tables(self) -> None:
@@ -641,8 +806,15 @@ class HaloRuntime:
                         for kind, values in kinds.items()
                     }
                     count = 1 + max(int(e.max(initial=0)) for e in entries.values())
+                    levels = plan.levels_of(direction, mode, peer)
                     message = _Message(
-                        peer, link, kinds, ring, -1 if link == "peer" else stage, count
+                        peer,
+                        link,
+                        kinds,
+                        ring,
+                        -1 if link == "peer" else stage,
+                        count,
+                        levels,
                     )
                     if link != "peer":
                         stage += 1
@@ -656,7 +828,12 @@ class HaloRuntime:
                         rows.append(values.astype(np.int64))
                         passes.append(entries.get(kind, np.zeros(0, np.int64)))
                         cursor += int(values.size)
-                    records.append(record + offsets + counts)
+                    within = [
+                        int(n)
+                        for kind in KINDS
+                        for n in levels.get(kind, np.zeros(plan.levels, np.int64))
+                    ]
+                    records.append(record + offsets + counts + within)
                     found.append(message)
                 stages[direction] = max(stages[direction], stage)
                 self.messages[(mode, direction)] = (first, found)
@@ -672,6 +849,7 @@ class HaloRuntime:
             dtype=torch.int32,
             device=device,
         )
+        self.record = _RECORD + len(KINDS) * plan.levels
         self.records = torch.tensor(
             np.array(records, np.int32).reshape(-1)
             if records
@@ -787,12 +965,13 @@ class HaloRuntime:
             "skipped": dict(self.skipped),
             **self.details,
             "message_bytes": self.capacity,
-            "mirrors_requested": self.mirrors_requested,
-            "mirrors_pruned": self.mirrors_pruned,
             "publications": self.publications,
             "fused_reads": self.fused_reads,
             "receipts": self.receipts,
             "credit_free": self.credit_free,
+            "mirrors_deepened": self.mirrors_deepened,
+            "shallow_reads": self.shallow_reads,
+            "unpublished": self.unpublished,
             "sends": sends,
             "receives": receives,
         }
@@ -801,6 +980,10 @@ class HaloRuntime:
         if self.memory is not None:
             self.memory.close()
             self.memory = None
+        self.registries.clear()
+        self.registry = None
+        self.registry_factory = None
+        self.__dict__.pop("access_arguments", None)
 
     # ------------------------------------------------------------------ #
     def site_table(self, words: Sequence[int]) -> torch.Tensor:
@@ -834,7 +1017,15 @@ class HaloRuntime:
             fields, layouts, mode, clear, clear_layout, site=site
         )
         if arguments is not None:
-            self.registry(**arguments)
+            self.registry_for(len(fields))(**arguments)
+
+    def registry_for(self, count: int):
+        """Exchange ABI sized for this message's field count."""
+
+        slots = max(MAX_FIELDS, count)
+        if slots not in self.registries:
+            self.registries[slots] = self.registry_factory(self, slots)
+        return self.registries[slots]
 
     def exchange_arguments(
         self,
@@ -849,16 +1040,20 @@ class HaloRuntime:
         """The exchange kernel's arguments for :meth:`exchange`, validated
         (``None``: this rank exchanges nothing in ``mode``). An accumulate
         of no fields only zeroes the ghost rows of ``clear``."""
-        if not 1 <= len(fields) <= MAX_FIELDS and not (
+        if not fields and not (
             not fields and clear is not None and mode == "accumulate"
         ):
-            raise ValueError(f"halo_exchange_ moves 1 to {MAX_FIELDS} fields")
+            raise ValueError(
+                "a halo exchange needs fields or an accumulate clear field"
+            )
         if mode not in ("mirror", "accumulate"):
             raise ValueError("halo exchange mode must be 'mirror' or 'accumulate'")
         if clear is not None and mode != "accumulate":
             raise ValueError("clear applies to accumulate exchanges")
         for tensor, layout in zip(fields, layouts, strict=True):
             self._check(tensor, layout, mode)
+            if layout.depth and mode != "mirror":
+                raise ValueError("accumulate exchanges carry every ghost row")
         if clear is not None:
             self._check(clear, clear_layout, mode, clearing=True)
         if not (
@@ -871,11 +1066,13 @@ class HaloRuntime:
                 "this halo has no exchange kernel; attach one with "
                 "hydroforge.kernels.halo.attach(runtime)"
             )
-        low, high = pack_layouts(layouts)
+        slots = max(MAX_FIELDS, len(fields))
         filler = fields[0] if fields else clear
-        padded = [*fields, *(filler,) * (MAX_FIELDS - len(fields))]
+        padded = [*fields, *(filler,) * (slots - len(fields))]
+        codes = [layout_code(layout) for layout in layouts]
         return dict(
-            **{f"f{i}": padded[i] for i in range(MAX_FIELDS)},
+            **{f"f{i}": padded[i] for i in range(slots)},
+            **{f"layout{i}": codes[i] if i < len(codes) else 0 for i in range(slots)},
             clear=filler if clear is None else clear,
             window=self.window,
             peers=self.peers,
@@ -888,10 +1085,21 @@ class HaloRuntime:
             nf=len(fields),
             accumulate=mode == "accumulate",
             has_clear=clear is not None,
-            layout_low=low,
-            layout_high=high,
             clear_layout=0 if clear_layout is None else pack_layouts([clear_layout])[0],
             site=self.plain_site if site is None else site,
+        )
+
+    def fits(
+        self, fields: Sequence[torch.Tensor], layouts: Sequence[FieldLayout]
+    ) -> bool:
+        """Whether a mirror message of ``fields`` fits a slot, to and from
+        every peer."""
+
+        views = [_View.of(t, layout) for t, layout in zip(fields, layouts)]
+        return all(
+            message.nbytes(views) <= self.capacity
+            for direction in ("send", "receive")
+            for message in self.messages[("mirror", direction)][1]
         )
 
     def _check_capacity(
@@ -956,11 +1164,16 @@ __all__ = [
     "HaloPlan",
     "HaloRuntime",
     "RowLayout",
+    "code_layout",
+    "covers",
+    "deeper",
     "ghost_rows",
+    "layout_code",
     "occurrences",
     "pack_layouts",
     "partition_layouts",
     "plain_site",
+    "read_depth",
     "site_words",
     "unpack_layouts",
 ]

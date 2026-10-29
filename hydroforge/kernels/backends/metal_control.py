@@ -41,7 +41,7 @@ from hydroforge.kernels.codegen.ir import (
 from hydroforge.kernels.codegen.msl import emulated_msl
 from hydroforge.kernels.metal import MetalArgument, MetalCommand, MetalProgram
 
-_REAL, _INT = torch.float32, torch.int32
+_REAL, _INT, _TICKS = torch.float32, torch.int32, torch.int64
 
 
 @cache
@@ -122,17 +122,23 @@ _ADAPTIVE_BEGIN = KernelFunction(
 def _adaptive_accept() -> KernelFunction:
     params = (
         Param("candidate", _REAL, "read"),
-        Param("duration", _REAL, "read"),
-        Param("elapsed", _REAL, "read"),
+        Param("duration", _TICKS, "read"),
+        Param("elapsed", _TICKS, "read"),
+        Param("step", _TICKS, "write"),
         Param("dt", _REAL, "write"),
         Param("error", _INT, "write"),
     )
-    candidate, duration, elapsed, dt, error = map(cell, params)
+    candidate, duration, elapsed, step, dt, error = map(cell, params)
     return KernelFunction(
         "hf_adaptive_accept",
         params,
         loop_control.adaptive_accept(
-            candidate=candidate, duration=duration, elapsed=elapsed, dt=dt, error=error
+            candidate=candidate,
+            duration=duration,
+            elapsed=elapsed,
+            step=step,
+            dt=dt,
+            error=error,
         ),
     )
 
@@ -144,9 +150,10 @@ SCATTER_ERROR_STATUS = 2
 
 def _adaptive_end(*, scatter_error: bool = False) -> KernelFunction:
     params = (
-        Param("duration", _REAL, "read"),
+        Param("duration", _TICKS, "read"),
+        Param("step", _TICKS, "read"),
         Param("dt", _REAL, "read"),
-        Param("elapsed", _REAL, "read_write"),
+        Param("elapsed", _TICKS, "read_write"),
         Param("counter", _INT, "read_write"),
         Param("continue_flag", _INT, "write"),
         Param("error", _INT, "read_write"),
@@ -154,7 +161,7 @@ def _adaptive_end(*, scatter_error: bool = False) -> KernelFunction:
         Param("maximum_steps", torch.int64),
         *((Param("scatter_error", _INT, "read"),) if scatter_error else ()),
     )
-    duration, dt, elapsed, counter, continue_flag, error = map(cell, params[:6])
+    duration, step, dt, elapsed, counter, continue_flag, error = map(cell, params[:7])
     failed: Any = Cast(error, _REAL)
     if scatter_error:
         failed = Binary(
@@ -172,7 +179,7 @@ def _adaptive_end(*, scatter_error: bool = False) -> KernelFunction:
         (
             *loop_control.adaptive_end(
                 duration=duration,
-                dt=dt,
+                step=step,
                 elapsed=elapsed,
                 counter=counter,
                 continue_flag=continue_flag,
@@ -198,6 +205,7 @@ def adaptive_control_commands(
     maximum: float,
     duration: torch.Tensor,
     elapsed: torch.Tensor,
+    step: torch.Tensor,
     dt: torch.Tensor,
     counter: torch.Tensor,
     continue_flag: torch.Tensor,
@@ -207,6 +215,7 @@ def adaptive_control_commands(
     scatter_error: torch.Tensor | None = None,
 ) -> tuple[MetalCommand, MetalCommand, MetalCommand]:
     """``status`` receives ``(error, continue, dt)`` for one host read.
+    ``duration``, ``elapsed`` and ``step`` are the loop's int64 clock ticks.
 
     With the iteration's ``(1,)`` int32 ``scatter_error`` bounds flag,
     ``status[0]`` also adds :data:`SCATTER_ERROR_STATUS` when that flag is
@@ -219,12 +228,14 @@ def adaptive_control_commands(
         candidate=candidate,
         duration=duration,
         elapsed=elapsed,
+        step=step,
         dt=dt,
         error=error_flag,
     )
     end = _command(
         _ADAPTIVE_END if scatter_error is None else _ADAPTIVE_END_CHECKED,
         duration=duration,
+        step=step,
         dt=dt,
         elapsed=elapsed,
         counter=counter,

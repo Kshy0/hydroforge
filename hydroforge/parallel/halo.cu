@@ -7,11 +7,13 @@
 // Halo exchange of the CUDA backend (hydroforge.parallel.halo, launched by
 // hydroforge.kernels.halo).
 //
-// A message to one peer carries the rows of up to eight fields, field after
+// A message to one peer carries the rows of its declared fields, field after
 // field, each element in its own bits (no conversion). A field is viewed as
 // (outer, extent, inner) around its decomposed axis; a message holds, for
 // each outer index, the listed rows of that axis with all their inner
-// elements. grid.x is a chunk of a message, grid.y the message.
+// elements. A mirror lists its rows nearest the receiver's owned rows first,
+// and a field of depth d carries the leading rows within d (its record
+// counts them). grid.x is a chunk of a message, grid.y the message.
 //
 // Peers NCCL (or CUDA IPC) maps take stores straight into their receive
 // ring: every directed pair owns DEPTH slots, message n of the pair using
@@ -46,17 +48,24 @@
 
 #include "peer.cuh"
 
+#ifndef HF_HALO_FIELDS
+#define HF_HALO_FIELDS 8
+#endif
+
 namespace hf_halo {
 
-constexpr int SLOTS = 9;  // eight exchanged fields and the accumulate's clear field
+constexpr int SLOTS = HF_HALO_FIELDS + 1;  // exchanged fields and the clear field
+constexpr int WRITTEN_WORDS = (SLOTS + 63) / 64;
 constexpr int KINDS = 3;
-constexpr int RECORD = 4 + 2 * KINDS;
+constexpr int COUNTS = 4 + KINDS;  // a record's row count of each kind
+constexpr int WITHIN = 4 + 2 * KINDS;  // then its rows within each depth
 constexpr int LINK_PEER = 0;
 constexpr int REPEATS = 32;  // flag of the link word: some row is listed twice
 constexpr int LINK = 15;  // the link code bits
 
 }  // namespace hf_halo
 
+// By value, sized by the field count this kernel was compiled for.
 struct HaloFields {
     char* data[hf_halo::SLOTS];
     int64_t outer[hf_halo::SLOTS];
@@ -65,14 +74,15 @@ struct HaloFields {
     int32_t size[hf_halo::SLOTS];  // bytes per element
     int32_t type[hf_halo::SLOTS];  // accumulate: 1 f32, 2 f64, 3 i32, 4 i64
     int32_t kind[hf_halo::SLOTS];
+    int32_t depth[hf_halo::SLOTS];  // ghost rows within this depth (0: all)
     int32_t count;                 // exchanged fields
-    int32_t clear;                 // slot 8 is a field to zero
-    int32_t written;               // receives: bit k set writes field k
+    int32_t clear;                 // the last slot is a field to zero
+    uint64_t written[hf_halo::WRITTEN_WORDS];  // receives: bit k writes field k
 };
 
 // Message record: peer, link (and REPEATS), ring slot (the sender's slot in
-// the receiver's ring), staging slot, then the row-table offset and row
-// count of every kind.
+// the receiver's ring), staging slot, the row-table offset and row count of
+// every kind, then per kind its rows within each depth 1 .. levels.
 struct HaloRing {
     char* window;          // arrivals[world], credits[world], ring
     const int64_t* peers;  // every rank's window as this process maps it
@@ -92,6 +102,8 @@ struct HaloRing {
     int32_t depth;
     int32_t chunk;         // elements one block moves
     int32_t checks;        // sends wait for their slot's credit
+    int32_t record;        // words of a message record
+    int32_t levels;        // depths a record counts rows within
 };
 
 namespace hf_halo {
@@ -110,11 +122,14 @@ __device__ __forceinline__ int64_t aligned(int64_t bytes) { return (bytes + 15) 
 // The message's layout, by the whole block: one thread per field reads its
 // rows, thread 0 then lays the segments out.
 __device__ void layout(const HaloFields& f, const HaloRing& r, const int32_t* rec, Layout& out) {
-    const int k = threadIdx.x;
-    if (k < SLOTS && (k < f.count || (k == SLOTS - 1 && f.clear))) {
-        out.first[k] = __ldg(rec + 4 + f.kind[k]);
-        out.rows[k] = __ldg(rec + 4 + KINDS + f.kind[k]);
-        out.count[k] = int64_t(out.rows[k]) * f.outer[k] * f.inner[k];
+    for (int k = threadIdx.x; k < SLOTS; k += blockDim.x) {
+        if (k < f.count || (k == SLOTS - 1 && f.clear)) {
+            const int depth = f.depth[k] < r.levels ? f.depth[k] : 0;
+            out.first[k] = __ldg(rec + 4 + f.kind[k]);
+            out.rows[k] = __ldg(depth ? rec + WITHIN + f.kind[k] * r.levels + depth - 1
+                                      : rec + COUNTS + f.kind[k]);
+            out.count[k] = int64_t(out.rows[k]) * f.outer[k] * f.inner[k];
+        }
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -212,7 +227,7 @@ __device__ __forceinline__ void move(const HaloFields& f, const Layout& s, const
             int k = 0;
             int64_t local = e;
             while (local >= s.count[k]) local -= s.count[k++];
-            if (!SEND && !(f.written >> k & 1)) {
+            if (!SEND && !(f.written[k >> 6] >> (k & 63) & 1)) {
                 live[u] = false;
                 continue;
             }
@@ -298,7 +313,7 @@ __device__ __forceinline__ void prologue(const HaloRing& r) {
 
 template <bool ACCUMULATE>
 __device__ void send(const HaloFields& f, const HaloRing& r, int32_t m) {
-    const int32_t* rec = r.messages + m * RECORD;
+    const int32_t* rec = r.messages + m * r.record;
     __shared__ Layout s;
     layout(f, r, rec, s);
     if (int64_t(blockIdx.x) >= s.blocks) return;
@@ -340,7 +355,7 @@ __device__ void send(const HaloFields& f, const HaloRing& r, int32_t m) {
 template <bool ACCUMULATE>
 __device__ void receive(const HaloFields& f, const HaloRing& r, int32_t m, int32_t pass,
                         bool last) {
-    const int32_t* rec = r.messages + m * RECORD;
+    const int32_t* rec = r.messages + m * r.record;
     __shared__ Layout s;
     layout(f, r, rec, s);
     // Receivers move the exchanged fields only (no clear).

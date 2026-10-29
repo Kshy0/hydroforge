@@ -18,7 +18,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
-import numpy as np
 import torch
 
 import hydroforge.parallel
@@ -33,8 +32,9 @@ from hydroforge.kernels.cuda import (
 )
 from hydroforge.kernels.registry import BackendRegistry
 from hydroforge.kernels.spec import (
-    HALO_FIELDS,
     HALO_HEADER_WORDS,
+    HALO_INLINE,
+    HALO_INTERIOR,
     HALO_QUIET_WORDS,
     HaloArgument,
     KernelSpec,
@@ -53,8 +53,8 @@ from hydroforge.parallel.halo import (
     _aligned,
     _Message,
     _View,
+    code_layout,
     plain_site,
-    unpack_layouts,
 )
 
 
@@ -62,6 +62,8 @@ def attach(runtime: HaloRuntime) -> HaloRuntime:
     """Give ``runtime`` its registered exchange kernel; returns it."""
 
     runtime.registry = _registry(runtime)
+    runtime.registry_factory = _registry
+    runtime.registries[MAX_FIELDS] = runtime.registry
     runtime.plain_site = HaloArgument(plain_site(runtime.plan.world))
     return runtime
 
@@ -102,12 +104,15 @@ def senders(runtime: HaloRuntime, published: Published) -> tuple[int, ...]:
 
 def consumes(layout: Any, distance: int, depth: int) -> bool:
     """Whether a kernel reading a field ``distance`` rows away reads every
-    ghost row of it (so writes them all back): slab fields read at the
-    slab's full ``depth``; partition key fields never (their ghosts are the
-    ends of whatever references the model holds, which one kernel need not
-    read)."""
+    ghost row a message of it carries (so writes them all back): slab
+    fields read at the message's ``depth`` or farther (the slab's, or the
+    layout's when it carries fewer rows); partition key fields never (their
+    ghosts are the ends of whatever references the model holds, which one
+    kernel need not read)."""
 
-    return layout.kind != KEY and bool(depth) and distance >= depth
+    if layout.kind == KEY or not depth:
+        return False
+    return distance >= (min(layout.depth, depth) if layout.depth else depth)
 
 
 def _interior(rows: Sequence[int]) -> tuple[int, int]:
@@ -131,9 +136,9 @@ def _segments(messages, views):
 
     result = []
     for message in messages:
-        offsets, rows, offset = [0] * MAX_FIELDS, [0] * MAX_FIELDS, 0
+        offsets, rows, offset = [0] * len(views), [0] * len(views), 0
         for f, view in enumerate(views):
-            count = message.count(view.kind)
+            count = message.count(view.kind, view.depth)
             offsets[f], rows[f] = offset, count
             offset += _aligned(view.elements(count) * view.size)
         result.append((offsets, rows))
@@ -142,11 +147,12 @@ def _segments(messages, views):
 
 def _row_entries(messages, view) -> tuple[list[int], list[int]]:
     """Row pointers over the stored rows of ``view`` and their (message,
-    position) entries in ``messages``."""
+    position) entries in ``messages`` (the rows its depth carries)."""
 
     entries: list[list[tuple[int, int]]] = [[] for _ in range(view.extent)]
     for m, message in enumerate(messages):
-        for position, row in enumerate(message.rows.get(view.kind, ())):
+        rows = message.rows.get(view.kind, ())
+        for position, row in enumerate(rows[: message.count(view.kind, view.depth)]):
             entries[int(row)].append((m, position))
     rowptr = [0]
     for found in entries:
@@ -179,6 +185,8 @@ def access_argument(
     commit: Sequence[tuple[int, int, int]] = (),
     *,
     checks: bool = True,
+    read_slots: tuple[int, ...] = (),
+    publish_slots: tuple[int, ...] = (),
 ) -> HaloArgument:
     """The ``halo`` argument of one call (``HfHalo`` of halo_access.cuh),
     prepared once per call site: the published fields (tensor, layout), the
@@ -188,10 +196,15 @@ def access_argument(
     counted) entries, and whether publishing waits for slot credits
     (``checks``: not in a loop body proven free of them).
 
-    Everything a thread needs on every element sits in the struct (passed
-    by value: the interior band of each field); the tables describe only
-    rows outside it, with each row's ring address precomputed. Arguments
-    of equal content are one object (kept by the runtime)."""
+    Everything a thread needs on every element of the first
+    ``HALO_INLINE`` declaration slots sits in the struct (passed by value:
+    the interior band of each field); further slots' descriptors and the
+    tables, which describe only rows outside the bands with each row's ring
+    address precomputed, sit in one tensor. ``read_slots`` and
+    ``publish_slots`` are the declaration slots of ``reads`` and
+    ``publish`` (by default their positions), so a disabled optional field
+    keeps the later fields' slots. Arguments of equal content are one object
+    (kept by the runtime)."""
 
     if runtime is None or not (
         publish or commit or any(p is not None for _, _, p, _ in reads)
@@ -210,21 +223,32 @@ def access_argument(
         ),
         tuple(commit),
         checks,
+        read_slots,
+        publish_slots,
     )
     prepared = runtime.__dict__.setdefault("access_arguments", {})
     found = prepared.get(key)
     if found is None:
         found = prepared[key] = _access_argument(
-            runtime, device, publish, reads, commit, checks
+            runtime, device, publish, reads, commit, checks, read_slots, publish_slots
         )
     return found
 
 
-def _access_argument(runtime, device, publish, reads, commit, checks) -> HaloArgument:
+def _access_argument(
+    runtime, device, publish, reads, commit, checks, read_slots, publish_slots
+) -> HaloArgument:
     plan, capacity = runtime.plan, runtime.capacity
     words = list(HALO_QUIET_WORDS)
+    read_slots = read_slots or tuple(range(len(reads)))
+    publish_slots = publish_slots or tuple(range(len(publish)))
+    # Descriptors of slots past the struct's inline ones head the table.
+    more_reads = max(max(read_slots, default=-1) + 1 - HALO_INLINE, 0)
+    more_publishes = max(max(publish_slots, default=-1) + 1 - HALO_INLINE, 0)
+    more = list((*HALO_INTERIOR, 0, 0) * (more_reads + more_publishes))
     tables: list[int] = []
-    pointers: list[tuple[int, int]] = []  # (word index, table offset)
+    # (words or more, index, table offset): addresses to fill in.
+    pointers: list[tuple[list[int], int, int]] = []
 
     def table(values: list[int]) -> int:
         """Append ``values`` to the tables; a placeholder for their address."""
@@ -232,6 +256,13 @@ def _access_argument(runtime, device, publish, reads, commit, checks) -> HaloArg
         offset = len(tables)
         tables.extend(values)
         return offset
+
+    def descriptor(slot: int, published: bool) -> tuple[list[int], int]:
+        """Where the descriptor of declaration ``slot`` starts."""
+
+        if slot < HALO_INLINE:
+            return words, HALO_HEADER_WORDS + 4 * (HALO_INLINE * published + slot)
+        return more, 4 * (more_reads * published + slot - HALO_INLINE)
 
     window = runtime.memory.addresses[plan.rank]
     assert DEPTH & (DEPTH - 1) == 0, "ring depth must be a power of two"
@@ -247,7 +278,9 @@ def _access_argument(runtime, device, publish, reads, commit, checks) -> HaloArg
     words[11] = int(checks)
     keep: list[Any] = [runtime.peers, runtime.state]
     if commit:
-        pointers.append((8, table([len(commit), *(v for e in commit for v in e)])))
+        pointers.append(
+            (words, 8, table([len(commit), *(v for e in commit for v in e)]))
+        )
     if publish:
         tensors = [t for t, _ in publish]
         layouts = [layout for _, layout in publish]
@@ -256,8 +289,10 @@ def _access_argument(runtime, device, publish, reads, commit, checks) -> HaloArg
         # counted, as by the send kernel.
         sends = [m for m in runtime.messages[("mirror", "send")][1] if m.nbytes(views)]
         runtime._check_capacity(tensors, layouts, "mirror")
-        words[7] = sum(v.elements(m.count(v.kind)) for m in sends for v in views)
-        pointers.append((9, table([m.peer for m in sends])))
+        words[7] = sum(
+            v.elements(m.count(v.kind, v.depth)) for m in sends for v in views
+        )
+        pointers.append((words, 9, table([m.peer for m in sends])))
         words[10] = len(sends)
         segments = _segments(sends, views)
         for f, view in enumerate(views):
@@ -280,20 +315,21 @@ def _access_argument(runtime, device, publish, reads, commit, checks) -> HaloArg
                         rows[f] * view.inner,
                     )
                 pointer_table.append(len(entries) // 2)
-            at = HALO_HEADER_WORDS + 4 * (HALO_FIELDS + f)
-            words[at : at + 2] = band
-            pointers.append((at + 2, table(pointer_table)))
-            pointers.append((at + 3, table(entries)))
+            target, at = descriptor(publish_slots[f], True)
+            target[at : at + 2] = band
+            pointers.append((target, at + 2, table(pointer_table)))
+            pointers.append((target, at + 3, table(entries)))
     if reads:
         receives = runtime.messages[("mirror", "receive")][1]
         for k, (tensor, layout, published, skip) in enumerate(reads):
             if published is None:
                 continue  # interior everywhere: read from the field
-            view = _View.of(tensor, layout)
             # The incoming message holds the publication's fields, alike on
-            # every rank, with the receive rows of each field's kind.
+            # every rank, with the receive rows of each field's kind and
+            # depth (rows beyond it: read from the field).
             group_views = _field_views(published.fields, published.layouts)
             f = [id(t) for t in published.fields].index(id(tensor))
+            view = group_views[f]
             incoming = [m for m in receives if m.nbytes(group_views)]
             segments = _segments(incoming, group_views)
             rowptr, flat = _row_entries(incoming, view)
@@ -315,23 +351,38 @@ def _access_argument(runtime, device, publish, reads, commit, checks) -> HaloArg
                     message.peer,
                     rows[f] * view.inner,
                 )
-            at = HALO_HEADER_WORDS + 4 * k
-            words[at : at + 2] = band
-            pointers.append((at + 2, table(ghosts)))
+            target, at = descriptor(read_slots[k], False)
+            target[at : at + 2] = band
+            pointers.append((target, at + 2, table(ghosts)))
             pointers.append(
-                (at + 3, table([int(skip.get(p, 0)) for p in range(plan.world)]))
+                (
+                    target,
+                    at + 3,
+                    table([int(skip.get(p, 0)) for p in range(plan.world)]),
+                )
             )
-    tensor = torch.tensor(np.array(tables or [0], np.int64), device=device)
-    for at, offset in pointers:
-        words[at] = tensor.data_ptr() + 8 * offset
-    return HaloArgument(tuple(words), (*keep, tensor))
+    tensor = torch.empty(
+        max(1, len(more) + len(tables)), dtype=torch.int64, device=device
+    )
+    address = tensor.data_ptr()
+    for target, at, offset in pointers:
+        target[at] = address + 8 * (len(more) + offset)
+    head = HALO_HEADER_WORDS + 8 * HALO_INLINE
+    words[head] = address if more_reads else 0
+    words[head + 1] = address + 32 * more_reads if more_publishes else 0
+    tensor.copy_(torch.tensor(more + tables or [0], dtype=torch.int64))
+    mask = sum(
+        1 << slot
+        for slot, (_, _, published, _) in zip(read_slots, reads, strict=True)
+        if published is not None
+    )
+    return HaloArgument(tuple(words), (*keep, tensor), mask)
 
 
 # --------------------------------------------------------------------------- #
 # The registered kernel
 # --------------------------------------------------------------------------- #
 _PARAMETERS = {
-    **{f"f{i}": "read_write" for i in range(MAX_FIELDS)},
     "clear": "read_write",
     # Peers write these; no rollback may restore them.
     "window": "remote",
@@ -345,13 +396,10 @@ _PARAMETERS = {
     "nf": constant("int32"),
     "accumulate": constant("bool"),
     "has_clear": constant("bool"),
-    "layout_low": constant("int32"),
-    "layout_high": constant("int32"),
     "clear_layout": constant("int32"),
     # The schedule's phase, counts and credits (parallel.halo.site_words).
     "site": "halo",
 }
-_SPEC = KernelSpec(name="halo_exchange", size=("num_entries",), parameters=_PARAMETERS)
 # halo.cu and peer.cuh ship with hydroforge.parallel.
 _DIR = Path(hydroforge.parallel.__file__).resolve().parent
 _THREADS = 512
@@ -359,20 +407,27 @@ _THREADS = 512
 
 def _views(arguments: Mapping[str, Any]) -> tuple[list[_View], _View | None]:
     count = arguments["nf"]
-    layouts = unpack_layouts(arguments["layout_low"], arguments["layout_high"], count)
+    layouts = [code_layout(arguments[f"layout{i}"]) for i in range(count)]
     views = [_View.of(arguments[f"f{i}"], layouts[i]) for i in range(count)]
     clear = None
     if arguments["has_clear"]:
-        (layout,) = unpack_layouts(arguments["clear_layout"], 0, 1)
-        clear = _View.of(arguments["clear"], layout)
+        clear = _View.of(arguments["clear"], code_layout(arguments["clear_layout"]))
     return views, clear
 
 
-def _fields_struct(views: Sequence[_View], clear: _View | None, written: int):
-    slots: list[_View | None] = [*views, *(None,) * (MAX_FIELDS - len(views)), clear]
+def _fields_struct(
+    views: Sequence[_View], clear: _View | None, written: int, capacity: int
+):
+    """HaloFields of halo.cu compiled for ``capacity`` fields, by value."""
+
+    slots: list[_View | None] = [*views, *(None,) * (capacity - len(views)), clear]
 
     def each(function):
         return [function(v) if v is not None else function(None) for v in slots]
+
+    def word(w: int) -> int:
+        value = written >> (64 * w) & (2**64 - 1)
+        return value - 2**64 if value >> 63 else value
 
     return struct(
         *each(lambda v: pointer(None if v is None else v.tensor)),
@@ -382,14 +437,15 @@ def _fields_struct(views: Sequence[_View], clear: _View | None, written: int):
         *each(lambda v: int32(1 if v is None else v.size)),
         *each(lambda v: int32(0 if v is None else _ADD_TYPES.get(v.tensor.dtype, 0))),
         *each(lambda v: int32(0 if v is None else KINDS.index(v.kind))),
+        *each(lambda v: int32(0 if v is None else v.depth)),
         int32(len(views)),
         int32(int(clear is not None)),
-        int32(written),
+        *(int64(word(w)) for w in range(-(-len(slots) // 64))),
     )
 
 
 def _blocks(message: _Message, views: Sequence[_View], clear: _View | None) -> int:
-    longest = sum(v.elements(message.count(v.kind)) for v in views)
+    longest = sum(v.elements(message.count(v.kind, v.depth)) for v in views)
     if clear is not None:
         longest = max(longest, clear.elements(message.count(clear.kind)))
     return -(-longest // CHUNK)
@@ -475,7 +531,8 @@ def cuda_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]) -> list[Any]:
     words = plain_site(runtime.plan.world) if site is None else site.words
     phase_index, written, checks, *table = words
     phase = PHASES[phase_index]
-    fields = _fields_struct(views, clear, written)
+    slots = max(MAX_FIELDS, arguments["nf"])
+    fields = _fields_struct(views, clear, written, slots)
     ring = struct(
         pointer(arguments["window"]),
         pointer(arguments["peers"]),
@@ -493,6 +550,8 @@ def cuda_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]) -> list[Any]:
         int32(DEPTH),
         int32(CHUNK),
         int32(checks),
+        int32(runtime.record),
+        int32(runtime.plan.levels),
     )
 
     def staged(direction: str) -> list[tuple[_Message, int]]:
@@ -607,7 +666,7 @@ def cuda_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]) -> list[Any]:
     return steps
 
 
-def _registry(runtime: HaloRuntime) -> BackendRegistry:
+def _registry(runtime: HaloRuntime, slots: int = MAX_FIELDS) -> BackendRegistry:
     """The exchange of ``runtime`` as one registered kernel."""
 
     def cuda_launch(**arguments):
@@ -617,20 +676,33 @@ def _registry(runtime: HaloRuntime) -> BackendRegistry:
         for step in _torch_steps(runtime, arguments):
             step()
 
+    spec = KernelSpec(
+        name="halo_exchange",
+        size=("num_entries",),
+        parameters={
+            **{f"f{i}": "read_write" for i in range(slots)},
+            **{f"layout{i}": constant("int32") for i in range(slots)},
+            **_PARAMETERS,
+        },
+    )
     cuda = CudaKernel(
-        CudaSource(path=_DIR / "halo.cu", include_root=_DIR),
-        launch=_named(cuda_launch, "BLOCK_SIZE"),
+        CudaSource(
+            path=_DIR / "halo.cu",
+            include_root=_DIR,
+            options=(f"-DHF_HALO_FIELDS={slots}",),
+        ),
+        launch=_named(cuda_launch, spec, "BLOCK_SIZE"),
         communicates=runtime.communicates,
         capturable=runtime.capturable,
     )
     torch_kernel = TorchKernel(
-        _named(halo_exchange),
+        _named(halo_exchange, spec),
         compile=False,
         communicates=runtime.communicates,
         capturable=runtime.capturable,
     )
     return BackendRegistry(
-        _SPEC,
+        spec,
         {
             "cuda": cuda,
             **{name: torch_kernel for name in ("triton", "torch", "metal")},
@@ -638,13 +710,13 @@ def _registry(runtime: HaloRuntime) -> BackendRegistry:
     )
 
 
-def _named(function, *extra: str):
+def _named(function, spec, *extra: str):
     """``function(**arguments)`` with the spec's parameters (and ``extra``)
     as its signature."""
 
     import inspect
 
-    names = (*_SPEC.parameter_names, *extra)
+    names = (*spec.parameter_names, *extra)
     parameters = [
         inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD)
         for name in names
@@ -680,11 +752,11 @@ def _torch_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]):
 
         offset = 0
         for view in views:
-            rows = message.count(view.kind)
+            rows = message.count(view.kind, view.depth)
             nbytes = view.elements(rows) * view.size
             if rows:
                 key = (mode, direction, message.peer, view.kind)
-                yield view, index[key], offset, nbytes
+                yield view, index[key][:rows], offset, nbytes
             offset += _aligned(nbytes)
 
     def send() -> None:

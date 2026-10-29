@@ -24,8 +24,12 @@ declares what kernels read and write:
   receipt recorded before it (a kernel declaring ``halo`` or ``publishes``
   reads ghost rows of its ``halo`` fields only: what it writes merely
   supersedes the ring);
-- ``halo_exchange_`` mirrors only dirty fields (current ones are pruned)
-  and receives ring ones;
+- ghost rows are current, or wait in a ring, within a *depth*: a mirror
+  the schedule records carries the rows within its reader's distance, a
+  publication those within its declared depth (``KernelSpec.publishes``).
+  A reader farther than the depth its field
+  is current to gets a deeper mirror (after the ring's receipt, for a
+  publication too shallow: reported as ``shallow_reads``);
 - a kernel declaring ``contributes=("s",)`` adds to rows of ``s`` other
   ranks own (its ghost rows): before anything but a contributor reads or
   writes ``s``, the contributions are summed into their owners (an
@@ -78,7 +82,7 @@ from __future__ import annotations
 import bisect
 import os
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -105,6 +109,7 @@ class _Entry:
     ring: Any  # the _Site whose publication holds the ghost rows, or None
     index: int  # operators recorded when the state was set
     entry: bool = False  # assumed at loop entry: nothing in the body wrote it
+    depth: int = 0  # ghost rows current (or in the ring) within it; 0 all
 
 
 @dataclass(eq=False)
@@ -115,9 +120,11 @@ class _Site:
 
     kind: str  # "kernel" or "exchange"
     argument: HaloArgument
-    # kernel: (tensor, layout, source (_Site, _ENTRY or None), consumes)
-    reads: list[tuple[torch.Tensor, Any, Any, bool]] = field(default_factory=list)
+    # kernel: (tensor, layout, source (_Site, _ENTRY or None), _Read)
+    reads: list[tuple[torch.Tensor, Any, Any, Any]] = field(default_factory=list)
     publish: tuple[tuple[torch.Tensor, Any], ...] = ()
+    read_slots: tuple[int, ...] = ()
+    publish_slots: tuple[int, ...] = ()
     # storages it writes (they supersede rings holding them)
     writes: frozenset[int] = frozenset()
     # exchange: its fields, mode and phase; a receipt's (site, "current" or
@@ -142,9 +149,44 @@ class _Site:
 
         if self.kind == "kernel":
             return Published(
-                tuple(t for t, _ in self.publish), tuple(layout for _, layout in self.publish)
+                tuple(t for t, _ in self.publish),
+                tuple(layout for _, layout in self.publish),
             )
         return Published(self.fields, self.layouts)
+
+
+@dataclass(frozen=True)
+class _Read:
+    """How far a declared read reaches: its distance, the rows its field's
+    layout holds on each side (``limit``) and the depth it needs."""
+
+    distance: int
+    limit: int
+    need: int
+
+    def consumes(self, layout: Any) -> bool:
+        """Whether it reads every row of the message carrying ``layout``."""
+
+        from hydroforge.kernels.halo import consumes
+
+        return consumes(layout, self.distance, self.limit)
+
+
+def _at_depth(layout: Any, depth: int) -> Any:
+    """``layout`` carrying the ghost rows within ``depth`` (0: every one)."""
+
+    return replace(layout, depth=depth) if depth else layout
+
+
+def _published_layout(site: _Site, storage: int) -> Any:
+    """The layout the publication (or exchange) of ``site`` carries the
+    field of ``storage`` in."""
+
+    group = site.group
+    for tensor, layout in zip(group.fields, group.layouts, strict=True):
+        if _storage(tensor) == storage:
+            return layout
+    raise KeyError(storage)
 
 
 @dataclass(eq=False)
@@ -239,6 +281,8 @@ class HaloSchedule:
         self.clobbered: frozenset[int] = frozenset()
         self.outside: tuple[frozenset[int], bool] = (frozenset(), False)
         self.assumed: dict[int, torch.Tensor] = {}
+        # The depth every reader of an assumed field needs at entry.
+        self.assumed_depth: dict[int, int] = {}
         self.log: list[_Site | _Event] = []
         self.state = CarriedState()
         self.free = False  # a loop body storing into slots without credits
@@ -290,9 +334,10 @@ class HaloSchedule:
                     return None
         return entry
 
-    def _assume(self, tensor: torch.Tensor) -> _Entry | None:
+    def _assume(self, tensor: torch.Tensor, depth: int = 0) -> _Entry | None:
         """In a loop body, a field nothing in the loop wrote yet is current
-        at entry (or waits in a ring the previous iteration left)."""
+        at entry within ``depth`` (or waits in a ring the previous
+        iteration left)."""
 
         storage = _storage(tensor)
         if (
@@ -302,8 +347,20 @@ class HaloSchedule:
         ):
             return None
         self.assumed[id(tensor)] = tensor
-        self._set(tensor, entry=True)
+        self.assumed_depth[id(tensor)] = depth
+        self._set(tensor, entry=True, depth=depth)
         return self.entries[id(tensor)]
+
+    def _deepen_assumed(self, tensor: torch.Tensor, entry: _Entry, need: int) -> None:
+        """An assumed field read farther: the loop provides it deeper at
+        entry (its mirrors before the first iteration and at the body's
+        end), so the body records nothing."""
+
+        from hydroforge.parallel.halo import deeper
+
+        entry.depth = deeper(entry.depth, need)
+        key = id(tensor)
+        self.assumed_depth[key] = deeper(self.assumed_depth.get(key, need), need)
 
     @property
     def entry(self) -> LoopHalo:
@@ -314,19 +371,28 @@ class HaloSchedule:
             return LoopHalo()
         pending = {s for _, p in self.state.items for s in p}
         fields = tuple(
-            t for t in self.assumed.values() if _storage(t) not in pending
+            (t, self.assumed_depth.get(key, 0))
+            for key, t in self.assumed.items()
+            if _storage(t) not in pending
         )
         return LoopHalo(
-            fields,
+            tuple(t for t, _ in fields),
             self.state,
             free=self.free,
             anchor=self._any_fields()[:8],
             zero=tuple(self.zeroed.values()),
+            depths=tuple(d for _, d in fields),
         )
 
-    def _set(self, tensor: torch.Tensor, ring: Any = None, entry: bool = False) -> None:
+    def _set(
+        self,
+        tensor: torch.Tensor,
+        ring: Any = None,
+        entry: bool = False,
+        depth: int = 0,
+    ) -> None:
         self.entries[id(tensor)] = _Entry(
-            tensor, ring, len(self.recorder.operators), entry
+            tensor, ring, len(self.recorder.operators), entry, depth
         )
 
     def _record(self, function, *args, **kwargs) -> None:
@@ -346,29 +412,27 @@ class HaloSchedule:
         clear: torch.Tensor | None = None,
         phase: str = "both",
         receipt: tuple[Any, str] | None = None,
-        record: Any = None,
+        layouts: tuple[Any, ...] | None = None,
     ) -> _Site | None:
-        """Record one exchange (``record``: the model's own call, given the
-        site argument) as a site (``None`` without ring work)."""
+        """Record one exchange as a site (``None`` without ring work);
+        ``layouts`` default to every ghost row of each field."""
 
         halo, runtime = self.halo, self.runtime
         argument = HaloArgument(halo.plain_site.words) if self.fusable else None
-        layouts = tuple(runtime.halo_layout(t) for t in fields)
+        if layouts is None:
+            layouts = tuple(runtime.halo_layout(t) for t in fields)
         operators = self.recorder.operators
         before = len(operators)
-        if record is not None:
-            self._record(record, argument)
-        else:
-            clear_layout = None if clear is None else runtime.halo_layout(clear)
-            self._record(
-                halo.exchange,
-                fields,
-                list(layouts),
-                mode,
-                clear,
-                clear_layout,
-                site=argument,
-            )
+        clear_layout = None if clear is None else runtime.halo_layout(clear)
+        self._record(
+            halo.exchange,
+            fields,
+            list(layouts),
+            mode,
+            clear,
+            clear_layout,
+            site=argument,
+        )
         if not self.fusable:
             return None
         # Logged on every rank, launching or not, so every rank replays the
@@ -391,32 +455,44 @@ class HaloSchedule:
         return site
 
     # ------------------------------------------------------------------ #
-    def mirror(self, fields: tuple[torch.Tensor, ...]) -> None:
-        """Record a mirror of ``fields`` (any state) and make them current."""
+    def mirror(
+        self, fields: tuple[torch.Tensor, ...], depths: tuple[int, ...] = ()
+    ) -> None:
+        """Record a mirror of ``fields`` (any state) within ``depths``
+        (default every ghost row) and make them current."""
 
         if not fields:
             return
+        depths = depths or (0,) * len(fields)
+        runtime = self.runtime
+        layouts = tuple(
+            _at_depth(runtime.halo_layout(t), d)
+            for t, d in zip(fields, depths, strict=True)
+        )
         for start in range(0, len(fields), 8):
-            self._exchange(tuple(fields[start : start + 8]))
-        for tensor in fields:
-            self._set(tensor)
+            self._exchange(
+                tuple(fields[start : start + 8]), layouts=layouts[start : start + 8]
+            )
+        for tensor, depth in zip(fields, depths, strict=True):
+            self._set(tensor, depth=depth)
             self._ghost(tensor, "copied")
 
     def receipt(self, published: _Site) -> None:
         """Record the receipt of a publication's ring (no messages)."""
 
         waiting = [
-            tensor
-            for tensor, _ in published.publish
+            (tensor, layout.depth)
+            for tensor, layout in published.publish
             if (entry := self._entry(tensor)) is not None and entry.ring is published
         ]
         self._exchange(
             tuple(t for t, _ in published.publish),
             phase="receive",
             receipt=(published, "current"),
+            layouts=tuple(layout for _, layout in published.publish),
         )
-        for tensor in waiting:
-            self._set(tensor)
+        for tensor, depth in waiting:
+            self._set(tensor, depth=depth)
         for tensor, _ in published.publish:
             self._ghost(tensor, "copied")
 
@@ -476,39 +552,16 @@ class HaloSchedule:
         if self.fusable:
             self.log.append(_Event("settle", len(self.recorder.operators)))
 
-    def request_mirror(self, fields: tuple[torch.Tensor, ...]) -> None:
-        """``halo_exchange_`` of ``fields`` in mirror mode."""
-
-        halo = self.halo
-        halo.mirrors_requested += len(fields)
-        dirty, ring = [], []
-        for tensor in fields:
-            entry = self._entry(tensor)
-            if entry is None:
-                dirty.append(tensor)
-            elif entry.ring is not None:
-                ring.append(tensor)
-        halo.mirrors_pruned += len(fields) - len(dirty) - len(ring)
-        self._access(list(fields))
-        if ring:
-            self.resolve_ring(ring)
-        self.mirror(tuple(dirty))
-
-    def other_exchange(
-        self,
-        fields: tuple[torch.Tensor, ...],
-        record,
-        *,
-        mode: str = "accumulate",
-        clear: torch.Tensor | None = None,
+    def _accumulate(
+        self, fields: tuple[torch.Tensor, ...], clear: torch.Tensor | None = None
     ) -> None:
-        """An accumulate exchange of ``fields`` (zeroing ``clear``'s
-        ghosts); ``record(site)`` records it. It rewrites them."""
+        """Record an accumulate exchange of ``fields`` (zeroing ``clear``'s
+        ghosts). It rewrites them."""
 
         touched = (*fields, *(() if clear is None else (clear,)))
         self._access(list(touched))
         self.resolve_ring(touched)
-        self._exchange(tuple(fields), mode, clear=clear, record=record)
+        self._exchange(tuple(fields), "accumulate", clear=clear)
         for tensor in touched:
             self.entries.pop(id(tensor), None)
             self._ghost(tensor, "zero")
@@ -549,11 +602,7 @@ class HaloSchedule:
         storages = dict.fromkeys(_storage(t) for t in fields)
         fields = [self.ghosts[storage].tensor for storage in storages]
         clears = list(
-            {
-                _storage(t): t
-                for t in clears
-                if _storage(t) not in storages
-            }.values()
+            {_storage(t): t for t in clears if _storage(t) not in storages}.values()
         )
         for start in range(0, len(fields), 8):
             chunk = tuple(fields[start : start + 8])
@@ -575,7 +624,7 @@ class HaloSchedule:
                     ),
                     None,
                 )
-            self.other_exchange(chunk, None, mode="accumulate", clear=clear)
+            self._accumulate(chunk, clear)
         for tensor in clears:
             self._clear(tensor)
 
@@ -651,7 +700,7 @@ class HaloSchedule:
         and what to note once it is recorded."""
 
         from hydroforge.execution.operators import buffer_access_semantics
-        from hydroforge.kernels.halo import consumes
+        from hydroforge.parallel.halo import covers, deeper, read_depth
 
         self.written_back = ()
         runtime, halo = self.runtime, self.halo
@@ -663,9 +712,16 @@ class HaloSchedule:
         if halo is None:
             return {**arguments, **placeholders}, None
         fusable = self.fusable
-        states = []
-        for name, distance in spec.halo.items():
+        wanted = []
+        read_slots = []
+        for slot, (name, distance) in enumerate(spec.halo.items()):
             tensor = bound[name]
+            if tensor is None:
+                continue
+            if isinstance(distance, str):
+                distance = bound[distance]
+                if distance < 1:
+                    raise ValueError(f"{spec.name}: halo distance must be positive")
             layout = runtime.halo_layout(tensor)
             limit = runtime.halo_depth(layout)
             if limit and distance > limit:
@@ -673,27 +729,79 @@ class HaloSchedule:
                     f"{spec.name} reads {name} {distance} rows away; the "
                     f"slab holds {limit} ghost rows"
                 )
-            entry = self._entry(tensor) or self._assume(tensor)
-            states.append((tensor, layout, distance, limit, entry))
-        self.mirror(tuple(t for t, _, _, _, entry in states if entry is None))
+            need = read_depth(distance, limit)
+            wanted.append((tensor, layout, _Read(distance, limit, need)))
+            read_slots.append(slot)
+        # Publications too shallow for a read are received first (then the
+        # field is mirrored deeper).
+        shallow = [
+            tensor
+            for tensor, _, read in wanted
+            if (entry := self._entry(tensor)) is not None
+            and entry.ring is not None
+            and not covers(entry.depth, read.need)
+        ]
+        if shallow:
+            halo.shallow_reads += len(shallow)
+            self.resolve_ring(shallow)
+        states, deepen = [], {}
+        for tensor, layout, read in wanted:
+            entry = self._entry(tensor) or self._assume(tensor, read.need)
+            if entry is not None and not covers(entry.depth, read.need):
+                if entry.entry and entry.ring is None:
+                    self._deepen_assumed(tensor, entry, read.need)
+                else:
+                    if not any(t is tensor for t in shallow):
+                        halo.mirrors_deepened += 1
+                    entry = None
+            if entry is None:
+                deepen[id(tensor)] = (
+                    tensor,
+                    deeper(deepen[id(tensor)][1], read.need)
+                    if id(tensor) in deepen
+                    else read.need,
+                )
+            states.append((tensor, layout, read, entry))
+        self.mirror(
+            tuple(t for t, _ in deepen.values()), tuple(d for _, d in deepen.values())
+        )
         if not fusable:
             return {**arguments, **placeholders}, None
         reads = []
-        for tensor, layout, distance, limit, entry in states:
+        for tensor, layout, read, entry in states:
             source = None
             if entry is not None and entry.ring is not None:
                 source = entry.ring
             elif entry is not None and entry.entry:
                 source = _ENTRY
-            reads.append((tensor, layout, source, consumes(layout, distance, limit)))
+            reads.append((tensor, layout, source, read))
+        publish, publish_slots = [], []
+        for slot, (name, depth) in enumerate(spec.publish_depths.items()):
+            tensor = bound[name]
+            if tensor is None:
+                continue
+            layout = runtime.halo_layout(tensor)
+            if depth is not None:
+                depth = bound[depth] if isinstance(depth, str) else depth
+                layout = _at_depth(
+                    layout, read_depth(depth, runtime.halo_depth(layout))
+                )
+            # Fields the slot has no room for are written unpublished.
+            if halo.fits(
+                [*(t for t, _ in publish), tensor],
+                [*(given for _, given in publish), layout],
+            ):
+                publish.append((tensor, layout))
+                publish_slots.append(slot)
+            else:
+                halo.unpublished += 1
         site = _Site(
             "kernel",
             HaloArgument(quiet.words),
             reads=reads,
-            publish=tuple(
-                (bound[name], runtime.halo_layout(bound[name]))
-                for name in spec.publishes
-            ),
+            read_slots=tuple(read_slots),
+            publish=tuple(publish),
+            publish_slots=tuple(publish_slots),
             writes=frozenset(
                 _storage(bound[name])
                 for name, access in spec.buffers.items()
@@ -704,15 +812,16 @@ class HaloSchedule:
             name=spec.name,
         )
         self.log.append(site)
-        fused = [(t, s, c) for t, _, s, c in reads if s is not None]
+        fused = [(t, s, r) for t, _, s, r in reads if s is not None]
 
         def recorded() -> None:
             # The call is the last operator; it may write back the ghost
             # rows it reads from rings (it records them written). Reading
-            # them all makes a ring field current; an assumed one stays
-            # assumed (the replay sees where its ring is). A field it also
-            # writes is dirty after it, or waits in its own ring when it
-            # publishes it: its writes supersede what it read.
+            # all a message carries makes a ring field current within the
+            # message's depth; an assumed one stays assumed (the replay sees
+            # where its ring is). A field it also writes is dirty after it,
+            # or waits in its own ring when it publishes it: its writes
+            # supersede what it read.
             operator = self.recorder.operators[-1]
             site.operator = operator
             from hydroforge.kernels.cuda import takes_halo
@@ -738,15 +847,22 @@ class HaloSchedule:
                     site.carrier.carried = True
             for tensor, _, _ in fused:
                 self._ghost(tensor, "copied")
-            for tensor, source, consumed in fused:
+            for tensor, source, read in fused:
                 if _storage(tensor) in site.writes:
                     self.entries.pop(id(tensor), None)
                 elif source is _ENTRY:
-                    self._set(tensor, entry=True)
+                    self._set(
+                        tensor, entry=True, depth=self.assumed_depth.get(id(tensor), 0)
+                    )
                 else:
-                    self._set(tensor, None if consumed else source)
-            for tensor, _ in site.publish:
-                self._set(tensor, site)
+                    layout = _published_layout(source, _storage(tensor))
+                    self._set(
+                        tensor,
+                        None if read.consumes(layout) else source,
+                        depth=layout.depth,
+                    )
+            for tensor, layout in site.publish:
+                self._set(tensor, site, depth=layout.depth)
 
         self.written_back = tuple(t for t, _, _ in fused)
         return {**arguments, HALO_PARAMETER: site.argument}, recorded
@@ -769,9 +885,10 @@ class HaloSchedule:
                 if self.ghosts[storage].state == "copied"
             ],
         )
-        # Fields assumed current at entry and left dirty: mirrored at the
-        # end (those a ring carries are not dirty).
-        self.mirror(tuple(t for t in self.assumed.values() if self._entry(t) is None))
+        # Fields assumed current at entry and left dirty, or current (or in
+        # a ring) within fewer rows than the body's readers need at entry:
+        # mirrored at the end (after the ring's receipt).
+        self._restore_assumed()
         if not self.fusable:
             return
         accessed, exchanges = self.outside
@@ -809,7 +926,10 @@ class HaloSchedule:
                 for site, pending in left.items:
                     if pending:
                         self._exchange(
-                            site.group.fields, phase="receive", receipt=(site, "current")
+                            site.group.fields,
+                            phase="receive",
+                            receipt=(site, "current"),
+                            layouts=site.group.layouts,
                         )
                 self._book()
                 continue
@@ -830,6 +950,24 @@ class HaloSchedule:
             and slots_free(self.halo.plan, result, state if carry else CarriedState())
         )
         self._fill(result)
+
+    def _restore_assumed(self) -> None:
+        from hydroforge.parallel.halo import covers
+
+        shallow, dirty = [], {}
+        for key, tensor in self.assumed.items():
+            need = self.assumed_depth.get(key, 0)
+            live = self._entry(tensor)
+            if live is not None and (live.entry or covers(live.depth, need)):
+                continue
+            if live is not None and live.ring is not None:
+                shallow.append(tensor)
+            dirty[key] = (tensor, need)
+        if shallow:
+            self.resolve_ring(shallow)
+        self.mirror(
+            tuple(t for t, _ in dirty.values()), tuple(d for _, d in dirty.values())
+        )
 
     def _carriable(self, state: CarriedState) -> bool:
         """Whether a loop can send ``state``'s messages before its first
@@ -861,7 +999,7 @@ class HaloSchedule:
         """Number every message, place counts and credits; raises
         :class:`_Insert` when receipts must be recorded first."""
 
-        from hydroforge.parallel.halo import DEPTH
+        from hydroforge.parallel.halo import DEPTH, covers
 
         plan = self.halo.plan
         me = plan.rank
@@ -955,7 +1093,9 @@ class HaloSchedule:
                     waiting = [
                         item
                         for item in items[credited:]
-                        if item.entry and not item.done and item.pending & event.storages
+                        if item.entry
+                        and not item.done
+                        and item.pending & event.storages
                     ]
                     if waiting:
                         raise _Insert(event, waiting)
@@ -972,7 +1112,7 @@ class HaloSchedule:
                 # What it reads from rings: the publication's message, or
                 # one the previous iteration left pending.
                 reads, reading = [], set()
-                for tensor, layout, source, consumed in site.reads:
+                for tensor, layout, source, read in site.reads:
                     item_position = None
                     storage = _storage(tensor)
                     if isinstance(source, _Site):
@@ -982,8 +1122,19 @@ class HaloSchedule:
                     elif source == _ENTRY:
                         for position in range(len(items)):
                             item = items[position]
-                            if item.entry and not item.done and storage in item.pending:
+                            if (
+                                item.entry
+                                and not item.done
+                                and storage in item.pending
+                                and covers(
+                                    _published_layout(item.site, storage).depth,
+                                    read.need,
+                                )
+                            ):
                                 item_position = position
+                    consumed = item_position is not None and read.consumes(
+                        _published_layout(items[item_position].site, storage)
+                    )
                     reads.append((tensor, layout, item_position, consumed))
                     if item_position is not None:
                         reading.add(item_position)
@@ -1010,7 +1161,12 @@ class HaloSchedule:
                     else:
                         item = items[item_position]
                         tables.append(
-                            (tensor, layout, item.site.group, offsets(item_position, counted))
+                            (
+                                tensor,
+                                layout,
+                                item.site.group,
+                                offsets(item_position, counted),
+                            )
                         )
                         result.fused += 1
                 result.kernel[id(site)] = (tables, entries)
@@ -1037,8 +1193,15 @@ class HaloSchedule:
                 # for the message of each pair holding rows of its kind; a
                 # partial one need not touch every pair's rows.
                 waits = [
-                    (p, rows_of(plan, items[p].pairs, layout))
-                    for _, layout, p, consumed in reads
+                    (
+                        p,
+                        rows_of(
+                            plan,
+                            items[p].pairs,
+                            _published_layout(items[p].site, _storage(tensor)),
+                        ),
+                    )
+                    for tensor, _, p, consumed in reads
                     if p is not None and consumed
                 ]
                 result.trace.append(
@@ -1065,7 +1228,7 @@ class HaloSchedule:
             before_counted, before_credited = counted, credited
             start = credited = prefix()
             receiving: dict[int, int] = {}
-            written = (1 << 8) - 1
+            written = -1
             # Its receive waits for every message of the item it receives.
             waits, published = [], []
             if target is not None:
@@ -1108,7 +1271,12 @@ class HaloSchedule:
                     prologue.append((peer, credit, count))
             counted = credited = end
             result.exchange[id(site)] = (
-                phase, written, receiving, settle, post, prologue
+                phase,
+                written,
+                receiving,
+                settle,
+                post,
+                prologue,
             )
         result.state = CarriedState(
             tuple((item.site, frozenset(item.pending)) for item in items[counted:]),
@@ -1132,6 +1300,7 @@ class HaloSchedule:
                 item.site.group.fields,
                 phase="receive",
                 receipt=(item.site, "entry" if item.entry else "current"),
+                layouts=item.site.group.layouts,
             )
         if insert.book:
             fields = (
@@ -1192,8 +1361,14 @@ class HaloSchedule:
                 commit = uncredited(commit)
                 with _disable_current_modes():
                     argument = access_argument(
-                        halo, halo.device, list(site.publish), reads, commit,
+                        halo,
+                        halo.device,
+                        list(site.publish),
+                        reads,
+                        commit,
                         checks=not free,
+                        read_slots=site.read_slots,
+                        publish_slots=site.publish_slots,
                     )
                 if site.publish:
                     halo.publications += 1
@@ -1203,8 +1378,11 @@ class HaloSchedule:
                     )
                     continue
                 site.argument.words, site.argument.keep = argument.words, argument.keep
+                site.argument.read_mask = argument.read_mask
                 continue
-            phase, written, receiving, settle, post, prologue = result.exchange[id(site)]
+            phase, written, receiving, settle, post, prologue = result.exchange[
+                id(site)
+            ]
             site.argument.words = site_words(
                 world,
                 phase,
@@ -1225,16 +1403,18 @@ def message_pairs(plan: Any, site: _Site) -> tuple[tuple[int, int], ...]:
 
     found = site.__dict__.get("pairs")
     if found is None:
-        from hydroforge.parallel.halo import KINDS
-
         if site.kind == "kernel" or site.receipt is not None:
             layouts, mode = site.group.layouts, "mirror"
         else:
             layouts, mode = site.layouts, site.mode
-        kinds = sorted({KINDS.index(layout.kind) for layout in layouts})
-        if not kinds:
+        if not layouts:
             return ()
-        owners, holders = np.nonzero(plan.counts[kinds].sum(0))
+        # Pairs some field of it has rows on, at the field's depth.
+        carried = sum(
+            plan.depth_rows(layout.kind, layout.depth if mode == "mirror" else 0)
+            for layout in layouts
+        )
+        owners, holders = np.nonzero(carried)
         if mode == "mirror":
             found = tuple(zip(owners.tolist(), holders.tolist()))
         else:
@@ -1246,11 +1426,10 @@ def message_pairs(plan: Any, site: _Site) -> tuple[tuple[int, int], ...]:
 def rows_of(
     plan: Any, pairs: tuple[tuple[int, int], ...], layout: Any
 ) -> tuple[tuple[int, int], ...]:
-    """The ``pairs`` whose messages hold rows of ``layout``'s kind."""
+    """The ``pairs`` whose messages hold rows of ``layout``'s kind (within
+    its depth)."""
 
-    from hydroforge.parallel.halo import KINDS
-
-    counts = plan.counts[KINDS.index(layout.kind)]
+    counts = plan.depth_rows(layout.kind, layout.depth)
     return tuple(pair for pair in pairs if counts[pair])
 
 
@@ -1315,7 +1494,9 @@ def slots_free(plan: Any, result: _Replay, state: CarriedState) -> bool:
                 pairs[message] = items[position].pairs
             for position, on in waits:
                 for pair in on:
-                    waited.setdefault(pair, []).append((time, number(iteration, position)))
+                    waited.setdefault(pair, []).append(
+                        (time, number(iteration, position))
+                    )
             for position in done:
                 finished.setdefault(number(iteration, position), time)
     messages: dict[tuple[int, int], list[int]] = {}
@@ -1359,7 +1540,10 @@ def neighbourhood(operators: Any, halo: Any) -> tuple[frozenset[int], bool]:
     accessed = frozenset(
         _storage(tensor)
         for operator in operators
-        for tensor in (*getattr(operator, "reads", ()), *getattr(operator, "writes", ()))
+        for tensor in (
+            *getattr(operator, "reads", ()),
+            *getattr(operator, "writes", ()),
+        )
         if isinstance(tensor, torch.Tensor)
     )
     exchanges = False
@@ -1368,14 +1552,22 @@ def neighbourhood(operators: Any, halo: Any) -> tuple[frozenset[int], bool]:
         if registry is None:
             continue
         spec = registry.spec
-        if (halo is not None and registry is halo.registry) or spec.halo or spec.publishes:
+        if (
+            (
+                halo is not None
+                and any(registry is value for value in halo.registries.values())
+            )
+            or spec.halo
+            or spec.publishes
+        ):
             exchanges = True
     return accessed, exchanges
 
 
 class LoopHalo:
     """What a loop does around its runs (outside any recording): before the
-    first iteration it mirrors the fields its body assumes current and sends
+    first iteration it mirrors the fields its body assumes current (within
+    ``depths``, default every ghost row) and sends
     the messages its body finds pending (:class:`CarriedState`); after the
     last it receives those still pending and counts and credits them all.
     A body storing without credits (``free``, :func:`slots_free`) first
@@ -1394,8 +1586,10 @@ class LoopHalo:
         free: bool = False,
         anchor: tuple[torch.Tensor, ...] = (),
         zero: tuple[torch.Tensor, ...] = (),
+        depths: tuple[int, ...] = (),
     ) -> None:
         self.fields = fields
+        self.depths = depths or (0,) * len(fields)
         self.state = state
         self.free = free
         self.anchor = anchor
@@ -1427,7 +1621,9 @@ class LoopHalo:
         launches = self.launches.get(which)
         if launches is None:
             launches = self.launches[which] = tuple(
-                execution.kernel_binding.bind(execution.runtime.halo.registry, a).compile()
+                execution.kernel_binding.bind(
+                    execution.runtime.halo.registry_for(a["nf"]), a
+                ).compile()
                 for a in self._arguments(execution, which)
             )
         for launch in launches:
@@ -1443,11 +1639,15 @@ class LoopHalo:
         found: list[dict] = []
 
         def exchange(site, phase, written=0, skip=None, prologue=()) -> None:
-            fields = site.group.fields if site is not None else self.anchor
+            if site is None:
+                fields = self.anchor
+                layouts = [runtime.halo_layout(t) for t in fields]
+            else:
+                fields, layouts = site.group
             mode = "mirror" if site is None or site.kind == "kernel" else site.mode
             arguments = halo.exchange_arguments(
                 fields,
-                [runtime.halo_layout(t) for t in fields],
+                list(layouts),
                 mode,
                 site=HaloArgument(
                     site_words(world, phase, written, skip, prologue=prologue)
@@ -1466,7 +1666,12 @@ class LoopHalo:
             for start in range(0, len(self.fields), 8):
                 chunk = self.fields[start : start + 8]
                 arguments = halo.exchange_arguments(
-                    chunk, [runtime.halo_layout(t) for t in chunk], "mirror"
+                    chunk,
+                    [
+                        _at_depth(runtime.halo_layout(t), d)
+                        for t, d in zip(chunk, self.depths[start : start + 8])
+                    ],
+                    "mirror",
                 )
                 if arguments is not None:
                     found.append(arguments)
@@ -1494,7 +1699,9 @@ class LoopHalo:
             if credited and not self.free:
                 credit = mine(credited)
                 exchange(
-                    items[0][0], "book", prologue=[(p, n, 0) for p, n in credit.items() if n]
+                    items[0][0],
+                    "book",
+                    prologue=[(p, n, 0) for p, n in credit.items() if n],
                 )
             return found
         if which == "leave":
@@ -1503,20 +1710,28 @@ class LoopHalo:
                     continue
                 fields = [_storage(t) for t in site.group.fields]
                 written = sum(1 << k for k, s in enumerate(fields) if s in pending)
-                skip = {p: n for p, n in mine(position).items() if (p, me) in pairs[position]}
+                skip = {
+                    p: n
+                    for p, n in mine(position).items()
+                    if (p, me) in pairs[position]
+                }
                 exchange(site, "receive", written, skip)
         counts = mine(len(items))
         if self.free:
             # Count them, then set every credit the body skipped.
             exchange(
-                items[0][0], "flush", prologue=[(p, 0, counts[p]) for p in peers if counts[p]]
+                items[0][0],
+                "flush",
+                prologue=[(p, 0, counts[p]) for p in peers if counts[p]],
             )
             return found
         credits = mine(len(items), credited)
         exchange(
             items[0][0],
             "book",
-            prologue=[(p, credits[p], counts[p]) for p in peers if counts[p] or credits[p]],
+            prologue=[
+                (p, credits[p], counts[p]) for p in peers if counts[p] or credits[p]
+            ],
         )
         return found
 

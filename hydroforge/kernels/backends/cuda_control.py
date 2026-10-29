@@ -11,8 +11,9 @@ ConditionalWhileGraph`) folds a loop into one graph launch: the body and its
 continuation predicate run on the device, so the host issues one launch per
 adaptive or predicate loop.  A fixed loop replays bounded batches of iterations
 from the host.  The control kernels are the rules of
-:mod:`hydroforge.kernels.backends.loop_control` printed in CUDA; the
-continuation predicate calls the CUDA-only ``set_conditional`` intrinsic.
+:mod:`hydroforge.kernels.backends.loop_control` printed in CUDA, so an
+adaptive iteration's controls are two launches; the continuation predicate
+calls the CUDA-only ``set_conditional`` intrinsic.
 Each control program compiles once with every kernel it holds, the
 statistics program with one entry per weight source and destination type.
 """
@@ -25,6 +26,7 @@ from typing import Any
 
 import torch
 
+from hydroforge.kernels.backends import loop_control
 from hydroforge.kernels.backends.loop_control import (
     FIXED_END,
     SamplePhase,
@@ -78,6 +80,61 @@ _SET_CONDITIONAL = KernelFunction(
 )
 
 
+def _adaptive_accept(real: torch.dtype) -> KernelFunction:
+    params = (
+        Param("candidate", real, "read"),
+        Param("duration", torch.int64, "read"),
+        Param("elapsed", torch.int64, "read"),
+        Param("step", torch.int64, "write"),
+        Param("dt", real, "write"),
+        Param("error", torch.int32, "write"),
+    )
+    candidate, duration, elapsed, step, dt, error = map(cell, params)
+    return KernelFunction(
+        f"hf_adaptive_accept_{str(real).removeprefix('torch.')}",
+        params,
+        loop_control.adaptive_accept(
+            candidate=candidate,
+            duration=duration,
+            elapsed=elapsed,
+            step=step,
+            dt=dt,
+            error=error,
+        ),
+    )
+
+
+def _adaptive_end() -> KernelFunction:
+    params = (
+        Param("duration", torch.int64, "read"),
+        Param("step", torch.int64, "read"),
+        Param("elapsed", torch.int64, "read_write"),
+        Param("counter", torch.int32, "read_write"),
+        Param("continue_flag", torch.int32, "write"),
+        Param("error", torch.int32, "read_write"),
+        Param("maximum_steps", torch.int64),
+    )
+    duration, step, elapsed, counter, continue_flag, error = map(cell, params[:6])
+    return KernelFunction(
+        "hf_adaptive_end",
+        params,
+        loop_control.adaptive_end(
+            duration=duration,
+            step=step,
+            elapsed=elapsed,
+            counter=counter,
+            continue_flag=continue_flag,
+            error=error,
+            maximum_steps=Var("maximum_steps", torch.int64),
+        ),
+    )
+
+
+# Accept an adaptive proposal (per width type) and advance the loop.
+_ADAPTIVE_ACCEPT = {real: _adaptive_accept(real) for real in _REALS}
+_ADAPTIVE_END = _adaptive_end()
+
+
 def _request(
     name: str,
     functions: tuple[KernelFunction, ...],
@@ -97,7 +154,7 @@ def _request(
 def _control_request() -> rtc.RtcRequest:
     return _request(
         "hydroforge_loop_control",
-        (_SET_CONDITIONAL, FIXED_END),
+        (_SET_CONDITIONAL, FIXED_END, *_ADAPTIVE_ACCEPT.values(), _ADAPTIVE_END),
         # ``cudaGraphSetConditional`` is declared by the device runtime.
         header="#include <cuda_device_runtime_api.h>\n\n",
         options=rtc.toolkit_include_options(),
@@ -171,6 +228,64 @@ def fixed_end(
         _control_request(),
         FIXED_END,
         {"counter": counter, "continue_flag": continue_flag, "count": count},
+        counter.device,
+    )
+
+
+def adaptive_accept(
+    *,
+    candidate: torch.Tensor,
+    duration: torch.Tensor,
+    elapsed: torch.Tensor,
+    step: torch.Tensor,
+    dt: torch.Tensor,
+    error: torch.Tensor,
+) -> None:
+    """Accept an adaptive proposal: the ``step`` ticks and the width ``dt``
+    (float32/float64) of the iteration, and its ``error``."""
+
+    function = _ADAPTIVE_ACCEPT.get(dt.dtype)
+    if function is None:
+        raise TypeError(f"adaptive widths must be float32/float64, got {dt.dtype}")
+    _launch(
+        _control_request(),
+        function,
+        {
+            "candidate": candidate,
+            "duration": duration,
+            "elapsed": elapsed,
+            "step": step,
+            "dt": dt,
+            "error": error,
+        },
+        dt.device,
+    )
+
+
+def adaptive_end(
+    *,
+    duration: torch.Tensor,
+    step: torch.Tensor,
+    elapsed: torch.Tensor,
+    counter: torch.Tensor,
+    continue_flag: torch.Tensor,
+    error: torch.Tensor,
+    maximum_steps: int,
+) -> None:
+    """Advance an adaptive loop by its accepted step."""
+
+    _launch(
+        _control_request(),
+        _ADAPTIVE_END,
+        {
+            "duration": duration,
+            "step": step,
+            "elapsed": elapsed,
+            "counter": counter,
+            "continue_flag": continue_flag,
+            "error": error,
+            "maximum_steps": maximum_steps,
+        },
         counter.device,
     )
 

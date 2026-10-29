@@ -246,8 +246,6 @@ def launch_extent(name: str, keys: tuple[str, ...], values: Mapping[str, Any]) -
 
 # The parameter a ``halo``/``publishes`` declaration adds (kind ``halo``).
 HALO_PARAMETER = "halo"
-# Fields a halo argument describes: reads and publications each.
-HALO_FIELDS = 8
 
 
 @dataclass(slots=True, eq=False)
@@ -255,15 +253,17 @@ class HaloArgument:
     """The value of a ``halo`` parameter: the int64 words of the by-value
     ``HfHalo`` struct of ``hydroforge/parallel/halo_access.cuh`` (prepared
     once per call site, so kernels compare against parameters instead of
-    loading tables), and the tensors its addresses point into. The halo
-    exchange takes its site the same way.
+    loading tables), the tensors its addresses point into, and the
+    declaration slots it reads from rings. The halo exchange takes its site
+    the same way.
 
     A recording binds it before its schedule knows every word, and fills it
     in when the recording ends (before anything compiles); arguments with
-    equal words are equal."""
+    equal words and ring-read masks are equal."""
 
     words: tuple[int, ...]
     keep: tuple[Any, ...] = ()
+    read_mask: int = 0
 
     @classmethod
     def quiet(cls) -> HaloArgument:
@@ -272,10 +272,14 @@ class HaloArgument:
         return cls(HALO_QUIET_WORDS)
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, HaloArgument) and self.words == other.words
+        return (
+            isinstance(other, HaloArgument)
+            and self.words == other.words
+            and self.read_mask == other.read_mask
+        )
 
     def __hash__(self) -> int:
-        return hash(self.words)
+        return hash((self.words, self.read_mask))
 
 
 def halo_work(value: HaloArgument) -> tuple[bool, bool, bool]:
@@ -297,17 +301,18 @@ def halo_read_mask(value: HaloArgument) -> int:
     """The declared read fields of a halo argument that may come from a
     ring (bit k: field k)."""
 
-    words = value.words
-    return sum(
-        1 << k for k in range(HALO_FIELDS) if words[HALO_HEADER_WORDS + 4 * k + 2]
-    )
+    return value.read_mask
 
 
-# HfHalo: 12 header words, then 4 per read and 4 per published field, each
-# opening with its interior band [lo, hi).
+# HfHalo: 12 header words, 4 per read and 4 per published field of the first
+# HALO_INLINE declaration slots, each opening with its interior band [lo, hi),
+# then the addresses of the further slots' descriptors (0: none).
 HALO_HEADER_WORDS = 12
+HALO_INLINE = 8
 HALO_INTERIOR = (0, 2**62)
-HALO_QUIET_WORDS = (0,) * HALO_HEADER_WORDS + (*HALO_INTERIOR, 0, 0) * (2 * HALO_FIELDS)
+HALO_QUIET_WORDS = (
+    (0,) * HALO_HEADER_WORDS + (*HALO_INTERIOR, 0, 0) * (2 * HALO_INLINE) + (0, 0)
+)
 
 
 def _size_keys(size: str | tuple[str, ...]) -> tuple[str, ...]:
@@ -430,8 +435,14 @@ class KernelSpec(HydroForgeModel):
 
     ``halo`` declares the buffers the kernel reads across the model's
     decomposed axis (slab rows or partition-key ghosts), each with the
-    farthest row it reads; ``publishes`` the buffers whose writes it
-    publishes to the peers holding their rows as ghosts. Either adds one
+    farthest row it reads (an integer, or the name of an integer scalar
+    parameter); ``publishes`` the buffers whose writes it
+    publishes to the peers holding their rows as ghosts: a tuple publishes
+    every ghost row, a mapping each buffer's rows within its depth (an
+    integer or an integer scalar's name, as ``halo``; ``None`` every row)
+    of the peers' owned rows; a reader farther than that receives the
+    publication, then has the field mirrored deeper (correct, slower).
+    Either adds one
     parameter, ``halo`` (kind ``halo``), after the declared ones; the
     framework binds it and schedules exchanges so a kernel finds current
     ghost rows (see :mod:`hydroforge.kernels.halo` and
@@ -459,10 +470,13 @@ class KernelSpec(HydroForgeModel):
         Literal["cuda", "triton", "metal"], Annotated[int, Field(ge=1, le=1024)]
     ] = Field(default_factory=dict)
     workspace: FrozenMapping[Identifier, KernelWorkspace] = Field(default_factory=dict)
-    halo: FrozenMapping[Identifier, Annotated[int, Field(ge=1)]] = Field(
+    halo: FrozenMapping[Identifier, Annotated[int, Field(ge=1)] | Identifier] = Field(
         default_factory=dict
     )
-    publishes: tuple[Identifier, ...] = ()
+    publishes: (
+        tuple[Identifier, ...]
+        | FrozenMapping[Identifier, Annotated[int, Field(ge=1)] | Identifier | None]
+    ) = ()
     contributes: tuple[Identifier, ...] = ()
     _precision_parameters: frozenset[str] = PrivateAttr(default_factory=frozenset)
     _derived: _Views | None = PrivateAttr(default=None)
@@ -477,6 +491,14 @@ class KernelSpec(HydroForgeModel):
     @property
     def parameter_names(self) -> tuple[str, ...]:
         return self._views.parameter_names
+
+    @property
+    def publish_depths(self) -> Mapping[str, int | str | None]:
+        """Every published buffer's depth (``None``: every ghost row)."""
+
+        if isinstance(self.publishes, Mapping):
+            return self.publishes
+        return dict.fromkeys(self.publishes)
 
     @property
     def size_keys(self) -> tuple[str, ...]:
@@ -546,22 +568,31 @@ class KernelSpec(HydroForgeModel):
     @model_validator(mode="after")
     def _validate_spec(self) -> Self:
         parameters = self.parameters
-        for name in self.halo:
+        for name, distance in self.halo.items():
             if name not in self.buffers:
                 raise ValueError(f"{self.name}: halo {name!r} must name a buffer")
-        if len(self.halo) > HALO_FIELDS:
-            raise ValueError(f"{self.name}: halo names up to {HALO_FIELDS} buffers")
-        if (
-            len(set(self.publishes)) != len(self.publishes)
-            or len(self.publishes) > HALO_FIELDS
-        ):
-            raise ValueError(
-                f"{self.name}: publishes names up to {HALO_FIELDS} unique buffers"
-            )
-        for name in self.publishes:
+            if isinstance(distance, str) and parameters.get(distance) not in (
+                "index",
+                "int32",
+                "int64",
+            ):
+                raise ValueError(
+                    f"{self.name}: halo distance {distance!r} must name an integer scalar"
+                )
+        if len(set(self.publishes)) != len(self.publishes):
+            raise ValueError(f"{self.name}: publishes names unique buffers")
+        for name, depth in self.publish_depths.items():
             if self.buffers.get(name) not in ("write", "read_write"):
                 raise ValueError(
                     f"{self.name}: published {name!r} must be a written buffer"
+                )
+            if isinstance(depth, str) and parameters.get(depth) not in (
+                "index",
+                "int32",
+                "int64",
+            ):
+                raise ValueError(
+                    f"{self.name}: publish depth {depth!r} must name an integer scalar"
                 )
         if len(set(self.contributes)) != len(self.contributes):
             raise ValueError(f"{self.name}: contributes names unique buffers")
@@ -573,9 +604,7 @@ class KernelSpec(HydroForgeModel):
                     "or read_write buffer"
                 )
             if name in self.publishes:
-                raise ValueError(
-                    f"{self.name}: {name!r} is contributed and published"
-                )
+                raise ValueError(f"{self.name}: {name!r} is contributed and published")
             if name in self.halo:
                 raise ValueError(
                     f"{self.name}: {name!r} is contributed and halo; ghost "
@@ -795,6 +824,11 @@ class KernelSpec(HydroForgeModel):
         self.validate_scalars(self.compile_time, values)
         self.launch_extent(values)
         self.validate_scalars(self.runtime_scalars, values)
+        for distance in (*self.halo.values(), *self.publish_depths.values()):
+            if isinstance(distance, str) and values[distance] < 1:
+                raise ValueError(
+                    f"{self.name}.{distance}: halo distance must be positive"
+                )
         for buffer, feature in self.optional.items():
             if feature is None:
                 continue

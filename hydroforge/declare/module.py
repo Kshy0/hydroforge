@@ -133,6 +133,7 @@ def TensorField(
     gt: float | None = None,
     le: float | None = None,
     lt: float | None = None,
+    halo: bool = False,
 ) -> Any:
     """
     Create a tensor field with shape information directly in AbstractModule.
@@ -187,6 +188,12 @@ def TensorField(
                  hold NaN. Invalid for other dtypes.
         ge, gt, le, lt: Inclusive/exclusive value bounds (at most one lower
                  and one upper). NaN violates a bound.
+        halo: ``True`` for a field halo exchanges carry: kernels read its
+                 ghost rows across ranks (``KernelSpec.halo``), publish it or
+                 contribute to it. It names the slab axis, or its leading
+                 axis holds the partition key's rows. Only such fields are
+                 exchanged and size the halo's message slots; other fields
+                 keep their ghost rows untouched.
 
     ``finite`` and the bounds are checked once, when the model materializes,
     for stored non-forcing fields.
@@ -231,6 +238,7 @@ def TensorField(
         required_by=required_by,
         units=units,
         finite=finite,
+        halo=halo,
         **{
             name: None if bound is None else float(bound)
             for name, bound in bounds.items()
@@ -505,9 +513,17 @@ def computed_tensor_field(
     contiguous: bool = True,
     materialize: TensorDependencies = None,
     after_init: bool = False,
+    halo: bool = False,
 ):
     """
     Create a computed tensor field with shape information for AbstractModule.
+
+    Decorate the getter itself; the field caches it (as
+    ``functools.cached_property``), so it runs once per module: stored
+    categories while the module is constructed (``after_init``: once the
+    state is initialized), a virtual on first use. A virtual's getter returns
+    an existing field or a stable view of one, never a value computed from
+    the current state; an expression virtual's outputs follow ``expr``.
 
     Args:
         description: Human-readable description of the variable
@@ -548,6 +564,7 @@ def computed_tensor_field(
             on first use, for buffers kernels write.
         after_init: For computed state, evaluate it from the state that
             ``initialize_model_state`` initialized instead of at construction.
+        halo: ``True`` for a field halo exchanges carry (as ``TensorField``).
     """
     if category not in _COMPUTED_CATEGORIES:
         raise ValueError(
@@ -568,52 +585,26 @@ def computed_tensor_field(
         contiguous=contiguous,
         materialize=materialize,
         after_init=after_init,
+        halo=halo,
     )
     declare = computed_field(description=description)
 
-    def decorate(prop: Any) -> Any:
-        setattr(_property_function(prop), _TENSOR_METADATA, metadata)
-        if isinstance(prop, property) and not isinstance(prop, _ActivatedProperty):
-            prop = _ActivatedProperty(prop.fget, prop.fset, prop.fdel, prop.__doc__)
+    def decorate(getter: Any) -> Any:
+        if isinstance(getter, property):
+            raise TypeError(
+                f"{getattr(getter.fget, '__qualname__', 'a computed tensor field')}: "
+                "computed_tensor_field caches its getter; decorate the function "
+                "itself, not a property"
+            )
+        # An explicit cached_property (the former spelling) is the same field.
+        if not isinstance(getter, cached_property):
+            getter = cached_property(getter)
+        setattr(getter.func, _TENSOR_METADATA, metadata)
         if metadata.after_init:
-            if not isinstance(prop, cached_property):
-                raise ValueError(
-                    "after_init tensors must wrap functools.cached_property"
-                )
-            prop = AfterInitProperty(prop.func)
-        return declare(prop)
+            getter = AfterInitProperty(getter.func)
+        return declare(getter)
 
     return decorate
-
-
-class _ActivatedProperty(property):
-    """A plain-property (virtual) tensor that reads ``None`` while inactive.
-
-    Cached properties get ``None`` stored when the module is specialized; a
-    plain property is recomputed on every access, so its reads are guarded.
-    The field is the attribute name the property is bound to.
-    """
-
-    def __init__(
-        self,
-        fget: Any = None,
-        fset: Any = None,
-        fdel: Any = None,
-        doc: str | None = None,
-    ) -> None:
-        super().__init__(fget, fset, fdel, doc)
-        self.field_name = getattr(fget, "__name__", None)
-
-    def __set_name__(self, owner: type, name: str) -> None:
-        self.field_name = name
-
-    def __get__(self, instance: Any, owner: type | None = None) -> Any:
-        if instance is None:
-            return self
-        binding = getattr(instance, "_binding", None)
-        if binding is not None and self.field_name not in binding.plan.active:
-            return None
-        return super().__get__(instance, owner)
 
 
 def _declared_attributes(owner: type) -> dict[str, Any]:
@@ -657,12 +648,6 @@ def _field_spec(
         ):
             raise ValueError(
                 f"{module_name}.{name}: physical tensor fields must be annotated as torch.Tensor or torch.Tensor | None"
-            )
-        if computed and not isinstance(info.wrapped_property, cached_property):
-            raise ValueError(
-                f"{module_name}.{name} is a stored computed tensor and must wrap "
-                "functools.cached_property; a plain property would reallocate "
-                "storage on every access and cannot be deactivated"
             )
         may_be_inactive = bool(
             tensor.depends_on

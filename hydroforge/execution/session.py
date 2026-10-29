@@ -175,38 +175,48 @@ class ModelRuntime:
         self.model_state_entered = False
 
     def halo_layout(self, tensor: torch.Tensor):
-        """Where a module tensor's decomposed axis is: a field whose shape names
-        the slab axis (cells or faces), or one aligned to the partition key
-        (its leading axis holds the key's owned and ghost rows)."""
+        """Where an exchanged field's decomposed axis is: a field declared
+        ``halo=True`` whose shape names the slab axis (cells or faces), or
+        whose leading axis holds the partition key's owned and ghost rows."""
 
         from hydroforge.parallel.halo import CELL, FACE, KEY, FieldLayout
 
         found = self._halo_layouts.get(id(tensor))
         if found is not None and found[0] is tensor:
             return found[1]
-        layout = None
-        for qualified, info in self.plan.fields.slab.items():
-            if info.kind == "interior":
-                continue
-            entry = self.plan.fields.entries[qualified]
-            module = self.modules.get(entry.module)
-            if module is not None and module.__dict__.get(entry.name) is tensor:
-                axis = len(entry.tensor.shape) - 1 - info.position
-                layout = FieldLayout(FACE if info.face else CELL, axis)
-                break
+        entry = next(
+            (
+                entry
+                for entry in self.plan.fields.entries.values()
+                if (module := self.modules.get(entry.module)) is not None
+                and module.__dict__.get(entry.name) is tensor
+            ),
+            None,
+        )
+        if entry is None or not entry.tensor.halo:
+            what = (
+                "a tensor that is no module field" if entry is None else entry.qualified
+            )
+            raise ValueError(
+                f"{what} is exchanged across ranks (a kernel's halo, publishes "
+                "or contributes); declare the field halo=True"
+            )
+        info = self.plan.fields.slab.get(entry.qualified)
         halo = self.halo
-        if (
-            layout is None
-            and halo is not None
+        if info is not None and info.kind != "interior":
+            axis = len(entry.tensor.shape) - 1 - info.position
+            layout = FieldLayout(FACE if info.face else CELL, axis)
+        elif (
+            halo is not None
             and KEY in halo.plan.kinds
             and tensor.dim() >= 1
             and tensor.shape[0] == halo.plan.extent(KEY)
         ):
             layout = FieldLayout(KEY, tensor.dim() - 1)
-        if layout is None:
+        else:
             raise ValueError(
-                "halo_exchange_ takes module tensors whose shape names the slab "
-                "axis, or whose leading axis holds the partition key's rows"
+                f"{entry.qualified} is declared halo=True but neither names the "
+                "slab axis nor holds the partition key's rows"
             )
         self._halo_layouts[id(tensor)] = (tensor, layout)
         return layout
@@ -233,7 +243,7 @@ class ModelRuntime:
     def _build_halo(self) -> None:
         """Create the halo of the partition's ghost rows and the slab's
         (collective over the spatial group), its message slots sized for the
-        largest declared or materialized fields."""
+        widest rows of the fields declared ``halo=True``."""
 
         from hydroforge.declare.tensors import ModuleTensors
         from hydroforge.kernels.halo import attach
@@ -254,25 +264,24 @@ class ModelRuntime:
         if rows is not None:
             layouts[KEY] = partition_layouts(*rows)
             extent = layouts[KEY][plan.spatial_rank].extent
-            widths = [
-                value.numel() // extent * value.element_size()
-                for module in self.modules.values()
-                for value in module.__dict__.values()
-                if isinstance(value, torch.Tensor)
-                and value.dim() >= 1
-                and value.shape[0] == extent
-            ]
-            # Declared fields too, computed ones not yet materialized
-            # included, at the widest element.
-            for module in self.modules.values():
-                tensors = ModuleTensors(module)
-                for name in module.spec().tensor_fields:
-                    try:
-                        shape = tensors._expected_shape(name)
-                    except ValueError:
-                        continue
-                    if shape and shape[0] == extent:
-                        widths.append(8 * int(np.prod(shape[1:], dtype=np.int64)))
+            # Rows of the fields declared halo=True, as materialized or
+            # declared (computed ones not yet materialized, at the widest
+            # element).
+            widths = []
+            for entry in plan.fields.entries.values():
+                module = self.modules.get(entry.module)
+                if not entry.tensor.halo or module is None:
+                    continue
+                value = module.__dict__.get(entry.name)
+                if isinstance(value, torch.Tensor) and value.dim() >= 1:
+                    if value.shape[0] == extent:
+                        widths.append(value.numel() // extent * value.element_size())
+                try:
+                    shape = ModuleTensors(module)._expected_shape(entry.name)
+                except ValueError:
+                    continue
+                if shape and shape[0] == extent:
+                    widths.append(8 * int(np.prod(shape[1:], dtype=np.int64)))
             row_bytes[KEY] = max(widths or [8])
         if slab is not None and slab.world > 1:
             positions = self.topology.positions()
@@ -292,7 +301,7 @@ class ModelRuntime:
             for qualified, info in plan.fields.slab.items():
                 entry = plan.fields.entries[qualified]
                 module = self.modules.get(entry.module)
-                if module is None or info.kind == "interior":
+                if module is None or info.kind == "interior" or not info.halo:
                     continue
                 shape = ModuleTensors(module)._expected_shape(entry.name)
                 if shape is None:

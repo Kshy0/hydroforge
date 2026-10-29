@@ -31,6 +31,8 @@ from hydroforge.execution.loops import (
 from hydroforge.execution.operators import launch_operators, rollback_tensors
 from hydroforge.kernels.backends.cuda_control import (
     StatisticsControls,
+    adaptive_accept,
+    adaptive_end,
     control_requests,
     fixed_end,
     set_conditional,
@@ -635,6 +637,32 @@ class _SegmentedFixed:
         self.executor.release_all(graphs, scope="fixed segment graphs")
 
 
+def _iterate(loop: Any) -> None:
+    """One adaptive iteration, its controls the compiled kernels of the
+    rules :meth:`AdaptiveLoop.iterate` implements with tensor operations."""
+
+    loop.candidate.copy_(loop.maximum_value)
+    loop.proposal.launch()
+    adaptive_accept(
+        candidate=loop.candidate,
+        duration=loop.duration,
+        elapsed=loop.elapsed,
+        step=loop.step,
+        dt=loop.time_step,
+        error=loop.error_flag,
+    )
+    loop.body.launch()
+    adaptive_end(
+        duration=loop.duration,
+        step=loop.step,
+        elapsed=loop.elapsed,
+        counter=loop.counter,
+        continue_flag=loop.continue_flag,
+        error=loop.error_flag,
+        maximum_steps=loop.maximum_steps,
+    )
+
+
 class _Adaptive:
     """One conditional WHILE launch per adaptive loop, then one status read."""
 
@@ -678,7 +706,7 @@ class _Adaptive:
         executor = self.executor
 
         def body(graph: Any, capturing: bool) -> None:
-            loop.iterate()
+            _iterate(loop)
             if launch is not None:
                 states = launch.states
                 executor.statistics_controls.adaptive(
@@ -736,7 +764,7 @@ class _HostAdaptive:
             # Warm-ups and capture start from a reset loop, as every run does.
             loop.reset()
             self.graph = self.executor.capture(
-                loop.iterate,
+                partial(_iterate, loop),
                 mutated_state=(
                     *loop.control_state,
                     *loop.proposal.rollback_tensors,

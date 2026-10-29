@@ -24,10 +24,12 @@ if TYPE_CHECKING:
 @dataclass(frozen=True, slots=True)
 class SlabField:
     """Where a field's slab axis sits: ``position`` in its logical shape and
-    its ``kind`` (cell rows, staggered faces or interior rows)."""
+    its ``kind`` (cell rows, staggered faces or interior rows); ``halo``:
+    whether halo exchanges carry it (``TensorField(halo=True)``)."""
 
     position: int
     kind: str
+    halo: bool = False
 
     @property
     def face(self) -> bool:
@@ -74,7 +76,7 @@ def compile_slab(
                 f"in more than one dimension of {tuple(entry.tensor.shape)!r}"
             )
         if hits:
-            found[entry.qualified] = SlabField(*hits[0])
+            found[entry.qualified] = SlabField(*hits[0], entry.tensor.halo)
     if not found:
         raise ValueError(
             f"slab axis {slab.dim!r} is named by no field of the opened modules"

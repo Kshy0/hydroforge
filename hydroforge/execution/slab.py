@@ -55,11 +55,16 @@ def build_slab(
             "a staggered axis holds one more entry than the cells"
         )
     (total,) = extents
+    depth = declared.halo
+    if isinstance(depth, str):
+        depth = getattr(plan.options, depth)
+        if type(depth) is not int or depth < 1:
+            raise ValueError("the slab halo option must resolve to a positive integer")
     return Slab.build(
         plan.spatial_rank,
         plan.spatial_world_size,
         total,
-        declared.halo,
+        depth,
         plan.slab_periodic,
         topology.positions()[plan.spatial_rank],
     )
