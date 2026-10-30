@@ -67,17 +67,21 @@ def _contributions(
     ABI names and views must not give one storage incompatible ghost states.
     """
 
-    fields: dict[int, tuple[str, torch.Tensor]] = {}
+    def storage(tensor: torch.Tensor) -> tuple[torch.device, int]:
+        # The storage itself, not its address: empty storages all sit at 0.
+        return tensor.device, tensor.untyped_storage()._cdata
+
+    fields: dict[tuple[torch.device, int], tuple[str, torch.Tensor]] = {}
     for name in spec.contributes:
         tensor = arguments.get(name)
         if isinstance(tensor, torch.Tensor):
-            fields.setdefault(tensor.untyped_storage().data_ptr(), (name, tensor))
+            fields.setdefault(storage(tensor), (name, tensor))
     if fields:
         for name in spec.halo:
             tensor = arguments.get(name)
             if not isinstance(tensor, torch.Tensor) or not tensor.numel():
                 continue
-            found = fields.get(tensor.untyped_storage().data_ptr())
+            found = fields.get(storage(tensor))
             if found is not None and found[1].numel():
                 raise ValueError(
                     f"{spec.name}: contributed {found[0]!r} aliases halo "

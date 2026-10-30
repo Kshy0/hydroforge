@@ -977,6 +977,10 @@ class OperatorRecording:
         if exc_type is None:
             try:
                 self.recorder.halo_schedule.finish()
+                schedule = getattr(self.parent, "halo_schedule", None)
+                if schedule is not None:
+                    # The parent goes on from the ghost rows it left.
+                    schedule.resume(self.recorder.halo_schedule)
             except BaseException as error:
                 failures.append(error)
         try:

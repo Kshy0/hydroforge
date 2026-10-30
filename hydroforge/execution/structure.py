@@ -351,12 +351,12 @@ def _stale_computed(
     ``(module, field, cached value)``. A tensor ``set_`` moves to new
     storage stays itself; views of its old storage do not follow it."""
 
+    def identity(tensor: torch.Tensor) -> tuple[torch.device, int]:
+        # The storage itself, not its address: empty storages all sit at 0.
+        return tensor.device, tensor.untyped_storage()._cdata
+
     replaced = {id(tensor) for tensor in swapped}
-    storages = {
-        tensor.untyped_storage().data_ptr()
-        for tensor in swapped
-        if tensor.untyped_storage().data_ptr()
-    }
+    storages = {identity(tensor) for tensor in swapped}
     found = []
     for module_name in runtime.plan.modules:
         module = runtime.modules[module_name]
@@ -365,7 +365,7 @@ def _stale_computed(
             if (
                 isinstance(value, torch.Tensor)
                 and id(value) not in replaced
-                and value.untyped_storage().data_ptr() in storages
+                and identity(value) in storages
             ):
                 found.append((module, field, value))
     return found

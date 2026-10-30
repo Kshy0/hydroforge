@@ -50,8 +50,12 @@ from typing import Any
 import torch
 
 
-def _storage(tensor: torch.Tensor) -> int:
-    return tensor.untyped_storage().data_ptr()
+Storage = tuple[torch.device, int]
+
+
+def _storage(tensor: torch.Tensor) -> Storage:
+    # The storage itself, not its address: empty storages all sit at 0.
+    return tensor.device, tensor.untyped_storage()._cdata
 
 
 @dataclass
@@ -96,16 +100,16 @@ class HaloSchedule:
             "fixed",
             "adaptive physics",
         )
-        self.clobbered: frozenset[int] = frozenset()
+        self.clobbered: frozenset[Storage] = frozenset()
         self.assumed: dict[int, torch.Tensor] = {}
         # The depth every reader of an assumed field needs at entry.
         self.assumed_depth: dict[int, int] = {}
         # Ghost rows of fields exchanged or contributed to here (by storage);
         # the storages kernels contribute to; in a loop body, those whose
         # ghost rows are assumed zero at entry.
-        self.ghosts: dict[int, _Ghosts] = {}
-        self.contributed: set[int] = set()
-        self.zeroed: dict[int, torch.Tensor] = {}
+        self.ghosts: dict[Storage, _Ghosts] = {}
+        self.contributed: set[Storage] = set()
+        self.zeroed: dict[Storage, torch.Tensor] = {}
 
     # ------------------------------------------------------------------ #
     @property
@@ -221,6 +225,29 @@ class HaloSchedule:
                 [g.tensor for g in self.ghosts.values() if g.state == "partial"]
             )
 
+    def resume(self, nested: HaloSchedule) -> None:
+        """A nested program (recorded after :meth:`settle`, run at least
+        once) returned: ghost rows it exchanged or contributed to are as it
+        left them; those of contributed fields it otherwise accessed are
+        unknown (its operators may write any row)."""
+
+        if self.halo is None:
+            return
+        self.contributed |= nested.contributed
+        for storage, ghosts in nested.ghosts.items():
+            self._ghost(ghosts.tensor, ghosts.state)
+            self.ghosts[storage].read = ghosts.read
+        for operator in nested.recorder.operators:
+            for tensor in (
+                *getattr(operator, "reads", ()),
+                *getattr(operator, "writes", ()),
+            ):
+                if not isinstance(tensor, torch.Tensor):
+                    continue
+                storage = _storage(tensor)
+                if storage in self.contributed and storage not in nested.ghosts:
+                    self._ghost(tensor, "copied")
+
     # ------------------------------------------------------------------ #
     # Contributions (KernelSpec.contributes)
     def _ghost(self, tensor: torch.Tensor, state: str) -> None:
@@ -234,12 +261,20 @@ class HaloSchedule:
 
     def _state(self, tensor: torch.Tensor) -> str:
         """``zero``, ``partial``, ``copied``, or ``entry`` (nothing here
-        touched its ghost rows yet)."""
+        touched its ghost rows yet). States are per storage: a view mirrored
+        or assumed current at entry gives its field's ghost rows copies."""
 
-        found = self.ghosts.get(_storage(tensor))
+        storage = _storage(tensor)
+        found = self.ghosts.get(storage)
         if found is not None:
             return found.state
-        if id(tensor) in self.assumed or id(tensor) in self.entries:
+        if any(
+            _storage(t) == storage
+            for t in (
+                *self.assumed.values(),
+                *(e.tensor for e in self.entries.values()),
+            )
+        ):
             return "copied"
         return "entry"
 
@@ -428,7 +463,7 @@ class HaloSchedule:
         )
 
 
-def written_storages(operators: Any) -> frozenset[int]:
+def written_storages(operators: Any) -> frozenset[Storage]:
     """The storages ``operators`` write."""
 
     return frozenset(
