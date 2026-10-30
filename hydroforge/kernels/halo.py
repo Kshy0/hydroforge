@@ -9,14 +9,15 @@
 :func:`attach` gives a :class:`~hydroforge.parallel.halo.HaloRuntime` its
 ``registry``: CUDA launches of ``halo.cu`` (peer stores, staging for NCCL
 and Gloo links) on the CUDA backend, torch operations elsewhere, both with
-the wire format the plan's message records describe.
+the wire format the plan's message records describe. The exchange is a
+program step of its own: model kernels never take part in it.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 import torch
 
@@ -31,30 +32,19 @@ from hydroforge.kernels.cuda import (
     struct,
 )
 from hydroforge.kernels.registry import BackendRegistry
-from hydroforge.kernels.spec import (
-    HALO_HEADER_WORDS,
-    HALO_INLINE,
-    HALO_INTERIOR,
-    HALO_QUIET_WORDS,
-    HaloArgument,
-    KernelSpec,
-    constant,
-)
+from hydroforge.kernels.spec import KernelSpec, constant
 from hydroforge.kernels.torch import TorchKernel
 from hydroforge.parallel.halo import (
     _ADD_TYPES,
     CHUNK,
     DEPTH,
-    KEY,
     KINDS,
     MAX_FIELDS,
-    PHASES,
     HaloRuntime,
     _aligned,
     _Message,
     _View,
     code_layout,
-    plain_site,
 )
 
 
@@ -62,336 +52,7 @@ def attach(runtime: HaloRuntime) -> HaloRuntime:
     """Give ``runtime`` its registered exchange kernel; returns it."""
 
     runtime.registry = _registry(runtime)
-    runtime.registry_factory = _registry
-    runtime.registries[MAX_FIELDS] = runtime.registry
-    runtime.plain_site = HaloArgument(plain_site(runtime.plan.world))
     return runtime
-
-
-# The device API of kernels declaring ``halo`` or ``publishes``
-# (``inline_includes``); its comment documents the protocol.
-ACCESS_HEADER = Path(hydroforge.parallel.__file__).resolve().parent / "halo_access.cuh"
-
-
-def publishable(runtime: HaloRuntime) -> str:
-    """Why kernels cannot publish or read rings, or ``""``: peer memory on
-    the CUDA backend and every pair of every rank on a peer link (alike on
-    every rank, so every rank records the same messages)."""
-
-    device = runtime.device
-    if runtime.backend != "cuda" or device.type != "cuda" or runtime.memory is None:
-        return "publication needs peer memory on the cuda backend"
-    if runtime.communicates:
-        return "some pair of ranks is reached over nccl or host links"
-    return ""
-
-
-class Published(NamedTuple):
-    """The message of one publication (or exchange): its fields and layouts
-    in message order."""
-
-    fields: tuple[torch.Tensor, ...]
-    layouts: tuple[Any, ...]
-
-
-def senders(runtime: HaloRuntime, published: Published) -> tuple[int, ...]:
-    """The peers whose message of ``published`` this rank receives."""
-
-    views = _field_views(published.fields, published.layouts)
-    receives = runtime.messages[("mirror", "receive")][1]
-    return tuple(m.peer for m in receives if m.nbytes(views))
-
-
-def consumes(layout: Any, distance: int, depth: int) -> bool:
-    """Whether a kernel reading a field ``distance`` rows away reads every
-    ghost row a message of it carries (so writes them all back): slab
-    fields read at the message's ``depth`` or farther (the slab's, or the
-    layout's when it carries fewer rows); partition key fields never (their
-    ghosts are the ends of whatever references the model holds, which one
-    kernel need not read)."""
-
-    if layout.kind == KEY or not depth:
-        return False
-    return distance >= (min(layout.depth, depth) if layout.depth else depth)
-
-
-def _interior(rows: Sequence[int]) -> tuple[int, int]:
-    """The longest run [a, b) of consecutive ``rows`` (sorted)."""
-
-    best, start = (0, 0), 0
-    for i, row in enumerate(rows):
-        if i == 0 or row != rows[i - 1] + 1:
-            start = row
-        if row + 1 - start > best[1] - best[0]:
-            best = (start, row + 1)
-    return best
-
-
-def _field_views(fields, layouts):
-    return [_View.of(t, layout) for t, layout in zip(fields, layouts, strict=True)]
-
-
-def _segments(messages, views):
-    """Each message's (byte offset, rows) of every field's segment."""
-
-    result = []
-    for message in messages:
-        offsets, rows, offset = [0] * len(views), [0] * len(views), 0
-        for f, view in enumerate(views):
-            count = message.count(view.kind, view.depth)
-            offsets[f], rows[f] = offset, count
-            offset += _aligned(view.elements(count) * view.size)
-        result.append((offsets, rows))
-    return result
-
-
-def _row_entries(messages, view) -> tuple[list[int], list[int]]:
-    """Row pointers over the stored rows of ``view`` and their (message,
-    position) entries in ``messages`` (the rows its depth carries)."""
-
-    entries: list[list[tuple[int, int]]] = [[] for _ in range(view.extent)]
-    for m, message in enumerate(messages):
-        rows = message.rows.get(view.kind, ())
-        for position, row in enumerate(rows[: message.count(view.kind, view.depth)]):
-            entries[int(row)].append((m, position))
-    rowptr = [0]
-    for found in entries:
-        rowptr.append(rowptr[-1] + len(found))
-    return rowptr, [value for found in entries for pair in found for value in pair]
-
-
-def _entry(offset: int, peer: int, outer: int) -> tuple[int, int]:
-    """A ring element descriptor (``HfRing``): the byte offset of its row's
-    element (outer 0, inner 0) in slot 0 from the window holding the ring,
-    then the peer (low half) and the elements per outer index (high half)."""
-
-    if not -(2**31) <= peer < 2**31 or not 0 <= outer < 2**31:
-        raise ValueError(f"halo descriptor out of range: peer={peer} outer={outer}")
-    return offset, (peer & 0xFFFFFFFF) | (outer << 32)
-
-
-def _outside(extent: int, band: tuple[int, int]) -> list[int]:
-    """The rows outside the interior band, in the order kernels index them
-    (``row < lo ? row : row - (hi - lo)``)."""
-
-    return [r for r in range(extent) if not band[0] <= r < band[1]]
-
-
-def access_argument(
-    runtime: HaloRuntime | None,
-    device: torch.device,
-    publish: Sequence[tuple[torch.Tensor, Any]] = (),
-    reads: Sequence[tuple[torch.Tensor, Any, Published | None, Mapping[int, int]]] = (),
-    commit: Sequence[tuple[int, int, int]] = (),
-    *,
-    checks: bool = True,
-    read_slots: tuple[int, ...] = (),
-    publish_slots: tuple[int, ...] = (),
-    declared: tuple[int, int] = (0, 0),
-) -> HaloArgument:
-    """The ``halo`` argument of one call (``HfHalo`` of halo_access.cuh),
-    prepared once per call site: the published fields (tensor, layout), the
-    read fields (tensor, layout, the message in the ring holding its ghost
-    rows (or ``None``: read them from the field) and, per peer, that
-    message's number past ``received``), the prologue's (peer, credits,
-    counted) entries, and whether publishing waits for slot credits
-    (``checks``: not in a loop body proven free of them).
-
-    Everything a thread needs on every element of the first
-    ``HALO_INLINE`` declaration slots sits in the struct (passed by value:
-    the interior band of each field); further slots' descriptors and the
-    tables, which describe only rows outside the bands with each row's ring
-    address precomputed, sit in one tensor. ``read_slots`` and
-    ``publish_slots`` are the declaration slots of ``reads`` and
-    ``publish`` (by default their positions), so a disabled optional field
-    keeps the later fields' slots; ``declared`` counts the kernel's declared
-    reads and publications, every one of which gets a descriptor (those not
-    in ``reads`` or ``publish``: no ring work). Arguments of equal content
-    are one object (kept by the runtime)."""
-
-    if runtime is None or not (
-        publish or commit or any(p is not None for _, _, p, _ in reads)
-    ):
-        return HaloArgument.quiet()  # every read from the field
-    key = (
-        tuple((id(t), layout) for t, layout in publish),
-        tuple(
-            (
-                id(t),
-                layout,
-                None if p is None else (tuple(map(id, p.fields)), p.layouts),
-                tuple(sorted(skip.items())),
-            )
-            for t, layout, p, skip in reads
-        ),
-        tuple(commit),
-        checks,
-        read_slots,
-        publish_slots,
-        declared,
-    )
-    prepared = runtime.__dict__.setdefault("access_arguments", {})
-    found = prepared.get(key)
-    if found is None:
-        found = prepared[key] = _access_argument(
-            runtime,
-            device,
-            publish,
-            reads,
-            commit,
-            checks,
-            read_slots,
-            publish_slots,
-            declared,
-        )
-    return found
-
-
-def _access_argument(
-    runtime, device, publish, reads, commit, checks, read_slots, publish_slots, declared
-) -> HaloArgument:
-    plan, capacity = runtime.plan, runtime.capacity
-    words = list(HALO_QUIET_WORDS)
-    read_slots = read_slots or tuple(range(len(reads)))
-    publish_slots = publish_slots or tuple(range(len(publish)))
-    # Descriptors of slots past the struct's inline ones head the table, one
-    # for every declared slot: a kernel may name any of them.
-    read_count = max(max(read_slots, default=-1) + 1, declared[0])
-    publish_count = max(max(publish_slots, default=-1) + 1, declared[1])
-    more_reads = max(read_count - HALO_INLINE, 0)
-    more_publishes = max(publish_count - HALO_INLINE, 0)
-    more = list((*HALO_INTERIOR, 0, 0) * (more_reads + more_publishes))
-    tables: list[int] = []
-    # (words or more, index, table offset): addresses to fill in.
-    pointers: list[tuple[list[int], int, int]] = []
-
-    def table(values: list[int]) -> int:
-        """Append ``values`` to the tables; a placeholder for their address."""
-
-        offset = len(tables)
-        tables.extend(values)
-        return offset
-
-    def descriptor(slot: int, published: bool) -> tuple[list[int], int]:
-        """Where the descriptor of declaration ``slot`` starts."""
-
-        if slot < HALO_INLINE:
-            return words, HALO_HEADER_WORDS + 4 * (HALO_INLINE * published + slot)
-        return more, 4 * (more_reads * published + slot - HALO_INLINE)
-
-    window = runtime.memory.addresses[plan.rank]
-    assert DEPTH & (DEPTH - 1) == 0, "ring depth must be a power of two"
-    words[:7] = [
-        runtime.peers.data_ptr(),
-        runtime.state.data_ptr(),
-        window,
-        capacity,
-        DEPTH - 1,  # slot mask (the depth is a power of two)
-        plan.world,
-        plan.rank,
-    ]
-    words[11] = int(checks)
-    keep: list[Any] = [runtime.peers, runtime.state]
-    if commit:
-        pointers.append(
-            (words, 8, table([len(commit), *(v for e in commit for v in e)]))
-        )
-    if publish:
-        tensors = [t for t, _ in publish]
-        layouts = [layout for _, layout in publish]
-        views = _field_views(tensors, layouts)
-        # Messages without rows of these fields are neither sent nor
-        # counted, as by the send kernel.
-        sends = [m for m in runtime.messages[("mirror", "send")][1] if m.nbytes(views)]
-        runtime._check_capacity(tensors, layouts, "mirror")
-        words[7] = sum(
-            v.elements(m.count(v.kind, v.depth)) for m in sends for v in views
-        )
-        pointers.append((words, 9, table([m.peer for m in sends])))
-        words[10] = len(sends)
-        segments = _segments(sends, views)
-        for f, view in enumerate(views):
-            rowptr, flat = _row_entries(sends, view)
-            band = _interior(
-                [r for r in range(view.extent) if rowptr[r + 1] == rowptr[r]]
-            )
-            outside = _outside(view.extent, band)
-            pointer_table, entries = [0], []
-            for row in outside:
-                for e in range(rowptr[row], rowptr[row + 1]):
-                    m, position = flat[2 * e], flat[2 * e + 1]
-                    message, (offsets, rows) = sends[m], segments[m]
-                    entries += _entry(
-                        runtime.ring
-                        + message.ring * DEPTH * capacity
-                        + offsets[f]
-                        + position * view.inner * view.size,
-                        message.peer,
-                        rows[f] * view.inner,
-                    )
-                pointer_table.append(len(entries) // 2)
-            target, at = descriptor(publish_slots[f], True)
-            target[at : at + 2] = band
-            pointers.append((target, at + 2, table(pointer_table)))
-            pointers.append((target, at + 3, table(entries)))
-    if reads:
-        receives = runtime.messages[("mirror", "receive")][1]
-        for k, (tensor, layout, published, skip) in enumerate(reads):
-            if published is None:
-                continue  # interior everywhere: read from the field
-            # The incoming message holds the publication's fields, alike on
-            # every rank, with the receive rows of each field's kind and
-            # depth (rows beyond it: read from the field).
-            group_views = _field_views(published.fields, published.layouts)
-            f = [id(t) for t in published.fields].index(id(tensor))
-            view = group_views[f]
-            incoming = [m for m in receives if m.nbytes(group_views)]
-            segments = _segments(incoming, group_views)
-            rowptr, flat = _row_entries(incoming, view)
-            band = _interior(
-                [r for r in range(view.extent) if rowptr[r + 1] == rowptr[r]]
-            )
-            ghosts: list[int] = []
-            for row in _outside(view.extent, band):
-                if rowptr[row] == rowptr[row + 1]:
-                    ghosts += _entry(0, -1, 0)  # not in the ring: the field
-                    continue
-                m, position = flat[2 * rowptr[row]], flat[2 * rowptr[row] + 1]
-                message, (offsets, rows) = incoming[m], segments[m]
-                ghosts += _entry(
-                    runtime.ring
-                    + message.ring * DEPTH * capacity
-                    + offsets[f]
-                    + position * view.inner * view.size,
-                    message.peer,
-                    rows[f] * view.inner,
-                )
-            target, at = descriptor(read_slots[k], False)
-            target[at : at + 2] = band
-            pointers.append((target, at + 2, table(ghosts)))
-            pointers.append(
-                (
-                    target,
-                    at + 3,
-                    table([int(skip.get(p, 0)) for p in range(plan.world)]),
-                )
-            )
-    tensor = torch.empty(
-        max(1, len(more) + len(tables)), dtype=torch.int64, device=device
-    )
-    address = tensor.data_ptr()
-    for target, at, offset in pointers:
-        target[at] = address + 8 * (len(more) + offset)
-    head = HALO_HEADER_WORDS + 8 * HALO_INLINE
-    words[head] = address if more_reads else 0
-    words[head + 1] = address + 32 * more_reads if more_publishes else 0
-    tensor.copy_(torch.tensor(more + tables or [0], dtype=torch.int64))
-    mask = sum(
-        1 << slot
-        for slot, (_, _, published, _) in zip(read_slots, reads, strict=True)
-        if published is not None
-    )
-    return HaloArgument(tuple(words), (*keep, tensor), mask)
 
 
 # --------------------------------------------------------------------------- #
@@ -412,8 +73,6 @@ _PARAMETERS = {
     "accumulate": constant("bool"),
     "has_clear": constant("bool"),
     "clear_layout": constant("int32"),
-    # The schedule's phase, counts and credits (parallel.halo.site_words).
-    "site": "halo",
 }
 # halo.cu and peer.cuh ship with hydroforge.parallel.
 _DIR = Path(hydroforge.parallel.__file__).resolve().parent
@@ -430,19 +89,13 @@ def _views(arguments: Mapping[str, Any]) -> tuple[list[_View], _View | None]:
     return views, clear
 
 
-def _fields_struct(
-    views: Sequence[_View], clear: _View | None, written: int, capacity: int
-):
-    """HaloFields of halo.cu compiled for ``capacity`` fields, by value."""
+def _fields_struct(views: Sequence[_View], clear: _View | None):
+    """HaloFields of halo.cu, by value."""
 
-    slots: list[_View | None] = [*views, *(None,) * (capacity - len(views)), clear]
+    slots: list[_View | None] = [*views, *(None,) * (MAX_FIELDS - len(views)), clear]
 
     def each(function):
         return [function(v) if v is not None else function(None) for v in slots]
-
-    def word(w: int) -> int:
-        value = written >> (64 * w) & (2**64 - 1)
-        return value - 2**64 if value >> 63 else value
 
     return struct(
         *each(lambda v: pointer(None if v is None else v.tensor)),
@@ -455,7 +108,6 @@ def _fields_struct(
         *each(lambda v: int32(0 if v is None else v.depth)),
         int32(len(views)),
         int32(int(clear is not None)),
-        *(int64(word(w)) for w in range(-(-len(slots) // 64))),
     )
 
 
@@ -536,18 +188,13 @@ def _nccl_step(runtime: HaloRuntime, sends, receives):
 
 
 def cuda_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]) -> list[Any]:
-    """The launches (and NCCL step) of one exchange on the CUDA backend; its
-    first launch runs the site's prologue (halo.cu)."""
+    """The launches (and NCCL step) of one exchange on the CUDA backend
+    (halo.cu)."""
 
     views, clear = _views(arguments)
     mode = "accumulate" if arguments["accumulate"] else "mirror"
     flag = "true" if arguments["accumulate"] else "false"
-    site = arguments["site"]
-    words = plain_site(runtime.plan.world) if site is None else site.words
-    phase_index, written, checks, *table = words
-    phase = PHASES[phase_index]
-    slots = max(MAX_FIELDS, arguments["nf"])
-    fields = _fields_struct(views, clear, written, slots)
+    fields = _fields_struct(views, clear)
     ring = struct(
         pointer(arguments["window"]),
         pointer(arguments["peers"]),
@@ -559,12 +206,10 @@ def cuda_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]) -> list[Any]:
         int64(runtime.capacity),
         int64(runtime.ring),
         int64(runtime.entries),
-        pointer(runtime.site_table(table)),
         int32(runtime.plan.world),
         int32(runtime.plan.rank),
         int32(DEPTH),
         int32(CHUNK),
-        int32(checks),
         int32(runtime.record),
         int32(runtime.plan.levels),
     )
@@ -582,38 +227,7 @@ def cuda_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]) -> list[Any]:
     def grid(messages, extra=None) -> int:
         return max([1, *(_blocks(m, views, extra) for m in messages)])
 
-    def begin() -> int32:
-        """1 for the exchange's first launch."""
-
-        return int32(int(not any(isinstance(s, CudaLaunch) for s in steps)))
-
     remote = staged("send") or staged("receive")
-    if phase != "both":
-        # Ring messages the schedule sends or receives apart (publishable).
-        if remote:
-            raise ValueError(f"a {phase} phase exchanges over peer links only")
-        if phase == "send" and sends:
-            # Messages a receiver finds pending (never added: no clearing).
-            steps.append(
-                CudaLaunch(
-                    "halo_send<false>",
-                    (grid(sends, clear), len(sends)),
-                    _THREADS,
-                    (fields, ring, int32(send_first), int32(1)),
-                )
-            )
-        elif phase == "receive" and receives:
-            steps.append(
-                CudaLaunch(
-                    "halo_receive<false>",
-                    (grid(receives), len(receives)),
-                    _THREADS,
-                    (fields, ring, int32(receive_first), int32(0), int32(1), int32(1)),
-                )
-            )
-        elif phase in ("book", "drain", "flush"):
-            steps.append(CudaLaunch(f"halo_{phase}", (1, 1), 32, (ring,)))
-        return steps
     if mode == "mirror" and not remote and sends and receives:
         steps.append(
             CudaLaunch(
@@ -636,17 +250,11 @@ def cuda_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]) -> list[Any]:
                 f"halo_send<{flag}>",
                 (grid(sends, clear), len(sends)),
                 _THREADS,
-                (fields, ring, int32(send_first), begin()),
+                (fields, ring, int32(send_first)),
             )
         )
     if remote:
-        steps.append(
-            _nccl_step(
-                runtime,
-                staged("send"),
-                staged("receive"),
-            )
-        )
+        steps.append(_nccl_step(runtime, staged("send"), staged("receive")))
     if not views:
         return steps  # zeroing the ghost rows of clear only: no receive
     if receives and mode == "mirror":
@@ -655,7 +263,7 @@ def cuda_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]) -> list[Any]:
                 "halo_receive<false>",
                 (grid(receives), len(receives)),
                 _THREADS,
-                (fields, ring, int32(receive_first), int32(0), int32(1), begin()),
+                (fields, ring, int32(receive_first), int32(0), int32(1)),
             )
         )
     elif receives:
@@ -674,14 +282,13 @@ def cuda_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]) -> list[Any]:
                             int32(receive_first + index),
                             int32(step),
                             int32(int(step == message.passes - 1)),
-                            begin(),
                         ),
                     )
                 )
     return steps
 
 
-def _registry(runtime: HaloRuntime, slots: int = MAX_FIELDS) -> BackendRegistry:
+def _registry(runtime: HaloRuntime) -> BackendRegistry:
     """The exchange of ``runtime`` as one registered kernel."""
 
     def cuda_launch(**arguments):
@@ -695,17 +302,13 @@ def _registry(runtime: HaloRuntime, slots: int = MAX_FIELDS) -> BackendRegistry:
         name="halo_exchange",
         size=("num_entries",),
         parameters={
-            **{f"f{i}": "read_write" for i in range(slots)},
-            **{f"layout{i}": constant("int32") for i in range(slots)},
+            **{f"f{i}": "read_write" for i in range(MAX_FIELDS)},
+            **{f"layout{i}": constant("int32") for i in range(MAX_FIELDS)},
             **_PARAMETERS,
         },
     )
     cuda = CudaKernel(
-        CudaSource(
-            path=_DIR / "halo.cu",
-            include_root=_DIR,
-            options=(f"-DHF_HALO_FIELDS={slots}",),
-        ),
+        CudaSource(path=_DIR / "halo.cu", include_root=_DIR),
         launch=_named(cuda_launch, spec, "BLOCK_SIZE"),
         communicates=runtime.communicates,
         capturable=runtime.capturable,
@@ -752,9 +355,6 @@ def _torch_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]):
 
     views, clear = _views(arguments)
     mode = "accumulate" if arguments["accumulate"] else "mirror"
-    site = arguments.get("site")
-    if site is not None and PHASES[site.words[0]] != "both":
-        raise ValueError("only peer links of the cuda backend exchange in phases")
     capacity = runtime.capacity
     index = runtime.index
     repeats = runtime.repeats
@@ -813,13 +413,4 @@ def _torch_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]):
     return (send, _nccl_step(runtime, staged_sends, staged_receives), receive)
 
 
-__all__ = [
-    "ACCESS_HEADER",
-    "Published",
-    "access_argument",
-    "attach",
-    "consumes",
-    "cuda_steps",
-    "publishable",
-    "senders",
-]
+__all__ = ["attach", "cuda_steps"]

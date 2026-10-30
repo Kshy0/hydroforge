@@ -18,28 +18,12 @@
 // Peers NCCL (or CUDA IPC) maps take stores straight into their receive
 // ring: every directed pair owns DEPTH slots, message n of the pair using
 // slot n % DEPTH. The sender stores, then counts an arrival in the
-// receiver's window; the receiver waits for it and reads; once the
-// receiver finished with it, it counts a credit in the sender's window;
-// the sender of message n first waits for the credit of message n - DEPTH.
-// So a message never overwrites one its receiver has not finished reading,
-// however far the sender runs ahead. Other peers go through NCCL
-// send/receive between the two kernels, from and into local staging slots.
-//
-// Kernels publish into the same rings and read from them
-// (halo_access.cuh), so a receiver may finish with a message long after it
-// arrived: each exchange gets a site table from the recorded schedule
-// (hydroforge.execution.halo_schedule). Per peer, ``skip`` places the
-// message it receives past ``received`` (messages before it still pending),
-// ``settle`` counts how many messages its receive finishes (``received``
-// advances: its own, those before it read since, or none while one before
-// it is still pending) and ``post`` credits as many. Its first launch also
-// runs the prologue of halo_access.cuh (counts and credits of messages
-// earlier launches finished with), before any wait of its own.
-//
-// In a loop body whose schedule proved every slot free when stored, sends
-// wait for no credit (``checks`` 0) and nothing returns any: halo_drain
-// first waits until every message sent before the loop is credited, and
-// halo_flush afterwards sets each peer's credits to what this rank counted.
+// receiver's window; the receiver waits for it, reads it into the ghost
+// rows and counts a credit in the sender's window; the sender of message n
+// first waits for the credit of message n - DEPTH. So a message never
+// overwrites one its receiver has not finished reading, however far the
+// sender runs ahead. Other peers go through NCCL send/receive between the
+// two kernels, from and into local staging slots.
 //
 // An accumulate message may list one owned row twice (a periodic slab over
 // two ranks): REPEATS marks it, and its receive runs once per pass, pass p
@@ -48,14 +32,10 @@
 
 #include "peer.cuh"
 
-#ifndef HF_HALO_FIELDS
-#define HF_HALO_FIELDS 8
-#endif
-
 namespace hf_halo {
 
-constexpr int SLOTS = HF_HALO_FIELDS + 1;  // exchanged fields and the clear field
-constexpr int WRITTEN_WORDS = (SLOTS + 63) / 64;
+constexpr int FIELDS = 8;  // hydroforge.parallel.halo.MAX_FIELDS
+constexpr int SLOTS = FIELDS + 1;  // exchanged fields and the clear field
 constexpr int KINDS = 3;
 constexpr int COUNTS = 4 + KINDS;  // a record's row count of each kind
 constexpr int WITHIN = 4 + 2 * KINDS;  // then its rows within each depth
@@ -65,7 +45,7 @@ constexpr int LINK = 15;  // the link code bits
 
 }  // namespace hf_halo
 
-// By value, sized by the field count this kernel was compiled for.
+// By value.
 struct HaloFields {
     char* data[hf_halo::SLOTS];
     int64_t outer[hf_halo::SLOTS];
@@ -77,7 +57,6 @@ struct HaloFields {
     int32_t depth[hf_halo::SLOTS];  // ghost rows within this depth (0: all)
     int32_t count;                 // exchanged fields
     int32_t clear;                 // the last slot is a field to zero
-    uint64_t written[hf_halo::WRITTEN_WORDS];  // receives: bit k writes field k
 };
 
 // Message record: peer, link (and REPEATS), ring slot (the sender's slot in
@@ -94,14 +73,10 @@ struct HaloRing {
     int64_t capacity;      // bytes of one message slot
     int64_t ring;          // byte offset of the ring in a window
     int64_t entries;       // entries of the row table (where passes start)
-    // The site table: skip[world], settle[world], post[world], then the
-    // prologue: n, n (peer, credits, counted).
-    const int64_t* site;
     int32_t world;
     int32_t rank;
     int32_t depth;
     int32_t chunk;         // elements one block moves
-    int32_t checks;        // sends wait for their slot's credit
     int32_t record;        // words of a message record
     int32_t levels;        // depths a record counts rows within
 };
@@ -227,10 +202,6 @@ __device__ __forceinline__ void move(const HaloFields& f, const Layout& s, const
             int k = 0;
             int64_t local = e;
             while (local >= s.count[k]) local -= s.count[k++];
-            if (!SEND && !(f.written[k >> 6] >> (k & 63) & 1)) {
-                live[u] = false;
-                continue;
-            }
             size[u] = f.size[k];
             type[u] = f.type[k];
             int32_t entry;
@@ -287,28 +258,14 @@ __device__ __forceinline__ void count(const int64_t* window, int64_t index,
     asm volatile("red.release.sys.global.add.u64 [%0], %1;" ::"l"(word), "l"(amount) : "memory");
 }
 
-// ``amount`` credits in a sender's window. A credit only says the slot's
-// reads are over; they returned their values before it is issued (earlier
-// launches, or this launch's blocks before their barrier and done count),
-// so no fence orders anything before it.
-__device__ __forceinline__ void credit(const int64_t* window, int64_t index, int64_t amount) {
+// A credit in a sender's window. It only says the slot's reads are over;
+// they returned their values before it is issued (this launch's blocks
+// before their barrier and done count), so no fence orders anything
+// before it.
+__device__ __forceinline__ void credit(const int64_t* window, int64_t index) {
     unsigned long long* word =
         reinterpret_cast<unsigned long long*>(const_cast<int64_t*>(window) + index);
-    asm volatile("red.relaxed.sys.global.add.u64 [%0], %1;" ::"l"(word), "l"(amount) : "memory");
-}
-
-// The prologue of an exchange's first launch (block 0, thread 0, before
-// any wait): counts and credits of messages earlier launches finished with.
-__device__ __forceinline__ void prologue(const HaloRing& r) {
-    if ((threadIdx.x | blockIdx.x | blockIdx.y) != 0) return;
-    const int64_t* list = r.site + 3 * r.world;
-    for (int64_t e = 0, n = list[0]; e < n; ++e) {
-        const int64_t peer = list[1 + 3 * e], credits = list[2 + 3 * e];
-        const int64_t counted = list[3 + 3 * e];
-        if (counted) r.state[r.world + peer] += counted;
-        if (credits)
-            credit(reinterpret_cast<const int64_t*>(r.peers[peer]), r.world + r.rank, credits);
-    }
+    asm volatile("red.relaxed.sys.global.add.u64 [%0], %1;" ::"l"(word), "l"(1ull) : "memory");
 }
 
 template <bool ACCUMULATE>
@@ -325,9 +282,8 @@ __device__ void send(const HaloFields& f, const HaloRing& r, int32_t m) {
     if (s.packed > 0) {
         if (direct) {
             // Message n - DEPTH left this slot once its credit arrived.
-            if (r.checks)
-                hf_peer_wait(reinterpret_cast<const int64_t*>(r.window) + r.world + peer,
-                             n - r.depth + 1);
+            hf_peer_wait(reinterpret_cast<const int64_t*>(r.window) + r.world + peer,
+                         n - r.depth + 1);
             out = reinterpret_cast<char*>(r.peers[peer]) + ring_slot(r, rec, n);
         } else {
             out = r.send_stage + int64_t(rec[3]) * r.capacity;
@@ -364,8 +320,7 @@ __device__ void receive(const HaloFields& f, const HaloRing& r, int32_t m, int32
     const bool direct = (rec[1] & LINK) == LINK_PEER;
     const int32_t* passes = ACCUMULATE && (rec[1] & REPEATS) ? r.rows + r.entries : nullptr;
     int64_t* received = r.state + r.world + peer;
-    // Messages of this peer still pending precede this one.
-    const int64_t n = *received + r.site[peer];
+    const int64_t n = *received;
     char* in;
     if (direct) {
         hf_peer_wait(reinterpret_cast<const int64_t*>(r.window) + peer, n + 1);
@@ -382,67 +337,31 @@ __device__ void receive(const HaloFields& f, const HaloRing& r, int32_t m, int32
     __syncthreads();
     if (threadIdx.x == 0 &&
         last_block(r.state + 3 * r.world + peer, (s.packed + r.chunk - 1) / r.chunk) && last) {
-        *received += r.site[r.world + peer];
-        // The credits in the sender's window: the slots are free again.
-        const int64_t credits = r.site[2 * r.world + peer];
-        if (direct && credits)
-            credit(reinterpret_cast<const int64_t*>(r.peers[peer]), r.world + r.rank, credits);
+        *received = n + 1;
+        // The credit in the sender's window: the slot is free again.
+        if (direct) credit(reinterpret_cast<const int64_t*>(r.peers[peer]), r.world + r.rank);
     }
 }
 
 }  // namespace hf_halo
 
-// Messages first .. first + gridDim.y of the record table; ``begin``: the
-// exchange's first launch (it runs the prologue).
+// Messages first .. first + gridDim.y of the record table.
 template <bool ACCUMULATE>
-__global__ void halo_send(HaloFields f, HaloRing r, int32_t first, int32_t begin) {
-    if (begin) hf_halo::prologue(r);
+__global__ void halo_send(HaloFields f, HaloRing r, int32_t first) {
     hf_halo::send<ACCUMULATE>(f, r, first + blockIdx.y);
 }
 
 // A message with repeated rows (accumulate) launches once per pass.
 template <bool ACCUMULATE>
 __global__ void halo_receive(HaloFields f, HaloRing r, int32_t first, int32_t pass,
-                             int32_t last, int32_t begin) {
-    if (begin) hf_halo::prologue(r);
+                             int32_t last) {
     hf_halo::receive<ACCUMULATE>(f, r, first + blockIdx.y, pass, last != 0);
-}
-
-// Only the prologue: messages finished with, counted and credited.
-__global__ void halo_book(HaloRing r) { hf_halo::prologue(r); }
-
-// Before a loop storing without credits: every message this rank sent so
-// far is credited (its receiver finished with it), so the loop reuses no
-// slot still unread.
-__global__ void halo_drain(HaloRing r) {
-    for (int32_t peer = threadIdx.x; peer < r.world; peer += blockDim.x) {
-        const int64_t sent = r.state[peer];
-        while (hf_peer_acquire(reinterpret_cast<const int64_t*>(r.window) + r.world + peer) <
-               sent) {
-        }
-    }
-}
-
-// After it: the prologue's counts, then each peer's credits set to every
-// message of it this rank counted (finished with). This rank alone writes
-// them, its earlier launches' credits are complete, and the slots' reads
-// returned before.
-__global__ void halo_flush(HaloRing r) {
-    if ((threadIdx.x | blockIdx.x | blockIdx.y) != 0) return;
-    hf_halo::prologue(r);
-    for (int32_t peer = 0; peer < r.world; ++peer) {
-        const int64_t received = r.state[r.world + peer];
-        if (peer == r.rank || received == 0) continue;
-        int64_t* word = reinterpret_cast<int64_t*>(r.peers[peer]) + r.world + r.rank;
-        asm volatile("st.relaxed.sys.global.u64 [%0], %1;" ::"l"(word), "l"(received) : "memory");
-    }
 }
 
 // A mirror whose messages all go to mapped peers: sends (lower blocks,
 // dispatched first) then receives, in one launch.
 __global__ void halo_mirror(HaloFields f, HaloRing r, int32_t sends, int32_t count,
                             int32_t receives) {
-    hf_halo::prologue(r);
     if (int32_t(blockIdx.y) < count)
         hf_halo::send<false>(f, r, sends + blockIdx.y);
     else

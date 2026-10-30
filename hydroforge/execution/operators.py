@@ -677,14 +677,12 @@ class _OperatorRecorder:
         if substep_fields:
             arguments = self._with_substep_fields(registry, substep_fields, arguments)
         schedule = self.halo_schedule
-        recorded = None
         # Contributions it reads are summed first, ghost rows it contributes
-        # to zeroed first (the schedule notes its contributions after it).
+        # to zeroed first (the schedule notes its contributions after it),
+        # and the mirrors its halo reads need are recorded before it.
         summed = schedule.prepare_sums(registry, spec, arguments)
-        declares = bool(spec.halo or spec.publishes)
-        if declares:
-            # Exchanges it needs are recorded first; it gets its halo buffers.
-            arguments, recorded = schedule.prepare_call(registry, spec, arguments)
+        if spec.halo:
+            schedule.prepare_reads(registry, spec, arguments)
         # Explicitly supplied tensors must already belong to model/runtime
         # state or be results produced earlier in this same operator program.
         # Automatically completed values are trusted because KernelBinder
@@ -721,16 +719,7 @@ class _OperatorRecorder:
                 and isinstance(bound.get(name), torch.Tensor)
             )
         )
-        # Rings of what an undeclared kernel accesses are received first; a
-        # declared one reads ghost rows of its halo fields only (the
-        # schedule saw it). Ghost rows it reads from rings it writes back.
-        fused = schedule.written_back if declares else ()
-        if not declares:
-            schedule.before_operator((*reads, *writes), kernel=True)
-        writes = tuple(dict.fromkeys((*writes, *fused)))
         self.operators.append(DeferredKernelCall(call, reads, writes, registry))
-        if recorded is not None:
-            recorded()
         if summed is not None:
             summed()
 
@@ -966,7 +955,7 @@ class OperatorRecording:
         self.parent = recording_sink()
         schedule = getattr(self.parent, "halo_schedule", None)
         if schedule is not None:
-            # A nested program finds every message received and counted.
+            # A nested program finds every contribution summed.
             schedule.settle()
         scope = routing(self.recorder)
         scope.__enter__()
@@ -987,7 +976,6 @@ class OperatorRecording:
         failures: list[BaseException] = []
         if exc_type is None:
             try:
-                # Nothing after the program reads its rings: received here.
                 self.recorder.halo_schedule.finish()
             except BaseException as error:
                 failures.append(error)

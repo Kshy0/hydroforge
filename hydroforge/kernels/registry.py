@@ -309,9 +309,8 @@ class KernelDeclaration(HydroForgeModel, ABC):
                     *spec.compile_time.items(),
                     *spec.runtime_scalars.items(),
                 )
-                # precision resolves later; a halo argument is no number
-                # (CUDA passes it by value, Torch hands it over, others omit it).
-                if kind not in ("precision", "halo")
+                # precision resolves later.
+                if kind != "precision"
             },
         )
         return self._build(spec, backend)

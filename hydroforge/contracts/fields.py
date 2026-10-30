@@ -363,7 +363,7 @@ class TensorMetadata:
     materialize: _Conditions = ()
     after_init: bool = False
     # Halo exchanges carry the field (kernels read its ghost rows across
-    # ranks, publish it or contribute to it); no other field is exchanged,
+    # ranks or contribute to it); no other field is exchanged,
     # nor sizes the halo's message slots.
     halo: bool = False
 

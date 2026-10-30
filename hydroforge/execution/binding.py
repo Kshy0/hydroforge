@@ -73,15 +73,14 @@ def _contributions(
         if isinstance(tensor, torch.Tensor):
             fields.setdefault(tensor.untyped_storage().data_ptr(), (name, tensor))
     if fields:
-        for name in (*spec.halo, *spec.publishes):
+        for name in spec.halo:
             tensor = arguments.get(name)
             if not isinstance(tensor, torch.Tensor) or not tensor.numel():
                 continue
             found = fields.get(tensor.untyped_storage().data_ptr())
             if found is not None and found[1].numel():
-                declaration = "halo" if name in spec.halo else "published"
                 raise ValueError(
-                    f"{spec.name}: contributed {found[0]!r} aliases {declaration} "
+                    f"{spec.name}: contributed {found[0]!r} aliases halo "
                     f"{name!r}; ghost rows cannot hold contributions and owner "
                     "copies together"
                 )
@@ -121,29 +120,25 @@ class KernelBinder:
     def call(self, registry: BackendRegistry, supplied: dict[str, Any]) -> None:
         """Launch one call of a managed step outside any recording.
 
-        A kernel declaring ``halo`` gets its fields mirrored first, and one
-        declaring ``halo``/``publishes`` an argument describing no ring work:
-        outside a recording nothing tracks which ghost rows are current.
-        One declaring ``contributes`` finds those fields' ghost rows zeroed,
-        and its contributions are summed into their owners after it.
+        A kernel declaring ``halo`` gets its fields mirrored first: outside
+        a recording nothing tracks which ghost rows are current. One
+        declaring ``contributes`` finds those fields' ghost rows zeroed, and
+        its contributions are summed into their owners after it.
         """
+
+        from hydroforge.parallel.halo import MAX_FIELDS
 
         spec = registry.spec_for(self.runtime.plan.backend)
         halo = self.runtime.halo if spec.contributes else None
         if halo is not None:
-            from hydroforge.kernels.spec import HALO_PARAMETER
-
-            values = dict(supplied)
-            if spec.halo or spec.publishes:
-                values.setdefault(HALO_PARAMETER, self.runtime.halo_quiet)
-            bound, _ = self.arguments(registry, values)
+            bound, _ = self.arguments(registry, supplied)
             sums = _contributions(spec, bound)
             for tensor in sums:
                 layout = self.runtime.halo_layout(tensor)
                 halo.exchange((), [], "accumulate", tensor, layout)
             self._launch(registry, spec, supplied)
-            for start in range(0, len(sums), 8):
-                chunk = sums[start : start + 8]
+            for start in range(0, len(sums), MAX_FIELDS):
+                chunk = sums[start : start + MAX_FIELDS]
                 halo.exchange(
                     chunk, [self.runtime.halo_layout(t) for t in chunk], "accumulate"
                 )
@@ -153,33 +148,28 @@ class KernelBinder:
     def _launch(
         self, registry: BackendRegistry, spec: Any, supplied: dict[str, Any]
     ) -> None:
-        if spec.halo or spec.publishes:
-            from hydroforge.kernels.spec import HALO_PARAMETER
+        halo = self.runtime.halo
+        if spec.halo and halo is not None:
+            from dataclasses import replace
 
-            supplied = {HALO_PARAMETER: self.runtime.halo_quiet, **supplied}
-            halo = self.runtime.halo
-            if spec.halo and halo is not None:
-                from dataclasses import replace
+            from hydroforge.parallel.halo import MAX_FIELDS, read_depth
 
-                from hydroforge.parallel.halo import read_depth
-
-                bound, _ = self.arguments(registry, supplied)
-                fields, layouts = [], []
-                # Each field within its read distance.
-                for name, distance in spec.halo.items():
-                    tensor = bound[name]
-                    if tensor is None:
-                        continue
-                    if isinstance(distance, str):
-                        distance = bound[distance]
-                    layout = self.runtime.halo_layout(tensor)
-                    limit = self.runtime.halo_depth(layout)
-                    fields.append(tensor)
-                    layouts.append(replace(layout, depth=read_depth(distance, limit)))
-                for start in range(0, len(fields), 8):
-                    halo.exchange(
-                        fields[start : start + 8], layouts[start : start + 8], "mirror"
-                    )
+            bound, _ = self.arguments(registry, supplied)
+            fields, layouts = [], []
+            # Each field within its read distance.
+            for name, distance in spec.halo.items():
+                tensor = bound[name]
+                if tensor is None:
+                    continue
+                if isinstance(distance, str):
+                    distance = bound[distance]
+                layout = self.runtime.halo_layout(tensor)
+                limit = self.runtime.halo_depth(layout)
+                fields.append(tensor)
+                layouts.append(replace(layout, depth=read_depth(distance, limit)))
+            for start in range(0, len(fields), MAX_FIELDS):
+                stop = start + MAX_FIELDS
+                halo.exchange(fields[start:stop], layouts[start:stop], "mirror")
         if not supplied:
             cached = self._launch_cache.get(id(registry))
             if cached is not None:

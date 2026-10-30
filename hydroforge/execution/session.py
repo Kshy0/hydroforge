@@ -47,7 +47,6 @@ from hydroforge.execution.structure import (
 )
 from hydroforge.io.construction_input import check_options_fingerprint
 from hydroforge.io.manifest import write_model_manifest
-from hydroforge.kernels.spec import HaloArgument
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -168,8 +167,6 @@ class ModelRuntime:
         self.slab = None
         self.topology = None
         self._halo_layouts: dict[int, tuple[Any, Any]] = {}
-        # The halo argument of calls with no halo work.
-        self.halo_quiet: HaloArgument | None = None
         self.fixed_parameters: Mapping[str, frozenset[str]] = MappingProxyType({})
         self.missing_inputs: frozenset[str] = frozenset()
         self.progress = None
@@ -199,8 +196,8 @@ class ModelRuntime:
                 "a tensor that is no module field" if entry is None else entry.qualified
             )
             raise ValueError(
-                f"{what} is exchanged across ranks (a kernel's halo, publishes "
-                "or contributes); declare the field halo=True"
+                f"{what} is exchanged across ranks (a kernel's halo or "
+                "contributes); declare the field halo=True"
             )
         info = self.plan.fields.slab.get(entry.qualified)
         halo = self.halo
@@ -503,8 +500,6 @@ class ModelRuntime:
             else Topology.single(plan.spatial_world_size)
         )
         self.partition = PartitionRuntime(plan, self.input, self.topology)
-        # The halo argument of calls with no halo work.
-        self.halo_quiet = HaloArgument.quiet()
         from hydroforge.execution.slab import build_slab
 
         self.slab = build_slab(plan, self.input, self.topology)

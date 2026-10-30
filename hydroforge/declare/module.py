@@ -189,8 +189,8 @@ def TensorField(
         ge, gt, le, lt: Inclusive/exclusive value bounds (at most one lower
                  and one upper). NaN violates a bound.
         halo: ``True`` for a field halo exchanges carry: kernels read its
-                 ghost rows across ranks (``KernelSpec.halo``), publish it or
-                 contribute to it. It names the slab axis, or its leading
+                 ghost rows across ranks (``KernelSpec.halo``) or contribute
+                 to it. It names the slab axis, or its leading
                  axis holds the partition key's rows. Only such fields are
                  exchanged and size the halo's message slots; other fields
                  keep their ghost rows untouched.

@@ -36,7 +36,7 @@ from hydroforge.execution.context import (
     specialization_key,
     validate_callback,
 )
-from hydroforge.execution.halo_schedule import neighbourhood, written_storages
+from hydroforge.execution.halo_schedule import written_storages
 from hydroforge.execution.loops import AdaptiveLoop, FixedLoop, PredicateLoop
 from hydroforge.execution.operators import record_operator_scope
 from hydroforge.kernels.calls import recording_sink
@@ -329,18 +329,9 @@ def _execute(context: Any, program: Any, *arguments: int | float) -> int:
     """Run one fixed or adaptive program and close its scope."""
 
     context.channel.event(StepEvent.SUBSTEP)
-    # Ghost rows the loop body assumes current, and messages it finds
-    # pending, at its entry; those still pending are received after it.
-    execution = context.execution
-    halo = program.halo_entry
-    halo.enter(execution)
-    executor = execution.executor
-    executor.halo_refresh = (lambda: halo.refresh(execution)) if halo.carries else None
-    try:
-        completed = program.execute(*arguments, context)
-    finally:
-        executor.halo_refresh = None
-    halo.leave(execution)
+    # Ghost rows the loop body assumes current at its entry.
+    program.halo_entry.enter(context.execution)
+    completed = program.execute(*arguments, context)
     context.completed_substeps = completed
     context.scopes.pop()
     return completed
@@ -390,9 +381,6 @@ class _FixedScope(InvocationScope):
             scope_kind="fixed",
             frame=loop.frame,
         ) as recording:
-            # A final tail is its own program: the body leaves no message
-            # pending for it.
-            recording.recorder.halo_schedule.carried = self.final is None
             yield loop.frame
             context.require_scopes_closed(depth)
         owned = [recording.program]
@@ -496,11 +484,10 @@ class _AdaptiveScope(InvocationScope):
         with proposal:
             self.proposal()
         # The proposal runs between physics iterations: what it writes is
-        # not current at the physics body's entry, and what it accesses no
-        # message may still carry.
-        schedule = physics.recorder.halo_schedule
-        schedule.clobbered = written_storages(proposal.recorder.operators)
-        schedule.outside = neighbourhood(proposal.recorder.operators, schedule.halo)
+        # not current at the physics body's entry.
+        physics.recorder.halo_schedule.clobbered = written_storages(
+            proposal.recorder.operators
+        )
         try:
             with physics:
                 yield loop.frame

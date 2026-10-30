@@ -181,7 +181,6 @@ class CudaGraphExecutor(LoopExecutor):
                         body()
                 current.wait_stream(side)
                 self._restore(state, snapshot)
-                self._refresh_halo()
             except BaseException as primary:
                 self._abort_capture(
                     primary,
@@ -262,7 +261,6 @@ class CudaGraphExecutor(LoopExecutor):
                 graph.instantiate()
             current.wait_stream(side)
             self._restore(state, snapshot)
-            self._refresh_halo()
         except BaseException as primary:
             self._abort_capture(
                 primary,
@@ -277,13 +275,6 @@ class CudaGraphExecutor(LoopExecutor):
             finalizer=partial(self._destroy_pooled, graph, device_index, pool, True),
         )
         return graph
-
-    def _refresh_halo(self) -> None:
-        """Warm-ups ran a loop body whose rings carry over: send them
-        again from the restored state (``halo_refresh``)."""
-
-        if self.halo_refresh is not None and self.warmup_iterations:
-            self.halo_refresh()
 
     @staticmethod
     def _destroy_pooled(

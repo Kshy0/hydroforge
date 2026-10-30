@@ -17,14 +17,15 @@ and both give every rank read-only *ghost* rows of rows other ranks own:
   contiguous row blocks with ``halo`` ghost rows on each side
   (kinds ``cell`` and ``face`` for its staggered axis).
 
-:meth:`HaloRuntime.exchange` exchanges fields of any of these kinds in
-one call, recorded by the schedule for kernels declaring ``halo``,
-``publishes`` or ``contributes`` on fields declared ``halo=True``
+:meth:`HaloRuntime.exchange` exchanges up to :data:`MAX_FIELDS` fields of
+any of these kinds in one call, recorded by the schedule for kernels
+declaring ``halo`` or ``contributes`` on fields declared ``halo=True``
 (:mod:`hydroforge.execution.halo_schedule`): ``"mirror"`` gives ghost rows
 their owners' values, ``"accumulate"`` adds what ghost rows hold to their
 owners (zeroing the ghosts, and those of ``clear``). Each element travels in
 its own bits, so integers and floats arrive exactly. It is a registered
-kernel, recorded and CUDA-graph capturable.
+kernel of its own (model kernels never communicate), recorded and
+CUDA-graph capturable.
 
 A slab mirror may carry fewer rows than the slab's ghost rows: a field's
 layout ``depth`` sends only the ghost rows within that many rows of the
@@ -53,17 +54,9 @@ forces one link for every pair; ``HYDROFORGE_PEER_MEMORY`` (``auto``,
 
 Peers write into a ring of :data:`DEPTH` message slots per directed pair:
 the sender stores message ``n`` into slot ``n % DEPTH`` only after the
-receiver credited message ``n - DEPTH`` (finished with it), so no message
-overwrites one still unread, however far a rank runs ahead (``halo.cu``).
-A loop body whose own waits already order every reuse after the read
-(the schedule proves it per pair) skips the credits.
-Kernels publish into the rings and read from them
-(:mod:`hydroforge.kernels.halo`), so a receiver may finish with a message
-long after it arrived: when it counts and credits each one, and which
-message every read wants, the recorded schedule decides
-(:mod:`hydroforge.execution.halo_schedule`); each exchange then carries a
-*site* argument, :data:`PLAIN_SITE` (receive the next message, count and
-credit it) outside recordings.
+receiver credited message ``n - DEPTH`` (read it into its ghost rows), so
+no message overwrites one still unread, however far a rank runs ahead
+(``halo.cu``).
 A periodic slab over two ranks can hold two ghosts of one owned row on the
 same peer, so the accumulate message from that peer lists the row twice:
 its owner then adds the message in passes (the first entry of every row,
@@ -85,8 +78,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
-# Preferred batch width for independent mirrors and contributions. Logical
-# kernel declarations and publication messages have no field-count limit.
+# Fields one exchange carries (halo.cu): wider batches are split.
 MAX_FIELDS = 8
 # Ring slots of a directed pair (a power of two): a sender may run this many
 # messages ahead of the receiver's credits.
@@ -97,13 +89,6 @@ KEY, CELL, FACE = KINDS
 LINKS = ("peer", "nccl", "host")
 _LINK_CODE = {name: code for code, name in enumerate(LINKS)}
 _REPEATS = 32  # halo.cu: an accumulate receive adds into some row twice
-# Phases of one exchange launch (halo.cu): sends and receives, sends only
-# (a message the schedule receives later), receives only (a receipt),
-# neither (only the prologue's counts and credits); and around a loop whose
-# body stores without credits (hydroforge.execution.halo_schedule), a wait
-# for every credit of what was sent before it, and the prologue's counts
-# then every credit set to what was counted.
-PHASES = ("both", "send", "receive", "book", "drain", "flush")
 # A message record (halo.cu): peer, link, ring slot, staging slot, the row
 # table offset and row count of every kind, then (HaloPlan.levels per kind)
 # its rows within each depth.
@@ -113,7 +98,7 @@ _HEADER_ALIGN = 256
 _ADD_TYPES = {torch.float32: 1, torch.float64: 2, torch.int32: 3, torch.int64: 4}
 
 
-# HYDROFORGE_HALO_DEPTH=full mirrors and publishes every ghost row.
+# HYDROFORGE_HALO_DEPTH=full mirrors every ghost row.
 _FULL_DEPTH = os.environ.get("HYDROFORGE_HALO_DEPTH", "declared") == "full"
 
 
@@ -613,41 +598,6 @@ def window_layout(plan: HaloPlan, capacity: int) -> tuple[int, int]:
     return ring, ring + slots * DEPTH * capacity
 
 
-def site_words(
-    world: int,
-    phase: str = "both",
-    written: int = -1,
-    skip: Mapping[int, int] | None = None,
-    settle: Mapping[int, int] | None = None,
-    post: Mapping[int, int] | None = None,
-    prologue: Sequence[tuple[int, int, int]] = (),
-    *,
-    checks: bool = True,
-) -> tuple[int, ...]:
-    """The words of an exchange's site argument: its phase (``PHASES``),
-    the mask of fields its receives write, whether its sends wait for slot
-    credits (``checks``: not in a loop body proven free of them), then its
-    site table (halo.cu): per peer the message's place past ``received``
-    (``skip``), the messages its receive counts (``settle``) and credits
-    (``post``), then the prologue's (peer, credits, counted) entries."""
-
-    table = []
-    for values in (skip, settle, post):
-        table += [int((values or {}).get(p, 0)) for p in range(world)]
-    table.append(len(prologue))
-    for entry in prologue:
-        table.extend(int(value) for value in entry)
-    return (PHASES.index(phase), int(written), int(checks), *table)
-
-
-def plain_site(world: int) -> tuple[int, ...]:
-    """The site words of an exchange outside recordings: every field
-    written, the next message received, counted and credited."""
-
-    every = dict.fromkeys(range(world), 1)
-    return site_words(world, settle=every, post=every)
-
-
 # --------------------------------------------------------------------------- #
 # Runtime
 # --------------------------------------------------------------------------- #
@@ -658,8 +608,7 @@ class HaloRuntime:
     bytes of one row of any field of that kind (every element of the field
     at one index of its decomposed axis). A message slot holds
     :data:`MAX_FIELDS` such fields with every ghost row (``capacity``), the
-    widest exchange the framework batches; a publication must fit too
-    (:meth:`fits`): mirrors that carry fewer rows leave room for more fields.
+    widest exchange.
     """
 
     def __init__(
@@ -680,19 +629,6 @@ class HaloRuntime:
         self.group = group
         self.details: dict[str, Any] = {}
         self.skipped: dict[str, str] = {}
-        # Recorded publications, ghost reads from rings and ring receipts
-        # (hydroforge.execution.halo_schedule).
-        self.publications = 0
-        self.fused_reads = 0
-        self.receipts = 0
-        self.credit_free = 0  # loop bodies proven to need no slot credits
-        # Mirrors deepening fields current to fewer rows than a reader's
-        # distance, reads farther than a publication's depth (received,
-        # then mirrored deeper), and published fields left out of their
-        # publication for its slot (mirrored when read).
-        self.mirrors_deepened = 0
-        self.shallow_reads = 0
-        self.unpublished = 0
         rank, world = plan.rank, plan.world
         if dist.get_world_size(group) != world or dist.get_rank(group) != rank:
             raise ValueError(
@@ -771,8 +707,6 @@ class HaloRuntime:
         # The registered exchange kernel (hydroforge.kernels.halo.attach),
         # attached by the layer that owns kernels.
         self.registry: Any = None
-        self.registry_factory: Any = None
-        self.registries: dict[int, Any] = {}
 
     # ------------------------------------------------------------------ #
     def _build_tables(self) -> None:
@@ -883,12 +817,6 @@ class HaloRuntime:
         world = plan.world
         # sent, received, sends done and receives done of every peer.
         self.state = torch.zeros(4 * world, dtype=torch.int64, device=device)
-        # Site tables by content (site_table), kept so recorded calls keep
-        # their addresses.
-        self.sites: dict[tuple[int, ...], torch.Tensor] = {}
-        # The site argument of exchanges outside recordings (a HaloArgument
-        # of plain_site's words, from hydroforge.kernels.halo.attach).
-        self.plain_site: Any = None
         self.send_stage = torch.zeros(
             max(1, stages["send"] * self.capacity), dtype=torch.uint8, device=device
         )
@@ -930,14 +858,6 @@ class HaloRuntime:
             self.records,
             *self.index.values(),
             *(t for passes in self.repeats.values() for pair in passes for t in pair),
-            # Site tables of exchanges and per-call access tables (kernels.halo).
-            *self.sites.values(),
-            *(
-                tensor
-                for argument in getattr(self, "access_arguments", {}).values()
-                for tensor in argument.keep
-                if isinstance(tensor, torch.Tensor)
-            ),
         )
 
     def summary(self) -> dict[str, Any]:
@@ -965,13 +885,6 @@ class HaloRuntime:
             "skipped": dict(self.skipped),
             **self.details,
             "message_bytes": self.capacity,
-            "publications": self.publications,
-            "fused_reads": self.fused_reads,
-            "receipts": self.receipts,
-            "credit_free": self.credit_free,
-            "mirrors_deepened": self.mirrors_deepened,
-            "shallow_reads": self.shallow_reads,
-            "unpublished": self.unpublished,
             "sends": sends,
             "receives": receives,
         }
@@ -980,26 +893,9 @@ class HaloRuntime:
         if self.memory is not None:
             self.memory.close()
             self.memory = None
-        self.registries.clear()
         self.registry = None
-        self.registry_factory = None
-        self.__dict__.pop("access_arguments", None)
 
     # ------------------------------------------------------------------ #
-    def site_table(self, words: Sequence[int]) -> torch.Tensor:
-        """The device copy of a site table (halo.cu), one per content."""
-
-        key = tuple(int(w) for w in words)
-        table = self.sites.get(key)
-        if table is None:
-            from torch.utils._python_dispatch import _disable_current_modes
-
-            with _disable_current_modes():
-                table = self.sites[key] = torch.tensor(
-                    key, dtype=torch.int64, device=self.device
-                )
-        return table
-
     def exchange(
         self,
         fields: Sequence[torch.Tensor],
@@ -1007,25 +903,12 @@ class HaloRuntime:
         mode: Literal["mirror", "accumulate"],
         clear: torch.Tensor | None = None,
         clear_layout: FieldLayout | None = None,
-        *,
-        site: Any = None,
     ) -> None:
-        """Exchange ``fields``. ``site`` (a ``HaloArgument`` whose words
-        :func:`site_words` lays out) comes from the recorded schedule; the
-        default receives, counts and credits the next message."""
-        arguments = self.exchange_arguments(
-            fields, layouts, mode, clear, clear_layout, site=site
-        )
+        """Exchange ``fields``."""
+
+        arguments = self.exchange_arguments(fields, layouts, mode, clear, clear_layout)
         if arguments is not None:
-            self.registry_for(len(fields))(**arguments)
-
-    def registry_for(self, count: int):
-        """Exchange ABI sized for this message's field count."""
-
-        slots = max(MAX_FIELDS, count)
-        if slots not in self.registries:
-            self.registries[slots] = self.registry_factory(self, slots)
-        return self.registries[slots]
+            self.registry(**arguments)
 
     def exchange_arguments(
         self,
@@ -1034,8 +917,6 @@ class HaloRuntime:
         mode: Literal["mirror", "accumulate"],
         clear: torch.Tensor | None = None,
         clear_layout: FieldLayout | None = None,
-        *,
-        site: Any = None,
     ) -> dict[str, Any] | None:
         """The exchange kernel's arguments for :meth:`exchange`, validated
         (``None``: this rank exchanges nothing in ``mode``). An accumulate
@@ -1048,6 +929,8 @@ class HaloRuntime:
             )
         if mode not in ("mirror", "accumulate"):
             raise ValueError("halo exchange mode must be 'mirror' or 'accumulate'")
+        if len(fields) > MAX_FIELDS:
+            raise ValueError(f"a halo exchange carries at most {MAX_FIELDS} fields")
         if clear is not None and mode != "accumulate":
             raise ValueError("clear applies to accumulate exchanges")
         for tensor, layout in zip(fields, layouts, strict=True):
@@ -1066,13 +949,15 @@ class HaloRuntime:
                 "this halo has no exchange kernel; attach one with "
                 "hydroforge.kernels.halo.attach(runtime)"
             )
-        slots = max(MAX_FIELDS, len(fields))
         filler = fields[0] if fields else clear
-        padded = [*fields, *(filler,) * (slots - len(fields))]
+        padded = [*fields, *(filler,) * (MAX_FIELDS - len(fields))]
         codes = [layout_code(layout) for layout in layouts]
         return dict(
-            **{f"f{i}": padded[i] for i in range(slots)},
-            **{f"layout{i}": codes[i] if i < len(codes) else 0 for i in range(slots)},
+            **{f"f{i}": padded[i] for i in range(MAX_FIELDS)},
+            **{
+                f"layout{i}": codes[i] if i < len(codes) else 0
+                for i in range(MAX_FIELDS)
+            },
             clear=filler if clear is None else clear,
             window=self.window,
             peers=self.peers,
@@ -1086,26 +971,6 @@ class HaloRuntime:
             accumulate=mode == "accumulate",
             has_clear=clear is not None,
             clear_layout=0 if clear_layout is None else pack_layouts([clear_layout])[0],
-            site=self.plain_site if site is None else site,
-        )
-
-    def fits(
-        self, fields: Sequence[torch.Tensor], layouts: Sequence[FieldLayout]
-    ) -> bool:
-        """Whether a mirror message of ``fields`` fits a slot between every
-        pair of ranks, not only this rank's: every rank decides alike (their
-        fields differ only in rows along the decomposed axis)."""
-
-        views = [_View.of(t, layout) for t, layout in zip(fields, layouts)]
-        plan = self.plan
-        rows = [plan.depth_rows(v.kind, v.depth) for v in views]
-        return all(
-            sum(
-                _aligned(v.elements(int(r[a, b])) * v.size) for v, r in zip(views, rows)
-            )
-            <= self.capacity
-            for a in range(plan.world)
-            for b in plan.neighbours[a]
         )
 
     def _check_capacity(
@@ -1165,7 +1030,6 @@ __all__ = [
     "KINDS",
     "LINKS",
     "MAX_FIELDS",
-    "PHASES",
     "FieldLayout",
     "HaloPlan",
     "HaloRuntime",
@@ -1178,8 +1042,6 @@ __all__ = [
     "occurrences",
     "pack_layouts",
     "partition_layouts",
-    "plain_site",
     "read_depth",
-    "site_words",
     "unpack_layouts",
 ]

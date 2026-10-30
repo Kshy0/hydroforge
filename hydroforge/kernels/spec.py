@@ -41,7 +41,7 @@ AccessMode = Literal[
     "remote",
 ]
 RuntimeKind = Literal[
-    "bool", "int32", "uint32", "index", "float32", "float64", "precision", "halo"
+    "bool", "int32", "uint32", "index", "float32", "float64", "precision"
 ]
 ConstantKind = Literal["bool", "int32", "float32", "float64", "precision"]
 Precision = Literal["float32", "float64"]
@@ -210,8 +210,6 @@ def host_scalar_is_valid(value: Any, kind: str) -> bool:
         return value == 0.0 or encoded != 0.0
     if kind == "float64":
         return type(value) is float and math.isfinite(value)
-    if kind == "halo":
-        return type(value) is HaloArgument
     raise RuntimeError(f"unknown host scalar kind {kind!r}")
 
 
@@ -220,8 +218,6 @@ def expected_host_scalar(kind: str) -> str:
 
     if kind == "precision":
         return "exact finite float32-representable precision host scalar"
-    if kind == "halo":
-        return "HaloArgument (the framework binds it)"
     return f"exact finite {kind} host scalar"
 
 
@@ -242,77 +238,6 @@ def launch_extent(name: str, keys: tuple[str, ...], values: Mapping[str, Any]) -
         if extent >= 2**63:
             raise OverflowError(f"{name} launch extent exceeds signed int64 range")
     return extent
-
-
-# The parameter a ``halo``/``publishes`` declaration adds (kind ``halo``).
-HALO_PARAMETER = "halo"
-
-
-@dataclass(slots=True, eq=False)
-class HaloArgument:
-    """The value of a ``halo`` parameter: the int64 words of the by-value
-    ``HfHalo`` struct of ``hydroforge/parallel/halo_access.cuh`` (prepared
-    once per call site, so kernels compare against parameters instead of
-    loading tables), the tensors its addresses point into, and the
-    declaration slots it reads from rings. The halo exchange takes its site
-    the same way.
-
-    A recording binds it before its schedule knows every word, and fills it
-    in when the recording ends (before anything compiles); arguments with
-    equal words and ring-read masks are equal."""
-
-    words: tuple[int, ...]
-    keep: tuple[Any, ...] = ()
-    read_mask: int = 0
-
-    @classmethod
-    def quiet(cls) -> HaloArgument:
-        """An argument describing no halo work: every row is interior."""
-
-        return cls(HALO_QUIET_WORDS)
-
-    def __eq__(self, other: object) -> bool:
-        return (
-            isinstance(other, HaloArgument)
-            and self.words == other.words
-            and self.read_mask == other.read_mask
-        )
-
-    def __hash__(self) -> int:
-        return hash((self.words, self.read_mask))
-
-
-def halo_work(value: HaloArgument) -> tuple[bool, bool, bool]:
-    """Whether a halo argument reads any ring, publishes, and returns slots
-    in its prologue."""
-
-    words = value.words
-    return halo_read_mask(value) != 0, words[7] != 0, words[8] != 0
-
-
-def halo_checks(value: HaloArgument) -> bool:
-    """Whether a halo argument's publication waits for slot credits (not
-    in a loop body whose schedule proved every slot free)."""
-
-    return value.words[11] != 0
-
-
-def halo_read_mask(value: HaloArgument) -> int:
-    """The declared read fields of a halo argument that may come from a
-    ring (bit k: field k)."""
-
-    return value.read_mask
-
-
-# HfHalo: 12 header words, 4 per read and 4 per published field of the first
-# HALO_INLINE declaration slots, each opening with its interior band [lo, hi),
-# then the addresses of the further slots' descriptors (0: none).
-HALO_HEADER_WORDS = 12
-HALO_INLINE = 8
-HALO_INTERIOR = (0, 2**62)
-HALO_QUIET_WORDS = (
-    (0,) * HALO_HEADER_WORDS + (*HALO_INTERIOR, 0, 0) * (2 * HALO_INLINE) + (0, 0)
-)
 
 
 def _size_keys(size: str | tuple[str, ...]) -> tuple[str, ...]:
@@ -436,17 +361,10 @@ class KernelSpec(HydroForgeModel):
     ``halo`` declares the buffers the kernel reads across the model's
     decomposed axis (slab rows or partition-key ghosts), each with the
     farthest row it reads (an integer, or the name of an integer scalar
-    parameter); ``publishes`` the buffers whose writes it
-    publishes to the peers holding their rows as ghosts: a tuple publishes
-    every ghost row, a mapping each buffer's rows within its depth (an
-    integer or an integer scalar's name, as ``halo``; ``None`` every row)
-    of the peers' owned rows; a reader farther than that receives the
-    publication, then has the field mirrored deeper (correct, slower).
-    Either adds one
-    parameter, ``halo`` (kind ``halo``), after the declared ones; the
-    framework binds it and schedules exchanges so a kernel finds current
-    ghost rows (see :mod:`hydroforge.kernels.halo` and
-    :mod:`hydroforge.execution.halo_schedule`). Triton kernels leave it out.
+    parameter). The kernel reads those ghost rows from the buffers like
+    any other row; the framework records exchanges before it so they are
+    current (:mod:`hydroforge.execution.halo_schedule`). It adds no
+    parameter.
 
     ``contributes`` declares the buffers the kernel adds contributions to,
     on any stored row: what it adds to a ghost row belongs to that row's
@@ -454,9 +372,9 @@ class KernelSpec(HydroForgeModel):
     reads the buffer (and mirrors the sums to a ``halo`` reader), and
     zeroes the ghost rows before contributions when they hold anything
     else. Other writes of such a buffer touch owned rows only. A contributed
-    storage cannot also be a halo input or publication of the same call:
+    storage cannot also be a halo input of the same call:
     its ghost rows hold contributions, not copies of the owner's values.
-    It adds no parameter.
+    It adds no parameter either.
     """
 
     name: Identifier
@@ -473,10 +391,6 @@ class KernelSpec(HydroForgeModel):
     halo: FrozenMapping[Identifier, Annotated[int, Field(ge=1)] | Identifier] = Field(
         default_factory=dict
     )
-    publishes: (
-        tuple[Identifier, ...]
-        | FrozenMapping[Identifier, Annotated[int, Field(ge=1)] | Identifier | None]
-    ) = ()
     contributes: tuple[Identifier, ...] = ()
     _precision_parameters: frozenset[str] = PrivateAttr(default_factory=frozenset)
     _derived: _Views | None = PrivateAttr(default=None)
@@ -491,14 +405,6 @@ class KernelSpec(HydroForgeModel):
     @property
     def parameter_names(self) -> tuple[str, ...]:
         return self._views.parameter_names
-
-    @property
-    def publish_depths(self) -> Mapping[str, int | str | None]:
-        """Every published buffer's depth (``None``: every ghost row)."""
-
-        if isinstance(self.publishes, Mapping):
-            return self.publishes
-        return dict.fromkeys(self.publishes)
 
     @property
     def size_keys(self) -> tuple[str, ...]:
@@ -545,27 +451,6 @@ class KernelSpec(HydroForgeModel):
         return self._precision_parameters
 
     @model_validator(mode="after")
-    def _add_halo_access(self) -> Self:
-        """Append the ``halo`` parameter a halo or publishes declaration
-        implies (framework-bound), after field validation.
-
-        A before validator would turn JSON arrays into Python lists before
-        the strict tuple fields can accept them as JSON.
-        """
-
-        if not (self.halo or self.publishes):
-            return self
-        parameters = self.parameters
-        if parameters.get(HALO_PARAMETER, "halo") != "halo":
-            raise ValueError(f"{HALO_PARAMETER} is the framework-bound halo parameter")
-        if HALO_PARAMETER not in parameters:
-            object.__setattr__(
-                self, "parameters", frozen_dict({**parameters, HALO_PARAMETER: "halo"})
-            )
-            self._derived = None
-        return self
-
-    @model_validator(mode="after")
     def _validate_spec(self) -> Self:
         parameters = self.parameters
         for name, distance in self.halo.items():
@@ -579,21 +464,6 @@ class KernelSpec(HydroForgeModel):
                 raise ValueError(
                     f"{self.name}: halo distance {distance!r} must name an integer scalar"
                 )
-        if len(set(self.publishes)) != len(self.publishes):
-            raise ValueError(f"{self.name}: publishes names unique buffers")
-        for name, depth in self.publish_depths.items():
-            if self.buffers.get(name) not in ("write", "read_write"):
-                raise ValueError(
-                    f"{self.name}: published {name!r} must be a written buffer"
-                )
-            if isinstance(depth, str) and parameters.get(depth) not in (
-                "index",
-                "int32",
-                "int64",
-            ):
-                raise ValueError(
-                    f"{self.name}: publish depth {depth!r} must name an integer scalar"
-                )
         if len(set(self.contributes)) != len(self.contributes):
             raise ValueError(f"{self.name}: contributes names unique buffers")
         for name in self.contributes:
@@ -603,8 +473,6 @@ class KernelSpec(HydroForgeModel):
                     f"{self.name}: contributed {name!r} must be an atomic_add "
                     "or read_write buffer"
                 )
-            if name in self.publishes:
-                raise ValueError(f"{self.name}: {name!r} is contributed and published")
             if name in self.halo:
                 raise ValueError(
                     f"{self.name}: {name!r} is contributed and halo; ghost "
@@ -824,7 +692,7 @@ class KernelSpec(HydroForgeModel):
         self.validate_scalars(self.compile_time, values)
         self.launch_extent(values)
         self.validate_scalars(self.runtime_scalars, values)
-        for distance in (*self.halo.values(), *self.publish_depths.values()):
+        for distance in self.halo.values():
             if isinstance(distance, str) and values[distance] < 1:
                 raise ValueError(
                     f"{self.name}.{distance}: halo distance must be positive"
@@ -845,14 +713,10 @@ class KernelSpec(HydroForgeModel):
 
 
 __all__ = [
-    "HaloArgument",
     "KernelSpec",
     "KernelWorkspace",
     "buffer_access_semantics",
     "constant",
-    "halo_checks",
-    "halo_read_mask",
-    "halo_work",
     "literal_value",
     "module_enabled",
     "module_flag",
