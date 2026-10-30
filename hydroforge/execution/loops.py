@@ -20,13 +20,30 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.utils._python_dispatch import _disable_current_modes
 
+from hydroforge.core.time import timedelta_microseconds
 from hydroforge.execution.context import SubstepFrame, close_runner
 from hydroforge.execution.halo_schedule import LoopHalo
 from hydroforge.execution.operators import PredicateLoopOperator
-from hydroforge.kernels.backends.loop_control import TICK, TICKS_PER_SECOND, clock_ticks
+from hydroforge.kernels.backends.loop_control import (
+    MAXIMUM_TICKS,
+    TICK,
+    TICKS_PER_SECOND,
+    microsecond_ticks,
+)
 
 if TYPE_CHECKING:
     from hydroforge.execution.runtime import ModelExecution
+
+
+def _interval_clock(step: Any) -> tuple[int, int]:
+    """One interval on the committed runtime clock, rounded at its endpoints."""
+
+    elapsed = step.clock.elapsed_microseconds
+    outer = microsecond_ticks(elapsed)
+    end = microsecond_ticks(elapsed + timedelta_microseconds(step.duration))
+    if end > torch.iinfo(torch.int64).max or not 0 < end - outer <= MAXIMUM_TICKS:
+        raise ValueError("substep clock interval exceeds its int64 tick range")
+    return outer, end - outer
 
 
 def distributed_capture_safe(*programs: Any) -> bool:
@@ -91,12 +108,29 @@ class FixedLoop:
             self.continue_flag = self.controls[1:2]
             self.count = self.controls[2:3]
             self._initial_count = self.initial[2:3]
-        self.frame = SubstepFrame(index=self.counter, dt=self.weight)
+            # (outer start, substep start, substep width, quotient, remainder).
+            self.clock = torch.zeros(5, device=execution.device, dtype=torch.int64)
+            self.outer_ticks = self.clock[0:1]
+            self.elapsed_ticks = self.clock[1:2]
+            self.dt_ticks = self.clock[2:3]
+            self.quotient = self.clock[3:4]
+            self.remainder = self.clock[4:5]
+            self.clock_index = torch.zeros_like(self.outer_ticks)
+            self.clock_product = torch.zeros_like(self.outer_ticks)
+        self.frame = SubstepFrame(
+            index=self.counter,
+            dt=self.weight,
+            outer_ticks=self.outer_ticks,
+            elapsed_ticks=self.elapsed_ticks,
+            dt_ticks=self.dt_ticks,
+        )
         self.body: Any = None
         self.final: Any = None
         self.halo_entry = LoopHalo()
         self.controlled = False
         self.weighted = False
+        self.clocked = False
+        self.timed = False
         self.runner: Any = None
         # Host copies of the count in ``initial`` and of the width in
         # ``weight``; a body that writes its width is refilled every launch.
@@ -128,7 +162,15 @@ class FixedLoop:
         self.body = body
         self.final = final
         programs = self.programs
-        self.controlled = any(
+        self.clocked = any(
+            program.references_tensor(tensor)
+            for program in programs
+            for tensor in (self.elapsed_ticks, self.dt_ticks)
+        )
+        self.timed = self.clocked or any(
+            program.references_tensor(self.outer_ticks) for program in programs
+        )
+        self.controlled = self.clocked or any(
             program.references_tensor(self.counter) for program in programs
         )
         self.weighted = any(
@@ -160,7 +202,34 @@ class FixedLoop:
     def reset(self) -> None:
         self.controls.copy_(self.initial)
 
+    def locate(self) -> None:
+        """Torch equivalent of loop_control.FIXED_CLOCK, without new tensors."""
+
+        self.clock_index.copy_(self.counter)
+        self.clock_product.copy_(self.clock_index).mul_(self.remainder).div_(
+            self.count, rounding_mode="floor"
+        )
+        self.elapsed_ticks.copy_(self.clock_index).mul_(self.quotient).add_(
+            self.clock_product
+        )
+        self.clock_index.add_(1)
+        self.clock_product.copy_(self.clock_index).mul_(self.remainder).div_(
+            self.count, rounding_mode="floor"
+        )
+        self.dt_ticks.copy_(self.clock_index).mul_(self.quotient).add_(
+            self.clock_product
+        ).sub_(self.elapsed_ticks)
+
     def execute(self, count: int, duration: float, step: Any) -> int:
+        if self.timed:
+            outer, ticks = _interval_clock(step)
+            quotient, remainder = divmod(ticks, count)
+            initial = torch.tensor(
+                (outer, 0, 0, quotient, remainder),
+                dtype=torch.int64,
+                pin_memory=self.clock.device.type == "cuda",
+            )
+            self.clock.copy_(initial, non_blocking=True)
         return self.runner.run(count, duration, step)
 
     def close(self) -> None:
@@ -261,7 +330,13 @@ class AdaptiveLoop:
             self._allocate(candidate_dt, dt, maximum_dt, maximum_steps)
             self.status_sources = (self.error_flag, self.continue_flag, dt.view(1))
         self.completion_sources = (self.error_flag, self.counter)
-        self.frame = SubstepFrame(index=self.counter, dt=dt)
+        self.frame = SubstepFrame(
+            index=self.counter,
+            dt=dt,
+            outer_ticks=self.outer_ticks,
+            elapsed_ticks=self.elapsed,
+            dt_ticks=self.step,
+        )
         self.proposal: Any = None
         self.body: Any = None
         self.halo_entry = LoopHalo()
@@ -281,6 +356,7 @@ class AdaptiveLoop:
             counts = dict(device=candidate_dt.device, dtype=torch.int32)
             # The clock counts int64 ticks (loop_control.TICK), not seconds.
             ticks = dict(device=candidate_dt.device, dtype=torch.int64)
+            self.outer_ticks = torch.zeros(1, **ticks)
             self.duration = torch.zeros(1, **ticks)
             self.elapsed = torch.zeros(1, **ticks)
             self.step = torch.zeros(1, **ticks)
@@ -325,6 +401,7 @@ class AdaptiveLoop:
         return (
             self.candidate,
             self.time_step,
+            self.outer_ticks,
             self.duration,
             self.elapsed,
             self.step,
@@ -427,7 +504,9 @@ class AdaptiveLoop:
         return host.tolist()
 
     def execute(self, duration: float, step: Any) -> int:
-        self.duration.fill_(clock_ticks(duration))
+        outer, ticks = _interval_clock(step)
+        self.outer_ticks.fill_(outer)
+        self.duration.fill_(ticks)
         return self.runner.run(duration, step)
 
     def close(self) -> None:

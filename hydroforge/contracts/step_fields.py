@@ -64,6 +64,10 @@ class StepTime:
 
 StepFieldProvider = Callable[[StepTime], int | float]
 StepFieldDType = Literal["int32", "int64", "float32", "float64", "precision"]
+SUBSTEP_TICK_SECONDS = 2.0**-30
+"""Seconds per tick of framework-owned physical substep clocks."""
+
+SubstepFieldSource = Literal["index", "dt", "outer_ticks", "elapsed_ticks", "dt_ticks"]
 _BUILTIN_STEP_FIELDS = (
     "doy",
     "month_idx",
@@ -93,15 +97,20 @@ def step_field(source: str, *, dtype: StepFieldDType = "precision") -> StepField
 class SubstepField(HydroForgeModel):
     """Bind one read-only buffer to the enclosing substep loop's control."""
 
-    source: Literal["index", "dt"]
+    source: SubstepFieldSource
 
 
-def substep_field(source: Literal["index", "dt"]) -> SubstepField:
+def substep_field(source: SubstepFieldSource) -> SubstepField:
     """Declare the enclosing fixed or adaptive substep's ``index`` (int32,
     from 0) or width ``dt`` in seconds (model precision).
 
     Bound only inside a substep body; ``dt`` of a fixed loop is the outer
-    step's width divided by the substep count.
+    step's width divided by the substep count. ``outer_ticks`` counts successful
+    outer-step duration since this runtime started, ``elapsed_ticks`` locates
+    the current substep within that outer step, and ``dt_ticks`` is its clock
+    width. All three are int64 multiples of :data:`SUBSTEP_TICK_SECONDS`.
+    They do not depend on model precision or require a calendar. The outer
+    clock resets with a new runtime; a model-specific time origin is separate.
     """
 
     return SubstepField(source=source)

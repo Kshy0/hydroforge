@@ -257,8 +257,8 @@ def _steps(runtime: Any, names: _Names) -> list[dict]:
         entry = steps.setdefault(step, {"name": step, "programs": []})
         frame = getattr(loop, "frame", None)
         if frame is not None:
-            names.add(frame.index, "substep.index")
-            names.add(frame.dt, "substep.dt")
+            for field in ("index", "dt", "outer_ticks", "elapsed_ticks", "dt_ticks"):
+                names.add(getattr(frame, field), f"substep.{field}")
         for control in ("counter", "continue_flag", "count", "weight"):
             names.add(getattr(loop, control, None), f"loop.{control}")
         roles = []

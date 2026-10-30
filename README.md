@@ -166,6 +166,40 @@ and construct the same model with that input. Supply a new
 compatible forcing. The checkpoint does not choose the continuation schedule
 for you.
 
+## Physical substep time
+
+Kernels inside `step.fixed()` or `step.adaptive()` can declare read-only
+framework time inputs in their `KernelSpec` parameters:
+
+```python
+from hydroforge.contracts import SUBSTEP_TICK_SECONDS, substep_field
+
+clock_inputs = {
+    "dt_ptr": substep_field("dt"),
+    "outer_ticks_ptr": substep_field("outer_ticks"),
+    "elapsed_ticks_ptr": substep_field("elapsed_ticks"),
+    "dt_ticks_ptr": substep_field("dt_ticks"),
+}
+```
+
+`dt` is the physics width in model precision. The three tick inputs are
+`int64`: `outer_ticks` is the duration of previously completed outer steps,
+`elapsed_ticks` is the current substep's start within its outer step, and
+`dt_ticks` is its clock width. Multiply ticks by `SUBSTEP_TICK_SECONDS`
+(`2**-30` seconds) when a calculation needs seconds. A model-specific
+initial time offset can be added before conversion; do not accumulate a
+second floating clock in the model.
+
+The outer clock accumulates successful step durations as integer
+microseconds, with each cumulative endpoint rounded to the nearest tick.
+Adjacent outer intervals therefore share exactly the same endpoint. Fixed
+substeps partition those ticks to within one tick while retaining their
+original physics width, `duration / count`, in model precision. Adaptive
+substeps expose the controller's accepted ticks directly. These inputs work
+without a calendar and retain stable device addresses during graph replay.
+They reset to zero on a new runtime or `reset_clock()`; they are runtime
+metadata, not checkpoint fields.
+
 ## Model structure page
 
 Call `model.export_html("model.html")` between steps to write a standalone,

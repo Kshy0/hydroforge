@@ -34,6 +34,7 @@ from hydroforge.kernels.backends.cuda_control import (
     adaptive_accept,
     adaptive_end,
     control_requests,
+    fixed_clock,
     fixed_end,
     set_conditional,
 )
@@ -527,6 +528,8 @@ class _Fixed:
 
         def body() -> None:
             for _ in range(repetitions):
+                if loop.clocked:
+                    fixed_clock(counter=loop.counter, count=loop.count, clock=loop.clock)
                 for program in programs:
                     program.launch()
                 if launch is not None:
@@ -539,6 +542,7 @@ class _Fixed:
             body,
             mutated_state=(
                 *((loop.controls,) if launch is not None or loop.controlled else ()),
+                *((loop.clock,) if loop.clocked else ()),
                 *(
                     tensor
                     for program in programs
@@ -587,7 +591,21 @@ class _SegmentedFixed:
             return plan
         loop = self.loop
         executor = self.executor
-        runs = list(_capture_runs(loop.body))
+        runs = []
+        if loop.clocked:
+            runs.append(
+                (
+                    True,
+                    partial(
+                        fixed_clock,
+                        counter=loop.counter,
+                        count=loop.count,
+                        clock=loop.clock,
+                    ),
+                    (loop.clock,),
+                )
+            )
+        runs.extend(_capture_runs(loop.body))
         if final:
             runs.extend(_capture_runs(loop.final))
         if loop.controlled:

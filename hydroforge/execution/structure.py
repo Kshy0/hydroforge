@@ -307,6 +307,7 @@ def _validate_dependent_shapes(
     runtime: ModelRuntime,
     replacements: Mapping[int, torch.Tensor],
     inferred: Mapping[tuple[int, str], tuple[_Dimension, int]],
+    rebuilt: frozenset[int] = frozenset(),
 ) -> None:
     changed = sorted(
         dimension.label
@@ -325,7 +326,7 @@ def _validate_dependent_shapes(
             ):
                 continue
             current = getattr(module, field.name, None)
-            if not isinstance(current, torch.Tensor):
+            if not isinstance(current, torch.Tensor) or id(current) in rebuilt:
                 continue
             candidate = replacements.get(id(current), current)
             expected = _expected_shape(
@@ -340,6 +341,55 @@ def _validate_dependent_shapes(
                     f"shape {tuple(candidate.shape)}, expected {expected}; "
                     f"changed dimensions={changed}"
                 )
+
+
+def _stale_computed(
+    runtime: ModelRuntime, swapped: Iterable[torch.Tensor]
+) -> list[tuple[Any, Any, torch.Tensor]]:
+    """Cached computed tensors (aliases or views of other fields) over the
+    storage of ``swapped``, whose storage a structural update replaces:
+    ``(module, field, cached value)``. A tensor ``set_`` moves to new
+    storage stays itself; views of its old storage do not follow it."""
+
+    replaced = {id(tensor) for tensor in swapped}
+    storages = {
+        tensor.untyped_storage().data_ptr()
+        for tensor in swapped
+        if tensor.untyped_storage().data_ptr()
+    }
+    found = []
+    for module_name in runtime.plan.modules:
+        module = runtime.modules[module_name]
+        for field in module.spec().tensor_fields.values():
+            value = module.__dict__.get(field.name) if field.computed else None
+            if (
+                isinstance(value, torch.Tensor)
+                and id(value) not in replaced
+                and value.untyped_storage().data_ptr() in storages
+            ):
+                found.append((module, field, value))
+    return found
+
+
+def _rebuild_computed(
+    runtime: ModelRuntime, stale: Sequence[tuple[Any, Any, torch.Tensor]]
+) -> None:
+    """Evaluate ``stale`` computed tensors again over the new storage, and
+    point the statistics sources reading them at the new tensors."""
+
+    for module, field, _ in stale:
+        module.__dict__.pop(field.name, None)
+    fresh = {}
+    for module, field, old in stale:
+        value = getattr(module, field.name)
+        ModuleTensors(module)._finish_computed(field, value)
+        fresh[id(old)] = module.__dict__.get(field.name, value)
+    statistics = runtime.statistics
+    if statistics is not None and fresh:
+        registry = statistics._tensor_registry
+        for name, tensor in list(registry.items()):
+            if id(tensor) in fresh:
+                registry[name] = fresh[id(tensor)]
 
 
 def _synchronize(device: torch.device) -> None:
@@ -649,18 +699,27 @@ def _commit_structural_update(
     fields = _replacement_fields(runtime, replacements)
     _validate_content_coordinates(fields, replacements, pairs, content_ids)
     inferred = _infer_dimensions(fields, replacements)
-    _validate_dependent_shapes(runtime, replacements, inferred)
+    # Fields set_ moves to new storage: cached computed views of them are
+    # evaluated again after the update (their shapes need not hold now).
+    swapped = [current for current, _ in pairs if id(current) not in content_ids]
+    stale = _stale_computed(runtime, swapped)
+    _validate_dependent_shapes(
+        runtime, replacements, inferred, frozenset(id(old) for *_, old in stale)
+    )
     _validate_update_integrity(runtime, fields, replacements)
     derived = _stale_reference_indices(runtime, replacements)
+    statistics = runtime.statistics
+    selections = (
+        () if statistics is None else statistics.prepare_selection_update(replacements)
+    )
+    # Derived indices and selections set_ moves too.
+    swapped += [c for c, fresh in (*derived, *selections) if c.shape != fresh.shape]
+    stale = _stale_computed(runtime, swapped)
     previous_dimensions = {
         key: int(getattr(dimension.owner, dimension.attribute))
         for key, (dimension, _extent) in inferred.items()
     }
     bindings = runtime.parameters.prepare_rebind(replacements)
-    statistics = runtime.statistics
-    selections = (
-        () if statistics is None else statistics.prepare_selection_update(replacements)
-    )
 
     mutated = False
     try:
@@ -680,6 +739,7 @@ def _commit_structural_update(
                     current.set_(fresh)
         changes = _publish_dimensions(inferred, previous_dimensions)
         _verify_dimensions(inferred)
+        _rebuild_computed(runtime, stale)
 
         if statistics is not None:
             statistics.recompile_resized_sources()

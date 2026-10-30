@@ -37,6 +37,7 @@ from hydroforge.kernels.backends import metal_aten
 from hydroforge.kernels.backends.metal_control import (
     SCATTER_ERROR_STATUS,
     adaptive_control_commands,
+    fixed_clock_command,
     fixed_control_command,
     statistics_control_command,
 )
@@ -406,6 +407,14 @@ class _Fixed:
 
         executor = self.executor
         body = self.lowered.commands[0]
+        if self.loop.clocked:
+            loop = self.loop
+            body = (
+                fixed_clock_command(
+                    counter=loop.counter, count=loop.count, clock=loop.clock
+                ),
+                *body,
+            )
         regular = executor.capture_commands((*body, *tail), cyclic=True)
         if self.loop.final is None:
             return regular, None

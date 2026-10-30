@@ -20,6 +20,7 @@ import torch
 
 from hydroforge.kernels.backends import loop_control
 from hydroforge.kernels.backends.loop_control import (
+    FIXED_CLOCK,
     FIXED_END,
     NEXT,
     SamplePhase,
@@ -68,6 +69,12 @@ def _command(function: KernelFunction, **values: Any) -> MetalCommand:
         _program(function),
         {names[param.name]: values[param.name] for param in function.params},
     )
+
+
+def fixed_clock_command(
+    *, counter: torch.Tensor, count: torch.Tensor, clock: torch.Tensor
+) -> MetalCommand:
+    return _command(FIXED_CLOCK, counter=counter, count=count, clock=clock)
 
 
 def fixed_control_command(

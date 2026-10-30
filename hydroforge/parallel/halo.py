@@ -1092,14 +1092,20 @@ class HaloRuntime:
     def fits(
         self, fields: Sequence[torch.Tensor], layouts: Sequence[FieldLayout]
     ) -> bool:
-        """Whether a mirror message of ``fields`` fits a slot, to and from
-        every peer."""
+        """Whether a mirror message of ``fields`` fits a slot between every
+        pair of ranks, not only this rank's: every rank decides alike (their
+        fields differ only in rows along the decomposed axis)."""
 
         views = [_View.of(t, layout) for t, layout in zip(fields, layouts)]
+        plan = self.plan
+        rows = [plan.depth_rows(v.kind, v.depth) for v in views]
         return all(
-            message.nbytes(views) <= self.capacity
-            for direction in ("send", "receive")
-            for message in self.messages[("mirror", direction)][1]
+            sum(
+                _aligned(v.elements(int(r[a, b])) * v.size) for v, r in zip(views, rows)
+            )
+            <= self.capacity
+            for a in range(plan.world)
+            for b in plan.neighbours[a]
         )
 
     def _check_capacity(

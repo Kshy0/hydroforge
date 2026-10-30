@@ -69,7 +69,7 @@ class RuntimeClock:
     ``schedule_index`` instead.
     """
 
-    __slots__ = ("schedule", "schedule_index", "time")
+    __slots__ = ("schedule", "schedule_index", "time", "elapsed_microseconds")
 
     def __init__(
         self, schedule: SimulationSchedule | None, initial_time: DateLike | None
@@ -77,6 +77,7 @@ class RuntimeClock:
         self.schedule = schedule
         self.schedule_index = 0
         self.time = initial_time if schedule is None else None
+        self.elapsed_microseconds = 0
 
     @property
     def current_time(self) -> DateLike | None:
@@ -906,6 +907,7 @@ class ModelRuntime:
                 self.statistics.restart()
             self.clock.time = target
             self.clock.schedule_index = 0
+            self.clock.elapsed_microseconds = 0
             self.progress.state = ProgressState()
         except BaseException as caught:
             error = caught

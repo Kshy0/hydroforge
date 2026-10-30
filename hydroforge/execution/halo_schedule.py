@@ -125,6 +125,7 @@ class _Site:
     publish: tuple[tuple[torch.Tensor, Any], ...] = ()
     read_slots: tuple[int, ...] = ()
     publish_slots: tuple[int, ...] = ()
+    declared: tuple[int, int] = (0, 0)  # the kernel's declared reads, publications
     # storages it writes (they supersede rings holding them)
     writes: frozenset[int] = frozenset()
     # exchange: its fields, mode and phase; a receipt's (site, "current" or
@@ -802,6 +803,7 @@ class HaloSchedule:
             read_slots=tuple(read_slots),
             publish=tuple(publish),
             publish_slots=tuple(publish_slots),
+            declared=(len(spec.halo), len(spec.publishes)),
             writes=frozenset(
                 _storage(bound[name])
                 for name, access in spec.buffers.items()
@@ -1369,6 +1371,7 @@ class HaloSchedule:
                         checks=not free,
                         read_slots=site.read_slots,
                         publish_slots=site.publish_slots,
+                        declared=site.declared,
                     )
                 if site.publish:
                     halo.publications += 1

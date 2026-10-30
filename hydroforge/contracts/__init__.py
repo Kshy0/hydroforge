@@ -34,6 +34,7 @@ from hydroforge.contracts.runtime import (
 from hydroforge.contracts.schedule import SimulationSchedule, SpinupSchedule
 from hydroforge.contracts.slab import SlabAxis
 from hydroforge.contracts.step_fields import (
+    SUBSTEP_TICK_SECONDS,
     StepField,
     StepTime,
     SubstepField,
@@ -80,6 +81,7 @@ __all__ = [
     "SimulationSchedule",
     "SpinupSchedule",
     "StatisticsPlan",
+    "SUBSTEP_TICK_SECONDS",
     "StepField",
     "StepTime",
     "SubstepField",

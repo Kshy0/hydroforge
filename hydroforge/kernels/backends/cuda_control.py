@@ -28,6 +28,7 @@ import torch
 
 from hydroforge.kernels.backends import loop_control
 from hydroforge.kernels.backends.loop_control import (
+    FIXED_CLOCK,
     FIXED_END,
     SamplePhase,
     cell,
@@ -154,7 +155,7 @@ def _request(
 def _control_request() -> rtc.RtcRequest:
     return _request(
         "hydroforge_loop_control",
-        (_SET_CONDITIONAL, FIXED_END, *_ADAPTIVE_ACCEPT.values(), _ADAPTIVE_END),
+        (_SET_CONDITIONAL, FIXED_END, FIXED_CLOCK, *_ADAPTIVE_ACCEPT.values(), _ADAPTIVE_END),
         # ``cudaGraphSetConditional`` is declared by the device runtime.
         header="#include <cuda_device_runtime_api.h>\n\n",
         options=rtc.toolkit_include_options(),
@@ -217,6 +218,19 @@ def _launch(
     )
     index = torch.cuda.current_device() if device.index is None else device.index
     rtc.prepare(request, (rtc.CudaLaunch(function.name, 1, 1, args),), index)()
+
+
+def fixed_clock(
+    *, counter: torch.Tensor, count: torch.Tensor, clock: torch.Tensor
+) -> None:
+    """Locate a fixed substep on its outer interval's exact tick partition."""
+
+    _launch(
+        _control_request(),
+        FIXED_CLOCK,
+        {"counter": counter, "count": count, "clock": clock},
+        counter.device,
+    )
 
 
 def fixed_end(

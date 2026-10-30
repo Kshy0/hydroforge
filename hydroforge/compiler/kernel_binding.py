@@ -292,8 +292,10 @@ class KernelBindingPlan:
         if name in spec.step_fields:
             return precision_dtype(spec.step_fields[name].dtype, plan.dtype)
         if name in spec.substep_fields:
-            index = spec.substep_fields[name].source == "index"
-            return torch.int32 if index else plan.dtype
+            source = spec.substep_fields[name].source
+            if source == "dt":
+                return plan.dtype
+            return torch.int32 if source == "index" else torch.int64
         field = name.removesuffix("_ptr")
         optional = name in spec.optional
         typed = []

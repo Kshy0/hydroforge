@@ -113,6 +113,7 @@ class StepContext:
         return (
             self.clock.time,
             self.clock.schedule_index,
+            self.clock.elapsed_microseconds,
             None if statistics is None else statistics.snapshot(),
         )
 
@@ -127,7 +128,12 @@ class StepContext:
             raise RuntimeError("managed scope belongs to an inactive invocation")
 
     def restore(self, snapshot: tuple[Any, ...]) -> None:
-        self.clock.time, self.clock.schedule_index, windows = snapshot
+        (
+            self.clock.time,
+            self.clock.schedule_index,
+            self.clock.elapsed_microseconds,
+            windows,
+        ) = snapshot
         if windows is not None:
             self.statistics.restore(windows)
 
@@ -163,6 +169,7 @@ class StepContext:
     def commit_clock(self) -> None:
         """Publish the next model time only after the full step succeeds."""
 
+        self.clock.elapsed_microseconds += timedelta_microseconds(self.duration)
         if self.scheduled_step is not None:
             self.clock.schedule_index = self.scheduled_step.index + 1
         elif self.current_time is not None:

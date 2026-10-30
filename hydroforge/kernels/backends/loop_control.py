@@ -52,6 +52,7 @@ from collections.abc import Callable
 
 import torch
 
+from hydroforge.contracts.step_fields import SUBSTEP_TICK_SECONDS
 from hydroforge.kernels.codegen.ir import (
     Binary,
     Call,
@@ -80,9 +81,18 @@ _TICKS = torch.int64
 # The adaptive clock's tick: 2**-30 s (under a nanosecond), so an interval
 # of up to 2**32 s (136 years) fits int64 with every intermediate product.
 CLOCK_BITS = 30
-TICK = 2.0**-CLOCK_BITS
+TICK = SUBSTEP_TICK_SECONDS
 TICKS_PER_SECOND = 2.0**CLOCK_BITS
 MAXIMUM_TICKS = 2**62
+
+
+def microsecond_ticks(microseconds: int) -> int:
+    """Round cumulative host microseconds to ticks without a floating clock."""
+
+    whole, remainder = divmod(microseconds * (1 << CLOCK_BITS), 1_000_000)
+    return whole + int(
+        remainder > 500_000 or (remainder == 500_000 and whole % 2 != 0)
+    )
 
 
 def clock_ticks(seconds: float) -> int:
@@ -280,6 +290,46 @@ FIXED_END = KernelFunction(
     (_COUNTER, _CONTINUE, _COUNT),
     _fixed_advance(cell(_COUNTER), cell(_CONTINUE), cell(_COUNT)),
 )
+
+
+def _fixed_clock() -> KernelFunction:
+    """Locate one fixed substep from a duration's quotient and remainder.
+
+    ``clock`` stores (outer, elapsed, width, quotient, remainder). Splitting
+    before multiplication bounds every intermediate by duration or count**2.
+    The last endpoint is exactly the outer duration even for count=3.
+    """
+
+    clock = Param("clock", _TICKS, "read_write")
+    index = Var("index", _TICKS)
+    count = Var("count64", _TICKS)
+    quotient = Load(clock.name, Const(3), _TICKS)
+    remainder = Load(clock.name, Const(4), _TICKS)
+
+    def boundary(at: Expr) -> Expr:
+        return Binary(
+            "+",
+            Binary("*", quotient, at),
+            Binary("/", Binary("*", remainder, at), count),
+        )
+
+    elapsed = Var("elapsed", _TICKS)
+    end = Var("end", _TICKS)
+    return KernelFunction(
+        "hf_fixed_clock",
+        (Param("counter", _INT, "read"), _COUNT, clock),
+        (
+            Let(index, Cast(cell(_COUNTER), _TICKS)),
+            Let(count, Cast(cell(_COUNT), _TICKS)),
+            Let(elapsed, boundary(index)),
+            Let(end, boundary(Binary("+", index, Const(1, _TICKS)))),
+            Store(clock.name, Const(1), elapsed),
+            Store(clock.name, Const(2), Binary("-", end, elapsed)),
+        ),
+    )
+
+
+FIXED_CLOCK = _fixed_clock()
 
 
 def statistics_control(

@@ -375,7 +375,14 @@ class _FixedScope(InvocationScope):
         context = self.context
         execution = context.execution
         loop = FixedLoop(execution)
-        controls = (loop.count, loop.counter, loop.weight)
+        controls = (
+            loop.count,
+            loop.counter,
+            loop.weight,
+            loop.outer_ticks,
+            loop.elapsed_ticks,
+            loop.dt_ticks,
+        )
         depth = len(context.scopes)
         with record_operator_scope(
             execution,
@@ -401,7 +408,12 @@ class _FixedScope(InvocationScope):
                 with final:
                     self.final()
                 owned.append(final.program)
-            aliases = dict(zip(map(id, controls), ("count", "index", "dt")))
+            aliases = dict(
+                zip(
+                    map(id, controls),
+                    ("count", "index", "dt", "outer_ticks", "elapsed_ticks", "dt_ticks"),
+                )
+            )
             signature = tuple(program.fingerprint(aliases) for program in owned)
         except BaseException:
             with cleanup_on_exit(
@@ -471,7 +483,13 @@ class _AdaptiveScope(InvocationScope):
         )
         physics = record_operator_scope(
             execution,
-            stable_tensors=(loop.counter, loop.time_step),
+            stable_tensors=(
+                loop.counter,
+                loop.time_step,
+                loop.outer_ticks,
+                loop.elapsed,
+                loop.step,
+            ),
             scope_kind="adaptive physics",
             frame=loop.frame,
         )
@@ -487,7 +505,12 @@ class _AdaptiveScope(InvocationScope):
             with physics:
                 yield loop.frame
             owned = (proposal.program, physics.program)
-            aliases = {id(loop.counter): "index"}
+            aliases = {
+                id(loop.counter): "index",
+                id(loop.outer_ticks): "outer_ticks",
+                id(loop.elapsed): "elapsed_ticks",
+                id(loop.step): "dt_ticks",
+            }
             signature = tuple(program.fingerprint(aliases) for program in owned)
         except BaseException:
             with cleanup_on_exit(

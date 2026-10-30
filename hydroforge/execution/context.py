@@ -68,6 +68,9 @@ class SubstepFrame:
 
     index: torch.Tensor
     dt: torch.Tensor
+    outer_ticks: torch.Tensor
+    elapsed_ticks: torch.Tensor
+    dt_ticks: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)

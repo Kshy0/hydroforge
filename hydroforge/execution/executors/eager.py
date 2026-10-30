@@ -33,6 +33,8 @@ class EagerFixed:
         body, final = loop.body, loop.final
         for index in range(count):
             last = index == count - 1
+            if loop.clocked:
+                loop.locate()
             body.launch()
             if last and final is not None:
                 final.launch()

@@ -187,6 +187,7 @@ def access_argument(
     checks: bool = True,
     read_slots: tuple[int, ...] = (),
     publish_slots: tuple[int, ...] = (),
+    declared: tuple[int, int] = (0, 0),
 ) -> HaloArgument:
     """The ``halo`` argument of one call (``HfHalo`` of halo_access.cuh),
     prepared once per call site: the published fields (tensor, layout), the
@@ -203,8 +204,10 @@ def access_argument(
     address precomputed, sit in one tensor. ``read_slots`` and
     ``publish_slots`` are the declaration slots of ``reads`` and
     ``publish`` (by default their positions), so a disabled optional field
-    keeps the later fields' slots. Arguments of equal content are one object
-    (kept by the runtime)."""
+    keeps the later fields' slots; ``declared`` counts the kernel's declared
+    reads and publications, every one of which gets a descriptor (those not
+    in ``reads`` or ``publish``: no ring work). Arguments of equal content
+    are one object (kept by the runtime)."""
 
     if runtime is None or not (
         publish or commit or any(p is not None for _, _, p, _ in reads)
@@ -225,26 +228,38 @@ def access_argument(
         checks,
         read_slots,
         publish_slots,
+        declared,
     )
     prepared = runtime.__dict__.setdefault("access_arguments", {})
     found = prepared.get(key)
     if found is None:
         found = prepared[key] = _access_argument(
-            runtime, device, publish, reads, commit, checks, read_slots, publish_slots
+            runtime,
+            device,
+            publish,
+            reads,
+            commit,
+            checks,
+            read_slots,
+            publish_slots,
+            declared,
         )
     return found
 
 
 def _access_argument(
-    runtime, device, publish, reads, commit, checks, read_slots, publish_slots
+    runtime, device, publish, reads, commit, checks, read_slots, publish_slots, declared
 ) -> HaloArgument:
     plan, capacity = runtime.plan, runtime.capacity
     words = list(HALO_QUIET_WORDS)
     read_slots = read_slots or tuple(range(len(reads)))
     publish_slots = publish_slots or tuple(range(len(publish)))
-    # Descriptors of slots past the struct's inline ones head the table.
-    more_reads = max(max(read_slots, default=-1) + 1 - HALO_INLINE, 0)
-    more_publishes = max(max(publish_slots, default=-1) + 1 - HALO_INLINE, 0)
+    # Descriptors of slots past the struct's inline ones head the table, one
+    # for every declared slot: a kernel may name any of them.
+    read_count = max(max(read_slots, default=-1) + 1, declared[0])
+    publish_count = max(max(publish_slots, default=-1) + 1, declared[1])
+    more_reads = max(read_count - HALO_INLINE, 0)
+    more_publishes = max(publish_count - HALO_INLINE, 0)
     more = list((*HALO_INTERIOR, 0, 0) * (more_reads + more_publishes))
     tables: list[int] = []
     # (words or more, index, table offset): addresses to fill in.
