@@ -18,6 +18,11 @@ events, so any divergence in the order of agreements is detected.
 * A managed-step event publishes its kind and a three-int signature; the
   first event of a warm step carries the invocation preflight in ``digest``
   and ``flag``.  A failed rank publishes kind ``-1``.
+
+Model bodies outside managed steps (``initialize_model_state`` and
+between-steps methods) use the same events for their collectives and close
+with one more (:meth:`ProcessGroupChannel.close_body`), so a rank's failure
+reaches every peer at the collective or the close it waits in.
 """
 
 from __future__ import annotations
@@ -30,7 +35,11 @@ import torch
 import torch.distributed as dist
 
 from hydroforge.core.devices import devices_match
-from hydroforge.core.errors import distributed_failure_error, failure_description
+from hydroforge.core.errors import (
+    ResourceCleanupError,
+    distributed_failure_error,
+    failure_description,
+)
 from hydroforge.core.identity import digest63
 from hydroforge.parallel.launch import communication_backend
 
@@ -48,6 +57,11 @@ def _full_records_ready(rows: Any) -> bool:
     return all(row[1] == StepEvent.TRANSACTION or row[6] & _PREFLIGHT for row in rows)
 
 
+class PeerFailureError(RuntimeError):
+    """A peer rank published a failure where this rank waited for it; the
+    peer's own error describes it."""
+
+
 class StepEvent(IntEnum):
     """Managed-step sequence points; collectives use kinds from 10 upward."""
 
@@ -56,6 +70,7 @@ class StepEvent(IntEnum):
     SUBSTEP = 2
     USER_STEP_COMPLETE = 3
     STEP_FINALIZED = 4
+    BODY_COMPLETE = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +129,12 @@ class LocalChannel:
 
     def abort(self) -> None:
         pass
+
+    def open_body(self) -> None:
+        pass
+
+    def close_body(self, error: BaseException | None) -> BaseException | None:
+        return error
 
 
 def require_process_group(what: str) -> None:
@@ -267,6 +288,11 @@ class ProcessGroupChannel:
             return empty, empty
         if not _full_records_ready(rows):
             self._terminal = True
+            failed = tuple(rank for rank, row in enumerate(rows) if row[1] == _FAILED)
+            if failed:
+                raise PeerFailureError(
+                    f"model call failed on peer rank(s) before {phase!r}: {failed}"
+                )
             raise RuntimeError(
                 f"distributed transaction and managed-step events differ across ranks: {rows}"
             )
@@ -342,6 +368,40 @@ class ProcessGroupChannel:
 
         self._event(_FAILED, _NO_SIGNATURE)
 
+    def open_body(self) -> None:
+        """Start a model body (initialization or a between-steps method)
+        whose collectives are events of this channel."""
+
+        self.open_step()
+
+    def close_body(self, error: BaseException | None) -> BaseException | None:
+        """End a model body on every rank at once.
+
+        A rank that failed publishes its failure; one that finished publishes
+        the end of its body. Either reaches a peer still waiting in a
+        collective or at its own end, so every rank leaves together. Returns
+        this rank's ``error``, or the peer failure (or divergence) the closing
+        event revealed; ``None`` exactly when every rank finished the body.
+        """
+
+        if error is not None:
+            try:
+                self.abort()
+            except BaseException as coordination:
+                return ResourceCleanupError(
+                    "model body failure propagation", (error, coordination)
+                )
+            return error
+        if self._terminal:
+            # A collective of this body already failed across ranks (and
+            # the body went on): there is no aligned event left to publish.
+            return RuntimeError("a collective of this model body failed on some rank")
+        try:
+            self._event(StepEvent.BODY_COMPLETE, _NO_SIGNATURE)
+        except BaseException as peer:
+            return peer
+        return None
+
     def _event(self, kind: int, signature: tuple[int, int, int]) -> None:
         if self._terminal:
             return
@@ -383,8 +443,8 @@ class ProcessGroupChannel:
             if kind == _FAILED:
                 return
             if failed_ranks:
-                raise RuntimeError(
-                    "managed step failed on peer rank(s) before distributed "
+                raise PeerFailureError(
+                    "model call failed on peer rank(s) before distributed "
                     f"event {sequence}: {failed_ranks}"
                 )
             raise RuntimeError(

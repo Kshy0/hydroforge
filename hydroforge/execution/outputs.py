@@ -24,7 +24,7 @@ from hydroforge.contracts.fields import (
     TensorMetadata,
 )
 from hydroforge.contracts.precision import precisions_of
-from hydroforge.contracts.views import view_indices
+from hydroforge.contracts.views import OutputUnion, view_indices
 from hydroforge.core.arrays import find_indices_in_torch
 from hydroforge.core.events import emit
 from hydroforge.core.expr import ExpressionSource, ScatterSource, TensorSource
@@ -443,6 +443,55 @@ class _StatisticsBinder:
             name=axis, extent=int(local.size), table=table, indices=values
         )
 
+    def _located_axis(self, tensor: TensorMetadata) -> tuple[int, Any] | None:
+        """Position of a located entity dimension in ``tensor``'s shape and
+        this rank's entities of it (``None``: none is cut by rank)."""
+
+        located = self.runtime.located
+        for position, token in enumerate(tensor.shape):
+            if isinstance(token, str) and bare(token) in located:
+                return position, located[bare(token)]
+        return None
+
+    def _located_output_axis(
+        self,
+        name: str,
+        axis: str,
+        indices: tuple[int, ...] | None,
+        located: Any,
+        tensors: dict[str, torch.Tensor],
+    ) -> OutputAxis:
+        """This rank's entities, selected by the view's global positions.
+
+        The output coordinate holds each entity's place in the complete
+        table, so ranks' files join along the axis.
+        """
+
+        places = located.positions
+        local = np.arange(places.size, dtype=np.int64)
+        if indices is not None:
+            chosen = np.isin(places, np.asarray(indices, dtype=np.int64))
+            places, local = places[chosen], local[chosen]
+        values = tuple(int(place) for place in places)
+        if local.size == 0:
+            return OutputAxis(name=axis, extent=0, start=0, step=1, indices=())
+        step = _regular_step(tuple(int(row) for row in local))
+        if step is not None:
+            return OutputAxis(
+                name=axis,
+                extent=int(local.size),
+                start=int(local[0]),
+                step=step,
+                indices=values,
+            )
+        table = f"__view__{name}__located"
+        tensors[table] = torch.as_tensor(
+            local, dtype=torch.int64, device=self.runtime.plan.device
+        )
+        return OutputAxis(
+            name=axis, extent=int(local.size), table=table, indices=values
+        )
+
     def _owned_rows(self, coordinate: str | None, rows: int) -> int:
         """Rows of ``coordinate`` this rank owns: halo ghost rows follow them."""
 
@@ -491,17 +540,68 @@ class _StatisticsBinder:
         shape = self._logical_shape(name, program, tensors, fields)
         names = declaration.axes[name]
         slab_axis = self._slab_axis(info.tensor)
-        # Views select by global row, so the slab axis has its global extent.
+        coordinate = bare(info.tensor.dim_coords)
+        located_axis = self._located_axis(info.tensor)
+        if located_axis is not None and (
+            (located_axis[0] == 0 and (coordinate or info.output_index))
+            or (slab_axis is not None and slab_axis[0] == located_axis[0])
+        ):
+            # Rows identified by coordinate IDs join ranks by those IDs.
+            located_axis = None
+        # Views select by global row or entity, so these axes have their
+        # global extents.
         extents = list(shape)
         if slab_axis is not None:
             extents[slab_axis[0]] = self.runtime.slab.total_of(slab_axis[1])
+        if located_axis is not None:
+            extents[located_axis[0]] = located_axis[1].total
+        view = declaration.views.get(name)
+        union = isinstance(view, OutputUnion)
+        if view is not None and (union or view.points):
+            if located_axis is not None:
+                raise ValueError("point views require grid axes, not located entity axes")
+            if union:
+                # The union's distinct cells are its points, in row-major order.
+                points = view.cells(tuple(names), tuple(extents)).T.copy()
+            else:
+                points = np.asarray([view.points[axis] for axis in names], dtype=np.int64)
+            if any(np.any(points[i] >= extent) for i, extent in enumerate(extents)):
+                raise ValueError(f"point view for {name!r} exceeds grid extents {extents}")
+            positions = np.arange(points.shape[1], dtype=np.int64)
+            if slab_axis is not None:
+                position, kind = slab_axis
+                slab = self.runtime.slab
+                owned = slab.global_rows(kind)
+                keep = np.isin(points[position], owned)
+                points, positions = points[:, keep], positions[keep]
+            # Where each written point lies, by global index of every axis.
+            coordinates = tuple(
+                (axis, tuple(int(value) for value in points[i]))
+                for i, axis in enumerate(names)
+            )
+            if slab_axis is not None and positions.size:
+                points[position] += slab.owned_slice(kind).start - owned[0]
+            flat = (np.ravel_multi_index(tuple(points), shape)
+                    if positions.size else np.empty(0, dtype=np.int64))
+            table = f"__view__{name}__points"
+            tensors[table] = torch.as_tensor(flat, dtype=torch.int64, device=self.runtime.plan.device)
+            return RuntimeTensorMetadata(
+                tensor=info.tensor, description=info.description,
+                output_index=info.output_index, output_coord=info.output_coord,
+                resolved_shape=info.resolved_shape,
+                output_axes=(OutputAxis(
+                    name=view.point_dimension, extent=positions.size,
+                    indices=tuple(int(i) for i in positions),
+                    coordinates=coordinates,
+                ),),
+                output_gather=table,
+            )
         selected = view_indices(
             names,
             tuple(extents),
             declaration.views.get(name),
             self.runtime.plan.spec.grid_axes,
         )
-        coordinate = bare(info.tensor.dim_coords)
         device = self.runtime.plan.device
         axes = []
         for position, (axis, extent, indices) in enumerate(
@@ -510,6 +610,12 @@ class _StatisticsBinder:
             if slab_axis is not None and position == slab_axis[0]:
                 axes.append(
                     self._slab_output_axis(name, axis, indices, slab_axis[1], tensors)
+                )
+            elif located_axis is not None and position == located_axis[0]:
+                axes.append(
+                    self._located_output_axis(
+                        name, axis, indices, located_axis[1], tensors
+                    )
                 )
             elif position == 0 and info.output_index is not None:
                 count = tensors[info.output_index].numel()

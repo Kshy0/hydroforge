@@ -14,12 +14,14 @@ forms that contracts, compilers and code generators consume.
 from __future__ import annotations
 
 import ast
+import copy
 import math
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum, StrEnum
 from functools import lru_cache
+from typing import Any
 
 import torch
 
@@ -52,12 +54,38 @@ class StatisticOperation:
 
 
 @dataclass(frozen=True)
+class FieldView:
+    """A field read at other elements than the expression's own.
+
+    ``field[1:-1, 1:-1]`` slices its leading axes (``slices`` holds each
+    sliced axis's ``(start, stop, step)``, Python bounds; trailing axes are
+    whole). ``take(field, index)`` gathers the field's elements at the flat
+    row-major positions an integer ``index`` field holds; the result has the
+    index's shape. ``key`` is the canonical spelling the lowering binds.
+    """
+
+    key: str
+    field: str
+    slices: tuple[tuple[int | None, int | None, int], ...] = ()
+    index: str | None = None
+
+
+@dataclass(frozen=True)
 class Expression:
-    """Validated Python expression AST and its model-field dependencies."""
+    """Validated Python expression AST and its model-field dependencies.
+
+    ``dependencies`` names every field it reads; ``operands`` those read at
+    the expression's own elements, ``views`` those read elsewhere.
+    """
 
     source: str
     tree: ast.Expression
     dependencies: tuple[str, ...]
+    operands: tuple[str, ...] = ()
+    views: tuple[FieldView, ...] = ()
+    # ``options.<path>`` constants, bound to the model's option values by
+    # the compiler (bind_options) before any backend lowers the expression.
+    options: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -179,12 +207,80 @@ def parse_operation(spelling: str) -> StatisticOperation:
     return StatisticOperation(canonical, outer, inner, k, stores_index)
 
 
+def _bound(node: ast.AST | None, what: str) -> int | None:
+    """An omitted or integer-literal slice bound."""
+
+    if node is None:
+        return None
+    sign = 1
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        sign, node = -1, node.operand
+    if not isinstance(node, ast.Constant) or type(node.value) is not int:
+        raise ValueError(f"slice {what} must be an integer literal")
+    return sign * node.value
+
+
+def field_view(node: ast.AST) -> FieldView | None:
+    """The view a ``field[...]`` or ``take(field, index)`` node reads
+    (``None`` for any other node)."""
+
+    if isinstance(node, ast.Subscript):
+        field = field_reference(
+            node.value, message="only a field name can be sliced: field[1:-1, ...]"
+        )
+        items = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+        slices = []
+        for item in items:
+            if not isinstance(item, ast.Slice):
+                raise ValueError(
+                    "field subscripts are slices (field[1:-1]); sample points "
+                    "with take(field, index)"
+                )
+            step = _bound(item.step, "step")
+            if step is not None and step < 1:
+                raise ValueError("slice step must be a positive integer")
+            slices.append(
+                (_bound(item.lower, "start"), _bound(item.upper, "stop"), step or 1)
+            )
+        text = ",".join(
+            f"{'' if start is None else start}:{'' if stop is None else stop}"
+            + ("" if step == 1 else f":{step}")
+            for start, stop, step in slices
+        )
+        return FieldView(f"{field}[{text}]", field, slices=tuple(slices))
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "take"
+    ):
+        if len(node.args) != 2 or node.keywords:
+            raise ValueError("take expects take(field, index)")
+        message = "take(field, index) takes two field names"
+        field = field_reference(node.args[0], message=message)
+        index = field_reference(node.args[1], message=message)
+        return FieldView(f"take({field},{index})", field, index=index)
+    return None
+
+
 class _ExpressionValidator(ast.NodeVisitor):
     """Reject semantics that cannot be rendered identically by every backend."""
 
     def __init__(self, source: str) -> None:
         self.source = source
         self.dependencies: set[str] = set()
+        self.operands: set[str] = set()
+        self.views: dict[str, FieldView] = {}
+        self.options: set[str] = set()
+
+    def _view(self, node: ast.AST) -> None:
+        view = field_view(node)
+        self.views[view.key] = view
+        self.dependencies.add(view.field)
+        if view.index is not None:
+            self.dependencies.add(view.index)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        self._view(node)
 
     def _unsupported(self, node: ast.AST) -> ValueError:
         return ValueError(
@@ -255,18 +351,25 @@ class _ExpressionValidator(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> None:
         if node.id not in {"pi", "M_PI", "True", "False"}:
             self.dependencies.add(node.id)
+            self.operands.add(node.id)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        self.dependencies.add(
-            field_reference(
-                node, message="statistics expressions only support dotted field names"
-            )
+        name = field_reference(
+            node, message="statistics expressions only support dotted field names"
         )
+        if name.startswith(OPTIONS_PREFIX):
+            self.options.add(name)
+            return
+        self.dependencies.add(name)
+        self.operands.add(name)
 
     def visit_Call(self, node: ast.Call) -> None:
         if not isinstance(node.func, ast.Name):
             raise ValueError("statistics expression functions must use bare names")
         function = node.func.id
+        if function == "take":
+            self._view(node)
+            return
         try:
             arity = _FUNCTION_ARITIES[function]
         except KeyError as error:
@@ -311,7 +414,44 @@ def _compile_expression(
             f"statistics expression {source!r} references unknown fields: "
             f"{sorted(unknown)}"
         )
-    return Expression(source, tree, tuple(sorted(visitor.dependencies)))
+    return Expression(
+        source,
+        tree,
+        tuple(sorted(visitor.dependencies)),
+        tuple(sorted(visitor.operands)),
+        tuple(visitor.views[key] for key in sorted(visitor.views)),
+        tuple(sorted(visitor.options)),
+    )
+
+
+OPTIONS_PREFIX = "options."
+
+
+def bind_options(expression: Expression, values: Any) -> Expression:
+    """``expression`` with every ``options.<path>`` replaced by its value.
+
+    ``values`` resolves a path (``OptionsConfig.value``); an option an
+    expression reads must hold a bool, int or float.
+    """
+
+    if not expression.options:
+        return expression
+
+    class _Bind(ast.NodeTransformer):
+        def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+            name = field_reference(node, message="")
+            if not name.startswith(OPTIONS_PREFIX):
+                return node
+            value = values(name.removeprefix(OPTIONS_PREFIX))
+            if type(value) not in (bool, int, float):
+                raise ValueError(
+                    f"expression {expression.source!r} reads {name}, which is "
+                    f"not a number: {value!r}"
+                )
+            return ast.copy_location(ast.Constant(value), node)
+
+    tree = ast.fix_missing_locations(_Bind().visit(copy.deepcopy(expression.tree)))
+    return _compile_expression(ast.unparse(tree), tree, None)
 
 
 def field_reference(

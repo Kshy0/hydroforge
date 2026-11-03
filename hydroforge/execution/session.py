@@ -32,7 +32,11 @@ from hydroforge.core.time import (
 from hydroforge.declare.initial import evaluate_after_init, materialize_declared
 from hydroforge.declare.module import AbstractModule, construct_module
 from hydroforge.declare.spec import ModuleBinding
-from hydroforge.execution.channel import LocalChannel, ProcessGroupChannel
+from hydroforge.execution.channel import (
+    LocalChannel,
+    PeerFailureError,
+    ProcessGroupChannel,
+)
 from hydroforge.execution.checkpoint import CheckpointRuntime
 from hydroforge.execution.context import managed_step_active, model_call
 from hydroforge.execution.inputs import InputBinding, prepare_payloads, shard_inputs
@@ -40,6 +44,7 @@ from hydroforge.execution.namespace import bind_field_owners, bind_namespace
 from hydroforge.execution.progress import ProgressRuntime, ProgressState
 from hydroforge.execution.runtime import ModelExecution
 from hydroforge.execution.signatures import compiled_signature, declaration_signature
+from hydroforge.execution.status import DeviceStatus
 from hydroforge.execution.step import compile_step_policies
 from hydroforge.execution.structure import (
     StructuralUpdateContext,
@@ -165,6 +170,8 @@ class ModelRuntime:
         self.parameters = None
         self.halo = None
         self.slab = None
+        # This rank's share of each located entity dimension (cut_located).
+        self.located: dict[str, Any] = {}
         self.topology = None
         self._halo_layouts: dict[int, tuple[Any, Any]] = {}
         self.fixed_parameters: Mapping[str, frozenset[str]] = MappingProxyType({})
@@ -422,13 +429,19 @@ class ModelRuntime:
                     ) from error
                 raise
         error: BaseException | None = None
+        # ``initialize_model_state`` may run collectives: until every rank
+        # closed it, a failure is published where peers may wait for it.
+        self._body_open = True
         try:
             from hydroforge.kernels.emulated import factories
 
+            self.channel.open_body()
             with factories(self.plan.metal_emulation):
                 self._build()
         except BaseException as caught:
             error = caught
+            if self._body_open:
+                error = self._close_body(error)
         if distributed:
             self._commit(error)
             return
@@ -441,6 +454,13 @@ class ModelRuntime:
                 ) from error
             raise error
         self.state = "materialized"
+
+    def _close_body(self, error: BaseException | None) -> BaseException | None:
+        """End initialization on every rank at once (``Channel.close_body``):
+        its collectives are over, or a failure reached every rank."""
+
+        self._body_open = False
+        return self.channel.close_body(error)
 
     def _preflight(self) -> None:
         """Prove every rank will materialize the same declaration and inputs."""
@@ -500,11 +520,14 @@ class ModelRuntime:
             else Topology.single(plan.spatial_world_size)
         )
         self.partition = PartitionRuntime(plan, self.input, self.topology)
-        from hydroforge.execution.slab import build_slab
+        from hydroforge.execution.slab import build_slab, cut_located
 
         self.slab = build_slab(plan, self.input, self.topology)
         # Every input-dependent check completes before any output side effect.
-        payloads = prepare_payloads(self, owner.prepare_model_input(shard_inputs(self)))
+        # The model's hook sees complete located tables; the rank keeps its own.
+        payloads = prepare_payloads(
+            self, cut_located(self, owner.prepare_model_input(shard_inputs(self)))
+        )
         changes = LocalParameterCompiler(self, payloads).compile(plan.parameters)
         directory = plan.output.directory
         if directory is not None:
@@ -567,6 +590,12 @@ class ModelRuntime:
             f"{name}.{field}" for name, fields in missing.items() for field in fields
         )
         self._construct_modules(payloads, missing)
+        # Every rank built its modules before collective setup (the halo,
+        # initialization collectives) can wait for one that failed: a
+        # failure published from here on reaches this agreement.
+        self.channel.preflight(
+            None, phase="runtime.modules", scope="distributed module construction"
+        )
         self._build_halo()
         modules = tuple(self.modules[name] for name in plan.module_order)
         for module in modules:
@@ -583,8 +612,16 @@ class ModelRuntime:
         execution.step_fields.prepare_initial(
             self.clock.current_time, self.clock.next_step_seconds
         )
+        execution.status = DeviceStatus.declared(self)
         with model_call(execution):
             owner.initialize_model_state()
+        # Initialization kernels report like a step's, but before the commit.
+        failure = execution.status.wait()
+        if failure is not None:
+            raise failure
+        failure = self._close_body(None)
+        if failure is not None:
+            raise failure
         evaluate_after_init(modules)
         self.checkpoint = CheckpointRuntime(self)
         if plan.output.declaration is not None:
@@ -725,13 +762,17 @@ class ModelRuntime:
 
         world_size = self.plan.world_size
         signature: tuple[Any, ...] | None = None
-        if initialization_error is None:
+        peer_failure = isinstance(initialization_error, PeerFailureError)
+        if peer_failure:
+            # The failed peer reports what happened.
+            initialization_error = None
+        if initialization_error is None and not peer_failure:
             try:
                 signature = compiled_signature(self)
             except BaseException as error:
                 initialization_error = error
         run_id_candidate: str | None = None
-        if initialization_error is None and self.plan.rank == 0:
+        if initialization_error is None and not peer_failure and self.plan.rank == 0:
             try:
                 run_id_candidate = str(uuid4())
             except BaseException as error:
@@ -837,6 +878,10 @@ class ModelRuntime:
         failure = execution.failure
         if failure is not None:
             raise execution.poisoned_error(failure)
+        status = execution.status.poll()
+        if status is not None:
+            execution.poison(status, phase="device error status")
+            raise status
 
     def update_structure(self) -> StructuralUpdateResult | None:
         """Run the ordered module structure pass and commit one staged update."""
@@ -940,8 +985,19 @@ class ModelRuntime:
 
         if self.state != "materialized":
             return
+        # The last steps' reports, which no later step will read.
+        status: BaseException | None = None
+        if self.execution.failure is None:
+            try:
+                status = self.execution.status.wait()
+            except BaseException as error:
+                status = error
         failures = self._release()
         self.state = "closed"
         if failures:
-            error = ResourceCleanupError("model resources", failures)
+            error = ResourceCleanupError(
+                "model resources", (*failures, *(() if status is None else (status,)))
+            )
             raise error from failures[0]
+        if status is not None:
+            raise status

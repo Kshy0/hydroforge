@@ -19,7 +19,7 @@ from collections.abc import Mapping
 
 import torch
 
-from hydroforge.core.expr import Expression, field_reference
+from hydroforge.core.expr import Expression, field_reference, field_view
 from hydroforge.kernels.codegen.ir import (
     Binary,
     Call,
@@ -109,6 +109,9 @@ class _Lowering:
                 return Const(float(node.value), self.dtype)
             case ast.Call(func=ast.Name(id="where")):
                 return self.select(*node.args)
+            case ast.Subscript() | ast.Call(func=ast.Name(id="take")):
+                # The caller binds every view by its canonical spelling.
+                return Cast(self.names[field_view(node).key], self.dtype)
             case ast.Call():
                 return Call(
                     _FUNCTIONS[node.func.id],
@@ -129,6 +132,7 @@ class _Lowering:
 def lower_expression(
     expression: Expression, names: Mapping[str, Expr], dtype: torch.dtype
 ) -> Expr:
-    """Lower ``expression`` evaluated in ``dtype``; ``names`` bind its fields."""
+    """Lower ``expression`` evaluated in ``dtype``; ``names`` bind its fields
+    and its views (by :attr:`FieldView.key <hydroforge.core.expr.FieldView>`)."""
 
     return Cast(_Lowering(names, dtype).visit(expression.tree.body), dtype)

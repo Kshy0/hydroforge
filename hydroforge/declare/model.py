@@ -41,7 +41,7 @@ from hydroforge.contracts.step_fields import (
     compile_step_field_expressions,
     validate_step_field_providers,
 )
-from hydroforge.contracts.views import GridAxis, Out, OutputView
+from hydroforge.contracts.views import GridAxis, Out, OutputUnion, OutputView
 from hydroforge.contracts.windows import StatisticsPlan
 from hydroforge.core.events import ConsoleEventSink, EventSink
 from hydroforge.core.expr import parse_operation, parse_value_source
@@ -272,11 +272,12 @@ class OutputConfig(HydroForgeModel):
             "Out(name, expression=..., view=...)]}."
         ),
     )
-    views: FrozenMapping[Identifier, OutputView] = Field(
+    views: FrozenMapping[Identifier, OutputView | OutputUnion] = Field(
         default_factory=dict,
         description=(
-            "Named spatial extents of outputs over global grid-axis indices, "
-            "referenced by Out(..., view=name)."
+            "Named spatial extents of outputs over global grid-axis indices "
+            "(axis ranges, paired points, or their union with |), referenced "
+            "by Out(..., view=name)."
         ),
     )
     statistics_plan: InstanceOf[StatisticsPlan] | None = Field(

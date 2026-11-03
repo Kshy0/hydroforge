@@ -505,6 +505,15 @@ def _create_output_files(
                     "long_name", f"global logical index of {dimension}"
                 )
                 axis_coordinate[:] = indices
+            for dimension, variable_name, values in schema.axis_coordinates:
+                axis_coordinate = ncfile.createVariable(
+                    variable_name, "i8", (dimension,)
+                )
+                axis_coordinate.setncattr(COMPLETE_DATA_ATTR, "true")
+                axis_coordinate.setncattr(
+                    "long_name", f"global logical index of each {dimension} cell"
+                )
+                axis_coordinate[:] = values
 
             # Write user-supplied static per-point variables. Coordinate scope
             # decides applicability; once applicable, dimension mismatch is a

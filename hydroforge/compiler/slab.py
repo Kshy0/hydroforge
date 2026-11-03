@@ -50,6 +50,64 @@ def slab_tokens(slab: SlabAxis, grid_axes: Mapping[str, GridAxis]) -> dict[str, 
     return tokens
 
 
+@dataclass(frozen=True, slots=True)
+class LocatedDim:
+    """Entities of one dimension, located on a grid by a ``grid_index`` table.
+
+    ``index`` (a qualified field name) holds each entity's flat row-major
+    index into the grid of dimensions ``grid``; every field naming ``dim``
+    describes the same entities. ``axis`` and ``kind`` place the slab axis
+    in ``grid`` (``None`` without a slab axis there): on several ranks each
+    keeps the entities in the rows it owns.
+    """
+
+    dim: str
+    index: str
+    grid: tuple[str, ...]
+    axis: int | None = None
+    kind: str | None = None
+
+
+def compile_located(
+    entries: Iterable[FieldEntry],
+    slab: SlabAxis | None,
+    grid_axes: Mapping[str, GridAxis],
+) -> Mapping[str, LocatedDim]:
+    """The located entity dimensions of the active fields, by dimension."""
+
+    tokens = {} if slab is None else slab_tokens(slab, grid_axes)
+    found: dict[str, LocatedDim] = {}
+    for entry in entries:
+        grid = tuple(bare(item) for item in entry.tensor.grid_index)
+        if not grid:
+            continue
+        dim = bare(entry.tensor.shape[0])
+        if dim in found:
+            raise ValueError(
+                f"entities {dim!r} are located by both {found[dim].index!r} and "
+                f"{entry.qualified!r}; one grid_index table locates a dimension"
+            )
+        if dim in tokens or dim in grid:
+            raise ValueError(
+                f"{entry.qualified!r} locates entities of a grid dimension {dim!r}"
+            )
+        hits = [position for position, item in enumerate(grid) if item in tokens]
+        if slab is not None and len(hits) != 1:
+            raise ValueError(
+                f"{entry.qualified!r} locates entities on grid {grid}, which must "
+                f"name the slab axis {slab.dim!r} (or an axis of it) exactly once"
+            )
+        axis = hits[0] if hits else None
+        found[dim] = LocatedDim(
+            dim,
+            entry.qualified,
+            grid,
+            axis,
+            None if axis is None else tokens[grid[axis]],
+        )
+    return MappingProxyType(found)
+
+
 def compile_slab(
     entries: Iterable[FieldEntry],
     slab: SlabAxis | None,

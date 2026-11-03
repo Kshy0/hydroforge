@@ -291,7 +291,10 @@ class StatisticsRuntime:
         for variable in ir.variables:
             if variable.output_group != "__full__":
                 bind_model(variable.output_group)
-            for item in self._statistics_layouts[variable.name].axes or ():
+            layout = self._statistics_layouts[variable.name]
+            if layout.gather is not None:
+                bind_model(layout.gather)
+            for item in layout.axes or ():
                 if item.table is not None:
                     bind_model(item.table)
             for dim_name in variable.tensor_shape:
@@ -511,7 +514,7 @@ class StatisticsRuntime:
                     "output_coord": output_coord,
                     "dim_coords": dim_coords,
                     "axes": tuple(
-                        (axis.name, axis.indices)
+                        (axis.name, axis.indices, axis.coordinates)
                         for axis in field_info.output_axes or ()
                     ),
                     "description": f"{description} ({op})",

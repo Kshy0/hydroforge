@@ -723,7 +723,9 @@ def predicate_scope(context: Any, *, maximum_steps: int) -> _PredicateScope:
     The body must write ``frame.continue_flag`` on every iteration.  The loop
     executes at least once and stops when that scalar becomes zero or after
     ``maximum_steps`` iterations.  It must be nested inside the one lexical
-    fixed substep owned by the managed step.
+    fixed substep owned by the managed step, whose time its body inherits:
+    substep fields there bind to that substep (``frame.index`` counts the
+    predicate's own iterations).
     """
 
     request = _PredicateLoopRequest(maximum_steps=maximum_steps)

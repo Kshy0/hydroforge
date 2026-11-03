@@ -21,7 +21,9 @@ from hydroforge.core.errors import (
 )
 from hydroforge.core.events import emit
 from hydroforge.execution.binding import KernelBinder
+from hydroforge.execution.context import ACTIVE_MODEL
 from hydroforge.execution.executors import EagerExecutor, select_executor
+from hydroforge.execution.status import DeviceStatus
 from hydroforge.execution.step_fields import StepFieldRuntime
 from hydroforge.kernels.calls import routing
 from hydroforge.kernels.toolchain import CompileRequest
@@ -57,6 +59,8 @@ class ModelExecution:
                 device=str(plan.device),
             )
         self.kernel_binding = KernelBinder(runtime)
+        # Declared device error statuses, watched once modules exist.
+        self.status = DeviceStatus()
         self.tf32 = precisions_of(plan).tf32
         self.step_fields = StepFieldRuntime(plan, executor=self.executor)
         self.step_policies: dict[Any, Any] = {}
@@ -76,12 +80,17 @@ class ModelExecution:
     @contextmanager
     def model_call(self) -> Iterator[None]:
         """The scope of model code: initialization, managed steps and
-        between-steps methods. Registered kernels bind to this model, and
-        torch float32 matrix products follow its compute tier (TF32 for
-        ``tf32``, IEEE otherwise)."""
+        between-steps methods. Registered kernels bind to this model,
+        collectives agree through its rank channel, and torch float32 matrix
+        products follow its compute tier (TF32 for ``tf32``, IEEE
+        otherwise)."""
 
-        with routing(self.kernel_binding), matmul_scope(self.tf32):
-            yield
+        token = ACTIVE_MODEL.set(self)
+        try:
+            with routing(self.kernel_binding), matmul_scope(self.tf32):
+                yield
+        finally:
+            ACTIVE_MODEL.reset(token)
 
     def take_pending(self) -> list[CompileRequest]:
         """Programs the model will launch that no compile batch has taken.

@@ -35,7 +35,9 @@ from hydroforge.core.events import emit
 from hydroforge.data.input import InputProxy
 from hydroforge.io.construction_input import (
     SLAB_COORDINATES,
+    located_coordinate,
     merge_construction_parts,
+    transient_coordinate,
     write_construction_input,
 )
 from hydroforge.io.files import atomic_output_path, publish_file
@@ -202,11 +204,31 @@ class CheckpointRuntime:
                 return info
         return None
 
+    def _located(self, name: str) -> tuple[Any, int] | None:
+        """This rank's located entities a field describes, and the position
+        of their dimension in its shape (``None``: not cut by entity)."""
+
+        runtime = self.runtime
+        if not runtime.located:
+            return None
+        spec = runtime.input.fields.get(name)
+        if spec is None or spec.field.tensor is None:
+            return None
+        for position, token in enumerate(spec.field.tensor.shape):
+            if isinstance(token, str):
+                located = runtime.located.get(token.rsplit(".", 1)[-1])
+                if located is not None:
+                    return located, position
+        return None
+
     def _local_indices(self, name: str) -> np.ndarray | None:
         runtime = self.runtime
         info = self._slab_field(name)
         if info is not None:
             return runtime.slab.global_rows(info.kind)
+        located = self._located(name)
+        if located is not None:
+            return located[0].positions
         group = runtime.plan.fields.variable_groups.get(name)
         return None if group is None else runtime.partition.rank_indices(group)
 
@@ -242,6 +264,11 @@ class CheckpointRuntime:
             return self._local_input_value(field.name)
         if field.info.tensor is None:
             return value
+        located = self._located(field.name)
+        if located is not None and located[0].index == field.name:
+            # The complete table indexes the global grid.
+            local = value.detach().cpu().numpy()
+            return located[0].global_index(local).astype(local.dtype)
         return self._owned(field.name, value, len(field.info.tensor.shape))
 
     def _compile_input_fields(self) -> tuple[_InputField, ...]:
@@ -291,9 +318,15 @@ class CheckpointRuntime:
                 shape = metadata[0]
                 dtype = self._numpy_dtype(name, metadata[1])
             coordinate = groups.get(name)
+            position = 0
             slab_info = self._slab_field(name)
+            located = self._located(name)
             if slab_info is not None:
                 coordinate = SLAB_COORDINATES[slab_info.kind]
+                position = slab_info.position
+            elif located is not None:
+                coordinate = located_coordinate(located[0].dim)
+                position = located[1]
             fields[name] = _InputField(
                 name=name,
                 module_name=info.module_name,
@@ -305,9 +338,7 @@ class CheckpointRuntime:
                 partition_axis=(
                     None
                     if coordinate is None
-                    else len(shape)
-                    - len(info.tensor.shape)
-                    + (0 if slab_info is None else slab_info.position)
+                    else len(shape) - len(info.tensor.shape) + position
                 ),
             )
         return tuple(fields[name] for name in sorted(fields))
@@ -368,6 +399,14 @@ class CheckpointRuntime:
                 # The owned global rows identify every part's rows; the merge
                 # joins parts by them and does not keep them.
                 values[coordinate] = slab.global_rows(kind)
+                groups[coordinate] = coordinate
+                distributed.append(coordinate)
+        for dim, located in runtime.located.items():
+            coordinate = located_coordinate(dim)
+            if coordinate in set(groups.values()):
+                # Each entity's place in the complete table, where the merge
+                # puts it back.
+                values[coordinate] = located.positions.astype(np.int64)
                 groups[coordinate] = coordinate
                 distributed.append(coordinate)
         for coordinate in sorted(set(groups.values())):
@@ -530,12 +569,17 @@ class CheckpointRuntime:
         stage_error: BaseException | None = None
         try:
             runtime.require_healthy(f"{type(runtime.owner).__name__}.save_state")
+            # No state a kernel reported as failed is saved.
+            status = runtime.execution.status.wait()
+            if status is not None:
+                runtime.execution.poison(status, phase="device error status")
+                raise status
             # Validate the layout before any side effect (statistics flush).
             for field in self.plan.fields:
                 if (
                     field.coordinate is not None
                     and field.partition_axis != 0
-                    and field.coordinate not in SLAB_COORDINATES.values()
+                    and not transient_coordinate(field.coordinate)
                 ):
                     raise ValueError(
                         f"checkpoint field {field.name!r} is partitioned on axis "

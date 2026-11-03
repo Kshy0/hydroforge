@@ -45,6 +45,7 @@ from hydroforge.contracts.views import (
     GridAxis,
     Indices,
     Out,
+    OutputUnion,
     OutputView,
     Range,
 )
@@ -75,6 +76,7 @@ __all__ = [
     "OptionRef",
     "OptionsConfig",
     "Out",
+    "OutputUnion",
     "OutputView",
     "ParameterChange",
     "Range",

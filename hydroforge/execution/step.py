@@ -564,8 +564,13 @@ class _StepPolicy:
             channel.abort()
             raise preflight.error
         failure = execution.failure
-        if failure is not None:
-            error = execution.poisoned_error(failure)
+        # A fatal condition earlier kernels reported (the device finished
+        # copying it) fails this step on every rank.
+        status = None if failure is not None else execution.status.poll()
+        if status is not None:
+            execution.poison(status, phase="device error status")
+        if failure is not None or status is not None:
+            error = status if status is not None else execution.poisoned_error(failure)
             try:
                 channel.abort()
             except BaseException as coordination_error:
@@ -633,6 +638,8 @@ class _StepPolicy:
                 if statistics is not None and statistics.step_closes:
                     channel.event(StepEvent.USER_STEP_COMPLETE)
                 context.finish()
+                # Read by a later step once the device gets there.
+                execution.status.watch()
                 if statistics is not None:
                     statistics.sink.poll(current_time)
                 if progress is not None and progress.progress_tick(step):

@@ -40,7 +40,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import prod
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
@@ -331,7 +331,12 @@ def _gated(mask: int | None, control: Param) -> tuple[tuple[Param, ...], tuple]:
 
 
 class _Values:
-    """Loads and expressions of one sample, each computed once."""
+    """Loads and expressions of one sample, each computed once.
+
+    ``offset`` addresses a buffer at the sample's element; ``element`` gives
+    the sample's member (``None`` without members) and its element in the
+    expression's logical shape, from which views address their fields.
+    """
 
     def __init__(
         self,
@@ -341,6 +346,7 @@ class _Values:
         prefix: str,
         dtype: torch.dtype,
         offset: Callable[[str], Expr],
+        element: Callable[[], tuple[Expr | None, Expr]] | None = None,
     ) -> None:
         self.context = context
         self.sources = lowering.ir.sources
@@ -348,16 +354,61 @@ class _Values:
         self.prefix = prefix
         self.dtype = dtype
         self.offset = offset
+        self.element = element
         self.statements: list[Stmt] = []
-        self.values: dict[str, Var] = {}
+        self.values: dict[Any, Var] = {}
 
     def expression(
-        self, expression: Expression, dtype: torch.dtype | None = None
+        self,
+        expression: Expression,
+        dtype: torch.dtype | None = None,
+        owner: str | None = None,
     ) -> Expr:
-        names = {name: self.value(name) for name in expression.dependencies}
+        names = {name: self.value(name) for name in expression.operands}
+        for view in expression.views:
+            names[view.key] = self.view(owner, view.key)
         return lower_expression(
             expression, names, self.dtype if dtype is None else dtype
         )
+
+    def view(self, owner: str | None, key: str) -> Var:
+        """The value a view of expression ``owner`` reads at this sample."""
+
+        known = self.values.get((owner, key))
+        if known is not None:
+            return known
+        if owner is None or self.element is None:
+            raise ValueError(f"{key} is not available in this statistics kernel")
+        geometry = self.context.layouts[owner].views[key]
+        member, element = self.element()
+        prefix = f"{self.prefix}_{self.context.symbol(geometry.field)}_view"
+        if geometry.index is not None:
+            index = self.context.buffer(geometry.index)
+            row = cast(Load(geometry.index, element, index.dtype), _INDEX)
+        else:
+            row = _view_source(
+                element,
+                geometry.shape,
+                geometry.field_shape,
+                tuple(
+                    AxisMap(start=start, step=step)
+                    for start, step in zip(geometry.starts, geometry.steps, strict=True)
+                ),
+                self.names,
+                prefix,
+                self.statements,
+            )
+        offset = row
+        if geometry.batched:
+            plane = Const(prod(geometry.field_shape), _INDEX)
+            offset = Binary("+", Binary("*", member, plane), row)
+        dtype = self.context.buffer(geometry.field).dtype
+        local = self.names.var(prefix, dtype)
+        self.statements.append(
+            Let(local, cast(Load(geometry.field, offset, dtype), dtype))
+        )
+        self.values[(owner, key)] = local
+        return local
 
     def value(self, name: str) -> Var:
         known = self.values.get(name)
@@ -368,7 +419,7 @@ class _Values:
             # Preserve each virtual field's resolved precision boundary. The
             # consumer's expression casts this value to its own arithmetic type.
             dtype = self.context.layouts[name].dtype
-            value = self.expression(source.expression, dtype)
+            value = self.expression(source.expression, dtype, owner=name)
         else:
             key = (
                 source.name
@@ -711,7 +762,7 @@ def _variable(
         return context.member_stride(key, rank) != 0
 
     match variable.layout:
-        case OutputLayout.FULL if layout.axes is not None:
+        case OutputLayout.FULL if layout.axes is not None or layout.gather is not None:
             # A view or the owned rows: decompose the output element and
             # read each axis through its rows.
             offset = LINEAR
@@ -727,21 +778,23 @@ def _variable(
                 addressing.append(
                     Let(element, Binary("%", LINEAR, Const(plane, _INDEX)))
                 )
-            source = _view_source(
-                element,
-                output_shape,
-                source_shape,
-                layout.axes,
-                names,
-                prefix,
-                addressing,
-            )
+            if layout.gather is not None:
+                source = names.var(f"{prefix}_point", _INDEX)
+                addressing.append(Let(source, Load(layout.gather, element, _INDEX)))
+            else:
+                source = _view_source(
+                    element, output_shape, source_shape, layout.axes,
+                    names, prefix, addressing,
+                )
             source_plane = Const(prod(source_shape), _INDEX)
 
             def source_offset(key: str) -> Expr:
                 if member is None or not batched_key(key):
                     return source
                 return Binary("+", Binary("*", member, source_plane), source)
+
+            def element_at() -> tuple[Expr | None, Expr]:
+                return member, source
 
         case OutputLayout.FULL:
             offset = LINEAR
@@ -752,12 +805,21 @@ def _variable(
                     return LINEAR
                 return Binary("%", LINEAR, Const(plane, _INDEX))
 
+            def element_at() -> tuple[Expr | None, Expr]:
+                if not layout.batched:
+                    return None, LINEAR
+                plane = Const(prod(source_shape), _INDEX)
+                return Binary("/", LINEAR, plane), Binary("%", LINEAR, plane)
+
         case OutputLayout.INDEXED_VECTOR:
             offset = names.var(f"{prefix}_offset", _INDEX)
             statements.append(Let(offset, _saved_offset()))
 
             def source_offset(key: str) -> Expr:
                 return _member_offset(context.member_stride(key), SOURCE)
+
+            def element_at() -> tuple[Expr | None, Expr]:
+                return MEMBER, SOURCE
 
         case _:
             levels = prod(output_shape[1:])
@@ -788,6 +850,9 @@ def _variable(
                 point = _member_offset(context.member_stride(key, rank), SOURCE)
                 return Binary("+", Binary("*", point, row), inner)
 
+            def element_at() -> tuple[Expr | None, Expr]:
+                return MEMBER, Binary("+", Binary("*", SOURCE, row), inner)
+
     weights = (
         StoragePlan.sample_weight(name),
         StoragePlan.inner_weight(name, Reduction.MEAN),
@@ -810,7 +875,7 @@ def _variable(
     )
     head = tuple(statements)
     statements.extend(addressing)
-    values = _Values(context, lowering, names, prefix, dtype, source_offset)
+    values = _Values(context, lowering, names, prefix, dtype, source_offset, element_at)
     value = values.value(name)
     statements.extend(values.statements)
     statements.extend(variable_update(name, variable.operations, value, dtype, ctx))
@@ -854,6 +919,9 @@ def _group(
     for key in inputs:
         buffers.setdefault(key, Param(key, context.buffer(key).dtype, "read"))
     for variable in variables:
+        gather = context.layouts[variable.variable.name].gather
+        if gather is not None:
+            buffers.setdefault(gather, Param(gather, context.buffer(gather).dtype, "read"))
         for item in context.layouts[variable.variable.name].axes or ():
             if item.table is not None:
                 buffers.setdefault(

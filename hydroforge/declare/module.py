@@ -38,9 +38,11 @@ from pydantic import (
     PrivateAttr,
     TypeAdapter,
     ValidationInfo,
-    computed_field,
     model_validator,
     validate_call,
+)
+from pydantic import (
+    computed_field as pydantic_computed_field,
 )
 
 from hydroforge.contracts.fields import TensorDependencies, TensorMetadata
@@ -134,6 +136,7 @@ def TensorField(
     le: float | None = None,
     lt: float | None = None,
     halo: bool = False,
+    grid_index: tuple[str, ...] = (),
 ) -> Any:
     """
     Create a tensor field with shape information directly in AbstractModule.
@@ -194,6 +197,16 @@ def TensorField(
                  axis holds the partition key's rows. Only such fields are
                  exchanged and size the halo's message slots; other fields
                  keep their ghost rows untouched.
+        grid_index: The dimensions of a grid, e.g. ``("nrows", "ncols")``:
+                 the field (a one-dimensional integer topology table) holds
+                 flat row-major indices of that grid's cells, so its entries
+                 are entities located on the grid (point sources, gauges).
+                 Every field naming its dimension describes the same
+                 entities. With a slab axis among the grid's dimensions each
+                 rank keeps the entities in its own rows, renumbered to its
+                 stored grid; ``prepare_model_input`` still sees the complete
+                 tables with global indices, and checkpoints save them
+                 complete (see :class:`hydroforge.contracts.SlabAxis`).
 
     ``finite`` and the bounds are checked once, when the model materializes,
     for stored non-forcing fields.
@@ -239,6 +252,7 @@ def TensorField(
         units=units,
         finite=finite,
         halo=halo,
+        grid_index=tuple(grid_index),
         **{
             name: None if bound is None else float(bound)
             for name, bound in bounds.items()
@@ -496,6 +510,28 @@ def _property_function(prop: Any) -> Any:
     return prop
 
 
+def computed_field(description: str):
+    """Declare a derived scalar cached on first read per module instance.
+
+    Use for dimensions and other values fixed for the module's lifetime.
+    Decorate the getter itself; no ``cached_property`` is needed. The field
+    keeps Pydantic's computed-field discovery and serialization metadata.
+    Dependencies are not tracked and do not invalidate this cache.
+    """
+
+    def decorate(getter: Any) -> Any:
+        if isinstance(getter, (property, cached_property)):
+            raise TypeError(
+                "computed_field caches its getter; decorate the function "
+                "itself, not a property or cached_property"
+            )
+        return pydantic_computed_field(
+            cached_property(getter), description=description
+        )
+
+    return decorate
+
+
 def computed_tensor_field(
     description: str,
     shape: tuple[str | int, ...],
@@ -514,6 +550,8 @@ def computed_tensor_field(
     materialize: TensorDependencies = None,
     after_init: bool = False,
     halo: bool = False,
+    errors: Mapping[int, str] | None = None,
+    error_info: tuple[str, ...] = (),
 ):
     """
     Create a computed tensor field with shape information for AbstractModule.
@@ -565,6 +603,9 @@ def computed_tensor_field(
         after_init: For computed state, evaluate it from the state that
             ``initialize_model_state`` initialized instead of at construction.
         halo: ``True`` for a field halo exchanges carry (as ``TensorField``).
+        errors, error_info: The codes of a device error status, their
+            meanings and its info values; see :func:`ErrorField`, which
+            declares one.
     """
     if category not in _COMPUTED_CATEGORIES:
         raise ValueError(
@@ -586,8 +627,10 @@ def computed_tensor_field(
         materialize=materialize,
         after_init=after_init,
         halo=halo,
+        errors=() if errors is None else tuple(sorted(errors.items())),
+        error_info=tuple(error_info),
     )
-    declare = computed_field(description=description)
+    declare = pydantic_computed_field(description=description)
 
     def decorate(getter: Any) -> Any:
         if isinstance(getter, property):
@@ -605,6 +648,59 @@ def computed_tensor_field(
         return declare(getter)
 
     return decorate
+
+
+def ErrorField(
+    description: str,
+    errors: Mapping[int, str],
+    *,
+    info: tuple[str, ...] = (),
+    depends_on: TensorDependencies = None,
+    required_by: TensorDependencies = None,
+) -> Any:
+    """Declare a device error status the module's kernels report through.
+
+    ``errors`` maps every code (a positive int32) to its meaning; ``info``
+    names the values the first failure records with its code, one int32
+    word each (where it happened, say a cell index). The field is one int32
+    tensor, zero when the module is built: ``[failures, code, *info]``.
+    Kernels bind it by name like any field (``<name>_ptr: "read_write"``).
+    A failing thread counts itself, and the one that finds the count zero
+    is the first failure, which stores the code and the info::
+
+        // CUDA
+        if (failed && atomicAdd(status, 1) == 0) {
+            status[1] = CODE;
+            status[2] = cell;
+        }
+
+        # Triton
+        report_error(status_ptr, failed, CODE, cells)  # triton_errors
+
+    HydroForge watches the status without stopping the device
+    (:mod:`hydroforge.execution.status`): a failure fails the next managed
+    step, or a checkpoint save, on every rank with a
+    :class:`~hydroforge.core.errors.DeviceStatusError` naming the first
+    failure, its info values and how many failures followed. Models neither
+    clear nor read the status themselves.
+    """
+
+    words = 2 + len(info)
+
+    def status(self) -> torch.Tensor | None:
+        return torch.zeros(words, dtype=torch.int32, device=self.device)
+
+    return computed_tensor_field(
+        description,
+        (words,),
+        dtype="idx",
+        category="shared_state",
+        output="disabled",
+        depends_on=depends_on,
+        required_by=required_by,
+        errors=errors,
+        error_info=tuple(info),
+    )(status)
 
 
 def _declared_attributes(owner: type) -> dict[str, Any]:

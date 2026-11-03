@@ -18,7 +18,12 @@ from pydantic import BaseModel
 
 from hydroforge.compiler.partition import compile_partition
 from hydroforge.compiler.selection import Selection
-from hydroforge.compiler.slab import SlabField, compile_slab
+from hydroforge.compiler.slab import (
+    LocatedDim,
+    SlabField,
+    compile_located,
+    compile_slab,
+)
 from hydroforge.contracts.conditions import conditions_satisfied
 from hydroforge.contracts.fields import (
     FieldDemandPlan,
@@ -163,6 +168,8 @@ class FieldPlan:
     partition: PartitionSchema
     variable_groups: Mapping[str, str]
     slab: Mapping[str, SlabField]
+    # Entity dimensions located on a grid by a ``grid_index`` table.
+    located: Mapping[str, LocatedDim]
     inverse_sources: frozenset[str]
     inputs: Mapping[str, InputFieldSpec]
     binding: Mapping[str, tuple[BindingSource, ...]]
@@ -643,6 +650,15 @@ def plan_fields(
         partition=partition,
         variable_groups=variable_groups,
         slab=compile_slab(
+            (
+                entry
+                for entry in entries.values()
+                if entry.active and not entry.reference_index
+            ),
+            spec.slab,
+            spec.grid_axes,
+        ),
+        located=compile_located(
             (
                 entry
                 for entry in entries.values()

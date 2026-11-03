@@ -143,9 +143,12 @@ class AbstractModel(ModelDeclaration, ABC):
     def prepare_model_input(self, values: dict[str, Any]) -> dict[str, Any]:
         """Return this rank's module input values before modules are built.
 
-        ``values`` holds every present input field, already rank-sliced.
-        Override to add model-derived construction values; the default
-        returns them unchanged.
+        ``values`` holds every present input field, already rank-sliced,
+        except the tables of entities located on the grid
+        (``TensorField(grid_index=...)``): they are complete, with indices
+        into the global grid, so this hook can check them whole; the rank's
+        own entities are kept afterwards. Override to add model-derived
+        construction values; the default returns them unchanged.
         """
 
         return values
@@ -186,11 +189,12 @@ class AbstractModel(ModelDeclaration, ABC):
         """Construction values a checkpoint saves instead of the live ones.
 
         A model whose ``prepare_model_input`` gives each rank only its share
-        of a global table (the point sources inside a slab, say) returns the
-        complete tables by field name, identical on every rank, so a
-        checkpoint restarts on any number of ranks. Called once per
-        materialization, after the model initialized; every save then writes
-        the current values of the returned tensors and arrays.
+        of a global table returns the complete tables by field name,
+        identical on every rank, so a checkpoint restarts on any number of
+        ranks (tables declared with ``grid_index`` need nothing here: the
+        framework saves them complete). Called once per materialization,
+        after the model initialized; every save then writes the current
+        values of the returned tensors and arrays.
         """
 
         return MappingProxyType({})
@@ -202,6 +206,14 @@ class AbstractModel(ModelDeclaration, ABC):
         ``missing_inputs``; registered kernels may run here. Parameters and
         topology stay as read. Computed state declared ``after_init=True`` is
         evaluated afterwards (see :mod:`hydroforge.declare.initial`).
+
+        Every rank runs it after its partition, slab and halo exist (ghost
+        rows a kernel's ``halo`` reads are mirrored as in a step), so it may
+        reduce across ranks: ``all_reduce_(tensor, reduction="max")`` turns a
+        rank's partial result into the global one. Every rank must call the
+        same collectives in the same order, as in a managed step; each call
+        checks that, and a rank that fails before or between them fails
+        every rank's materialization instead of leaving one waiting.
         """
 
     def release_model_state(self) -> None:

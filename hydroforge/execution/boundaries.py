@@ -21,6 +21,7 @@ from hydroforge.core.errors import (
     distributed_failure_error,
 )
 from hydroforge.core.validation import HydroForgeModel
+from hydroforge.execution.channel import PeerFailureError
 from hydroforge.execution.context import (
     managed_step_active,
     model_call,
@@ -68,7 +69,9 @@ def between_steps(function: _F) -> _F:
     In a distributed run every rank must call the same between-step APIs in
     the same order. Arguments are this rank's own data (for example its
     spatial shard of new inputs): the framework compares only the method
-    identity and call order across ranks, never the argument values.
+    identity and call order across ranks, never the argument values. The
+    body may run collectives (``all_reduce_``), every rank the same ones in
+    the same order, as in ``initialize_model_state``.
     """
 
     declaration = _BetweenStepsDeclaration(function=function)
@@ -155,9 +158,11 @@ def between_steps(function: _F) -> _F:
 
         result: Any = None
         body_error: BaseException | None = None
-        # Registered kernels called by the body bind like inside a step.
+        # Registered kernels called by the body bind like inside a step; its
+        # collectives are events of the rank channel, which closes the body.
         execution = runtime.execution
         try:
+            channel.open_body()
             with nullcontext() if execution is None else model_call(execution):
                 result = function(self, *args, **kwargs)
         except BaseException as error:
@@ -165,10 +170,22 @@ def between_steps(function: _F) -> _F:
 
         poison_phase = f"between-steps body:{protocol_name}"
         try:
+            # Every rank finished, or every rank learns of a failure here;
+            # then the failures themselves are exchanged.
+            closed_error = channel.close_body(body_error)
+            if closed_error is None:
+                return result
+            if isinstance(body_error, PeerFailureError):
+                # The failed peer reports what happened.
+                body_error = None
             body_failures = channel.gather(
                 body_error,
                 phase=f"between-steps.body:{protocol_name}",
             )
+            if body_error is None and not any(
+                failure is not None for failure in body_failures
+            ):
+                body_error = closed_error
         except BaseException as coordination_error:
             failure = (
                 coordination_error
@@ -182,18 +199,16 @@ def between_steps(function: _F) -> _F:
             if failure is coordination_error:
                 raise
             raise failure from coordination_error
-        if any(failure is not None for failure in body_failures):
-            failure = (
-                body_error
-                if body_error is not None
-                else distributed_failure_error(
-                    "distributed between-steps body",
-                    body_failures,
-                )
+        failure = (
+            body_error
+            if body_error is not None
+            else distributed_failure_error(
+                "distributed between-steps body",
+                body_failures,
             )
-            runtime.execution.poison(failure, phase=poison_phase)
-            raise failure
-        return result
+        )
+        runtime.execution.poison(failure, phase=poison_phase)
+        raise failure
 
     guarded.__hydroforge_between_steps__ = True
     return cast(_F, guarded)

@@ -27,6 +27,10 @@ from hydroforge.core.identity import canonical
 ACTIVE_STEP: ContextVar[Any] = ContextVar(
     "hydroforge_active_managed_step", default=None
 )
+# The model execution whose code runs on this thread: a managed step,
+# ``initialize_model_state`` or a between-steps body. Its collectives agree
+# through the runtime's rank channel.
+ACTIVE_MODEL: ContextVar[Any] = ContextVar("hydroforge_active_model", default=None)
 
 
 def managed_step_active() -> bool:

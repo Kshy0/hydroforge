@@ -105,7 +105,12 @@ def substep_field(source: SubstepFieldSource) -> SubstepField:
     from 0) or width ``dt`` in seconds (model precision).
 
     Bound only inside a substep body; ``dt`` of a fixed loop is the outer
-    step's width divided by the substep count. ``outer_ticks`` counts successful
+    step's width divided by the substep count. The fields always name the
+    nearest enclosing fixed or adaptive substep: a ``step.predicate()`` loop
+    nested in it is not a time scope and passes its time through unchanged
+    (``index`` stays the substep's; the predicate's own iteration is
+    ``frame.index`` of its loop), so kernels in the predicate body read the
+    substep's ``dt`` without a model copy of it. ``outer_ticks`` counts successful
     outer-step duration since this runtime started, ``elapsed_ticks`` locates
     the current substep within that outer step, and ``dt_ticks`` is its clock
     width. All three are int64 multiples of :data:`SUBSTEP_TICK_SECONDS`.
@@ -169,7 +174,11 @@ def compile_step_field_expressions(
             source = parse_value_source(expression, known)
         except ValueError as error:
             raise ValueError(f"device step field {name!r}: {error}") from error
-        if not isinstance(source, ExpressionSource):
+        if (
+            not isinstance(source, ExpressionSource)
+            or source.expression.views
+            or source.expression.options
+        ):
             raise ValueError("device step fields require scalar expressions")
         compiled[name] = source.expression
     order = dependency_order(

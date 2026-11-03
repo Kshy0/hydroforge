@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from functools import partial
 from types import MappingProxyType
 from typing import Any
@@ -612,19 +612,30 @@ class _OperatorRecorder:
     ) -> None:
         self.execution = execution
         self.scope_kind = scope_kind
-        # The enclosing substep's ``SubstepFrame``, bound to substep fields.
-        self.frame = frame
         self.binder = execution.kernel_binding
         self.operators: list[Any] = []
         self.references: dict[int, _StableRef | _ValueRef] = {
             id(tensor): _StableRef(tensor) for tensor in stable_tensors
         }
+        # The enclosing substep's ``SubstepFrame``, bound to substep fields.
+        self.frame: Any = None
+        if frame is not None:
+            self.adopt_frame(frame)
         self.next_value = 0
         self.snapshots: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         # Halo states and exchanges of this recording.
         from hydroforge.execution.halo_schedule import HaloSchedule
 
         self.halo_schedule = HaloSchedule(self)
+
+    def adopt_frame(self, frame: Any) -> None:
+        """Bind substep fields to ``frame``, whose controls the recording
+        reads as stable tensors."""
+
+        self.frame = frame
+        for item in fields(frame):
+            tensor = getattr(frame, item.name)
+            self.references.setdefault(id(tensor), _StableRef(tensor))
 
     def reference(self, tensor: torch.Tensor) -> _StableRef | _ValueRef:
         """Resolve one tensor actually observed by the lexical substep."""
@@ -738,7 +749,8 @@ class _OperatorRecorder:
         if frame is None:
             raise ValueError(
                 f"{registry.name} reads substep fields and may be called only "
-                "directly inside a fixed or adaptive substep body"
+                "inside a fixed or adaptive substep body, or a predicate loop "
+                "nested in one"
             )
         return {
             **arguments,
@@ -953,6 +965,12 @@ class OperatorRecording:
 
     def __enter__(self) -> OperatorRecording:
         self.parent = recording_sink()
+        frame = getattr(self.parent, "frame", None)
+        if self.recorder.frame is None and frame is not None:
+            # Substep fields name the nearest enclosing fixed or adaptive
+            # substep: a nested predicate loop is not a time scope, so its
+            # body reads the time of the substep it runs in.
+            self.recorder.adopt_frame(frame)
         schedule = getattr(self.parent, "halo_schedule", None)
         if schedule is not None:
             # A nested program finds every contribution summed.
@@ -1054,7 +1072,8 @@ def record_operator_scope(
     """Open an operator recording transaction without requiring a callback.
 
     ``frame`` is the ``SubstepFrame`` of a fixed or adaptive substep body,
-    bound to the substep fields of the kernels it calls.
+    bound to the substep fields of the kernels it calls. A recording nested
+    in another without its own frame inherits the enclosing one.
     """
     return OperatorRecording(
         execution,

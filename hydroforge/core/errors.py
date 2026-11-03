@@ -73,6 +73,11 @@ class SubstepCompileError(RuntimeError):
     """Raised when a substep contains an operator without strict lowering."""
 
 
+class DeviceStatusError(RuntimeError):
+    """Kernels reported a fatal condition through a declared error status
+    (``ErrorField``); the message names every bit that was set."""
+
+
 class UnknownFieldError(KeyError, ValueError):
     """Raised when a name does not identify a declared tensor field.
 

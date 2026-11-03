@@ -260,6 +260,8 @@ class NetCDFSchema:
     data_dimensions: tuple[str, ...]
     create_options: Mapping[str, Any]
     axis_indices: tuple[tuple[str, tuple[int, ...]], ...] = ()
+    # Further coordinates of a dimension: (dimension, variable, values).
+    axis_coordinates: tuple[tuple[str, str, tuple[int, ...]], ...] = ()
 
     @classmethod
     def compile(
@@ -310,13 +312,14 @@ class NetCDFSchema:
         # Axis names (grid axes, symbols or dim_{axis}); a coordinate axis
         # is the saved points.
         axes = metadata.get("axes") or ()
-        logical_dimensions = [name for name, _indices in axes] or [
+        logical_dimensions = [axis[0] for axis in axes] or [
             f"dim_{axis}" if type(name) is int else name
             for axis, name in enumerate(tensor_shape)
         ]
         if (coordinate_name or not full_output) and logical_actual_shape:
             logical_dimensions[0] = POINT_DIM
         axis_indices = []
+        axis_coordinates = []
         for axis, (name, extent) in enumerate(
             zip(logical_dimensions, logical_actual_shape, strict=True)
         ):
@@ -330,6 +333,17 @@ class NetCDFSchema:
             if indices is not None:
                 # The global indices a subset grid axis holds.
                 axis_indices.append((data_dimensions[-1], tuple(indices)))
+            for variable_name, values in (
+                axes[axis][2] if axes and len(axes[axis]) > 2 else ()
+            ):
+                # The global index of each covered axis, per selected cell.
+                axis_coordinates.append(
+                    (
+                        data_dimensions[-1],
+                        f"{data_dimensions[-1]}_{variable_name}",
+                        tuple(values),
+                    )
+                )
         if netcdf_options.get("contiguous") is True:
             raise ValueError(
                 f"streaming NetCDF output {variable!r} has an unlimited time "
@@ -388,4 +402,5 @@ class NetCDFSchema:
             data_dimensions=tuple(data_dimensions),
             create_options=MappingProxyType(create_options),
             axis_indices=tuple(axis_indices),
+            axis_coordinates=tuple(axis_coordinates),
         )

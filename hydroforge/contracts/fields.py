@@ -366,6 +366,9 @@ class TensorMetadata:
     # ranks or contribute to it); no other field is exchanged,
     # nor sizes the halo's message slots.
     halo: bool = False
+    grid_index: tuple[TensorName, ...] = ()
+    errors: tuple[tuple[int, str], ...] = ()
+    error_info: tuple[str, ...] = ()
 
     @field_validator("depends_on", "required_by", "materialize", mode="before")
     @classmethod
@@ -428,6 +431,44 @@ class TensorMetadata:
                 )
         if self.expression and self.category != "virtual":
             raise ValueError("expr can only be provided when category is 'virtual'")
+        if self.grid_index and (
+            len(self.shape) != 1
+            or not isinstance(self.shape[0], str)
+            or self.dtype not in {"int", "idx"}
+            or self.category != "topology"
+            or self.dim_coords is not None
+            or self.is_key
+        ):
+            raise ValueError(
+                "grid_index declares a one-dimensional integer topology table "
+                "over a symbolic entity dimension (no dim_coords or key)"
+            )
+        if self.grid_index and len(set(self.grid_index)) != len(self.grid_index):
+            raise ValueError("grid_index names each grid dimension once")
+        if self.errors or self.error_info:
+            if (
+                not self.errors
+                or self.shape != (2 + len(self.error_info),)
+                or self.dtype != "idx"
+                or self.category != "shared_state"
+                or self.output != "disabled"
+            ):
+                raise ValueError(
+                    "errors declare an int32 shared_state status of a failure "
+                    "count, a code and one word per info value, without "
+                    "output (use ErrorField)"
+                )
+            codes = [code for code, _message in self.errors]
+            if len(set(codes)) != len(codes) or any(
+                code <= 0 or code >= 1 << 31 for code in codes
+            ):
+                raise ValueError("error codes must be distinct, positive int32 values")
+            if any(not message.strip() for _code, message in self.errors):
+                raise ValueError("every error code needs a message")
+            if len(set(self.error_info)) != len(self.error_info) or not all(
+                name.isidentifier() for name in self.error_info
+            ):
+                raise ValueError("error info values need distinct identifier names")
         if self.after_init and self.category not in {"state", "shared_state"}:
             raise ValueError(
                 "after_init applies to computed state; parameters and "
@@ -601,6 +642,8 @@ class OutputAxis(HydroForgeModel):
     start: int = Field(default=0, ge=0)
     step: int = Field(default=1, ge=1)
     indices: tuple[int, ...] | None = None
+    # A point dimension's global index of each point, per grid axis.
+    coordinates: tuple[tuple[str, tuple[int, ...]], ...] = ()
 
 
 class RuntimeTensorMetadata(HydroForgeModel):
@@ -616,3 +659,5 @@ class RuntimeTensorMetadata(HydroForgeModel):
     output_coord: str | None = None
     resolved_shape: tuple[int, ...] | None = None
     output_axes: tuple[OutputAxis, ...] | None = None
+    # Paired grid points collapse all logical source axes into one output axis.
+    output_gather: str | None = None

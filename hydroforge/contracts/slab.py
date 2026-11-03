@@ -40,6 +40,19 @@ class SlabAxis(HydroForgeModel):
     stencil to the stored rows sees the domain's own boundary at the first and
     last rank and ghost rows everywhere else. A global notion (a boundary
     zone, a distance to the edge) reads the rank's ``slab`` geometry.
+
+    Sparse tables of entities on the grid (point sources, boundary cells,
+    gauges) declare their locating field ``TensorField(grid_index=(dim,
+    ...))``: flat row-major indices into a grid naming this axis. Each entity
+    belongs to the rank owning its row. The complete tables, indexing the
+    global grid, reach ``prepare_model_input``; then every input naming the
+    entity dimension keeps the rank's entities in their order and the
+    locating field indexes the rank's stored grid, so kernels use it as it
+    is. A rank may hold none: kernels sized by the dimension launch empty,
+    and every rank still makes the same calls. Checkpoints save the
+    complete tables in their order with global indices, so a run restarts
+    on any number of ranks; outputs along the dimension tag each entity
+    with its place in the complete table.
     """
 
     dim: Identifier

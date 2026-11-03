@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -24,9 +24,11 @@ from hydroforge.compiler.fields import (
 )
 from hydroforge.compiler.partition import bare, coordinate_identity, coordinate_index
 from hydroforge.compiler.selection import Selection
+from hydroforge.compiler.slab import slab_tokens
 from hydroforge.contracts.fields import concrete_tensor_dtype
 from hydroforge.contracts.precision import precisions_of
-from hydroforge.contracts.views import OutputView
+from hydroforge.contracts.slab import CELL, INTERIOR
+from hydroforge.contracts.views import OutputUnion, OutputView
 from hydroforge.contracts.windows import EveryStep, StatisticsOutput, StatisticsPlan
 from hydroforge.core.arrays import torch_to_numpy_dtype
 from hydroforge.core.expr import (
@@ -35,6 +37,7 @@ from hydroforge.core.expr import (
     ScatterSource,
     TensorSource,
     ValueSource,
+    bind_options,
     parse_operation,
     parse_value_source,
     validate_expression_constants,
@@ -95,6 +98,14 @@ class StatisticsDeclarationCompiler:
         source = self._parsed_sources.get(expression)
         if source is None:
             source = parse_value_source(expression, self.known)
+            # Option constants hold this model's values from here on.
+            value = self.selection.options.value
+            if isinstance(source, ExpressionSource):
+                source = ExpressionSource(bind_options(source.expression, value))
+            elif isinstance(source, ScatterSource):
+                source = ScatterSource(
+                    source.reduction, bind_options(source.value, value), source.index
+                )
             self._parsed_sources[expression] = source
         return source
 
@@ -143,6 +154,15 @@ class StatisticsDeclarationCompiler:
             raise ValueError(
                 "ad-hoc scatter statistics must be declared as a computed tensor field"
             )
+        views = (
+            source.value.views
+            if isinstance(source, ScatterSource)
+            else source.expression.views
+            if isinstance(source, ExpressionSource)
+            else ()
+        )
+        if views:
+            return self.validate_views(name, source, target_metadata)
         names = (
             source.value.dependencies
             if isinstance(source, ScatterSource)
@@ -285,6 +305,143 @@ class StatisticsDeclarationCompiler:
             )
         return reference if target_metadata is None else target_metadata
 
+    def validate_views(
+        self,
+        name: str,
+        source: ValueSource,
+        target_metadata: tuple[Any, ...] | None,
+    ) -> tuple[Any, ...]:
+        """Check an expression reading fields through slices or ``take``.
+
+        Its dimensions are those of the computed field declaring it: a field
+        read as it is has that shape; a slice keeps each axis it does not
+        cut and maps each axis it cuts to the declared one (the extent is
+        checked when the model is built); ``take(field, index)`` has the
+        shape of ``index``, a ``grid_index`` table over the field's grid.
+        The slab axis is cut over ranks, so a slice may cut it only as
+        ``[1:-1]`` onto its interior axis, whose rows every rank holds whole;
+        entities a ``take`` samples are each rank's own (see
+        :class:`~hydroforge.contracts.SlabAxis`).
+        """
+
+        if isinstance(source, ScatterSource) or target_metadata is None:
+            raise ValueError(
+                f"statistics expression {name!r} slices or samples fields; "
+                "declare it as a computed_tensor_field(expr=...) whose shape "
+                "names the dimensions they produce (not a scatter or alias)"
+            )
+        expression = cast(ExpressionSource, source).expression
+        target = self.schema_identity(name)[0]
+        if self.fields[name].tensor.dim_coords is not None:
+            raise ValueError(
+                f"statistics field {name!r} slices or samples fields and cannot "
+                "declare dim_coords"
+            )
+        forcing = [
+            dependency
+            for dependency in expression.dependencies
+            if self.metadata(dependency)[4] == "forcing"
+        ]
+        if forcing:
+            raise ValueError(
+                f"statistics expression {name!r} depends on forcing fields {forcing}"
+            )
+        values = [*expression.operands, *(view.field for view in expression.views)]
+        dtypes = {
+            self.metadata(value)[3]
+            for value in values
+            if self.metadata(value)[3] != "bool"
+        }
+        if len(dtypes) > 1:
+            raise ValueError(
+                f"statistics expression {name!r} mixes field dtypes {sorted(dtypes)}"
+            )
+        shared = [
+            value
+            for value in values
+            if self.metadata(value)[4] in {"topology", "shared_state"}
+        ]
+        if self.selection.ensemble_size is not None and shared:
+            raise ValueError(
+                f"dynamic statistics expression {name!r} uses shared fields "
+                f"{shared} in a multi-member model"
+            )
+        for operand in expression.operands:
+            if self.schema_identity(operand)[0] != target:
+                raise ValueError(
+                    f"statistics expression {name!r} reads {operand!r} at its own "
+                    f"elements, so {operand!r} must have its shape {target}"
+                )
+        slab = self.selection.spec.slab
+        tokens = (
+            {} if slab is None else slab_tokens(slab, self.selection.spec.grid_axes)
+        )
+        for view in expression.views:
+            field = self.fields[view.field].tensor
+            if field.category == "virtual" and field.expression:
+                raise ValueError(
+                    f"{view.key} in {name!r} reads an expression field; slices "
+                    "and take() read stored fields"
+                )
+            shape = self.schema_identity(view.field)[0]
+            if view.index is not None:
+                index = self.fields[view.index].tensor
+                grid = tuple(bare(item) for item in index.grid_index)
+                if grid != shape:
+                    raise ValueError(
+                        f"{view.key} in {name!r}: {view.index!r} must locate "
+                        f"entities on the grid {shape} of {view.field!r} "
+                        f"(TensorField(grid_index=...)), not {grid or 'none'}"
+                    )
+                if target != (bare(index.shape[0]),):
+                    raise ValueError(
+                        f"{view.key} has the shape {(bare(index.shape[0]),)} of "
+                        f"{view.index!r}, but {name!r} declares {target}"
+                    )
+                continue
+            if len(shape) != len(target) or len(view.slices) > len(shape):
+                raise ValueError(
+                    f"{view.key} in {name!r} slices a field of shape {shape} "
+                    f"into the declared shape {target}; a slice keeps the rank"
+                )
+            for axis, (have, want) in enumerate(zip(shape, target, strict=True)):
+                cut = axis < len(view.slices) and view.slices[axis] != (None, None, 1)
+                if cut and axis == 0 and field.dim_coords is not None:
+                    raise ValueError(
+                        f"{view.key} in {name!r} slices rows identified by "
+                        "coordinate IDs; select them by ID instead"
+                    )
+                if have in tokens or want in tokens:
+                    onto_interior = (
+                        cut
+                        and tokens.get(have) == CELL
+                        and tokens.get(want) == INTERIOR
+                        and view.slices[axis] == (1, -1, 1)
+                    )
+                    if (not cut and have == want) or onto_interior:
+                        continue
+                    raise ValueError(
+                        f"{view.key} in {name!r}: the slab axis is cut over "
+                        "ranks, so a slice may cut it only as [1:-1] onto its "
+                        f"interior axis {tuple(slab.interior)}, not {have!r} "
+                        f"onto {want!r}"
+                    )
+                if not cut and have != want:
+                    raise ValueError(
+                        f"axis {axis} of {view.key} is {have!r}, but {name!r} "
+                        f"declares {want!r}"
+                    )
+        validate_expression_constants(
+            name,
+            expression,
+            concrete_tensor_dtype(
+                target_metadata[3],
+                precisions_of(self.selection).field_dtype,
+                precisions_of(self.selection).storage_dtype,
+            ),
+        )
+        return target_metadata
+
     def compile_operation(
         self, output_name: str, operation: str, field_metadata: tuple[Any, ...]
     ) -> Any:
@@ -415,6 +572,15 @@ class StatisticsDeclarationCompiler:
             return
         view = self.config.views[output.view]
         coordinate = metadata[2]
+        points = view.axes if isinstance(view, OutputUnion) else tuple(view.points)
+        if points:
+            if coordinate or set(points) != set(axes):
+                raise ValueError(
+                    f"point view {output.view!r} must name every grid axis {axes} "
+                    "and cannot select coordinate rows"
+                )
+            self.variable_views[output.name] = view
+            return
         if coordinate and coordinate in view.axes:
             raise ValueError(
                 f"view {output.view!r} selects coordinate {coordinate!r} by index; "
@@ -442,7 +608,13 @@ class StatisticsDeclarationCompiler:
         )
         self.compiled_output_metadata[key] = metadata
         name = f"{output.name}_{output.operation}"
-        self.compiled_netcdf_options[name] = self.compile_output_options(name, metadata)
+        view = self.variable_views.get(output.name)
+        saved_metadata = (
+            ((view.point_dimension,), *metadata[1:])
+            if view is not None and (isinstance(view, OutputUnion) or view.points)
+            else metadata
+        )
+        self.compiled_netcdf_options[name] = self.compile_output_options(name, saved_metadata)
 
     def collect_fields(self) -> None:
         # OutputConfig already rejected repeated field/operation pairs,

@@ -140,6 +140,14 @@ OutputConfig(
 )
 ```
 
+Paired grid points can be configured without model fields:
+`OutputView(points={"y": [4, 1, 4], "x": [2, 8, 2]}, point_dimension="gauge")`.
+This selects (4, 2), (1, 8), (4, 2), preserving order and repeated locations,
+and requires every logical grid axis of the output. Each rank writes its
+owned points, with their positions in the complete list as the output
+coordinate. Axis-range views retain their Cartesian shape; point views have
+one point dimension.
+
 Choose ranges within your domain. Distributed outputs contain owned rows
 only. For point-based models, `hydroforge.io.MultiRankStatsReader` reads
 saved point series across rank files by point ID.
@@ -199,14 +207,6 @@ substeps expose the controller's accepted ticks directly. These inputs work
 without a calendar and retain stable device addresses during graph replay.
 They reset to zero on a new runtime or `reset_clock()`; they are runtime
 metadata, not checkpoint fields.
-
-## Model structure page
-
-Call `model.export_html("model.html")` between steps to write a standalone,
-interactive page. It shows modules, options, fields, outputs, and the kernels
-used by completed steps. Open it in a browser without a server. For a
-distributed run, use a distinct path per rank, such as
-`f"model_rank{context.rank}.html"`.
 
 ## Multiple GPUs
 

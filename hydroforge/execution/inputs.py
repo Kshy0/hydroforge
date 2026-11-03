@@ -197,6 +197,7 @@ class InputBinding:
         self._validate_declared_sources()
         self.axes = self._compile_axes()
         self.slab_axes = self._compile_slab_axes()
+        self.located_axes = self._compile_located_axes()
 
     def _validate_inventory(self) -> None:
         injected = self.proxy.injected_vars
@@ -318,6 +319,22 @@ class InputBinding:
                 slab[name] = (self.axes[name] + info.position, info.kind)
         return MappingProxyType(slab)
 
+    def _compile_located_axes(self) -> Mapping[str, int]:
+        """Stored axis of the located entity dimension of each present input
+        field naming one (see ``hydroforge.execution.slab.cut_located``)."""
+
+        located = self.plan.fields.located
+        axes: dict[str, int] = {}
+        for name, spec in self.fields.items():
+            tensor = spec.field.tensor
+            if not located or tensor is None or name not in self.proxy:
+                continue
+            for position, token in enumerate(tensor.shape):
+                if isinstance(token, str) and bare(token) in located:
+                    axes[name] = self.axes[name] + position
+                    break
+        return MappingProxyType(axes)
+
     def __contains__(self, name: str) -> bool:
         return name in self.proxy
 
@@ -345,9 +362,11 @@ class InputBinding:
         axis = self.axes.get(name, 0)
         mesh = self.plan.parallel
         members = slice(None) if mesh is None else mesh.member_slice
-        if spatial_indices is not None and name in self.slab_axes:
-            # Rows of the slab axis, wherever it sits in the stored shape.
-            selector = [slice(None)] * self.slab_axes[name][0]
+        cut = self.slab_axes.get(name, (self.located_axes.get(name),))[0]
+        if spatial_indices is not None and cut is not None:
+            # Rows of the slab axis or entities of a located dimension,
+            # wherever they sit in the stored shape.
+            selector = [slice(None)] * cut
             if axis == 1:
                 selector[0] = members
             return normalize_selection(

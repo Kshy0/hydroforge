@@ -196,7 +196,21 @@ SLAB_COORDINATES = {
     "face": "hf_slab_faces",
     "interior": "hf_slab_interior",
 }
-TRANSIENT_COORDINATES = frozenset(SLAB_COORDINATES.values())
+# The coordinate of a located entity dimension holds the places of a part's
+# entities in the complete table; the merge puts every entity back there.
+LOCATED_PREFIX = "hf_located_"
+
+
+def located_coordinate(dim: str) -> str:
+    """The construction coordinate of located entity dimension ``dim``."""
+
+    return LOCATED_PREFIX + dim
+
+
+def transient_coordinate(name: str) -> bool:
+    """Whether ``name`` is a coordinate the merge consumes and drops."""
+
+    return name in SLAB_COORDINATES.values() or name.startswith(LOCATED_PREFIX)
 
 
 def construction_dims(
@@ -416,10 +430,13 @@ def merge_construction_parts(
     Every partitioned variable occurs in every part and is concatenated along
     its group axis (the first unless ``axes`` says otherwise) in part order,
     or, along a slab coordinate (:data:`SLAB_COORDINATES`), in the order of
-    that coordinate's global rows, which must cover the axis exactly;
-    the other variables come from part zero only, whose variable order the
+    that coordinate's global rows, which must cover the axis exactly; along
+    a located coordinate (:func:`located_coordinate`) every entry goes to
+    its place in the complete table, which the parts must cover exactly.
+    The other variables come from part zero only, whose variable order the
     merged file keeps.  Coordinate IDs must be unique across the parts, and
-    the slab row coordinates (:data:`TRANSIENT_COORDINATES`) are not kept.
+    the slab and located coordinates (:func:`transient_coordinate`) are not
+    kept.
     ``options`` and ``opened_modules`` record the merged file's option
     fingerprint as in :func:`write_construction_input`.
     """
@@ -508,9 +525,19 @@ def merge_construction_parts(
         # coordinate joins its parts by its own global rows, which must then
         # cover the axis in order; other groups keep part order.
         orders = {}
+        # Located entities: the place of every concatenated entry.
+        places: dict[str, np.ndarray] = {}
         for group, pieces in coordinates.items():
             order = list(range(len(parts)))
-            if group in TRANSIENT_COORDINATES:
+            if group.startswith(LOCATED_PREFIX):
+                ids = np.concatenate(pieces)
+                if not np.array_equal(np.sort(ids), np.arange(ids.size)):
+                    raise ValueError(
+                        f"construction located coordinate {group!r} does not "
+                        f"cover entities 0..{ids.size - 1} exactly once"
+                    )
+                places[group] = ids
+            elif group in SLAB_COORDINATES.values():
                 order.sort(key=lambda i: int(pieces[i][0]) if pieces[i].size else -1)
                 ids = np.concatenate([pieces[i] for i in order])
                 if not np.array_equal(ids, np.arange(ids.size)):
@@ -550,7 +577,7 @@ def merge_construction_parts(
                 merged.setncattr(name, value)
             for name, plan in plans.items():
                 group = partitions.get(name)
-                if name in TRANSIENT_COORDINATES:
+                if transient_coordinate(name):
                     continue
                 if group is None:
                     _write(
@@ -561,6 +588,25 @@ def merge_construction_parts(
                     )
                     continue
                 variable = _create(merged, name, plan)
+                cut = axes.get(name, 0)
+                if group in places:
+                    # Small entity tables: gathered whole, then placed.
+                    pieces = [
+                        _read(part, dataset.variables[name], name)
+                        for part, dataset in zip(parts, datasets, strict=True)
+                    ]
+                    for part, values in zip(parts, pieces, strict=True):
+                        if not _same_layout(values, plan, cut):
+                            raise TypeError(
+                                f"construction part {str(part)!r} variable "
+                                f"{name!r} changed decoded layout"
+                            )
+                    values = np.concatenate(pieces, axis=cut)
+                    placed = np.empty_like(values)
+                    placed[(slice(None),) * cut + (places[group],)] = values
+                    if placed.size:
+                        variable[...] = placed.astype(plan.storage, copy=False)
+                    continue
                 offset = 0
                 for index in orders[group]:
                     part, dataset = parts[index], datasets[index]

@@ -4,12 +4,21 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-"""Explicit distributed operators for compiled substeps.
+"""Explicit distributed operators for model code.
+
+Collectives run wherever model code runs: managed steps (recorded once in a
+compiled substep, replayed every iteration), ``initialize_model_state``
+(after every rank built its partition, slab and halo) and between-steps
+bodies. Every rank must call the same collectives in the same order; each
+call is one event of the runtime's rank channel, which checks the order and
+tensor ABI and carries a peer's failure to the ranks waiting for it. On a
+single-rank runtime every collective is the identity and records nothing,
+so models call them unconditionally.
 
 Every collective goes through one batched path: a batch costs a single
-managed-step handshake and, when the communication backend supports it, one
-coalescing group rather than one of each per tensor. ``reduce_`` and
-``all_reduce_`` are its one-tensor spellings.
+handshake and, when the communication backend supports it, one coalescing
+group rather than one of each per tensor. ``reduce_`` and ``all_reduce_``
+are its one-tensor spellings.
 
 A recorded ``all_reduce_`` of model tensors on CUDA ranks runs as a
 registered kernel instead, over the fastest transport of its process group
@@ -34,7 +43,7 @@ from hydroforge.execution.channel import (
     ENSEMBLE_COLLECTIVE_FLAG,
     require_process_group,
 )
-from hydroforge.execution.context import ACTIVE_STEP
+from hydroforge.execution.context import ACTIVE_MODEL
 from hydroforge.kernels.calls import compiled_operator_entry, recording_sink
 from hydroforge.parallel.launch import communication_backend
 from hydroforge.parallel.mesh import ParallelAxis
@@ -289,15 +298,16 @@ def _run_validated_batch(
     instead of the process group.
     """
 
-    step = ACTIVE_STEP.get()
-    if step is None:
+    execution = ACTIVE_MODEL.get()
+    if execution is None:
         raise RuntimeError(
-            "HydroForge collectives may be called only inside a managed step "
-            "or an operator recorder"
+            "HydroForge collectives may be called only from model code: a "
+            "managed step, initialize_model_state or a @between_steps method"
         )
+    runtime = execution.runtime
     _code, op = _REDUCTIONS[reduction]
     environment = _batch_environment(
-        step.mesh,
+        runtime.plan.parallel,
         scope=scope,
         operation=operation,
         destination=destination,
@@ -305,7 +315,7 @@ def _run_validated_batch(
     )
     # The handshake runs even for an empty batch: a rank that contributes no
     # tensors must still be seen to disagree with one that does.
-    step.channel.event(
+    runtime.channel.event(
         _event_kind(operation, reduction, destination)
         | (ENSEMBLE_COLLECTIVE_FLAG if scope == "ensemble" else 0),
         _batch_signature(abis, reduction, destination),
@@ -339,24 +349,22 @@ def _run_validated_batch(
 def _device_reduction(request: _CollectiveRequest) -> tuple[Any, str] | None:
     """The reducer and transport serving ``request`` as a kernel, or ``None``."""
 
-    step = ACTIVE_STEP.get()
+    execution = ACTIVE_MODEL.get()
     tensors = request.tensors
     if (
-        step is None
+        execution is None
         or request.operation != "all_reduce"
         or not tensors
         or tensors[0].device.type != "cuda"
     ):
         return None
     recording = recording_sink() is not None
-    if recording and not all(
-        step.execution.is_model_tensor(tensor) for tensor in tensors
-    ):
+    if recording and not all(execution.is_model_tensor(tensor) for tensor in tensors):
         # A recorded kernel binds model tensors; temporaries keep the
         # recorded collective.
         return None
     environment = _batch_environment(
-        step.mesh,
+        execution.runtime.plan.parallel,
         scope=request.scope,
         operation=request.operation,
         destination=None,
@@ -365,7 +373,7 @@ def _device_reduction(request: _CollectiveRequest) -> tuple[Any, str] | None:
     group = environment.group if environment.group is not None else dist.group.WORLD
     if environment.group_size == 1 or dist.get_world_size(group) == 1:
         return None
-    reducer = step.execution.reducer(group, tensors[0].device)
+    reducer = execution.reducer(group, tensors[0].device)
     transport = reducer.transport(tensors, request.reduction)
     if transport is None or (transport == "nccl" and not recording):
         # Eagerly, NCCL is the process-group collective itself.
@@ -374,6 +382,11 @@ def _device_reduction(request: _CollectiveRequest) -> tuple[Any, str] | None:
 
 
 def _submit_collective(request: _CollectiveRequest) -> None:
+    execution = ACTIVE_MODEL.get()
+    if execution is not None and execution.runtime.plan.world_size == 1:
+        # One rank: every reduction is the identity, so nothing is recorded
+        # and a substep loop stays one captured graph.
+        return
     device = _device_reduction(request)
     recorder = recording_sink()
     if recorder is not None and device is not None:

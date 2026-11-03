@@ -53,6 +53,25 @@ def storage_dtype_of(
 
 
 @dataclass(frozen=True, slots=True)
+class ViewMap:
+    """Where element ``e`` of an expression of logical ``shape`` reads one
+    of its views (:class:`~hydroforge.core.expr.FieldView`) of ``field``.
+
+    A slice reads element ``start_d + step_d * i_d`` along every axis ``d``
+    of the field; a gather the flat element ``index[e]``. ``field_shape``
+    is the field's logical shape, ``batched`` whether it has members.
+    """
+
+    field: str
+    shape: tuple[int, ...]
+    field_shape: tuple[int, ...]
+    batched: bool
+    starts: tuple[int, ...] = ()
+    steps: tuple[int, ...] = ()
+    index: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class StatisticsVariableLayout:
     """Fully resolved storage and source addressing for one output variable."""
 
@@ -66,6 +85,9 @@ class StatisticsVariableLayout:
     # None when the output is the whole source.
     source_shape: tuple[int, ...] = ()
     axes: tuple[AxisMap, ...] | None = None
+    gather: str | None = None
+    # The views of an expression source, by key.
+    views: Mapping[str, ViewMap] = MappingProxyType({})
 
     @property
     def actual_ndim(self) -> int:
@@ -89,6 +111,7 @@ class _SourceLayout:
     batched: bool
     scatter_extent: int | None = None
     scatter_source_size: int | None = None
+    views: Mapping[str, ViewMap] = MappingProxyType({})
 
     @property
     def logical_axis(self) -> int:
@@ -144,6 +167,7 @@ class _StatisticsLayoutCompiler:
                 ),
                 scatter_extent=materialized.scatter_extent,
                 scatter_source_size=materialized.scatter_source_size,
+                views=materialized.views,
             )
         return MappingProxyType(layouts)
 
@@ -217,23 +241,63 @@ class _StatisticsLayoutCompiler:
         name: str,
         expression: Expression,
     ) -> _SourceLayout:
-        dependencies = expression.dependencies
-        layouts = tuple(self._source_layout(item) for item in dependencies)
-        reference = next((layout for layout in layouts if layout.batched), layouts[0])
-        reference_shape = reference.shape[int(reference.batched) :]
-        for dependency, layout in zip(dependencies, layouts, strict=True):
-            if layout.shape[int(layout.batched) :] != reference_shape:
+        # Every operand and view reads the expression's logical shape.
+        shapes: dict[str, tuple[tuple[int, ...], bool]] = {}
+        for item in expression.operands:
+            layout = self._source_layout(item)
+            shapes[item] = (layout.shape[int(layout.batched) :], layout.batched)
+        views = {}
+        for view in expression.views:
+            field = self._source_layout(view.field)
+            field_shape = field.shape[int(field.batched) :]
+            if view.index is None:
+                ranges = [
+                    range(*slice(*bounds).indices(extent))
+                    for bounds, extent in zip(view.slices, field_shape)
+                ] + [range(extent) for extent in field_shape[len(view.slices) :]]
+                shape = tuple(len(item) for item in ranges)
+                if 0 in shape:
+                    raise ValueError(
+                        f"statistics expression {name!r}: {view.key} is empty "
+                        f"for {view.field!r} of shape {field_shape}"
+                    )
+                mapped = ViewMap(
+                    view.field,
+                    shape,
+                    field_shape,
+                    field.batched,
+                    starts=tuple(item.start for item in ranges),
+                    steps=tuple(item.step for item in ranges),
+                )
+            else:
+                index = self.tensors[view.index]
+                if index.ndim != 1 or index.dtype not in {torch.int32, torch.int64}:
+                    raise ValueError(
+                        f"statistics expression {name!r}: {view.index!r} must be "
+                        "a one-dimensional integer index"
+                    )
+                shape = (index.numel(),)
+                mapped = ViewMap(
+                    view.field, shape, field_shape, field.batched, index=view.index
+                )
+            views[view.key] = mapped
+            shapes[view.key] = (shape, field.batched)
+        reference_shape = next(iter(shapes.values()))[0]
+        for item, (shape, _batched) in shapes.items():
+            if shape != reference_shape:
                 raise ValueError(
                     f"statistics expression {name!r} has incompatible resolved "
-                    f"shape for {dependency!r}: {layout.shape}; "
-                    f"expected logical shape {reference_shape}"
+                    f"shape for {item!r}: {shape}; expected logical shape "
+                    f"{reference_shape}"
                 )
+        batched = any(item for _shape, item in shapes.values())
         dtype = self._declared_dtype(name)
         return _SourceLayout(
-            reference.shape,
-            reference.logical_rank,
+            (self.ensemble_size, *reference_shape) if batched else reference_shape,
+            len(reference_shape),
             dtype,
-            reference.batched,
+            batched,
+            views=MappingProxyType(views),
         )
 
     def _scatter_layout(
@@ -278,8 +342,14 @@ class _StatisticsLayoutCompiler:
         source = self._source_layout(name)
         source_shape = source.shape[int(source.batched) :]
         output_axes = self.fields[name].output_axes
+        gather = self.fields[name].output_gather
         axes = None
-        if output_axes is None:
+        if gather is not None:
+            actual_shape = (*source.shape[:int(source.batched)], output_axes[0].extent)
+            if not output_axes[0].extent:
+                # No point on this rank: nothing is read, nothing addressed.
+                gather = None
+        elif output_axes is None:
             actual_shape = source.shape
         else:
             if len(output_axes) != len(source_shape):
@@ -298,7 +368,11 @@ class _StatisticsLayoutCompiler:
                 AxisMap(axis.table, axis.start, axis.step) for axis in output_axes
             )
             extents = tuple(axis.extent for axis in output_axes)
-            if not all(item.identity for item in maps) or extents != source_shape:
+            # An output with no element on this rank (a view of rows it does
+            # not own) reads nothing, so it needs no addressing.
+            if 0 not in extents and (
+                not all(item.identity for item in maps) or extents != source_shape
+            ):
                 axes = maps
             actual_shape = (
                 *source.shape[: int(source.batched)],
@@ -318,6 +392,8 @@ class _StatisticsLayoutCompiler:
             scatter_source_size=source.scatter_source_size,
             source_shape=source_shape,
             axes=axes,
+            gather=gather,
+            views=source.views,
         )
 
 
