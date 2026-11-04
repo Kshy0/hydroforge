@@ -379,9 +379,9 @@ class PartitionRuntime:
     def _key_edges(self) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
         """Key-row pairs of the crossing references: ``(tree, edges)``.
 
-        ``tree`` holds the references within the key coordinate with one
-        target per row (``downstream``), along which groups are cut;
-        ``edges`` every crossing reference.
+        ``tree`` holds the references within the key coordinate
+        (``downstream``), along which groups are cut; ``edges`` every
+        crossing reference.
         """
 
         tree: list[tuple[np.ndarray, np.ndarray]] = []
@@ -389,11 +389,9 @@ class PartitionRuntime:
         for name in self.crossing_references():
             coordinate = self.variable_groups[name]
             targets = self._reference_index(name)
-            sources = self._key_rows(coordinate)
-            width = targets.size // max(sources.size, 1)
-            pair = (np.repeat(sources, width), targets.reshape(-1).astype(np.int64))
+            pair = (self._key_rows(coordinate), targets.astype(np.int64))
             edges.append(pair)
-            if coordinate == self.partition_key and width == 1:
+            if coordinate == self.partition_key:
                 tree.append(pair)
 
         def joined(pairs):

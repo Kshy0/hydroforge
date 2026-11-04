@@ -32,7 +32,6 @@ from hydroforge.contracts.fields import (
     concrete_tensor_dtype,
     tensor_is_active,
 )
-from hydroforge.contracts.precision import precisions_of
 from hydroforge.core.expr import ExpressionSource, TensorSource, parse_value_source
 from hydroforge.declare.spec import (
     FieldSpec,
@@ -599,8 +598,8 @@ def plan_fields(
                     if tensor is None
                     else concrete_tensor_dtype(
                         tensor.dtype,
-                        precisions_of(selection).field_dtype,
-                        precisions_of(selection).storage_dtype,
+                        selection.precisions.field_dtype,
+                        selection.precisions.storage_dtype,
                     ),
                 )
         for name, metadata in binding.reference_indices.items():

@@ -23,8 +23,7 @@ from hydroforge.contracts.fields import (
     RuntimeTensorMetadata,
     TensorMetadata,
 )
-from hydroforge.contracts.precision import precisions_of
-from hydroforge.contracts.views import OutputUnion, view_indices
+from hydroforge.contracts.views import OutputUnion, OutputView, view_indices
 from hydroforge.core.arrays import find_indices_in_torch
 from hydroforge.core.events import emit
 from hydroforge.core.expr import ExpressionSource, ScatterSource, TensorSource
@@ -152,8 +151,8 @@ class _StatisticsBinder:
             on_write_failure=partial(
                 runtime.execution.poison, phase="statistics background write"
             ),
-            base_dtype=precisions_of(plan).field_dtype,
-            storage_dtype=precisions_of(plan).storage_dtype,
+            precisions=plan.precisions,
+            status_ticket=runtime.execution.status.ticket,
             output_dir=plan.output.directory,
             rank=plan.spatial_rank,
             world_size=plan.spatial_world_size,
@@ -284,6 +283,8 @@ class _StatisticsBinder:
         fields: dict[str, RuntimeTensorMetadata] = {}
         scatter_extents: dict[str, int] = {}
         pending_bindings: list[tuple[str, torch.Tensor, bool]] = []
+        # Output coordinates that are selections (their IDs never change).
+        selected_ids: set[str] = set()
 
         def install_tensor(
             name: str,
@@ -333,6 +334,8 @@ class _StatisticsBinder:
                     info,
                 )
 
+            if info.output_index is not None:
+                selected_ids.add(info.output_coord)
             for binding_name in (info.output_index, info.output_coord):
                 if not binding_name:
                     continue
@@ -345,10 +348,13 @@ class _StatisticsBinder:
                     )
                 )
 
+        coordinate_sources: dict[str, torch.Tensor] = {}
         for binding_name, binding, output_coordinate in pending_bindings:
             existing = tensors.get(binding_name)
             if existing is not None:
                 continue
+            if output_coordinate and binding_name not in selected_ids:
+                coordinate_sources[binding_name] = binding
             install_tensor(
                 binding_name,
                 binding,
@@ -385,6 +391,7 @@ class _StatisticsBinder:
                 (coordinate, selected, tensors.get(f"__selection_idx__{name}", index))
                 for name, (coordinate, selected, index) in self.selections.items()
             ),
+            coordinate_sources=tuple(coordinate_sources.items()),
         )
 
     def _slab_axis(self, tensor: TensorMetadata) -> tuple[int, str] | None:
@@ -492,6 +499,99 @@ class _StatisticsBinder:
             name=axis, extent=int(local.size), table=table, indices=values
         )
 
+    def _view_points(
+        self,
+        name: str,
+        view: OutputView,
+        names: tuple[str, ...],
+        extents: tuple[int, ...],
+        slab_axis: tuple[int, str] | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """This rank's paired points of ``view`` (global indices, one column
+        per point) and their positions in the view's point list."""
+
+        points = np.asarray([view.points[axis] for axis in names], dtype=np.int64)
+        if any(np.any(points[i] >= extent) for i, extent in enumerate(extents)):
+            raise ValueError(f"point view for {name!r} exceeds grid extents {extents}")
+        positions = np.arange(points.shape[1], dtype=np.int64)
+        if slab_axis is not None:
+            position, kind = slab_axis
+            keep = np.isin(points[position], self.runtime.slab.global_rows(kind))
+            points, positions = points[:, keep], positions[keep]
+        return points, positions
+
+    def _union_cells(
+        self,
+        view: OutputUnion,
+        names: tuple[str, ...],
+        extents: tuple[int, ...],
+        slab_axis: tuple[int, str] | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """This rank's distinct cells of ``view`` (global indices, one column
+        per cell) in row-major order, and their flat row-major indices on the
+        global grid.
+
+        Each part selects only the rows of the slab axis this rank owns, so
+        no rank enumerates another's cells; a cell has one owner, so ranks'
+        cells are distinct across ranks too.
+        """
+
+        owned = None
+        if slab_axis is not None:
+            owned = self.runtime.slab.global_rows(slab_axis[1])
+        grid_axes = self.runtime.plan.spec.grid_axes
+        found = [np.empty((0, len(names)), dtype=np.int64)]
+        for part in view.parts:
+            if part.points:
+                points = {
+                    axis: np.asarray(indices, dtype=np.int64)
+                    for axis, indices in part.points.items()
+                }
+                for axis, values in points.items():
+                    extent = extents[names.index(axis)]
+                    if int(values.max()) >= extent:
+                        raise ValueError(
+                            f"point index {int(values.max())} exceeds the axis "
+                            f"{axis!r} extent {extent}"
+                        )
+                keep = np.ones(len(next(iter(points.values()))), dtype=bool)
+                if owned is not None and names[slab_axis[0]] in points:
+                    keep = np.isin(points[names[slab_axis[0]]], owned)
+                # Each point, repeated over the axes it leaves complete.
+                ranges = [np.flatnonzero(keep)]
+                free = [i for i, axis in enumerate(names) if axis not in points]
+                for i in free:
+                    ranges.append(
+                        owned
+                        if owned is not None and i == slab_axis[0]
+                        else np.arange(extents[i], dtype=np.int64)
+                    )
+                grid = [item.reshape(-1) for item in np.meshgrid(*ranges, indexing="ij")]
+                cells = np.empty((grid[0].size, len(names)), dtype=np.int64)
+                for i, axis in enumerate(names):
+                    cells[:, i] = (
+                        points[axis][grid[0]]
+                        if axis in points
+                        else grid[1 + free.index(i)]
+                    )
+            else:
+                selected = view_indices(names, extents, part, grid_axes)
+                ranges = [
+                    np.arange(extent, dtype=np.int64)
+                    if indices is None
+                    else np.asarray(indices, dtype=np.int64)
+                    for indices, extent in zip(selected, extents, strict=True)
+                ]
+                if owned is not None:
+                    position = slab_axis[0]
+                    ranges[position] = np.intersect1d(ranges[position], owned)
+                grid = np.meshgrid(*ranges, indexing="ij")
+                cells = np.stack([item.reshape(-1) for item in grid], axis=1)
+            found.append(cells)
+        cells = np.concatenate(found)
+        numbers = np.unique(np.ravel_multi_index(tuple(cells.T), extents))
+        return np.stack(np.unravel_index(numbers, extents)).astype(np.int64), numbers
+
     def _owned_rows(self, coordinate: str | None, rows: int) -> int:
         """Rows of ``coordinate`` this rank owns: halo ghost rows follow them."""
 
@@ -560,40 +660,45 @@ class _StatisticsBinder:
         if view is not None and (union or view.points):
             if located_axis is not None:
                 raise ValueError("point views require grid axes, not located entity axes")
-            if union:
-                # The union's distinct cells are its points, in row-major order.
-                points = view.cells(tuple(names), tuple(extents)).T.copy()
-            else:
-                points = np.asarray([view.points[axis] for axis in names], dtype=np.int64)
-            if any(np.any(points[i] >= extent) for i, extent in enumerate(extents)):
-                raise ValueError(f"point view for {name!r} exceeds grid extents {extents}")
-            positions = np.arange(points.shape[1], dtype=np.int64)
-            if slab_axis is not None:
-                position, kind = slab_axis
-                slab = self.runtime.slab
-                owned = slab.global_rows(kind)
-                keep = np.isin(points[position], owned)
-                points, positions = points[:, keep], positions[keep]
+            points, numbers = (
+                self._union_cells(view, names, tuple(extents), slab_axis)
+                if union
+                else self._view_points(name, view, names, tuple(extents), slab_axis)
+            )
             # Where each written point lies, by global index of every axis.
             coordinates = tuple(
                 (axis, tuple(int(value) for value in points[i]))
                 for i, axis in enumerate(names)
             )
-            if slab_axis is not None and positions.size:
-                points[position] += slab.owned_slice(kind).start - owned[0]
-            flat = (np.ravel_multi_index(tuple(points), shape)
-                    if positions.size else np.empty(0, dtype=np.int64))
+            if slab_axis is not None and numbers.size:
+                position, kind = slab_axis
+                slab = self.runtime.slab
+                points[position] += (
+                    slab.owned_slice(kind).start - slab.global_rows(kind)[0]
+                )
+            flat = (
+                np.ravel_multi_index(tuple(points), shape)
+                if numbers.size
+                else np.empty(0, dtype=np.int64)
+            )
             table = f"__view__{name}__points"
-            tensors[table] = torch.as_tensor(flat, dtype=torch.int64, device=self.runtime.plan.device)
+            tensors[table] = torch.as_tensor(
+                flat, dtype=torch.int64, device=self.runtime.plan.device
+            )
             return RuntimeTensorMetadata(
-                tensor=info.tensor, description=info.description,
-                output_index=info.output_index, output_coord=info.output_coord,
+                tensor=info.tensor,
+                description=info.description,
+                output_index=info.output_index,
+                output_coord=info.output_coord,
                 resolved_shape=info.resolved_shape,
-                output_axes=(OutputAxis(
-                    name=view.point_dimension, extent=positions.size,
-                    indices=tuple(int(i) for i in positions),
-                    coordinates=coordinates,
-                ),),
+                output_axes=(
+                    OutputAxis(
+                        name=view.point_dimension,
+                        extent=int(numbers.size),
+                        indices=tuple(int(number) for number in numbers),
+                        coordinates=coordinates,
+                    ),
+                ),
                 output_gather=table,
             )
         selected = view_indices(

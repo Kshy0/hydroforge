@@ -158,19 +158,6 @@ def resolve_precisions(
     return resolved
 
 
-def precisions_of(plan: object) -> Precisions:
-    """The tiers of a model plan; a plan built without them (as some tests
-    do) has a scalar ``dtype`` and a ``mixed_precision`` flag."""
-
-    found = getattr(plan, "precisions", None)
-    if found is not None:
-        return found
-    dtype = getattr(plan, "dtype", torch.float32)
-    return resolve_precisions(
-        tier_of(dtype), None, bool(getattr(plan, "mixed_precision", False))
-    )
-
-
 @contextmanager
 def matmul_scope(tf32: bool) -> Iterator[None]:
     """Run torch float32 matrix products and convolutions on TF32 tensor
@@ -199,7 +186,6 @@ __all__ = [
     "STORAGE_TIERS",
     "TIERS",
     "matmul_scope",
-    "precisions_of",
     "PrecisionTier",
     "Precisions",
     "ScalarPrecision",

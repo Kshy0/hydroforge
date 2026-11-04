@@ -15,6 +15,7 @@ from types import MappingProxyType
 import torch
 
 from hydroforge.contracts.fields import RuntimeTensorMetadata, concrete_tensor_dtype
+from hydroforge.contracts.precision import Precisions
 from hydroforge.core.expr import (
     Expression,
     ExpressionSource,
@@ -37,19 +38,6 @@ class AxisMap:
     @property
     def identity(self) -> bool:
         return self.table is None and self.start == 0 and self.step == 1
-
-
-def storage_dtype_of(
-    base_dtype: torch.dtype, storage_dtype: torch.dtype | None, mixed_precision: bool
-) -> torch.dtype:
-    """The hpfloat dtype: ``storage_dtype``, else ``base_dtype`` promoted as
-    ``mixed_precision`` says (see :mod:`hydroforge.contracts.precision`)."""
-
-    if storage_dtype is not None:
-        return storage_dtype
-    from hydroforge.contracts.precision import resolve_precisions, tier_of
-
-    return resolve_precisions(tier_of(base_dtype), None, mixed_precision).storage_dtype
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,19 +119,14 @@ class _StatisticsLayoutCompiler:
         fields: Mapping[str, RuntimeTensorMetadata],
         scatter_extents: Mapping[str, int],
         ensemble_size: int,
-        base_dtype: torch.dtype,
-        storage_dtype: torch.dtype | None = None,
-        mixed_precision: bool = False,
+        precisions: Precisions,
     ) -> None:
         self.program = program
         self.tensors = tensors
         self.fields = fields
         self.scatter_extents = scatter_extents
         self.ensemble_size = ensemble_size
-        self.base_dtype = base_dtype
-        self.storage_dtype = storage_dtype_of(
-            base_dtype, storage_dtype, mixed_precision
-        )
+        self.precisions = precisions
         self.sources: dict[str, _SourceLayout] = {}
 
     def compile(
@@ -202,8 +185,8 @@ class _StatisticsLayoutCompiler:
         metadata = self.fields[name].tensor
         return concrete_tensor_dtype(
             metadata.dtype,
-            self.base_dtype,
-            self.storage_dtype,
+            self.precisions.field_dtype,
+            self.precisions.storage_dtype,
         )
 
     def _source_layout(self, name: str) -> _SourceLayout:
@@ -405,9 +388,7 @@ def compile_statistics(
     fields: Mapping[str, RuntimeTensorMetadata],
     scatter_extents: Mapping[str, int],
     ensemble_size: int,
-    base_dtype: torch.dtype,
-    storage_dtype: torch.dtype | None = None,
-    mixed_precision: bool = False,
+    precisions: Precisions,
 ) -> StatisticsCompilation:
     """Compile exact layouts from construction-time validated semantics."""
 
@@ -422,8 +403,7 @@ def compile_statistics(
         fields=fields,
         scatter_extents=scatter_extents,
         ensemble_size=ensemble_size,
-        base_dtype=base_dtype,
-        storage_dtype=storage_dtype_of(base_dtype, storage_dtype, mixed_precision),
+        precisions=precisions,
     ).compile(immutable_ops)
     return StatisticsCompilation(immutable_ops, program, layouts)
 

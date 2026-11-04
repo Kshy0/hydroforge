@@ -36,7 +36,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from hydroforge.compiler.partition import bare
-from hydroforge.contracts.precision import precisions_of
 
 if TYPE_CHECKING:
     from hydroforge.model.model import AbstractModel
@@ -832,9 +831,9 @@ def model_structure(model: AbstractModel) -> dict[str, Any]:
         "state": runtime.state,
         "backend": plan.backend.name,
         "device": str(plan.device),
-        "precision": precisions_of(plan).compute,
-        "storage_precision": precisions_of(plan).storage,
-        "mixed_precision": plan.mixed_precision,
+        "precision": plan.precisions.compute,
+        "storage_precision": plan.precisions.storage,
+        "mixed_precision": plan.precisions.mixed,
         "ensemble_size": plan.ensemble_size,
         "opened_modules": list(plan.modules),
         "module_order": list(plan.module_order),

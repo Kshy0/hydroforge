@@ -8,13 +8,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from hydroforge.contracts.precision import matmul_scope, precisions_of
+from hydroforge.contracts.precision import matmul_scope
 from hydroforge.core.errors import (
     cleanup_on_exit,
     failure_description,
@@ -59,12 +60,12 @@ class ModelExecution:
                 device=str(plan.device),
             )
         self.kernel_binding = KernelBinder(runtime)
-        # Declared device error statuses, watched once modules exist.
+        # Declared device error statuses, checked once modules exist.
         self.status = DeviceStatus()
-        self.tf32 = precisions_of(plan).tf32
+        self.tf32 = plan.precisions.tf32
         self.step_fields = StepFieldRuntime(plan, executor=self.executor)
         self.step_policies: dict[Any, Any] = {}
-        self.programs: dict[Any, Any] = {}
+        # Built substep and outer programs, by scope key (``programs``).
         self.host_variants: dict[Any, Any] = {}
         # Validated adaptive-scope limits keyed by their exact inputs.
         self.adaptive_requests: dict[Any, Any] = {}
@@ -189,7 +190,7 @@ class ModelExecution:
             for name in module.spec().kernel_fields:
                 module.__dict__.pop(name, None)
         self._tensor_index_valid = False
-        programs, self.programs = self.programs, {}
+        programs = self.programs
         self.host_variants = {}
         self.adaptive_requests = {}
         try:
@@ -205,6 +206,19 @@ class ModelExecution:
         except BaseException as error:
             self.poison(error, phase="execution-plan invalidation")
             raise
+
+    @property
+    def programs(self) -> Mapping[Any, Any]:
+        """Every built substep and outer program by its cache key: a view of
+        the programs ``host_variants`` owns."""
+
+        return MappingProxyType(
+            {
+                key: entry.program
+                for variants in self.host_variants.values()
+                for key, entry in variants.entries.items()
+            }
+        )
 
     def reducer(self, group: Any, device: torch.device) -> Any:
         """The all-reduce transports of ``group``, chosen collectively on

@@ -16,7 +16,6 @@ from uuid import uuid4
 import numpy as np
 import torch
 
-from hydroforge.contracts.precision import precisions_of
 from hydroforge.core.errors import (
     ResourceCleanupError,
     distributed_failure_error,
@@ -245,21 +244,13 @@ class ModelRuntime:
 
         return 0 if layout.kind == KEY or self.slab is None else self.slab.halo
 
-    def _build_halo(self) -> None:
-        """Create the halo of the partition's ghost rows and the slab's
-        (collective over the spatial group), its message slots sized for the
-        widest rows of the fields declared ``halo=True``."""
+    def _halo_rows(self) -> tuple[dict[str, Any], dict[str, int]]:
+        """Every rank's rows of each halo kind (the partition's ghost rows,
+        the slab's) and the widest row of the fields declared ``halo=True``
+        of each kind on this rank."""
 
         from hydroforge.declare.tensors import ModuleTensors
-        from hydroforge.kernels.halo import attach
-        from hydroforge.parallel.halo import (
-            CELL,
-            FACE,
-            KEY,
-            HaloPlan,
-            HaloRuntime,
-            partition_layouts,
-        )
+        from hydroforge.parallel.halo import CELL, FACE, KEY, partition_layouts
         from hydroforge.parallel.slab import slab_layouts
 
         plan, slab = self.plan, self.slab
@@ -316,8 +307,19 @@ class ModelRuntime:
                     int(np.prod(shape, dtype=np.int64)) // max(shape[info.position], 1)
                 )
                 row_bytes[kind] = max(row_bytes.get(kind, 8), width)
+        return layouts, row_bytes
+
+    def _build_halo(self, layouts: dict[str, Any], row_bytes: dict[str, int]) -> None:
+        """Create the halo of ``layouts`` (collective over the spatial group),
+        its message slots sized for the widest rows of the fields declared
+        ``halo=True``."""
+
+        from hydroforge.kernels.halo import attach
+        from hydroforge.parallel.halo import HaloPlan, HaloRuntime
+
         if not layouts:
             return
+        plan, slab = self.plan, self.slab
         self.halo = attach(
             HaloRuntime(
                 HaloPlan(plan.spatial_rank, layouts),
@@ -542,9 +544,9 @@ class ModelRuntime:
                 experiment_name=plan.output.config.experiment,
                 backend=execution.backend.name,
                 device=str(plan.device),
-                precision=precisions_of(plan).compute,
-                storage_precision=precisions_of(plan).storage,
-                mixed_precision=plan.mixed_precision,
+                precision=plan.precisions.compute,
+                storage_precision=plan.precisions.storage,
+                mixed_precision=plan.precisions.mixed,
                 metal_emulation=plan.metal_emulation,
                 opened_modules=plan.modules,
                 options=plan.options.resolved_dict(),
@@ -590,13 +592,14 @@ class ModelRuntime:
             f"{name}.{field}" for name, fields in missing.items() for field in fields
         )
         self._construct_modules(payloads, missing)
-        # Every rank built its modules before collective setup (the halo,
-        # initialization collectives) can wait for one that failed: a
-        # failure published from here on reaches this agreement.
+        halo = self._halo_rows()
+        # Every rank built its modules and halo layout before collective
+        # setup (the halo, initialization collectives) can wait for one that
+        # failed: a failure published from here on reaches this agreement.
         self.channel.preflight(
             None, phase="runtime.modules", scope="distributed module construction"
         )
-        self._build_halo()
+        self._build_halo(*halo)
         modules = tuple(self.modules[name] for name in plan.module_order)
         for module in modules:
             module._tensors.constructed = True
@@ -615,8 +618,8 @@ class ModelRuntime:
         execution.status = DeviceStatus.declared(self)
         with model_call(execution):
             owner.initialize_model_state()
-        # Initialization kernels report like a step's, but before the commit.
-        failure = execution.status.wait()
+        # Initialization kernels report like a step's, before the commit.
+        failure = execution.status.check()
         if failure is not None:
             raise failure
         failure = self._close_body(None)
@@ -878,10 +881,6 @@ class ModelRuntime:
         failure = execution.failure
         if failure is not None:
             raise execution.poisoned_error(failure)
-        status = execution.status.poll()
-        if status is not None:
-            execution.poison(status, phase="device error status")
-            raise status
 
     def update_structure(self) -> StructuralUpdateResult | None:
         """Run the ordered module structure pass and commit one staged update."""
@@ -985,11 +984,11 @@ class ModelRuntime:
 
         if self.state != "materialized":
             return
-        # The last steps' reports, which no later step will read.
+        # Kernels launched outside the calls that check (direct calls).
         status: BaseException | None = None
         if self.execution.failure is None:
             try:
-                status = self.execution.status.wait()
+                status = self.execution.status.check()
             except BaseException as error:
                 status = error
         failures = self._release()

@@ -381,10 +381,32 @@ class _PeerMemory:
         self.closers = []
 
 
+def _agree(group: Any, world: int, problem: str | None, payload: Any = None) -> list[Any]:
+    """Every rank's ``payload``, unless a rank reports a ``problem``: then
+    every rank raises the same error here, before the next collective."""
+
+    import torch.distributed as dist
+
+    rows: list[Any] = [None] * world
+    dist.all_gather_object(rows, (problem, payload), group=group)
+    failed = [(rank, row[0]) for rank, row in enumerate(rows) if row[0] is not None]
+    if failed:
+        raise ValueError(
+            "halo setup failed: "
+            + "; ".join(f"rank {rank}: {reason}" for rank, reason in failed)
+        )
+    return [row[1] for row in rows]
+
+
 def _open_peer_memory(
-    nbytes: int, group: Any, device: torch.device, details: dict[str, Any]
+    nbytes: int,
+    group: Any,
+    device: torch.device,
+    details: dict[str, Any],
+    requested: str,
 ) -> tuple[_PeerMemory | None, str | None]:
-    """Peer-mapped memory (collective), or why there is none."""
+    """Peer-mapped memory (collective) from the ``HYDROFORGE_PEER_MEMORY``
+    provider every rank ``requested``, or why there is none."""
 
     import torch.distributed as dist
 
@@ -395,11 +417,6 @@ def _open_peer_memory(
         ipc_problem,
     )
 
-    requested = os.environ.get("HYDROFORGE_PEER_MEMORY", "auto")
-    if requested not in ("auto", "nccl", "ipc"):
-        raise ValueError(
-            f"HYDROFORGE_PEER_MEMORY must be auto, nccl or ipc, got {requested!r}"
-        )
     library, problem = nccl_library()
     states: list[Any] = [None] * dist.get_world_size(group)
     dist.all_gather_object(
@@ -635,29 +652,46 @@ class HaloRuntime:
                 f"the halo plan is rank {rank} of {world}, but the process group "
                 f"is rank {dist.get_rank(group)} of {dist.get_world_size(group)}"
             )
-        # The node every rank runs on, whatever placement assumed.
-        labels: list[Any] = [None] * world
-        dist.all_gather_object(labels, node_label(), group=group)
-        self.nodes = tuple(labels)
-        bounds: list[Any] = [None] * world
-        dist.all_gather_object(bounds, dict(row_bytes), group=group)
-        self.row_bytes = {
-            kind: max(int(b.get(kind, 0)) for b in bounds) for kind in plan.kinds
-        }
-        self.capacity = message_capacity(plan, self.row_bytes)
-        group_backend = str(dist.get_backend(group)).lower()
+        # Settings each rank reads for itself: a rank whose settings are
+        # invalid fails every rank here, before any other collective.
         requested = os.environ.get("HYDROFORGE_HALO_TRANSPORT", "auto")
+        memory = os.environ.get("HYDROFORGE_PEER_MEMORY", "auto")
+        group_backend = str(dist.get_backend(group)).lower()
+        fallback = "nccl" if group_backend == "nccl" else "host"
+        problem = None
         if requested not in ("auto", *LINKS):
-            raise ValueError(
+            problem = (
                 f"HYDROFORGE_HALO_TRANSPORT must be auto or one of {LINKS}, "
                 f"got {requested!r}"
             )
-        fallback = "nccl" if group_backend == "nccl" else "host"
-        if requested in ("nccl", "host") and requested != fallback:
-            raise ValueError(
+        elif memory not in ("auto", "nccl", "ipc"):
+            problem = (
+                f"HYDROFORGE_PEER_MEMORY must be auto, nccl or ipc, got {memory!r}"
+            )
+        elif requested in ("nccl", "host") and requested != fallback:
+            problem = (
                 f"the {requested} halo transport needs a "
                 f"{'NCCL' if requested == 'nccl' else 'Gloo'} process group"
             )
+        facts = _agree(
+            group, world, problem, (node_label(), dict(row_bytes), requested, memory)
+        )
+        for position, name in (
+            (2, "HYDROFORGE_HALO_TRANSPORT"),
+            (3, "HYDROFORGE_PEER_MEMORY"),
+        ):
+            if len({fact[position] for fact in facts}) > 1:
+                raise ValueError(
+                    f"{name} differs across ranks: "
+                    f"{[fact[position] for fact in facts]}"
+                )
+        # The node every rank runs on, whatever placement assumed.
+        self.nodes = tuple(fact[0] for fact in facts)
+        self.row_bytes = {
+            kind: max(int(fact[1].get(kind, 0)) for fact in facts)
+            for kind in plan.kinds
+        }
+        self.capacity = message_capacity(plan, self.row_bytes)
         self.ring, self.window_bytes = window_layout(plan, self.capacity)
         self.memory: _PeerMemory | None = None
         reach = [False] * world
@@ -670,7 +704,7 @@ class HaloRuntime:
         dist.all_gather_object(flags, capable, group=group)
         if all(flags) and any(plan.neighbours):
             self.memory, problem = _open_peer_memory(
-                self.window_bytes, group, device, self.details
+                self.window_bytes, group, device, self.details, memory
             )
             if self.memory is None:
                 self.skipped["peer"] = problem
@@ -681,29 +715,37 @@ class HaloRuntime:
             self.skipped["peer"] = "some rank cannot store into peers"
         matrix: list[Any] = [None] * world
         dist.all_gather_object(matrix, reach, group=group)
-        self.links: dict[int, str] = {}
-        for peer in plan.neighbours[rank]:
-            direct = matrix[rank][peer] and matrix[peer][rank]
-            if requested == "peer" and not direct:
-                raise ValueError(
-                    f"HYDROFORGE_HALO_TRANSPORT=peer, but rank {peer} is not "
-                    f"load/store reachable from rank {rank} "
-                    f"({self.skipped.get('peer', 'outside the LSA team')})"
-                )
-            self.links[peer] = (
-                "peer" if direct and requested in ("auto", "peer") else fallback
+        # Every rank sees every pair, so each raises the same error.
+        unreachable = [
+            (a, b)
+            for a in range(world)
+            for b in plan.neighbours[a]
+            if not (matrix[a][b] and matrix[b][a])
+        ]
+        if requested == "peer" and unreachable:
+            raise ValueError(
+                "HYDROFORGE_HALO_TRANSPORT=peer, but these neighbouring ranks "
+                f"are not load/store reachable: {unreachable} "
+                f"({self.skipped.get('peer', 'outside the LSA team')})"
             )
-        everywhere: list[Any] = [None] * world
-        dist.all_gather_object(
-            everywhere, sorted(set(self.links.values())), group=group
-        )
+        direct = requested in ("auto", "peer")
+        self.links: dict[int, str] = {
+            peer: "peer" if direct and matrix[rank][peer] and matrix[peer][rank]
+            else fallback
+            for peer in plan.neighbours[rank]
+        }
+        problem = None
+        try:
+            self._build_tables()
+        except Exception as error:
+            problem = f"{type(error).__name__}: {error}"
+        everywhere = _agree(group, world, problem, sorted(set(self.links.values())))
         self.communicates = any(
             link != "peer" for links in everywhere for link in links
         )
         # Host staging (``.cpu()``, Gloo requests) runs on the host at every
         # exchange: no CUDA graph can replay it.
         self.capturable = not any("host" in links for links in everywhere)
-        self._build_tables()
         # The registered exchange kernel (hydroforge.kernels.halo.attach),
         # attached by the layer that owns kernels.
         self.registry: Any = None

@@ -551,10 +551,38 @@ class _Fixed:
         self.executor.release_all(graphs, scope="fixed loop graphs")
 
 
+class _Segment:
+    """One run of operators between host-launched ones, captured where it
+    first runs: its warmups and capture read what the host operators before
+    it (a nested predicate loop, a collective) produced in that iteration."""
+
+    __slots__ = ("loop", "launches", "writes", "graph")
+
+    def __init__(
+        self,
+        loop: _SegmentedFixed,
+        launches: tuple[Callable[[], None], ...],
+        writes: tuple[torch.Tensor, ...],
+    ) -> None:
+        self.loop = loop
+        self.launches = launches
+        self.writes = writes
+        self.graph: Any = None
+
+    def __call__(self) -> None:
+        if self.graph is None:
+            self.graph = self.loop.executor.capture(
+                partial(_launch_all, self.launches), mutated_state=self.writes
+            )
+            self.loop.graphs.append(self.graph)
+        self.graph.replay()
+
+
 class _SegmentedFixed:
     """A fixed loop whose body launches host-only operators (nested predicate
     loops, collectives): the runs between them replay as separate graphs in
-    lexical order, and every iteration samples from the host."""
+    lexical order, each captured when it first runs, and every iteration
+    samples from the host."""
 
     def __init__(self, executor: CudaGraphExecutor, loop: Any) -> None:
         self.executor = executor
@@ -575,7 +603,8 @@ class _SegmentedFixed:
         return count
 
     def _plan(self, *, final: bool) -> tuple[Callable[[], None], ...]:
-        """Capture operator runs between host-launched operators exactly once."""
+        """The operator runs between host-launched operators, each captured
+        once, in execution order."""
 
         plan = self.plans.get(final)
         if plan is not None:
@@ -614,29 +643,10 @@ class _SegmentedFixed:
                 groups[-1][2].extend(writes)
             else:
                 groups.append((safe, [launch], list(writes)))
-        captured: list[Any] = []
-        steps: list[Callable[[], None]] = []
-        try:
-            for safe, launches, writes in groups:
-                if not safe:
-                    steps.append(launches[0])
-                    continue
-                graph = executor.capture(
-                    partial(_launch_all, tuple(launches)), mutated_state=writes
-                )
-                captured.append(graph)
-                steps.append(graph.replay)
-        except BaseException:
-            with cleanup_on_exit(
-                "fixed segment capture",
-                (
-                    partial(
-                        executor.release_all, captured, scope="fixed segment capture"
-                    ),
-                ),
-            ):
-                raise
-        self.graphs.extend(captured)
+        steps: list[Callable[[], None]] = [
+            _Segment(self, tuple(launches), tuple(writes)) if safe else launches[0]
+            for safe, launches, writes in groups
+        ]
         plan = self.plans[final] = tuple(steps)
         return plan
 

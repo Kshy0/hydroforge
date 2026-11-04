@@ -48,10 +48,6 @@ class Selection:
     conditions: Mapping[str, bool]
     backend: Backend
     device: torch.device
-    precision: Literal["float32", "float64"]
-    """The scalar precision: host scalars, step fields, workspaces."""
-    dtype: torch.dtype
-    mixed_precision: bool
     precisions: Precisions
     metal_emulation: Literal["native", "float32x2"]
     backend_requirement: BackendRequirement
@@ -70,6 +66,24 @@ class Selection:
     parallel: EnsembleParallel | None
     partition_imbalance: float | None
     slab_periodic: bool
+
+    @property
+    def precision(self) -> Literal["float32", "float64"]:
+        """The scalar precision: host scalars, step fields, workspaces."""
+
+        return self.precisions.scalar
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Elements of the scalar precision."""
+
+        return self.precisions.scalar_dtype
+
+    @property
+    def mixed_precision(self) -> bool:
+        """Whether ``hpfloat`` tensors hold more than ``float`` ones."""
+
+        return self.precisions.mixed
 
     @property
     def field_dtype(self) -> torch.dtype:
@@ -213,7 +227,6 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
                 f"{declaration.precision!r} with storage_precision="
                 f"{declaration.storage_precision!r}"
             )
-    mixed_precision = precisions.mixed
     if (
         device.type == "xpu"
         and "float64" in (precisions.compute, precisions.storage)
@@ -237,7 +250,7 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
     emulation = declaration.metal_emulation
     if emulation == "auto":
         emulation = (
-            "float32x2" if backend.name == "metal" and mixed_precision else "native"
+            "float32x2" if backend.name == "metal" and precisions.mixed else "native"
         )
     if emulation != "native":
         if backend.math.physics_fast_math:
@@ -280,9 +293,6 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
         conditions=conditions,
         backend=backend,
         device=device,
-        precision=precisions.scalar,
-        dtype=precisions.scalar_dtype,
-        mixed_precision=mixed_precision,
         precisions=precisions,
         metal_emulation=emulation,
         backend_requirement=model_rule,

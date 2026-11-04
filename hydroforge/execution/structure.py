@@ -637,6 +637,8 @@ def _commit_content_update(
 
     changed = tuple(current for current, _ in (*pairs, *derived))
     statistics = runtime.statistics
+    if statistics is not None:
+        statistics.require_stable_coordinates(replacements, kind="content")
     if runtime.execution.kernel_binding.content_requires_rebind(changed) or (
         statistics is not None and statistics.content_requires_rebind(changed)
     ):
@@ -709,6 +711,8 @@ def _commit_structural_update(
     _validate_update_integrity(runtime, fields, replacements)
     derived = _stale_reference_indices(runtime, replacements)
     statistics = runtime.statistics
+    if statistics is not None:
+        statistics.require_stable_coordinates(replacements, kind="structural")
     selections = (
         () if statistics is None else statistics.prepare_selection_update(replacements)
     )

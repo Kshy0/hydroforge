@@ -570,7 +570,7 @@ class CheckpointRuntime:
         try:
             runtime.require_healthy(f"{type(runtime.owner).__name__}.save_state")
             # No state a kernel reported as failed is saved.
-            status = runtime.execution.status.wait()
+            status = runtime.execution.status.check()
             if status is not None:
                 runtime.execution.poison(status, phase="device error status")
                 raise status

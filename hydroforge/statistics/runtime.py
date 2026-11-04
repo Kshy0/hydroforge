@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from hydroforge.contracts.fields import RuntimeTensorMetadata
+from hydroforge.contracts.precision import Precisions
 from hydroforge.contracts.schedule import SimulationSchedule, SimulationStep
 from hydroforge.contracts.windows import StatisticsPlan
 from hydroforge.core.arrays import find_indices_in_torch
@@ -144,6 +145,9 @@ class StatisticsInstallation:
     statics: tuple[StatisticsStaticBinding, ...]
     netcdf_options: Mapping[str, Mapping[str, Any]]
     selection_sources: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...] = ()
+    # Coordinates labelling full outputs: (name, the model's tensor). Their
+    # IDs were copied at installation and written as the outputs' axis.
+    coordinate_sources: tuple[tuple[str, torch.Tensor], ...] = ()
 
 
 @dataclass
@@ -157,9 +161,10 @@ class StatisticsRuntime:
     schedule: SimulationSchedule | None = field(repr=False)
     on_write_failure: Callable[[BaseException], None] = field(repr=False)
     block_size: int
-    base_dtype: torch.dtype = torch.float32
-    storage_dtype: torch.dtype | None = None
-    mixed_precision: bool = False
+    precisions: Precisions
+    # The model's device statuses behind the work so far, carried by each
+    # finalized window for its sink to verify before publishing it.
+    status_ticket: Callable[[], Any] | None = field(default=None, repr=False)
     output_dir: Path | None = None
     rank: int = 0
     world_size: int = 1
@@ -803,7 +808,10 @@ class StatisticsRuntime:
             values = {
                 key: decoded_output_tensor(value) for key, value in values.items()
             }
-        self.sink.append(dt, values)
+        ticket = (
+            self.status_ticket() if values and self.status_ticket is not None else None
+        )
+        self.sink.append(dt, values, status=ticket)
         dirty.difference_update(keys)
         self._current_time_index += 1
         self._last_time_number = time_number
@@ -871,9 +879,7 @@ class StatisticsRuntime:
             fields=self._field_registry,
             scatter_extents=self.installation.scatter_extents,
             ensemble_size=self.ensemble_size,
-            base_dtype=self.base_dtype,
-            storage_dtype=self.storage_dtype,
-            mixed_precision=self.mixed_precision,
+            precisions=self.precisions,
         )
         for name in self._variable_ops:
             previous = self._statistics_layouts[name]
@@ -916,6 +922,41 @@ class StatisticsRuntime:
                 for tensor in selection
             )
         return any(tensor.untyped_storage()._cdata in sources for tensor in tensors)
+
+    def require_stable_coordinates(
+        self, replacements: Mapping[int, torch.Tensor], *, kind: str
+    ) -> None:
+        """Reject an update that changes the IDs labelling full outputs.
+
+        A full output writes the model's rows in their current order under
+        the IDs installed with it; its files cannot be relabelled without
+        mislabelling the records already written. A ``SelectionField`` maps
+        saved IDs to their current rows instead.
+        """
+
+        for name, source in self.installation.coordinate_sources:
+            replacement = replacements.get(id(source))
+            if replacement is None:
+                continue
+            installed = self._tensor_registry[name]
+            rows = installed.numel()
+            if replacement.shape[0] >= rows and torch.equal(
+                replacement[:rows].to(device=installed.device, dtype=installed.dtype),
+                installed,
+            ):
+                continue
+            outputs = sorted(
+                variable
+                for variable in self._variable_ops
+                if self._field_registry[variable].output_coord == name
+            )
+            raise ValueError(
+                f"{kind} update changes the IDs or order of {name!r}, which "
+                f"labels the outputs {outputs}: their files keep the IDs "
+                "installed with them, so new row order would be mislabelled. "
+                f"Keep {name!r} unchanged, or save these outputs through a "
+                f"SelectionField of {name!r}, whose IDs follow their rows"
+            )
 
     def prepare_selection_update(
         self, replacements: Mapping[int, torch.Tensor]
@@ -1108,9 +1149,7 @@ class StatisticsRuntime:
             fields=self._field_registry,
             scatter_extents=installation.scatter_extents,
             ensemble_size=self.ensemble_size,
-            base_dtype=self.base_dtype,
-            storage_dtype=self.storage_dtype,
-            mixed_precision=self.mixed_precision,
+            precisions=self.precisions,
         )
         self._activate_compilation(compilation)
 

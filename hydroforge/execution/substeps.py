@@ -88,7 +88,8 @@ class _HostVariant:
 
 class HostVariants:
     """Recorded host values of one scope's primary program, its built
-    variants and the step triggers (duration, count) already matched to one.
+    variants (which it owns: ``ModelExecution.programs`` only views them)
+    and the step triggers (duration, count) already matched to one.
 
     Triggers map straight to their variant, so a warm step never hashes or
     compares a recorded signature.  ``recent`` orders the non-primary
@@ -150,7 +151,6 @@ def cached_program(
                 ),
             ):
                 raise
-        execution.programs[variant] = program
         entry = _HostVariant(variant, program)
         if variants is None:
             variants = execution.host_variants[key] = HostVariants(signature)
@@ -162,18 +162,17 @@ def cached_program(
     variants.triggers.move_to_end(trigger)
     if len(variants.triggers) > _HOST_TRIGGER_LIMIT:
         variants.triggers.popitem(last=False)
-    _evict_host_variants(execution.programs, variants)
+    _evict_host_variants(variants)
     return entry.program
 
 
-def _evict_host_variants(programs: dict[Any, Any], variants: HostVariants) -> None:
+def _evict_host_variants(variants: HostVariants) -> None:
     """Close the least recently used non-primary variants beyond the limit."""
 
     evicted = []
     while len(variants.recent) > _HOST_VARIANT_LIMIT:
         entry, _ = variants.recent.popitem(last=False)
         del variants.entries[entry.key]
-        programs.pop(entry.key, None)
         triggers = variants.triggers
         for trigger in [
             trigger for trigger, value in triggers.items() if value is entry

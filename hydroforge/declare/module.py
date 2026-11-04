@@ -47,6 +47,7 @@ from pydantic import (
 
 from hydroforge.contracts.fields import TensorDependencies, TensorMetadata
 from hydroforge.contracts.options import OptionsConfig
+from hydroforge.contracts.precision import resolve_precisions, tier_of
 from hydroforge.contracts.runtime import MODEL_OWNED_MODULE_FIELDS
 from hydroforge.core.arrays import find_indices_in_torch
 from hydroforge.core.errors import UnknownFieldError, error_message
@@ -205,8 +206,11 @@ def TensorField(
                  entities. With a slab axis among the grid's dimensions each
                  rank keeps the entities in its own rows, renumbered to its
                  stored grid; ``prepare_model_input`` still sees the complete
-                 tables with global indices, and checkpoints save them
-                 complete (see :class:`hydroforge.contracts.SlabAxis`).
+                 tables with global indices (it may also compute them), and
+                 checkpoints save them complete (see
+                 :class:`hydroforge.contracts.SlabAxis`). The table comes
+                 from the input: ``default=None`` makes it optional, a fill
+                 value is rejected.
 
     ``finite`` and the bounds are checked once, when the model materializes,
     for stored non-forcing fields.
@@ -225,6 +229,13 @@ def TensorField(
         raise ValueError("TensorField default must be a bool, int, float or None")
     if default is not _NO_FIELD_DEFAULT and default is not None:
         _validate_scalar_default(default, dtype)
+    if grid_index and default is not _NO_FIELD_DEFAULT and default is not None:
+        # Its cells are checked and cut per rank where inputs are read;
+        # ``default=None`` only leaves an optional table absent.
+        raise ValueError(
+            "a grid_index table is read from the model input; it cannot "
+            "have a fill default (default=None leaves it absent)"
+        )
     if output is None:
         output = "disabled" if category == "forcing" or mode == "discard" else "auto"
     bounds = {"ge": ge, "gt": gt, "le": le, "lt": lt}
@@ -334,7 +345,8 @@ def ReferenceField(
     is_key: bool = False,
     default: Any = _NO_FIELD_DEFAULT,
 ):
-    """Declare a globally valid foreign key to another coordinate."""
+    """Declare a globally valid foreign key to another coordinate: a
+    one-dimensional ``shape``, one target ID per row."""
     return TensorField(
         description=description,
         shape=shape,
@@ -677,9 +689,12 @@ def ErrorField(
         # Triton
         report_error(status_ptr, failed, CODE, cells)  # triton_errors
 
-    HydroForge watches the status without stopping the device
-    (:mod:`hydroforge.execution.status`): a failure fails the next managed
-    step, or a checkpoint save, on every rank with a
+    No step waits for the device to read it
+    (:mod:`hydroforge.execution.status`): each output window carries the
+    status behind it, and a window after a failure is never published (to
+    ``model.results`` or a NetCDF file). The failure surfaces at the next
+    window close, results read, checkpoint save or ``close`` (and at
+    initialization), on every rank, as a
     :class:`~hydroforge.core.errors.DeviceStatusError` naming the first
     failure, its info values and how many failures followed. Models neither
     clear nor read the status themselves.
@@ -909,8 +924,8 @@ class AbstractModule(HydroForgeModel, ABC):
     storage_precision: torch.dtype | None = Field(
         default=None,
         description=(
-            "Elements of hpfloat tensors (the storage tier); None promotes "
-            "them as mixed_precision says"
+            "Elements of hpfloat tensors (the storage tier); omitted, it is "
+            "resolved at construction from precision as mixed_precision says"
         ),
     )
     matmul_tf32: bool = Field(
@@ -949,14 +964,10 @@ class AbstractModule(HydroForgeModel, ABC):
 
     @property
     def storage_dtype(self) -> torch.dtype:
-        """Elements of this module's hpfloat tensors."""
+        """Elements of this module's hpfloat tensors (resolved at
+        construction, see ``storage_precision``)."""
 
-        if self.storage_precision is not None:
-            return self.storage_precision
-        from hydroforge.contracts.precision import resolve_precisions, tier_of
-
-        tiers = resolve_precisions(tier_of(self.precision), None, self.mixed_precision)
-        return tiers.storage_dtype
+        return self.storage_precision
 
     @classmethod
     def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
@@ -1093,6 +1104,15 @@ class AbstractModule(HydroForgeModel, ABC):
                     f"module {cls.module_name!r} prepare_module_input must "
                     "return a dict"
                 )
+            if payload.get("storage_precision") is None:
+                # A module built alone (a model always passes both tiers):
+                # its storage tier resolves here, once, as a model's would.
+                precision = payload.get("precision", torch.float32)
+                mixed = payload.get("mixed_precision", True)
+                if isinstance(precision, torch.dtype) and type(mixed) is bool:
+                    payload["storage_precision"] = resolve_precisions(
+                        tier_of(precision), None, mixed
+                    ).storage_dtype
             unknown = sorted(set(payload).difference(cls.model_fields))
             if unknown:
                 warnings.warn(

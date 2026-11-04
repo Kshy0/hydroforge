@@ -32,12 +32,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cache
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Literal
 
 import torch
 from pydantic import validate_call
 
-from hydroforge.contracts.precision import tier_of
+from hydroforge.contracts.precision import Precisions, tier_of
 from hydroforge.core.validation import HydroForgeModel
 from hydroforge.platform import env
 from hydroforge.platform.devices import float64_supported
@@ -156,26 +156,11 @@ class Backend:
         return device.type != "xpu" or float64_supported(device)
 
     def validate_precision(
-        self, precisions: Any, mixed: bool | None = None, *, emulated: bool = False
+        self, precisions: Precisions, *, emulated: bool = False
     ) -> None:
         """Reject tiers whose elements this backend's framework kernels do
-        not handle; ``emulated`` storage (Metal float32x2) is not native.
+        not handle; ``emulated`` storage (Metal float32x2) is not native."""
 
-        ``precisions`` is a :class:`~hydroforge.contracts.precision.Precisions`,
-        or a compute tier with ``mixed`` (whether hpfloat is promoted)."""
-
-        if isinstance(precisions, str):
-            # A bare compute tier and whether hpfloat is promoted.
-            if precisions not in self.precisions:
-                raise ValueError(
-                    f"backend {self.name!r} requires precision in "
-                    f"{sorted(self.precisions)}, got {precisions!r}"
-                )
-            if mixed and not self.mixed_precision:
-                raise ValueError(
-                    f"backend {self.name!r} does not support mixed precision"
-                )
-            return
         compute = tier_of(precisions.field_dtype)
         if compute not in self.precisions:
             raise ValueError(

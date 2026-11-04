@@ -12,6 +12,7 @@ from typing import Any, Literal, Self
 
 from pydantic import Field, field_validator, model_validator
 
+from hydroforge.contracts.precision import Precisions
 from hydroforge.core.validation import HydroForgeModel
 
 MODEL_OWNED_MODULE_FIELDS = (
@@ -92,29 +93,8 @@ class BackendRequirement(HydroForgeModel):
             )
         return self
 
-    def validate_precision(
-        self,
-        precisions: Any,
-        mixed_precision: bool | None = None,
-        *,
-        backend: str,
-    ) -> None:
-        """Validate the model's tiers (:class:`~hydroforge.contracts.precision.
-        Precisions`, or a compute tier with ``mixed_precision``) against this
-        model restriction."""
-
-        if isinstance(precisions, str):
-            # A bare compute tier: the tier and the promotion request.
-            if self.precision is not None and precisions not in self.precision:
-                raise ValueError(
-                    f"backend {backend!r} requires precision in "
-                    f"{sorted(self.precision)}, got {precisions!r}"
-                )
-            if not self.mixed_precision and mixed_precision:
-                raise ValueError(
-                    f"backend {backend!r} does not support mixed precision"
-                )
-            return
+    def validate_precision(self, precisions: Precisions, *, backend: str) -> None:
+        """Validate the model's tiers against this model restriction."""
 
         served = (
             frozenset(("float64", "float32", "tf32"))

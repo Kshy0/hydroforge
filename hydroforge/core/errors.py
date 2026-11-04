@@ -75,7 +75,8 @@ class SubstepCompileError(RuntimeError):
 
 class DeviceStatusError(RuntimeError):
     """Kernels reported a fatal condition through a declared error status
-    (``ErrorField``); the message names every bit that was set."""
+    (``ErrorField``); the message names the first failure, its info values
+    and how many failures there were."""
 
 
 class UnknownFieldError(KeyError, ValueError):

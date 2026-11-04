@@ -70,8 +70,12 @@ def checked_narrowing(
 class StatisticsSink(Protocol):
     """What the statistics runtime calls on its output destination."""
 
-    def append(self, dt: Any, values: Mapping[str, torch.Tensor]) -> None:
-        """Take one finalized sample of the outputs in ``values``."""
+    def append(
+        self, dt: Any, values: Mapping[str, torch.Tensor], status: Any = None
+    ) -> None:
+        """Take one finalized sample of the outputs in ``values``; publish it
+        only once ``status`` (a :class:`~hydroforge.execution.status.
+        StatusTicket` of the work that produced it) verified."""
 
     def flush(self, dt: Any) -> None:
         """Make every accepted sample durable (e.g. before a checkpoint)."""
@@ -100,7 +104,9 @@ class MemorySink:
     Samples leaving a CUDA device for CPU results are copied asynchronously
     into one pinned staging buffer per dtype and land in owned pageable
     storage before the next sample or any read, so a sample never waits for
-    the device queue.
+    the device queue. A sample with a status ticket lands the same way, once
+    the ticket verified: after failed kernels it, and every later sample,
+    is dropped and the failure raised (then on every later use).
     """
 
     def __init__(
@@ -123,10 +129,24 @@ class MemorySink:
                     )
         self._results: dict[str, list[torch.Tensor]] = {name: [] for name in outputs}
         self._staging: dict[torch.dtype, torch.Tensor] = {}
-        # (copy event, ((name, staged view), ...)) of the last staged sample.
-        self._staged: tuple[Any, tuple[tuple[str, torch.Tensor], ...]] | None = None
+        # (copy event or None, ((name, staged view), ...), {name: owned
+        # copy}, status ticket or None) of the last sample not yet landed.
+        self._staged: (
+            tuple[
+                Any,
+                tuple[tuple[str, torch.Tensor], ...],
+                dict[str, torch.Tensor],
+                Any,
+            ]
+            | None
+        ) = None
+        self._failure: BaseException | None = None
 
-    def append(self, dt: Any, values: Mapping[str, torch.Tensor]) -> None:
+    def append(
+        self, dt: Any, values: Mapping[str, torch.Tensor], status: Any = None
+    ) -> None:
+        if self._failure is not None:
+            raise self._failure
         # One host check covers every narrowed output of the sample.
         flags: list[tuple[torch.Tensor, str, str]] = []
         converted = {}
@@ -190,10 +210,16 @@ class MemorySink:
             moved = flat.to(device=self.device).split(sizes)
             for name, part, value in zip(names, parts, moved, strict=True):
                 copies[name] = value.view(part.shape)
+        event = None
         if staged:
             event = torch.cuda.Event()
             event.record(stream)
-            self._staged = (event, tuple(staged))
+        if staged or status is not None:
+            self._staged = (event, tuple(staged), copies, status)
+        else:
+            self._keep(copies)
+
+    def _keep(self, copies: Mapping[str, torch.Tensor]) -> None:
         for name, value in copies.items():
             # Exact widening follows the move: the sampling device may lack
             # the wider type (MPS has no float64).
@@ -213,16 +239,25 @@ class MemorySink:
         target.copy_(flat, non_blocking=True)
         return target
 
-    def _land(self) -> None:
-        """Move the staged sample into owned results once its copy completed."""
+    def _land(self, *, report: bool = True) -> None:
+        """Move the last sample into owned results once its copy completed
+        and its statuses verified; ``report`` raises a failure (found now or
+        earlier)."""
 
         staged, self._staged = self._staged, None
-        if staged is None:
-            return
-        event, values = staged
-        event.synchronize()
-        for name, value in values:
-            self._results[name].append(value.clone())
+        if staged is not None:
+            event, values, copies, status = staged
+            if event is not None:
+                event.synchronize()
+            failure = None if status is None else status.verify()
+            if failure is not None:
+                self._failure = failure
+            else:
+                self._keep(copies)
+                for name, value in values:
+                    self._results[name].append(value.clone())
+        if report and self._failure is not None:
+            raise self._failure
 
     def _snapshot(
         self, name: str, selection: slice, *, as_stacked: bool
@@ -305,5 +340,6 @@ class MemorySink:
         del run_id
 
     def close(self) -> None:
-        self._land()
+        # Failed kernels were reported where found, or by the model's check.
+        self._land(report=False)
         self._staging.clear()

@@ -26,7 +26,6 @@ from hydroforge.compiler.partition import bare, coordinate_identity, coordinate_
 from hydroforge.compiler.selection import Selection
 from hydroforge.compiler.slab import slab_tokens
 from hydroforge.contracts.fields import concrete_tensor_dtype
-from hydroforge.contracts.precision import precisions_of
 from hydroforge.contracts.slab import CELL, INTERIOR
 from hydroforge.contracts.views import OutputUnion, OutputView
 from hydroforge.contracts.windows import EveryStep, StatisticsOutput, StatisticsPlan
@@ -299,8 +298,8 @@ class StatisticsDeclarationCompiler:
                 value_expression,
                 concrete_tensor_dtype(
                     reference[3] if target_metadata is None else target_metadata[3],
-                    precisions_of(self.selection).field_dtype,
-                    precisions_of(self.selection).storage_dtype,
+                    self.selection.precisions.field_dtype,
+                    self.selection.precisions.storage_dtype,
                 ),
             )
         return reference if target_metadata is None else target_metadata
@@ -436,8 +435,8 @@ class StatisticsDeclarationCompiler:
             expression,
             concrete_tensor_dtype(
                 target_metadata[3],
-                precisions_of(self.selection).field_dtype,
-                precisions_of(self.selection).storage_dtype,
+                self.selection.precisions.field_dtype,
+                self.selection.precisions.storage_dtype,
             ),
         )
         return target_metadata
@@ -490,8 +489,8 @@ class StatisticsDeclarationCompiler:
         )
         tensor_dtype = concrete_tensor_dtype(
             dtype,
-            precisions_of(self.selection).field_dtype,
-            precisions_of(self.selection).storage_dtype,
+            self.selection.precisions.field_dtype,
+            self.selection.precisions.storage_dtype,
         )
         precision = self.config.save_precision
         saved_dtype = saved_dtype_of(

@@ -98,6 +98,7 @@ _NonemptyText = Annotated[str, Field(min_length=1)]
 _SourcePath = Annotated[Path, Field(strict=False)]
 _CONDITION = re.compile(r"(not\s+)?([A-Za-z_]\w*)")
 _INCLUDE = re.compile(r'^\s*#include\s+"([^"]+)"', re.MULTILINE)
+_PRAGMA_ONCE = re.compile(r"^[ \t]*#[ \t]*pragma[ \t]+once\b[^\n]*$", re.MULTILINE)
 _LANES = frozenset({1, 2, 4, 8, 16, 32})
 
 
@@ -107,7 +108,10 @@ class CudaSource(HydroForgeModel):
     The source is ``path`` (expanded with its ``prefixes`` and quoted
     includes) or literal ``text``.  A quoted include resolves against
     ``inline_includes`` by basename, then relative to the including file
-    inside ``include_root``.  ``options`` use the runtime compiler's spelling
+    inside ``include_root``. Expansion keeps the preprocessor's meaning: a
+    file is expanded at every include, its ``#ifndef`` guard or ``#pragma
+    once`` (expanded once per source) deciding what repeats, and a file
+    including itself again while expanding expands nothing there.  ``options`` use the runtime compiler's spelling
     (``--ftz=false``, ``-DNAME=value``); ``HYDROFORGE_FAST_MATH`` decides fast
     math, so sources do not set it. Expanded source and toolkit headers can
     use the persistent binary cache. Other external headers (including custom
@@ -200,7 +204,13 @@ class CudaSource(HydroForgeModel):
                     # context-independent payloads can be reused by another root.
                     if previous == backedges:
                         expanded[path] = payload
+                if not _PRAGMA_ONCE.search(payload):
+                    # Expanded each time, as the preprocessor would: its own
+                    # #ifndef guard, if any, still applies.
+                    return f"{payload}\n"
+                # ``#pragma once`` names the file, which expansion inlines.
                 guard = "HYDROFORGE_INCLUDE_" + sha256(str(path).encode()).hexdigest()
+                payload = _PRAGMA_ONCE.sub("", payload)
                 return f"#ifndef {guard}\n#define {guard}\n{payload}\n#endif\n"
 
             return _INCLUDE.sub(replace, text)

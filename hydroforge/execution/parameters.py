@@ -26,7 +26,6 @@ import torch
 from hydroforge.compiler.parameters import validate_set_targets
 from hydroforge.contracts.fields import concrete_tensor_dtype
 from hydroforge.contracts.parameters import ParameterValue, validate_parameter_scalar
-from hydroforge.contracts.precision import precisions_of
 from hydroforge.core.devices import devices_match
 from hydroforge.core.errors import ResourceCleanupError
 from hydroforge.declare.module import AbstractModule
@@ -321,8 +320,8 @@ class LocalParameterCompiler:
             expected_shape=update_shape,
             expected_dtype=concrete_tensor_dtype(
                 tensor.dtype,
-                precisions_of(plan).field_dtype,
-                precisions_of(plan).storage_dtype,
+                plan.precisions.field_dtype,
+                plan.precisions.storage_dtype,
             ),
             expected_device=torch.device("cpu")
             if tensor.mode == "cpu"

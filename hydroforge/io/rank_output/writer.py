@@ -34,6 +34,7 @@ import torch
 
 from hydroforge.core.arrays import torch_to_numpy_dtype
 from hydroforge.core.errors import (
+    DeviceStatusError,
     ResourceCleanupError,
     cleanup_on_exit,
     failure_description,
@@ -590,12 +591,20 @@ class _OutputStream:
 
 @dataclass(frozen=True, slots=True)
 class _StagedStep:
-    """One output step whose device-to-host copies may still be in flight."""
+    """One output step whose device-to-host copies may still be in flight.
+
+    ``status`` is the model's device statuses behind the step
+    (:class:`~hydroforge.execution.status.StatusTicket`), verified before its
+    rows may reach a file; ``before`` is where each stream's rows stood
+    before the step, so a failed step and the later ones can be withdrawn.
+    """
 
     rows: tuple[tuple[_OutputStream, int, int], ...]
     flags: tuple[tuple[torch.Tensor, str, str], ...]
     flag_row: int
     event: Any
+    status: Any = None
+    before: tuple[tuple[_OutputStream, int, int], ...] = ()
 
 
 class RankOutputWriter:
@@ -1154,7 +1163,10 @@ class RankOutputWriter:
         return self._dtypes[name]
 
     def _write_step(
-        self, values: Mapping[str, torch.Tensor], dt: datetime | cftime.datetime
+        self,
+        values: Mapping[str, torch.Tensor],
+        dt: datetime | cftime.datetime,
+        status: Any = None,
     ) -> None:
         """Copy one step into the ring, check it, and append full slots."""
 
@@ -1197,12 +1209,18 @@ class RankOutputWriter:
                     del target
                 rows.append((stream, slot, row))
         # A rejected step leaves no row behind and the writer usable.
+        failure = None if status is None else status.verify()
+        if failure is not None:
+            raise failure
         raise_narrowing_failures(flags)
         self._place(rows, dt)
         self._submit_full(tuple(rows))
 
     def _stage(
-        self, values: Mapping[str, torch.Tensor], dt: datetime | cftime.datetime
+        self,
+        values: Mapping[str, torch.Tensor],
+        dt: datetime | cftime.datetime,
+        status: Any = None,
     ) -> None:
         """Snapshot on the device, enqueue the copies into the ring, queue the step.
 
@@ -1258,13 +1276,26 @@ class RankOutputWriter:
             event = self._events[flag_row]
             event.record(copy_stream)
         self._flag_row = 1 - flag_row
+        before = {stream: (stream.slot, stream.rows) for stream, _slot, _row in rows}
         self._place(rows, dt)
-        self._staged.append(_StagedStep(tuple(rows), tuple(flags), flag_row, event))
+        self._staged.append(
+            _StagedStep(
+                tuple(rows),
+                tuple(flags),
+                flag_row,
+                event,
+                status,
+                tuple((stream, *at) for stream, at in before.items()),
+            )
+        )
 
     def _land(self, staged: _StagedStep) -> None:
-        """Wait for a staged step and check its flags."""
+        """Wait for a staged step and check its device statuses and flags."""
 
         staged.event.synchronize()
+        failure = None if staged.status is None else staged.status.verify()
+        if failure is not None:
+            raise failure
         if staged.flags:
             # Host values, so a raised failure holds no view of the ring.
             raise_narrowing_failures(
@@ -1282,6 +1313,11 @@ class RankOutputWriter:
             staged = self._staged[0]
             try:
                 self._land(staged)
+            except DeviceStatusError as error:
+                # Kernels failed before this step: it and the later steps
+                # never reach a file, the rows before them still do.
+                self._withdraw_staged()
+                self._latch_failures("statistics output staging", [error])
             except Exception as error:
                 # The rejected step's rows already sit in every stream's slot.
                 self._poisoned = None
@@ -1292,6 +1328,22 @@ class RankOutputWriter:
                     self._latch_failures("statistics output staging", [error])
             self._staged.popleft()
             self._submit_full(staged.rows)
+
+    def _withdraw_staged(self) -> None:
+        """Drop every staged step, oldest included, and their rows."""
+
+        staged = tuple(self._staged)
+        self._staged.clear()
+        # Their copies finish before the slots take other rows.
+        with cleanup_on_exit(
+            "statistics output staging", (staged[-1].event.synchronize,)
+        ):
+            pass
+        for stream, slot, rows in staged[0].before:
+            if stream.slot == slot:
+                times = stream.times[slot]
+                del times[len(times) - (stream.rows - rows) :]
+            stream.slot, stream.rows = slot, rows
 
     def _flush_all_write_buffers(
         self, *, latch: bool = True, next_slot: bool = False
@@ -1327,7 +1379,12 @@ class RankOutputWriter:
         while self._staged:
             staged = self._staged[0]
             # A step that failed its range check must not reach any file.
-            self._land(staged)
+            try:
+                self._land(staged)
+            except DeviceStatusError:
+                # Nor one after failed kernels, nor the steps after it.
+                self._withdraw_staged()
+                break
             self._staged.popleft()
             slots.extend(
                 (stream, slot, stream.slots.batch)
@@ -1471,9 +1528,16 @@ class RankOutputWriter:
             self._create_netcdf_files()
 
     def append(
-        self, dt: datetime | cftime.datetime, values: Mapping[str, torch.Tensor]
+        self,
+        dt: datetime | cftime.datetime,
+        values: Mapping[str, torch.Tensor],
+        status: Any = None,
     ) -> None:
-        """Copy one finalized sample; the caller may then reuse its tensors."""
+        """Copy one finalized sample; the caller may then reuse its tensors.
+
+        ``status`` (a :class:`~hydroforge.execution.status.StatusTicket`) is
+        verified before the sample's rows may reach a file.
+        """
         self._raise_if_background_failed()
         if self._ring is None:
             raise RuntimeError("statistics output writer was not started")
@@ -1492,13 +1556,13 @@ class RankOutputWriter:
                 raise ValueError("NetCDF write timestamps must be strictly increasing")
         self._prepare_output_files(dt)
         if not self._asynchronous:
-            self._write_step(values, dt)
+            self._write_step(values, dt, status)
             self._last_times.update(dict.fromkeys(values, numeric_time))
             return
         # At most one step is in flight (an interrupted landing may leave
         # two, landed here first), so the two flag rows never overlap.
         self._land_staged(keep=1)
-        self._stage(values, dt)
+        self._stage(values, dt, status)
         # The previous step is checked while this one's copies run.
         self._land_staged(keep=1)
         self._last_times.update(dict.fromkeys(values, numeric_time))
@@ -1554,8 +1618,17 @@ class RankOutputWriter:
             if failure is None:
                 self._flush_all_write_buffers()
             else:
-                failures.append(failure)
+                # Failed kernels were reported where found (or by the
+                # model's own check at close), not by its output.
+                if not isinstance(failure, DeviceStatusError):
+                    failures.append(failure)
                 self._flush_surviving_buffers()
+        except DeviceStatusError:
+            # Found by the last landing: the rows before it are still kept.
+            try:
+                self._flush_surviving_buffers()
+            except BaseException as error:
+                failures.append(error)
         except BaseException as error:
             if error is not failure:
                 failures.append(error)

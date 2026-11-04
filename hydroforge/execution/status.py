@@ -10,28 +10,40 @@ A module declares an ``ErrorField``: an int32 status ``[failures, code,
 *info]`` that kernels bind like any field. A failing thread counts itself;
 the first failure also stores its code and info values (where it happened),
 so the status always describes one failure consistently. Kernels never stop
-the run, and the host never waits for a step just to read the statuses:
+the run, and a status only grows, so a status copied after some work tells
+whether that work, or any before it, failed. The physical state is not
+rolled back.
 
-* after each managed step they are copied to pinned host memory behind the
-  step's work, one copy in flight at a time (a status only grows, so a
-  skipped copy loses nothing);
-* the next managed step and every between-steps call read the last copy
-  once the device finished it, without waiting;
-* initialization, a checkpoint save and ``close`` wait for them, so no
-  failed state is saved and no failure goes unreported.
+No managed step waits for the device to learn its statuses:
 
-A failure fails the rank's next managed step (or the save) with a
-:class:`~hydroforge.core.errors.DeviceStatusError` naming the first failure
-and its info values, and poisons the model; on several ranks the rank
-channel fails the others at the same step. Compiled substeps and CUDA
-graphs are unaffected: kernels only write device memory, and the copies
-follow the work on the caller's stream. Devices other than CUDA read the
-statuses directly at those points.
+* each statistics window carries a :class:`StatusTicket`, the statuses
+  copied behind the work that produced it (asynchronously on CUDA), and its
+  sink verifies the ticket before the window becomes visible: before
+  ``model.results`` returns it, or before its rows go to a NetCDF file. The
+  sinks already wait for the window's own copy there, so the check costs no
+  extra wait. A failed window and every later one are dropped; earlier
+  windows are kept and written.
+* initialization, a checkpoint save (no failed state is saved) and
+  ``close`` check the statuses directly, waiting for the work enqueued so
+  far.
+
+So a failure surfaces where the output it spoiled would have appeared: the
+next window close, a ``model.results`` read, a save or ``close`` (on several
+ranks the rank channel fails the others in that call). Steps in between,
+and between-steps calls, commit. A model without statistics output learns
+of a failure at its next save or ``close``. A model without an
+``ErrorField`` never checks.
+
+A failure raises a :class:`~hydroforge.core.errors.DeviceStatusError` naming
+the first failure and its info values, and poisons the model. Compiled
+substeps and CUDA graphs are unaffected: kernels only write device memory.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -66,27 +78,66 @@ class _Status:
         )
 
 
-class DeviceStatus:
-    """The declared error statuses of one model runtime."""
+class StatusTicket:
+    """The statuses as they stood after the work enqueued before the ticket.
 
-    def __init__(self, statuses: tuple[_Status, ...] = (), rank: int = 0) -> None:
+    On CUDA they are copied into pinned host memory behind that work; on
+    other devices they were read already. :meth:`verify` waits for the copy
+    (a sink calls it once the output that ticket travels with has landed)
+    and names the first failure, if any.
+    """
+
+    __slots__ = ("status", "host", "event", "words")
+
+    def __init__(
+        self,
+        status: DeviceStatus,
+        *,
+        host: torch.Tensor | None = None,
+        event: Any = None,
+        words: list[int] | None = None,
+    ) -> None:
+        self.status = status
+        self.host = host
+        self.event = event
+        self.words = words
+
+    def verify(self) -> DeviceStatusError | None:
+        if self.words is None:
+            self.event.synchronize()
+            self.words = self.host.tolist()
+            self.status.free.append(self.host)
+            self.host = None
+        return self.status.failure(self.words)
+
+
+class DeviceStatus:
+    """The declared error statuses of one model runtime.
+
+    ``on_failure`` receives the first failure found (to poison the model),
+    by a check or by a sink verifying a ticket.
+    """
+
+    def __init__(
+        self,
+        statuses: tuple[_Status, ...] = (),
+        rank: int = 0,
+        on_failure: Callable[[DeviceStatusError], None] | None = None,
+    ) -> None:
         self.statuses = statuses
         self.rank = rank
+        self.on_failure = on_failure
         self.reported = False
         self.offsets = []
         offset = 0
         for status in statuses:
             self.offsets.append(offset)
             offset += status.tensor.numel()
+        self.words = offset
         device = statuses[0].tensor.device if statuses else None
         self.cuda = device is not None and device.type == "cuda"
-        self.host: torch.Tensor | None = None
-        self.event: Any = None
-        self.copied = False
-        if self.cuda:
-            with _disable_current_modes():
-                self.host = torch.zeros(offset, dtype=torch.int32, pin_memory=True)
-            self.event = torch.cuda.Event()
+        # Pinned buffers of verified tickets, reused by later ones.
+        self.free: list[torch.Tensor] = []
 
     @classmethod
     def declared(cls, runtime: ModelRuntime) -> DeviceStatus:
@@ -118,47 +169,41 @@ class DeviceStatus:
                     tensor,
                 )
             )
-        return cls(tuple(statuses), runtime.plan.rank)
+        return cls(
+            tuple(statuses),
+            runtime.plan.rank,
+            partial(runtime.execution.poison, phase="device error status"),
+        )
 
-    def _copy(self) -> None:
+    def ticket(self) -> StatusTicket | None:
+        """The statuses behind the work enqueued so far, without waiting."""
+
+        if not self.statuses:
+            return None
+        if not self.cuda:
+            return StatusTicket(self, words=self._read())
         with _disable_current_modes(), torch.no_grad():
+            host = (
+                self.free.pop()
+                if self.free
+                else torch.empty(self.words, dtype=torch.int32, pin_memory=True)
+            )
             for offset, status in zip(self.offsets, self.statuses, strict=True):
                 words = status.tensor.numel()
-                self.host[offset : offset + words].copy_(
-                    status.tensor, non_blocking=True
-                )
+                host[offset : offset + words].copy_(status.tensor, non_blocking=True)
             device = self.statuses[0].tensor.device
-            self.event.record(torch.cuda.current_stream(device))
-        self.copied = True
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(device))
+        return StatusTicket(self, host=host, event=event)
 
-    def watch(self) -> None:
-        """Copy the statuses behind the work enqueued so far, unless the
-        last copy is still in flight."""
+    def check(self) -> DeviceStatusError | None:
+        """The failure kernels reported in all work enqueued so far, waiting
+        for that work; ``None`` once a failure was reported."""
 
-        if self.cuda and not self.reported and (not self.copied or self.event.query()):
-            self._copy()
-
-    def poll(self) -> DeviceStatusError | None:
-        """The failure the device already reported, without waiting."""
-
-        if not self.statuses or self.reported:
+        if self.reported:
             return None
-        if not self.cuda:
-            return self._failure(self._read())
-        if not self.copied or not self.event.query():
-            return None
-        return self._failure(self.host.tolist())
-
-    def wait(self) -> DeviceStatusError | None:
-        """The failure the device reported for all work enqueued so far."""
-
-        if not self.statuses or self.reported:
-            return None
-        if not self.cuda:
-            return self._failure(self._read())
-        self._copy()
-        self.event.synchronize()
-        return self._failure(self.host.tolist())
+        ticket = self.ticket()
+        return None if ticket is None else ticket.verify()
 
     def _read(self) -> list[int]:
         with _disable_current_modes():
@@ -166,17 +211,23 @@ class DeviceStatus:
                 int(word) for status in self.statuses for word in status.tensor.tolist()
             ]
 
-    def _failure(self, words: list[int]) -> DeviceStatusError | None:
-        # The first status that failed, in declaration order: one failure.
+    def failure(self, words: list[int]) -> DeviceStatusError | None:
+        """The first status that failed in ``words``, in declaration order:
+        one failure. The first one found is reported to ``on_failure``."""
+
         for offset, status in zip(self.offsets, self.statuses, strict=True):
             own = words[offset : offset + status.tensor.numel()]
             if own[0]:
-                self.reported = True
-                return DeviceStatusError(
+                error = DeviceStatusError(
                     f"kernels reported a fatal condition on rank {self.rank}: "
                     + status.describe(own)
                 )
+                if not self.reported:
+                    self.reported = True
+                    if self.on_failure is not None:
+                        self.on_failure(error)
+                return error
         return None
 
 
-__all__ = ["DeviceStatus"]
+__all__ = ["DeviceStatus", "StatusTicket"]

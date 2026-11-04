@@ -400,6 +400,13 @@ class TensorMetadata:
             )
         if self.selects and self.references != self.selects:
             raise ValueError("selection references must name its selects target")
+        if self.references and len(self.shape) != 1:
+            # One target per row: partitioning, halos and derived reference
+            # indices all read a reference that way.
+            raise ValueError(
+                "references declare one-dimensional integer metadata, one "
+                "target ID per row"
+            )
         if self.replicated and (self.partition_by or self.references):
             raise ValueError("replicated coordinates cannot declare partition lineage")
         if self.dim_coords is not None and not self.shape:

@@ -26,7 +26,6 @@ import torch
 
 from hydroforge.compiler.partition import bare, coordinate_is_partitioned
 from hydroforge.contracts.fields import cast_declared_tensor
-from hydroforge.contracts.precision import precisions_of
 from hydroforge.contracts.slab import CELL, FACE, INTERIOR
 from hydroforge.core.errors import error_message
 from hydroforge.core.events import EventSink, ModelEvent, emit
@@ -595,10 +594,10 @@ def prepare_payloads(
                 "opened_modules": plan.modules,
                 "rank": plan.spatial_rank,
                 "device": plan.device,
-                "precision": precisions_of(plan).field_dtype,
-                "storage_precision": precisions_of(plan).storage_dtype,
-                "matmul_tf32": precisions_of(plan).tf32,
-                "mixed_precision": plan.mixed_precision,
+                "precision": plan.precisions.field_dtype,
+                "storage_precision": plan.precisions.storage_dtype,
+                "matmul_tf32": plan.precisions.tf32,
+                "mixed_precision": plan.precisions.mixed,
                 "metal_emulation": plan.metal_emulation,
                 "ensemble_size": plan.local_ensemble_size,
                 "options": plan.options,

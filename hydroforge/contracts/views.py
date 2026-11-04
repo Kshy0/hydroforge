@@ -27,7 +27,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Self
 
-import numpy as np
 from pydantic import Field, model_validator
 
 from hydroforge.core.naming import Identifier
@@ -160,10 +159,11 @@ class OutputUnion(HydroForgeModel):
 
     A part is a box (axis ranges; axes it does not name are complete) or
     paired points (an axis they do not name is complete for each point). As
-    a point view, a union names every grid axis of its output, and each
-    rank writes the cells it owns, numbered by their place in the whole
-    union. ``point_dimension`` is that of the first point view among the
-    parts, else ``"point"``.
+    a point view, a union names every grid axis of its output. The point
+    dimension's coordinate is each cell's flat row-major index on the global
+    grid, with its index on every axis beside it; each rank writes the cells
+    it owns, so ranks' files join by that coordinate. ``point_dimension`` is
+    that of the first point view among the parts, else ``"point"``.
     """
 
     parts: tuple[OutputView, ...] = Field(min_length=1)
@@ -198,49 +198,6 @@ class OutputUnion(HydroForgeModel):
                 axis for part in self.parts for axis in (*part.axes, *part.points)
             )
         )
-
-    def cells(self, axes: tuple[str, ...], extents: tuple[int, ...]) -> np.ndarray:
-        """The selected cells as global indices of ``axes`` (each with its
-        global extent), one per row: distinct and in row-major order."""
-
-        found = []
-        for part in self.parts:
-            if part.points:
-                # Every point, repeated over the axes it leaves complete.
-                count = len(next(iter(part.points.values())))
-                free = [i for i, axis in enumerate(axes) if axis not in part.points]
-                grid = np.meshgrid(
-                    np.arange(count),
-                    *(np.arange(extents[i]) for i in free),
-                    indexing="ij",
-                )
-                flat = [item.reshape(-1) for item in grid]
-                rows = np.empty((flat[0].size, len(axes)), dtype=np.int64)
-                for i, axis in enumerate(axes):
-                    if axis in part.points:
-                        values = np.asarray(part.points[axis], dtype=np.int64)
-                        if int(values.max()) >= extents[i]:
-                            raise ValueError(
-                                f"point index {int(values.max())} exceeds the "
-                                f"axis {axis!r} extent {extents[i]}"
-                            )
-                        rows[:, i] = values[flat[0]]
-                    else:
-                        rows[:, i] = flat[1 + free.index(i)]
-                found.append(rows)
-            else:
-                ranges = [
-                    np.asarray(
-                        part.axes[axis].indices(extent)
-                        if axis in part.axes
-                        else range(extent),
-                        dtype=np.int64,
-                    )
-                    for axis, extent in zip(axes, extents, strict=True)
-                ]
-                grid = np.meshgrid(*ranges, indexing="ij")
-                found.append(np.stack([item.reshape(-1) for item in grid], axis=1))
-        return np.unique(np.concatenate(found), axis=0)
 
 
 class Out(HydroForgeModel):
