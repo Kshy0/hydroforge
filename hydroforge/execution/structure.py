@@ -20,7 +20,7 @@ import torch
 
 from hydroforge.compiler.partition import coordinate_is_partitioned
 from hydroforge.core.arrays import find_indices_in_torch
-from hydroforge.declare.tensors import ModuleTensors
+from hydroforge.declare.tensors import ModuleTensors, ghost_rows
 from hydroforge.execution.checkpoint import CheckpointRuntime
 from hydroforge.execution.context import managed_step_active, validate_callback
 
@@ -254,6 +254,27 @@ def _infer_dimensions(
                 replacement,
                 len(declared),
             )
+            # Storage holds the halo ghost rows after the owned ones; the
+            # dimension counts the owned rows, as at construction.
+            ghosts = ghost_rows(module, field_name, metadata)
+            if ghosts:
+                owned = actual[0] - ghosts
+                token = declared[0]
+                if isinstance(token, int):
+                    current = token
+                else:
+                    dimension = _dimension(module, token)
+                    current = getattr(dimension.owner, dimension.attribute)
+                if owned != current:
+                    raise ValueError(
+                        f"structural replacement {module.module_name}."
+                        f"{field_name} holds {owned} owned rows, but its "
+                        f"coordinate carries {ghosts} halo ghost row(s) and "
+                        "the halo exchanging them is fixed when the model "
+                        f"materializes: it must keep {current} owned rows "
+                        f"(storage {current + ghosts})"
+                    )
+                actual = (owned, *actual[1:])
             for token, extent in zip(declared, actual, strict=True):
                 if isinstance(token, int):
                     if extent != token:
@@ -298,6 +319,10 @@ def _expected_shape(
                 f"{type(value).__name__}"
             )
         dimensions.append(int(value))
+    metadata = module.spec().tensor_fields[field_name].tensor
+    ghosts = ghost_rows(module, field_name, metadata)
+    if ghosts:
+        dimensions[0] += ghosts
     current = getattr(module, field_name)
     if isinstance(current, torch.Tensor) and module.is_batched(field_name):
         return (module.ensemble_size, *dimensions)

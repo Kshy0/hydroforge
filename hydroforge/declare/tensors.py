@@ -121,6 +121,22 @@ class ModulePayload:
         }
 
 
+def ghost_rows(owner: Any, field_name: str, metadata: Any) -> int:
+    """Halo ghost rows a field stores after the owned rows of its leading
+    axis: the ghosts of its coordinate (``dim_coords``, or the field itself
+    for a coordinate) on this rank. Logical dimensions (``owned_rows``)
+    exclude them; storage holds them.
+    """
+
+    binding = getattr(owner, "_binding", None)
+    if binding is None or metadata is None or not metadata.shape:
+        return 0
+    coordinate = metadata.dim_coords or (field_name if metadata.is_coordinate else None)
+    if not coordinate:
+        return 0
+    return int(binding.ghosts.get(coordinate.rsplit(".", 1)[-1], 0))
+
+
 class ModuleTensors:
     """Materialize and validate a module's declared tensor schema once."""
 
@@ -222,11 +238,8 @@ class ModuleTensors:
                 ) from error
         shape = tuple(values[dimension] for dimension in schema.tensor.shape)
         # Halo ghost rows follow the owned rows of their coordinate.
-        coordinate = schema.tensor.dim_coords or (
-            field_name if schema.tensor.is_coordinate else None
-        )
-        if coordinate and shape:
-            ghosts = module._binding.ghosts.get(coordinate.rsplit(".", 1)[-1], 0)
+        ghosts = ghost_rows(module, field_name, schema.tensor)
+        if ghosts:
             shape = (shape[0] + ghosts, *shape[1:])
         for dimension, size in zip(schema.tensor.shape, shape, strict=True):
             if isinstance(size, bool) or not isinstance(size, Integral):
