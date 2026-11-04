@@ -486,19 +486,18 @@ class _Fixed:
         batches, remainder = divmod(
             count - int(loop.final is not None), self.batch_size
         )
-        regular = self._iteration(launch, final=False) if remainder else None
-        batch = (
-            self._iteration(launch, final=False, repetitions=self.batch_size)
-            if batches
-            else None
-        )
-        final = self._iteration(launch, final=True) if loop.final is not None else None
-        for _ in range(batches):
-            batch.replay()
-        for _ in range(remainder):
-            regular.replay()
-        if final is not None:
-            final.replay()
+        # Each graph is captured (and warmed up) where it first runs: the
+        # final tail reads what the iterations before it produced.
+        if batches:
+            batch = self._iteration(launch, final=False, repetitions=self.batch_size)
+            for _ in range(batches):
+                batch.replay()
+        if remainder:
+            regular = self._iteration(launch, final=False)
+            for _ in range(remainder):
+                regular.replay()
+        if loop.final is not None:
+            self._iteration(launch, final=True).replay()
         if step.sampling and not fold:
             step.sample(first=count == 1, last=True, weight=duration)
         return count

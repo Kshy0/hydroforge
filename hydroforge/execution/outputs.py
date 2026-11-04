@@ -350,11 +350,12 @@ class _StatisticsBinder:
 
         coordinate_sources: dict[str, torch.Tensor] = {}
         for binding_name, binding, output_coordinate in pending_bindings:
+            # Guarded even when an expression already installed it live.
+            if output_coordinate and binding_name not in selected_ids:
+                coordinate_sources[binding_name] = binding
             existing = tensors.get(binding_name)
             if existing is not None:
                 continue
-            if output_coordinate and binding_name not in selected_ids:
-                coordinate_sources[binding_name] = binding
             install_tensor(
                 binding_name,
                 binding,

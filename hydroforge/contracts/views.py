@@ -74,6 +74,11 @@ class Range(HydroForgeModel):
         stop = extent if self.stop is None else self.stop
         if stop > extent:
             raise ValueError(f"range stop {stop} exceeds the axis extent {extent}")
+        if self.start >= stop:
+            raise ValueError(
+                f"range [{self.start}, {stop}) selects no index of an axis of "
+                f"extent {extent}"
+            )
         return range(self.start, stop, self.step)
 
 

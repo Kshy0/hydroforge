@@ -984,13 +984,36 @@ class ModelRuntime:
 
         if self.state != "materialized":
             return
-        # Kernels launched outside the calls that check (direct calls).
+        # The statuses behind the last work no output window carried.
+        execution = self.execution
+        healthy = execution.failure is None
         status: BaseException | None = None
-        if self.execution.failure is None:
+        if healthy:
             try:
-                status = self.execution.status.check()
+                status = execution.status.check()
             except BaseException as error:
                 status = error
+        if self.channel.distributed:
+            # Every rank learns whether kernels failed on any rank: one that
+            # has not failed yet fails its close with them.
+            found = status if status is not None else execution.status.error
+            try:
+                failures = self.channel.gather(found, phase="runtime.close.status")
+            except BaseException as error:
+                status = (
+                    error
+                    if status is None
+                    else ResourceCleanupError(
+                        "model close coordination", (status, error)
+                    )
+                )
+            else:
+                if status is None and healthy and any(
+                    failure is not None for failure in failures
+                ):
+                    status = distributed_failure_error(
+                        "kernels on another rank", failures
+                    )
         failures = self._release()
         self.state = "closed"
         if failures:

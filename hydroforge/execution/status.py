@@ -29,10 +29,12 @@ No managed step waits for the device to learn its statuses:
 
 So a failure surfaces where the output it spoiled would have appeared: the
 next window close, a ``model.results`` read, a save or ``close`` (on several
-ranks the rank channel fails the others in that call). Steps in between,
-and between-steps calls, commit. A model without statistics output learns
-of a failure at its next save or ``close``. A model without an
-``ErrorField`` never checks.
+ranks the rank channel fails the others in that call; ``close`` exchanges
+every rank's failure). A managed step that returns has therefore not
+confirmed its own kernels: it and the steps and between-steps calls after
+it commit (the clock advances), and only their output is withheld. A model
+without statistics output learns of a failure at its next save or
+``close``. A model without an ``ErrorField`` never checks.
 
 A failure raises a :class:`~hydroforge.core.errors.DeviceStatusError` naming
 the first failure and its info values, and poisons the model. Compiled
@@ -128,6 +130,8 @@ class DeviceStatus:
         self.rank = rank
         self.on_failure = on_failure
         self.reported = False
+        # The first failure found, by a check or a sink's ticket.
+        self.error: DeviceStatusError | None = None
         self.offsets = []
         offset = 0
         for status in statuses:
@@ -224,6 +228,7 @@ class DeviceStatus:
                 )
                 if not self.reported:
                     self.reported = True
+                    self.error = error
                     if self.on_failure is not None:
                         self.on_failure(error)
                 return error

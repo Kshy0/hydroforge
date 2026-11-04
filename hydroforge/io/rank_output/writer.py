@@ -1330,7 +1330,10 @@ class RankOutputWriter:
             self._submit_full(staged.rows)
 
     def _withdraw_staged(self) -> None:
-        """Drop every staged step, oldest included, and their rows."""
+        """Drop every staged step, oldest included, and their rows: each
+        stream returns to where it stood before the first dropped step
+        that wrote to it (a later step may write streams the first did not).
+        """
 
         staged = tuple(self._staged)
         self._staged.clear()
@@ -1339,7 +1342,11 @@ class RankOutputWriter:
             "statistics output staging", (staged[-1].event.synchronize,)
         ):
             pass
-        for stream, slot, rows in staged[0].before:
+        earliest: dict[_OutputStream, tuple[int, int]] = {}
+        for step in staged:
+            for stream, slot, rows in step.before:
+                earliest.setdefault(stream, (slot, rows))
+        for stream, (slot, rows) in earliest.items():
             if stream.slot == slot:
                 times = stream.times[slot]
                 del times[len(times) - (stream.rows - rows) :]

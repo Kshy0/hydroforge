@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
+from hydroforge.compiler.partition import coordinate_is_partitioned
 from hydroforge.core.arrays import find_indices_in_torch
 from hydroforge.declare.tensors import ModuleTensors
 from hydroforge.execution.checkpoint import CheckpointRuntime
@@ -521,6 +522,27 @@ def _reference_must_resolve_locally(runtime: ModelRuntime, field: Any) -> bool:
     )
 
 
+def _rows_resolving_locally(runtime: ModelRuntime, field: Any, rows: int) -> int:
+    """Leading rows of a reference to the partition key that must resolve on
+    this rank: those of entities it owns. Their targets are owned or ghost
+    rows, and which rows the halo carries is fixed at materialization, so a
+    target held only by another rank cannot be read here."""
+
+    partition = runtime.partition
+    key = partition.partition_key
+    if runtime.plan.spatial_world_size == 1 or key is None:
+        return 0
+    if field.tensor.references.rsplit(".", 1)[-1] != key:
+        return 0
+    coordinate = partition.variable_groups.get(field.name)
+    schema = runtime.plan.fields.partition
+    if coordinate is None or not coordinate_is_partitioned(schema, key, coordinate):
+        return 0
+    if coordinate == key:
+        rows -= int(partition.ghost_indices(key).size)
+    return rows
+
+
 def _validate_update_integrity(
     runtime: ModelRuntime,
     fields: Mapping[int, list[tuple[Any, str, Any]]],
@@ -569,11 +591,25 @@ def _validate_update_integrity(
             values = replacements.get(id(values), values).reshape(-1)
             target = replacements.get(id(target), target).reshape(-1)
             missing = find_indices_in_torch(values, target.to(values.device)) < 0
-            if bool(missing.any()) and _reference_must_resolve_locally(runtime, field):
+            if not bool(missing.any()):
+                continue
+            if _reference_must_resolve_locally(runtime, field):
                 raise ValueError(
                     f"update leaves {int(missing.sum().item())} value(s) of "
                     f"reference {module_name}.{field.name} absent from "
                     f"{reference!r}; examples: {values[missing][:5].tolist()}"
+                )
+            owned = missing[: _rows_resolving_locally(runtime, field, values.shape[0])]
+            if bool(owned.any()):
+                raise ValueError(
+                    f"update makes {int(owned.sum().item())} row(s) of "
+                    f"reference {module_name}.{field.name} on rank "
+                    f"{runtime.plan.spatial_rank} refer to {reference!r} rows "
+                    "held only by another rank (examples: "
+                    f"{values[: owned.numel()][owned][:5].tolist()}); the "
+                    "partition and its halo are fixed when the model "
+                    "materializes, so references may only move among the rows "
+                    "this rank holds; rebuild the model for a new topology"
                 )
 
 

@@ -936,13 +936,13 @@ class StatisticsRuntime:
 
         for name, source in self.installation.coordinate_sources:
             replacement = replacements.get(id(source))
-            if replacement is None:
+            # The IDs the files were written with (a copy taken at install).
+            written = self._coord_cache.get(name)
+            if replacement is None or written is None:
                 continue
-            installed = self._tensor_registry[name]
-            rows = installed.numel()
-            if replacement.shape[0] >= rows and torch.equal(
-                replacement[:rows].to(device=installed.device, dtype=installed.dtype),
-                installed,
+            rows = written.shape[0]
+            if replacement.shape[0] >= rows and np.array_equal(
+                replacement.detach()[:rows].to("cpu", torch.int64).numpy(), written
             ):
                 continue
             outputs = sorted(

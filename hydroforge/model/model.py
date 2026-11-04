@@ -117,7 +117,12 @@ class AbstractModel(ModelDeclaration, ABC):
         ModelRuntime.of(self).reset_clock(time)
 
     def close(self) -> None:
-        """Release every runtime resource; only ``materialize()`` rebuilds."""
+        """Release every runtime resource; only ``materialize()`` rebuilds.
+
+        It raises a failure kernels reported that nothing reported yet
+        (``ErrorField``); on several ranks every rank closes, and a rank
+        whose peer found one fails too.
+        """
 
         ModelRuntime.of(self).close()
 
