@@ -31,6 +31,9 @@ class EagerFixed:
         controlled = loop.controlled
         loop.prepare(count, width, controls=controlled, weight=loop.weighted)
         body, final = loop.body, loop.final
+        # Without operations before the last substep only that sample acts;
+        # it keeps the phase and weight a per-substep run gives it.
+        fold = step.fold
         for index in range(count):
             last = index == count - 1
             if loop.clocked:
@@ -40,7 +43,8 @@ class EagerFixed:
                 final.launch()
             if controlled:
                 loop.counter.add_(1)
-            step.sample(first=index == 0, last=last, weight=width)
+            if fold or last:
+                step.sample(first=index == 0, last=last, weight=width)
         return count
 
     def close(self) -> None:
@@ -66,6 +70,7 @@ def host_adaptive(
     loop.reset()
     count = 0
     continuing = True
+    fold = step.fold
     while continuing:
         iterate()
         failed, flag, weight = loop.fetch(sources, loop.status, loop.status_host)
@@ -76,7 +81,8 @@ def host_adaptive(
             )
         count += 1
         continuing = flag != 0
-        step.sample(first=count == 1, last=not continuing, weight=weight)
+        if fold or not continuing:
+            step.sample(first=count == 1, last=not continuing, weight=weight)
     return count
 
 

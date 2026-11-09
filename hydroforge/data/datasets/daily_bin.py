@@ -7,11 +7,11 @@
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Self
 
 import cftime
 import numpy as np
-from pydantic import Field, PrivateAttr, field_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from hydroforge.core.arrays import immutable_array
 from hydroforge.core.time import (
@@ -35,6 +35,11 @@ from hydroforge.data.datasets.timeline import StorageLayout
 from hydroforge.data.datasets.values import MissingPolicy, convert
 from hydroforge.io.files import SourceFiles
 
+# A selection with at least one cell in this many of its latitude band reads
+# the band contiguously; sparser ones gather their cells (measured crossover
+# near one in three for float32 frames of a million cells).
+_DENSE_BAND = 3
+
 FileStartDate = (
     DateLike | FrozenMapping[Annotated[str, Field(min_length=1)], DateLike] | Callable
 )
@@ -57,9 +62,9 @@ class DailyBinDataset(ForcingDataset):
       renumbered from zero merely because a run requests a subset of dates.
 
     Consecutive frames of one file are read together; a mapped view reads
-    only the latitude rows spanning its source cells and keeps only those
-    cells before any value check, so cells outside it (for example ocean NaN)
-    never affect the result.  Missing values (NaN, or ``fill_value`` when set)
+    only its source cells (a dense selection copies the latitude rows
+    spanning them) and keeps only those cells before any value check, so
+    cells outside it (for example ocean NaN) never affect the result.  Missing values (NaN, or ``fill_value`` when set)
     become zero unless ``missing="error"``.
 
     Binary files record no units: ``target_units`` converts from the declared
@@ -106,6 +111,39 @@ class DailyBinDataset(ForcingDataset):
         if kind not in {"i", "u", "f"}:
             raise ValueError("bin_dtype must describe a real numeric dtype")
         return value
+
+    @model_validator(mode="after")
+    def _validate_fill_value(self) -> Self:
+        """Require ``fill_value`` to be exactly representable in ``bin_dtype``.
+
+        A sentinel that wraps or rounds on conversion would mask valid values
+        (for example ``-9999`` becomes 241 in ``uint8``).
+        """
+
+        if self.fill_value is None:
+            return self
+        dtype = np.dtype(self.bin_dtype)
+        fill = self.fill_value
+        if dtype.kind == "f":
+            with np.errstate(over="ignore"):
+                stored = dtype.type(fill)
+            if not np.isfinite(fill) or not np.isfinite(stored):
+                raise ValueError(
+                    f"fill_value {fill!r} is not a finite {dtype} value; NaN "
+                    "is already treated as missing"
+                )
+            return self
+        limits = np.iinfo(dtype)
+        if not np.isfinite(fill) or fill != int(fill):
+            raise ValueError(
+                f"fill_value {fill!r} must be an integer for bin_dtype {dtype}"
+            )
+        if not limits.min <= int(fill) <= limits.max:
+            raise ValueError(
+                f"fill_value {fill!r} is outside the {dtype} range "
+                f"[{limits.min}, {limits.max}]"
+            )
+        return self
 
     @field_validator("extent")
     @classmethod
@@ -329,13 +367,21 @@ class DailyBinDataset(ForcingDataset):
         ny, nx = self.shape
         frame_size = ny * nx
         storage_dtype = np.dtype(self.bin_dtype)
-        rows = columns = None
+        band = picks = order = None
         if selection is not None and selection.size:
             # Frames are row-major, so the latitude rows spanning the
-            # selection are one contiguous band of each frame.
-            first_row = int(selection.min()) // nx
-            rows = slice(first_row, int(selection.max()) // nx + 1)
-            columns = selection - first_row * nx
+            # selection are one contiguous band of each frame.  A dense
+            # selection copies the band once and picks from it; a sparse one
+            # gathers only its elements, in ascending file order, and then
+            # restores the selection order (repeats included).
+            start = int(selection.min()) // nx * nx
+            stop = (int(selection.max()) // nx + 1) * nx
+            if selection.size * _DENSE_BAND >= stop - start:
+                band, picks = slice(start, stop), selection - start
+            else:
+                picks, order = np.unique(selection, return_inverse=True)
+                if picks.size == selection.size and np.array_equal(picks, selection):
+                    order = None
         blocks = []
         for key, first_frame, count in runs:
             path = self._files.checked(self._layout.path(key))
@@ -346,7 +392,7 @@ class DailyBinDataset(ForcingDataset):
                     count=count * frame_size,
                     offset=first_frame * frame_size * storage_dtype.itemsize,
                 ).reshape(count, frame_size)
-            elif columns is None:
+            elif picks is None:
                 data = np.empty((count, 0), dtype=storage_dtype)
             else:
                 frames = np.memmap(
@@ -354,11 +400,15 @@ class DailyBinDataset(ForcingDataset):
                     dtype=storage_dtype,
                     mode="r",
                     offset=first_frame * frame_size * storage_dtype.itemsize,
-                    shape=(count, ny, nx),
+                    shape=(count, frame_size),
                 )
-                band = np.array(frames[:, rows, :]).reshape(count, -1)
+                if band is None:
+                    data = frames[:, picks]
+                else:
+                    data = np.array(frames[:, band])[:, picks]
                 del frames
-                data = band[:, columns]
+                if order is not None:
+                    data = data[:, order]
             self._files.verify(path)
             blocks.append(data)
         return blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=0)

@@ -505,7 +505,10 @@ class _ManagedStepDescriptor:
                 kwargs,
                 context=_Conditions(*conditions),
             )
-            if cacheable and len(self.requests) < 64:
+            if cacheable:
+                # Bounded: the oldest validated request makes room.
+                if len(self.requests) >= 64:
+                    del self.requests[next(iter(self.requests))]
                 self.requests[key] = request
         return _Invocation(current_time, step, request, conditions)
 

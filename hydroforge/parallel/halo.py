@@ -78,6 +78,8 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
+from hydroforge.core.errors import cleanup_on_exit
+
 # Fields one exchange carries (halo.cu): wider batches are split.
 MAX_FIELDS = 8
 # Ring slots of a directed pair (a power of two): a sender may run this many
@@ -376,26 +378,9 @@ class _PeerMemory:
     closers: list[Any] = field(default_factory=list)
 
     def close(self) -> None:
-        for close in self.closers:
-            close()
-        self.closers = []
-
-
-def _agree(group: Any, world: int, problem: str | None, payload: Any = None) -> list[Any]:
-    """Every rank's ``payload``, unless a rank reports a ``problem``: then
-    every rank raises the same error here, before the next collective."""
-
-    import torch.distributed as dist
-
-    rows: list[Any] = [None] * world
-    dist.all_gather_object(rows, (problem, payload), group=group)
-    failed = [(rank, row[0]) for rank, row in enumerate(rows) if row[0] is not None]
-    if failed:
-        raise ValueError(
-            "halo setup failed: "
-            + "; ".join(f"rank {rank}: {reason}" for rank, reason in failed)
-        )
-    return [row[1] for row in rows]
+        closers, self.closers = self.closers, []
+        with cleanup_on_exit("halo peer memory", closers):
+            pass
 
 
 def _open_peer_memory(
@@ -430,20 +415,24 @@ def _open_peer_memory(
             nodes: list[Any] = [None] * dist.get_world_size(group)
             dist.all_gather_object(nodes, node_label(), group=group)
             window = PeerWindow(library, group, device, nbytes, nodes)
-            details["nccl"] = library.version_text
-            details["window_scope"] = window.scope
-            details.update(window.properties)
-            if window.node_properties:
-                details["node"] = window.node_properties
-            if window.tensor is not None:
-                window.tensor.zero_()
-            # Every window is zeroed before any peer stores into it.
-            torch.cuda.synchronize(device)
-            dist.barrier(group=group)
-            tensor = window.tensor
-            if tensor is None:
-                # A rank alone on its node keeps a window of its own.
-                tensor = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+            try:
+                details["nccl"] = library.version_text
+                details["window_scope"] = window.scope
+                details.update(window.properties)
+                if window.node_properties:
+                    details["node"] = window.node_properties
+                if window.tensor is not None:
+                    window.tensor.zero_()
+                # Every window is zeroed before any peer stores into it.
+                torch.cuda.synchronize(device)
+                dist.barrier(group=group)
+                tensor = window.tensor
+                if tensor is None:
+                    # A rank alone on its node keeps a window of its own.
+                    tensor = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+            except BaseException:
+                with cleanup_on_exit("halo peer memory setup", (window.close,)):
+                    raise
             return _PeerMemory("nccl", tensor, window.peers, [window.close]), None
         missing = [r for r, state in enumerate(states) if state is None]
         problems["nccl"] = (
@@ -638,6 +627,8 @@ class HaloRuntime:
     ) -> None:
         import torch.distributed as dist
 
+        from hydroforge.parallel.launch import communication_backend
+        from hydroforge.parallel.symmetric import agree
         from hydroforge.parallel.topology import node_label
 
         self.plan = plan
@@ -656,7 +647,9 @@ class HaloRuntime:
         # invalid fails every rank here, before any other collective.
         requested = os.environ.get("HYDROFORGE_HALO_TRANSPORT", "auto")
         memory = os.environ.get("HYDROFORGE_PEER_MEMORY", "auto")
-        group_backend = str(dist.get_backend(group)).lower()
+        group_backend = communication_backend(
+            dist.get_backend(group), device_type=device.type
+        )
         fallback = "nccl" if group_backend == "nccl" else "host"
         problem = None
         if requested not in ("auto", *LINKS):
@@ -673,8 +666,11 @@ class HaloRuntime:
                 f"the {requested} halo transport needs a "
                 f"{'NCCL' if requested == 'nccl' else 'Gloo'} process group"
             )
-        facts = _agree(
-            group, world, problem, (node_label(), dict(row_bytes), requested, memory)
+        facts = agree(
+            group,
+            problem,
+            (node_label(), dict(row_bytes), requested, memory),
+            setup="halo setup",
         )
         for position, name in (
             (2, "HYDROFORGE_HALO_TRANSPORT"),
@@ -694,61 +690,72 @@ class HaloRuntime:
         self.capacity = message_capacity(plan, self.row_bytes)
         self.ring, self.window_bytes = window_layout(plan, self.capacity)
         self.memory: _PeerMemory | None = None
-        reach = [False] * world
-        capable = requested in ("auto", "peer")
-        if capable and (backend != "cuda" or device.type != "cuda"):
-            self.skipped["peer"] = "peer stores need the cuda backend on CUDA devices"
-            capable = False
-        # Every rank takes part in allocating peer memory, or none does.
-        flags: list[Any] = [None] * world
-        dist.all_gather_object(flags, capable, group=group)
-        if all(flags) and any(plan.neighbours):
-            self.memory, problem = _open_peer_memory(
-                self.window_bytes, group, device, self.details, memory
-            )
-            if self.memory is None:
-                self.skipped["peer"] = problem
-            else:
-                self.details["memory"] = self.memory.provider
-                reach = [address != 0 for address in self.memory.addresses]
-        elif capable:
-            self.skipped["peer"] = "some rank cannot store into peers"
-        matrix: list[Any] = [None] * world
-        dist.all_gather_object(matrix, reach, group=group)
-        # Every rank sees every pair, so each raises the same error.
-        unreachable = [
-            (a, b)
-            for a in range(world)
-            for b in plan.neighbours[a]
-            if not (matrix[a][b] and matrix[b][a])
-        ]
-        if requested == "peer" and unreachable:
-            raise ValueError(
-                "HYDROFORGE_HALO_TRANSPORT=peer, but these neighbouring ranks "
-                f"are not load/store reachable: {unreachable} "
-                f"({self.skipped.get('peer', 'outside the LSA team')})"
-            )
-        direct = requested in ("auto", "peer")
-        self.links: dict[int, str] = {
-            peer: "peer" if direct and matrix[rank][peer] and matrix[peer][rank]
-            else fallback
-            for peer in plan.neighbours[rank]
-        }
-        problem = None
+        # The runtime owns the peer memory from here; a failed step (a peer
+        # that a forced transport cannot reach, a table error on any rank)
+        # releases it before the error leaves.
         try:
-            self._build_tables()
-        except Exception as error:
-            problem = f"{type(error).__name__}: {error}"
-        everywhere = _agree(group, world, problem, sorted(set(self.links.values())))
-        self.communicates = any(
-            link != "peer" for links in everywhere for link in links
-        )
-        # Host staging (``.cpu()``, Gloo requests) runs on the host at every
-        # exchange: no CUDA graph can replay it.
-        self.capturable = not any("host" in links for links in everywhere)
-        # The registered exchange kernel (hydroforge.kernels.halo.attach),
-        # attached by the layer that owns kernels.
-        self.registry: Any = None
+            reach = [False] * world
+            capable = requested in ("auto", "peer")
+            if capable and (backend != "cuda" or device.type != "cuda"):
+                self.skipped["peer"] = (
+                    "peer stores need the cuda backend on CUDA devices"
+                )
+                capable = False
+            # Every rank takes part in allocating peer memory, or none does.
+            flags: list[Any] = [None] * world
+            dist.all_gather_object(flags, capable, group=group)
+            if all(flags) and any(plan.neighbours):
+                self.memory, problem = _open_peer_memory(
+                    self.window_bytes, group, device, self.details, memory
+                )
+                if self.memory is None:
+                    self.skipped["peer"] = problem
+                else:
+                    self.details["memory"] = self.memory.provider
+                    reach = [address != 0 for address in self.memory.addresses]
+            elif capable:
+                self.skipped["peer"] = "some rank cannot store into peers"
+            matrix: list[Any] = [None] * world
+            dist.all_gather_object(matrix, reach, group=group)
+            # Every rank sees every pair, so each raises the same error.
+            unreachable = [
+                (a, b)
+                for a in range(world)
+                for b in plan.neighbours[a]
+                if not (matrix[a][b] and matrix[b][a])
+            ]
+            if requested == "peer" and unreachable:
+                raise ValueError(
+                    "HYDROFORGE_HALO_TRANSPORT=peer, but these neighbouring ranks "
+                    f"are not load/store reachable: {unreachable} "
+                    f"({self.skipped.get('peer', 'outside the LSA team')})"
+                )
+            direct = requested in ("auto", "peer")
+            self.links: dict[int, str] = {
+                peer: "peer" if direct and matrix[rank][peer] and matrix[peer][rank]
+                else fallback
+                for peer in plan.neighbours[rank]
+            }
+            problem = None
+            try:
+                self._build_tables()
+            except Exception as error:
+                problem = f"{type(error).__name__}: {error}"
+            everywhere = agree(
+                group, problem, sorted(set(self.links.values())), setup="halo setup"
+            )
+            self.communicates = any(
+                link != "peer" for links in everywhere for link in links
+            )
+            # Host staging (``.cpu()``, Gloo requests) runs on the host at every
+            # exchange: no CUDA graph can replay it.
+            self.capturable = not any("host" in links for links in everywhere)
+            # The registered exchange kernel (hydroforge.kernels.halo.attach),
+            # attached by the layer that owns kernels.
+            self.registry: Any = None
+        except BaseException:
+            with cleanup_on_exit("halo setup", (self.close,)):
+                raise
 
     # ------------------------------------------------------------------ #
     def _build_tables(self) -> None:
@@ -932,10 +939,10 @@ class HaloRuntime:
         }
 
     def close(self) -> None:
-        if self.memory is not None:
-            self.memory.close()
-            self.memory = None
+        memory, self.memory = self.memory, None
         self.registry = None
+        if memory is not None:
+            memory.close()
 
     # ------------------------------------------------------------------ #
     def exchange(

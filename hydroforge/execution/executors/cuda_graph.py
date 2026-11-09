@@ -595,10 +595,12 @@ class _SegmentedFixed:
         loop.prepare(count, width, controls=loop.controlled, weight=loop.weighted)
         regular = self._plan(final=False)
         last = self._plan(final=True) if loop.final is not None else regular
+        fold = step.fold
         for index in range(count):
             for launch in last if index == count - 1 else regular:
                 launch()
-            step.sample(first=index == 0, last=index == count - 1, weight=width)
+            if fold or index == count - 1:
+                step.sample(first=index == 0, last=index == count - 1, weight=width)
         return count
 
     def _plan(self, *, final: bool) -> tuple[Callable[[], None], ...]:

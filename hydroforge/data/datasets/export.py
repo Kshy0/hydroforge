@@ -678,8 +678,9 @@ def export_quantiles(
     if resident is not None:
         first = resident.main
     elif fits:
-        dataset.load_to_memory()
-        first = dataset._resident.main
+        # Only the budgeted main operations are read: no spin-up, and no
+        # resident cache outlives the export.
+        first = dataset._read_values(main_ops, *dataset._columns)
     else:
         positions = (
             np.arange(columns, dtype=np.int64)
@@ -731,7 +732,7 @@ def export_quantiles(
             variable.long_name = f"{key} quantile values"
             variables[key] = variable
         if fits:
-            write_quantiles(variables, blocks, 0, columns, owned=False)
+            write_quantiles(variables, blocks, 0, columns, owned=resident is None)
         elif resident is not None:
             for start in range(0, columns, batch):
                 stop = min(start + batch, columns)

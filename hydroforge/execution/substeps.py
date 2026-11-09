@@ -51,6 +51,9 @@ INVALID_SUBSTEP_COUNT: Final[int] = (1 << 31) - 1
 _HOST_VARIANT: Final[str] = "host values"
 _HOST_VARIANT_LIMIT: Final[int] = 8
 _HOST_TRIGGER_LIMIT: Final[int] = 256
+# Built programs over every scope key (each ``specialization=`` value is one);
+# the least recently used scopes beyond it are closed.
+_HOST_PROGRAM_LIMIT: Final[int] = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,8 +124,10 @@ def cached_program(
     ``specialization=``.
     """
 
-    variants = execution.host_variants.get(key)
+    scopes = execution.host_variants
+    variants = scopes.get(key)
     if variants is not None:
+        scopes.move_to_end(key)
         entry = variants.triggers.get(trigger)
         if entry is not None:
             variants.triggers.move_to_end(trigger)
@@ -153,7 +158,7 @@ def cached_program(
                 raise
         entry = _HostVariant(variant, program)
         if variants is None:
-            variants = execution.host_variants[key] = HostVariants(signature)
+            variants = scopes[key] = HostVariants(signature)
         variants.entries[variant] = entry
     if variant is not key:
         variants.recent[entry] = None
@@ -163,7 +168,28 @@ def cached_program(
     if len(variants.triggers) > _HOST_TRIGGER_LIMIT:
         variants.triggers.popitem(last=False)
     _evict_host_variants(variants)
+    _evict_scopes(scopes)
     return entry.program
+
+
+def _evict_scopes(scopes: OrderedDict[Any, HostVariants]) -> None:
+    """Close the least recently used scopes while more than
+    :data:`_HOST_PROGRAM_LIMIT` programs are built; the scope just resolved,
+    the most recent, stays."""
+
+    built = sum(len(variants.entries) for variants in scopes.values())
+    evicted = []
+    for key in list(scopes)[:-1]:
+        if built <= _HOST_PROGRAM_LIMIT:
+            break
+        variants = scopes.pop(key)
+        built -= len(variants.entries)
+        evicted.extend(entry.program for entry in variants.entries.values())
+    # Bookkeeping is complete before any close can fail.
+    with cleanup_on_exit(
+        "scope program eviction", (program.close for program in evicted)
+    ):
+        pass
 
 
 def _evict_host_variants(variants: HostVariants) -> None:

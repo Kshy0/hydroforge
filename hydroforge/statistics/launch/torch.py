@@ -18,6 +18,11 @@ compilation within Dynamo's per-frame recompile limit.  Full-layout programs,
 measured on this reference backend, only recovered their compile cost on
 long runs of large CPU grids.
 
+A sample or settle that tracks gradients (grad mode on and a bound tensor
+requiring grad) runs the eager entry with autograd saving clones, as
+differentiable operator programs do: controls, model state and the storage
+itself are updated in place by the next sample.
+
 The CUDA and Triton programs close a window without a sample through this
 module's settle kernels (:func:`compile_settle`), which run eagerly on the
 same storage; Metal prints its own.
@@ -183,6 +188,14 @@ def _binder(
     return bind
 
 
+def _tracked(states: Mapping[str, torch.Tensor]) -> bool:
+    """Whether a launch over ``states`` records gradients."""
+
+    return torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in states.values()
+    )
+
+
 def compile_statistics(
     context: StatisticsCompileContext, plan: StatisticsKernelPlan
 ) -> CompiledStatistics:
@@ -209,6 +222,10 @@ def compile_statistics(
         return bound[1]
 
     def run(states, phase):
+        if _tracked(states):
+            with torch.autograd.graph.saved_tensors_hooks(torch.clone, lambda x: x):
+                module.update(states, phase)
+            return
         if phase not in phases:
             module.update(states, phase)
             return
@@ -230,7 +247,12 @@ def compile_statistics(
         run(flat(states), phase & bits)
 
     def internal_settle_statistics(states, phase):
-        module.settle(flat(states), phase)
+        states = flat(states)
+        if _tracked(states):
+            with torch.autograd.graph.saved_tensors_hooks(torch.clone, lambda x: x):
+                module.settle(states, phase)
+            return
+        module.settle(states, phase)
 
     return CompiledStatistics(
         lowering=plan.lowering,

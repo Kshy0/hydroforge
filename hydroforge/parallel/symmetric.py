@@ -106,6 +106,25 @@ def gather_rank_facts(group: Any, device: torch.device) -> tuple[RankFacts, ...]
     return tuple(facts)
 
 
+def agree(
+    group: Any, problem: str | None, payload: Any = None, *, setup: str
+) -> list[Any]:
+    """Every rank's ``payload``, unless a rank reports a ``problem``: then
+    every rank raises the same error here, before the next collective."""
+
+    import torch.distributed as dist
+
+    rows: list[Any] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(rows, (problem, payload), group=group)
+    failed = [(rank, row[0]) for rank, row in enumerate(rows) if row[0] is not None]
+    if failed:
+        raise ValueError(
+            f"{setup} failed: "
+            + "; ".join(f"rank {rank}: {reason}" for rank, reason in failed)
+        )
+    return [row[1] for row in rows]
+
+
 def ipc_problem(facts: tuple[RankFacts, ...]) -> str | None:
     """Why CUDA IPC cannot map every rank's memory, or ``None``."""
 
@@ -231,6 +250,7 @@ __all__ = [
     "Memory",
     "PeerBuffers",
     "RankFacts",
+    "agree",
     "gather_rank_facts",
     "ipc_problem",
     "nvshmem_problem",

@@ -58,6 +58,7 @@ from hydroforge.kernels.torch import TorchKernel
 from hydroforge.kernels.triton import TritonProgram
 from hydroforge.parallel.symmetric import (
     PeerBuffers,
+    agree,
     gather_rank_facts,
     ipc_problem,
     nvshmem_problem,
@@ -367,34 +368,49 @@ class ReduceRuntime:
     """The all-reduce transports of one process group.
 
     Construction is collective over ``group``: every rank gathers the others'
-    facts and keeps, in order, the transports they all support (or the one
-    ``HYDROFORGE_REDUCE_TRANSPORT`` names). ``transports`` lists them,
-    ``skipped`` why the others were not taken.
+    facts and keeps, in order, the transports they all support and every
+    rank opened (or the one ``HYDROFORGE_REDUCE_TRANSPORT`` names, which
+    must be alike on every rank). ``transports`` lists them, ``skipped`` why
+    the others were not taken.
     """
 
     def __init__(self, group: Any, device: torch.device, backend: str) -> None:
         import torch.distributed as dist
 
-        requested = os.environ.get("HYDROFORGE_REDUCE_TRANSPORT", "auto")
-        if requested not in ("auto", "process_group", *TRANSPORTS):
-            raise ValueError(
-                "HYDROFORGE_REDUCE_TRANSPORT must be auto, process_group or one "
-                f"of {TRANSPORTS}, got {requested!r}"
-            )
+        from hydroforge.parallel.launch import communication_backend
+
         self.rank = dist.get_rank(group)
         self.world = dist.get_world_size(group)
         self.skipped: dict[str, str] = {}
         self.transports: tuple[str, ...] = ()
         self.buffers: PeerBuffers | None = None
+        # Settings each rank reads for itself: an invalid or differing one
+        # fails every rank here, before any rank returns or allocates.
+        requested = os.environ.get("HYDROFORGE_REDUCE_TRANSPORT", "auto")
+        problem = None
+        if requested not in ("auto", "process_group", *TRANSPORTS):
+            problem = (
+                "HYDROFORGE_REDUCE_TRANSPORT must be auto, process_group or one "
+                f"of {TRANSPORTS}, got {requested!r}"
+            )
+        cuda = torch.version.hip is None and device.type == "cuda"
+        settings = agree(group, problem, (requested, cuda), setup="all-reduce setup")
+        if len({setting[0] for setting in settings}) > 1:
+            raise ValueError(
+                "HYDROFORGE_REDUCE_TRANSPORT differs across ranks: "
+                f"{[setting[0] for setting in settings]}"
+            )
         if requested == "process_group":
             self.skipped = dict.fromkeys(TRANSPORTS, "HYDROFORGE_REDUCE_TRANSPORT")
             return
-        if torch.version.hip is not None or device.type != "cuda":
+        if not all(setting[1] for setting in settings):
             self.skipped = dict.fromkeys(TRANSPORTS, "device reductions need CUDA")
             return
         facts = gather_rank_facts(group, device)
         problems = transport_problems(
-            backend, facts, str(dist.get_backend(group)).lower()
+            backend,
+            facts,
+            communication_backend(dist.get_backend(group), device_type=device.type),
         )
         chosen = []
         for name in TRANSPORTS if requested == "auto" else (requested,):
@@ -402,7 +418,26 @@ class ReduceRuntime:
                 # Both serve the same requests; the faster one is open.
                 self.skipped[name] = "peer serves its requests"
                 continue
-            problem = problems[name] or self._open(name, group, device)
+            # ``problems`` is alike on every rank; opening is not, so a
+            # transport serves only if it opened on every rank.
+            problem = problems[name]
+            if problem is None:
+                failure = None
+                try:
+                    problem = self._open(name, group, device)
+                except Exception as error:
+                    failure = f"{type(error).__name__}: {error}"
+                reasons = agree(group, failure, problem, setup="all-reduce setup")
+                problem = (
+                    "; ".join(
+                        f"rank {rank}: {reason}"
+                        for rank, reason in enumerate(reasons)
+                        if reason is not None
+                    )
+                    or None
+                )
+                if problem is not None and name != "nccl":
+                    self.buffers = None
             if problem is None:
                 chosen.append(name)
             else:

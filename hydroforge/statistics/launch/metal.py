@@ -47,6 +47,8 @@ def compile_statistics(
     for scatter, declared in zip(
         plan.scatters, plan.lowering.ir.ordered_scatters(), strict=True
     ):
+        if scatter is None:
+            continue
         zero, add = scatter.zero, scatter.add
         if (
             context.storage[StoragePlan.scatter_buffer(declared.name)].dtype

@@ -140,17 +140,23 @@ def _raw_axis_bounds(
     return arr, source_dtype
 
 
-def _bounds_are_periodic(bounds: np.ndarray) -> bool:
-    """Whether ordered cell bounds span exactly one 360-degree period."""
+def _longitude_span(bounds: np.ndarray) -> tuple[float, float] | None:
+    """Bound span of ordered cells and the tolerance a period is judged by."""
 
     lower = np.minimum(bounds[:, 0], bounds[:, 1])
     upper = np.maximum(bounds[:, 0], bounds[:, 1])
     widths = upper - lower
     if widths.size == 0 or float(np.min(widths)) <= 0.0:
-        return False
+        return None
     span = float(np.max(upper) - np.min(lower))
-    tolerance = min(_GLOBAL_LONGITUDE_ATOL, 0.25 * float(np.min(widths)))
-    return abs(span - 360.0) <= tolerance
+    return span, min(_GLOBAL_LONGITUDE_ATOL, 0.25 * float(np.min(widths)))
+
+
+def _bounds_are_periodic(bounds: np.ndarray) -> bool:
+    """Whether ordered cell bounds span exactly one 360-degree period."""
+
+    measured = _longitude_span(bounds)
+    return measured is not None and abs(measured[0] - 360.0) <= measured[1]
 
 
 def _validate_axis_bounds(
@@ -399,6 +405,18 @@ class RegularGrid(HydroForgeModel):
             np.any(self.y_bounds < -90.0) or np.any(self.y_bounds > 90.0)
         ):
             raise ValueError("geographic latitude bounds must lie within [-90, 90]")
+        if self.is_geographic:
+            # Validated cells tile one contiguous interval, so a span beyond
+            # one period means two columns cover the same meridians (for
+            # example a cyclic 360 column repeating 0) and would be counted
+            # twice by every overlap and aggregation.
+            span, tolerance = _longitude_span(self.x_bounds)
+            if span > 360.0 + tolerance:
+                raise ValueError(
+                    f"{self.x_name} cells span {span:.6g} degrees, more than "
+                    "one 360-degree period; drop the cyclic duplicate column "
+                    "(e.g. a 360 repeating 0) or overlapping bounds"
+                )
         for name in ("x", "y", "x_bounds", "y_bounds"):
             object.__setattr__(
                 self,

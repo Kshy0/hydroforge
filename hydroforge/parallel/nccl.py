@@ -32,6 +32,8 @@ from typing import Any
 
 import torch
 
+from hydroforge.core.errors import cleanup_on_exit
+
 MINIMUM_VERSION = 22900
 """NCCL 2.29: host-side peer pointers and communicator properties."""
 
@@ -246,11 +248,11 @@ class NcclComm:
         return found
 
     def close(self) -> None:
-        if self.handle:
+        handle, self.handle = self.handle, ctypes.c_void_p()
+        if handle:
             self.library.check(
-                self.library.handle.ncclCommDestroy(self.handle), "ncclCommDestroy"
+                self.library.handle.ncclCommDestroy(handle), "ncclCommDestroy"
             )
-            self.handle = ctypes.c_void_p()
 
 
 class _DeviceArray:
@@ -282,6 +284,8 @@ class NcclWindow:
         self.nbytes = -(-max(int(nbytes), 1) // _WIN_ALIGNMENT) * _WIN_ALIGNMENT
         self.address = ctypes.c_void_p()
         self.window = ctypes.c_void_p()
+        self.peers: list[int] = []
+        self.tensor: torch.Tensor | None = None
         with torch.cuda.device(comm.device):
             library.check(
                 handle.ncclMemAlloc(
@@ -289,52 +293,74 @@ class NcclWindow:
                 ),
                 "ncclMemAlloc",
             )
-            library.check(
-                handle.ncclCommWindowRegister(
-                    comm.handle,
-                    self.address,
-                    ctypes.c_size_t(self.nbytes),
-                    ctypes.byref(self.window),
-                    _WIN_COLL_SYMMETRIC,
-                ),
-                "ncclCommWindowRegister",
-            )
-        self.peers: list[int] = []
-        if not self.window:
-            # Without the device API (a communicator spanning nodes NCCL
-            # cannot reach from the device) registration yields no window.
-            library.check(handle.ncclMemFree(self.address), "ncclMemFree")
-            self.address = ctypes.c_void_p()
-            self.tensor = None
-            return
-        for peer in range(comm.world):
-            pointer = ctypes.c_void_p()
-            result = handle.ncclGetPeerDevicePointer(
-                self.window, ctypes.c_size_t(0), peer, ctypes.byref(pointer)
-            )
-            if peer == comm.rank:
-                library.check(result, "ncclGetPeerDevicePointer")
-            # A peer outside the LSA team has no address: NCCL returns NULL,
-            # or (2.32) an invalid-argument error.
-            self.peers.append(int(pointer.value or 0) if result == 0 else 0)
-        self.tensor = torch.as_tensor(
-            _DeviceArray(int(self.address.value), self.nbytes), device=comm.device
-        )
-        self.tensor.zero_()
+            # The window owns the allocation (and then its registration)
+            # from here; a failed step releases what was taken.
+            try:
+                # Only a successful registration is a window to deregister.
+                window = ctypes.c_void_p()
+                library.check(
+                    handle.ncclCommWindowRegister(
+                        comm.handle,
+                        self.address,
+                        ctypes.c_size_t(self.nbytes),
+                        ctypes.byref(window),
+                        _WIN_COLL_SYMMETRIC,
+                    ),
+                    "ncclCommWindowRegister",
+                )
+                self.window = window
+                if not self.window:
+                    # Without the device API (a communicator spanning nodes
+                    # NCCL cannot reach from the device) registration yields
+                    # no window.
+                    self.close()
+                    return
+                for peer in range(comm.world):
+                    pointer = ctypes.c_void_p()
+                    result = handle.ncclGetPeerDevicePointer(
+                        self.window, ctypes.c_size_t(0), peer, ctypes.byref(pointer)
+                    )
+                    if peer == comm.rank:
+                        library.check(result, "ncclGetPeerDevicePointer")
+                    # A peer outside the LSA team has no address: NCCL returns
+                    # NULL, or (2.32) an invalid-argument error.
+                    self.peers.append(int(pointer.value or 0) if result == 0 else 0)
+                self.tensor = torch.as_tensor(
+                    _DeviceArray(int(self.address.value), self.nbytes),
+                    device=comm.device,
+                )
+                self.tensor.zero_()
+            except BaseException:
+                with cleanup_on_exit("NCCL window construction", (self.close,)):
+                    raise
 
     @property
     def registered(self) -> bool:
         return bool(self.window)
 
     def close(self) -> None:
-        if self.window:
-            library = self.comm.library
-            library.check(
-                library.handle.ncclCommWindowDeregister(self.comm.handle, self.window),
-                "ncclCommWindowDeregister",
+        """Deregister and free; both are attempted, failures reported after."""
+
+        library = self.comm.library
+        window, self.window = self.window, ctypes.c_void_p()
+        address, self.address = self.address, ctypes.c_void_p()
+        self.tensor = None
+        actions = []
+        if window:
+            actions.append(
+                lambda: library.check(
+                    library.handle.ncclCommWindowDeregister(self.comm.handle, window),
+                    "ncclCommWindowDeregister",
+                )
             )
-            library.check(library.handle.ncclMemFree(self.address), "ncclMemFree")
-            self.window = ctypes.c_void_p()
+        if address:
+            actions.append(
+                lambda: library.check(
+                    library.handle.ncclMemFree(address), "ncclMemFree"
+                )
+            )
+        with cleanup_on_exit("NCCL window", actions):
+            pass
 
 
 class PeerWindow:
@@ -367,41 +393,46 @@ class PeerWindow:
 
         world = dist.get_world_size(group)
         rank = dist.get_rank(group)
+        # Closers of what was taken, newest first; on failure every one runs.
         self._closers: list[Any] = []
-        comm = NcclComm(library, group, device)
-        self.properties = comm.properties()
-        self.node_properties: dict[str, Any] = {}
-        window = NcclWindow(comm, nbytes)
-        everyone: list[Any] = [None] * world
-        dist.all_gather_object(everyone, window.registered, group=group)
-        if all(everyone):
-            self.scope = "group"
-            self._keep(window, comm)
-            self.tensor, self.peers = window.tensor, window.peers
-            return
-        window.close()
-        comm.close()
-        self.scope = "node"
-        self.peers = [0] * world
-        self.tensor = None
-        # One communicator per node, every rank of the group making its own.
-        members = [r for r in range(world) if nodes[r] == nodes[rank]]
-        local = NcclComm(library, group, device, members)
-        self.node_properties = local.properties()
-        window = NcclWindow(local, nbytes)
-        self._keep(window, local)
-        if window.registered:
-            self.tensor = window.tensor
-            for position, peer in enumerate(window.peers):
-                self.peers[members[position]] = peer
+        try:
+            comm = self._take(NcclComm(library, group, device))
+            self.properties = comm.properties()
+            self.node_properties: dict[str, Any] = {}
+            window = self._take(NcclWindow(comm, nbytes))
+            everyone: list[Any] = [None] * world
+            dist.all_gather_object(everyone, window.registered, group=group)
+            if all(everyone):
+                self.scope = "group"
+                self.tensor, self.peers = window.tensor, window.peers
+                return
+            self.close()
+            self.scope = "node"
+            self.peers = [0] * world
+            self.tensor = None
+            # One communicator per node, every rank of the group making its own.
+            members = [r for r in range(world) if nodes[r] == nodes[rank]]
+            local = self._take(NcclComm(library, group, device, members))
+            self.node_properties = local.properties()
+            window = self._take(NcclWindow(local, nbytes))
+            if window.registered:
+                self.tensor = window.tensor
+                for position, peer in enumerate(window.peers):
+                    self.peers[members[position]] = peer
+        except BaseException:
+            with cleanup_on_exit("NCCL peer window construction", (self.close,)):
+                raise
 
-    def _keep(self, window: NcclWindow, comm: NcclComm) -> None:
-        self._closers = [window.close, comm.close, *self._closers]
+    def _take(self, resource: Any) -> Any:
+        self._closers.insert(0, resource.close)
+        return resource
 
     def close(self) -> None:
-        for close in self._closers:
-            close()
-        self._closers = []
+        """Close every window and communicator; failures are reported after."""
+
+        closers, self._closers = self._closers, []
+        with cleanup_on_exit("NCCL peer window", closers):
+            pass
 
 
 __all__ = [

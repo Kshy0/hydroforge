@@ -170,6 +170,8 @@ class EmulatedTensor(torch.Tensor):
                     "copy encoded values using an explicit cpu() or float() conversion"
                 )
             other = args[1]
+            # ``copy_(src, non_blocking)`` may pass the flag by position.
+            kwargs = {"non_blocking": args[2]} if len(args) > 2 else kwargs
             if isinstance(other, cls):
                 first.carrier.copy_(other.carrier, **kwargs)
             elif other.device.type == "cpu":

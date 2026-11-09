@@ -41,7 +41,7 @@ from hydroforge.core.arrays import (
 from hydroforge.core.naming import validate_netcdf_name, validate_safe_path_component
 from hydroforge.core.time import canonical_calendar
 from hydroforge.core.validation import HydroForgeModel
-from hydroforge.io.netcdf.encoding import COMPLETE_DATA_ATTR
+from hydroforge.io.netcdf.encoding import COMPLETE_DATA_ATTR, read_netcdf_values
 from hydroforge.io.netcdf.options import (
     NetCDFOptions,
     create_netcdf_variable,
@@ -231,9 +231,15 @@ def _compile_aggregate_field_plan(
 def _read_field_block(
     plan: _AggregateFieldPlan, var_name: str, start: int, stop: int
 ) -> np.ndarray:
-    """Read time rows ``[start, stop)`` as float64 with masked values as NaN."""
+    """Read time rows ``[start, stop)`` as float64 with masked values as NaN.
 
-    field = plan.variable[start:stop] if plan.has_time else plan.variable[:]
+    Variables marked as complete framework data keep values equal to their
+    ``_FillValue``; unmarked external files keep NetCDF missing semantics.
+    """
+
+    field = read_netcdf_values(
+        plan.variable, slice(start, stop) if plan.has_time else Ellipsis
+    )
     if np.ma.isMaskedArray(field):
         mask = np.ma.getmaskarray(field)
         raw_field = np.asarray(field.data)

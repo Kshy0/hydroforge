@@ -257,7 +257,8 @@ Members = Literal["threads", "loop", "tiles"]
 @dataclass(frozen=True, slots=True)
 class StatisticsKernelPlan:
     lowering: StatisticsLowering
-    scatters: tuple[ScatterKernels, ...]
+    # Aligned with the ordered scatters; ``None``: no output target selected.
+    scatters: tuple[ScatterKernels | None, ...]
     groups: tuple[GroupKernel, ...]
 
     def scatter_kernels(self, *, unrolled: bool) -> tuple[StatisticsKernel, ...]:
@@ -266,6 +267,7 @@ class StatisticsKernelPlan:
         return tuple(
             kernel
             for scatter in self.scatters
+            if scatter is not None
             for kernel in (
                 scatter.zero,
                 scatter.add_members if unrolled else scatter.add,
@@ -554,7 +556,7 @@ def _scatter(
     name: str,
     source: ScatterSource,
     control: Param,
-) -> ScatterKernels:
+) -> ScatterKernels | None:
     buffer = StoragePlan.scatter_buffer(name)
     count = (
         StoragePlan.scatter_count(name) if source.reduction is Reduction.MEAN else None
@@ -574,6 +576,9 @@ def _scatter(
         # Only the targets the outputs read, and the sources reaching them.
         targets = context.tensors[targets_name]
         needed = targets.numel()
+        if not needed:
+            # Outputs select no target of this scatter: it has no work at all.
+            return None
         sources = context.tensors[sources_name].numel()
         target_params = (Param(targets_name, targets.dtype, "read"),)
         source_params = (Param(sources_name, torch.int64, "read"),)

@@ -64,6 +64,11 @@ class _Entry:
     index: int  # operators recorded when the state was set
     entry: bool = False  # assumed at loop entry: nothing in the body wrote it
     depth: int = 0  # ghost rows current within it; 0 all
+    checked: int = -1  # operators already found not to write it (-1: index)
+
+    def __post_init__(self) -> None:
+        if self.checked < 0:
+            self.checked = self.index
 
 
 def _at_depth(layout: Any, depth: int) -> Any:
@@ -110,6 +115,9 @@ class HaloSchedule:
         self.ghosts: dict[Storage, _Ghosts] = {}
         self.contributed: set[Storage] = set()
         self.zeroed: dict[Storage, torch.Tensor] = {}
+        # Storages the first ``written_count`` recorded operators write.
+        self.written: set[Storage] = set()
+        self.written_count = 0
 
     # ------------------------------------------------------------------ #
     @property
@@ -127,13 +135,24 @@ class HaloSchedule:
         entry = self.entries.get(id(tensor))
         if entry is None or entry.tensor is not tensor:
             return None
+        # Operators are only appended: each is checked once per entry.
+        operators = self.recorder.operators
         storage = _storage(tensor)
-        for operator in self.recorder.operators[entry.index :]:
+        for operator in operators[entry.checked :]:
             for written in getattr(operator, "writes", ()):
                 if isinstance(written, torch.Tensor) and _storage(written) == storage:
                     del self.entries[id(tensor)]
                     return None
+        entry.checked = len(operators)
         return entry
+
+    def _written(self) -> set[Storage]:
+        """The storages recorded operators write, extended incrementally."""
+
+        operators = self.recorder.operators
+        self.written.update(written_storages(operators[self.written_count :]))
+        self.written_count = len(operators)
+        return self.written
 
     def _set(self, tensor: torch.Tensor, entry: bool = False, depth: int = 0) -> None:
         self.entries[id(tensor)] = _Entry(
@@ -145,11 +164,7 @@ class HaloSchedule:
         at entry within ``depth``."""
 
         storage = _storage(tensor)
-        if (
-            not self.carried
-            or storage in self.clobbered
-            or storage in written_storages(self.recorder.operators)
-        ):
+        if not self.carried or storage in self.clobbered or storage in self._written():
             return None
         self.assumed[id(tensor)] = tensor
         self.assumed_depth[id(tensor)] = depth

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from types import MappingProxyType
@@ -65,8 +66,9 @@ class ModelExecution:
         self.tf32 = plan.precisions.tf32
         self.step_fields = StepFieldRuntime(plan, executor=self.executor)
         self.step_policies: dict[Any, Any] = {}
-        # Built substep and outer programs, by scope key (``programs``).
-        self.host_variants: dict[Any, Any] = {}
+        # Built substep and outer programs, by scope key from least to most
+        # recently used (``programs``).
+        self.host_variants: OrderedDict[Any, Any] = OrderedDict()
         # Validated adaptive-scope limits keyed by their exact inputs.
         self.adaptive_requests: dict[Any, Any] = {}
         # All-reduce transports of each process group.
@@ -191,7 +193,7 @@ class ModelExecution:
                 module.__dict__.pop(name, None)
         self._tensor_index_valid = False
         programs = self.programs
-        self.host_variants = {}
+        self.host_variants = OrderedDict()
         self.adaptive_requests = {}
         try:
             with cleanup_on_exit(

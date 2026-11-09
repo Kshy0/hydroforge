@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import heapq
 from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import timedelta
@@ -25,7 +26,11 @@ from hydroforge.contracts.windows import (
     StatisticsPlan,
     WindowRule,
 )
-from hydroforge.core.time import normalize_calendar_dates, require_calendar
+from hydroforge.core.time import (
+    normalize_calendar_dates,
+    require_calendar,
+    timedelta_microseconds,
+)
 from hydroforge.statistics.phases import SampleFlags
 
 _INNER_FIRST = int(SampleFlags.INNER_FIRST)
@@ -517,7 +522,87 @@ def validate_statistics_window_schedule(
         EveryStep,
     ):
         return
-    for step in schedule:
+    steps = (
+        (schedule._step_at_trusted(index) for index in _boundary_steps(plan, schedule))
+        if _calendar_cursor(plan, schedule)
+        else schedule
+    )
+    for step in steps:
         if step.is_spin_up:
             continue
         controller.resolve(step, _validate=True)
+
+
+def _calendar_cursor(plan: StatisticsPlan, schedule: SimulationSchedule) -> bool:
+    """Whether only steps touching a calendar boundary need validation.
+
+    On a regular schedule with a calendar outer rule and a calendar or
+    every-step inner rule, a step whose closed interval holds no calendar
+    boundary continues its predecessor's windows: it raises nothing and
+    leaves the cursor as it found it.
+    """
+
+    return (
+        schedule._is_regular
+        and isinstance(plan.effective_outer, CalendarWindow)
+        and isinstance(plan.inner, CalendarWindow | EveryStep)
+    )
+
+
+def _boundary_steps(plan: StatisticsPlan, schedule: SimulationSchedule) -> Any:
+    """Ascending schedule indices of the first and final main step and of
+    every main step whose ``[start, end]`` holds a calendar boundary.
+
+    Boundaries are generated lazily in time order, so a schedule whose
+    steps span several windows fails at its first such step.
+    """
+
+    first, count = schedule._num_spinup_steps, schedule.num_main_steps
+    if not count:
+        return
+    start = schedule.start
+    cadence = timedelta_microseconds(schedule.cadence)
+    rules = {
+        id(rule): rule
+        for rule in (plan.inner, plan.effective_outer)
+        if isinstance(rule, CalendarWindow)
+    }
+    yield first
+    previous = 0
+    for boundary in heapq.merge(
+        *(_calendar_boundaries(rule, start, schedule.end) for rule in rules.values())
+    ):
+        offset, remainder = divmod(timedelta_microseconds(boundary - start), cadence)
+        for index in (offset - 1, offset) if remainder == 0 else (offset,):
+            if previous < index < count:
+                previous = index
+                yield first + index
+    if previous < count - 1:
+        yield first + count - 1
+
+
+def _calendar_boundaries(rule: CalendarWindow, start: Any, end: Any) -> Any:
+    """The window starts of ``rule`` in ``(start, end]``, ascending."""
+
+    midnight = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    if rule.period == "day":
+        boundary = midnight
+        while boundary <= end:
+            if boundary > start:
+                yield boundary
+            boundary += timedelta(days=1)
+        return
+    year, month = start.year, start.month
+    while True:
+        if rule.period == "month":
+            boundary = midnight.replace(year=year, month=month, day=1)
+            year, month = (year, month + 1) if month < 12 else (year + 1, 1)
+        else:
+            boundary = midnight.replace(
+                year=year, month=rule.start_month, day=rule.start_day
+            )
+            year += 1
+        if boundary > end:
+            return
+        if boundary > start:
+            yield boundary
