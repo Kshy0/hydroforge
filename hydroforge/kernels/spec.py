@@ -312,19 +312,37 @@ class KernelWorkspace(HydroForgeModel):
     CSR offsets omit the terminal entry; CSR order is a stable source ordering.
     Workspaces are built once per execution plan and rebuilt on invalidation.
     They are neither physical state nor checkpoint/output fields.
+
+    ``dtype`` is an exact torch dtype name, ``"precision"`` (the scalar
+    precision), or a field's semantic ``"float"`` (the compute tier) or
+    ``"hpfloat"`` (the storage tier; :mod:`hydroforge.contracts.precision`).
+
+    ``halo=True`` exchanges the workspace across ranks like a field declared
+    ``TensorField(halo=True)``: kernels may name it in ``KernelSpec.halo``
+    and ``contributes``. Its decomposed axis is the dimension it shares with
+    the partition key's coordinate, which must lead its shape after any
+    ``ensemble_size`` (the rank's ghost rows follow the owned ones, as in
+    the fields of that coordinate), or the slab axis it names. Halo message
+    slots are sized at startup from the fields declared ``halo=True``; a
+    halo workspace's rows must fit them.
     """
 
     key: DottedPath
-    dtype: Literal["precision", "float32", "float64", "int32", "int64", "bool"]
+    dtype: Literal[
+        "precision", "float", "hpfloat", "float32", "float64", "int32", "int64", "bool"
+    ]
     shape: tuple[Identifier | Annotated[int, Field(ge=0)], ...] = Field(min_length=1)
     initialize: Literal["zeros", "csr_offsets", "csr_order"] = "zeros"
     source: Identifier | None = None
     target_count: Identifier | None = None
     module: Identifier | None = None
     emulated_only: bool = False
+    halo: bool = False
 
     @model_validator(mode="after")
     def _validate_initialization(self) -> Self:
+        if self.halo and self.initialize != "zeros":
+            raise ValueError("a halo workspace starts from zeros, not a topology")
         if self.initialize == "zeros":
             if self.source is not None or self.target_count is not None:
                 raise ValueError("zero workspace must not declare a topology source")

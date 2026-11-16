@@ -36,7 +36,6 @@ from hydroforge.compiler.kernel_binding import (
     SubstepFieldValue,
     Unresolved,
 )
-from hydroforge.contracts.fields import precision_dtype
 from hydroforge.core.errors import error_message
 from hydroforge.kernels.registry import BackendRegistry, KernelCall
 from hydroforge.kernels.spec import KernelSpec, KernelWorkspace
@@ -114,6 +113,9 @@ class KernelBinder:
 
         self._complete_cache.clear()
         self._launch_cache.clear()
+        for declaration, tensor in self._workspaces.values():
+            if declaration.halo and tensor is not None:
+                self.runtime.detach_halo_layout(tensor)
         self._workspaces.clear()
         self._workspace_sources.clear()
 
@@ -412,7 +414,12 @@ class KernelBinder:
             return result
 
         shape = tuple(dimension(field) for field in declaration.shape)
-        dtype = precision_dtype(declaration.dtype, plan.dtype)
+        dtype = self.plan.workspace_dtype(declaration)
+        layout = None
+        if declaration.halo:
+            shape, layout = self.runtime.halo_workspace(
+                declaration.key, declaration.shape, shape, dtype.itemsize
+            )
         if prod(shape) > (2**63 - 1) // dtype.itemsize:
             raise OverflowError(
                 f"workspace {declaration.key!r} exceeds int64 byte size"
@@ -446,6 +453,8 @@ class KernelBinder:
                 )
             tensor = result.to(device=plan.device, dtype=dtype)
             self._workspace_sources[id(source)] = source
+        if layout is not None:
+            self.runtime.attach_halo_layout(tensor, layout)
         self._workspaces[declaration.key] = (declaration, tensor)
         return tensor
 

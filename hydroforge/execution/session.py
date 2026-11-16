@@ -165,6 +165,8 @@ class ModelRuntime:
         self.field_owners = MappingProxyType({})
         self.execution = None
         self.statistics = None
+        # hydroforge.execution.autodiff.StepTape while the model is in differentiable mode.
+        self.step_tape = None
         self.checkpoint = None
         self.parameters = None
         self.halo = None
@@ -181,7 +183,8 @@ class ModelRuntime:
     def halo_layout(self, tensor: torch.Tensor):
         """Where an exchanged field's decomposed axis is: a field declared
         ``halo=True`` whose shape names the slab axis (cells or faces), or
-        whose leading axis holds the partition key's owned and ghost rows."""
+        whose leading axis holds the partition key's owned and ghost rows;
+        or a kernel workspace declared ``halo=True`` (:meth:`halo_workspace`)."""
 
         from hydroforge.parallel.halo import CELL, FACE, KEY, FieldLayout
 
@@ -199,11 +202,14 @@ class ModelRuntime:
         )
         if entry is None or not entry.tensor.halo:
             what = (
-                "a tensor that is no module field" if entry is None else entry.qualified
+                "a tensor that is neither a module field nor a halo workspace"
+                if entry is None
+                else entry.qualified
             )
             raise ValueError(
                 f"{what} is exchanged across ranks (a kernel's halo or "
-                "contributes); declare the field halo=True"
+                "contributes); declare the field halo=True (a kernel "
+                "workspace: KernelWorkspace(halo=True))"
             )
         info = self.plan.fields.slab.get(entry.qualified)
         halo = self.halo
@@ -224,6 +230,101 @@ class ModelRuntime:
             )
         self._halo_layouts[id(tensor)] = (tensor, layout)
         return layout
+
+    def halo_workspace(
+        self,
+        key: str,
+        dims: tuple[str | int, ...],
+        shape: tuple[int, ...],
+        itemsize: int,
+    ) -> tuple[tuple[int, ...], Any]:
+        """The stored shape of a kernel workspace declared ``halo=True`` and
+        its decomposed axis's layout (``None`` while ranks exchange nothing).
+
+        Exchanged like a field declared ``halo=True``: the partition key's
+        dimension leads its shape (after ``ensemble_size``, one member while
+        ranks exchange) and holds the rank's ghost rows after the owned ones,
+        or it names the slab axis (whose dimensions are the stored rows).
+        Its rows must fit the message slots the halo sized at startup for
+        the rows of the fields declared ``halo=True``.
+        """
+
+        from hydroforge.compiler.partition import bare
+        from hydroforge.compiler.slab import slab_tokens
+        from hydroforge.parallel.halo import CELL, FACE, KEY, FieldLayout
+
+        halo, plan = self.halo, self.plan
+        if halo is None:
+            return shape, None
+        names = [bare(dim) if isinstance(dim, str) else dim for dim in dims]
+        layout = None
+        if plan.spec.slab is not None:
+            tokens = slab_tokens(plan.spec.slab, plan.spec.grid_axes)
+            hits = [
+                (position, tokens[name])
+                for position, name in enumerate(names)
+                if isinstance(name, str) and name in tokens
+            ]
+            if len(hits) == 1 and hits[0][1] in (CELL, FACE):
+                layout = FieldLayout(hits[0][1], len(shape) - 1 - hits[0][0])
+        elif KEY in halo.plan.kinds:
+            # Ensemble members may lead (one member whenever ranks exchange).
+            position = 0
+            while position < len(names) - 1 and names[position] == "ensemble_size":
+                position += 1
+            if names[position] == self._partition_dimension():
+                ghosts = self.partition.ghost_indices(plan.spec.partition_key).size
+                rows = shape[position] + ghosts
+                if rows != halo.plan.extent(KEY):
+                    raise ValueError(
+                        f"halo workspace {key!r} holds {rows} rows of "
+                        f"{names[position]!r}; the partition key's rank holds "
+                        f"{halo.plan.extent(KEY)} with its ghost rows"
+                    )
+                shape = (*shape[:position], rows, *shape[position + 1 :])
+                layout = FieldLayout(KEY, len(shape) - 1 - position)
+        if layout is None:
+            raise ValueError(
+                f"workspace {key!r} is declared halo=True but its shape "
+                f"{tuple(dims)!r} neither names the slab axis nor leads with "
+                "the partition key's dimension (after ensemble_size)"
+            )
+        position = len(shape) - 1 - layout.axis
+        row = itemsize * int(np.prod(shape, dtype=np.int64)) // max(shape[position], 1)
+        if row > halo.row_bytes.get(layout.kind, 0):
+            raise ValueError(
+                f"halo workspace {key!r} has {row}-byte rows; the halo sized its "
+                f"message slots at startup for rows of at most "
+                f"{halo.row_bytes.get(layout.kind, 0)} bytes, the widest "
+                "field declared halo=True"
+            )
+        return shape, layout
+
+    def _partition_dimension(self) -> str | None:
+        """The dimension of the partition key's coordinate field."""
+
+        from hydroforge.compiler.partition import bare
+
+        key = self.plan.spec.partition_key
+        found = {
+            bare(entry.tensor.shape[0])
+            for entry in self.plan.fields.entries.values()
+            if entry.active
+            and entry.name == key
+            and entry.tensor.shape
+            and isinstance(entry.tensor.shape[0], str)
+        }
+        return found.pop() if len(found) == 1 else None
+
+    def attach_halo_layout(self, tensor: torch.Tensor, layout: Any) -> None:
+        """Exchange ``tensor`` (a halo workspace) with ``layout``."""
+
+        self._halo_layouts[id(tensor)] = (tensor, layout)
+
+    def detach_halo_layout(self, tensor: torch.Tensor) -> None:
+        found = self._halo_layouts.get(id(tensor))
+        if found is not None and found[0] is tensor:
+            del self._halo_layouts[id(tensor)]
 
     def spatial_group(self) -> Any:
         """The process group of this rank's spatial partitions: the mesh's
@@ -247,7 +348,8 @@ class ModelRuntime:
     def _halo_rows(self) -> tuple[dict[str, Any], dict[str, int]]:
         """Every rank's rows of each halo kind (the partition's ghost rows,
         the slab's) and the widest row of the fields declared ``halo=True``
-        of each kind on this rank."""
+        of each kind on this rank. Kernel workspaces declared ``halo=True``
+        are allocated later, on their first call; their rows must fit."""
 
         from hydroforge.declare.tensors import ModuleTensors
         from hydroforge.parallel.halo import CELL, FACE, KEY, partition_layouts
@@ -536,7 +638,7 @@ class ModelRuntime:
             self._prepare_output_directory(directory)
         execution = ModelExecution(self)
         self.execution = execution
-        self.progress = ProgressRuntime(self)
+        self.progress = ProgressRuntime(self) if self.owner.progress else None
         if directory is not None and plan.rank == 0:
             write_model_manifest(
                 directory,
@@ -947,7 +1049,8 @@ class ModelRuntime:
             self.clock.time = target
             self.clock.schedule_index = 0
             self.clock.elapsed_microseconds = 0
-            self.progress.state = ProgressState()
+            if self.progress is not None:
+                self.progress.state = ProgressState()
         except BaseException as caught:
             error = caught
         try:

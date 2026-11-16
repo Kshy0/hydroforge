@@ -280,6 +280,14 @@ class KernelBindingPlan:
             kind, plan.precisions.field_dtype, plan.precisions.storage_dtype
         )
 
+    def workspace_dtype(self, workspace: KernelWorkspace) -> torch.dtype:
+        """Elements of ``workspace``: a field's semantic ``float``/``hpfloat``,
+        the scalar ``precision`` or an exact dtype."""
+
+        if workspace.dtype in ("float", "hpfloat"):
+            return self._concrete(workspace.dtype)
+        return precision_dtype(workspace.dtype, self.plan.dtype)
+
     def _declared_dtype(
         self, spec: KernelSpec, name: str
     ) -> torch.dtype | None | Unresolved:
@@ -287,7 +295,7 @@ class KernelBindingPlan:
 
         plan = self.plan
         if name in spec.workspace:
-            return precision_dtype(spec.workspace[name].dtype, plan.dtype)
+            return self.workspace_dtype(spec.workspace[name])
         if name in spec.step_fields:
             return precision_dtype(spec.step_fields[name].dtype, plan.dtype)
         if name in spec.substep_fields:

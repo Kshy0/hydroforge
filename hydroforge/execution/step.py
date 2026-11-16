@@ -250,6 +250,7 @@ class ManagedStep:
         "output_enabled",
         "requested_sub_steps",
         "is_spin_up",
+        "differentiable",
         "_context",
     )
 
@@ -258,6 +259,10 @@ class ManagedStep:
     output_enabled: bool
     requested_sub_steps: int
     is_spin_up: bool
+    # Whether this step is recorded for its adjoint (hydroforge.execution.autodiff):
+    # a model with per-sub-step tape fields may skip filling them otherwise;
+    # a cached scope that branches on it declares it as a specialization.
+    differentiable: bool
 
     def __init__(self, context: StepContext) -> None:
         step = context.scheduled_step
@@ -267,6 +272,8 @@ class ManagedStep:
         requested = context.requested_sub_steps
         self.requested_sub_steps = 1 if requested is None else requested
         self.is_spin_up = context.spinup
+        tape = context.execution.runtime.step_tape
+        self.differentiable = tape is not None and tape.recording
         self._context = context
 
     def fixed(
@@ -691,6 +698,14 @@ def managed_step(function: _F) -> _F:
         if not args:
             raise TypeError(f"{method_name}() requires the model instance positionally")
         runtime = args[0].__pydantic_private__["_runtime"]
+        tape = runtime.step_tape
+        if tape is not None:
+            # Differentiable mode (hydroforge.execution.autodiff): the same step,
+            # recorded as an autograd node when its inputs need gradients.
+            return tape.record(lambda: advance(runtime, args, kwargs))
+        return advance(runtime, args, kwargs)
+
+    def advance(runtime, args, kwargs):
         channel = runtime.channel
         materialized = runtime.state == "materialized"
         if materialized and not channel.distributed:

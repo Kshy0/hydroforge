@@ -569,6 +569,14 @@ class ModelDeclaration(HydroForgeModel):
         default_factory=ConsoleEventSink,
         description="Structured lifecycle/progress event destination",
     )
+    progress: bool = Field(
+        default=True,
+        strict=True,
+        description=(
+            "Emit a step.completed progress event after managed steps; False "
+            "for drivers that step many times per output (training loops)"
+        ),
+    )
     simulation_schedule: InstanceOf[SimulationSchedule] | None = Field(
         default=None,
         description="Runtime-owned model call schedule and calendar contract",

@@ -9,13 +9,14 @@
 from __future__ import annotations
 
 from abc import ABC
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType, TracebackType
 from typing import TYPE_CHECKING, Any, Self
 
 import cftime
+import torch
 
 from hydroforge.compiler.plan import ModelPlan, compile_model
 from hydroforge.core.errors import ResourceCleanupError
@@ -255,6 +256,48 @@ class AbstractModel(ModelDeclaration, ABC):
         """Run the ordered module structure pass between managed steps."""
 
         return ModelRuntime.of(self).update_structure()
+
+    @property
+    def differentiable_enabled(self) -> bool:
+        """Whether managed steps record autograd nodes (:meth:`set_differentiable`)."""
+
+        return ModelRuntime.of(self).step_tape is not None
+
+    def set_differentiable(self, enabled: bool) -> None:
+        """Switch differentiable mode between steps (see :mod:`hydroforge.execution.autodiff`).
+
+        While on, values staged into the inputs of the model's ``StepAdjoint``
+        keep their autograd graph, each managed step whose inputs need
+        gradients becomes an autograd node whose backward runs the model's
+        ``@adjoint_step``, and :meth:`capture_state` returns the results'
+        graph values. Off drops every graph value: plain steps save no tape.
+        A model without a step adjoint, or built without its adjoint and tape
+        fields, cannot be switched on.
+        """
+
+        from hydroforge.execution.autodiff import set_differentiable
+
+        set_differentiable(self, enabled)
+
+    def capture_state(self, keys: Iterable[str] | None = None) -> dict[str, torch.Tensor]:
+        """Copies of state tensors in device memory, keyed ``module.field``.
+
+        Omitted ``keys`` selects every ``init_state`` field. Pair with
+        :meth:`assign_state` to rerun or roll back steps without a checkpoint
+        (see :mod:`hydroforge.execution.state_assignment`). In differentiable
+        mode a field with an autograd graph value returns that value.
+        """
+
+        from hydroforge.execution.state_assignment import capture_state
+
+        return capture_state(self, keys)
+
+    def assign_state(self, values: Mapping[str, torch.Tensor]) -> None:
+        """Copy ``module.field`` values into ``init_state``/``state`` tensors between steps."""
+
+        from hydroforge.execution.state_assignment import assign_state
+
+        assign_state(self, values)
 
     def save_state(self) -> InputProxy:
         """Publish a complete construction input at the committed clock.

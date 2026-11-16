@@ -368,7 +368,7 @@ class HaloSchedule:
 
         if self.busy or self.halo is None or not (spec.contributes or self.ghosts):
             return None
-        bound, _ = self.recorder.binder.arguments(registry, arguments)
+        bound = self._bound(registry, arguments)
         contributes = {
             _storage(tensor): tensor for tensor in _contributions(spec, bound)
         }
@@ -401,6 +401,17 @@ class HaloSchedule:
 
         return recorded
 
+    def _bound(self, registry: Any, arguments: dict) -> dict:
+        """The call's complete arguments. Binding is cold-path compiler work
+        (a workspace's first allocation, cached scalars), not an operator of
+        the recording."""
+
+        from torch.utils._python_dispatch import _disable_current_modes
+
+        with _disable_current_modes():
+            bound, _ = self.recorder.binder.arguments(registry, arguments)
+        return bound
+
     # ------------------------------------------------------------------ #
     def prepare_reads(self, registry: Any, spec: Any, arguments: dict) -> None:
         """Before a call of a kernel declaring ``halo``: record a mirror of
@@ -411,7 +422,7 @@ class HaloSchedule:
         runtime, halo = self.runtime, self.halo
         if halo is None:
             return
-        bound, _ = self.recorder.binder.arguments(registry, arguments)
+        bound = self._bound(registry, arguments)
         stale: dict[int, tuple[torch.Tensor, int]] = {}
         for name, distance in spec.halo.items():
             tensor = bound[name]

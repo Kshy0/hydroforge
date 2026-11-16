@@ -29,6 +29,20 @@ out-of-range threads and forwards the arguments to the device function.
 ``masks`` packs bool compile-time values into ``#define HYDROFORGE_<MASK>``
 bit masks ahead of the source; their members are never arguments.
 
+A source that names ``HYDROFORGE_KERNEL_PARAMETERS`` gets it defined ahead
+of the source as the typed parameter list of the default arguments (every
+canonical value the launches take, in parameter order, named like the spec):
+buffers as pointers to their element type, ``const`` unless the spec's access
+writes them, scalars in the device type of their kind. Hand-written kernels
+then bind by name, whatever their order::
+
+    extern "C" __global__ void k(HYDROFORGE_KERNEL_PARAMETERS) { ... }
+
+Such a source also gets ``HYDROFORGE_LAUNCHES_<kernel>`` defined for every
+hand-written kernel the declaration launches, so a source shared by kernels
+of several specs compiles, in each program, only the kernels whose
+parameter names that spec provides.
+
 This module's public names are the helpers of hand-written launch plans.
 """
 
@@ -71,6 +85,7 @@ from hydroforge.kernels.registry import (
 )
 from hydroforge.kernels.spec import (
     KernelSpec,
+    buffer_access_semantics,
     expected_host_scalar,
     host_scalar_is_valid,
     launch_extent,
@@ -78,6 +93,7 @@ from hydroforge.kernels.spec import (
 from hydroforge.kernels.toolchain import CompileRequest
 from hydroforge.kernels.toolchain import cuda as rtc
 from hydroforge.kernels.toolchain.cuda import (
+    CudaConcurrent,
     CudaLaunch,
     blocks,
     boolean,
@@ -100,6 +116,8 @@ _CONDITION = re.compile(r"(not\s+)?([A-Za-z_]\w*)")
 _INCLUDE = re.compile(r'^\s*#include\s+"([^"]+)"', re.MULTILINE)
 _PRAGMA_ONCE = re.compile(r"^[ \t]*#[ \t]*pragma[ \t]+once\b[^\n]*$", re.MULTILINE)
 _LANES = frozenset({1, 2, 4, 8, 16, 32})
+_KERNEL_PARAMETERS = "HYDROFORGE_KERNEL_PARAMETERS"
+_KERNEL_NAME = re.compile(r"\s*([A-Za-z_]\w*)")
 
 
 class CudaSource(HydroForgeModel):
@@ -118,11 +136,15 @@ class CudaSource(HydroForgeModel):
     ``-I`` paths or macro includes) compile once per process and must remain
     unchanged in that process; use ``include_root`` or ``inline_includes`` to
     make application dependencies part of the persistent cache identity.
+    ``toolkit_headers`` adds the CUDA toolkit's own headers to the search path
+    (``<cooperative_groups.h>`` for the grid barrier of a cooperative
+    :class:`CudaLaunch`, the device runtime); they stay cacheable.
     """
 
     path: _SourcePath | None = None
     text: _NonemptyText | None = None
     options: tuple[_NonemptyText, ...] = ()
+    toolkit_headers: bool = False
     prefixes: tuple[_SourcePath, ...] = ()
     inline_includes: tuple[_SourcePath, ...] = ()
     include_root: _SourcePath | None = None
@@ -280,7 +302,8 @@ class CudaCall(HydroForgeModel):
     ``arguments`` defaults to the canonical values in parameter order
     (buffers as pointers, scalars in the device type of their kind); an
     explicit tuple may name canonical values or workspaces, with ``None`` for
-    a null pointer. ``pack="struct"`` passes them as one by-value struct; a
+    a null pointer. A hand-written kernel can declare the default list as
+    ``HYDROFORGE_KERNEL_PARAMETERS`` (see the module documentation). ``pack="struct"`` passes them as one by-value struct; a
     generated entry then declares that struct with the argument names as
     fields and passes it as ``args``.
 
@@ -293,7 +316,27 @@ class CudaCall(HydroForgeModel):
     ``batched`` expression runs instead over grid.y = members.
     ``shared_memory`` reserves per-thread dynamic shared elements typed like
     the named buffers. ``when`` runs the step only if a compile-time bool
-    (``"NAME"`` or ``"not NAME"``) holds.
+    (``"NAME"`` or ``"not NAME"``) holds, or if an optional buffer is present
+    (``"NAME"``) or absent (``"not NAME"``).
+
+    Hand-written kernels may shape their launch further. ``threads`` fixes
+    the block size (instead of ``BLOCK_SIZE``). ``extent="max"`` covers the
+    largest of several ``size`` values instead of their product. ``grid``
+    chooses the blocks:
+
+    - ``"items"``: enough blocks for one thread per item (the default);
+    - ``"blocks"``: one block per item;
+    - ``"multiprocessors"``: one block per multiprocessor of the device;
+    - ``"resident"``: as many blocks as the device keeps resident.
+
+    The last two need ``cooperative``, which launches every block at once so
+    the kernel may synchronize the whole grid
+    (``cooperative_groups::this_grid().sync()``); with ``cap_grid`` a
+    multiprocessor grid never exceeds the ``"items"`` grid. A step with an empty extent is skipped,
+    whatever its grid. ``rounds`` names an integer value R: the step then
+    launches R times in stream order, round index ascending (descending with
+    ``reverse_rounds``), each launch passing the round index as a trailing
+    ``int`` argument.
 
     A generated entry computes ``hydroforge_index`` (the thread's item, or the
     C++ ``index`` expression over the entry's parameters), returns when it is
@@ -321,11 +364,44 @@ class CudaCall(HydroForgeModel):
     batched: str | None = Field(default=None, min_length=1)
     batch_axis: Identifier | None = None
     when: str | None = None
+    threads: PositiveInt | None = Field(default=None, le=1024)
+    extent: Literal["product", "max"] = "product"
+    grid: Literal["items", "blocks", "multiprocessors", "resident"] = "items"
+    cooperative: bool = False
+    cap_grid: bool = False
+    rounds: Identifier | None = None
+    reverse_rounds: bool = False
 
     @model_validator(mode="after")
     def _validate_launch(self) -> Self:
         if (self.kernel is None) == (self.device is None):
             raise ValueError("CUDA call step requires exactly one of kernel or device")
+        shaped = (
+            self.threads is not None
+            or self.extent != "product"
+            or self.grid != "items"
+            or self.cooperative
+            or self.rounds is not None
+        )
+        if shaped and (
+            self.device is not None
+            or self.batched is not None
+            or self.parallel_axes
+            or self.pack != "arguments"
+            or self.lanes != 1
+            or self.max_block is not None
+        ):
+            raise ValueError(
+                "threads, extent, grid, cooperative and rounds shape launches of a "
+                "hand-written kernel with one item axis, plain arguments, one lane "
+                "and no max_block"
+            )
+        if self.grid in ("multiprocessors", "resident") and not self.cooperative:
+            raise ValueError(f"grid={self.grid!r} requires a cooperative launch")
+        if self.cap_grid and self.grid != "multiprocessors":
+            raise ValueError("cap_grid limits a multiprocessors grid")
+        if self.reverse_rounds and self.rounds is None:
+            raise ValueError("reverse_rounds requires rounds")
         if self.kernel is not None and (
             self.index is not None or self.pass_index or not self.guard
         ):
@@ -425,9 +501,10 @@ def _compile_steps(
         if step.when is None:
             return None
         negate, name = _CONDITION.fullmatch(step.when).groups()
-        if spec.compile_time.get(name) != "bool":
+        if spec.compile_time.get(name) != "bool" and name not in spec.optional:
             raise ValueError(
-                f"{spec.name}: CUDA step condition {name!r} must be a compile-time bool"
+                f"{spec.name}: CUDA step condition {name!r} must be a compile-time "
+                "bool or an optional buffer"
             )
         return negate is None, name
 
@@ -451,6 +528,8 @@ def _compile_steps(
         axes = {axis for axis in step.parallel_axes if isinstance(axis, str)}
         if step.batch_axis is not None:
             axes.add(step.batch_axis)
+        if step.rounds is not None:
+            axes.add(step.rounds)
         require("grid extents must be integer values", set(size) | axes, counts)
         if step.arguments is None:
             arguments = tuple(
@@ -545,15 +624,32 @@ def _allocate_workspace(
     }
 
 
+def _extent(name: str, step: _CallStep, values: Mapping[str, Any]) -> int:
+    if step.declaration.extent == "max":
+        return max(launch_extent(name, (key,), values) for key in step.size)
+    return launch_extent(name, step.size, values)
+
+
+def _enabled(
+    condition: tuple[bool, str] | None, values: Mapping[str, Any], buffers: frozenset[str]
+) -> bool:
+    if condition is None:
+        return True
+    expected, name = condition
+    value = values[name]
+    return (value is not None if name in buffers else bool(value)) == expected
+
+
 @dataclass(frozen=True, slots=True)
 class _Rendering:
     spec: KernelSpec
     values: Mapping[str, Any]
     buffers: frozenset[str]
     buffer_dtypes: Mapping[str, torch.dtype | None] | None
+    device: int = 0
 
     def enabled(self, condition: tuple[bool, str] | None) -> bool:
-        return condition is None or bool(self.values[condition[1]]) == condition[0]
+        return _enabled(condition, self.values, self.buffers)
 
     def substitute(self, expression: str) -> str:
         substitutions = {}
@@ -592,6 +688,54 @@ class _Rendering:
         )
         # An absent buffer without a declared dtype converts to any pointer.
         return f"{ctype(dtype)}* {name}" if dtype else f"decltype(nullptr) {name}"
+
+    def parameter(self, name: str) -> str:
+        """``HYDROFORGE_KERNEL_PARAMETERS`` entry of one canonical value."""
+        declaration = self.declaration(name, 0)
+        if (
+            name in self.spec.buffers
+            and not declaration.startswith("decltype")
+            and not buffer_access_semantics(self.spec.buffers[name]).writes
+        ):
+            return f"const {declaration}"
+        return declaration
+
+    def shaped(self, step: _CallStep) -> tuple[CudaLaunch, ...]:
+        """Launches of a hand-written kernel with a declared block or grid shape."""
+        declared = step.declaration
+        extent = _extent(self.spec.name, step, self.values)
+        if extent == 0:
+            return ()
+        threads = declared.threads or self.values["BLOCK_SIZE"]
+        items = blocks(extent, threads)
+        if declared.grid == "items":
+            grid: int | str = items
+        elif declared.grid == "blocks":
+            grid = extent
+        elif declared.grid == "multiprocessors":
+            grid = torch.cuda.get_device_properties(self.device).multi_processor_count
+            grid = min(grid, items) if declared.cap_grid else grid
+        else:
+            grid = "resident"
+        kernel = self.substitute(declared.kernel)
+        arguments = tuple(self.argument(name) for name in step.arguments)
+        shared = threads * sum(
+            self.values[name].element_size() * count
+            for name, count in declared.shared_memory.items()
+        )
+        if declared.rounds is None:
+            rounds: tuple[int | None, ...] = (None,)
+        else:
+            count = launch_extent(self.spec.name, (declared.rounds,), self.values)
+            rounds = tuple(reversed(range(count)) if declared.reverse_rounds else range(count))
+        return tuple(
+            CudaLaunch(
+                kernel, grid, threads,
+                arguments if r is None else (*arguments, int32(r)),
+                shared, cooperative=declared.cooperative,
+            )
+            for r in rounds
+        )
 
     def launch(self, step: _CallStep, entry: str) -> tuple[CudaLaunch | None, str]:
         declared = step.declaration
@@ -701,6 +845,7 @@ def _render_steps(
         {**values, **workspace},
         frozenset(spec.buffers).union(workspace),
         buffer_dtypes,
+        _launch_device(values),
     )
     launches: list[rtc.LaunchStep] = []
     sources: list[str] = []
@@ -712,11 +857,24 @@ def _render_steps(
             if target is not None:
                 launches.append(partial(target.fill_, step.value))
             continue
+        if _shaped(step.declaration):
+            launches.extend(rendering.shaped(step))
+            continue
         launch, source = rendering.launch(step, f"hydroforge_entry_{position}")
         if launch is not None:
             launches.append(launch)
             sources.append(source)
     return tuple(launches), "".join(sources)
+
+
+def _shaped(declared: CudaCall) -> bool:
+    return (
+        declared.threads is not None
+        or declared.extent != "product"
+        or declared.grid != "items"
+        or declared.cooperative
+        or declared.rounds is not None
+    )
 
 
 def _launch_device(values: Mapping[str, Any]) -> int:
@@ -820,12 +978,39 @@ class _CudaImplementation(KernelImplementation):
         self.declaration = declaration
         self.steps = steps
         self.plan_names = plan_names
+        handwritten = [
+            step
+            for step in steps or ()
+            if isinstance(step, _CallStep) and step.declaration.kernel is not None
+        ]
+        self.launched = tuple(
+            dict.fromkeys(
+                _KERNEL_NAME.match(step.declaration.kernel).group(1)
+                for step in handwritten
+            )
+        )
+        self.default_arguments = tuple(
+            dict.fromkeys(
+                step.arguments
+                for step in handwritten
+                if step.declaration.arguments is None
+            )
+        )
         self.check_names = (
             ()
             if declaration.check is None
             else named_parameters(spec, declaration.check)
         )
-        self.options = rtc.program_options(declaration.source.options, physics=True)
+        source_options = declaration.source.options
+        if declaration.source.toolkit_headers:
+            toolkit = rtc.toolkit_include_options()
+            if not toolkit:
+                raise RuntimeError(
+                    "toolkit_headers needs the CUDA toolkit's include directory "
+                    "(set CUDA_HOME); none was found"
+                )
+            source_options = (*source_options, *toolkit)
+        self.options = rtc.program_options(source_options, physics=True)
         self._programs: dict[tuple[str, ...], rtc.RtcProgram] = {}
 
     @property
@@ -846,12 +1031,13 @@ class _CudaImplementation(KernelImplementation):
                 if not rendering.enabled(step.condition):
                     continue
                 if isinstance(step, _CallStep):
-                    launch_extent(self.spec.name, step.size, values)
+                    _extent(self.spec.name, step, values)
                     axes = tuple(
                         axis
                         for axis in (
                             *step.declaration.parallel_axes,
                             step.declaration.batch_axis,
+                            step.declaration.rounds,
                         )
                         if isinstance(axis, str)
                     )
@@ -892,8 +1078,35 @@ class _CudaImplementation(KernelImplementation):
         if check is not None:
             check(**{name: values[name] for name in self.check_names})
 
-    def _program(self, values: Mapping[str, Any], entries: str) -> rtc.RtcProgram:
-        """The compiled program of one call: masks, source and generated entries."""
+    def _kernel_parameters(
+        self, values: Mapping[str, Any], buffer_dtypes: Mapping[str, Any] | None
+    ) -> str:
+        """``HYDROFORGE_KERNEL_PARAMETERS`` and ``HYDROFORGE_LAUNCHES_<kernel>``."""
+
+        if len(self.default_arguments) != 1:
+            raise ValueError(
+                f"{self.spec.name}: {_KERNEL_PARAMETERS} needs declared steps whose "
+                "hand-written kernels take one default argument list; found "
+                f"{len(self.default_arguments)}"
+            )
+        (names,) = self.default_arguments
+        rendering = _Rendering(
+            self.spec, values, frozenset(self.spec.buffers), buffer_dtypes
+        )
+        parameters = ", \\\n    ".join(rendering.parameter(name) for name in names)
+        launched = "".join(
+            f"#define HYDROFORGE_LAUNCHES_{name}\n" for name in self.launched
+        )
+        return f"#define {_KERNEL_PARAMETERS} \\\n    {parameters}\n{launched}"
+
+    def _program(
+        self,
+        values: Mapping[str, Any],
+        entries: str,
+        buffer_dtypes: Mapping[str, Any] | None,
+    ) -> rtc.RtcProgram:
+        """The compiled program of one call: masks, kernel parameters, source
+        and generated entries."""
 
         spec = self.spec
         declaration = self.declaration
@@ -912,12 +1125,17 @@ class _CudaImplementation(KernelImplementation):
             program = self._programs[key] = rtc.RtcProgram(
                 source, self.options, spec.name
             )
-        if not declaration.masks and not entries:
+        parameters = (
+            self._kernel_parameters(values, buffer_dtypes)
+            if _KERNEL_PARAMETERS in program.source
+            else ""
+        )
+        if not declaration.masks and not entries and not parameters:
             return program
         prefix = "".join(
             f"#define HYDROFORGE_{name} {_mask(members, values)}u\n"
             for name, members in declaration.masks.items()
-        )
+        ) + parameters
         return rtc.RtcProgram(
             prefix + program.source + entries, program.options, program.name
         )
@@ -943,8 +1161,8 @@ class _CudaImplementation(KernelImplementation):
                 )
             )
         request = None
-        if any(isinstance(step, CudaLaunch) for step in steps):
-            program = self._program(values, entries)
+        if rtc.launches(steps):
+            program = self._program(values, entries, call.buffer_dtypes)
             request = rtc.request_for(program, steps)
         return request, steps, device, workspace
 
@@ -1040,6 +1258,7 @@ class CudaKernel(KernelDeclaration):
 
 
 __all__ = [
+    "CudaConcurrent",
     "CudaLaunch",
     "blocks",
     "boolean",

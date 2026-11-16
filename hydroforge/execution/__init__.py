@@ -6,6 +6,7 @@
 
 """Compiled model orchestration and backend-owned execution."""
 
+from hydroforge.execution.autodiff import StepAdjoint, adjoint_step
 from hydroforge.execution.boundaries import between_steps, specialization_update
 from hydroforge.execution.collectives import (
     all_reduce_,
@@ -16,6 +17,8 @@ from hydroforge.execution.collectives import (
 from hydroforge.execution.step import ManagedStep, managed_step
 
 __all__ = [
+    "StepAdjoint",
+    "adjoint_step",
     "all_reduce_",
     "all_reduce_many_",
     "between_steps",

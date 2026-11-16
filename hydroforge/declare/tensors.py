@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import inspect
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from numbers import Integral
 from typing import Any, get_args
 
@@ -37,10 +37,31 @@ def copy_tensor_inputs(
     Model setters validate their physical and optional-module semantics before
     calling this helper. Copies are not rolled back on failure: setters must
     use ``@between_steps`` to prevent subsequent execution of partial state.
+
+    In differentiable mode (:mod:`hydroforge.execution.autodiff`) the model also keeps
+    each value staged into a declared input as the field's autograd graph
+    value. Outside it, ``@between_steps`` setters reject arguments that
+    require grad before their body runs: the copy would cut the gradient.
     """
 
+    if _differentiable_staging is not None and _differentiable_staging(inputs):
+        return
     for value, target in inputs.values():
         target.copy_(value)
+
+
+# Installed by hydroforge.execution.autodiff (a higher layer): stages the
+# inputs of a model in differentiable mode and returns True, else False.
+_differentiable_staging: Callable[[Mapping[str, tuple[Any, torch.Tensor]]], bool] | None = None
+
+
+def install_differentiable_staging(
+    staging: Callable[[Mapping[str, tuple[Any, torch.Tensor]]], bool],
+) -> None:
+    """Route :func:`copy_tensor_inputs` through differentiable mode (framework-internal)."""
+
+    global _differentiable_staging
+    _differentiable_staging = staging
 
 
 class ModulePayload:

@@ -14,6 +14,7 @@ from contextlib import contextmanager, nullcontext
 from functools import wraps
 from typing import Any, TypeVar, cast
 
+import torch
 from pydantic import model_validator
 
 from hydroforge.core.errors import (
@@ -56,6 +57,23 @@ class _BetweenStepsDeclaration(HydroForgeModel):
                 "@between_steps requires self as the first positional parameter"
             )
         return self
+
+
+def _reject_gradients(method_name: str, arguments: dict[str, Any]) -> None:
+    """Outside differentiable mode a staged value that requires grad loses it.
+
+    Under ``torch.no_grad()`` nothing would be recorded anyway: accepted.
+    """
+
+    if not torch.is_grad_enabled():
+        return
+    for name, value in arguments.items():
+        if name != "self" and isinstance(value, torch.Tensor) and value.requires_grad:
+            raise ValueError(
+                f"{method_name}: argument {name!r} requires grad, but the model is not "
+                "in differentiable mode: staging it would cut its gradient (see "
+                "set_differentiable)"
+            )
 
 
 def between_steps(function: _F) -> _F:
@@ -136,6 +154,8 @@ def between_steps(function: _F) -> _F:
                 parameter_names,
                 arguments,
             )
+            if runtime.step_tape is None:
+                _reject_gradients(method_name, arguments)
         except BaseException as error:
             invocation_error = error
         channel.preflight(
