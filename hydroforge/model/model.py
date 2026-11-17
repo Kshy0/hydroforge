@@ -28,6 +28,7 @@ from hydroforge.model.results import ModelResults
 
 if TYPE_CHECKING:
     from hydroforge.execution.partition import GroupRankLookup
+    from hydroforge.execution.state_assignment import ModelClock
     from hydroforge.parallel.slab import Slab
 
 
@@ -257,35 +258,13 @@ class AbstractModel(ModelDeclaration, ABC):
 
         return ModelRuntime.of(self).update_structure()
 
-    @property
-    def differentiable_enabled(self) -> bool:
-        """Whether managed steps record autograd nodes (:meth:`set_differentiable`)."""
-
-        return ModelRuntime.of(self).step_tape is not None
-
-    def set_differentiable(self, enabled: bool) -> None:
-        """Switch differentiable mode between steps (see :mod:`hydroforge.execution.autodiff`).
-
-        While on, values staged into the inputs of the model's ``StepAdjoint``
-        keep their autograd graph, each managed step whose inputs need
-        gradients becomes an autograd node whose backward runs the model's
-        ``@adjoint_step``, and :meth:`capture_state` returns the results'
-        graph values. Off drops every graph value: plain steps save no tape.
-        A model without a step adjoint, or built without its adjoint and tape
-        fields, cannot be switched on.
-        """
-
-        from hydroforge.execution.autodiff import set_differentiable
-
-        set_differentiable(self, enabled)
-
     def capture_state(self, keys: Iterable[str] | None = None) -> dict[str, torch.Tensor]:
         """Copies of state tensors in device memory, keyed ``module.field``.
 
         Omitted ``keys`` selects every ``init_state`` field. Pair with
-        :meth:`assign_state` to rerun or roll back steps without a checkpoint
-        (see :mod:`hydroforge.execution.state_assignment`). In differentiable
-        mode a field with an autograd graph value returns that value.
+        :meth:`assign_state` and :meth:`capture_clock` to rerun, roll back or
+        reverse steps without a checkpoint (see
+        :mod:`hydroforge.execution.state_assignment`).
         """
 
         from hydroforge.execution.state_assignment import capture_state
@@ -298,6 +277,24 @@ class AbstractModel(ModelDeclaration, ABC):
         from hydroforge.execution.state_assignment import assign_state
 
         assign_state(self, values)
+
+    def capture_clock(self) -> ModelClock:
+        """The clock's position, for :meth:`assign_clock`."""
+
+        from hydroforge.execution.state_assignment import capture_clock
+
+        return capture_clock(self)
+
+    def assign_clock(self, clock: ModelClock) -> None:
+        """Move the clock to a captured position no later than the furthest step.
+
+        Steps from an earlier position replay simulated time and write no
+        output; an ``@adjoint_step`` moves the clock back by itself.
+        """
+
+        from hydroforge.execution.state_assignment import assign_clock
+
+        assign_clock(self, clock)
 
     def save_state(self) -> InputProxy:
         """Publish a complete construction input at the committed clock.

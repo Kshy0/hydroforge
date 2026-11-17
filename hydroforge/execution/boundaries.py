@@ -60,9 +60,11 @@ class _BetweenStepsDeclaration(HydroForgeModel):
 
 
 def _reject_gradients(method_name: str, arguments: dict[str, Any]) -> None:
-    """Outside differentiable mode a staged value that requires grad loses it.
+    """A staged value that requires grad would lose it in the copy.
 
     Under ``torch.no_grad()`` nothing would be recorded anyway: accepted.
+    A driver differentiating through steps stages detached values inside its
+    own autograd node and runs the model's ``@adjoint_step`` in the backward.
     """
 
     if not torch.is_grad_enabled():
@@ -70,9 +72,9 @@ def _reject_gradients(method_name: str, arguments: dict[str, Any]) -> None:
     for name, value in arguments.items():
         if name != "self" and isinstance(value, torch.Tensor) and value.requires_grad:
             raise ValueError(
-                f"{method_name}: argument {name!r} requires grad, but the model is not "
-                "in differentiable mode: staging it would cut its gradient (see "
-                "set_differentiable)"
+                f"{method_name}: argument {name!r} requires grad: staging it would "
+                "cut its gradient (stage a detached value inside an autograd node "
+                "whose backward runs the model's @adjoint_step)"
             )
 
 
@@ -154,8 +156,7 @@ def between_steps(function: _F) -> _F:
                 parameter_names,
                 arguments,
             )
-            if runtime.step_tape is None:
-                _reject_gradients(method_name, arguments)
+            _reject_gradients(method_name, arguments)
         except BaseException as error:
             invocation_error = error
         channel.preflight(

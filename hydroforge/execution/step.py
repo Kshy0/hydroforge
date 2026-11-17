@@ -10,6 +10,22 @@ authoring scopes.
 A managed method validates each distinct driver request once per compiled
 policy; a warm step then reuses the cached request and runs the transaction
 without constructing validation models.
+
+An ``@adjoint_step`` method is the reverse of the model's ``@managed_step``:
+the same transaction run for the step that ended at the current clock, which
+first moves the clock back to that step's start and leaves it there. Its body
+sees the step's calendar (current time, width, sub-steps and step fields)
+exactly as the forward step did; what it reads and writes is up to the model
+and its driver, which stage the step's inputs and result adjoints with the
+model's own setters and :meth:`~hydroforge.model.AbstractModel.assign_state`
+first.
+
+The clock remembers the furthest point it has reached (its frontier). A step
+that starts before the frontier — after :meth:`assign_clock` or reverse steps
+moved the clock back — replays time already simulated: it writes no
+statistics, emits no progress and must end at or before the frontier. Reverse
+steps are replays too. Once the clock is back at the frontier, steps output
+as usual.
 """
 
 from __future__ import annotations
@@ -102,6 +118,10 @@ class StepContext:
         self.output_enabled = False
         self.sampling = False
         self.flags = 0
+        # Set by ``begin`` for a step before the clock frontier (reverse steps
+        # included): it leaves statistics, progress and parameter plans alone.
+        self.replay = False
+        self.reverse = False
         self.substep_claimed = False
         self.completed_substeps: int | None = None
         self._outer_sites: dict[Any, int] = {}
@@ -114,6 +134,7 @@ class StepContext:
             self.clock.time,
             self.clock.schedule_index,
             self.clock.elapsed_microseconds,
+            self.clock.frontier,
             None if statistics is None else statistics.snapshot(),
         )
 
@@ -132,6 +153,7 @@ class StepContext:
             self.clock.time,
             self.clock.schedule_index,
             self.clock.elapsed_microseconds,
+            self.clock.frontier,
             windows,
         ) = snapshot
         if windows is not None:
@@ -152,11 +174,24 @@ class StepContext:
         self.duration = duration
         self.time_step = timedelta_microseconds(duration) / 1_000_000
         self.spinup = spinup = step is not None and step.is_spin_up
+        self.reverse = invocation.reverse
+        self.replay = invocation.replay
+        if invocation.reverse:
+            # The reverse step runs at the start of the step it reverses.
+            clock = self.clock
+            clock.elapsed_microseconds -= timedelta_microseconds(duration)
+            if step is not None:
+                clock.schedule_index = step.index
+            elif invocation.current_time is not None:
+                clock.time = invocation.current_time
         enabled = (
             not spinup if request.output_enabled is None else request.output_enabled
         )
         statistics = self.statistics
-        if statistics is None:
+        if invocation.replay:
+            self.output_enabled = self.sampling = False
+            self.flags = 0
+        elif statistics is None:
             self.output_enabled = enabled
             self.sampling = False
             self.flags = 0
@@ -167,13 +202,20 @@ class StepContext:
             self.flags = statistics.step_flags
 
     def commit_clock(self) -> None:
-        """Publish the next model time only after the full step succeeds."""
+        """Publish the next model time only after the full step succeeds.
 
-        self.clock.elapsed_microseconds += timedelta_microseconds(self.duration)
+        A reverse step moved the clock back in ``begin``; it stays there.
+        """
+
+        if self.reverse:
+            return
+        clock = self.clock
+        clock.elapsed_microseconds += timedelta_microseconds(self.duration)
+        clock.frontier = max(clock.frontier, clock.elapsed_microseconds)
         if self.scheduled_step is not None:
-            self.clock.schedule_index = self.scheduled_step.index + 1
+            clock.schedule_index = self.scheduled_step.index + 1
         elif self.current_time is not None:
-            self.clock.time = self.current_time + self.duration
+            clock.time = self.current_time + self.duration
 
     @staticmethod
     def _require_unnested(kind: str) -> None:
@@ -233,7 +275,7 @@ class StepContext:
                 "statistics were enabled but the managed step executed no "
                 "step.fixed/adaptive scope"
             )
-        if self.statistics is not None:
+        if self.statistics is not None and not self.replay:
             self.statistics.finish_step()
 
 
@@ -250,7 +292,7 @@ class ManagedStep:
         "output_enabled",
         "requested_sub_steps",
         "is_spin_up",
-        "differentiable",
+        "replay",
         "_context",
     )
 
@@ -259,10 +301,10 @@ class ManagedStep:
     output_enabled: bool
     requested_sub_steps: int
     is_spin_up: bool
-    # Whether this step is recorded for its adjoint (hydroforge.execution.autodiff):
-    # a model with per-sub-step tape fields may skip filling them otherwise;
-    # a cached scope that branches on it declares it as a specialization.
-    differentiable: bool
+    # Whether the step starts before the clock frontier (a recomputation or
+    # a reverse step): it outputs nothing. A cached scope that branches on it
+    # declares it as a specialization.
+    replay: bool
 
     def __init__(self, context: StepContext) -> None:
         step = context.scheduled_step
@@ -272,8 +314,7 @@ class ManagedStep:
         requested = context.requested_sub_steps
         self.requested_sub_steps = 1 if requested is None else requested
         self.is_spin_up = context.spinup
-        tape = context.execution.runtime.step_tape
-        self.differentiable = tape is not None and tape.recording
+        self.replay = context.replay
         self._context = context
 
     def fixed(
@@ -343,6 +384,7 @@ class _Conditions:
     current_time_available: bool
     schedule_configured: bool
     statistics_configured: bool
+    replay: bool = False
 
 
 class _StepRequest(HydroForgeModel):
@@ -367,6 +409,13 @@ class _StepRequest(HydroForgeModel):
             raise ValueError("time_step must be positive")
         if conditions.spinup and self.output_enabled is True:
             raise ValueError("spin-up requires output_enabled=False")
+        if conditions.replay and self.output_enabled is True:
+            raise ValueError(
+                "a step before the clock frontier (a recomputation or a reverse "
+                "step) writes no output; output_enabled must not be True"
+            )
+        if conditions.replay:
+            return self
         enabled = (
             not conditions.spinup
             if self.output_enabled is None
@@ -386,13 +435,20 @@ class _StepRequest(HydroForgeModel):
 class _Invocation:
     """One validated driver request resolved against the runtime clock."""
 
-    __slots__ = ("current_time", "scheduled_step", "request", "conditions")
+    __slots__ = ("current_time", "scheduled_step", "request", "conditions", "reverse")
 
-    def __init__(self, current_time, scheduled_step, request, conditions) -> None:
+    def __init__(
+        self, current_time, scheduled_step, request, conditions, reverse=False
+    ) -> None:
         self.current_time = current_time
         self.scheduled_step = scheduled_step
         self.request = request
         self.conditions = conditions
+        self.reverse = reverse
+
+    @property
+    def replay(self) -> bool:
+        return self.conditions[-1]
 
     def signature(self) -> Any:
         """Return the exact driver and schedule identity shared by all ranks."""
@@ -406,6 +462,7 @@ class _Invocation:
                 request.num_sub_steps,
                 request.output_enabled,
                 self.conditions,
+                self.reverse,
             )
         )
 
@@ -452,8 +509,11 @@ class _ManagedStepDeclaration(HydroForgeModel):
 
 
 class _ManagedStepDescriptor:
-    def __init__(self, declaration: _ManagedStepDeclaration) -> None:
+    def __init__(
+        self, declaration: _ManagedStepDeclaration, *, reverse: bool = False
+    ) -> None:
         self.function = declaration.function
+        self.reverse = reverse
         self.protocol_name = f"{self.function.__module__}.{self.function.__qualname__}"
         self.protocol_code = digest63(self.protocol_name)
         self.requests: dict[tuple[Any, ...], _StepRequest] = {}
@@ -481,15 +541,24 @@ class _ManagedStepDescriptor:
         clock = runtime.clock
         schedule = plan.schedule
         statistics_configured = plan.output.windows is not None
+        reverse = self.reverse
+        if reverse and plan.parameters:
+            raise ValueError("a model with scheduled parameter changes has no reverse step")
         step = None
         if schedule is not None:
-            if clock.schedule_index >= len(schedule):
-                raise ValueError("simulation schedule is exhausted")
-            step = schedule._step_at_trusted(clock.schedule_index)
+            if reverse:
+                if clock.schedule_index == 0:
+                    raise ValueError("no step to reverse: the clock is at the schedule start")
+                step = schedule._step_at_trusted(clock.schedule_index - 1)
+            else:
+                if clock.schedule_index >= len(schedule):
+                    raise ValueError("simulation schedule is exhausted")
+                step = schedule._step_at_trusted(clock.schedule_index)
         current_time = clock.time if step is None else step.start
         duration = kwargs.get("time_step")
         count = kwargs.get("num_sub_steps")
         output = kwargs.get("output_enabled")
+        replay = reverse or clock.elapsed_microseconds < clock.frontier
         # An explicit ``None`` is the advertised default, not a supplied value.
         conditions = (
             duration is not None,
@@ -497,6 +566,7 @@ class _ManagedStepDescriptor:
             current_time is not None,
             schedule is not None,
             statistics_configured,
+            replay,
         )
         key = (type(duration), duration, type(count), count, type(output), output)
         key += conditions
@@ -517,7 +587,22 @@ class _ManagedStepDescriptor:
                 if len(self.requests) >= 64:
                     del self.requests[next(iter(self.requests))]
                 self.requests[key] = request
-        return _Invocation(current_time, step, request, conditions)
+        if replay:
+            width = request.time_step if step is None else step.end - step.start
+            microseconds = timedelta_microseconds(width)
+            if reverse:
+                if clock.elapsed_microseconds < microseconds:
+                    raise ValueError(
+                        "the reverse step would move the clock before its start"
+                    )
+                if step is None and current_time is not None:
+                    current_time = current_time - width
+            elif clock.elapsed_microseconds + microseconds > clock.frontier:
+                raise ValueError(
+                    "a step before the clock frontier must end at or before it; "
+                    "this one would cross it"
+                )
+        return _Invocation(current_time, step, request, conditions, reverse)
 
 
 class _StepPolicy:
@@ -588,9 +673,12 @@ class _StepPolicy:
                 raise combined from error
             raise error
         snapshot = context.snapshot()
-        statistics = context.statistics
+        replay = invocation.replay
+        # A replay (recomputation or reverse step) leaves statistics, progress
+        # and parameter plans alone.
+        statistics = None if replay else context.statistics
         current_time = invocation.current_time
-        progress = self.progress
+        progress = None if replay else self.progress
         entered_user_step = False
         try:
             if statistics is not None:
@@ -619,7 +707,7 @@ class _StepPolicy:
             if progress is not None:
                 progress.begin_step(step)
             with self._parameter_transaction():
-                if not context.spinup:
+                if not context.spinup and not replay:
                     self._execute_parameter_change_plan(current_time)
                 token = ACTIVE_STEP.set(context)
                 context.invocation = managed
@@ -686,8 +774,23 @@ def compile_step_policies(runtime: ModelRuntime) -> None:
 
 def managed_step(function: _F) -> _F:
     """Compile step lifecycle once; the hot wrapper performs direct lookups."""
+    return _step_method(function, reverse=False)
+
+
+def adjoint_step(function: _F) -> _F:
+    """Declare the reverse of the model's managed step (see module docs).
+
+    The method is written like a ``@managed_step`` (``(self, step)``) and
+    called like one (``time_step``/``num_sub_steps`` as for the step it
+    reverses; a schedule supplies the width). It runs for the step that ended
+    at the current clock and moves the clock back to that step's start.
+    """
+    return _step_method(function, reverse=True)
+
+
+def _step_method(function: _F, *, reverse: bool) -> _F:
     declaration = _ManagedStepDeclaration(function=function)
-    descriptor = _ManagedStepDescriptor(declaration)
+    descriptor = _ManagedStepDescriptor(declaration, reverse=reverse)
     method_name = function.__qualname__
     phase = f"managed-step.invocation:{descriptor.protocol_name}"
     scope = "distributed managed-step invocation validation"
@@ -698,14 +801,6 @@ def managed_step(function: _F) -> _F:
         if not args:
             raise TypeError(f"{method_name}() requires the model instance positionally")
         runtime = args[0].__pydantic_private__["_runtime"]
-        tape = runtime.step_tape
-        if tape is not None:
-            # Differentiable mode (hydroforge.execution.autodiff): the same step,
-            # recorded as an autograd node when its inputs need gradients.
-            return tape.record(lambda: advance(runtime, args, kwargs))
-        return advance(runtime, args, kwargs)
-
-    def advance(runtime, args, kwargs):
         channel = runtime.channel
         materialized = runtime.state == "materialized"
         if materialized and not channel.distributed:

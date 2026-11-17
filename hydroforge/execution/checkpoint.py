@@ -100,6 +100,13 @@ def _host_copy(name: str, value: Any) -> Any:
         if value.dtype in (torch.float16, torch.bfloat16):
             value = value.to(torch.float32)
         return value.numpy().astype(dtype, copy=False)
+    if isinstance(value, np.ma.MaskedArray):
+        if np.ma.getmaskarray(value).any():
+            raise ValueError(
+                f"checkpoint construction input {name!r} has masked entries; "
+                "a checkpoint would save the values beneath the mask as data"
+            )
+        value = value.data
     if isinstance(value, np.ndarray):
         return np.array(value, order="K", copy=True, subok=False)
     if isinstance(value, np.generic):

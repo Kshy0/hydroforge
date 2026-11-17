@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
@@ -65,14 +66,23 @@ if TYPE_CHECKING:
 _EMPTY_STRUCTURE_HOOK = AbstractModule.update_structure
 
 
+# Process-unique identities of clock timelines (materializations and resets).
+_TIMELINES = itertools.count(1)
+
+
 class RuntimeClock:
     """Next execution index and physical date of one runtime.
 
     ``time`` is the unscheduled clock; a schedule derives the date from
-    ``schedule_index`` instead.
+    ``schedule_index`` instead. ``frontier`` is the furthest elapsed time a
+    step has reached on this timeline (steps before it are replays, see
+    :mod:`hydroforge.execution.step`); ``timeline`` counts clock resets, so a
+    captured clock is assigned only on the timeline it came from.
     """
 
-    __slots__ = ("schedule", "schedule_index", "time", "elapsed_microseconds")
+    __slots__ = (
+        "schedule", "schedule_index", "time", "elapsed_microseconds", "frontier", "timeline",
+    )
 
     def __init__(
         self, schedule: SimulationSchedule | None, initial_time: DateLike | None
@@ -81,6 +91,8 @@ class RuntimeClock:
         self.schedule_index = 0
         self.time = initial_time if schedule is None else None
         self.elapsed_microseconds = 0
+        self.frontier = 0
+        self.timeline = next(_TIMELINES)
 
     @property
     def current_time(self) -> DateLike | None:
@@ -165,8 +177,6 @@ class ModelRuntime:
         self.field_owners = MappingProxyType({})
         self.execution = None
         self.statistics = None
-        # hydroforge.execution.autodiff.StepTape while the model is in differentiable mode.
-        self.step_tape = None
         self.checkpoint = None
         self.parameters = None
         self.halo = None
@@ -1049,6 +1059,8 @@ class ModelRuntime:
             self.clock.time = target
             self.clock.schedule_index = 0
             self.clock.elapsed_microseconds = 0
+            self.clock.frontier = 0
+            self.clock.timeline = next(_TIMELINES)
             if self.progress is not None:
                 self.progress.state = ProgressState()
         except BaseException as caught:

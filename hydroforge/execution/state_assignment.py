@@ -4,34 +4,60 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 
-"""In-memory capture and assignment of model state between managed steps.
+"""In-memory capture and assignment of model state and clock between steps.
 
 Checkpoints (:meth:`AbstractModel.save_state`) persist a complete construction
-input; these two calls instead copy state tensors in device memory, for
-drivers that rerun or roll back steps (truncated backpropagation through time,
-recomputation, line searches over whole runs). Keys are ``module.field``. In
-differentiable mode both carry autograd graph values (see
-:mod:`hydroforge.execution.autodiff`).
+input; these calls instead copy state tensors in device memory and move the
+clock, for drivers that rerun, roll back or reverse steps (truncated
+backpropagation through time, recomputation, line searches over whole runs).
+The model keeps no history for them: whatever a driver wants to return to, it
+captures itself.
 
-Only ``init_state`` and ``state`` tensors of open modules are accepted. A value
-must have the field's local shape (this rank's rows); dtype conversion follows
+State keys are ``module.field``. Only ``init_state`` and ``state`` tensors of
+open modules are accepted. A value must have the field's local shape (this
+rank's rows); it may live on any device, and dtype conversion follows
 ``Tensor.copy_``. Halo-exchanged fields are rejected while the model exchanges
-halos: assigned owned rows would leave their ghost copies stale. The model's
-clock, statistics windows and derived fields are not touched.
+halos: assigned owned rows would leave their ghost copies stale. Assigning
+state does not touch the clock, statistics windows or derived fields.
+
+A :class:`ModelClock` returned by :func:`capture_clock` may be assigned back
+on the same timeline (until the clock is reset or the model rematerialized)
+as long as it does not lie beyond the furthest point steps have reached:
+steps from an earlier clock replay time already simulated and write no
+output (see :mod:`hydroforge.execution.step`). Every call is a between-steps
+operation, in the same order on every rank.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 
+from hydroforge.core.identity import canonical
+from hydroforge.core.time import DateLike
 from hydroforge.declare.tensors import copy_tensor_inputs
 from hydroforge.execution.boundaries import between_steps
 from hydroforge.execution.context import managed_step_active
 
 STATE_CATEGORIES = frozenset({"init_state", "state"})
+
+
+@dataclass(frozen=True, slots=True)
+class ModelClock:
+    """One position of a model's clock (opaque to drivers apart from ``time``).
+
+    ``time`` is the date of the next step (``None`` without one);
+    ``schedule_index`` the next scheduled step; ``elapsed_microseconds`` the
+    time stepped on this timeline.
+    """
+
+    time: DateLike | None
+    schedule_index: int
+    elapsed_microseconds: int
+    timeline: int
 
 
 def state_field(
@@ -72,42 +98,24 @@ def state_keys(model: Any, categories: Iterable[str] = ("init_state",)) -> tuple
 
 
 def capture_state(model: Any, keys: Iterable[str] | None = None) -> dict[str, torch.Tensor]:
-    """Copies of state tensors (default: every ``init_state`` field).
-
-    Detached, except in differentiable mode, where a field with an autograd
-    graph value (a step result, or a value assigned with its graph) returns
-    that value (see :mod:`hydroforge.execution.autodiff`).
-    """
+    """Detached copies of state tensors (default: every ``init_state`` field)."""
 
     if managed_step_active():
         raise RuntimeError("capture_state is allowed only between managed steps")
     names = state_keys(model) if keys is None else tuple(keys)
-    tape = model.__pydantic_private__["_runtime"].step_tape
-    graph = {} if tape is None else tape.values
-    captured = {}
-    for key in names:
-        tensor = state_field(model, key)[0]
-        value = graph.get(key)
-        captured[key] = tensor.detach().clone() if value is None else value
-    return captured
+    return {key: state_field(model, key)[0].detach().clone() for key in names}
 
 
-def _targets(
-    model: Any, values: Mapping[str, Any], categories: frozenset[str]
-) -> dict[str, tuple[Any, torch.Tensor]]:
-    tape = model.__pydantic_private__["_runtime"].step_tape
+def _targets(model: Any, values: Mapping[str, Any]) -> dict[str, tuple[Any, torch.Tensor]]:
     targets = {}
     for key, value in values.items():
-        tensor, spec = state_field(model, key, categories)
+        tensor, spec = state_field(model, key)
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"state {key!r} must be a tensor")
-        if (value.requires_grad and torch.is_grad_enabled()
-                and (tape is None or key not in tape.spec.inputs)):
+        if value.requires_grad and torch.is_grad_enabled():
             raise ValueError(
-                f"state {key!r} requires grad, but "
-                + ("the model is not in differentiable mode" if tape is None
-                   else "the model's step adjoint has no adjoint of it")
-                + ": assigning it would cut its gradient"
+                f"state {key!r} requires grad: assigning it would cut its gradient "
+                "(assign a detached value under the driver's own autograd node)"
             )
         if tuple(value.shape) != tuple(tensor.shape):
             raise ValueError(
@@ -135,32 +143,84 @@ def assign_state(model: Any, values: Mapping[str, torch.Tensor]) -> None:
     copying poisons the model like any between-steps mutation.
     """
 
-    stage_fields(model, values, STATE_CATEGORIES, "assign_state")
-
-
-def stage_fields(
-    model: Any, values: Mapping[str, torch.Tensor], categories: frozenset[str], what: str
-) -> None:
-    """:func:`assign_state` for fields of ``categories`` (framework-internal)."""
-
     from hydroforge.execution.session import ModelRuntime
 
     if managed_step_active():
-        raise RuntimeError(f"{what} is allowed only between managed steps")
+        raise RuntimeError("assign_state is allowed only between managed steps")
     runtime = ModelRuntime.of(model)
     error: BaseException | None = None
     targets: dict[str, tuple[Any, torch.Tensor]] = {}
     try:
-        runtime.ensure_materialized(f"{type(model).__name__}.{what}")
-        targets = _targets(model, values, categories)
+        runtime.ensure_materialized(f"{type(model).__name__}.assign_state")
+        targets = _targets(model, values)
     except BaseException as caught:
         error = caught
     runtime.channel.preflight(
         error,
-        phase=f"state.{what}.validation",
+        phase="state.assign_state.validation",
         scope="distributed state assignment validation",
     )
     _assign(model, targets=targets)
 
 
-__all__ = ["assign_state", "capture_state", "stage_fields", "state_field", "state_keys"]
+def capture_clock(model: Any) -> ModelClock:
+    """The model's clock, to assign back later with :func:`assign_clock`."""
+
+    from hydroforge.execution.session import ModelRuntime
+
+    if managed_step_active():
+        raise RuntimeError("capture_clock is allowed only between managed steps")
+    clock = ModelRuntime.of(model).clock
+    return ModelClock(
+        clock.time, clock.schedule_index, clock.elapsed_microseconds, clock.timeline
+    )
+
+
+def assign_clock(model: Any, value: ModelClock) -> None:
+    """Move the clock to a captured position no later than its frontier."""
+
+    from hydroforge.execution.session import ModelRuntime
+
+    if managed_step_active():
+        raise RuntimeError("assign_clock is allowed only between managed steps")
+    runtime = ModelRuntime.of(model)
+    error: BaseException | None = None
+    signature = None
+    try:
+        runtime.require_healthy(f"{type(model).__name__}.assign_clock")
+        if not isinstance(value, ModelClock):
+            raise TypeError("assign_clock takes a ModelClock from capture_clock")
+        clock = runtime.clock
+        if value.timeline != clock.timeline:
+            raise ValueError(
+                "the clock was captured on another timeline (before a clock reset "
+                "or rematerialization)"
+            )
+        if value.elapsed_microseconds > clock.frontier:
+            raise ValueError("the clock cannot move beyond the furthest step reached")
+        if runtime.plan.parameters and value.elapsed_microseconds != clock.elapsed_microseconds:
+            raise ValueError("a model with scheduled parameter changes cannot move its clock")
+        signature = canonical((value.time, value.schedule_index, value.elapsed_microseconds))
+    except BaseException as caught:
+        error = caught
+    runtime.channel.preflight(
+        error,
+        phase="clock.assign.validation",
+        scope="distributed clock assignment validation",
+        signature=signature,
+    )
+    clock = runtime.clock
+    clock.time = value.time
+    clock.schedule_index = value.schedule_index
+    clock.elapsed_microseconds = value.elapsed_microseconds
+
+
+__all__ = [
+    "ModelClock",
+    "assign_clock",
+    "assign_state",
+    "capture_clock",
+    "capture_state",
+    "state_field",
+    "state_keys",
+]
