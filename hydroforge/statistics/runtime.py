@@ -372,6 +372,12 @@ class StatisticsRuntime:
         self._control_host_slots = host_slots
         self._control_streams = streams
         self._control_slot_index = 0
+        self._accum_weight_host = torch.zeros(
+            1,
+            dtype=required_tensors[CONTROL_ACCUM_WEIGHT].dtype,
+            device="cpu",
+            pin_memory=streams is not None,
+        )
 
     def _check_offsets(self, tensors: Mapping[str, torch.Tensor]) -> None:
         """Reject bindings whose kernel element offsets would wrap."""
@@ -699,13 +705,49 @@ class StatisticsRuntime:
             )
         self._window_weight = totals[-1]
 
-    def fold_weights(self, count: int, duration: float) -> None:
-        """Mirror the window weight sum of a device loop that folds samples.
+    def copy_accumulated_weight_async(self) -> torch.Tensor:
+        """Enqueue a non-blocking read of the device's accumulated weight.
 
-        Fixed loops fold ``count`` samples of ``duration / count`` and are
-        mirrored exactly before launch.  Adaptive loops report only their
-        iteration count after the launch; their mean width is mirrored, which
-        detects a stalled sum once a typical sample no longer changes it.
+        Callers must synchronize the current stream (for example via a
+        subsequent synchronous device-to-host read on the same stream) before
+        reading the returned host tensor.
+        """
+
+        accum = self._kernel_states[CONTROL_ACCUM_WEIGHT]
+        host = getattr(self, "_accum_weight_host", None)
+        if host is None or host.dtype != accum.dtype:
+            host = torch.zeros(
+                1,
+                dtype=accum.dtype,
+                device="cpu",
+                pin_memory=accum.device.type == "cuda",
+            )
+            self._accum_weight_host = host
+        host.copy_(accum, non_blocking=True)
+        return host
+
+    def sync_accumulated_weight(
+        self, accumulated: float, *, stalled: bool = False
+    ) -> None:
+        """Record the device's exact accumulated window weight after an
+        adaptive loop completes, and report any float32 precision stall."""
+
+        if self._weight_guard and stalled:
+            raise OverflowError(
+                "statistics mean window weight exceeds float32 resolution: "
+                "an adaptive substep weight no longer changes the accumulated "
+                f"{accumulated!r}; use shorter windows or float64 storage"
+            )
+        self._accumulated_weight = float(accumulated)
+        self._window_weight = np.float32(accumulated)
+
+    def fold_weights(self, count: int, duration: float) -> None:
+        """Mirror the window weight sum of a fixed device loop that folds samples.
+
+        Fixed loops fold ``count`` uniform samples of ``duration / count`` and
+        are mirrored exactly without a post-launch device readback.  Adaptive
+        loops use :meth:`sync_accumulated_weight` with the device's actual
+        accumulated weight instead.
         """
 
         weight = self._convert_weight(duration / count)

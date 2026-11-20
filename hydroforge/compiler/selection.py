@@ -205,8 +205,20 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
     # before-validator (on_missing="open") or checked above ("error").
     options = declaration.options
 
+    topology = ProcessTopology.capture()
+    spatial_world_size = (
+        topology.world_size if parallel is None else parallel.spatial_partitions
+    )
+    has_halo_fields = any(
+        field.tensor.halo
+        for name in opened
+        for field in spec.modules[name].tensor_fields.values()
+    )
+    needs_halo = spatial_world_size > 1 and (
+        spec.slab is not None or (spec.partition_key is not None and has_halo_fields)
+    )
     device = declaration.device
-    backend = resolve_backend(device)
+    backend = resolve_backend(device, halo=needs_halo)
     model_rule = spec.backend_requirements.get(
         backend.name, DEFAULT_BACKEND_REQUIREMENT
     )
@@ -283,15 +295,7 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
                 ConditionContext(frozenset(opened), options=options)
             )
         )
-    topology = ProcessTopology.capture()
-    spatial_world_size = (
-        topology.world_size if parallel is None else parallel.spatial_partitions
-    )
-    if (
-        spec.slab is not None
-        and spatial_world_size > 1
-        and backend.name not in ("cuda", "torch")
-    ):
+    if needs_halo and backend.name not in ("cuda", "torch"):
         raise ValueError(
             f"halo exchange is not supported on backend {backend.name!r}; "
             "use HYDROFORGE_BACKEND=cuda (or torch)"

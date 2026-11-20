@@ -168,7 +168,11 @@ def _statistics_functions(
 ) -> Mapping[tuple[bool, torch.dtype, torch.dtype], KernelFunction]:
     return {
         (fixed, source, destination): statistics_control(
-            sample_phase, source, destination, fixed=fixed
+            sample_phase,
+            source,
+            destination,
+            fixed=fixed,
+            track_stalled=not fixed,
         )
         for fixed in (True, False)
         for source in _REALS
@@ -382,6 +386,7 @@ class StatisticsControls:
         old_weight: torch.Tensor,
         accum_weight: torch.Tensor,
         phase: torch.Tensor,
+        stalled: torch.Tensor,
     ) -> None:
         """Write the controls of an advanced adaptive iteration's sample."""
 
@@ -396,5 +401,6 @@ class StatisticsControls:
                 "old_weight": old_weight,
                 "accum_weight": accum_weight,
                 "phase": phase,
+                "stalled": stalled,
             },
         )

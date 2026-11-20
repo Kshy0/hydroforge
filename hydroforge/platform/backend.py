@@ -275,14 +275,16 @@ def backend_named(name: str) -> Backend:
 
 
 @validate_call(config=HydroForgeModel.model_config)
-def resolve_backend(device: torch.device) -> Backend:
+def resolve_backend(device: torch.device, *, halo: bool = False) -> Backend:
     """Resolve one model's backend from its declared device.
 
     An explicit ``HYDROFORGE_BACKEND`` remains authoritative.  In automatic
     mode the model device, rather than accelerator visibility elsewhere in the
     process, selects the backend, so CPU and accelerator models coexist
-    without assigning a native GPU backend to CPU state.  Selecting Triton
-    proves that its driver matches the device.
+    without assigning a native GPU backend to CPU state.  Multi-rank halo
+    models on CUDA select the native CUDA backend automatically because
+    Triton does not support halo exchange.  Selecting Triton proves that its
+    driver matches the device.
     """
 
     if device.type in {"xla", "lazy"}:
@@ -294,6 +296,8 @@ def resolve_backend(device: torch.device) -> Backend:
             require_triton_device(device)
         backend.require_device(device)
         return backend
+    if device.type == "cuda" and halo:
+        return CUDA
     if device.type in {"cuda", "xpu"}:
         require_triton_device(device)
         return TRITON

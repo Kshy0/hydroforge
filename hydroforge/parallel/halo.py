@@ -951,10 +951,15 @@ class HaloRuntime:
         memory, self.memory = self.memory, None
         self.registry = None
         if memory is not None:
-            if self.device.type == "cuda" and torch.cuda.is_available():
-                torch.cuda.synchronize(self.device)
-            self.window = torch.zeros(1, dtype=torch.uint8, device=self.device)
-            memory.close()
+            def _release_window() -> None:
+                self.window = torch.empty(0, dtype=torch.uint8)
+
+            with cleanup_on_exit(
+                "halo runtime close",
+                (_release_window, memory.close),
+            ):
+                if self.device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize(self.device)
 
     # ------------------------------------------------------------------ #
     def exchange(

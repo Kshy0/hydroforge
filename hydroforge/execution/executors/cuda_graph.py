@@ -705,14 +705,23 @@ class _Adaptive:
             step.statistics.prelaunch()
         loop.reset()
         self._graph(launch).launch()
+        accum_host = (
+            step.statistics.copy_accumulated_weight_async()
+            if launch is not None
+            else None
+        )
         # The error flag must fail this step before statistics, outputs or the
         # committed clock can observe it, so this read stays synchronous.
-        failed, count = loop.fetch(
+        # Its blocking device-to-host copy on the same stream also completes
+        # the queued non-blocking read of CONTROL_ACCUM_WEIGHT above.
+        failed, count, stalled = loop.fetch(
             loop.completion_sources, loop.completion, loop.completion_host
         )
         loop.check_completion(failed)
         if launch is not None:
-            step.statistics.fold_weights(count, duration)
+            step.statistics.sync_accumulated_weight(
+                float(accum_host.item()), stalled=bool(stalled)
+            )
         if launch is None and step.sampling:
             step.sample(first=True, last=True, weight=duration)
         return count
@@ -743,6 +752,7 @@ class _Adaptive:
                     old_weight=states[CONTROL_OLD_WEIGHT],
                     accum_weight=states[CONTROL_ACCUM_WEIGHT],
                     phase=states[CONTROL_PHASE],
+                    stalled=loop.weight_stalled,
                 )
                 launch(-1)
             set_conditional(

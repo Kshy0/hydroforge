@@ -157,6 +157,7 @@ def _sample_controls(
     old_weight: Load,
     accum_weight: Load,
     phase: Load,
+    stalled: Load | None = None,
 ) -> tuple[Stmt, ...]:
     """Write the weight, accumulated old weight and phase of the sample."""
 
@@ -164,7 +165,8 @@ def _sample_controls(
     phase_var = Var("sample_phase_bits", _INT)
     step_weight = Var("step_weight", weight.type)
     prev_weight = Var("prev_weight", weight.type)
-    return (
+    next_weight = Var("next_weight", weight.type)
+    statements: list[Stmt] = [
         Let(first_var, first),
         Let(last_var, last),
         Let(phase_var, sample_phase(flags, first_var, last_var)),
@@ -179,11 +181,26 @@ def _sample_controls(
                 accum_weight,
             ),
         ),
+        Let(next_weight, Binary("+", prev_weight, step_weight)),
         _store(weight, step_weight),
         _store(old_weight, prev_weight),
-        _store(accum_weight, Binary("+", prev_weight, step_weight)),
+        _store(accum_weight, next_weight),
         _store(phase, phase_var),
-    )
+    ]
+    if stalled is not None and weight.type == torch.float32:
+        statements.append(
+            If(
+                Logical(
+                    "and",
+                    (
+                        Compare("!=", step_weight, Const(0.0, weight.type)),
+                        Compare("==", next_weight, prev_weight),
+                    ),
+                ),
+                (_store(stalled, Const(1, stalled.type)),),
+            )
+        )
+    return tuple(statements)
 
 
 def adaptive_accept(
@@ -357,6 +374,7 @@ def statistics_control(
     destination: torch.dtype,
     *,
     fixed: bool,
+    track_stalled: bool = False,
 ) -> KernelFunction:
     """Write the controls of an iteration's sample from a ``source`` weight.
 
@@ -370,7 +388,10 @@ def statistics_control(
     weight = Param("weight", destination, "write")
     old_weight = Param("old_weight", destination, "write")
     accum_weight = Param("accum_weight", destination, "read_write")
-    controls = (_FLAGS, weight, old_weight, accum_weight, _PHASE)
+    stalled = Param("stalled", _INT, "read_write") if track_stalled else None
+    controls: tuple[Param, ...] = (_FLAGS, weight, old_weight, accum_weight, _PHASE)
+    if stalled is not None:
+        controls = (*controls, stalled)
     if fixed:
         params = (_COUNTER, _CONTINUE, _COUNT, weight_source, *controls)
         advance = _fixed_advance(cell(_COUNTER), cell(_CONTINUE), cell(_COUNT))
@@ -400,6 +421,7 @@ def statistics_control(
                 old_weight=cell(old_weight),
                 accum_weight=cell(accum_weight),
                 phase=cell(_PHASE),
+                stalled=None if stalled is None else cell(stalled),
             ),
         ),
     )

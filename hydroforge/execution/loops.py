@@ -92,30 +92,33 @@ def conditional_capture_safe(*programs: Any) -> bool:
     return True
 
 
-def predicate_capture_safe(*programs: Any) -> bool:
-    """Return whether a rank-local predicate loop may run as a device WHILE
-    graph: cross-rank halo exchanges require rank-synchronous iteration counts
-    and must not spin inside a rank-local conditional graph."""
+def predicate_has_halo(*programs: Any) -> bool:
+    """Return whether any recorded predicate loop program calls ``halo_exchange``."""
 
     from hydroforge.execution.operators import CompiledKernelCall
 
-    if not conditional_capture_safe(*programs):
-        return False
     pending = [program for program in programs if program is not None]
     while pending:
         program = pending.pop()
         for operator in program.operators:
             if isinstance(operator, PredicateLoopOperator):
-                if operator.loop.body is None:
-                    return False
-                pending.append(operator.loop.body)
+                if operator.loop.body is not None:
+                    pending.append(operator.loop.body)
             elif (
                 isinstance(operator, CompiledKernelCall)
                 and getattr(getattr(operator.call, "spec", None), "name", None)
                 == "halo_exchange"
             ):
-                return False
-    return True
+                return True
+    return False
+
+
+def predicate_capture_safe(*programs: Any) -> bool:
+    """Return whether a rank-local predicate loop may run as a device WHILE
+    graph: cross-rank halo exchanges require rank-synchronous iteration counts
+    and must not spin inside a rank-local conditional graph."""
+
+    return conditional_capture_safe(*programs) and not predicate_has_halo(*programs)
 
 
 class FixedLoop:
@@ -270,6 +273,7 @@ class PredicateLoop:
 
     def __init__(self, execution: ModelExecution, *, maximum_steps: int) -> None:
         self.executor = execution.executor
+        self._runtime = execution.runtime
         self.maximum_steps = maximum_steps
         with _disable_current_modes(), torch.inference_mode(False):
             options = {"device": execution.device, "dtype": torch.int32}
@@ -287,6 +291,7 @@ class PredicateLoop:
             self.continue_flag = self.controls[2:3]
         self.body: Any = None
         self.runner: Any = None
+        self.sync_group: Any = None
 
     @property
     def programs(self) -> tuple[Any, ...]:
@@ -307,6 +312,12 @@ class PredicateLoop:
         """Attach the recorded loop body and build its backend runner."""
 
         self.body = body
+        plan = getattr(self._runtime, "plan", None)
+        self.sync_group = (
+            self._runtime.spatial_group()
+            if getattr(plan, "spatial_world_size", 1) > 1 and predicate_has_halo(body)
+            else None
+        )
         self.runner = self.executor.predicate(self)
         return self
 
@@ -355,7 +366,7 @@ class AdaptiveLoop:
         with _disable_current_modes():
             self._allocate(candidate_dt, dt, maximum_dt, maximum_steps)
             self.status_sources = (self.error_flag, self.continue_flag, dt.view(1))
-        self.completion_sources = (self.error_flag, self.counter)
+        self.completion_sources = (self.error_flag, self.counter, self.weight_stalled)
         self.frame = SubstepFrame(
             index=self.counter,
             dt=dt,
@@ -389,6 +400,7 @@ class AdaptiveLoop:
             self.counter = torch.zeros(1, **counts)
             self.continue_flag = torch.zeros_like(self.counter)
             self.error_flag = torch.zeros_like(self.counter)
+            self.weight_stalled = torch.zeros_like(self.counter)
             # Stable scalar scratch belongs to the loop, not to an iteration.
             # CUDA captures these addresses and eager execution performs no
             # per-substep tensor allocation.
@@ -407,13 +419,14 @@ class AdaptiveLoop:
             self.maximum_count = torch.full((1,), maximum_steps, **counts)
             self.one_count = torch.ones_like(self.maximum_count)
             # Host-read loop status: ``(error, continue, dt)`` per host-driven
-            # substep and ``(error, counter)`` per device loop, each fetched
-            # with one small transfer into reused (pinned on CUDA) storage.
+            # substep and ``(error, counter, weight_stalled)`` per device loop,
+            # each fetched with one small transfer into reused (pinned on CUDA)
+            # storage.
             self.status = torch.zeros(3, **options)
-            self.completion = torch.zeros(2, **counts)
+            self.completion = torch.zeros(3, **counts)
             pinned = candidate_dt.device.type == "cuda"
             self.status_host = torch.zeros(3, dtype=dt.dtype, pin_memory=pinned)
-            self.completion_host = torch.zeros(2, dtype=torch.int32, pin_memory=pinned)
+            self.completion_host = torch.zeros(3, dtype=torch.int32, pin_memory=pinned)
 
     @property
     def programs(self) -> tuple[Any, ...]:
@@ -434,6 +447,7 @@ class AdaptiveLoop:
             self.counter,
             self.continue_flag,
             self.error_flag,
+            self.weight_stalled,
             self.remaining,
             self.whole,
             self.zero_ticks,
@@ -469,6 +483,7 @@ class AdaptiveLoop:
         self.counter.zero_()
         self.continue_flag.fill_(1)
         self.error_flag.zero_()
+        self.weight_stalled.zero_()
 
     def iterate(self) -> None:
         self.candidate.copy_(self.maximum_value)
