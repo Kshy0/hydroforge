@@ -66,7 +66,7 @@ from hydroforge.platform.backend import TRITON
 _POLICY = "hydroforge-physics-v3-fallback"
 _logger = logging.getLogger(__name__)
 _native_specializations: set[str] = set()
-_policy_attempt: ContextVar[bool | None] = ContextVar(
+_policy_attempt: ContextVar[list[bool] | None] = ContextVar(
     "hydroforge_triton_policy_attempt", default=None
 )
 _MEMORY_OP = re.compile(r"\btt\.(?:load|store|atomic_rmw|atomic_cas)\b")
@@ -171,19 +171,23 @@ def _compile_with_fallback(compile_fn):
 
         env = get_cache_invalidating_env_vars() if _env_vars is None else _env_vars
         backend = make_backend(target)
-        parsed = backend.parse_options(dict(options or {}, **src.parse_options()))
+        merged_options = {**src.parse_options(), **(options or {})}
+        parsed = backend.parse_options(merged_options)
         hook = knobs.runtime.add_stages_inspection_hook
         preceding_key = hook() if hook is not None else ("", "")
         key = get_cache_key(src, backend, parsed, env) + repr(preceding_key)
         if _known_native(key):
             return compile_fn(src, target=target, options=options, _env_vars=env)
+        attempt_cell = [False]
         policy = _active_policy.set(True)
-        attempt = _policy_attempt.set(False)
+        attempt = _policy_attempt.set(attempt_cell)
         try:
             try:
-                return compile_fn(src, target=target, options=options, _env_vars=env)
+                return compile_fn(
+                    src, target=target, options=options, _env_vars=env
+                )
             except Exception:
-                if not _policy_attempt.get():
+                if not attempt_cell[0]:
                     raise
                 # Re-enter the full compiler from the AST, never mutated IR or
                 # metadata. Native compilation has its own Triton disk-cache key.
@@ -268,7 +272,8 @@ def _install() -> bool:
             return
 
         def policy_ttgir(src, metadata):
-            if _policy_attempt.get() is None:
+            attempt_cell = _policy_attempt.get()
+            if attempt_cell is None:
                 return make_ttgir(src, metadata)
             ttir = str(src)
             if any(
@@ -282,7 +287,7 @@ def _install() -> bool:
             single_stage = (
                 options.num_stages != 1 and _PIPELINED_OPS.search(ttir) is None
             )
-            _policy_attempt.set(skip_coalesce or single_stage)
+            attempt_cell[0] = skip_coalesce or single_stage
             if single_stage:
                 one_stage = dataclasses.replace(options, num_stages=1)
 

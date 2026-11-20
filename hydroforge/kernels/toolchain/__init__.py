@@ -132,6 +132,19 @@ def _build_all(requests: Iterable[CompileRequest], errors: list[BaseException]) 
             errors.append(error)
 
 
+class _ContextPool:
+    """Propagate ``ContextVar``s captured at ``submit`` to worker threads."""
+
+    def __init__(self, pool: ThreadPoolExecutor) -> None:
+        self._pool = pool
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future:
+        from contextvars import copy_context
+
+        context = copy_context()
+        return self._pool.submit(context.run, fn, *args, **kwargs)
+
+
 def _compile_triton(requests: Sequence[CompileRequest], jobs: int | None) -> None:
     """Warm up Triton specializations, compiling distinct kernels concurrently.
 
@@ -149,7 +162,9 @@ def _compile_triton(requests: Sequence[CompileRequest], jobs: int | None) -> Non
         for request in requests:
             request.build()
         return
-    with ThreadPoolExecutor(max_workers=count) as pool, AsyncCompileMode(pool):
+    with ThreadPoolExecutor(max_workers=count) as pool, AsyncCompileMode(
+        _ContextPool(pool)
+    ):
         for request in requests:
             request.build()
 

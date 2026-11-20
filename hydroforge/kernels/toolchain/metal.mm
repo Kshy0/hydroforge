@@ -28,6 +28,7 @@ std::mutex pipeline_mutex;
 struct Pipeline {
   id<MTLComputePipelineState> state = nil;
   id<MTLArgumentEncoder> argument_encoder = nil;
+  std::mutex encoder_mutex;
   enum class ArgumentType : uint8_t {
     Buffer, Float32, Int32, UInt32, Int64, Bool
   };
@@ -46,12 +47,18 @@ using at::mps::MPSStream;
 // useResource:.  A released binding or ICB therefore stays alive until every
 // stream that encoded it has completed its current command buffer.
 struct EncodedOn {
+  mutable std::mutex mutex;
   std::vector<MPSStream*> streams;
   void note(MPSStream* stream) {
+    std::lock_guard<std::mutex> guard(mutex);
     for (MPSStream* seen : streams) {
       if (seen == stream) return;
     }
     streams.push_back(stream);
+  }
+  std::vector<MPSStream*> snapshot() const {
+    std::lock_guard<std::mutex> guard(mutex);
+    return streams;
   }
 };
 
@@ -71,8 +78,8 @@ void drain_retired_resources() {
 }
 
 void release_after_completion(std::shared_ptr<void> resource,
-                              const EncodedOn& encoded_on) {
-  for (MPSStream* stream : encoded_on.streams) {
+                              const std::vector<MPSStream*>& streams) {
+  for (MPSStream* stream : streams) {
     auto* holder = new std::shared_ptr<void>(resource);
     try {
       stream->addCompletedHandler(^(id<MTLCommandBuffer> completed) {
@@ -346,8 +353,8 @@ void release_argument_binding(int64_t binding_id) {
   }
   drain_retired_resources();
   // An ICB keeps its own reference; only direct encodes need a GPU fence.
-  const EncodedOn encoded_on = binding->encoded_on;
-  release_after_completion(std::move(binding), encoded_on);
+  const std::vector<MPSStream*> streams = binding->encoded_on.snapshot();
+  release_after_completion(std::move(binding), streams);
 }
 
 int64_t create_argument_binding(
@@ -364,7 +371,6 @@ int64_t create_argument_binding(
                   options:MTLResourceStorageModeShared];
   TORCH_CHECK(binding->encoded != nil,
               "Failed to allocate Metal argument buffer");
-  [pipeline->argument_encoder setArgumentBuffer:binding->encoded offset:0];
   binding->resources.push_back({binding->encoded, MTLResourceUsageRead});
   NSUInteger scalar_count = 0;
   for (const auto kind : pipeline->argument_types) {
@@ -379,43 +385,47 @@ int64_t create_argument_binding(
     binding->owned_scalar_buffers.push_back(scalars);
     binding->resources.push_back({scalars, MTLResourceUsageRead});
   }
-  NSUInteger scalar_offset = 0;
-  for (pybind11::ssize_t i = 0; i < arguments.size(); ++i) {
-    const auto kind = pipeline->argument_types[static_cast<size_t>(i)];
-    pybind11::handle value = arguments[i];
-    id<MTLBuffer> buffer = nil;
-    NSUInteger offset = 0;
-    if (kind == Pipeline::ArgumentType::Buffer) {
-      if (value.is_none()) {
-        buffer = nil;
+  {
+    std::lock_guard<std::mutex> encoder_guard(pipeline->encoder_mutex);
+    [pipeline->argument_encoder setArgumentBuffer:binding->encoded offset:0];
+    NSUInteger scalar_offset = 0;
+    for (pybind11::ssize_t i = 0; i < arguments.size(); ++i) {
+      const auto kind = pipeline->argument_types[static_cast<size_t>(i)];
+      pybind11::handle value = arguments[i];
+      id<MTLBuffer> buffer = nil;
+      NSUInteger offset = 0;
+      if (kind == Pipeline::ArgumentType::Buffer) {
+        if (value.is_none()) {
+          buffer = nil;
+        } else {
+          torch::Tensor tensor = pybind11::cast<torch::Tensor>(value);
+          TORCH_CHECK(tensor.device().is_mps(),
+                      "Metal argument buffers require MPS tensors");
+          buffer = at::native::mps::getMTLBufferStorage(tensor);
+          offset = tensor.storage_offset() * tensor.element_size();
+          binding->retained_tensors.push_back(tensor);
+        }
       } else {
-        torch::Tensor tensor = pybind11::cast<torch::Tensor>(value);
-        TORCH_CHECK(tensor.device().is_mps(),
-                    "Metal argument buffers require MPS tensors");
-        buffer = at::native::mps::getMTLBufferStorage(tensor);
-        offset = tensor.storage_offset() * tensor.element_size();
-        binding->retained_tensors.push_back(tensor);
+        buffer = scalars;
+        offset = scalar_offset;
+        scalar_offset += kScalarSlot;
+        if (kind == Pipeline::ArgumentType::Float32) {
+          write_scalar<float>(buffer, offset, value);
+        } else if (kind == Pipeline::ArgumentType::Int32) {
+          write_scalar<int32_t>(buffer, offset, value);
+        } else if (kind == Pipeline::ArgumentType::UInt32) {
+          write_scalar<uint32_t>(buffer, offset, value);
+        } else if (kind == Pipeline::ArgumentType::Int64) {
+          write_scalar<int64_t>(buffer, offset, value);
+        } else {
+          write_scalar<bool>(buffer, offset, value);
+        }
       }
-    } else {
-      buffer = scalars;
-      offset = scalar_offset;
-      scalar_offset += kScalarSlot;
-      if (kind == Pipeline::ArgumentType::Float32) {
-        write_scalar<float>(buffer, offset, value);
-      } else if (kind == Pipeline::ArgumentType::Int32) {
-        write_scalar<int32_t>(buffer, offset, value);
-      } else if (kind == Pipeline::ArgumentType::UInt32) {
-        write_scalar<uint32_t>(buffer, offset, value);
-      } else if (kind == Pipeline::ArgumentType::Int64) {
-        write_scalar<int64_t>(buffer, offset, value);
-      } else {
-        write_scalar<bool>(buffer, offset, value);
+      [pipeline->argument_encoder setBuffer:buffer offset:offset atIndex:i];
+      if (buffer != nil && kind == Pipeline::ArgumentType::Buffer) {
+        binding->resources.push_back({
+            buffer, pipeline->argument_usage[static_cast<size_t>(i)]});
       }
-    }
-    [pipeline->argument_encoder setBuffer:buffer offset:offset atIndex:i];
-    if (buffer != nil && kind == Pipeline::ArgumentType::Buffer) {
-      binding->resources.push_back({
-          buffer, pipeline->argument_usage[static_cast<size_t>(i)]});
     }
   }
   std::lock_guard<std::mutex> guard(binding_mutex);
@@ -628,8 +638,8 @@ void release_icb(int64_t graph_id) {
   }
   // Destroy buffers outside the registry lock. Releasing the same id is safe.
   drain_retired_resources();
-  const EncodedOn encoded_on = graph->encoded_on;
-  release_after_completion(std::move(graph), encoded_on);
+  const std::vector<MPSStream*> streams = graph->encoded_on.snapshot();
+  release_after_completion(std::move(graph), streams);
 }
 
 }  // namespace

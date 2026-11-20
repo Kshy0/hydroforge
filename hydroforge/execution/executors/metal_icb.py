@@ -47,7 +47,9 @@ from hydroforge.kernels.toolchain.metal import (
     record_metal_commands,
 )
 from hydroforge.statistics.phases import (
+    CONTROL_ACCUM_WEIGHT,
     CONTROL_FLAGS,
+    CONTROL_OLD_WEIGHT,
     CONTROL_PHASE,
     CONTROL_WEIGHT,
     sample_phase_expr,
@@ -444,6 +446,8 @@ class _Fixed:
             counter=loop.counter,
             flags=states[CONTROL_FLAGS],
             weight=states[CONTROL_WEIGHT],
+            old_weight=states[CONTROL_OLD_WEIGHT],
+            accum_weight=states[CONTROL_ACCUM_WEIGHT],
             phase=states[CONTROL_PHASE],
         )
         pair = self._capture(

@@ -467,7 +467,11 @@ class StatisticsDeclarationCompiler:
         return parsed
 
     def compile_output_options(
-        self, output_name: str, field_metadata: tuple[Any, ...]
+        self,
+        output_name: str,
+        field_metadata: tuple[Any, ...],
+        *,
+        stores_index: bool = False,
     ) -> Mapping[str, Any]:
         shape, _output, _coordinate, dtype, category = field_metadata
         batched = bool(
@@ -487,10 +491,14 @@ class StatisticsDeclarationCompiler:
         dimensions = tuple(
             f"axis_{index}" for index in range(1 + len(shape) + int(batched))
         )
-        tensor_dtype = concrete_tensor_dtype(
-            dtype,
-            self.selection.precisions.field_dtype,
-            self.selection.precisions.storage_dtype,
+        tensor_dtype = (
+            torch.int64
+            if stores_index
+            else concrete_tensor_dtype(
+                dtype,
+                self.selection.precisions.field_dtype,
+                self.selection.precisions.storage_dtype,
+            )
         )
         precision = self.config.save_precision
         saved_dtype = saved_dtype_of(
@@ -602,9 +610,10 @@ class StatisticsDeclarationCompiler:
     ) -> None:
         self.compile_view(output, metadata)
         key = (output.name, output.operation)
-        self.compiled_operations[key] = self.compile_operation(
+        operation = self.compile_operation(
             output.name, output.operation, metadata
         )
+        self.compiled_operations[key] = operation
         self.compiled_output_metadata[key] = metadata
         name = f"{output.name}_{output.operation}"
         view = self.variable_views.get(output.name)
@@ -613,7 +622,9 @@ class StatisticsDeclarationCompiler:
             if view is not None and (isinstance(view, OutputUnion) or view.points)
             else metadata
         )
-        self.compiled_netcdf_options[name] = self.compile_output_options(name, saved_metadata)
+        self.compiled_netcdf_options[name] = self.compile_output_options(
+            name, saved_metadata, stores_index=operation.stores_index
+        )
 
     def collect_fields(self) -> None:
         # OutputConfig already rejected repeated field/operation pairs,
@@ -661,7 +672,16 @@ class StatisticsDeclarationCompiler:
                 operation = output.operation
             if output.expression is not None and (
                 not self.active_declared_field(output.name)
+                or self.fields[output.name].tensor.output == "disabled"
             ):
+                if (field := self.fields.get(output.name)) is not None and not (
+                    field.tensor.depends_on
+                    or field.tensor.required_by
+                    or field.tensor.output_only
+                ):
+                    raise ValueError(
+                        f"statistics alias {output.name!r} shadows an unconditional model field"
+                    )
                 expression_metadata = self.validate_expression(
                     name=output.name,
                     expression=output.expression,
@@ -747,7 +767,10 @@ class StatisticsDeclarationCompiler:
             self.grouped_operations.setdefault(output.name, []).append(
                 self.compiled_operations[output.name, output.operation]
             )
-            if output.expression is None or self.active_declared_field(output.name):
+            if output.expression is None or (
+                self.active_declared_field(output.name)
+                and self.fields[output.name].tensor.output != "disabled"
+            ):
                 source = self.resolve_declared_source(output.name)
             else:
                 source = self.parse_source(output.expression)

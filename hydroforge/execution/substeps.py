@@ -28,7 +28,6 @@ from torch.utils._python_dispatch import _disable_current_modes
 from hydroforge.core.devices import devices_match
 from hydroforge.core.errors import SubstepCompileError, cleanup_on_exit
 from hydroforge.core.validation import HydroForgeModel
-from hydroforge.execution.channel import StepEvent
 from hydroforge.execution.context import (
     InvocationScope,
     PredicateLoopFrame,
@@ -353,7 +352,6 @@ class _PredicateLoopRequest(HydroForgeModel):
 def _execute(context: Any, program: Any, *arguments: int | float) -> int:
     """Run one fixed or adaptive program and close its scope."""
 
-    context.channel.event(StepEvent.SUBSTEP)
     # Ghost rows the loop body assumes current at its entry.
     program.halo_entry.enter(context.execution)
     completed = program.execute(*arguments, context)

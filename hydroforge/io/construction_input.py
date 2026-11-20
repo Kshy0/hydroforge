@@ -334,7 +334,8 @@ def _write(
     variable = _create(dataset, name, plan)
     stored = values.astype(plan.storage, copy=False)
     if values.ndim:
-        variable[:] = stored
+        if values.size:
+            variable[:] = stored
     else:
         variable.assignValue(stored)
 
@@ -622,7 +623,8 @@ def merge_construction_parts(
                         )
                     cut = axes.get(name, 0)
                     end = offset + values.shape[cut]
-                    variable[(slice(None),) * cut + (slice(offset, end),)] = (
-                        values.astype(plan.storage, copy=False)
-                    )
+                    if values.shape[cut]:
+                        variable[(slice(None),) * cut + (slice(offset, end),)] = (
+                            values.astype(plan.storage, copy=False)
+                        )
                     offset = end

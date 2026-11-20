@@ -144,4 +144,5 @@ class ModelResults:
 
         statistics = self._statistics()
         if statistics is not None:
+            self._retained()
             statistics.reset_time_index()

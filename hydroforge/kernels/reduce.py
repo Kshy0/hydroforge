@@ -133,14 +133,9 @@ _CUDA_KERNEL = CudaKernel(
 # Triton: direct stores into mapped peers (peer) or NVSHMEM puts (nvshmem)
 # --------------------------------------------------------------------------- #
 @cache
-def _triton_kernels():
+def _triton_helpers():
     import triton
     import triton.language as tl
-    from torch.distributed._symmetric_memory import _nvshmem_triton as nvshmem
-
-    # nvshmem_common_transport.h / nvshmem_constants.h.
-    signal_add = tl.constexpr(10)
-    cmp_ge = tl.constexpr(5)
 
     @triton.jit
     def encode(mine, floating: tl.constexpr):
@@ -180,10 +175,25 @@ def _triton_kernels():
             elif op == 2:
                 result = result + value
             elif op == 1:
-                result = tl.where(value > result, value, result)
+                if floating:
+                    result = tl.where((value != value) | (value > result), value, result)
+                else:
+                    result = tl.where(value > result, value, result)
+            elif floating:
+                result = tl.where((value != value) | (value < result), value, result)
             else:
                 result = tl.where(value < result, value, result)
         tl.store(values + lanes, result, mask=mask)
+
+    return encode, combine
+
+
+@cache
+def _triton_peer_kernel():
+    import triton
+    import triton.language as tl
+
+    encode, combine = _triton_helpers()
 
     @triton.jit(do_not_specialize=["numel", "rank"])
     def peer_all_reduce_kernel(
@@ -231,6 +241,20 @@ def _triton_kernels():
         combine(values, slots, base, lanes, mask, world, op, floating, capacity)
         tl.store(calls, call + 1)
 
+    return peer_all_reduce_kernel
+
+
+@cache
+def _triton_nvshmem_kernel():
+    import triton
+    import triton.language as tl
+    from torch.distributed._symmetric_memory import _nvshmem_triton as nvshmem
+
+    encode, combine = _triton_helpers()
+    # nvshmem_common_transport.h / nvshmem_constants.h.
+    signal_add = tl.constexpr(10)
+    cmp_ge = tl.constexpr(5)
+
     @nvshmem.requires_nvshmem
     @triton.jit(do_not_specialize=["numel", "rank"])
     def nvshmem_all_reduce_kernel(
@@ -267,13 +291,13 @@ def _triton_kernels():
         combine(values, slots, base, lanes, mask, world, op, floating, capacity)
         tl.store(calls, call + 1)
 
-    return peer_all_reduce_kernel, nvshmem_all_reduce_kernel
+    return nvshmem_all_reduce_kernel
 
 
 def _triton_prepare(direct: bool):
     def prepare(arguments, buffer_dtypes):
         del buffer_dtypes
-        kernel = _triton_kernels()[0 if direct else 1]
+        kernel = _triton_peer_kernel() if direct else _triton_nvshmem_kernel()
         names = ("values", "slots", "signals", "calls")
         names += ("slot_peers", "signal_peers") if direct else ("stage",)
         values = {name: arguments[name] for name in names}

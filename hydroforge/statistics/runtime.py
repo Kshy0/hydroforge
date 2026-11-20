@@ -50,10 +50,12 @@ from hydroforge.statistics.layout import (
     compile_statistics,
 )
 from hydroforge.statistics.phases import (
+    CONTROL_ACCUM_WEIGHT,
     CONTROL_FLAGS,
     CONTROL_LAYOUT,
     CONTROL_MACRO_INDEX,
     CONTROL_MACRO_STEPS,
+    CONTROL_OLD_WEIGHT,
     CONTROL_PHASE,
     CONTROL_STATE,
     CONTROL_WEIGHT,
@@ -200,8 +202,11 @@ class StatisticsRuntime:
 
         self._controller = StatisticsWindowController(self.windows, self.schedule)
         self._step_flags = 0
-        # Host mirror of a float32 window weight sum (see ``sample``).
+        # Host mirror of the window sample weight sum (see ``sample``).
+        self._wide_weights = False
         self._weight_guard = False
+        self._accumulated_weight = 0.0
+        self._step_start_weight = 0.0
         self._window_weight = np.float32(0.0)
 
         self._variable_ops: dict[str, list[str]] = {}  # var -> list[ops]
@@ -225,6 +230,7 @@ class StatisticsRuntime:
         # Destination of finalized samples, installed with the compilation.
         self.sink: StatisticsSink | None = None
         self._last_time_number: float | None = None
+        self._last_outer_time_number: float | None = None
         self._current_time_index: int = 0
 
         emit(
@@ -389,7 +395,9 @@ class StatisticsRuntime:
             return torch.float64
         if "float64" not in self.backend.precisions:
             return torch.float32
-        if any(tensor.dtype == torch.float64 for tensor in self._storage.values()):
+        if self._wide_weights or any(
+            tensor.dtype == torch.float64 for tensor in self._storage.values()
+        ):
             return torch.float64
         return torch.float32
 
@@ -418,7 +426,14 @@ class StatisticsRuntime:
         self._indexed_storage_rows: dict[str, int] = {}
 
         mean_count_limits: set[int] = set()
+        has_mean = False
         for name, operations in compilation.program.operations.items():
+            if any(
+                (operation.inner is None and operation.outer is Reduction.MEAN)
+                or operation.inner is Reduction.MEAN
+                for operation in operations
+            ):
+                has_mean = True
             if not any(
                 operation.compound and operation.outer is Reduction.MEAN
                 for operation in operations
@@ -431,11 +446,12 @@ class StatisticsRuntime:
                 mean_count_limits.add(2**48 if self.backend.name == "metal" else 2**53)
 
         # Visible outputs and hidden dependencies use the same scatter storage.
-        # Sample weights accumulate in float64 where backend and device have
-        # it natively; elsewhere ``sample`` guards their float32 sum.
-        # Devices without a known FP64 capability keep float32 weights.
-        wide_weights = (
-            "float64" in self.backend.precisions
+        # Sample weights accumulate as one scalar control in float64 where
+        # backend and device have it natively; elsewhere ``sample`` guards
+        # their float32 sum.
+        self._wide_weights = (
+            has_mean
+            and "float64" in self.backend.precisions
             and self.device.type in {"cpu", "cuda", "mps", "xpu"}
             and float64_supported(self.device)
         )
@@ -444,9 +460,7 @@ class StatisticsRuntime:
             compilation.layouts,
             self._variable_ops,
             self.ensemble_size,
-            weight_dtype=torch.float64 if wide_weights else None,
         )
-        self._weight_guard = self._float32_weight_slots()
         for slot in self._storage_plan.slots.values():
             if slot.owner in self._variable_ops:
                 layout = self._statistics_layouts[slot.owner]
@@ -483,6 +497,9 @@ class StatisticsRuntime:
             self._storage[slot.name] = self._full_tensor(slot.shape, initial, dtype)
             if slot.output:
                 self._output_keys.append(slot.name)
+        self._weight_guard = (
+            has_mean and self._statistics_control_dtype() == torch.float32
+        )
 
         for var_name in self._variable_ops:
             operation_nodes = self._statistics_program.operations[var_name]
@@ -546,7 +563,7 @@ class StatisticsRuntime:
             self._aggregator_function,
             self._kernel_states,
             self.block_size,
-            tuple(self._storage.values()),
+            (*self._storage.values(), self._kernel_states[CONTROL_ACCUM_WEIGHT]),
         )
         self._requests = self._request_builder(self._kernel_states, self.block_size)
 
@@ -587,6 +604,11 @@ class StatisticsRuntime:
         else:
             events = self._controller.resolve(step)
         self._step_flags = self.window_state.begin(events, sampling=enabled, time=time)
+        if self.window_state.sampling:
+            if self._step_flags & _INNER_FIRST:
+                self._accumulated_weight = 0.0
+                self._window_weight = np.float32(0.0)
+            self._step_start_weight = self._accumulated_weight
         return self.window_state.sampling
 
     @property
@@ -600,13 +622,27 @@ class StatisticsRuntime:
         events = self.window_state.events
         return events is not None and events.inner_last
 
-    def snapshot(self) -> tuple[Any, Any]:
-        """Capture the window cursor that ``begin_step`` advances."""
-        return self._controller.snapshot_state()
+    def snapshot(self) -> tuple[Any, ...]:
+        """Capture the window cursor and open-window state for rollback."""
+        return (
+            self._controller.snapshot_state(),
+            self.window_state.snapshot_state(),
+            self._accumulated_weight,
+            self._step_start_weight,
+            float(self._window_weight),
+        )
 
-    def restore(self, snapshot: tuple[Any, Any]) -> None:
-        self._controller.restore_snapshot_state(snapshot)
-        self.window_state.events = None
+    def restore(self, snapshot: tuple[Any, ...]) -> None:
+        (
+            controller_state,
+            window_state,
+            self._accumulated_weight,
+            self._step_start_weight,
+            window_weight,
+        ) = snapshot
+        self._controller.restore_snapshot_state(controller_state)
+        self.window_state.restore_snapshot_state(window_state)
+        self._window_weight = np.float32(window_weight)
 
     def sample(self, *, first: bool, last: bool, weight: float) -> int:
         """Publish the controls of one host-issued sample; return its phase."""
@@ -615,34 +651,26 @@ class StatisticsRuntime:
         weight = self._convert_weight(weight)
         if self._weight_guard:
             self._accumulate_float32_weight(weight, phase)
+        dtype = self._kernel_states[CONTROL_WEIGHT].dtype
+        old_weight = 0.0 if phase & _INNER_FIRST else self._accumulated_weight
+        accum_weight = _control_float_value(dtype, old_weight + weight)
+        self._accumulated_weight = accum_weight
         state = self.window_state
         count, index = (
             state.claim(phase)
             if phase & _INNER_LAST
             else (state.macro_count, state.macro_index)
         )
-        self._write_control(weight, phase, count, index)
+        self._write_control(weight, old_weight, accum_weight, phase, count, index)
         return phase
 
-    def _float32_weight_slots(self) -> bool:
-        """Whether a mean accumulates its window's sample weight in float32."""
-
-        names = {
-            name
-            for variable in self._variable_ops
-            for name in (
-                StoragePlan.sample_weight(variable),
-                StoragePlan.inner_weight(variable, Reduction.MEAN),
-            )
-        }
-        return any(
-            slot.dtype == torch.float32
-            for name, slot in self._storage_plan.slots.items()
-            if name in names
-        )
-
     def _accumulate_float32_weight(
-        self, weight: float, phase: int, *, samples: int = 1
+        self,
+        weight: float,
+        phase: int,
+        *,
+        samples: int = 1,
+        initial: np.float32 | None = None,
     ) -> None:
         """Mirror the device's float32 window weight sum of ``samples`` samples.
 
@@ -653,7 +681,8 @@ class StatisticsRuntime:
         reproduces exactly.
         """
 
-        total = np.float32(0.0) if phase & _INNER_FIRST else self._window_weight
+        base = self._window_weight if initial is None else initial
+        total = np.float32(0.0) if phase & _INNER_FIRST else base
         totals = np.add.accumulate(
             np.concatenate(
                 ([total], np.full(samples, weight, dtype=np.float32))
@@ -679,10 +708,20 @@ class StatisticsRuntime:
         detects a stalled sum once a typical sample no longer changes it.
         """
 
+        weight = self._convert_weight(duration / count)
+        phase = sample_phase(self._step_flags, first=True, last=count == 1)
         if self._weight_guard:
-            weight = self._convert_weight(duration / count)
-            phase = sample_phase(self._step_flags, first=True, last=count == 1)
-            self._accumulate_float32_weight(weight, phase, samples=count)
+            self._accumulate_float32_weight(
+                weight,
+                phase,
+                samples=count,
+                initial=np.float32(self._step_start_weight),
+            )
+        dtype = self._kernel_states[CONTROL_WEIGHT].dtype
+        if dtype == torch.float64:
+            self._accumulated_weight = float(self._step_start_weight + duration)
+        else:
+            self._accumulated_weight = float(self._window_weight)
 
     def prelaunch(self) -> None:
         """Publish the controls of a device loop that folds every iteration.
@@ -698,11 +737,13 @@ class StatisticsRuntime:
             if flags & _INNER_LAST
             else (state.macro_count, state.macro_index)
         )
-        self._write_control(0.0, 0, count, index)
+        start = self._step_start_weight
+        self._write_control(0.0, start, start, 0, count, index)
 
-    def finish_step(self) -> None:
-        """Close the begun step: settle a window without a closing sample,
-        then publish every output its closes completed."""
+    def prepare_finish(
+        self,
+    ) -> tuple[tuple[Any, tuple[str, ...], bool, bool, float], ...] | None:
+        """Settle and validate closing windows before rank-wide step commit."""
 
         state = self.window_state
         phase = state.settle_phase()
@@ -710,15 +751,73 @@ class StatisticsRuntime:
             count, index = state.claim(phase)
             # Only settle kernels read the controls of a close.
             if self._settle_function is not None:
-                self._write_control(0.0, phase, count, index)
+                accum = self._accumulated_weight
+                self._write_control(0.0, accum, accum, phase, count, index)
                 self._settle_function(self._kernel_states, phase)
-        label = state.close()
-        if label is not None:
-            self.finalize_time_step(label)
+        batches = state.close()
+        if not batches:
+            return None
+        inner_set = frozenset(state.inner_outputs)
+        outer_set = frozenset(state.outer_outputs)
+        has_separate_outer = bool(inner_set and outer_set)
+        prepared: list[tuple[Any, tuple[str, ...], bool, bool, float]] = []
+        last_inner = self._last_time_number
+        last_outer = self._last_outer_time_number
+        for dt, batch_keys in batches:
+            batch_set = frozenset(batch_keys)
+            ordered = tuple(key for key in self._output_keys if key in batch_set)
+            if not ordered:
+                continue
+            touches_inner = bool(batch_set & inner_set) or not has_separate_outer
+            touches_outer = has_separate_outer and bool(batch_set & outer_set)
+            previous = last_inner if touches_inner else last_outer
+            time_number = self._validate_next_time(dt, last_time_number=previous)
+            if touches_inner:
+                last_inner = time_number
+            if touches_outer:
+                last_outer = time_number
+            prepared.append(
+                (dt, ordered, touches_inner, touches_outer, time_number)
+            )
+        return tuple(prepared) if prepared else None
 
-    def _write_control(self, weight: float, phase: int, count: int, index: int) -> None:
+    def commit_finish(
+        self,
+        prepared: tuple[tuple[Any, tuple[str, ...], bool, bool, float], ...] | None,
+    ) -> None:
+        """Export validated window batches after rank-wide step finalization."""
+
+        if not prepared:
+            return
+        dirty = self.window_state.dirty
+        for dt, keys, touches_inner, touches_outer, time_number in prepared:
+            self._export_batch(dt, keys)
+            dirty.difference_update(keys)
+            if touches_inner:
+                self._last_time_number = time_number
+            if touches_outer:
+                self._last_outer_time_number = time_number
+        self._current_time_index += 1
+
+    def finish_step(self) -> None:
+        """Close the begun step: settle a window without a closing sample,
+        then publish every output its closes completed."""
+
+        self.commit_finish(self.prepare_finish())
+
+    def _write_control(
+        self,
+        weight: float,
+        old_weight: float,
+        accum_weight: float,
+        phase: int,
+        count: int,
+        index: int,
+    ) -> None:
         values = {
             CONTROL_WEIGHT: weight,
+            CONTROL_OLD_WEIGHT: old_weight,
+            CONTROL_ACCUM_WEIGHT: accum_weight,
             CONTROL_MACRO_STEPS: count,
             CONTROL_FLAGS: self._step_flags,
             CONTROL_PHASE: phase,
@@ -763,6 +862,7 @@ class StatisticsRuntime:
         self.sink.reset()
         self._current_time_index = 0
         self._last_time_number = None
+        self._last_outer_time_number = None
 
     def restart(self) -> None:
         """Discard results and partial windows before replaying a timeline.
@@ -778,11 +878,15 @@ class StatisticsRuntime:
             state.inner_outputs, state.outer_outputs, state.mean_count_limit
         )
         self._step_flags = 0
+        self._accumulated_weight = 0.0
+        self._step_start_weight = 0.0
         self._window_weight = np.float32(0.0)
 
     def _validate_next_time(
         self,
         dt: datetime | cftime.datetime,
+        *,
+        last_time_number: float | None = ...,  # type: ignore[assignment]
     ) -> float:
         value = float(
             cftime.date2num(
@@ -793,14 +897,16 @@ class StatisticsRuntime:
         )
         if not np.isfinite(value):
             raise ValueError("statistics output time must be finite")
-        if self._last_time_number is not None and value <= self._last_time_number:
+        previous = (
+            self._last_time_number
+            if last_time_number is ...
+            else last_time_number
+        )
+        if previous is not None and value <= previous:
             raise ValueError("statistics output times must be strictly increasing")
         return value
 
-    def finalize_time_step(self, dt: Any) -> None:
-        time_number = self._validate_next_time(dt)
-        dirty = self.window_state.dirty
-        keys = [key for key in self._output_keys if key in dirty]
+    def _export_batch(self, dt: Any, keys: tuple[str, ...] | list[str]) -> None:
         values = {key: self._storage[key] for key in keys}
         if not self.in_memory:
             # The NetCDF writer exports logical values, never an encoded
@@ -812,6 +918,12 @@ class StatisticsRuntime:
             self.status_ticket() if values and self.status_ticket is not None else None
         )
         self.sink.append(dt, values, status=ticket)
+
+    def finalize_time_step(self, dt: Any) -> None:
+        time_number = self._validate_next_time(dt)
+        dirty = self.window_state.dirty
+        keys = [key for key in self._output_keys if key in dirty]
+        self._export_batch(dt, keys)
         dirty.difference_update(keys)
         self._current_time_index += 1
         self._last_time_number = time_number
@@ -1120,8 +1232,10 @@ class StatisticsRuntime:
             if binding.output_index is None
             else binding.tensor[binding.output_index]
         )
-        values = tensor.detach().to(device="cpu", copy=True).numpy()
-        values = np.array(values, order="C", copy=True)
+        cpu = tensor.detach().to(device="cpu", copy=True)
+        if cpu.dtype in {torch.bfloat16, torch.float16}:
+            cpu = cpu.to(dtype=torch.float32)
+        values = np.array(cpu.numpy(), order="C", copy=True)
         values.setflags(write=False)
         self.static_vars[binding.name] = {
             "values": values,

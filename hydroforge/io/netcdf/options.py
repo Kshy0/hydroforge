@@ -20,7 +20,7 @@ from importlib.metadata import distributions
 from inspect import signature
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Lock
+from threading import Lock, RLock
 from types import MappingProxyType
 from typing import Annotated, Any
 
@@ -121,16 +121,11 @@ def _netcdf4_installer() -> str | None:
     return matches[0] if matches else None
 
 
+_HDF5_PLUGIN_LOCK = RLock()
+
+
 @cache
-def ensure_hdf5_plugins() -> None:
-    """Use Conda's HDF5 filter plugins for a Conda-installed netCDF4, once.
-
-    Called before HydroForge first opens or creates a NetCDF file and before
-    the Blosc probe child starts, so importing HydroForge does not scan
-    package metadata.  Best effort: unreadable package metadata or plugin
-    directories leave ``HDF5_PLUGIN_PATH`` unchanged.
-    """
-
+def _ensure_hdf5_plugins_once() -> None:
     try:
         if _netcdf4_installer() != "conda":
             return
@@ -146,6 +141,19 @@ def ensure_hdf5_plugins() -> None:
     os.environ["HDF5_PLUGIN_PATH"] = os.pathsep.join(
         str(candidate) for candidate in candidates
     )
+
+
+def ensure_hdf5_plugins() -> None:
+    """Use Conda's HDF5 filter plugins for a Conda-installed netCDF4, once.
+
+    Called before HydroForge first opens or creates a NetCDF file and before
+    the Blosc probe child starts, so importing HydroForge does not scan
+    package metadata.  Best effort: unreadable package metadata or plugin
+    directories leave ``HDF5_PLUGIN_PATH`` unchanged.
+    """
+
+    with _HDF5_PLUGIN_LOCK:
+        _ensure_hdf5_plugins_once()
 
 
 def default_netcdf_options() -> dict[str, Any]:

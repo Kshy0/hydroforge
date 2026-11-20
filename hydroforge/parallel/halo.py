@@ -441,13 +441,17 @@ def _open_peer_memory(
     if requested in ("auto", "ipc"):
         ipc = ipc_problem(gather_rank_facts(group, device))
         if ipc is None:
-            buffers = PeerBuffers(
-                group, device, {"window": (nbytes, torch.uint8)}, "CUDA"
-            )
-            if buffers.mapped:
-                addresses = buffers.peers["window"].tolist()
-                return _PeerMemory("ipc", buffers.tensors["window"], addresses), None
-            ipc = "the peers' memory could not be mapped"
+            try:
+                buffers = PeerBuffers(
+                    group, device, {"window": (nbytes, torch.uint8)}, "CUDA"
+                )
+            except (RuntimeError, ValueError) as error:
+                ipc = f"{type(error).__name__}: {error}"
+            else:
+                if buffers.mapped:
+                    addresses = buffers.peers["window"].tolist()
+                    return _PeerMemory("ipc", buffers.tensors["window"], addresses), None
+                ipc = "the peers' memory could not be mapped"
         problems["ipc"] = ipc
     return None, "; ".join(f"{k}: {v}" for k, v in problems.items())
 
@@ -652,7 +656,12 @@ class HaloRuntime:
         )
         fallback = "nccl" if group_backend == "nccl" else "host"
         problem = None
-        if requested not in ("auto", *LINKS):
+        if backend not in ("cuda", "torch"):
+            problem = (
+                f"halo exchange is not supported on backend {backend!r}; "
+                "expected 'cuda' or 'torch'"
+            )
+        elif requested not in ("auto", *LINKS):
             problem = (
                 f"HYDROFORGE_HALO_TRANSPORT must be auto or one of {LINKS}, "
                 f"got {requested!r}"
@@ -942,6 +951,9 @@ class HaloRuntime:
         memory, self.memory = self.memory, None
         self.registry = None
         if memory is not None:
+            if self.device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)
+            self.window = torch.zeros(1, dtype=torch.uint8, device=self.device)
             memory.close()
 
     # ------------------------------------------------------------------ #
@@ -1035,6 +1047,14 @@ class HaloRuntime:
         views = [_View.of(t, layout) for t, layout in zip(fields, layouts)]
         for direction in ("send", "receive"):
             for message in self.messages[(mode, direction)][1]:
+                for index_i, v in enumerate(views):
+                    elems = v.elements(message.count(v.kind, v.depth))
+                    if elems >= 2**32:
+                        raise ValueError(
+                            f"halo message field {index_i} ({v.kind}) carries "
+                            f"{elems} elements, exceeding the uint32 CUDA "
+                            "addressing limit"
+                        )
                 nbytes = message.nbytes(views)
                 if nbytes <= self.capacity:
                     continue

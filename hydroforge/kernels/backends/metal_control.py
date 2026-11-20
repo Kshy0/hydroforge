@@ -103,6 +103,8 @@ def statistics_control_command(
     counter: torch.Tensor,
     flags: torch.Tensor,
     weight: torch.Tensor,
+    old_weight: torch.Tensor,
+    accum_weight: torch.Tensor,
     phase: torch.Tensor,
 ) -> MetalCommand:
     """``sample_phase(flags, first, last)`` is the statistics phase rule."""
@@ -114,6 +116,8 @@ def statistics_control_command(
         counter=counter,
         flags=flags,
         weight=weight,
+        old_weight=old_weight,
+        accum_weight=accum_weight,
         phase=phase,
     )
 

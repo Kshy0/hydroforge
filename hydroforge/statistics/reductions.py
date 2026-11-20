@@ -69,17 +69,16 @@ class SampleContext:
 
     ``offset`` addresses the element in every slot of the variable (top-k
     slots hold ``k`` entries per element); ``names`` allocates the locals of
-    the kernel and ``prefix`` makes them readable.  ``weight_dtype`` is the
-    dtype of the sample weight slots (the value dtype when ``None``).
+    the kernel and ``prefix`` makes them readable.
     """
 
     offset: Expr
     weight: Expr
+    old_weight: Expr
     macro_steps: Expr
     macro_index: Expr
     names: Names
     prefix: str
-    weight_dtype: torch.dtype | None = None
 
     def local(self, role: str, dtype: torch.dtype) -> Var:
         return self.names.var(f"{self.prefix}_{role}", dtype)
@@ -99,45 +98,22 @@ def _isnan(value: Expr) -> Expr:
 
 def _weighted_mean(
     old: Expr,
-    weight_slot: str,
     value: Expr,
     dtype: torch.dtype,
     ctx: SampleContext,
-    role: str,
-) -> tuple[tuple[Let, Store], Expr]:
-    """Fold ``value`` into the weighted mean ``old`` of the open window.
+) -> Expr:
+    """Fold ``value`` into the weighted mean ``old`` using the scalar window weight."""
 
-    Returns the load and the store of the accumulated weight, which enclose
-    every use of the returned mean, and the mean.
-
-    The accumulated weight keeps ``ctx.weight_dtype``: in the value dtype
-    alone a float32 sum stops growing once it is 2**24 times the sample
-    weight, which turns a long window's mean into a moving average.
-    """
-
-    weight_dtype = dtype if ctx.weight_dtype is None else ctx.weight_dtype
-    offset = ctx.offset
-    old_weight = ctx.local(role, weight_dtype)
-    mean = Call(
+    return Call(
         "weighted_mean",
-        (old, cast(old_weight, dtype), cast(value, dtype), cast(ctx.weight, dtype)),
+        (
+            old,
+            cast(ctx.old_weight, dtype),
+            cast(value, dtype),
+            cast(ctx.weight, dtype),
+        ),
         dtype,
     )
-    return (
-        Let(
-            old_weight,
-            Select(
-                INNER_FIRST,
-                Const(0, weight_dtype),
-                Load(weight_slot, offset, weight_dtype),
-            ),
-        ),
-        Store(
-            weight_slot,
-            offset,
-            Binary("+", old_weight, cast(ctx.weight, weight_dtype)),
-        ),
-    ), mean
 
 
 def inner(
@@ -181,11 +157,7 @@ def inner(
             Let(result, Binary("+", old, Binary("*", cast(value, dtype), weight)))
         )
     else:
-        weighted, mean = _weighted_mean(
-            old, slots.weight, value, dtype, ctx, "mean_inner_weight"
-        )
-        load, store = weighted
-        statements += [load, Let(result, mean), store]
+        statements.append(Let(result, _weighted_mean(old, value, dtype, ctx)))
     statements.append(Store(slots.state, offset, result))
     return tuple(statements), result
 
@@ -202,14 +174,9 @@ def _simple(
     match operation.outer:
         case Reduction.MEAN:
             old = ctx.local("mean_old", dtype)
-            weighted, mean = _weighted_mean(
-                old, slots.sample_weight, value, dtype, ctx, "mean_weight"
-            )
             return (
                 Let(old, Select(INNER_FIRST, zero, Load(out, offset, dtype))),
-                weighted[0],
-                Store(out, offset, mean),
-                weighted[1],
+                Store(out, offset, _weighted_mean(old, value, dtype, ctx)),
             )
         case Reduction.SUM:
             old = ctx.local("sum_old", dtype)

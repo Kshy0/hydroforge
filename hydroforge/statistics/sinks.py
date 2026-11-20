@@ -128,14 +128,16 @@ class MemorySink:
                         "or save_precision='float32'"
                     )
         self._results: dict[str, list[torch.Tensor]] = {name: [] for name in outputs}
+        self._timestamps: dict[str, list[Any]] = {name: [] for name in outputs}
         self._staging: dict[torch.dtype, torch.Tensor] = {}
         # (copy event or None, ((name, staged view), ...), {name: owned
-        # copy}, status ticket or None) of the last sample not yet landed.
+        # copy}, status ticket or None, dt) of the last sample not yet landed.
         self._staged: (
             tuple[
                 Any,
                 tuple[tuple[str, torch.Tensor], ...],
                 dict[str, torch.Tensor],
+                Any,
                 Any,
             ]
             | None
@@ -215,11 +217,11 @@ class MemorySink:
             event = torch.cuda.Event()
             event.record(stream)
         if staged or status is not None:
-            self._staged = (event, tuple(staged), copies, status)
+            self._staged = (event, tuple(staged), copies, status, dt)
         else:
-            self._keep(copies)
+            self._keep(copies, dt)
 
-    def _keep(self, copies: Mapping[str, torch.Tensor]) -> None:
+    def _keep(self, copies: Mapping[str, torch.Tensor], dt: Any = None) -> None:
         for name, value in copies.items():
             # Exact widening follows the move: the sampling device may lack
             # the wider type (MPS has no float64).
@@ -227,6 +229,7 @@ class MemorySink:
             self._results[name].append(
                 value if value.dtype == dtype else value.to(dtype)
             )
+            self._timestamps[name].append(dt)
 
     def _stage(self, flat: torch.Tensor) -> torch.Tensor:
         """Enqueue ``flat``'s copy into the pinned buffer of its dtype."""
@@ -246,16 +249,17 @@ class MemorySink:
 
         staged, self._staged = self._staged, None
         if staged is not None:
-            event, values, copies, status = staged
+            event, values, copies, status, dt = staged
             if event is not None:
                 event.synchronize()
             failure = None if status is None else status.verify()
             if failure is not None:
                 self._failure = failure
             else:
-                self._keep(copies)
+                self._keep(copies, dt)
                 for name, value in values:
                     self._results[name].append(value.clone())
+                    self._timestamps[name].append(dt)
         if report and self._failure is not None:
             raise self._failure
 
@@ -307,6 +311,12 @@ class MemorySink:
             for name in self._results
         }
 
+    def timestamps(self, name: str) -> tuple[Any, ...]:
+        """Return the published timestamps of one output."""
+
+        self._land()
+        return tuple(self._timestamps[name])
+
     def drain(
         self, max_steps: int | None = None, *, as_stacked: bool = True
     ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
@@ -315,6 +325,8 @@ class MemorySink:
         result = self.all(as_stacked=as_stacked, stop=max_steps)
         for values in self._results.values():
             del values[:max_steps]
+        for times in self._timestamps.values():
+            del times[:max_steps]
         return result
 
     def pop(self, name: str) -> torch.Tensor | None:
@@ -322,12 +334,17 @@ class MemorySink:
 
         self._land()
         values = self._results[name]
-        return values.pop() if values else None
+        if not values:
+            return None
+        self._timestamps[name].pop()
+        return values.pop()
 
     def reset(self) -> None:
         self._land()
         for values in self._results.values():
             values.clear()
+        for times in self._timestamps.values():
+            times.clear()
 
     def flush(self, dt: Any) -> None:
         del dt

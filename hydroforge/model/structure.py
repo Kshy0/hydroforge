@@ -188,7 +188,10 @@ def _operators(program: Any, names: _Names) -> list[dict]:
     """Every operator of one recorded program, nested loops flattened."""
 
     result = []
-    for operator in getattr(program, "operators", ()):
+    items = getattr(program, "operators", ())
+    if hasattr(items, "operators"):
+        items = items.operators
+    for operator in items:
         call = getattr(operator, "call", None)
         kind = type(operator).__name__
         if call is not None and hasattr(call, "implementation"):
@@ -589,10 +592,13 @@ def _declaration(model: AbstractModel) -> dict[str, Any]:
     steps = [
         {
             "name": attribute,
-            "doc": (value.function.__doc__ or "").strip(),
+            "doc": (descriptor.function.__doc__ or "").strip(),
         }
         for attribute, value in vars(model_type).items()
-        if isinstance(value, _ManagedStepDescriptor)
+        if isinstance(
+            descriptor := getattr(value, "__hydroforge_managed_step__", value),
+            _ManagedStepDescriptor,
+        )
     ]
     initialize = model_type.__dict__.get("initialize_model_state")
     return {

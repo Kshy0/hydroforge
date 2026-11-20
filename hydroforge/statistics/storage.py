@@ -8,13 +8,13 @@
 
 Every slot a statistics program allocates, binds or publishes is named by a
 :class:`StoragePlan` rule: operation outputs ``{variable}_{operation}``,
-arg-reduction values ``..._aux``, the sample weight of a simple mean, inner
-window states and weights, and scatter buffers and counts.
+arg-reduction values ``..._aux``, inner window states, and scatter buffers
+and counts.
 
 A variable with a simple ``mean`` records its inner ``mean`` window in the
-same output and sample weight slots: both are the weighted mean of the open
-inner window.  Sample weights may use a wider dtype than their variable, so
-long windows of short substeps keep accumulating time exactly.
+same output slot: both are the weighted mean of the open inner window, whose
+accumulated sample weight is carried once as a scalar control across all
+variables.
 """
 
 from __future__ import annotations
@@ -72,7 +72,6 @@ class OperationSlots:
 
     output: str
     aux: str | None
-    sample_weight: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +79,6 @@ class InnerSlots:
     """The recorded state of one inner window reduction."""
 
     state: str
-    weight: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,16 +96,8 @@ class StoragePlan:
         return f"{variable}_{operation}_aux"
 
     @staticmethod
-    def sample_weight(variable: str) -> str:
-        return f"{variable}_mean_sample_weight_state"
-
-    @staticmethod
     def inner_state(variable: str, inner: Reduction) -> str:
         return f"{variable}_{inner.value}_inner_state"
-
-    @staticmethod
-    def inner_weight(variable: str, inner: Reduction) -> str:
-        return f"{variable}_{inner.value}_weight_state"
 
     @staticmethod
     def scatter_buffer(name: str) -> str:
@@ -124,9 +114,6 @@ class StoragePlan:
         return OperationSlots(
             cls.output(variable, operation.spelling),
             cls.aux(variable, operation.spelling) if operation.stores_index else None,
-            cls.sample_weight(variable)
-            if operation.inner is None and operation.outer is Reduction.MEAN
-            else None,
         )
 
     @classmethod
@@ -143,13 +130,8 @@ class StoragePlan:
             operation.inner is None and operation.outer is Reduction.MEAN
             for operation in operations
         ):
-            return InnerSlots(
-                cls.output(variable, Reduction.MEAN.value), cls.sample_weight(variable)
-            )
-        return InnerSlots(
-            cls.inner_state(variable, inner),
-            cls.inner_weight(variable, inner) if inner is Reduction.MEAN else None,
-        )
+            return InnerSlots(cls.output(variable, Reduction.MEAN.value))
+        return InnerSlots(cls.inner_state(variable, inner))
 
     def owned_by(self, owners: Iterable[str]) -> tuple[str, ...]:
         """Names of the slots of ``owners``, in allocation order."""
@@ -163,13 +145,10 @@ def variable_slots(
     operations: Iterable[StatisticOperation],
     shape: tuple[int, ...],
     dtype: torch.dtype,
-    weight_dtype: torch.dtype | None = None,
 ) -> tuple[StorageSlot, ...]:
-    """Slots of one statistic variable of ``shape`` and value ``dtype``;
-    sample weights use ``weight_dtype`` (``dtype`` when omitted)."""
+    """Slots of one statistic variable of ``shape`` and value ``dtype``."""
 
     operations = tuple(operations)
-    weight_dtype = dtype if weight_dtype is None else weight_dtype
     slots: dict[str, StorageSlot] = {}
 
     def add(name, slot_shape, slot_dtype, initialization, output=False) -> None:
@@ -189,16 +168,12 @@ def variable_slots(
             add(names.aux, operation_shape, dtype, initialization)
         else:
             add(names.output, operation_shape, dtype, initialization, output=True)
-        if names.sample_weight is not None:
-            add(names.sample_weight, shape, weight_dtype, zero)
         if operation.inner is None:
             continue
         # A ``last`` inner state records the last sampled value for a window
         # closed by a step that collects no output.
         inner = StoragePlan.inner_slots(variable, operation.inner, operations)
         add(inner.state, shape, dtype, storage_initialization(operation.inner))
-        if inner.weight is not None:
-            add(inner.weight, shape, weight_dtype, zero)
     return tuple(slots.values())
 
 
@@ -207,12 +182,8 @@ def build_storage_plan(
     layouts: Mapping[str, StatisticsVariableLayout],
     variables: Iterable[str],
     ensemble_size: int,
-    weight_dtype: torch.dtype | None = None,
 ) -> StoragePlan:
-    """Scatter buffers of every scatter source, then each variable's slots.
-
-    ``weight_dtype`` widens floating sample weights (``None`` keeps each
-    variable's dtype)."""
+    """Scatter buffers of every scatter source, then each variable's slots."""
 
     slots: dict[str, StorageSlot] = {}
     zero = StorageInitialization.ZERO
@@ -234,9 +205,6 @@ def build_storage_plan(
             program.operations[variable],
             layout.actual_shape,
             layout.dtype,
-            weight_dtype
-            if weight_dtype is not None and layout.dtype.is_floating_point
-            else None,
         ):
             slots[slot.name] = slot
     return StoragePlan(MappingProxyType(slots))

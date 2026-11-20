@@ -370,12 +370,12 @@ def _validate_dependent_shapes(
 
 
 def _stale_computed(
-    runtime: ModelRuntime, swapped: Iterable[torch.Tensor]
+    runtime: ModelRuntime,
+    swapped: Iterable[torch.Tensor],
+    changed_dims: frozenset[tuple[int, str]] = frozenset(),
 ) -> list[tuple[Any, Any, torch.Tensor]]:
-    """Cached computed tensors (aliases or views of other fields) over the
-    storage of ``swapped``, whose storage a structural update replaces:
-    ``(module, field, cached value)``. A tensor ``set_`` moves to new
-    storage stays itself; views of its old storage do not follow it."""
+    """Cached computed tensors over the storage of ``swapped`` or naming a
+    resized dimension: ``(module, field, cached value)``."""
 
     def identity(tensor: torch.Tensor) -> tuple[torch.device, int]:
         # The storage itself, not its address: empty storages all sit at 0.
@@ -388,11 +388,14 @@ def _stale_computed(
         module = runtime.modules[module_name]
         for field in module.spec().tensor_fields.values():
             value = module.__dict__.get(field.name) if field.computed else None
-            if (
-                isinstance(value, torch.Tensor)
-                and id(value) not in replaced
-                and identity(value) in storages
-            ):
+            if not isinstance(value, torch.Tensor) or id(value) in replaced:
+                continue
+            dim_changed = bool(changed_dims) and any(
+                not isinstance(token, int)
+                and _dimension(module, token).key in changed_dims
+                for token in field.tensor.shape
+            )
+            if identity(value) in storages or dim_changed:
                 found.append((module, field, value))
     return found
 
@@ -762,10 +765,38 @@ def _commit_structural_update(
     fields = _replacement_fields(runtime, replacements)
     _validate_content_coordinates(fields, replacements, pairs, content_ids)
     inferred = _infer_dimensions(fields, replacements)
+    previous_dimensions = {
+        key: int(getattr(dimension.owner, dimension.attribute))
+        for key, (dimension, _extent) in inferred.items()
+    }
+    changed_dims = frozenset(
+        key
+        for key, (_dimension_ref, extent) in inferred.items()
+        if previous_dimensions[key] != extent
+    )
+    if runtime.halo is not None:
+        for current, replacement in pairs:
+            for _module, field_name, metadata in fields[id(current)]:
+                if metadata is None or not metadata.halo:
+                    continue
+                layout = runtime.halo_layout(current)
+                pos = replacement.dim() - 1 - layout.axis
+                row = (
+                    replacement.numel()
+                    // max(replacement.shape[pos], 1)
+                    * replacement.element_size()
+                )
+                limit = runtime.halo.row_bytes.get(layout.kind, 0)
+                if row > limit:
+                    raise ValueError(
+                        f"structural replacement {field_name!r} has {row}-byte "
+                        f"halo rows, exceeding the {limit}-byte halo slot "
+                        "capacity sized at materialization"
+                    )
     # Fields set_ moves to new storage: cached computed views of them are
     # evaluated again after the update (their shapes need not hold now).
     swapped = [current for current, _ in pairs if id(current) not in content_ids]
-    stale = _stale_computed(runtime, swapped)
+    stale = _stale_computed(runtime, swapped, changed_dims)
     _validate_dependent_shapes(
         runtime, replacements, inferred, frozenset(id(old) for *_, old in stale)
     )
@@ -779,11 +810,7 @@ def _commit_structural_update(
     )
     # Derived indices and selections set_ moves too.
     swapped += [c for c, fresh in (*derived, *selections) if c.shape != fresh.shape]
-    stale = _stale_computed(runtime, swapped)
-    previous_dimensions = {
-        key: int(getattr(dimension.owner, dimension.attribute))
-        for key, (dimension, _extent) in inferred.items()
-    }
+    stale = _stale_computed(runtime, swapped, changed_dims)
     bindings = runtime.parameters.prepare_rebind(replacements)
 
     mutated = False

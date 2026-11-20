@@ -451,7 +451,8 @@ def bind_options(expression: Expression, values: Any) -> Expression:
             return ast.copy_location(ast.Constant(value), node)
 
     tree = ast.fix_missing_locations(_Bind().visit(copy.deepcopy(expression.tree)))
-    return _compile_expression(ast.unparse(tree), tree, None)
+    unparsed = ast.unparse(tree)
+    return _compile_expression(unparsed, ast.parse(unparsed, mode="eval"), None)
 
 
 def field_reference(

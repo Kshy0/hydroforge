@@ -284,6 +284,18 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
             )
         )
     topology = ProcessTopology.capture()
+    spatial_world_size = (
+        topology.world_size if parallel is None else parallel.spatial_partitions
+    )
+    if (
+        spec.slab is not None
+        and spatial_world_size > 1
+        and backend.name not in ("cuda", "torch")
+    ):
+        raise ValueError(
+            f"halo exchange is not supported on backend {backend.name!r}; "
+            "use HYDROFORGE_BACKEND=cuda (or torch)"
+        )
     return Selection(
         model=f"{spec.model_type.__module__}.{spec.model_type.__qualname__}",
         spec=spec,
@@ -304,9 +316,7 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
         rank=topology.rank,
         world_size=topology.world_size,
         spatial_rank=(topology.rank if parallel is None else parallel.spatial_rank),
-        spatial_world_size=(
-            topology.world_size if parallel is None else parallel.spatial_partitions
-        ),
+        spatial_world_size=spatial_world_size,
         ensemble_size=ensemble_size,
         local_ensemble_size=(
             ensemble_size if parallel is None else parallel.local_ensemble_size

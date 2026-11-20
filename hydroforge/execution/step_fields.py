@@ -9,11 +9,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import timedelta
 from functools import partial
 from typing import TYPE_CHECKING, Any
-from uuid import uuid4
 
 import torch
 from torch.utils._python_dispatch import _disable_current_modes
@@ -32,17 +31,9 @@ from hydroforge.contracts.step_fields import (
 )
 from hydroforge.core.errors import cleanup_on_exit
 from hydroforge.execution.aten import normalize_floating_scalar
+from hydroforge.kernels.backends.ir_program import compile_ir_scalar_variants
 from hydroforge.kernels.calls import recording_sink
-from hydroforge.kernels.codegen.c import CUDA, MSL, msl_arguments
-from hydroforge.kernels.codegen.ir import KernelFunction
-from hydroforge.kernels.codegen.torch import PRELUDE as TORCH_PRELUDE
-from hydroforge.kernels.codegen.torch import TorchPrinter
-from hydroforge.kernels.codegen.triton import PRINTER as TRITON
 from hydroforge.kernels.toolchain import CompileRequest
-from hydroforge.kernels.toolchain.python import (
-    compile_generated_module,
-    release_generated_module,
-)
 from hydroforge.platform.backend import Backend
 
 if TYPE_CHECKING:
@@ -83,8 +74,9 @@ class _StepFieldStorage:
 class CompiledStepFields:
     """Execution-owned generated kernel whose advance the executor repeats.
 
-    The kernel IR is printed in the backend's dialect; ``requests`` describe
-    its native compilation, which otherwise happens at the first launch.
+    The kernel IR is compiled through the unified IR toolchain in the backend's
+    dialect; ``requests`` describe its native compilation, which otherwise
+    happens at the first launch.
     """
 
     def __init__(
@@ -103,8 +95,9 @@ class CompiledStepFields:
         self.tensors = (clock, duration, *(storage[dtype] for dtype in context.dtypes))
         self.executor = executor
         self.advance: Any = None
-        self.module = None
-        self.filename = None
+        self.module: Any = None
+        self.filename: str | None = None
+        self._close_program = lambda: None
         self.requests: tuple[CompileRequest, ...] = ()
         self.dialect = backend.dialect
         # MSL has no double: the clock's floating values take the widest
@@ -112,118 +105,28 @@ class CompiledStepFields:
         real = torch.float64 if "float64" in backend.precisions else torch.float32
         function = step_field_program(context, real)
         try:
-            {
-                "torch": self._compile_torch,
-                "triton": self._compile_triton,
-                "cuda": self._compile_cuda,
-                "msl": self._compile_metal,
-            }[self.dialect](function)
+            (
+                self.launch,
+                self.requests,
+                self._close_program,
+                self.source,
+                self.module,
+                self.filename,
+            ) = compile_ir_scalar_variants(
+                self.dialect,
+                device=clock.device,
+                function=function,
+                tensors=self.tensors,
+                variants={
+                    False: {"advance": False},
+                    True: {"advance": True},
+                },
+                physics=False,
+                name_prefix="hydroforge_step_time",
+            )
         except BaseException:
             with cleanup_on_exit("step field compilation", (self.close,)):
                 raise
-
-    def _load_module(self, source: str):
-        name = "hydroforge_step_time_" + uuid4().hex
-        module = compile_generated_module(source, name=name)
-        self.module = module
-        self.filename = module.__file__
-        self.source = source
-        return module
-
-    def _compile_torch(self, function: KernelFunction) -> None:
-        # The source spells scalar parameters as literals: one function per
-        # value of ``advance``.
-        buffers = [param.name for param in function.params if param.access]
-        states = dict(zip(buffers, self.tensors, strict=True))
-        sizes = {name: tensor.numel() for name, tensor in states.items()}
-        printer = TorchPrinter("device")
-        names = {
-            False: f"{function.name}_refresh",
-            True: f"{function.name}_advance",
-        }
-        source = "\n\n\n".join(
-            (
-                TORCH_PRELUDE.rstrip("\n"),
-                f"device = torch.device({str(self.clock.device)!r})",
-                *(
-                    printer.kernel(
-                        replace(function, name=name),
-                        sizes=sizes,
-                        scalars={"advance": int(advance)},
-                    )
-                    for advance, name in names.items()
-                ),
-            )
-        )
-        module = self._load_module(source + "\n")
-        kernels = {advance: getattr(module, name) for advance, name in names.items()}
-        # The kernels read no sample phase.
-        self.launch = lambda advance: kernels[advance](states, 0)
-
-    def _compile_triton(self, function: KernelFunction) -> None:
-        from hydroforge.kernels.toolchain.triton import warming_up, warmup_request
-        from hydroforge.kernels.triton import launch_triton_kernel
-
-        module = self._load_module(TRITON.program((function,)))
-        launch = launch_triton_kernel(
-            getattr(module, function.name), (1,), physics=False
-        )
-        self.launch = lambda advance: launch(
-            *self.tensors, advance, BLOCK_SIZE=1, num_warps=1
-        )
-
-        def warmup() -> None:
-            with warming_up():
-                for advance in (False, True):
-                    self.launch(advance)
-
-        self.requests = (warmup_request(warmup, cost=len(self.source)),)
-
-    def _compile_cuda(self, function: KernelFunction) -> None:
-        from hydroforge.kernels.toolchain import cuda as rtc
-
-        self.source = CUDA.program((function,))
-        program = rtc.RtcProgram(
-            self.source, rtc.program_options((), physics=False), "hydroforge_step_time"
-        )
-        device = self.clock.device.index
-        request = rtc.RtcRequest(program, (function.name,))
-        launches = {}
-
-        def launch(advance: bool) -> None:
-            prepared = launches.get(advance)
-            if prepared is None:
-                step = rtc.CudaLaunch(
-                    function.name,
-                    1,
-                    1,
-                    (*map(rtc.pointer, self.tensors), rtc.boolean(advance)),
-                )
-                prepared = launches[advance] = rtc.prepare(request, (step,), device)
-            prepared()
-
-        self.requests = (rtc.precompile_request(request, device),)
-        self.launch = launch
-
-    def _compile_metal(self, function: KernelFunction) -> None:
-        from hydroforge.kernels.metal import MetalArgument, MetalProgram
-
-        self.source = MSL.program((function,))
-        fields = msl_arguments(function)
-        program = MetalProgram(
-            self.source,
-            function.name,
-            tuple(MetalArgument(*field) for field in fields),
-            extent=(),
-        )
-        names = [field[0] for field in fields]
-        launches = {
-            advance: program.specialize(
-                dict(zip(names, (*self.tensors, advance), strict=True)), 1
-            )
-            for advance in (False, True)
-        }
-        self.launch = lambda advance: launches[advance]()
 
     def run(self, *, advance: bool) -> None:
         if not advance:
@@ -244,12 +147,14 @@ class CompiledStepFields:
                 advance, self.advance = self.advance, None
                 advance.close()
         finally:
-            if self.filename is not None:
-                release_generated_module(self.module.__name__, self.filename)
+            close_program, self._close_program = self._close_program, lambda: None
+            try:
+                close_program()
+            finally:
+                self.module = None
                 self.filename = None
-            self.module = None
-            self.launch = None
-            self.tensors = ()
+                self.launch = None
+                self.tensors = ()
 
 
 class StepFieldRuntime:

@@ -553,7 +553,7 @@ MSL = CPrinter(
         },
         cast="{type}({value})",
         atomic_add="atomic_fetch_add_explicit({pointer}, {value}, memory_order_relaxed)",
-        thread_index="tid",
+        thread_index="long(tid)",
         prelude=_MSL_PRELUDE,
         nan=lambda spelled: "hydroforge_nan()",
         entry=_msl_entry,

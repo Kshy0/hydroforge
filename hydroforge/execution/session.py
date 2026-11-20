@@ -223,16 +223,18 @@ class ModelRuntime:
             )
         info = self.plan.fields.slab.get(entry.qualified)
         halo = self.halo
+        module = self.modules[entry.module]
+        batched = int(module.is_batched(entry.name))
         if info is not None and info.kind != "interior":
             axis = len(entry.tensor.shape) - 1 - info.position
             layout = FieldLayout(FACE if info.face else CELL, axis)
         elif (
             halo is not None
             and KEY in halo.plan.kinds
-            and tensor.dim() >= 1
-            and tensor.shape[0] == halo.plan.extent(KEY)
+            and tensor.dim() > batched
+            and tensor.shape[batched] == halo.plan.extent(KEY)
         ):
-            layout = FieldLayout(KEY, tensor.dim() - 1)
+            layout = FieldLayout(KEY, tensor.dim() - 1 - batched)
         else:
             raise ValueError(
                 f"{entry.qualified} is declared halo=True but neither names the "
@@ -361,7 +363,6 @@ class ModelRuntime:
         of each kind on this rank. Kernel workspaces declared ``halo=True``
         are allocated later, on their first call; their rows must fit."""
 
-        from hydroforge.declare.tensors import ModuleTensors
         from hydroforge.parallel.halo import CELL, FACE, KEY, partition_layouts
         from hydroforge.parallel.slab import slab_layouts
 
@@ -385,11 +386,17 @@ class ModelRuntime:
                     if value.shape[0] == extent:
                         widths.append(value.numel() // extent * value.element_size())
                 try:
-                    shape = ModuleTensors(module)._expected_shape(entry.name)
+                    shape = module._tensors._expected_shape(entry.name)
                 except ValueError:
                     continue
-                if shape and shape[0] == extent:
-                    widths.append(8 * int(np.prod(shape[1:], dtype=np.int64)))
+                if shape and shape[int(module.is_batched(entry.name))] == extent:
+                    widths.append(
+                        8
+                        * (
+                            int(np.prod(shape, dtype=np.int64))
+                            // max(extent, 1)
+                        )
+                    )
             row_bytes[KEY] = max(widths or [8])
         if slab is not None and slab.world > 1:
             positions = self.topology.positions()
@@ -411,12 +418,13 @@ class ModelRuntime:
                 module = self.modules.get(entry.module)
                 if module is None or info.kind == "interior" or not info.halo:
                     continue
-                shape = ModuleTensors(module)._expected_shape(entry.name)
+                shape = module._tensors._expected_shape(entry.name)
                 if shape is None:
                     continue
+                pos = info.position + int(module.is_batched(entry.name))
                 kind = FACE if info.face else CELL
                 width = 8 * (
-                    int(np.prod(shape, dtype=np.int64)) // max(shape[info.position], 1)
+                    int(np.prod(shape, dtype=np.int64)) // max(shape[pos], 1)
                 )
                 row_bytes[kind] = max(row_bytes.get(kind, 8), width)
         return layouts, row_bytes
@@ -1108,6 +1116,9 @@ class ModelRuntime:
                 status = execution.status.check()
             except BaseException as error:
                 status = error
+        if healthy and self.halo is not None and self.plan.device.type == "cuda":
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self.plan.device)
         if self.channel.distributed:
             # Every rank learns whether kernels failed on any rank: one that
             # has not failed yet fails its close with them.

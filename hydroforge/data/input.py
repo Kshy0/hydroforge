@@ -168,7 +168,14 @@ def _decode_netcdf_input_array(variable: Any, value: Any, *, name: str) -> np.nd
     value = decode_netcdf_logical_array(variable, value, name=name)
     if ma.isMaskedArray(value) and np.any(ma.getmaskarray(value)):
         raise ValueError(f"NetCDF input variable {name!r} contains missing values")
-    return np.asarray(value)
+    array = np.asarray(value)
+    if array.dtype == object:
+        flat = array.reshape(-1)
+        if all(isinstance(item, str) for item in flat):
+            return np.asarray(array, dtype="U" if flat.size else "U1")
+        if all(isinstance(item, (bytes, bytearray)) for item in flat):
+            return np.asarray(array, dtype="S" if flat.size else "S1")
+    return array
 
 
 _INPUT_FILE_LABEL = "NetCDF input file"

@@ -8,16 +8,18 @@
 
 ``LocalChannel`` serves a single-rank runtime: each agreement is decided
 locally and no distributed code runs.  ``ProcessGroupChannel`` exchanges one
-fixed wire row per agreement, ``(sequence, kind, a, b, c, digest, flag)``,
-under a single sequence shared by public transactions and managed-step
-events, so any divergence in the order of agreements is detected.
+fixed wire row per agreement,
+``(sequence, kind, a, b, c, begin_digest, digest, flag)``, under a single
+sequence shared by public transactions and managed-step events, so any
+divergence in the order of agreements is detected.
 
 * A public transaction publishes the digest of ``(sequence, phase,
   signature)``; ``flag`` requests the full record exchange that a failure,
   a payload or any difference needs.
-* A managed-step event publishes its kind and a three-int signature; the
-  first event of a warm step carries the invocation preflight in ``digest``
-  and ``flag``.  A failed rank publishes kind ``-1``.
+* A warm managed step stages its invocation preflight and ``BEGIN`` metadata
+  without a network round-trip and carries both on its first wire event
+  (``STEP_FINALIZED`` for steps without host collectives, so each warm step
+  costs one handshake).  A failed rank publishes kind ``-1``.
 
 Model bodies outside managed steps (``initialize_model_state`` and
 between-steps methods) use the same events for their collectives and close
@@ -47,6 +49,7 @@ Failures = tuple[dict[str, str] | None, ...]
 
 # Collective event kinds carry this bit for ensemble-scope collectives.
 ENSEMBLE_COLLECTIVE_FLAG = 1 << 60
+_DIGEST_MASK = (1 << 63) - 1
 _NO_SIGNATURE = (0, 0, 0)
 _FAILED = -1
 _DETAILS = 1
@@ -54,7 +57,7 @@ _PREFLIGHT = 2
 
 
 def _full_records_ready(rows: Any) -> bool:
-    return all(row[1] == StepEvent.TRANSACTION or row[6] & _PREFLIGHT for row in rows)
+    return all(row[1] == StepEvent.TRANSACTION or row[7] & _PREFLIGHT for row in rows)
 
 
 class PeerFailureError(RuntimeError):
@@ -67,8 +70,6 @@ class StepEvent(IntEnum):
 
     TRANSACTION = 0
     BEGIN = 1
-    SUBSTEP = 2
-    USER_STEP_COMPLETE = 3
     STEP_FINALIZED = 4
     BODY_COMPLETE = 5
 
@@ -80,7 +81,12 @@ class StagedPreflight:
     error: BaseException | None
     phase: str
     scope: str
-    signature: tuple[Any, ...] | None
+    signature: Any = None
+    digest: int | None = None
+
+    def resolved_signature(self) -> tuple[Any, ...] | None:
+        value = self.signature
+        return value() if callable(value) else value
 
 
 class LocalChannel:
@@ -123,6 +129,9 @@ class LocalChannel:
 
     def open_step(self, preflight: StagedPreflight | None = None) -> None:
         del preflight
+
+    def stage_begin(self, signature: tuple[int, int, int]) -> None:
+        del signature
 
     def event(self, kind: int, signature: tuple[int, int, int] = _NO_SIGNATURE) -> None:
         del kind, signature
@@ -195,15 +204,21 @@ class ProcessGroupChannel:
         self.rejection: BaseException | None = None
         self._group: Any = None
         self._source: torch.Tensor | None = None
-        self._staging = torch.empty(7, dtype=torch.int64)
+        self._staging = torch.empty(8, dtype=torch.int64)
         self._wire = self._staging.numpy()
         self._gathered: torch.Tensor | None = None
         self._outputs: list[torch.Tensor] = []
         self._preflight: StagedPreflight | None = None
+        self._begin_digest: int = 0
         self._terminal = False
 
     def _rows(
-        self, kind: int, signature: tuple[int, int, int], digest: int, flag: int
+        self,
+        kind: int,
+        signature: tuple[int, int, int],
+        begin_digest: int,
+        digest: int,
+        flag: int,
     ) -> list[list[int]]:
         """Exchange one wire row under the next sequence number."""
 
@@ -215,7 +230,7 @@ class ProcessGroupChannel:
             or not devices_match(self._gathered.device, device)
         ):
             self._gathered = torch.empty(
-                (self.world_size, 7), dtype=torch.int64, device=device
+                (self.world_size, 8), dtype=torch.int64, device=device
             )
             self._outputs = list(self._gathered.unbind(0))
             self._source = (
@@ -224,7 +239,7 @@ class ProcessGroupChannel:
                 else torch.empty_like(self._staging, device=device)
             )
             self._group = group
-        self._wire[:] = (self.sequence, kind, *signature, digest, flag)
+        self._wire[:] = (self.sequence, kind, *signature, begin_digest, digest, flag)
         if self._source is not self._staging:
             self._source.copy_(self._staging)
         dist.all_gather(self._outputs, self._source, group=group)
@@ -280,10 +295,11 @@ class ProcessGroupChannel:
         rows = self._rows(
             StepEvent.TRANSACTION,
             _NO_SIGNATURE,
+            0,
             digest63((sequence, phase, signature)),
             int(full),
         )
-        if not rows[0][6] and all(row == rows[0] for row in rows):
+        if not rows[0][7] and all(row == rows[0] for row in rows):
             empty = (None,) * self.world_size
             return empty, empty
         if not _full_records_ready(rows):
@@ -356,7 +372,21 @@ class ProcessGroupChannel:
         require_process_group("a multi-rank managed step")
         self._terminal = False
         self._preflight = preflight
+        self._begin_digest = 0
         self.rejection = None
+
+    def stage_begin(self, signature: tuple[int, int, int]) -> None:
+        """Stage ``BEGIN`` metadata to ride on the step's first wire event."""
+
+        a, b, c = signature
+        self._begin_digest = (
+            1
+            + (
+                (a * 0x9E3779B97F4A7C15)
+                ^ ((b + 2) * 0xBF58476D1CE4E5B9)
+                ^ ((c + 3) * 0x94D049BB133111EB)
+            )
+        ) & _DIGEST_MASK
 
     def event(self, kind: int, signature: tuple[int, int, int] = _NO_SIGNATURE) -> None:
         """Match the next rank event or propagate a peer's local failure."""
@@ -406,15 +436,23 @@ class ProcessGroupChannel:
         if self._terminal:
             return
         preflight, self._preflight = self._preflight, None
+        begin_digest, self._begin_digest = self._begin_digest, 0
         sequence = self.sequence
         digest = flag = 0
         if preflight is not None:
-            digest = digest63((sequence, preflight.phase, preflight.signature))
+            if preflight.digest is not None:
+                digest = (
+                    (sequence * 0x9E3779B97F4A7C15) ^ preflight.digest
+                ) & _DIGEST_MASK
+            else:
+                digest = digest63(
+                    (sequence, preflight.phase, preflight.resolved_signature())
+                )
             flag = _PREFLIGHT | int(preflight.error is not None)
-        rows = self._rows(kind, signature, digest, flag)
+        rows = self._rows(kind, signature, begin_digest, digest, flag)
         ready = _full_records_ready(rows)
         if not ready and any(
-            row[1] == StepEvent.TRANSACTION or row[6] & _PREFLIGHT for row in rows
+            row[1] == StepEvent.TRANSACTION or row[7] & _PREFLIGHT for row in rows
         ):
             self._terminal = True
             if kind == _FAILED:
@@ -423,10 +461,10 @@ class ProcessGroupChannel:
                 f"distributed transaction and managed-step events differ across ranks: {rows}"
             )
         if preflight is not None and (
-            len({tuple(row[5:]) for row in rows}) != 1 or rows[0][6] & _DETAILS
+            len({(row[6], row[7]) for row in rows}) != 1 or rows[0][7] & _DETAILS
         ):
             self._resolve_preflight(sequence, preflight)
-        observed = tuple(tuple(row[:5]) for row in rows)
+        observed = tuple(tuple(row[:6]) for row in rows)
         failed_ranks = tuple(
             rank for rank, value in enumerate(observed) if value[1] == _FAILED
         )
@@ -434,9 +472,12 @@ class ProcessGroupChannel:
         mesh = self.mesh
         if mesh is not None and kind >= 10 and not failed_ranks:
             scope = "ensemble" if kind & ENSEMBLE_COLLECTIVE_FLAG else "spatial"
-            matching = len({value[:2] for value in observed}) == 1 and all(
-                len({observed[rank][2:] for rank in ranks}) == 1
-                for ranks in mesh.rank_groups(scope)
+            matching = (
+                len({(value[0], value[1], value[5]) for value in observed}) == 1
+                and all(
+                    len({observed[rank][2:5] for rank in ranks}) == 1
+                    for ranks in mesh.rank_groups(scope)
+                )
             )
         if failed_ranks or not matching:
             self._terminal = True
@@ -456,7 +497,7 @@ class ProcessGroupChannel:
         """Exchange full preflight records after a digest or failure differs.
 
         Every rank reaches this from the same gathered rows. A rejection is
-        raised before any rank enters model code, so it is not a poisoning
+        raised before any rank commits the step, so it is not a poisoning
         step failure.
         """
 
@@ -466,7 +507,7 @@ class ProcessGroupChannel:
                 sequence,
                 preflight.error,
                 phase=preflight.phase,
-                signature=preflight.signature,
+                signature=preflight.resolved_signature(),
             )
             if any(failure is not None for failure in failures):
                 if preflight.error is not None:

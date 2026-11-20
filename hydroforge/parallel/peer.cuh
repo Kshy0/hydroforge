@@ -30,7 +30,15 @@ __device__ __forceinline__ void hf_peer_arrive(int64_t* peer_signal) {
 // Block-wide wait until ``signal`` counts ``arrivals``.
 __device__ __forceinline__ void hf_peer_wait(const int64_t* signal, int64_t arrivals) {
     if (threadIdx.x == 0) {
+        uint32_t spins = 0;
         while (hf_peer_acquire(signal) < arrivals) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            if (++spins > 64u) {
+                __nanosleep(64);
+            }
+#else
+            ++spins;
+#endif
         }
     }
     __syncthreads();

@@ -217,8 +217,13 @@ class KernelBindingPlan:
                     for module, module_spec in plan.spec.modules.items()
                     if source in module_spec.fields
                 ]
-                if len(declared) == 1 and declared[0] not in plan.modules:
-                    return Fixed(False, "batched", declared[0])
+                if len(declared) == 1:
+                    module_name = declared[0]
+                    if (
+                        module_name not in plan.modules
+                        or source not in plan.fields.modules[module_name].active
+                    ):
+                        return Fixed(False, "batched", module_name)
             return Batched(source, owners)
         return FieldValue(field, plan.fields.binding.get(field, ()))
 

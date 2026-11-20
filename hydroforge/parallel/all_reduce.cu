@@ -41,10 +41,10 @@ __global__ void peer_all_reduce(
         slot[(set + rank) * capacity + i] = hf_bits(values[i]);
     }
     __syncthreads();
-    if (threadIdx.x < world) {
-        __threadfence_system();
+    __threadfence_system();
+    for (int32_t peer = threadIdx.x; peer < world; peer += blockDim.x) {
         atomicAdd_system(
-            reinterpret_cast<unsigned long long*>(signal_peers[threadIdx.x]), 1ull);
+            reinterpret_cast<unsigned long long*>(signal_peers[peer]), 1ull);
     }
     hf_peer_wait(signals, (call + 1) * world);
     for (int32_t i = threadIdx.x; i < numel; i += blockDim.x) {
@@ -52,8 +52,8 @@ __global__ void peer_all_reduce(
         for (int32_t peer = 1; peer < world; ++peer) {
             const T value = hf_from_bits<T>(__ldcv(slots + (set + peer) * capacity + i));
             result = OP == 2   ? result + value
-                     : OP == 1 ? (value > result ? value : result)
-                               : (value < result ? value : result);
+                     : OP == 1 ? ((value != value || value > result) ? value : result)
+                               : ((value != value || value < result) ? value : result);
         }
         values[i] = result;
     }

@@ -250,9 +250,10 @@ class NcclComm:
     def close(self) -> None:
         handle, self.handle = self.handle, ctypes.c_void_p()
         if handle:
-            self.library.check(
-                self.library.handle.ncclCommDestroy(handle), "ncclCommDestroy"
-            )
+            with torch.cuda.device(self.device):
+                self.library.check(
+                    self.library.handle.ncclCommDestroy(handle), "ncclCommDestroy"
+                )
 
 
 class _DeviceArray:
@@ -359,7 +360,9 @@ class NcclWindow:
                     library.handle.ncclMemFree(address), "ncclMemFree"
                 )
             )
-        with cleanup_on_exit("NCCL window", actions):
+        with torch.cuda.device(self.comm.device), cleanup_on_exit(
+            "NCCL window", actions
+        ):
             pass
 
 

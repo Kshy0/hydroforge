@@ -119,20 +119,26 @@ def phase_implies(bits: int, implied: int) -> bool:
 CONTROL_MACRO_STEPS = "__num_macro_steps"
 CONTROL_MACRO_INDEX = "__macro_step_index"
 CONTROL_WEIGHT = "__weight"
+CONTROL_OLD_WEIGHT = "__old_weight"
+CONTROL_ACCUM_WEIGHT = "__accum_weight"
 CONTROL_FLAGS = "__flags"
 CONTROL_PHASE = "__phase"
 CONTROL_LAYOUT: tuple[tuple[str, torch.dtype | None], ...] = (
     (CONTROL_MACRO_STEPS, torch.int64),
     (CONTROL_MACRO_INDEX, torch.int64),
     (CONTROL_WEIGHT, None),
+    (CONTROL_OLD_WEIGHT, None),
+    (CONTROL_ACCUM_WEIGHT, None),
     (CONTROL_FLAGS, torch.int32),
     (CONTROL_PHASE, torch.int32),
 )
 # Control names share the statistics kernel state namespace.
 CONTROL_STATE = frozenset(name for name, _dtype in CONTROL_LAYOUT)
-# Scalars an aggregation kernel reads; ``__flags`` feeds only loop controls.
+# Scalars an aggregation kernel reads; ``__flags`` and ``__accum_weight``
+# feed only loop controls.
 KERNEL_CONTROLS = (
     CONTROL_WEIGHT,
+    CONTROL_OLD_WEIGHT,
     CONTROL_MACRO_STEPS,
     CONTROL_PHASE,
     CONTROL_MACRO_INDEX,

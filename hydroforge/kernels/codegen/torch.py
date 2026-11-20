@@ -129,6 +129,17 @@ def _hydroforge_accumulate(target, operand, operation):
 # compilation, the blended form is computed only when some result needs it.
 def hydroforge_weighted_mean(old, old_weight, value, weight, out=None):
     new_weight = old_weight + weight
+    overflow = ~torch.isfinite(new_weight) & torch.isfinite(old_weight) & torch.isfinite(weight)
+    if isinstance(overflow, torch.Tensor) and (
+        torch.compiler.is_compiling() or bool(overflow.any())
+    ):
+        old_weight = torch.where(overflow, old_weight * 0.5, old_weight)
+        weight = torch.where(overflow, weight * 0.5, weight)
+        new_weight = old_weight + weight
+    elif not isinstance(overflow, torch.Tensor) and overflow:
+        old_weight = old_weight * 0.5
+        weight = weight * 0.5
+        new_weight = old_weight + weight
     ratio = weight / new_weight
     # old + (value - old) * ratio
     incremental = _hydroforge_accumulate(
@@ -829,14 +840,15 @@ class _Kernel(TorchPrinter):
         if self.count is not None and not isinstance(address, _Lanes):
             index = f"{index}.expand({self.count})"
         value = self.value(node.value)
+        dtype = self.dtypes[node.buffer]
         if self.predicate is not None:
-            # Excluded lanes add zero to element 0, which no sum from a
-            # zeroed buffer can hold as -0.0.
+            # Excluded lanes add the additive identity (-0.0 preserves IEEE-754
+            # -0.0 in element 0; 0 for integer buffers).
+            zero = "-0.0" if dtype.is_floating_point else "0"
             index = f"torch.where({self.predicate}, {index}, 0)"
-            value = f"torch.where({self.predicate}, {value}, 0)"
+            value = f"torch.where({self.predicate}, {value}, {zero})"
         if not _integer(index) and not index.isidentifier():
             index = self.local("index", index, lines, indent)
-        dtype = self.dtypes[node.buffer]
         value = f"({self.tensor(value, dtype)}).expand_as({index})"
         lines.append(f"{indent}states[{node.buffer!r}].index_add_(0, {index}, {value})")
         return lines

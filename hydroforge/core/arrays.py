@@ -201,7 +201,11 @@ def canonical_floating_array(
             # Integers up to 2**exact_bits are exact; only larger magnitudes
             # need the exact (object) comparison.
             limit = 2**exact_bits
-            large = (source > limit) | (source < -limit)
+            large = (
+                source > limit
+                if source.dtype.kind == "u"
+                else (source > limit) | (source < -limit)
+            )
             if large.any() and not np.array_equal(
                 source[large].astype(object),
                 result[large].astype(object),
@@ -258,6 +262,22 @@ def canonical_float64(value: NumericValue, *, label: str) -> np.ndarray:
         raise ValueError(f"{label} contains values outside float64 range")
 
     if source.dtype.kind in {"i", "u"} or source.dtype.itemsize > 8:
+        if source.dtype.kind in {"i", "u"} and source.dtype.itemsize >= 8 and source.size:
+            # ARM64 saturates out-of-range float64 -> int64/uint64 casts (e.g.
+            # float64(2**63 - 1) == 2.0**63 -> 2**63 - 1), so check exactness
+            # in Python int space for magnitudes beyond 53-bit significand.
+            limit = 1 << 53
+            wide = (
+                source > limit
+                if source.dtype.kind == "u"
+                else (source > limit) | (source < -limit)
+            )
+            if wide.any() and any(
+                int(float(item)) != int(item) for item in source[wide].reshape(-1)
+            ):
+                raise ValueError(
+                    f"{label} contains values that cannot be represented exactly as float64"
+                )
         with np.errstate(invalid="ignore", over="ignore"):
             restored = result.astype(source.dtype)
         if not np.array_equal(restored, source):

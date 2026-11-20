@@ -92,6 +92,32 @@ def conditional_capture_safe(*programs: Any) -> bool:
     return True
 
 
+def predicate_capture_safe(*programs: Any) -> bool:
+    """Return whether a rank-local predicate loop may run as a device WHILE
+    graph: cross-rank halo exchanges require rank-synchronous iteration counts
+    and must not spin inside a rank-local conditional graph."""
+
+    from hydroforge.execution.operators import CompiledKernelCall
+
+    if not conditional_capture_safe(*programs):
+        return False
+    pending = [program for program in programs if program is not None]
+    while pending:
+        program = pending.pop()
+        for operator in program.operators:
+            if isinstance(operator, PredicateLoopOperator):
+                if operator.loop.body is None:
+                    return False
+                pending.append(operator.loop.body)
+            elif (
+                isinstance(operator, CompiledKernelCall)
+                and getattr(getattr(operator.call, "spec", None), "name", None)
+                == "halo_exchange"
+            ):
+                return False
+    return True
+
+
 class FixedLoop:
     """Fixed-width loop over one recorded body and an optional final tail."""
 

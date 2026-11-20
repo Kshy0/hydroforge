@@ -473,6 +473,11 @@ class PartitionRuntime:
         from hydroforge.contracts.runtime import DEFAULT_MODULE_REQUIREMENT
 
         plan = self.plan
+        if plan.backend.name not in ("cuda", "torch"):
+            return (
+                f"halo exchange is not supported on backend {plan.backend.name!r} "
+                "(use HYDROFORGE_BACKEND=cuda)"
+            )
         requirements = plan.spec.module_requirements
         unsupported = [
             name

@@ -31,11 +31,13 @@ as usual.
 from __future__ import annotations
 
 import inspect
+import struct
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import wraps
+from hashlib import blake2b
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import torch
@@ -268,7 +270,7 @@ class StepContext:
 
         return self.sampling and self.statistics.per_substep
 
-    def finish(self) -> None:
+    def prepare_finish(self) -> Any:
         self.require_scopes_closed()
         if self.sampling and not self.substep_claimed:
             raise RuntimeError(
@@ -276,7 +278,15 @@ class StepContext:
                 "step.fixed/adaptive scope"
             )
         if self.statistics is not None and not self.replay:
-            self.statistics.finish_step()
+            return self.statistics.prepare_finish()
+        return None
+
+    def commit_finish(self, prepared: Any) -> None:
+        if prepared is not None:
+            self.statistics.commit_finish(prepared)
+
+    def finish(self) -> None:
+        self.commit_finish(self.prepare_finish())
 
 
 class ManagedStep:
@@ -432,6 +442,10 @@ class _StepRequest(HydroForgeModel):
         return self
 
 
+_FAST_DIGEST_PACK = struct.Struct("<4q4i")
+_DIGEST_MASK = (1 << 63) - 1
+
+
 class _Invocation:
     """One validated driver request resolved against the runtime clock."""
 
@@ -465,6 +479,42 @@ class _Invocation:
                 self.reverse,
             )
         )
+
+    def fast_digest(self, protocol_code: int, materialized: bool) -> int:
+        """Compute a fast deterministic 63-bit preflight digest for warm steps."""
+
+        dt = self.current_time
+        step = self.scheduled_step
+        req = self.request
+        ts = req.time_step
+        cond_bits = 0
+        for idx, flag in enumerate(self.conditions):
+            if flag:
+                cond_bits |= 1 << idx
+        out_code = -1 if req.output_enabled is None else int(req.output_enabled)
+        sub_steps = -1 if req.num_sub_steps is None else req.num_sub_steps
+        step_idx = -1 if step is None else step.index
+        ts_us = -1 if ts is None else timedelta_microseconds(ts)
+        hasher = blake2b(digest_size=8)
+        hasher.update(
+            _FAST_DIGEST_PACK.pack(
+                protocol_code,
+                ts_us,
+                step_idx,
+                int(materialized) | (int(self.reverse) << 1),
+                sub_steps,
+                out_code,
+                cond_bits,
+                0 if dt is None else dt.year,
+            )
+        )
+        if dt is not None:
+            cal = getattr(dt, "calendar", "standard")
+            hasher.update(
+                f"{type(dt).__qualname__}:{cal}:{dt.month}:{dt.day}:"
+                f"{dt.hour}:{dt.minute}:{dt.second}:{dt.microsecond}".encode()
+            )
+        return int.from_bytes(hasher.digest(), "big") & _DIGEST_MASK
 
 
 class _ManagedStepDeclaration(HydroForgeModel):
@@ -693,17 +743,18 @@ class _StepPolicy:
             managed = ManagedStep(context)
             step = invocation.scheduled_step
             requested = context.requested_sub_steps
-            channel.event(
-                StepEvent.BEGIN,
-                (
-                    self.descriptor.protocol_code,
-                    -1 if step is None else step.index,
-                    (0 if requested is None else requested) << 6
-                    | context.flags << 2
-                    | int(context.output_enabled) << 1
-                    | int(context.spinup),
-                ),
+            begin_sig = (
+                self.descriptor.protocol_code,
+                -1 if step is None else step.index,
+                (0 if requested is None else requested) << 6
+                | context.flags << 2
+                | int(context.output_enabled) << 1
+                | int(context.spinup),
             )
+            if self.runtime.structure_hooks:
+                channel.event(StepEvent.BEGIN, begin_sig)
+            else:
+                channel.stage_begin(begin_sig)
             if progress is not None:
                 progress.begin_step(step)
             with self._parameter_transaction():
@@ -725,14 +776,7 @@ class _StepPolicy:
                 finally:
                     context.invocation = None
                     ACTIVE_STEP.reset(token)
-                # Statistics output is the only rank-visible effect of
-                # finish(); without it the final handshake alone rejects a
-                # peer's body failure before the clock commits.
-                if statistics is not None and statistics.step_closes:
-                    channel.event(StepEvent.USER_STEP_COMPLETE)
-                context.finish()
-                if statistics is not None:
-                    statistics.sink.poll(current_time)
+                prepared_output = context.prepare_finish()
                 if progress is not None and progress.progress_tick(step):
                     emit(
                         self.runtime,
@@ -745,6 +789,9 @@ class _StepPolicy:
                         progress=progress.format_progress(step),
                     )
                 channel.event(StepEvent.STEP_FINALIZED)
+                context.commit_finish(prepared_output)
+                if statistics is not None:
+                    statistics.sink.poll(current_time)
                 context.commit_clock()
             return result
         except BaseException as error:
@@ -813,16 +860,26 @@ def _step_method(function: _F, *, reverse: bool) -> _F:
             invocation = descriptor.validate(runtime, args, kwargs)
         except BaseException as caught:
             error = caught
-        signature = (
-            None
-            if invocation is None or not channel.distributed
-            else (materialized, invocation.signature())
-        )
         preflight = None
         if channel.distributed and materialized:
-            # A warm step publishes its preflight inside the BEGIN handshake.
-            preflight = StagedPreflight(error, phase, scope, signature)
+            # A warm step publishes its preflight inside the next step event.
+            signature = (
+                None
+                if invocation is None
+                else (lambda: (materialized, invocation.signature()))
+            )
+            digest = (
+                None
+                if invocation is None or error is not None
+                else invocation.fast_digest(descriptor.protocol_code, materialized)
+            )
+            preflight = StagedPreflight(error, phase, scope, signature, digest)
         else:
+            signature = (
+                None
+                if invocation is None or not channel.distributed
+                else (materialized, invocation.signature())
+            )
             channel.preflight(error, phase=phase, scope=scope, signature=signature)
             runtime.ensure_materialized(method_name)
         return runtime.execution.step_policies[descriptor].execute(

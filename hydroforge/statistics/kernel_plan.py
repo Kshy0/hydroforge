@@ -89,6 +89,7 @@ from hydroforge.statistics.phases import (
     CONTROL_LAYOUT,
     CONTROL_MACRO_INDEX,
     CONTROL_MACRO_STEPS,
+    CONTROL_OLD_WEIGHT,
     CONTROL_PHASE,
     CONTROL_WEIGHT,
     KERNEL_CONTROLS,
@@ -124,6 +125,7 @@ _SCATTER_SLOT = Var("slot", _INDEX)
 _SCATTER_ELEMENT = Var("element", _INDEX)
 _CONTROL_NAMES = {
     CONTROL_WEIGHT: "weight",
+    CONTROL_OLD_WEIGHT: "old_weight",
     CONTROL_MACRO_STEPS: "num_macro_steps",
     CONTROL_PHASE: PHASE.name,
     CONTROL_MACRO_INDEX: "macro_step_index",
@@ -791,7 +793,7 @@ def _variable(
                     element, output_shape, source_shape, layout.axes,
                     names, prefix, addressing,
                 )
-            source_plane = Const(prod(source_shape), _INDEX)
+            source_plane = Const(max(1, prod(source_shape)), _INDEX)
 
             def source_offset(key: str) -> Expr:
                 if member is None or not batched_key(key):
@@ -813,7 +815,7 @@ def _variable(
             def element_at() -> tuple[Expr | None, Expr]:
                 if not layout.batched:
                     return None, LINEAR
-                plane = Const(prod(source_shape), _INDEX)
+                plane = Const(max(1, prod(source_shape)), _INDEX)
                 return Binary("/", LINEAR, plane), Binary("%", LINEAR, plane)
 
         case OutputLayout.INDEXED_VECTOR:
@@ -858,25 +860,14 @@ def _variable(
             def element_at() -> tuple[Expr | None, Expr]:
                 return MEMBER, Binary("+", Binary("*", SOURCE, row), inner)
 
-    weights = (
-        StoragePlan.sample_weight(name),
-        StoragePlan.inner_weight(name, Reduction.MEAN),
-    )
     ctx = SampleContext(
         offset=offset,
         weight=_control_var(controls[CONTROL_WEIGHT]),
+        old_weight=_control_var(controls[CONTROL_OLD_WEIGHT]),
         macro_steps=_control_var(controls[CONTROL_MACRO_STEPS]),
         macro_index=_control_var(controls[CONTROL_MACRO_INDEX]),
         names=names,
         prefix=prefix,
-        weight_dtype=next(
-            (
-                context.storage[slot].dtype
-                for slot in weights
-                if slot in context.storage
-            ),
-            None,
-        ),
     )
     head = tuple(statements)
     statements.extend(addressing)
@@ -999,6 +990,12 @@ def _entry(group: GroupKernel, members: Members) -> StatisticsKernel:
     return _thread_entry(group)
 
 
+def _phase_guard(group: GroupKernel) -> tuple[Stmt, ...]:
+    if group.phase_mask is None:
+        return ()
+    return (Guard(PhaseTest(group.phase_mask)),)
+
+
 def _full_entry(group: GroupKernel, members: Members) -> StatisticsKernel:
     """One thread per element; members are part of the flat index.
 
@@ -1011,6 +1008,7 @@ def _full_entry(group: GroupKernel, members: Members) -> StatisticsKernel:
         Let(LINEAR, ThreadIndex()),
         Guard(Compare("<", LINEAR, ELEMENTS)),
         *group.controls,
+        *_phase_guard(group),
         *(
             node
             for variable in group.variables
@@ -1072,8 +1070,9 @@ def _loop_entry(group: GroupKernel) -> StatisticsKernel:
     body = (
         Let(POINT, ThreadIndex()),
         Guard(Compare("<", POINT, POINTS)),
-        _source_index(group),
         *group.controls,
+        *_phase_guard(group),
+        _source_index(group),
         ForK(MEMBER, group.ensemble_size, tuple(batched)),
     )
     return _indexed(group, body, 1)
@@ -1102,8 +1101,9 @@ def _tile_entry(group: GroupKernel) -> StatisticsKernel:
     body = (
         Let(POINT, TileIndex(0) if tiled else ThreadIndex()),
         Guard(Compare("<", POINT, POINTS)),
-        _source_index(group),
         *group.controls,
+        *_phase_guard(group),
+        _source_index(group),
         ForK(MEMBER, group.ensemble_size, tuple(batched)),
     )
     return _indexed(group, body, 1)
@@ -1165,6 +1165,7 @@ def _thread_entry(group: GroupKernel) -> StatisticsKernel:
         Let(LINEAR, ThreadIndex()),
         Guard(Compare("<", LINEAR, total)),
         *group.controls,
+        *_phase_guard(group),
         *parts,
     )
     return _indexed(group, body, ensemble * levels)

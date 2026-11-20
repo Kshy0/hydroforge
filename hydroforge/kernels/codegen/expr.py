@@ -66,9 +66,11 @@ class _Lowering:
 
     def truth(self, node: ast.AST) -> Expr:
         value = self.visit(node)
-        if type_of(value) == torch.bool:
+        dtype = type_of(value)
+        if dtype == torch.bool:
             return value
-        return Compare("!=", value, Const(0.0))
+        zero = Const(0.0) if dtype.is_floating_point else Const(0, dtype)
+        return Compare("!=", value, zero)
 
     def visit(self, node: ast.AST) -> Expr:
         match node:

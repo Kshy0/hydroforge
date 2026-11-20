@@ -238,12 +238,17 @@ __device__ __forceinline__ int64_t ring_slot(const HaloRing& r, const int32_t* r
 
 // Called by thread 0 once its block is done with a message (after a block
 // barrier): whether it is the last of the message's ``blocks``. Each block of
-// a multi-block message fences its work before counting it.
+// a multi-block message releases its work at system scope and the completing
+// block acquires every peer block's work before resetting ``done`` and
+// issuing the cross-GPU arrival or credit signal.
 __device__ __forceinline__ bool last_block(int64_t* done, int64_t blocks) {
     if (blocks == 1) return true;
-    __threadfence_system();
-    const unsigned long long previous =
-        atomicAdd(reinterpret_cast<unsigned long long*>(done), 1ull);
+    unsigned long long previous;
+    unsigned long long* word = reinterpret_cast<unsigned long long*>(done);
+    asm volatile("atom.acq_rel.sys.global.add.u64 %0, [%1], 1;"
+                 : "=l"(previous)
+                 : "l"(word)
+                 : "memory");
     if (int64_t(previous) != blocks - 1) return false;
     *done = 0;
     return true;
@@ -258,14 +263,13 @@ __device__ __forceinline__ void count(const int64_t* window, int64_t index,
     asm volatile("red.release.sys.global.add.u64 [%0], %1;" ::"l"(word), "l"(amount) : "memory");
 }
 
-// A credit in a sender's window. It only says the slot's reads are over;
-// they returned their values before it is issued (this launch's blocks
-// before their barrier and done count), so no fence orders anything
-// before it.
+// A credit in a sender's window, released at system scope so every warp's
+// ring reads in this CTA (and prior CTAs via ``last_block``) complete before
+// the sender can overwrite the freed ring slot.
 __device__ __forceinline__ void credit(const int64_t* window, int64_t index) {
     unsigned long long* word =
         reinterpret_cast<unsigned long long*>(const_cast<int64_t*>(window) + index);
-    asm volatile("red.relaxed.sys.global.add.u64 [%0], %1;" ::"l"(word), "l"(1ull) : "memory");
+    asm volatile("red.release.sys.global.add.u64 [%0], %1;" ::"l"(word), "l"(1ull) : "memory");
 }
 
 template <bool ACCUMULATE>

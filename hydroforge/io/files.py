@@ -62,6 +62,12 @@ class FileIdentity:
 
 _HANDLE_POOLS: WeakSet[_NetCDFHandlePool] = WeakSet()
 _HANDLE_POOLS_LOCK = RLock()
+_HDF5_LOCK = RLock()
+
+
+def _reset_hdf5_lock_after_fork() -> None:
+    global _HDF5_LOCK
+    _HDF5_LOCK = RLock()
 
 
 def _close_handle_pools_before_fork() -> None:
@@ -79,7 +85,10 @@ def _close_handle_pools_before_fork() -> None:
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(before=_close_handle_pools_before_fork)
+    os.register_at_fork(
+        before=_close_handle_pools_before_fork,
+        after_in_child=_reset_hdf5_lock_after_fork,
+    )
 
 
 def _close_if_open(dataset: Dataset) -> None:
@@ -137,14 +146,14 @@ class _NetCDFHandlePool:
         """Serialize use of one persistent process-local read handle."""
 
         self._reset_for_process()
-        with self._lock:
+        with _HDF5_LOCK, self._lock:
             yield self._open_locked(path)
 
     def close(self) -> None:
         """Close all handles owned by the current process, idempotently."""
 
         self._reset_for_process()
-        with self._lock:
+        with _HDF5_LOCK, self._lock:
             handles = tuple(self._handles.values())
             self._handles.clear()
             with cleanup_on_exit(

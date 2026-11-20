@@ -697,10 +697,13 @@ def _setup_distributed_trusted(
             device=device,
             backend=backend,
         )
-        arguments: dict[str, Any] = {
-            "backend": backend,
-            "init_method": "env://",
-        }
+        arguments: dict[str, Any] = {"backend": backend}
+        if isinstance(consensus_store, dist.Store):
+            arguments["store"] = dist.PrefixStore("default_pg", consensus_store)
+            arguments["rank"] = expected_rank
+            arguments["world_size"] = world_size
+        else:
+            arguments["init_method"] = "env://"
         if device.type in {"cuda", "xpu"}:
             arguments["device_id"] = device
         try:

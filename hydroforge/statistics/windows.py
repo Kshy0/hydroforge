@@ -352,6 +352,7 @@ class WindowState:
         "macro_count",
         "dirty",
         "start_time",
+        "outer_start_time",
         "inner_samples",
         "outer_folded",
         "pending_outer_first",
@@ -373,12 +374,41 @@ class WindowState:
         self.macro_count = 0
         self.dirty: set[str] = set()
         self.start_time: Any = None
+        self.outer_start_time: Any = None
         self.inner_samples = False
         self.outer_folded = False
         self.pending_outer_first = False
         self.events: WindowEvents | None = None
         self.sampling = False
         self.time: Any = None
+
+    def snapshot_state(self) -> tuple[Any, ...]:
+        return (
+            self.macro_index,
+            self.macro_count,
+            frozenset(self.dirty),
+            self.start_time,
+            self.outer_start_time,
+            self.inner_samples,
+            self.outer_folded,
+            self.pending_outer_first,
+        )
+
+    def restore_snapshot_state(self, state: tuple[Any, ...]) -> None:
+        (
+            self.macro_index,
+            self.macro_count,
+            dirty,
+            self.start_time,
+            self.outer_start_time,
+            self.inner_samples,
+            self.outer_folded,
+            self.pending_outer_first,
+        ) = state
+        self.dirty = set(dirty)
+        self.events = None
+        self.sampling = False
+        self.time = None
 
     def begin(self, events: WindowEvents | None, *, sampling: bool, time: Any) -> int:
         """Record one step and return the step bits its samples carry."""
@@ -438,36 +468,59 @@ class WindowState:
         self.dirty.update(self.inner_outputs)
         return count, index
 
-    def close(self) -> Any:
-        """Finish the recorded step; return the output time if it publishes."""
+    def close(self) -> tuple[tuple[Any, tuple[str, ...]], ...]:
+        """Finish the recorded step; return ``(start_time, keys)`` batches."""
 
         events, self.events = self.events, None
         if events is None:
-            return None
+            return ()
         if events.inner_first:
             self.start_time = self.time
             self.inner_samples = False
         if events.outer_first:
+            self.outer_start_time = self.time
             self.pending_outer_first = True
             self.outer_folded = False
         self.inner_samples = self.inner_samples or self.sampling
         if not events.inner_last:
-            return None
+            return ()
         if self.inner_samples:
             self.pending_outer_first = False
             self.outer_folded = True
+        outer_closed = False
+        outer_label = None
         if events.outer_last and self.outer_folded:
             self.dirty.update(self.outer_outputs)
             self.outer_folded = False
-        label, self.start_time = self.start_time, None
+            outer_closed = True
+            outer_label, self.outer_start_time = self.outer_start_time, None
+        inner_label, self.start_time = self.start_time, None
         self.inner_samples = False
         if not self.dirty:
-            return None
-        if label is None:
-            # ``None`` means "nothing to publish"; a sampled window must not
-            # be dropped silently for want of a time label.
+            return ()
+        inner_dirty = tuple(
+            name for name in self.inner_outputs if name in self.dirty
+        )
+        outer_dirty = (
+            tuple(name for name in self.outer_outputs if name in self.dirty)
+            if outer_closed
+            else ()
+        )
+        if inner_dirty and inner_label is None:
             raise RuntimeError("statistics window closed without a start time")
-        return label
+        if outer_dirty and outer_label is None:
+            raise RuntimeError(
+                "outer statistics window closed without a start time"
+            )
+        if inner_dirty and outer_dirty:
+            if inner_label == outer_label:
+                return ((inner_label, (*inner_dirty, *outer_dirty)),)
+            return ((inner_label, inner_dirty), (outer_label, outer_dirty))
+        if inner_dirty:
+            return ((inner_label, inner_dirty),)
+        if outer_dirty:
+            return ((outer_label, outer_dirty),)
+        return ()
 
 
 def bind_statistics_plan_schedule(

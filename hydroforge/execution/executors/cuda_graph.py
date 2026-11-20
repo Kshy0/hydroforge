@@ -27,6 +27,7 @@ from hydroforge.execution.executors.eager import (
 from hydroforge.execution.loops import (
     conditional_capture_safe,
     distributed_capture_safe,
+    predicate_capture_safe,
 )
 from hydroforge.execution.operators import launch_operators, rollback_tensors
 from hydroforge.kernels.backends.cuda_control import (
@@ -41,7 +42,9 @@ from hydroforge.kernels.backends.cuda_control import (
 from hydroforge.kernels.toolchain import CompileRequest
 from hydroforge.kernels.toolchain.cuda import ConditionalWhileGraph
 from hydroforge.statistics.phases import (
+    CONTROL_ACCUM_WEIGHT,
     CONTROL_FLAGS,
+    CONTROL_OLD_WEIGHT,
     CONTROL_PHASE,
     CONTROL_WEIGHT,
     sample_phase_expr,
@@ -338,6 +341,8 @@ class CudaGraphExecutor(LoopExecutor):
             weight_src=width,
             flags=states[CONTROL_FLAGS],
             weight=states[CONTROL_WEIGHT],
+            old_weight=states[CONTROL_OLD_WEIGHT],
+            accum_weight=states[CONTROL_ACCUM_WEIGHT],
             phase=states[CONTROL_PHASE],
         )
 
@@ -370,7 +375,7 @@ class CudaGraphExecutor(LoopExecutor):
         return _Adaptive(self, loop)
 
     def predicate(self, loop: Any) -> Any:
-        if self._eager_fallback(loop.body) or not conditional_capture_safe(loop.body):
+        if self._eager_fallback(loop.body) or not predicate_capture_safe(loop.body):
             self.loop_modes["predicate"] = "host"
             return EagerPredicate(loop)
         self.loop_modes["predicate"] = "device"
@@ -735,6 +740,8 @@ class _Adaptive:
                     counter=loop.counter,
                     flags=states[CONTROL_FLAGS],
                     weight=states[CONTROL_WEIGHT],
+                    old_weight=states[CONTROL_OLD_WEIGHT],
+                    accum_weight=states[CONTROL_ACCUM_WEIGHT],
                     phase=states[CONTROL_PHASE],
                 )
                 launch(-1)

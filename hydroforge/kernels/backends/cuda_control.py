@@ -350,6 +350,8 @@ class StatisticsControls:
         weight_src: torch.Tensor,
         flags: torch.Tensor,
         weight: torch.Tensor,
+        old_weight: torch.Tensor,
+        accum_weight: torch.Tensor,
         phase: torch.Tensor,
     ) -> None:
         """Advance a fixed loop and write the controls of its sample."""
@@ -363,6 +365,8 @@ class StatisticsControls:
                 "weight_source": weight_src,
                 "flags": flags,
                 "weight": weight,
+                "old_weight": old_weight,
+                "accum_weight": accum_weight,
                 "phase": phase,
             },
         )
@@ -375,6 +379,8 @@ class StatisticsControls:
         counter: torch.Tensor,
         flags: torch.Tensor,
         weight: torch.Tensor,
+        old_weight: torch.Tensor,
+        accum_weight: torch.Tensor,
         phase: torch.Tensor,
     ) -> None:
         """Write the controls of an advanced adaptive iteration's sample."""
@@ -387,6 +393,8 @@ class StatisticsControls:
                 "counter": counter,
                 "flags": flags,
                 "weight": weight,
+                "old_weight": old_weight,
+                "accum_weight": accum_weight,
                 "phase": phase,
             },
         )

@@ -660,6 +660,8 @@ class RankOutputWriter:
         self._coord_cache = coordinates
         self._closed = False
         self._current_year = None
+        self._stream_years: dict[str, int] = {}
+        self._active_append_variables: tuple[str, ...] | None = None
         self._files_created = False
         self._write_executors: list[ProcessPoolExecutor] = []
         self._pending_writes: list[PendingNetCDFWrite] = []
@@ -835,13 +837,24 @@ class RankOutputWriter:
 
         self.run_id = run_id
 
-    def _create_netcdf_files(self, year: int | None = None) -> None:
+    def _create_netcdf_files(
+        self,
+        year: int | None = None,
+        variables: Iterable[str] | None = None,
+    ) -> None:
         """Create empty NetCDF files with proper structure for streaming.
 
         Creation writes headers only (~5 ms per output), so it runs inline; a
         spawned pool cost ~1.6 s of interpreter start-up on the first step.
         """
         if not self.output_split_by_year and self._files_created:
+            return
+        selected = (
+            tuple(self._netcdf_schemas)
+            if variables is None
+            else tuple(variables)
+        )
+        if not selected:
             return
 
         self._raise_if_background_failed()
@@ -866,7 +879,8 @@ class RankOutputWriter:
         )
         planned_by_variable: dict[str, tuple[Path, ...]] = {}
         batch_events: list[ModelEvent] = []
-        for out_name, schema in self._netcdf_schemas.items():
+        for out_name in selected:
+            schema = self._netcdf_schemas[out_name]
             planned_by_variable[out_name] = tuple(
                 self.output_dir / rank_file_name(file_variable, self.rank, year)
                 for file_variable, _name, _suffix in _output_components(
@@ -904,7 +918,8 @@ class RankOutputWriter:
         try:
             stage_output.mkdir()
             backup_dir.mkdir()
-            for out_name, schema in self._netcdf_schemas.items():
+            for out_name in selected:
+                schema = self._netcdf_schemas[out_name]
                 expected = planned_by_variable[out_name]
                 coordinate = schema.output_coordinate
                 _create_output_files(
@@ -990,7 +1005,8 @@ class RankOutputWriter:
 
         # The data transaction is now complete.  Publish owner state in one
         # non-I/O section, then report telemetry on a best-effort basis.
-        for out_name, streams in self._streams.items():
+        for out_name in selected:
+            streams = self._streams[out_name]
             for stream, path in zip(
                 streams, planned_by_variable[out_name], strict=True
             ):
@@ -1346,10 +1362,13 @@ class RankOutputWriter:
         for step in staged:
             for stream, slot, rows in step.before:
                 earliest.setdefault(stream, (slot, rows))
+        # Pop every staged timestamp in reverse append order across slot boundaries.
+        for step in reversed(staged):
+            for stream, slot, _row in step.rows:
+                if stream.times[slot]:
+                    stream.times[slot].pop()
         for stream, (slot, rows) in earliest.items():
-            if stream.slot == slot:
-                times = stream.times[slot]
-                del times[len(times) - (stream.rows - rows) :]
+            del stream.times[slot][rows:]
             stream.slot, stream.rows = slot, rows
 
     def _flush_all_write_buffers(
@@ -1519,17 +1538,50 @@ class RankOutputWriter:
         """Create the files that receive rows stamped ``dt``."""
 
         if self.output_split_by_year:
-            if self._current_year is None:
-                self._create_netcdf_files(year=dt.year)
-                self._current_year = dt.year
-            elif self._current_year != dt.year:
+            targets = self._active_append_variables or tuple(self._netcdf_schemas)
+            first_time = [
+                name for name in targets if name not in self._stream_years
+            ]
+            rolling = [
+                name
+                for name in targets
+                if name in self._stream_years
+                and self._stream_years[name] != dt.year
+            ]
+            if rolling:
                 # Rows of the old year go to its files before the new ones,
                 # and the new files start in fresh, chunk-aligned slots.
-                self._flush_all_write_buffers(next_slot=True)
+                self._raise_if_background_failed()
+                self._land_staged()
+                rolling_streams = {
+                    stream for name in rolling for stream in self._streams[name]
+                }
+                try:
+                    partial = [
+                        item
+                        for item in self._partial_slots()
+                        if item[0] in rolling_streams
+                    ]
+                    if partial:
+                        self._submit(partial)
+                except BaseException as error:
+                    self._latch_failures("NetCDF write buffers", [error])
+                    raise
+                for stream in rolling_streams:
+                    if 0 < stream.rows < stream.slots.batch:
+                        stream.rows = stream.slots.batch
                 self._release_worker_files(
-                    tuple(stream.path for stream in self._all_streams())
+                    tuple(
+                        stream.path
+                        for name in rolling
+                        for stream in self._streams[name]
+                    )
                 )
-                self._create_netcdf_files(year=dt.year)
+            to_create = (*first_time, *rolling)
+            if to_create:
+                self._create_netcdf_files(year=dt.year, variables=to_create)
+                for name in to_create:
+                    self._stream_years[name] = dt.year
                 self._current_year = dt.year
         elif not self._files_created:
             self._create_netcdf_files()
@@ -1561,7 +1613,11 @@ class RankOutputWriter:
                 numeric_time <= self._last_times.get(name, -math.inf) for name in values
             ):
                 raise ValueError("NetCDF write timestamps must be strictly increasing")
-        self._prepare_output_files(dt)
+        self._active_append_variables = tuple(values)
+        try:
+            self._prepare_output_files(dt)
+        finally:
+            self._active_append_variables = None
         if not self._asynchronous:
             self._write_step(values, dt, status)
             self._last_times.update(dict.fromkeys(values, numeric_time))

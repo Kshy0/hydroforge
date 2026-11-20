@@ -154,16 +154,35 @@ def _sample_controls(
     weight_source: Load,
     flags: Load,
     weight: Load,
+    old_weight: Load,
+    accum_weight: Load,
     phase: Load,
 ) -> tuple[Stmt, ...]:
-    """Write the weight and phase of the sample at ``first``/``last``."""
+    """Write the weight, accumulated old weight and phase of the sample."""
 
     first_var, last_var = Var("first", torch.bool), Var("last", torch.bool)
+    phase_var = Var("sample_phase_bits", _INT)
+    step_weight = Var("step_weight", weight.type)
+    prev_weight = Var("prev_weight", weight.type)
     return (
         Let(first_var, first),
         Let(last_var, last),
-        _store(weight, cast(weight_source, weight.type)),
-        _store(phase, sample_phase(flags, first_var, last_var)),
+        Let(phase_var, sample_phase(flags, first_var, last_var)),
+        Let(step_weight, cast(weight_source, weight.type)),
+        Let(
+            prev_weight,
+            Select(
+                Compare(
+                    "!=", Binary("&", phase_var, Const(1, _INT)), Const(0, _INT)
+                ),
+                Const(0, weight.type),
+                accum_weight,
+            ),
+        ),
+        _store(weight, step_weight),
+        _store(old_weight, prev_weight),
+        _store(accum_weight, Binary("+", prev_weight, step_weight)),
+        _store(phase, phase_var),
     )
 
 
@@ -349,7 +368,9 @@ def statistics_control(
 
     weight_source = Param("weight_source", source, "read")
     weight = Param("weight", destination, "write")
-    controls = (_FLAGS, weight, _PHASE)
+    old_weight = Param("old_weight", destination, "write")
+    accum_weight = Param("accum_weight", destination, "read_write")
+    controls = (_FLAGS, weight, old_weight, accum_weight, _PHASE)
     if fixed:
         params = (_COUNTER, _CONTINUE, _COUNT, weight_source, *controls)
         advance = _fixed_advance(cell(_COUNTER), cell(_CONTINUE), cell(_COUNT))
@@ -376,6 +397,8 @@ def statistics_control(
                 weight_source=cell(weight_source),
                 flags=cell(_FLAGS),
                 weight=cell(weight),
+                old_weight=cell(old_weight),
+                accum_weight=cell(accum_weight),
                 phase=cell(_PHASE),
             ),
         ),

@@ -8,14 +8,16 @@
 
 :func:`attach` gives a :class:`~hydroforge.parallel.halo.HaloRuntime` its
 ``registry``: CUDA launches of ``halo.cu`` (peer stores, staging for NCCL
-and Gloo links) on the CUDA backend, torch operations elsewhere, both with
-the wire format the plan's message records describe. The exchange is a
-program step of its own: model kernels never take part in it.
+and Gloo links) on the CUDA backend, torch operations on the PyTorch
+reference backend, both with the wire format the plan's message records
+describe. Halo exchange is not registered on the Triton or Metal backends.
+The exchange is a program step of its own: model kernels never take part in it.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -187,6 +189,13 @@ def _nccl_step(runtime: HaloRuntime, sends, receives):
     return run
 
 
+@cache
+def _resident_mirror_blocks(device_index: int) -> int:
+    """Conservative co-resident CTA cap for fused ``halo_mirror`` launches."""
+
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
 def cuda_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]) -> list[Any]:
     """The launches (and NCCL step) of one exchange on the CUDA backend
     (halo.cu)."""
@@ -229,21 +238,29 @@ def cuda_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]) -> list[Any]:
 
     remote = staged("send") or staged("receive")
     if mode == "mirror" and not remote and sends and receives:
-        steps.append(
-            CudaLaunch(
-                "halo_mirror",
-                (grid([*sends, *receives]), len(sends) + len(receives)),
-                _THREADS,
-                (
-                    fields,
-                    ring,
-                    int32(send_first),
-                    int32(len(sends)),
-                    int32(receive_first),
-                ),
-            )
+        mirror_x = grid([*sends, *receives])
+        mirror_y = len(sends) + len(receives)
+        device_index = (
+            torch.cuda.current_device()
+            if runtime.device.index is None
+            else runtime.device.index
         )
-        return steps
+        if mirror_x * mirror_y <= _resident_mirror_blocks(device_index):
+            steps.append(
+                CudaLaunch(
+                    "halo_mirror",
+                    (mirror_x, mirror_y),
+                    _THREADS,
+                    (
+                        fields,
+                        ring,
+                        int32(send_first),
+                        int32(len(sends)),
+                        int32(receive_first),
+                    ),
+                )
+            )
+            return steps
     if sends:
         steps.append(
             CudaLaunch(
@@ -323,7 +340,7 @@ def _registry(runtime: HaloRuntime) -> BackendRegistry:
         spec,
         {
             "cuda": cuda,
-            **{name: torch_kernel for name in ("triton", "torch", "metal")},
+            "torch": torch_kernel,
         },
     )
 
