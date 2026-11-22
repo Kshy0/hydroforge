@@ -86,15 +86,15 @@ MAX_FIELDS = 8
 # messages ahead of the receiver's credits.
 DEPTH = 4
 CHUNK = 2048  # elements one block moves (four per thread)
-KINDS = ("key", "cell", "face")
-KEY, CELL, FACE = KINDS
+KINDS = ("key", "cell", "face", "cell1", "face1", "cell2", "face2")
+KEY, CELL, FACE = KINDS[:3]
+_FACE_KINDS = frozenset(KINDS[2::2])
 LINKS = ("peer", "nccl", "host")
 _LINK_CODE = {name: code for code, name in enumerate(LINKS)}
 _REPEATS = 32  # halo.cu: an accumulate receive adds into some row twice
 # A message record (halo.cu): peer, link, ring slot, staging slot, the row
 # table offset and row count of every kind, then (HaloPlan.levels per kind)
 # its rows within each depth.
-_RECORD = 4 + 2 * len(KINDS)
 _HEADER_ALIGN = 256
 # halo.cu accumulates these element types.
 _ADD_TYPES = {torch.float32: 1, torch.float64: 2, torch.int32: 3, torch.int64: 4}
@@ -129,6 +129,18 @@ def deeper(a: int, b: int) -> int:
 # --------------------------------------------------------------------------- #
 # Plan
 # --------------------------------------------------------------------------- #
+def slab_kind(kind: str, index: int) -> str:
+    """The halo kind of slab rows ``kind`` in the model's ``index``-th domain."""
+
+    return kind if index == 0 else f"{kind}{index}"
+
+
+def slab_kind_index(kind: str) -> int:
+    """The slab domain a cell or face halo kind belongs to."""
+
+    return (KINDS.index(kind) - 1) // 2
+
+
 def ghost_rows(
     rank_rows: Sequence[np.ndarray],
     references: Sequence[tuple[np.ndarray, Sequence[np.ndarray]]],
@@ -201,6 +213,10 @@ class HaloPlan:
             raise ValueError(f"unknown halo kinds {sorted(unknown)}")
         self.rank = rank
         self.world = len(next(iter(layouts.values())))
+        # Records list the kinds of one slab domain unless a model has more.
+        self.record_kinds = (
+            3 if set(layouts) <= set(KINDS[:3]) else len(KINDS)
+        )
         self.layouts = dict(layouts)
         self.pairs: dict[str, dict[tuple[int, int], tuple[np.ndarray, np.ndarray]]] = {}
         # Per kind and pair: the ghost rows' distances, in pair order.
@@ -277,7 +293,7 @@ class HaloPlan:
         at = np.clip(np.searchsorted(owned, stored), 1, owned.size) - 1
         below, above = owned[at], owned[np.minimum(at + 1, owned.size - 1)]
         distance = np.minimum(np.abs(stored - below), np.abs(stored - above))
-        if kind == FACE:
+        if kind in _FACE_KINDS:
             upper = stored > owned[-1]
             distance[upper] = np.maximum(distance[upper] - 1, 1)
         return distance.astype(np.int64)
@@ -441,6 +457,7 @@ def _open_peer_memory(
     if requested in ("auto", "ipc"):
         ipc = ipc_problem(gather_rank_facts(group, device))
         if ipc is None:
+            # PeerBuffers agrees across ranks: every rank falls back, or none.
             try:
                 buffers = PeerBuffers(
                     group, device, {"window": (nbytes, torch.uint8)}, "CUDA"
@@ -491,7 +508,7 @@ def pack_layouts(layouts: Sequence[FieldLayout]) -> tuple[int, int]:
     for index, layout in enumerate(layouts):
         if not 0 <= layout.axis < 16:
             raise ValueError("halo fields have at most sixteen dimensions")
-        code = (layout.axis << 2) | KINDS.index(layout.kind)
+        code = (layout.axis << 3) | KINDS.index(layout.kind)
         words[index // 4] |= code << (8 * (index % 4))
     return words[0], words[1]
 
@@ -501,7 +518,7 @@ def unpack_layouts(low: int, high: int, count: int) -> list[FieldLayout]:
     result = []
     for index in range(count):
         code = (words[index // 4] >> (8 * (index % 4))) & 0xFF
-        result.append(FieldLayout(KINDS[code & 3], code >> 2))
+        result.append(FieldLayout(KINDS[code & 7], code >> 3))
     return result
 
 
@@ -813,7 +830,7 @@ class HaloRuntime:
                     code = _LINK_CODE[link] | (_REPEATS if count > 1 else 0)
                     record = [peer, code, ring, message.stage]
                     offsets, counts = [], []
-                    for kind in KINDS:
+                    for kind in KINDS[: plan.record_kinds]:
                         values = kinds.get(kind, np.zeros(0, np.int64))
                         offsets.append(cursor)
                         counts.append(int(values.size))
@@ -822,7 +839,7 @@ class HaloRuntime:
                         cursor += int(values.size)
                     within = [
                         int(n)
-                        for kind in KINDS
+                        for kind in KINDS[: plan.record_kinds]
                         for n in levels.get(kind, np.zeros(plan.levels, np.int64))
                     ]
                     records.append(record + offsets + counts + within)
@@ -841,7 +858,7 @@ class HaloRuntime:
             dtype=torch.int32,
             device=device,
         )
-        self.record = _RECORD + len(KINDS) * plan.levels
+        self.record = 4 + plan.record_kinds * (2 + plan.levels)
         self.records = torch.tensor(
             np.array(records, np.int32).reshape(-1)
             if records
@@ -1109,6 +1126,8 @@ __all__ = [
     "HaloRuntime",
     "RowLayout",
     "code_layout",
+    "slab_kind",
+    "slab_kind_index",
     "covers",
     "deeper",
     "ghost_rows",

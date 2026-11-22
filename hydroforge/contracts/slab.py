@@ -16,6 +16,13 @@ from hydroforge.contracts.conditions import Condition, as_condition
 from hydroforge.core.naming import Identifier
 from hydroforge.core.validation import HydroForgeModel
 
+DEFAULT_DOMAIN = "slab"
+"""The spatial domain of a model declaring one ``slab_axis``."""
+PARTITION_DOMAIN = "partition"
+"""The spatial domain of the fields a model's ``partition_key`` decomposes."""
+MAX_SLAB_DOMAINS = 3
+"""Slab axes one model may decompose; every one spans the same spatial ranks."""
+
 CELL, FACE, INTERIOR = "cell", "face", "interior"
 """Kinds of slab axis: the cell rows, the faces staggering them (one more
 entry) and the interior rows of a padded axis."""

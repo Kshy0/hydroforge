@@ -26,6 +26,7 @@ from pydantic import (
     model_validator,
 )
 
+from hydroforge.contracts.coupling import Port
 from hydroforge.contracts.conditions import (
     declared_condition_errors,
     field_conditions,
@@ -35,7 +36,12 @@ from hydroforge.contracts.parameters import ParameterChange
 from hydroforge.contracts.precision import PrecisionTier, StorageTier
 from hydroforge.contracts.runtime import BackendRequirement, ModuleRequirement
 from hydroforge.contracts.schedule import SimulationSchedule
-from hydroforge.contracts.slab import SlabAxis
+from hydroforge.contracts.slab import (
+    DEFAULT_DOMAIN,
+    MAX_SLAB_DOMAINS,
+    PARTITION_DOMAIN,
+    SlabAxis,
+)
 from hydroforge.contracts.step_fields import (
     StepFieldProvider,
     compile_step_field_expressions,
@@ -75,6 +81,7 @@ _PARTITION_KEY = TypeAdapter(Identifier | None, config=_STRICT)
 _PARTITION_GROUP = TypeAdapter(Identifier, config=_STRICT)
 _GRID_AXES = TypeAdapter(FrozenMapping[Identifier, GridAxis], config=_STRICT)
 _SLAB = TypeAdapter(SlabAxis | None, config=_STRICT)
+_DOMAINS = TypeAdapter(FrozenMapping[Identifier, SlabAxis], config=_STRICT)
 
 
 def _grid_axes(cls: type[ModelDeclaration]) -> Mapping[str, GridAxis]:
@@ -131,6 +138,47 @@ def _contract_errors(
     return errors
 
 
+def _port_errors(modules: Mapping[str, ModuleSpec]) -> list[str]:
+    """Check that every port names a field and every import an export."""
+
+    errors: list[str] = []
+    for name, module in modules.items():
+        declared = module.module_type
+        for kind, ports in (("export", declared.exports), ("import", declared.imports)):
+            for port_name, port in ports.items():
+                if not isinstance(port, Port):
+                    errors.append(f"{name}.{port_name}: {kind} must be a Port")
+                elif port.field not in module.tensor_fields:
+                    errors.append(
+                        f"{name}.{port_name}: {kind} names no tensor field "
+                        f"{port.field!r}"
+                    )
+                elif port.dims is not None and (
+                    not port.dims
+                    or not set(port.dims)
+                    <= {
+                        item if not isinstance(item, str) else item.rsplit(".", 1)[-1]
+                        for item in module.tensor_fields[port.field].shape
+                    }
+                ):
+                    errors.append(
+                        f"{name}.{port_name}: dims {port.dims} are not dimensions "
+                        f"of {port.field!r}"
+                    )
+                elif kind == "export" and port.source is not None:
+                    errors.append(f"{name}.{port_name}: an export has no source")
+                elif kind == "import":
+                    provider, _, export = (port.source or "").partition(".")
+                    if provider not in modules or export not in (
+                        modules[provider].module_type.exports
+                    ):
+                        errors.append(
+                            f"{name}.{port_name}: import source {port.source!r} "
+                            "is no export of a module of this model"
+                        )
+    return errors
+
+
 def _model_spec(cls: type[ModelDeclaration]) -> ModelSpec:
     """Validate and freeze one model class declaration."""
 
@@ -155,7 +203,7 @@ def _model_spec(cls: type[ModelDeclaration]) -> ModelSpec:
     modules = {
         name: reference.module_type.spec() for name, reference in references.items()
     }
-    errors = _contract_errors(cls, modules)
+    errors = [*_contract_errors(cls, modules), *_port_errors(modules)]
     if len(errors) == 1:
         raise ValueError(errors[0])
     if errors:
@@ -163,11 +211,28 @@ def _model_spec(cls: type[ModelDeclaration]) -> ModelSpec:
             f"{cls.__name__} declares invalid contracts:\n  - " + "\n  - ".join(errors)
         )
     slab = _SLAB.validate_python(cls.slab_axis)
+    domains = _DOMAINS.validate_python(cls.spatial_domains)
     if slab is not None and cls.partition_key is not None:
         raise ValueError(
             "a model declares either a partition_key (row-wise partition groups) "
-            "or a slab axis (contiguous row blocks of a structured grid), not both"
+            "or a slab axis (contiguous row blocks of a structured grid), not both; "
+            "declare spatial_domains to decompose different modules differently"
         )
+    if slab is not None and domains:
+        raise ValueError("a model declares either slab_axis or spatial_domains")
+    if len(domains) > MAX_SLAB_DOMAINS:
+        raise ValueError(f"a model declares at most {MAX_SLAB_DOMAINS} slab domains")
+    if PARTITION_DOMAIN in domains:
+        raise ValueError(f"spatial domain name {PARTITION_DOMAIN!r} is reserved")
+    slabs = {DEFAULT_DOMAIN: slab} if slab is not None else dict(domains)
+    known = {*slabs, *(() if cls.partition_key is None else (PARTITION_DOMAIN,))}
+    for name, module in modules.items():
+        bound = module.module_type.spatial_domain
+        if bound is not None and bound not in known:
+            raise ValueError(
+                f"module {name!r} binds spatial domain {bound!r}; the model "
+                f"declares {sorted(known)}"
+            )
     return ModelSpec(
         model_type=cls,
         modules=MappingProxyType(modules),
@@ -181,7 +246,8 @@ def _model_spec(cls: type[ModelDeclaration]) -> ModelSpec:
         partition_key=_PARTITION_KEY.validate_python(cls.partition_key),
         partition_group=_PARTITION_GROUP.validate_python(cls.partition_group),
         grid_axes=_grid_axes(cls),
-        slab=slab,
+        slab=next(iter(slabs.values())) if len(slabs) == 1 else None,
+        slabs=MappingProxyType(slabs),
         step_fields=StepFieldPlan(
             providers=providers,
             expressions=compile_step_field_expressions(
@@ -506,6 +572,11 @@ class ModelDeclaration(HydroForgeModel):
     """Row-slab decomposition of one structured-grid axis over the spatial
     ranks (:class:`~hydroforge.contracts.slab.SlabAxis`); a staggered axis of
     it is a ``grid_axes`` entry that ``staggers`` the cell axis."""
+    spatial_domains: ClassVar[Mapping[str, SlabAxis]] = MappingProxyType({})
+    """Named slab decompositions of different grid axes, over the same spatial
+    ranks. A field belongs to the domain whose axis its shape names; a module
+    may declare ``spatial_domain`` to have that checked. Replaces ``slab_axis``
+    and may accompany a ``partition_key``."""
     grid_axes: ClassVar[Mapping[str, GridAxis]] = MappingProxyType({})
     """Names of symbolic dimensions as grid axes (``{"num_i": GridAxis(name=
     "west_east")}``); outputs name their dimensions and views select by them.

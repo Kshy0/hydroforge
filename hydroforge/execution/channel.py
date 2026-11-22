@@ -72,6 +72,8 @@ class StepEvent(IntEnum):
     BEGIN = 1
     STEP_FINALIZED = 4
     BODY_COMPLETE = 5
+    PREDICATE_SYNC = 6
+    OUTPUT_COMMITTED = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +137,9 @@ class LocalChannel:
 
     def event(self, kind: int, signature: tuple[int, int, int] = _NO_SIGNATURE) -> None:
         del kind, signature
+
+    def predicate_continue(self, continuing: bool) -> bool:
+        return bool(continuing)
 
     def abort(self) -> None:
         pass
@@ -392,6 +397,71 @@ class ProcessGroupChannel:
         """Match the next rank event or propagate a peer's local failure."""
 
         self._event(kind, signature)
+
+    def predicate_continue(self, continuing: bool) -> bool:
+        """Coordinate a halo-bearing predicate loop's exit decision on the
+        control plane so a peer failure in the loop body reaches waiting ranks."""
+
+        if self._terminal:
+            return False
+        preflight, self._preflight = self._preflight, None
+        begin_digest, self._begin_digest = self._begin_digest, 0
+        sequence = self.sequence
+        digest = flag = 0
+        if preflight is not None:
+            if preflight.digest is not None:
+                digest = (
+                    (sequence * 0x9E3779B97F4A7C15) ^ preflight.digest
+                ) & _DIGEST_MASK
+            else:
+                digest = digest63(
+                    (sequence, preflight.phase, preflight.resolved_signature())
+                )
+            flag = _PREFLIGHT | int(preflight.error is not None)
+        rows = self._rows(
+            StepEvent.PREDICATE_SYNC,
+            (int(bool(continuing)), 0, 0),
+            begin_digest,
+            digest,
+            flag,
+        )
+        ready = _full_records_ready(rows)
+        if not ready and any(
+            row[1] == StepEvent.TRANSACTION or row[7] & _PREFLIGHT for row in rows
+        ):
+            self._terminal = True
+            raise RuntimeError(
+                f"distributed transaction and managed-step events differ across ranks: {rows}"
+            )
+        if preflight is not None and (
+            len({(row[6], row[7]) for row in rows}) != 1 or rows[0][7] & _DETAILS
+        ):
+            self._resolve_preflight(sequence, preflight)
+        observed = tuple(tuple(row[:6]) for row in rows)
+        failed_ranks = tuple(
+            rank for rank, value in enumerate(observed) if value[1] == _FAILED
+        )
+        if failed_ranks:
+            self._terminal = True
+            raise PeerFailureError(
+                "model call failed on peer rank(s) before distributed "
+                f"event {sequence}: {failed_ranks}"
+            )
+        if (
+            len(
+                {
+                    (value[0], value[1], value[3], value[4], value[5])
+                    for value in observed
+                }
+            )
+            != 1
+        ):
+            self._terminal = True
+            raise RuntimeError(
+                "managed-step distributed event or collective ABI differs "
+                f"across ranks: {observed}"
+            )
+        return any(value[2] != 0 for value in observed)
 
     def abort(self) -> None:
         """Publish a caught local failure at the next synchronization event."""

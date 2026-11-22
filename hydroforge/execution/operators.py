@@ -246,6 +246,27 @@ class PredicateLoopOperator:
         self.loop.close()
 
 
+def reject_untracked_gradients(programs: Iterable[Any]) -> None:
+    """Refuse a captured launch that would silently lose a gradient.
+
+    A captured native program runs outside autograd. Eager programs track
+    gradients themselves, and a body under ``no_grad`` or ``inference_mode``
+    has asked for none, so warm steps there pay only the mode check.
+    """
+
+    if not torch.is_grad_enabled():
+        return
+    for program in programs:
+        if not program.eager and any(
+            tensor.requires_grad for tensor in program.referenced_tensors
+        ):
+            raise RuntimeError(
+                "a captured execution program reads a tensor that requires "
+                'grad and would lose its gradient: use execution_mode="eager", '
+                "an @adjoint_step, or run the step under torch.no_grad()"
+            )
+
+
 def launch_operators(
     operators: tuple[Any, ...],
     values: dict[int, Any],

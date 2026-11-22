@@ -395,19 +395,20 @@ class _StatisticsBinder:
             coordinate_sources=tuple(coordinate_sources.items()),
         )
 
-    def _slab_axis(self, tensor: TensorMetadata) -> tuple[int, str] | None:
-        """Position and kind of the slab axis in ``tensor``'s shape."""
+    def _slab_axis(self, tensor: TensorMetadata) -> tuple[int, str, Any] | None:
+        """Position and kind of the slab axis in ``tensor``'s shape, and the
+        rows of its domain."""
 
-        slab = self.runtime.slab
-        if slab is None:
+        from hydroforge.compiler.slab import domain_tokens
+
+        runtime = self.runtime
+        if not runtime.slabs:
             return None
-        from hydroforge.compiler.slab import slab_tokens
-
-        plan = self.runtime.plan
-        tokens = slab_tokens(plan.spec.slab, plan.spec.grid_axes)
+        tokens = domain_tokens(runtime.plan.spec.slabs, runtime.plan.spec.grid_axes)
         for position, token in enumerate(tensor.shape):
             if isinstance(token, str) and bare(token) in tokens:
-                return position, tokens[bare(token)]
+                domain, kind = tokens[bare(token)]
+                return position, kind, runtime.slabs[domain]
         return None
 
     def _slab_output_axis(
@@ -416,6 +417,7 @@ class _StatisticsBinder:
         axis: str,
         indices: tuple[int, ...] | None,
         kind: str,
+        slab: Any,
         tensors: dict[str, torch.Tensor],
     ) -> OutputAxis:
         """The owned rows of the slab axis, selected by the view's global rows.
@@ -425,7 +427,6 @@ class _StatisticsBinder:
         axis.
         """
 
-        slab = self.runtime.slab
         owned = slab.global_rows(kind)
         stored = slab.owned_slice(kind).start
         if indices is not None:
@@ -506,7 +507,7 @@ class _StatisticsBinder:
         view: OutputView,
         names: tuple[str, ...],
         extents: tuple[int, ...],
-        slab_axis: tuple[int, str] | None,
+        slab_axis: tuple[int, str, Any] | None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """This rank's paired points of ``view`` (global indices, one column
         per point) and their positions in the view's point list."""
@@ -516,8 +517,8 @@ class _StatisticsBinder:
             raise ValueError(f"point view for {name!r} exceeds grid extents {extents}")
         positions = np.arange(points.shape[1], dtype=np.int64)
         if slab_axis is not None:
-            position, kind = slab_axis
-            keep = np.isin(points[position], self.runtime.slab.global_rows(kind))
+            position, kind, slab = slab_axis
+            keep = np.isin(points[position], slab.global_rows(kind))
             points, positions = points[:, keep], positions[keep]
         return points, positions
 
@@ -526,7 +527,7 @@ class _StatisticsBinder:
         view: OutputUnion,
         names: tuple[str, ...],
         extents: tuple[int, ...],
-        slab_axis: tuple[int, str] | None,
+        slab_axis: tuple[int, str, Any] | None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """This rank's distinct cells of ``view`` (global indices, one column
         per cell) in row-major order, and their flat row-major indices on the
@@ -539,7 +540,7 @@ class _StatisticsBinder:
 
         owned = None
         if slab_axis is not None:
-            owned = self.runtime.slab.global_rows(slab_axis[1])
+            owned = slab_axis[2].global_rows(slab_axis[1])
         grid_axes = self.runtime.plan.spec.grid_axes
         found = [np.empty((0, len(names)), dtype=np.int64)]
         for part in view.parts:
@@ -653,7 +654,7 @@ class _StatisticsBinder:
         # global extents.
         extents = list(shape)
         if slab_axis is not None:
-            extents[slab_axis[0]] = self.runtime.slab.total_of(slab_axis[1])
+            extents[slab_axis[0]] = slab_axis[2].total_of(slab_axis[1])
         if located_axis is not None:
             extents[located_axis[0]] = located_axis[1].total
         view = declaration.views.get(name)
@@ -672,8 +673,7 @@ class _StatisticsBinder:
                 for i, axis in enumerate(names)
             )
             if slab_axis is not None and numbers.size:
-                position, kind = slab_axis
-                slab = self.runtime.slab
+                position, kind, slab = slab_axis
                 points[position] += (
                     slab.owned_slice(kind).start - slab.global_rows(kind)[0]
                 )
@@ -715,7 +715,9 @@ class _StatisticsBinder:
         ):
             if slab_axis is not None and position == slab_axis[0]:
                 axes.append(
-                    self._slab_output_axis(name, axis, indices, slab_axis[1], tensors)
+                    self._slab_output_axis(
+                        name, axis, indices, slab_axis[1], slab_axis[2], tensors
+                    )
                 )
             elif located_axis is not None and position == located_axis[0]:
                 axes.append(

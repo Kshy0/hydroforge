@@ -371,10 +371,11 @@ class StatisticsDeclarationCompiler:
                     f"statistics expression {name!r} reads {operand!r} at its own "
                     f"elements, so {operand!r} must have its shape {target}"
                 )
-        slab = self.selection.spec.slab
-        tokens = (
-            {} if slab is None else slab_tokens(slab, self.selection.spec.grid_axes)
-        )
+        slabs = self.selection.spec.slabs
+        tokens: dict[str, str] = {}
+        for declared in slabs.values():
+            tokens.update(slab_tokens(declared, self.selection.spec.grid_axes))
+        interior = tuple(axis for declared in slabs.values() for axis in declared.interior)
         for view in expression.views:
             field = self.fields[view.field].tensor
             if field.category == "virtual" and field.expression:
@@ -422,7 +423,7 @@ class StatisticsDeclarationCompiler:
                     raise ValueError(
                         f"{view.key} in {name!r}: the slab axis is cut over "
                         "ranks, so a slice may cut it only as [1:-1] onto its "
-                        f"interior axis {tuple(slab.interior)}, not {have!r} "
+                        f"interior axis {interior}, not {have!r} "
                         f"onto {want!r}"
                     )
                 if not cut and have != want:

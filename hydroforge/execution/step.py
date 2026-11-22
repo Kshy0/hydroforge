@@ -62,6 +62,7 @@ from hydroforge.execution.substeps import (
     adaptive_scope,
     fixed_scope,
     predicate_scope,
+    unsampled_fixed_scope,
 )
 from hydroforge.kernels.calls import recording_sink
 
@@ -250,6 +251,31 @@ class StepContext:
         self.scopes.append("outer")
         return (self.owner, "outer", site, occurrence, self.options_key, specialization)
 
+    def claim_unsampled_scope(
+        self, site: Any, specialization: Any, *, windowed: bool = False
+    ) -> tuple[Any, ...]:
+        """Return the cache key of one unsampled fixed scope and open it.
+
+        Like an outer scope, each occurrence of a lexical site is one program,
+        unless the scope is ``windowed``: its sub-intervals share one.
+        """
+
+        self._require_unnested("fixed")
+        if windowed:
+            occurrence = "windows"
+        else:
+            occurrence = self._outer_sites.get(site, 0)
+            self._outer_sites[site] = occurrence + 1
+        self.scopes.append("substep")
+        return (
+            self.owner,
+            "unsampled fixed",
+            site,
+            occurrence,
+            self.options_key,
+            specialization,
+        )
+
     def require_scopes_closed(self, depth: int = 0) -> None:
         """Reject a scope exited by ``break``/``return`` before completion."""
 
@@ -333,12 +359,36 @@ class ManagedStep:
         count: object = None,
         specialization: Any = None,
         final: Callable[[], None] | None = None,
+        sampled: bool = True,
+        span: tuple[int, int] | None = None,
     ):
-        """Declare one validated fixed physical-substep scope."""
+        """Declare one validated fixed physical-substep scope.
+
+        A step has at most one sampled fixed or adaptive scope, which feeds
+        statistics. ``sampled=False`` declares a further sequential loop (one
+        component of a multi-rate step) with its own explicit ``count``; it
+        never samples statistics. It covers the outer interval, or with
+        ``span=(index, parts)`` that sub-interval, whose ``outer_ticks`` start
+        at the window: one coupling window of a component.
+        """
 
         self._context.require_invocation(self)
-        return fixed_scope(
-            self._context, count=count, specialization=specialization, final=final
+        if sampled is True:
+            if span is not None:
+                raise ValueError("step.fixed(span=...) requires sampled=False")
+            return fixed_scope(
+                self._context, count=count, specialization=specialization, final=final
+            )
+        if sampled is not False:
+            raise TypeError("step.fixed(sampled=...) must be an exact bool")
+        caller = sys._getframe(1)
+        return unsampled_fixed_scope(
+            self._context,
+            site=(caller.f_code, caller.f_lasti),
+            count=count,
+            specialization=specialization,
+            final=final,
+            span=span,
         )
 
     def adaptive(
@@ -751,10 +801,9 @@ class _StepPolicy:
                 | int(context.output_enabled) << 1
                 | int(context.spinup),
             )
-            if self.runtime.structure_hooks:
-                channel.event(StepEvent.BEGIN, begin_sig)
-            else:
-                channel.stage_begin(begin_sig)
+            # Agree on invocation preflight and BEGIN metadata before any
+            # parameter change or model body can mutate device state.
+            channel.event(StepEvent.BEGIN, begin_sig)
             if progress is not None:
                 progress.begin_step(step)
             with self._parameter_transaction():
@@ -777,6 +826,8 @@ class _StepPolicy:
                     context.invocation = None
                     ACTIVE_STEP.reset(token)
                 prepared_output = context.prepare_finish()
+                if statistics is not None and prepared_output is None:
+                    statistics.sink.poll(current_time)
                 if progress is not None and progress.progress_tick(step):
                     emit(
                         self.runtime,
@@ -788,18 +839,27 @@ class _StepPolicy:
                         adaptive_time_step=context.completed_substeps,
                         progress=progress.format_progress(step),
                     )
-                channel.event(StepEvent.STEP_FINALIZED)
-                context.commit_finish(prepared_output)
-                if statistics is not None:
-                    statistics.sink.poll(current_time)
+                channel.event(
+                    StepEvent.STEP_FINALIZED,
+                    (int(prepared_output is not None), 0, 0),
+                )
+                if prepared_output is not None:
+                    context.commit_finish(prepared_output)
+                    if statistics is not None:
+                        statistics.sink.poll(current_time)
+                    # Confirm output commit across ranks before returning so
+                    # any rank-local write/status failure reaches peers here.
+                    channel.event(StepEvent.OUTPUT_COMMITTED)
                 context.commit_clock()
             return result
         except BaseException as error:
-            poison = entered_user_step or channel.distributed
+            poison = entered_user_step or (
+                channel.distributed and error is not channel.rejection
+            )
             resolved = self._fail(
                 snapshot,
                 error,
-                poison=poison and error is not channel.rejection,
+                poison=poison,
             )
             if resolved is error:
                 raise
@@ -861,8 +921,9 @@ def _step_method(function: _F, *, reverse: bool) -> _F:
         except BaseException as caught:
             error = caught
         preflight = None
-        if channel.distributed and materialized:
-            # A warm step publishes its preflight inside the next step event.
+        if channel.distributed and materialized and not runtime.structure_hooks:
+            # A warm step without structure hooks publishes its preflight inside
+            # StepEvent.BEGIN before any parameter change or model body runs.
             signature = (
                 None
                 if invocation is None

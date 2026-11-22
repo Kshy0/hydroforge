@@ -42,6 +42,7 @@ from netCDF4 import Dataset
 from pydantic import Field, InstanceOf, validate_call
 
 from hydroforge.contracts.options import HydroForgeOptionWarning, OptionsConfig
+from hydroforge.contracts.slab import DEFAULT_DOMAIN
 from hydroforge.core.errors import user_stacklevel
 from hydroforge.core.naming import validate_netcdf_name
 from hydroforge.core.validation import HydroForgeModel
@@ -207,10 +208,23 @@ def located_coordinate(dim: str) -> str:
     return LOCATED_PREFIX + dim
 
 
+def slab_coordinate(kind: str, domain: str = DEFAULT_DOMAIN) -> str:
+    """The row coordinate of slab rows ``kind`` in spatial ``domain``."""
+
+    base = SLAB_COORDINATES[kind]
+    return base if domain == DEFAULT_DOMAIN else f"{base}__{domain}"
+
+
+def is_slab_coordinate(name: str) -> bool:
+    """Whether ``name`` holds the global rows of a slab axis."""
+
+    return name.split("__", 1)[0] in SLAB_COORDINATES.values()
+
+
 def transient_coordinate(name: str) -> bool:
     """Whether ``name`` is a coordinate the merge consumes and drops."""
 
-    return name in SLAB_COORDINATES.values() or name.startswith(LOCATED_PREFIX)
+    return is_slab_coordinate(name) or name.startswith(LOCATED_PREFIX)
 
 
 def construction_dims(
@@ -538,7 +552,7 @@ def merge_construction_parts(
                         f"cover entities 0..{ids.size - 1} exactly once"
                     )
                 places[group] = ids
-            elif group in SLAB_COORDINATES.values():
+            elif is_slab_coordinate(group):
                 order.sort(key=lambda i: int(pieces[i][0]) if pieces[i].size else -1)
                 ids = np.concatenate([pieces[i] for i in order])
                 if not np.array_equal(ids, np.arange(ids.size)):

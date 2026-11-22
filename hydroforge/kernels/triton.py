@@ -233,6 +233,9 @@ class _TritonKernelImplementation(KernelImplementation):
         self.batch_layout = declaration.batch_layout
         self.check = declaration.check
         self.check_arguments = _check_arguments(spec, declaration.check)
+        self.launch = (
+            {} if declaration.num_warps is None else {"num_warps": declaration.num_warps}
+        )
 
     def _validate(self, call: KernelCall) -> None:
         if self.check is not None:
@@ -277,7 +280,9 @@ class _TritonKernelImplementation(KernelImplementation):
 
         def build():
             with proven.active():
-                options = {**launch_options(selected, physics=True), **static}
+                options = {
+                    **launch_options(selected, physics=True), **self.launch, **static
+                }
                 return selected.warmup(grid=grid, **options)
 
         return (warmup_request(build),)
@@ -288,7 +293,7 @@ class _TritonKernelImplementation(KernelImplementation):
             return empty_launch
         selected, grid, static = planned
         with proven_triton_device(triton_call_device(static.values())).active():
-            options = {**launch_options(selected, physics=True), **static}
+            options = {**launch_options(selected, physics=True), **self.launch, **static}
             return partial(selected[grid], **options)
 
 
@@ -299,7 +304,12 @@ class TritonKernel(KernelDeclaration):
     its ``batch_layout`` is ``"flat"`` (one thread per cell and member) or
     ``"loop"`` (one thread per cell looping over members).  ``kernel`` may then
     omit scalars used only by the batched layout.  ``check`` names canonical
-    values and raises on a call the kernels cannot serve.
+    values and raises on a call the kernels cannot serve.  ``num_warps`` sets
+    the warps of one program (Triton's default when ``None``): a kernel
+    holding one column per program in a short vector, whose serial loops
+    reduce that vector, keeps those reductions inside one warp with 1. The
+    warps lay out lanes, not arithmetic, so results do not change unless a
+    floating-point reduction combines several nonzero lanes.
     """
 
     toolchain: ClassVar[str] = "triton"
@@ -309,6 +319,7 @@ class TritonKernel(KernelDeclaration):
     batch_axis: Identifier | None = None
     batch_layout: Literal["flat", "loop"] = "flat"
     check: NamedCallable = None
+    num_warps: Literal[1, 2, 4, 8, 16, 32] | None = None
 
     def __init__(self, kernel: Any, /, **fields: Any) -> None:
         super().__init__(kernel=kernel, **fields)

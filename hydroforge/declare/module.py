@@ -45,6 +45,7 @@ from pydantic import (
     computed_field as pydantic_computed_field,
 )
 
+from hydroforge.contracts.coupling import Port
 from hydroforge.contracts.fields import TensorDependencies, TensorMetadata
 from hydroforge.contracts.options import OptionsConfig
 from hydroforge.contracts.precision import resolve_precisions, tier_of
@@ -902,6 +903,14 @@ class AbstractModule(HydroForgeModel, ABC):
     module_name: ClassVar[str] = "abstract"
     description: ClassVar[str] = "Abstract base module"
     conflicts: ClassVar[tuple[str, ...]] = ()
+    spatial_domain: ClassVar[str | None] = None
+    """The model's spatial domain this module's fields are decomposed over
+    (``"partition"`` for the partition key's); ``None`` leaves it to each
+    field's shape."""
+    exports: ClassVar[Mapping[str, Port]] = MappingProxyType({})
+    """Fields this module offers to others, by port name."""
+    imports: ClassVar[Mapping[str, Port]] = MappingProxyType({})
+    """Fields this module receives, by port name; each names its ``source``."""
     nc_excluded_fields: ClassVar[tuple[str, ...]] = MODEL_OWNED_MODULE_FIELDS
     """Fields owned by the model runtime rather than module input data."""
     opened_modules: tuple[str, ...] = Field(
@@ -1016,7 +1025,7 @@ class AbstractModule(HydroForgeModel, ABC):
 
     @property
     def slab(self) -> Any:
-        """This rank's rows of the model's slab axis, or ``None``.
+        """This rank's rows of this module's slab axis, or ``None``.
 
         A :class:`~hydroforge.parallel.slab.Slab`: the owned and ghost rows
         and the global row each stored row holds, for kernels whose logic

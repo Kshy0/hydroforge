@@ -35,6 +35,8 @@ from hydroforge.core.events import emit
 from hydroforge.data.input import InputProxy
 from hydroforge.io.construction_input import (
     SLAB_COORDINATES,
+    is_slab_coordinate,
+    slab_coordinate,
     located_coordinate,
     merge_construction_parts,
     transient_coordinate,
@@ -203,12 +205,9 @@ class CheckpointRuntime:
         """The slab axis of a field of a multi-rank slab model, by bare name."""
 
         runtime = self.runtime
-        slab = runtime.slab
-        if slab is None or slab.world == 1:
-            return None
         for qualified, info in runtime.plan.fields.slab.items():
             if qualified.rsplit(".", 1)[-1] == name:
-                return info
+                return None if runtime.slabs[info.domain].world == 1 else info
         return None
 
     def _located(self, name: str) -> tuple[Any, int] | None:
@@ -232,7 +231,7 @@ class CheckpointRuntime:
         runtime = self.runtime
         info = self._slab_field(name)
         if info is not None:
-            return runtime.slab.global_rows(info.kind)
+            return runtime.slabs[info.domain].global_rows(info.kind)
         located = self._located(name)
         if located is not None:
             return located[0].positions
@@ -249,7 +248,7 @@ class CheckpointRuntime:
 
         info = self._slab_field(name)
         if info is not None and isinstance(value, torch.Tensor) and rank is not None:
-            rows = self.runtime.slab.owned_slice(info.kind)
+            rows = self.runtime.slabs[info.domain].owned_slice(info.kind)
             return value.narrow(
                 value.ndim - rank + info.position, rows.start, rows.stop - rows.start
             )
@@ -329,7 +328,7 @@ class CheckpointRuntime:
             slab_info = self._slab_field(name)
             located = self._located(name)
             if slab_info is not None:
-                coordinate = SLAB_COORDINATES[slab_info.kind]
+                coordinate = slab_coordinate(slab_info.kind, slab_info.domain)
                 position = slab_info.position
             elif located is not None:
                 coordinate = located_coordinate(located[0].dim)
@@ -400,14 +399,16 @@ class CheckpointRuntime:
             groups[group_name] = coordinate
             distributed.append(group_name)
 
-        slab = runtime.slab
-        for kind, coordinate in SLAB_COORDINATES.items():
-            if coordinate in set(groups.values()):
-                # The owned global rows identify every part's rows; the merge
-                # joins parts by them and does not keep them.
-                values[coordinate] = slab.global_rows(kind)
-                groups[coordinate] = coordinate
-                distributed.append(coordinate)
+        if any(is_slab_coordinate(group) for group in groups.values()):
+            for domain, slab in runtime.slabs.items():
+                for kind in SLAB_COORDINATES:
+                    coordinate = slab_coordinate(kind, domain)
+                    if coordinate in set(groups.values()):
+                        # The owned global rows identify every part's rows;
+                        # the merge joins parts by them and does not keep them.
+                        values[coordinate] = slab.global_rows(kind)
+                        groups[coordinate] = coordinate
+                        distributed.append(coordinate)
         for dim, located in runtime.located.items():
             coordinate = located_coordinate(dim)
             if coordinate in set(groups.values()):

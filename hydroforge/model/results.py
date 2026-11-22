@@ -88,7 +88,10 @@ class ModelResults:
         start: int | None = None,
         stop: int | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
-        """Return isolated copies of one retained output, stacked over time."""
+        """Return detached copies of one retained output, stacked over time.
+
+        Published results are data; differentiate :meth:`accumulator`.
+        """
 
         op = _operation(op)
         return self._retained((name, op)).get(
@@ -103,7 +106,7 @@ class ModelResults:
         start: int | None = None,
         stop: int | None = None,
     ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
-        """Return isolated copies of every retained output by output name."""
+        """Return detached copies of every retained output by output name."""
 
         return self._retained().all(as_stacked=as_stacked, start=start, stop=stop)
 
@@ -116,7 +119,7 @@ class ModelResults:
 
     @_QUERY
     def pop(self, name: str, op: str = "mean") -> torch.Tensor | None:
-        """Pop the newest retained result without keeping its history."""
+        """Pop the newest retained result, detached, without its history."""
 
         op = _operation(op)
         return self._retained((name, op)).pop(StoragePlan.output(name, op))
@@ -128,7 +131,7 @@ class ModelResults:
         *,
         as_stacked: bool = True,
     ) -> dict[str, Any]:
-        """Copy and release the oldest retained samples; keep the timeline."""
+        """Copy, detached, and release the oldest samples; keep the timeline."""
 
         return self._retained().drain(max_steps, as_stacked=as_stacked)
 

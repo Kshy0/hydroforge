@@ -16,7 +16,10 @@ from hydroforge.execution.context import (
     close_runner,
     specialization_key,
 )
-from hydroforge.execution.operators import record_operator_scope
+from hydroforge.execution.operators import (
+    record_operator_scope,
+    reject_untracked_gradients,
+)
 from hydroforge.execution.substeps import Recorded, cached_program
 
 if TYPE_CHECKING:
@@ -54,6 +57,7 @@ class _OnceScope(InvocationScope):
             (context.time_step, context.requested_sub_steps),
             self._record,
         )
+        reject_untracked_gradients((program.operators,))
         program.launch()
         context.scopes.pop()
 

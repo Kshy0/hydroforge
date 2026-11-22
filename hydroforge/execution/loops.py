@@ -95,7 +95,7 @@ def conditional_capture_safe(*programs: Any) -> bool:
 def predicate_has_halo(*programs: Any) -> bool:
     """Return whether any recorded predicate loop program calls ``halo_exchange``."""
 
-    from hydroforge.execution.operators import CompiledKernelCall
+    from hydroforge.execution.operators import CompiledKernelCall, DeferredKernelCall
 
     pending = [program for program in programs if program is not None]
     while pending:
@@ -104,10 +104,11 @@ def predicate_has_halo(*programs: Any) -> bool:
             if isinstance(operator, PredicateLoopOperator):
                 if operator.loop.body is not None:
                     pending.append(operator.loop.body)
+            # A nested body binds before its parent's batch compiles its calls.
             elif (
-                isinstance(operator, CompiledKernelCall)
-                and getattr(getattr(operator.call, "spec", None), "name", None)
-                == "halo_exchange"
+                isinstance(operator, (CompiledKernelCall, DeferredKernelCall))
+                and operator.call is not None
+                and operator.call.implementation.spec.name == "halo_exchange"
             ):
                 return True
     return False
@@ -273,7 +274,7 @@ class PredicateLoop:
 
     def __init__(self, execution: ModelExecution, *, maximum_steps: int) -> None:
         self.executor = execution.executor
-        self._runtime = execution.runtime
+        self._runtime = getattr(execution, "runtime", None)
         self.maximum_steps = maximum_steps
         with _disable_current_modes(), torch.inference_mode(False):
             options = {"device": execution.device, "dtype": torch.int32}
@@ -291,7 +292,7 @@ class PredicateLoop:
             self.continue_flag = self.controls[2:3]
         self.body: Any = None
         self.runner: Any = None
-        self.sync_group: Any = None
+        self.sync_channel: Any = None
 
     @property
     def programs(self) -> tuple[Any, ...]:
@@ -313,8 +314,8 @@ class PredicateLoop:
 
         self.body = body
         plan = getattr(self._runtime, "plan", None)
-        self.sync_group = (
-            self._runtime.spatial_group()
+        self.sync_channel = (
+            self._runtime.channel
             if getattr(plan, "spatial_world_size", 1) > 1 and predicate_has_halo(body)
             else None
         )

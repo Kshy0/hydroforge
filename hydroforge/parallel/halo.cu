@@ -36,9 +36,6 @@ namespace hf_halo {
 
 constexpr int FIELDS = 8;  // hydroforge.parallel.halo.MAX_FIELDS
 constexpr int SLOTS = FIELDS + 1;  // exchanged fields and the clear field
-constexpr int KINDS = 3;
-constexpr int COUNTS = 4 + KINDS;  // a record's row count of each kind
-constexpr int WITHIN = 4 + 2 * KINDS;  // then its rows within each depth
 constexpr int LINK_PEER = 0;
 constexpr int REPEATS = 32;  // flag of the link word: some row is listed twice
 constexpr int LINK = 15;  // the link code bits
@@ -79,6 +76,7 @@ struct HaloRing {
     int32_t chunk;         // elements one block moves
     int32_t record;        // words of a message record
     int32_t levels;        // depths a record counts rows within
+    int32_t kinds;         // kinds a record lists
 };
 
 namespace hf_halo {
@@ -101,8 +99,8 @@ __device__ void layout(const HaloFields& f, const HaloRing& r, const int32_t* re
         if (k < f.count || (k == SLOTS - 1 && f.clear)) {
             const int depth = f.depth[k] < r.levels ? f.depth[k] : 0;
             out.first[k] = __ldg(rec + 4 + f.kind[k]);
-            out.rows[k] = __ldg(depth ? rec + WITHIN + f.kind[k] * r.levels + depth - 1
-                                      : rec + COUNTS + f.kind[k]);
+            out.rows[k] = __ldg(depth ? rec + 4 + 2 * r.kinds + f.kind[k] * r.levels + depth - 1
+                                      : rec + 4 + r.kinds + f.kind[k]);
             out.count[k] = int64_t(out.rows[k]) * f.outer[k] * f.inner[k];
         }
     }

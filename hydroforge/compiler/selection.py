@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -66,6 +67,7 @@ class Selection:
     parallel: EnsembleParallel | None
     partition_imbalance: float | None
     slab_periodic: bool
+    slab_periodics: Mapping[str, bool]
 
     @property
     def precision(self) -> Literal["float32", "float64"]:
@@ -201,6 +203,14 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
             raise ValueError(
                 f"module {name!r} requires simulation_schedule or initial_time"
             )
+    for name in opened:
+        for port_name, port in spec.modules[name].module_type.imports.items():
+            provider = port.source.partition(".")[0]
+            if provider not in opened:
+                raise ValueError(
+                    f"import {name}.{port_name} needs module {provider!r}, which "
+                    "is not open"
+                )
     # Option-required modules were opened by the declaration's
     # before-validator (on_missing="open") or checked above ("error").
     options = declaration.options
@@ -215,7 +225,7 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
         for field in spec.modules[name].tensor_fields.values()
     )
     needs_halo = spatial_world_size > 1 and (
-        spec.slab is not None or (spec.partition_key is not None and has_halo_fields)
+        bool(spec.slabs) or (spec.partition_key is not None and has_halo_fields)
     )
     device = declaration.device
     backend = resolve_backend(device, halo=needs_halo)
@@ -286,15 +296,18 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
     if not model_rule.ensemble and ensemble_size is not None:
         raise ValueError(f"backend {backend.name!r} does not support ensemble members")
 
-    slab_periodic = False
-    if spec.slab is not None and spec.slab.periodic is not None:
-        from hydroforge.contracts.conditions import ConditionContext
+    from hydroforge.contracts.conditions import ConditionContext
 
-        slab_periodic = bool(
-            spec.slab.periodic.evaluate(
+    slab_periodics = {
+        domain: declared.periodic is not None
+        and bool(
+            declared.periodic.evaluate(
                 ConditionContext(frozenset(opened), options=options)
             )
         )
+        for domain, declared in spec.slabs.items()
+    }
+    slab_periodic = len(slab_periodics) == 1 and next(iter(slab_periodics.values()))
     if needs_halo and backend.name not in ("cuda", "torch"):
         raise ValueError(
             f"halo exchange is not supported on backend {backend.name!r}; "
@@ -329,4 +342,5 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
         parallel=parallel,
         partition_imbalance=declaration.partition_imbalance,
         slab_periodic=slab_periodic,
+        slab_periodics=MappingProxyType(slab_periodics),
     )

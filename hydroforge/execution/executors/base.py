@@ -72,6 +72,11 @@ class LoopExecutor:
         self._resources.append((resource, finalizer))
         return resource
 
+    def owns(self, resource: Any) -> bool:
+        """Whether ``resource`` is registered and not yet released."""
+
+        return any(owned is resource for owned, _finalizer in self._resources)
+
     def release(self, resource: Any) -> None:
         """Release one owned resource and remove every retained reference."""
 

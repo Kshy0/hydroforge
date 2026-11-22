@@ -841,7 +841,13 @@ def compile_ir_scalar_variants(
             + "\n"
         )
         module, generated = _load_torch_module(source, name_prefix, 0)
-        entries = {key: getattr(module, names[key]) for key in variants}
+        try:
+            entries = {key: getattr(module, names[key]) for key in variants}
+        except BaseException:
+            with cleanup_on_exit(
+                "scalar IR setup", (partial(release_generated_module, *generated),)
+            ):
+                raise
 
         def close_torch() -> None:
             release_generated_module(*generated)
@@ -860,9 +866,16 @@ def compile_ir_scalar_variants(
         module_name = f"{name_prefix}_{uuid4().hex}"
         module = compile_generated_module(source, name=module_name)
         filename = module.__file__
-        launch = launch_triton_kernel(
-            getattr(module, function.name), (1,), physics=physics
-        )
+        try:
+            launch = launch_triton_kernel(
+                getattr(module, function.name), (1,), physics=physics
+            )
+        except BaseException:
+            with cleanup_on_exit(
+                "scalar IR setup",
+                (partial(release_generated_module, module_name, filename),),
+            ):
+                raise
 
         def run_triton(key: Any) -> None:
             spec = variants[key]

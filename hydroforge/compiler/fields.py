@@ -654,8 +654,9 @@ def plan_fields(
                 for entry in entries.values()
                 if entry.active and not entry.reference_index
             ),
-            spec.slab,
+            spec.slabs,
             spec.grid_axes,
+            {name: spec.modules[name].module_type.spatial_domain for name in opened},
         ),
         located=compile_located(
             (
@@ -663,7 +664,7 @@ def plan_fields(
                 for entry in entries.values()
                 if entry.active and not entry.reference_index
             ),
-            spec.slab,
+            spec.slabs,
             spec.grid_axes,
         ),
         inverse_sources=frozenset(

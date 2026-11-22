@@ -124,6 +124,17 @@ def _netcdf4_installer() -> str | None:
 _HDF5_PLUGIN_LOCK = RLock()
 
 
+def _reset_hdf5_plugin_lock_after_fork() -> None:
+    """A child must not inherit a lock held by a thread it does not have."""
+
+    global _HDF5_PLUGIN_LOCK
+    _HDF5_PLUGIN_LOCK = RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_hdf5_plugin_lock_after_fork)
+
+
 @cache
 def _ensure_hdf5_plugins_once() -> None:
     try:

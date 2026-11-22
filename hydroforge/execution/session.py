@@ -19,6 +19,7 @@ import torch
 
 from hydroforge.core.errors import (
     ResourceCleanupError,
+    cleanup_on_exit,
     distributed_failure_error,
     failure_description,
 )
@@ -180,9 +181,12 @@ class ModelRuntime:
         self.checkpoint = None
         self.parameters = None
         self.halo = None
+        # This rank's rows of every slab domain, and of the only one.
+        self.slabs: dict[str, Any] = {}
         self.slab = None
         # This rank's share of each located entity dimension (cut_located).
         self.located: dict[str, Any] = {}
+        self.remaps: dict[Any, Any] = {}
         self.topology = None
         self._halo_layouts: dict[int, tuple[Any, Any]] = {}
         self.fixed_parameters: Mapping[str, frozenset[str]] = MappingProxyType({})
@@ -196,7 +200,7 @@ class ModelRuntime:
         whose leading axis holds the partition key's owned and ghost rows;
         or a kernel workspace declared ``halo=True`` (:meth:`halo_workspace`)."""
 
-        from hydroforge.parallel.halo import CELL, FACE, KEY, FieldLayout
+        from hydroforge.parallel.halo import KEY, FieldLayout
 
         found = self._halo_layouts.get(id(tensor))
         if found is not None and found[0] is tensor:
@@ -227,7 +231,7 @@ class ModelRuntime:
         batched = int(module.is_batched(entry.name))
         if info is not None and info.kind != "interior":
             axis = len(entry.tensor.shape) - 1 - info.position
-            layout = FieldLayout(FACE if info.face else CELL, axis)
+            layout = FieldLayout(self._slab_halo_kind(info.kind, info.domain), axis)
         elif (
             halo is not None
             and KEY in halo.plan.kinds
@@ -262,7 +266,7 @@ class ModelRuntime:
         """
 
         from hydroforge.compiler.partition import bare
-        from hydroforge.compiler.slab import slab_tokens
+        from hydroforge.compiler.slab import domain_tokens
         from hydroforge.parallel.halo import CELL, FACE, KEY, FieldLayout
 
         halo, plan = self.halo, self.plan
@@ -270,16 +274,18 @@ class ModelRuntime:
             return shape, None
         names = [bare(dim) if isinstance(dim, str) else dim for dim in dims]
         layout = None
-        if plan.spec.slab is not None:
-            tokens = slab_tokens(plan.spec.slab, plan.spec.grid_axes)
-            hits = [
-                (position, tokens[name])
-                for position, name in enumerate(names)
-                if isinstance(name, str) and name in tokens
-            ]
-            if len(hits) == 1 and hits[0][1] in (CELL, FACE):
-                layout = FieldLayout(hits[0][1], len(shape) - 1 - hits[0][0])
-        elif KEY in halo.plan.kinds:
+        tokens = domain_tokens(plan.spec.slabs, plan.spec.grid_axes)
+        hits = [
+            (position, *tokens[name])
+            for position, name in enumerate(names)
+            if isinstance(name, str) and name in tokens
+        ]
+        if len(hits) == 1 and hits[0][2] in (CELL, FACE):
+            layout = FieldLayout(
+                self._slab_halo_kind(hits[0][2], hits[0][1]),
+                len(shape) - 1 - hits[0][0],
+            )
+        elif not hits and KEY in halo.plan.kinds:
             # Ensemble members may lead (one member whenever ranks exchange).
             position = 0
             while position < len(names) - 1 and names[position] == "ensemble_size":
@@ -353,9 +359,26 @@ class ModelRuntime:
         """Ghost rows on each side of a slab field's rows; 0 for partition
         key fields (their ghosts are whole rows, read or not)."""
 
-        from hydroforge.parallel.halo import KEY
+        from hydroforge.parallel.halo import KEY, slab_kind_index
 
-        return 0 if layout.kind == KEY or self.slab is None else self.slab.halo
+        if layout.kind == KEY or not self.slabs:
+            return 0
+        domains = tuple(self.plan.spec.slabs)
+        return self.slabs[domains[slab_kind_index(layout.kind)]].halo
+
+    def module_slab(self, name: str) -> Any:
+        """The rows of module ``name``'s slab domain (the only one unless it
+        binds one), or ``None``."""
+
+        bound = self.plan.spec.modules[name].module_type.spatial_domain
+        return self.slab if bound is None else self.slabs.get(bound)
+
+    def _slab_halo_kind(self, kind: str, domain: str) -> str:
+        """The halo kind of slab rows ``kind`` of ``domain``."""
+
+        from hydroforge.parallel.halo import slab_kind
+
+        return slab_kind(kind, tuple(self.plan.spec.slabs).index(domain))
 
     def _halo_rows(self) -> tuple[dict[str, Any], dict[str, int]]:
         """Every rank's rows of each halo kind (the partition's ghost rows,
@@ -366,7 +389,7 @@ class ModelRuntime:
         from hydroforge.parallel.halo import CELL, FACE, KEY, partition_layouts
         from hydroforge.parallel.slab import slab_layouts
 
-        plan, slab = self.plan, self.slab
+        plan = self.plan
         layouts = {}
         row_bytes = {}
         rows = self.partition.halo_rows()
@@ -398,9 +421,11 @@ class ModelRuntime:
                         )
                     )
             row_bytes[KEY] = max(widths or [8])
-        if slab is not None and slab.world > 1:
+        for domain, slab in self.slabs.items():
+            if slab.world == 1:
+                continue
             positions = self.topology.positions()
-            slabs = [
+            ranks = [
                 type(slab).build(
                     rank,
                     slab.world,
@@ -411,9 +436,11 @@ class ModelRuntime:
                 )
                 for rank in range(slab.world)
             ]
-            layouts[CELL] = slab_layouts(slabs, CELL)
-            layouts[FACE] = slab_layouts(slabs, FACE)
+            layouts[self._slab_halo_kind(CELL, domain)] = slab_layouts(ranks, CELL)
+            layouts[self._slab_halo_kind(FACE, domain)] = slab_layouts(ranks, FACE)
             for qualified, info in plan.fields.slab.items():
+                if info.domain != domain:
+                    continue
                 entry = plan.fields.entries[qualified]
                 module = self.modules.get(entry.module)
                 if module is None or info.kind == "interior" or not info.halo:
@@ -422,9 +449,8 @@ class ModelRuntime:
                 if shape is None:
                     continue
                 pos = info.position + int(module.is_batched(entry.name))
-                kind = FACE if info.face else CELL
-                width = 8 * (
-                    int(np.prod(shape, dtype=np.int64)) // max(shape[pos], 1)
+                kind = self._slab_halo_kind(info.kind, domain)
+                width = 8 * (                    int(np.prod(shape, dtype=np.int64)) // max(shape[pos], 1)
                 )
                 row_bytes[kind] = max(row_bytes.get(kind, 8), width)
         return layouts, row_bytes
@@ -465,6 +491,15 @@ class ModelRuntime:
             **({} if slab is None else {"slab_rows": (slab.start, slab.stop)}),
         )
 
+    def _close_remaps(self) -> None:
+        """Release the cached exchanges (``exchange_``) and their halos."""
+
+        remaps, self.remaps = self.remaps, {}
+        with cleanup_on_exit(
+            "exchange release", tuple(item.close for item in remaps.values())
+        ):
+            pass
+
     def _release(self) -> list[BaseException]:
         """Attempt every release of one materialization; return the failures.
 
@@ -474,9 +509,12 @@ class ModelRuntime:
         """
 
         releases = [
-            resource.close
-            for resource in (self.statistics, self.execution, self.halo)
-            if resource is not None
+            self._close_remaps,
+            *(
+                resource.close
+                for resource in (self.statistics, self.execution, self.halo)
+                if resource is not None
+            ),
         ]
         if self.model_state_entered:
             releases.append(self.owner.release_model_state)
@@ -642,9 +680,10 @@ class ModelRuntime:
             else Topology.single(plan.spatial_world_size)
         )
         self.partition = PartitionRuntime(plan, self.input, self.topology)
-        from hydroforge.execution.slab import build_slab, cut_located
+        from hydroforge.execution.slab import build_slabs, cut_located
 
-        self.slab = build_slab(plan, self.input, self.topology)
+        self.slabs = build_slabs(plan, self.input, self.topology)
+        self.slab = next(iter(self.slabs.values())) if len(self.slabs) == 1 else None
         # Every input-dependent check completes before any output side effect.
         # The model's hook sees complete located tables; the rank keeps its own.
         payloads = prepare_payloads(
@@ -849,7 +888,7 @@ class ModelRuntime:
                     defaults=MappingProxyType(view._default_values),
                     missing=missing[name],
                     ghosts=ghosts,
-                    slab=self.slab,
+                    slab=self.module_slab(name),
                 ),
             )
         self.input.clear_cache()
@@ -1118,7 +1157,16 @@ class ModelRuntime:
                 status = error
         if healthy and self.halo is not None and self.plan.device.type == "cuda":
             if torch.cuda.is_available():
-                torch.cuda.synchronize(self.plan.device)
+                try:
+                    torch.cuda.synchronize(self.plan.device)
+                except BaseException as error:
+                    status = (
+                        error
+                        if status is None
+                        else ResourceCleanupError(
+                            "model close device synchronization", (status, error)
+                        )
+                    )
         if self.channel.distributed:
             # Every rank learns whether kernels failed on any rank: one that
             # has not failed yet fails its close with them.

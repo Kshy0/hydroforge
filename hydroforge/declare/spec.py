@@ -134,6 +134,7 @@ class ModelSpec:
     partition_group: str
     grid_axes: Mapping[str, GridAxis]
     slab: SlabAxis | None
+    slabs: Mapping[str, SlabAxis]
     step_fields: StepFieldPlan
     kernel_fields: tuple[str, ...]
     authored_fields: tuple[str, ...]

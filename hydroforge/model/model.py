@@ -192,6 +192,12 @@ class AbstractModel(ModelDeclaration, ABC):
 
         return ModelRuntime.of(self).slab
 
+    @property
+    def slabs(self) -> Mapping[str, Slab]:
+        """This rank's rows of every slab domain, by domain name."""
+
+        return MappingProxyType(ModelRuntime.of(self).slabs)
+
     def checkpoint_inputs(self) -> Mapping[str, Any]:
         """Construction values a checkpoint saves instead of the live ones.
 

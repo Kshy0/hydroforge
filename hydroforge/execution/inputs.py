@@ -307,15 +307,15 @@ class InputBinding:
                 )
         return MappingProxyType(axes)
 
-    def _compile_slab_axes(self) -> Mapping[str, tuple[int, str]]:
+    def _compile_slab_axes(self) -> Mapping[str, tuple[int, str, str]]:
         """Stored axis of the slab dimension of each present input field,
         and its kind (cells, faces or interior rows)."""
 
-        slab: dict[str, tuple[int, str]] = {}
+        slab: dict[str, tuple[int, str, str]] = {}
         for qualified, info in self.plan.fields.slab.items():
             name = qualified.rsplit(".", 1)[-1]
             if name in self.proxy and name in self.fields:
-                slab[name] = (self.axes[name] + info.position, info.kind)
+                slab[name] = (self.axes[name] + info.position, info.kind, info.domain)
         return MappingProxyType(slab)
 
     def _compile_located_axes(self) -> Mapping[str, int]:
@@ -474,20 +474,20 @@ def shard_inputs(runtime: ModelRuntime) -> dict[str, Any]:
         group = groups.get(name)
         return (0, "", name) if group is None else (1, group, name)
 
-    slab = runtime.slab
-    rows_of: dict[str, Any] = (
-        {}
-        if slab is None
-        else {kind: slab.rows_of(kind) for kind in (CELL, FACE, INTERIOR)}
-    )
+    rows_of: dict[tuple[str, str], Any] = {
+        (domain, kind): slab.rows_of(kind)
+        for domain, slab in runtime.slabs.items()
+        for kind in (CELL, FACE, INTERIOR)
+    }
     sliced: list[str] = []
     for name in sorted(source.fields, key=field_order):
         if name not in source:
             missing.append(name)
             continue
         group = groups.get(name)
-        if group is None and slab is not None and name in source.slab_axes:
-            result[name] = source.read_local(name, rows_of[source.slab_axes[name][1]])
+        if group is None and name in source.slab_axes:
+            _axis, kind, domain = source.slab_axes[name]
+            result[name] = source.read_local(name, rows_of[(domain, kind)])
             sliced.append(name)
             continue
         if group is None:
@@ -537,8 +537,11 @@ def shard_inputs(runtime: ModelRuntime) -> dict[str, Any]:
             "Loaded slab rows of grid fields",
             rank=plan.rank,
             fields=tuple(sliced),
-            rows=slab.rows,
-            owned=(slab.start, slab.stop),
+            rows={domain: slab.rows for domain, slab in runtime.slabs.items()},
+            owned={
+                domain: (slab.start, slab.stop)
+                for domain, slab in runtime.slabs.items()
+            },
         )
     if full:
         emit(
@@ -622,7 +625,7 @@ def prepare_payloads(
                     event_sink=runtime.event_sink,
                     prepared=True,
                     ghosts=ghosts,
-                    slab=runtime.slab,
+                    slab=runtime.module_slab(name),
                 ),
                 defer_defaults=True,
             )

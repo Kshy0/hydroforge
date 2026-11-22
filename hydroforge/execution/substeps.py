@@ -18,6 +18,7 @@ import math
 from collections import OrderedDict
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
+from datetime import timedelta
 from functools import lru_cache
 from typing import Any, Final
 
@@ -27,6 +28,7 @@ from torch.utils._python_dispatch import _disable_current_modes
 
 from hydroforge.core.devices import devices_match
 from hydroforge.core.errors import SubstepCompileError, cleanup_on_exit
+from hydroforge.core.time import timedelta_microseconds
 from hydroforge.core.validation import HydroForgeModel
 from hydroforge.execution.context import (
     InvocationScope,
@@ -37,7 +39,10 @@ from hydroforge.execution.context import (
 )
 from hydroforge.execution.halo_schedule import written_storages
 from hydroforge.execution.loops import AdaptiveLoop, FixedLoop, PredicateLoop
-from hydroforge.execution.operators import record_operator_scope
+from hydroforge.execution.operators import (
+    record_operator_scope,
+    reject_untracked_gradients,
+)
 from hydroforge.kernels.calls import recording_sink
 
 _MISSING_PROGRAM = object()
@@ -349,13 +354,82 @@ class _PredicateLoopRequest(HydroForgeModel):
     maximum_steps: int = Field(ge=1, lt=INVALID_SUBSTEP_COUNT)
 
 
-def _execute(context: Any, program: Any, *arguments: int | float) -> int:
+@dataclass(frozen=True, slots=True)
+class _SpanClock:
+    """The committed clock as a sub-interval's loop reads it."""
+
+    elapsed_microseconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Span:
+    """One sub-interval of the outer step, on whole microseconds."""
+
+    clock: _SpanClock
+    duration: timedelta
+    seconds: float
+
+
+def _resolve_span(context: Any, span: object) -> _Span | None:
+    """Sub-interval ``index`` of ``parts``; the parts tile the outer step."""
+
+    if span is None:
+        return None
+    if (
+        type(span) is not tuple
+        or len(span) != 2
+        or any(type(value) is not int for value in span)
+        or not 0 <= span[0] < span[1]
+    ):
+        raise ValueError(
+            "step.fixed(span=...) must be (index, parts) with 0 <= index < parts"
+        )
+    index, parts = span
+    total = timedelta_microseconds(context.duration)
+    first, last = total * index // parts, total * (index + 1) // parts
+    if last <= first:
+        raise ValueError(
+            f"step.fixed(span={span!r}) is empty in a {total} microsecond step"
+        )
+    return _Span(
+        _SpanClock(context.clock.elapsed_microseconds + first),
+        timedelta(microseconds=last - first),
+        (last - first) / 1_000_000,
+    )
+
+
+class _UnsampledStep:
+    """The step as an unsampled fixed loop sees it: its interval, no samples."""
+
+    __slots__ = ("clock", "duration")
+    fold = False
+    sampling = False
+
+    def __init__(self, context: Any, span: _Span | None = None) -> None:
+        self.clock = context.clock if span is None else span.clock
+        self.duration = context.duration if span is None else span.duration
+
+    def sample(self, *, first: bool, last: bool, weight: float) -> None:
+        del first, last, weight
+
+
+def _execute(
+    context: Any,
+    program: Any,
+    *arguments: int | float,
+    sampled: bool = True,
+    span: _Span | None = None,
+) -> int:
     """Run one fixed or adaptive program and close its scope."""
 
+    reject_untracked_gradients(program.programs)
     # Ghost rows the loop body assumes current at its entry.
     program.halo_entry.enter(context.execution)
-    completed = program.execute(*arguments, context)
-    context.completed_substeps = completed
+    if sampled:
+        completed = program.execute(*arguments, context)
+        context.completed_substeps = completed
+    else:
+        completed = program.execute(*arguments, _UnsampledStep(context, span))
     context.scopes.pop()
     return completed
 
@@ -368,22 +442,29 @@ class _FixedScope(InvocationScope):
         key: tuple[Any, ...],
         count: int,
         final: Callable[[], None] | None,
+        sampled: bool = True,
+        span: _Span | None = None,
     ) -> None:
         super().__init__(context)
         self.key = key
         self.count = count
         self.final = final
+        self.sampled = sampled
+        self.span = span
         self.completed = 0
 
     def _iterate(self) -> Generator[SubstepFrame, None, None]:
         context = self.context
+        width = context.time_step if self.span is None else self.span.seconds
         program = yield from cached_program(
             context.execution,
             self.key,
-            (context.time_step, self.count),
+            (width, self.count),
             self._record,
         )
-        self.completed = _execute(context, program, self.count, context.time_step)
+        self.completed = _execute(
+            context, program, self.count, width, sampled=self.sampled, span=self.span
+        )
 
     def _record(self) -> Generator[SubstepFrame, None, Recorded]:
         context = self.context
@@ -627,6 +708,44 @@ def fixed_scope(
         "fixed", (specialized, ("final", final is not None))
     )
     return _FixedScope(context, key=key, count=resolved, final=final)
+
+
+def unsampled_fixed_scope(
+    context: Any,
+    *,
+    site: tuple[Any, int],
+    count: object,
+    specialization: Any,
+    final: Callable[[], None] | None,
+    span: object = None,
+) -> _FixedScope:
+    """Declare a further fixed loop without samples.
+
+    It leaves the step's one sampled scope available. ``count`` is required:
+    a driver's ``num_sub_steps`` describes the sampled scope. ``span=(index,
+    parts)`` runs it over that sub-interval of the outer step, and every
+    index of one lexical site shares one program: what differs between
+    windows must come from the frame or ``specialization``.
+    """
+
+    validate_callback(final, arguments=0, label="fixed final")
+    if type(count) is not int:
+        raise ValueError("step.fixed(sampled=False) requires an exact integer count")
+    resolved = _fixed_count(count, None)
+    resolved_span = _resolve_span(context, span)
+    key = context.claim_unsampled_scope(
+        site,
+        (specialization_key(specialization), ("final", final is not None)),
+        windowed=resolved_span is not None,
+    )
+    return _FixedScope(
+        context,
+        key=key,
+        count=resolved,
+        final=final,
+        sampled=False,
+        span=resolved_span,
+    )
 
 
 def _tensor_identity(tensor: Any) -> tuple[Any, ...]:

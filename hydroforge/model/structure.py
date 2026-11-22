@@ -783,6 +783,18 @@ def model_structure(model: AbstractModel) -> dict[str, Any]:
             "ghosts": [slab.lower, slab.upper],
             "position": slab.position,
         }
+    domains = {} if live is None else getattr(live, "slabs", {})
+    partition["domains"] = {
+        domain: {
+            "axis": spec.slabs[domain].dim,
+            "halo": spec.slabs[domain].halo,
+            "periodic": plan.slab_periodics[domain],
+            "rows": value.total,
+            "owned": [value.start, value.stop],
+            "ghosts": [value.lower, value.upper],
+        }
+        for domain, value in domains.items()
+    }
     execution = None if live is None else getattr(live, "execution", None)
     for name, reducer in getattr(execution, "reducers", {}).items():
         partition["reduce"][name] = {

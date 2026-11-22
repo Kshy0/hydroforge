@@ -26,6 +26,7 @@ from hydroforge.contracts.options import (
     option,
     validate_option_groups,
 )
+from hydroforge.contracts.coupling import Port
 from hydroforge.contracts.parameters import ParameterChange
 from hydroforge.contracts.runtime import (
     BackendRequirement,
@@ -68,6 +69,7 @@ __all__ = [
     "FieldDemandPlan",
     "ForcingOptionField",
     "GridAxis",
+    "Port",
     "SlabAxis",
     "HydroForgeOptionWarning",
     "Indices",

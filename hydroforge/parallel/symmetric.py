@@ -211,18 +211,32 @@ class PeerBuffers:
     ) -> None:
         import torch.distributed as dist
 
-        symm_mem = symmetric_memory(memory, device)
-        if not symm_mem.is_symm_mem_enabled_for_group(group.group_name):
-            symm_mem.enable_symm_mem_for_group(group.group_name)
         self.memory = memory
         self.world = dist.get_world_size(group)
         self.tensors: dict[str, torch.Tensor] = {}
         addresses: dict[str, list[int]] = {}
-        for name, (numel, dtype) in buffers.items():
-            tensor = symm_mem.empty(max(numel, 1), dtype=dtype, device=device)
-            handle = symm_mem.rendezvous(tensor, group=group)
-            self.tensors[name] = tensor
-            addresses[name] = list(handle.buffer_ptrs)
+        # Every rank reaches both agreements, whatever failed on it, so no
+        # rank is left in a collective its peers abandoned.
+        problem = None
+        symm_mem = None
+        try:
+            symm_mem = symmetric_memory(memory, device)
+            if not symm_mem.is_symm_mem_enabled_for_group(group.group_name):
+                symm_mem.enable_symm_mem_for_group(group.group_name)
+            for name, (numel, dtype) in buffers.items():
+                self.tensors[name] = symm_mem.empty(
+                    max(numel, 1), dtype=dtype, device=device
+                )
+        except (RuntimeError, ValueError) as error:
+            problem = f"{type(error).__name__}: {error}"
+        agree(group, problem, setup="symmetric buffer allocation")
+        try:
+            for name, tensor in self.tensors.items():
+                handle = symm_mem.rendezvous(tensor, group=group)
+                addresses[name] = list(handle.buffer_ptrs)
+        except (RuntimeError, ValueError) as error:
+            problem = f"{type(error).__name__}: {error}"
+        agree(group, problem, setup="symmetric buffer rendezvous")
         mapped = all(
             len(values) == self.world and all(values) for values in addresses.values()
         )

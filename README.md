@@ -174,6 +174,51 @@ and construct the same model with that input. Supply a new
 compatible forcing. The checkpoint does not choose the continuation schedule
 for you.
 
+## Coupling modules
+
+One model schedules its modules; a component such as an atmosphere or an ocean
+is a module. `spatial_domains` names one slab decomposition per grid, over the
+same spatial ranks, and may accompany a `partition_key`. A module states its
+domain with `spatial_domain`, and a field belongs to the domain its shape names.
+
+Modules declare what they exchange. `exports` and `imports` are checked when
+the model class is defined, and `exchange_` runs an import through a weighted
+link table of global point IDs, held as ordinary fields of a coupling module
+so that they and any accumulators are checkpointed. A slab field's IDs index
+its `Port.dims` row-major over their global extents (default: every
+dimension, so `(lat, lon)` cells); a partition field's are coordinate IDs and
+located entities' their place in the complete table. Other dimensions are
+carried along each point and must match between the two ends:
+
+```python
+class Atmosphere(AbstractModule):
+    spatial_domain = "air"
+    exports = {"heat": Port("heat_mean"),  # (num_ja, num_ia) cells
+               "tracer": Port("tracer", dims=("num_ja", "num_ia"))}  # carries ch
+
+class Ocean(AbstractModule):
+    spatial_domain = "sea"
+    imports = {"heat": Port("heat_in", source="atmosphere.heat"),
+               "tracer": Port("tracer_in", source="atmosphere.tracer",
+                              dims=("num_jo", "num_io"))}
+
+class Coupled(AbstractModel):
+    spatial_domains = {"air": SlabAxis(dim="num_ja", halo=2),
+                       "sea": SlabAxis(dim="num_jo", halo=1)}
+
+    @managed_step
+    def step_advance(self, step):
+        ...  # component scopes
+        exchange_(self, "ocean.heat", target_ids=links.target,
+                  source_ids=links.source, weights=links.weight)
+```
+
+The result does not depend on the rank count. The exchange runs between
+scopes: each rank receives, point to point over the halo links, only the
+source points its own links need, so its memory and messages scale with its
+share of the grids rather than with the table. Under CUDA graphs it is
+captured at its first call.
+
 ## Physical substep time
 
 Kernels inside `step.fixed()` or `step.adaptive()` can declare read-only
@@ -197,6 +242,35 @@ clock_inputs = {
 (`2**-30` seconds) when a calculation needs seconds. A model-specific
 initial time offset can be added before conversion; do not accumulate a
 second floating clock in the model.
+
+A step has at most one sampled `step.fixed()` or `step.adaptive()` scope, which
+feeds statistics. Components that subcycle at other rates over the same outer
+interval run in further sequential scopes that never sample:
+
+```python
+for _ in step.fixed(count=atmosphere_steps, sampled=False):
+    advance_atmosphere()
+for _ in step.fixed(count=land_steps, sampled=False):
+    advance_land()
+for _ in step.fixed(count=ocean_steps):  # the sampled scope
+    advance_ocean()
+```
+
+`span=(index, parts)` runs an unsampled scope over one sub-interval, so a step
+can alternate components across coupling windows. Every window of one call site
+shares one compiled program, and `outer_ticks` starts at the window. Statistics
+still come from the one sampled scope: when every component subcycles inside
+the windows, end the step with a sampled scope that publishes the diagnostics.
+
+```python
+for window in range(windows):
+    for _ in step.fixed(count=atmosphere_steps, sampled=False, span=(window, windows)):
+        advance_atmosphere()
+    for _ in step.fixed(count=ocean_steps, sampled=False, span=(window, windows)):
+        advance_ocean()
+for _ in step.fixed(count=1):
+    publish_diagnostics()
+```
 
 The outer clock accumulates successful step durations as integer
 microseconds, with each cumulative endpoint rounded to the nearest tick.

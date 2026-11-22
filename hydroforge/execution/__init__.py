@@ -13,6 +13,7 @@ from hydroforge.execution.collectives import (
     reduce_,
     reduce_many_,
 )
+from hydroforge.execution.remap import exchange_
 from hydroforge.execution.step import ManagedStep, adjoint_step, managed_step
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "all_reduce_",
     "all_reduce_many_",
     "between_steps",
+    "exchange_",
     "ManagedStep",
     "managed_step",
     "reduce_",

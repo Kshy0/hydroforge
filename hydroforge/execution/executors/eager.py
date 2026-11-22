@@ -13,7 +13,6 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
-from torch import distributed as dist
 
 from hydroforge.execution.executors.base import DirectRunner, LoopExecutor
 
@@ -114,16 +113,13 @@ class EagerPredicate:
     def run(self) -> None:
         loop = self.loop
         loop.reset()
-        sync_group = getattr(loop, "sync_group", None)
+        sync_channel = getattr(loop, "sync_channel", None)
         while True:
             loop.iterate()
-            if sync_group is not None:
-                dist.all_reduce(
-                    loop.continue_flag,
-                    op=dist.ReduceOp.MAX,
-                    group=sync_group,
-                )
-            if int(loop.continue_flag.item()) == 0:
+            continuing = int(loop.continue_flag.item()) != 0
+            if sync_channel is not None:
+                continuing = sync_channel.predicate_continue(continuing)
+            if not continuing:
                 break
 
     def close(self) -> None:

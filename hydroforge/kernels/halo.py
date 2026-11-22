@@ -221,6 +221,7 @@ def cuda_steps(runtime: HaloRuntime, arguments: Mapping[str, Any]) -> list[Any]:
         int32(CHUNK),
         int32(runtime.record),
         int32(runtime.plan.levels),
+        int32(runtime.plan.record_kinds),
     )
 
     def staged(direction: str) -> list[tuple[_Message, int]]:

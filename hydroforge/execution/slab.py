@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from hydroforge.compiler.partition import bare
-from hydroforge.contracts.slab import CELL, FACE, INTERIOR
+from hydroforge.contracts.slab import CELL, DEFAULT_DOMAIN, FACE, INTERIOR
 from hydroforge.core.events import emit
 from hydroforge.parallel.slab import Slab
 
@@ -30,17 +30,44 @@ if TYPE_CHECKING:
     from hydroforge.parallel.topology import Topology
 
 
+def build_slabs(
+    plan: ModelPlan, source: InputBinding, topology: Topology
+) -> dict[str, Slab]:
+    """This rank's rows of every slab domain of the model."""
+
+    return {
+        domain: _build_slab(
+            plan, source, topology, domain, declared, plan.slab_periodics[domain]
+        )
+        for domain, declared in plan.spec.slabs.items()
+    }
+
+
 def build_slab(
     plan: ModelPlan, source: InputBinding, topology: Topology
 ) -> Slab | None:
-    """This rank's rows, from the row count every input holding the axis
-    agrees on (``None`` for a model without a slab axis). Blocks follow the
-    ranks' node order, so neighbouring blocks share a node where they can."""
+    """This rank's rows of a model's only slab axis, or ``None``."""
 
     declared = plan.spec.slab
     if declared is None:
         return None
-    if plan.slab_periodic and declared.interior and plan.spatial_world_size > 1:
+    domain = next(iter(getattr(plan.spec, "slabs", (DEFAULT_DOMAIN,))))
+    return _build_slab(plan, source, topology, domain, declared, plan.slab_periodic)
+
+
+def _build_slab(
+    plan: ModelPlan,
+    source: InputBinding,
+    topology: Topology,
+    domain: str,
+    declared: Any,
+    periodic: bool,
+) -> Slab:
+    """This rank's rows, from the row count every input holding the axis
+    agrees on. Blocks follow the ranks' node order, so neighbouring blocks
+    share a node where they can."""
+
+    if periodic and declared.interior and plan.spatial_world_size > 1:
         # A periodic axis has no perimeter rows: the interior rows a rank
         # reads would not be the rows it stores and saves.
         raise ValueError(
@@ -49,7 +76,9 @@ def build_slab(
         )
     offset = {CELL: 0, FACE: -1, INTERIOR: 2}
     extents: dict[int, list[str]] = {}
-    for name, (axis, kind) in source.slab_axes.items():
+    for name, (axis, kind, owner) in source.slab_axes.items():
+        if owner != domain:
+            continue
         rows = source.get_var_shape(name)[axis] + offset[kind]
         extents.setdefault(rows, []).append(name)
     if not extents:
@@ -76,7 +105,7 @@ def build_slab(
         plan.spatial_world_size,
         total,
         depth,
-        plan.slab_periodic,
+        periodic,
         topology.positions()[plan.spatial_rank],
     )
 
@@ -151,7 +180,6 @@ def cut_located(runtime: ModelRuntime, values: Any) -> Any:
         return values
     values = dict(values)
     source = runtime.input
-    slab = runtime.slab
     kept = {}
     for dim, located in declared.items():
         name = bare(located.index)
@@ -165,6 +193,7 @@ def cut_located(runtime: ModelRuntime, values: Any) -> Any:
             raise ValueError(
                 f"{name} holds indices outside its grid {located.grid} of {cells} cells"
             )
+        slab = runtime.slabs.get(located.domain)
         if slab is None or slab.world == 1 or located.axis is None:
             continue
         coords = list(np.unravel_index(flat, grid))
@@ -216,4 +245,4 @@ def cut_located(runtime: ModelRuntime, values: Any) -> Any:
     return values
 
 
-__all__ = ["LocatedEntities", "build_slab", "cut_located"]
+__all__ = ["LocatedEntities", "build_slab", "build_slabs", "cut_located"]

@@ -14,7 +14,13 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from hydroforge.compiler.partition import bare
-from hydroforge.contracts.slab import CELL, FACE, INTERIOR, SlabAxis
+from hydroforge.contracts.slab import (
+    CELL,
+    DEFAULT_DOMAIN,
+    FACE,
+    INTERIOR,
+    SlabAxis,
+)
 from hydroforge.contracts.views import GridAxis
 
 if TYPE_CHECKING:
@@ -30,6 +36,7 @@ class SlabField:
     position: int
     kind: str
     halo: bool = False
+    domain: str = DEFAULT_DOMAIN
 
     @property
     def face(self) -> bool:
@@ -50,6 +57,23 @@ def slab_tokens(slab: SlabAxis, grid_axes: Mapping[str, GridAxis]) -> dict[str, 
     return tokens
 
 
+def domain_tokens(
+    slabs: Mapping[str, SlabAxis], grid_axes: Mapping[str, GridAxis]
+) -> dict[str, tuple[str, str]]:
+    """Every slab dimension's ``(domain, kind)``; a dimension has one domain."""
+
+    found: dict[str, tuple[str, str]] = {}
+    for domain, slab in slabs.items():
+        for token, kind in slab_tokens(slab, grid_axes).items():
+            if token in found:
+                raise ValueError(
+                    f"dimension {token!r} belongs to spatial domains "
+                    f"{found[token][0]!r} and {domain!r}"
+                )
+            found[token] = (domain, kind)
+    return found
+
+
 @dataclass(frozen=True, slots=True)
 class LocatedDim:
     """Entities of one dimension, located on a grid by a ``grid_index`` table.
@@ -66,16 +90,17 @@ class LocatedDim:
     grid: tuple[str, ...]
     axis: int | None = None
     kind: str | None = None
+    domain: str | None = None
 
 
 def compile_located(
     entries: Iterable[FieldEntry],
-    slab: SlabAxis | None,
+    slabs: Mapping[str, SlabAxis],
     grid_axes: Mapping[str, GridAxis],
 ) -> Mapping[str, LocatedDim]:
     """The located entity dimensions of the active fields, by dimension."""
 
-    tokens = {} if slab is None else slab_tokens(slab, grid_axes)
+    tokens = domain_tokens(slabs, grid_axes)
     found: dict[str, LocatedDim] = {}
     for entry in entries:
         grid = tuple(bare(item) for item in entry.tensor.grid_index)
@@ -92,51 +117,63 @@ def compile_located(
                 f"{entry.qualified!r} locates entities of a grid dimension {dim!r}"
             )
         hits = [position for position, item in enumerate(grid) if item in tokens]
-        if slab is not None and len(hits) != 1:
+        if slabs and len(hits) != 1:
+            names = tuple(slab.dim for slab in slabs.values())
             raise ValueError(
                 f"{entry.qualified!r} locates entities on grid {grid}, which must "
-                f"name the slab axis {slab.dim!r} (or an axis of it) exactly once"
+                f"name a slab axis of {names} (or an axis of it) exactly once"
             )
         axis = hits[0] if hits else None
-        found[dim] = LocatedDim(
-            dim,
-            entry.qualified,
-            grid,
-            axis,
-            None if axis is None else tokens[grid[axis]],
-        )
+        domain, kind = (None, None) if axis is None else tokens[grid[axis]]
+        found[dim] = LocatedDim(dim, entry.qualified, grid, axis, kind, domain)
     return MappingProxyType(found)
 
 
 def compile_slab(
     entries: Iterable[FieldEntry],
-    slab: SlabAxis | None,
+    slabs: Mapping[str, SlabAxis],
     grid_axes: Mapping[str, GridAxis],
+    bound: Mapping[str, str | None] = MappingProxyType({}),
 ) -> Mapping[str, SlabField]:
-    """Slab axis of every active field that names it, by qualified name."""
+    """Slab axis of every active field that names it, by qualified name.
 
-    if slab is None:
+    ``bound`` gives modules' declared spatial domains: their fields may name
+    no other domain's axis.
+    """
+
+    if not slabs:
         return MappingProxyType({})
-    tokens = slab_tokens(slab, grid_axes)
+    tokens = domain_tokens(slabs, grid_axes)
     found: dict[str, SlabField] = {}
     for entry in entries:
         shape = [
             bare(item) if isinstance(item, str) else item for item in entry.tensor.shape
         ]
         hits = [
-            (position, tokens[item])
+            (position, *tokens[item])
             for position, item in enumerate(shape)
             if item in tokens
         ]
         if len(hits) > 1:
             raise ValueError(
-                f"field {entry.qualified!r} names the slab axis {slab.dim!r} "
+                f"field {entry.qualified!r} names a slab axis "
                 f"in more than one dimension of {tuple(entry.tensor.shape)!r}"
             )
         if hits:
-            found[entry.qualified] = SlabField(*hits[0], entry.tensor.halo)
-    if not found:
-        raise ValueError(
-            f"slab axis {slab.dim!r} is named by no field of the opened modules"
-        )
+            position, domain, kind = hits[0]
+            expected = bound.get(entry.module)
+            if expected is not None and expected != domain:
+                raise ValueError(
+                    f"field {entry.qualified!r} names an axis of spatial domain "
+                    f"{domain!r}, but module {entry.module!r} binds {expected!r}"
+                )
+            found[entry.qualified] = SlabField(
+                position, kind, entry.tensor.halo, domain
+            )
+    named = {info.domain for info in found.values()}
+    for domain, slab in slabs.items():
+        if domain not in named:
+            raise ValueError(
+                f"slab axis {slab.dim!r} is named by no field of the opened modules"
+            )
     return MappingProxyType(found)
