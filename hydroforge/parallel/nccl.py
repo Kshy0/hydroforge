@@ -360,8 +360,9 @@ class NcclWindow:
                     library.handle.ncclMemFree(address), "ncclMemFree"
                 )
             )
-        with torch.cuda.device(self.comm.device), cleanup_on_exit(
-            "NCCL window", actions
+        with (
+            torch.cuda.device(self.comm.device),
+            cleanup_on_exit("NCCL window", actions),
         ):
             pass
 

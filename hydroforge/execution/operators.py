@@ -633,6 +633,7 @@ class _OperatorRecorder:
     ) -> None:
         self.execution = execution
         self.scope_kind = scope_kind
+        self.ensemble_coupled = False  # the body reduces across ensemble ranks
         self.binder = execution.kernel_binding
         self.operators: list[Any] = []
         self.references: dict[int, _StableRef | _ValueRef] = {

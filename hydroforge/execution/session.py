@@ -82,7 +82,12 @@ class RuntimeClock:
     """
 
     __slots__ = (
-        "schedule", "schedule_index", "time", "elapsed_microseconds", "frontier", "timeline",
+        "schedule",
+        "schedule_index",
+        "time",
+        "elapsed_microseconds",
+        "frontier",
+        "timeline",
     )
 
     def __init__(
@@ -414,11 +419,7 @@ class ModelRuntime:
                     continue
                 if shape and shape[int(module.is_batched(entry.name))] == extent:
                     widths.append(
-                        8
-                        * (
-                            int(np.prod(shape, dtype=np.int64))
-                            // max(extent, 1)
-                        )
+                        8 * (int(np.prod(shape, dtype=np.int64)) // max(extent, 1))
                     )
             row_bytes[KEY] = max(widths or [8])
         for domain, slab in self.slabs.items():
@@ -450,8 +451,7 @@ class ModelRuntime:
                     continue
                 pos = info.position + int(module.is_batched(entry.name))
                 kind = self._slab_halo_kind(info.kind, domain)
-                width = 8 * (                    int(np.prod(shape, dtype=np.int64)) // max(shape[pos], 1)
-                )
+                width = 8 * (int(np.prod(shape, dtype=np.int64)) // max(shape[pos], 1))
                 row_bytes[kind] = max(row_bytes.get(kind, 8), width)
         return layouts, row_bytes
 
@@ -1182,8 +1182,10 @@ class ModelRuntime:
                     )
                 )
             else:
-                if status is None and healthy and any(
-                    failure is not None for failure in failures
+                if (
+                    status is None
+                    and healthy
+                    and any(failure is not None for failure in failures)
                 ):
                     status = distributed_failure_error(
                         "kernels on another rank", failures

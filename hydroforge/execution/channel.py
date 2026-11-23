@@ -74,6 +74,8 @@ class StepEvent(IntEnum):
     BODY_COMPLETE = 5
     PREDICATE_SYNC = 6
     OUTPUT_COMMITTED = 7
+    PREDICATE_IDLE = 8
+    EXCHANGE_SYNC = 9
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,8 +140,18 @@ class LocalChannel:
     def event(self, kind: int, signature: tuple[int, int, int] = _NO_SIGNATURE) -> None:
         del kind, signature
 
-    def predicate_continue(self, continuing: bool) -> bool:
-        return bool(continuing)
+    def predicate_continue(
+        self, continuing: bool, *, coupled: bool = False
+    ) -> tuple[bool, bool]:
+        del coupled
+        return bool(continuing), bool(continuing)
+
+    def predicate_wait(self) -> bool:
+        return False
+
+    def exchange_sync(self, level: int, tag: int) -> tuple[int, int]:
+        del tag
+        return level, level
 
     def abort(self) -> None:
         pass
@@ -216,6 +228,20 @@ class ProcessGroupChannel:
         self._preflight: StagedPreflight | None = None
         self._begin_digest: int = 0
         self._terminal = False
+        self._own_spatial_ranks: tuple[int, ...] | None = None
+
+    def _spatial_ranks(self) -> tuple[int, ...]:
+        """World ranks of this rank's spatial group."""
+
+        if self._own_spatial_ranks is None:
+            rank = dist.get_rank()
+            groups = (
+                (tuple(range(self.world_size)),)
+                if self.mesh is None
+                else self.mesh.rank_groups("spatial")
+            )
+            self._own_spatial_ranks = next(g for g in groups if rank in g)
+        return self._own_spatial_ranks
 
     def _rows(
         self,
@@ -398,12 +424,11 @@ class ProcessGroupChannel:
 
         self._event(kind, signature)
 
-    def predicate_continue(self, continuing: bool) -> bool:
-        """Coordinate a halo-bearing predicate loop's exit decision on the
-        control plane so a peer failure in the loop body reaches waiting ranks."""
+    def _staged_rows(
+        self, kind: int, signature: tuple[int, int, int]
+    ) -> tuple[int, list[list[int]]]:
+        """Exchange one row carrying what the step staged for its first event."""
 
-        if self._terminal:
-            return False
         preflight, self._preflight = self._preflight, None
         begin_digest, self._begin_digest = self._begin_digest, 0
         sequence = self.sequence
@@ -418,13 +443,7 @@ class ProcessGroupChannel:
                     (sequence, preflight.phase, preflight.resolved_signature())
                 )
             flag = _PREFLIGHT | int(preflight.error is not None)
-        rows = self._rows(
-            StepEvent.PREDICATE_SYNC,
-            (int(bool(continuing)), 0, 0),
-            begin_digest,
-            digest,
-            flag,
-        )
+        rows = self._rows(kind, signature, begin_digest, digest, flag)
         ready = _full_records_ready(rows)
         if not ready and any(
             row[1] == StepEvent.TRANSACTION or row[7] & _PREFLIGHT for row in rows
@@ -437,7 +456,9 @@ class ProcessGroupChannel:
             len({(row[6], row[7]) for row in rows}) != 1 or rows[0][7] & _DETAILS
         ):
             self._resolve_preflight(sequence, preflight)
-        observed = tuple(tuple(row[:6]) for row in rows)
+        return sequence, rows
+
+    def _raise_failed(self, observed: Any, sequence: int) -> None:
         failed_ranks = tuple(
             rank for rank, value in enumerate(observed) if value[1] == _FAILED
         )
@@ -447,21 +468,137 @@ class ProcessGroupChannel:
                 "model call failed on peer rank(s) before distributed "
                 f"event {sequence}: {failed_ranks}"
             )
-        if (
-            len(
-                {
-                    (value[0], value[1], value[3], value[4], value[5])
-                    for value in observed
-                }
-            )
-            != 1
+
+    def _diverged(self, observed: Any) -> RuntimeError:
+        self._terminal = True
+        return RuntimeError(
+            "managed-step distributed event or collective ABI differs "
+            f"across ranks: {observed}"
+        )
+
+    def _collectives_match(self, observed: Any) -> bool:
+        """Whether the running ranks issue one collective; a finished spatial
+        group of a predicate loop idles through a spatial-scope one."""
+
+        running = tuple(v for v in observed if v[1] != StepEvent.PREDICATE_IDLE)
+        if not running or len({(v[0], v[1], v[5]) for v in running}) != 1:
+            return False
+        kind = running[0][1]
+        if self.mesh is None:
+            return len(running) == len(observed) and len(set(running)) == 1
+        scope = "ensemble" if kind & ENSEMBLE_COLLECTIVE_FLAG else "spatial"
+        if scope == "ensemble" and len(running) != len(observed):
+            return False  # a coupled body never leaves a partition idle
+        idle = StepEvent.PREDICATE_IDLE
+        if any(
+            len({observed[rank][1] == idle for rank in ranks}) != 1
+            for ranks in self.mesh.rank_groups("spatial")
         ):
-            self._terminal = True
-            raise RuntimeError(
-                "managed-step distributed event or collective ABI differs "
-                f"across ranks: {observed}"
-            )
-        return any(value[2] != 0 for value in observed)
+            return False
+        return all(
+            len({observed[r][2:5] for r in ranks if observed[r][1] != idle}) <= 1
+            for ranks in self.mesh.rank_groups(scope)
+        )
+
+    def _predicate_round(
+        self, rows: list[list[int]], sequence: int
+    ) -> tuple[bool, bool] | None:
+        """``(this spatial group continues, any group does)`` when every
+        running rank reached this loop's decision, else ``None``."""
+
+        observed = tuple(tuple(row[:6]) for row in rows)
+        self._raise_failed(observed, sequence)
+        idle = StepEvent.PREDICATE_IDLE
+        running = tuple(v for v in observed if v[1] != idle)
+        if not running:
+            raise self._diverged(observed)
+        if running[0][1] != StepEvent.PREDICATE_SYNC:
+            # A running group's body collective: only an idle rank gets here.
+            if rows[dist.get_rank()][1] != idle or running[0][1] < 10:
+                raise self._diverged(observed)
+            if not self._collectives_match(observed):
+                raise self._diverged(observed)
+            return None
+        if len({(v[0], v[1], v[3], v[4], v[5]) for v in running}) != 1 or any(
+            len({observed[rank][1] == idle for rank in ranks}) != 1
+            for ranks in (() if self.mesh is None else self.mesh.rank_groups("spatial"))
+        ):
+            raise self._diverged(observed)
+        group = any(observed[rank][2] != 0 for rank in self._spatial_ranks())
+        return group, any(value[2] != 0 for value in running)
+
+    def predicate_continue(
+        self, continuing: bool, *, coupled: bool = False
+    ) -> tuple[bool, bool]:
+        """Decide one iteration of a rank-synchronized predicate loop.
+
+        Returns whether this rank's spatial group iterates again and whether
+        any group does. A group that stops calls :meth:`predicate_wait`
+        until no group continues, so it still sees a peer's failure.
+
+        ``coupled``: the body reduces across ensemble ranks, so a member that
+        stopped would leave that reduction without a defined contribution.
+        Spatial groups that disagree raise on every rank before another
+        iteration writes any state.
+        """
+
+        if self._terminal:
+            return False, False
+        sequence, rows = self._staged_rows(
+            StepEvent.PREDICATE_SYNC,
+            (int(bool(continuing)), 0, 0),
+        )
+        decided = self._predicate_round(rows, sequence)
+        if decided is None:
+            raise self._diverged(tuple(tuple(row[:6]) for row in rows))
+        if coupled and self.mesh is not None:
+            decisions = {
+                any(rows[rank][2] != 0 for rank in ranks)
+                for ranks in self.mesh.rank_groups("spatial")
+            }
+            if len(decisions) != 1:
+                self._terminal = True
+                raise RuntimeError(
+                    "a predicate loop whose body reduces across the ensemble "
+                    "needs one exit decision: ensemble partitions disagree on "
+                    "continuing. Reduce the continue flag across the ensemble "
+                    "(all_reduce_(iteration.continue_flag, reduction='max', "
+                    "scope='ensemble')) or move the reduction out of the loop"
+                )
+        return decided
+
+    def predicate_wait(self) -> bool:
+        """Idle one round of a loop this spatial group finished; return
+        whether any group iterates again."""
+
+        while not self._terminal:
+            sequence = self.sequence
+            rows = self._rows(StepEvent.PREDICATE_IDLE, _NO_SIGNATURE, 0, 0, 0)
+            decided = self._predicate_round(rows, sequence)
+            if decided is not None:
+                return decided[1]
+        return False
+
+    def exchange_sync(self, level: int, tag: int) -> tuple[int, int]:
+        """Agree what one ``exchange_`` call does before it communicates.
+
+        ``level``: 0 replay, 1 recapture, 2 rebuild. Returns the highest
+        level of this rank's spatial group and of every rank.
+        """
+
+        if self._terminal:
+            raise RuntimeError("exchange_ after a failed distributed event")
+        sequence, rows = self._staged_rows(
+            StepEvent.EXCHANGE_SYNC, (int(level), tag, 0)
+        )
+        observed = tuple(tuple(row[:6]) for row in rows)
+        self._raise_failed(observed, sequence)
+        if len({(v[0], v[1], v[3], v[4], v[5]) for v in observed}) != 1:
+            raise self._diverged(observed)
+        return (
+            max(observed[rank][2] for rank in self._spatial_ranks()),
+            max(value[2] for value in observed),
+        )
 
     def abort(self) -> None:
         """Publish a caught local failure at the next synchronization event."""
@@ -539,16 +676,8 @@ class ProcessGroupChannel:
             rank for rank, value in enumerate(observed) if value[1] == _FAILED
         )
         matching = len(set(observed)) == 1
-        mesh = self.mesh
-        if mesh is not None and kind >= 10 and not failed_ranks:
-            scope = "ensemble" if kind & ENSEMBLE_COLLECTIVE_FLAG else "spatial"
-            matching = (
-                len({(value[0], value[1], value[5]) for value in observed}) == 1
-                and all(
-                    len({observed[rank][2:5] for rank in ranks}) == 1
-                    for ranks in mesh.rank_groups(scope)
-                )
-            )
+        if self.mesh is not None and kind >= 10 and not failed_ranks:
+            matching = self._collectives_match(observed)
         if failed_ranks or not matching:
             self._terminal = True
             if kind == _FAILED:

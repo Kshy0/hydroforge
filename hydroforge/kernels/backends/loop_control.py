@@ -90,9 +90,7 @@ def microsecond_ticks(microseconds: int) -> int:
     """Round cumulative host microseconds to ticks without a floating clock."""
 
     whole, remainder = divmod(microseconds * (1 << CLOCK_BITS), 1_000_000)
-    return whole + int(
-        remainder > 500_000 or (remainder == 500_000 and whole % 2 != 0)
-    )
+    return whole + int(remainder > 500_000 or (remainder == 500_000 and whole % 2 != 0))
 
 
 def clock_ticks(seconds: float) -> int:
@@ -174,9 +172,7 @@ def _sample_controls(
         Let(
             prev_weight,
             Select(
-                Compare(
-                    "!=", Binary("&", phase_var, Const(1, _INT)), Const(0, _INT)
-                ),
+                Compare("!=", Binary("&", phase_var, Const(1, _INT)), Const(0, _INT)),
                 Const(0, weight.type),
                 accum_weight,
             ),

@@ -631,7 +631,9 @@ def _extent(name: str, step: _CallStep, values: Mapping[str, Any]) -> int:
 
 
 def _enabled(
-    condition: tuple[bool, str] | None, values: Mapping[str, Any], buffers: frozenset[str]
+    condition: tuple[bool, str] | None,
+    values: Mapping[str, Any],
+    buffers: frozenset[str],
 ) -> bool:
     if condition is None:
         return True
@@ -727,12 +729,17 @@ class _Rendering:
             rounds: tuple[int | None, ...] = (None,)
         else:
             count = launch_extent(self.spec.name, (declared.rounds,), self.values)
-            rounds = tuple(reversed(range(count)) if declared.reverse_rounds else range(count))
+            rounds = tuple(
+                reversed(range(count)) if declared.reverse_rounds else range(count)
+            )
         return tuple(
             CudaLaunch(
-                kernel, grid, threads,
+                kernel,
+                grid,
+                threads,
                 arguments if r is None else (*arguments, int32(r)),
-                shared, cooperative=declared.cooperative,
+                shared,
+                cooperative=declared.cooperative,
             )
             for r in rounds
         )
@@ -1132,10 +1139,13 @@ class _CudaImplementation(KernelImplementation):
         )
         if not declaration.masks and not entries and not parameters:
             return program
-        prefix = "".join(
-            f"#define HYDROFORGE_{name} {_mask(members, values)}u\n"
-            for name, members in declaration.masks.items()
-        ) + parameters
+        prefix = (
+            "".join(
+                f"#define HYDROFORGE_{name} {_mask(members, values)}u\n"
+                for name, members in declaration.masks.items()
+            )
+            + parameters
+        )
         return rtc.RtcProgram(
             prefix + program.source + entries, program.options, program.name
         )

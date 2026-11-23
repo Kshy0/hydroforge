@@ -234,7 +234,9 @@ class _TritonKernelImplementation(KernelImplementation):
         self.check = declaration.check
         self.check_arguments = _check_arguments(spec, declaration.check)
         self.launch = (
-            {} if declaration.num_warps is None else {"num_warps": declaration.num_warps}
+            {}
+            if declaration.num_warps is None
+            else {"num_warps": declaration.num_warps}
         )
 
     def _validate(self, call: KernelCall) -> None:
@@ -281,7 +283,9 @@ class _TritonKernelImplementation(KernelImplementation):
         def build():
             with proven.active():
                 options = {
-                    **launch_options(selected, physics=True), **self.launch, **static
+                    **launch_options(selected, physics=True),
+                    **self.launch,
+                    **static,
                 }
                 return selected.warmup(grid=grid, **options)
 
@@ -293,7 +297,11 @@ class _TritonKernelImplementation(KernelImplementation):
             return empty_launch
         selected, grid, static = planned
         with proven_triton_device(triton_call_device(static.values())).active():
-            options = {**launch_options(selected, physics=True), **self.launch, **static}
+            options = {
+                **launch_options(selected, physics=True),
+                **self.launch,
+                **static,
+            }
             return partial(selected[grid], **options)
 
 

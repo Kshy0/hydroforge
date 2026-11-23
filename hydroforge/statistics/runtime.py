@@ -818,9 +818,7 @@ class StatisticsRuntime:
                 last_inner = time_number
             if touches_outer:
                 last_outer = time_number
-            prepared.append(
-                (dt, ordered, touches_inner, touches_outer, time_number)
-            )
+            prepared.append((dt, ordered, touches_inner, touches_outer, time_number))
         return tuple(prepared) if prepared else None
 
     def commit_finish(
@@ -940,9 +938,7 @@ class StatisticsRuntime:
         if not np.isfinite(value):
             raise ValueError("statistics output time must be finite")
         previous = (
-            self._last_time_number
-            if last_time_number is ...
-            else last_time_number
+            self._last_time_number if last_time_number is ... else last_time_number
         )
         if previous is not None and value <= previous:
             raise ValueError("statistics output times must be strictly increasing")

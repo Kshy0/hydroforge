@@ -26,11 +26,11 @@ from pydantic import (
     model_validator,
 )
 
-from hydroforge.contracts.coupling import Port
 from hydroforge.contracts.conditions import (
     declared_condition_errors,
     field_conditions,
 )
+from hydroforge.contracts.coupling import Port
 from hydroforge.contracts.options import OptionsConfig, reject_rules_declaration
 from hydroforge.contracts.parameters import ParameterChange
 from hydroforge.contracts.precision import PrecisionTier, StorageTier

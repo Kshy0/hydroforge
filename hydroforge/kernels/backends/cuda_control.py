@@ -155,7 +155,13 @@ def _request(
 def _control_request() -> rtc.RtcRequest:
     return _request(
         "hydroforge_loop_control",
-        (_SET_CONDITIONAL, FIXED_END, FIXED_CLOCK, *_ADAPTIVE_ACCEPT.values(), _ADAPTIVE_END),
+        (
+            _SET_CONDITIONAL,
+            FIXED_END,
+            FIXED_CLOCK,
+            *_ADAPTIVE_ACCEPT.values(),
+            _ADAPTIVE_END,
+        ),
         # ``cudaGraphSetConditional`` is declared by the device runtime.
         header="#include <cuda_device_runtime_api.h>\n\n",
         options=rtc.toolkit_include_options(),

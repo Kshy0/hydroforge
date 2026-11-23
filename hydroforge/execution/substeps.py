@@ -503,7 +503,14 @@ class _FixedScope(InvocationScope):
             aliases = dict(
                 zip(
                     map(id, controls),
-                    ("count", "index", "dt", "outer_ticks", "elapsed_ticks", "dt_ticks"),
+                    (
+                        "count",
+                        "index",
+                        "dt",
+                        "outer_ticks",
+                        "elapsed_ticks",
+                        "dt_ticks",
+                    ),
                 )
             )
             signature = tuple(program.fingerprint(aliases) for program in owned)
@@ -659,7 +666,8 @@ class _PredicateScope(InvocationScope):
                     index=loop.counter,
                     continue_flag=loop.predicate,
                 )
-            loop.bind(recording.program)
+                coupled = recording_sink().ensemble_coupled
+            loop.bind(recording.program, ensemble_coupled=coupled)
             bound = True
             parent.record_predicate_loop(loop)
             context.scopes.pop()
@@ -867,7 +875,10 @@ def predicate_scope(context: Any, *, maximum_steps: int) -> _PredicateScope:
     ``maximum_steps`` iterations.  It must be nested inside the one lexical
     fixed substep owned by the managed step, whose time its body inherits:
     substep fields there bind to that substep (``frame.index`` counts the
-    predicate's own iterations).
+    predicate's own iterations). Under an ensemble mesh each spatial group
+    runs its own count. A body that reduces across ensemble ranks needs one
+    exit decision for all of them, for example by reducing the continue flag
+    across the ensemble; partitions that disagree raise on every rank.
     """
 
     request = _PredicateLoopRequest(maximum_steps=maximum_steps)

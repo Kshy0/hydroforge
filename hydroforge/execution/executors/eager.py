@@ -113,14 +113,26 @@ class EagerPredicate:
     def run(self) -> None:
         loop = self.loop
         loop.reset()
-        sync_channel = getattr(loop, "sync_channel", None)
-        while True:
-            loop.iterate()
-            continuing = int(loop.continue_flag.item()) != 0
-            if sync_channel is not None:
-                continuing = sync_channel.predicate_continue(continuing)
-            if not continuing:
-                break
+        channel = getattr(loop, "sync_channel", None)
+        if channel is None:
+            while True:
+                loop.iterate()
+                if int(loop.continue_flag.item()) == 0:
+                    return
+        # Spatial groups (ensemble partitions) iterate independently. One
+        # that finishes stops updating its state and keeps taking part in
+        # the decisions until no group continues, so a failure reaches it.
+        # A body reducing across the ensemble raises if the groups disagree.
+        active = pending = True
+        while pending:
+            if active:
+                loop.iterate()
+                active, pending = channel.predicate_continue(
+                    int(loop.continue_flag.item()) != 0,
+                    coupled=loop.ensemble_coupled,
+                )
+            else:
+                pending = channel.predicate_wait()
 
     def close(self) -> None:
         pass

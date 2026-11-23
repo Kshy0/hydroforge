@@ -95,7 +95,9 @@ def _dialect_kernels(
     plan: StatisticsKernelPlan,
     dialect: str,
 ) -> tuple[tuple[IrKernel, ...], tuple[IrKernel, ...], dict[str, torch.Tensor], bool]:
-    settle = _to_ir_kernels(plan.settle_kernels("loop")) if plan.lowering.compound else ()
+    settle = (
+        _to_ir_kernels(plan.settle_kernels("loop")) if plan.lowering.compound else ()
+    )
     if dialect == "cuda":
         return _to_ir_kernels(plan.kernels("threads")), settle, {}, False
     if dialect == "triton":
@@ -174,7 +176,9 @@ def compile_statistics_program(
         implies=_implies,
         phase_control=CONTROL_PHASE,
         sample_phases=SAMPLE_PHASES,
-        compile_torch_update=not any(group.output_index is None for group in plan.groups),
+        compile_torch_update=not any(
+            group.output_index is None for group in plan.groups
+        ),
         physics=False,
         name_prefix="hydroforge_statistics",
         rank=context.rank,

@@ -162,8 +162,9 @@ def _compile_triton(requests: Sequence[CompileRequest], jobs: int | None) -> Non
         for request in requests:
             request.build()
         return
-    with ThreadPoolExecutor(max_workers=count) as pool, AsyncCompileMode(
-        _ContextPool(pool)
+    with (
+        ThreadPoolExecutor(max_workers=count) as pool,
+        AsyncCompileMode(_ContextPool(pool)),
     ):
         for request in requests:
             request.build()

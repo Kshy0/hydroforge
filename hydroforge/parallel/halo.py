@@ -214,9 +214,7 @@ class HaloPlan:
         self.rank = rank
         self.world = len(next(iter(layouts.values())))
         # Records list the kinds of one slab domain unless a model has more.
-        self.record_kinds = (
-            3 if set(layouts) <= set(KINDS[:3]) else len(KINDS)
-        )
+        self.record_kinds = 3 if set(layouts) <= set(KINDS[:3]) else len(KINDS)
         self.layouts = dict(layouts)
         self.pairs: dict[str, dict[tuple[int, int], tuple[np.ndarray, np.ndarray]]] = {}
         # Per kind and pair: the ghost rows' distances, in pair order.
@@ -467,7 +465,9 @@ def _open_peer_memory(
             else:
                 if buffers.mapped:
                     addresses = buffers.peers["window"].tolist()
-                    return _PeerMemory("ipc", buffers.tensors["window"], addresses), None
+                    return _PeerMemory(
+                        "ipc", buffers.tensors["window"], addresses
+                    ), None
                 ipc = "the peers' memory could not be mapped"
         problems["ipc"] = ipc
     return None, "; ".join(f"{k}: {v}" for k, v in problems.items())
@@ -704,8 +704,7 @@ class HaloRuntime:
         ):
             if len({fact[position] for fact in facts}) > 1:
                 raise ValueError(
-                    f"{name} differs across ranks: "
-                    f"{[fact[position] for fact in facts]}"
+                    f"{name} differs across ranks: {[fact[position] for fact in facts]}"
                 )
         # The node every rank runs on, whatever placement assumed.
         self.nodes = tuple(fact[0] for fact in facts)
@@ -758,7 +757,8 @@ class HaloRuntime:
                 )
             direct = requested in ("auto", "peer")
             self.links: dict[int, str] = {
-                peer: "peer" if direct and matrix[rank][peer] and matrix[peer][rank]
+                peer: "peer"
+                if direct and matrix[rank][peer] and matrix[peer][rank]
                 else fallback
                 for peer in plan.neighbours[rank]
             }
@@ -968,6 +968,7 @@ class HaloRuntime:
         memory, self.memory = self.memory, None
         self.registry = None
         if memory is not None:
+
             def _release_window() -> None:
                 self.window = torch.empty(0, dtype=torch.uint8)
 

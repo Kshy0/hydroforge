@@ -538,9 +538,7 @@ def computed_field(description: str):
                 "computed_field caches its getter; decorate the function "
                 "itself, not a property or cached_property"
             )
-        return pydantic_computed_field(
-            cached_property(getter), description=description
-        )
+        return pydantic_computed_field(cached_property(getter), description=description)
 
     return decorate
 

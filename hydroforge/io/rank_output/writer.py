@@ -850,9 +850,7 @@ class RankOutputWriter:
         if not self.output_split_by_year and self._files_created:
             return
         selected = (
-            tuple(self._netcdf_schemas)
-            if variables is None
-            else tuple(variables)
+            tuple(self._netcdf_schemas) if variables is None else tuple(variables)
         )
         if not selected:
             return
@@ -1539,14 +1537,11 @@ class RankOutputWriter:
 
         if self.output_split_by_year:
             targets = self._active_append_variables or tuple(self._netcdf_schemas)
-            first_time = [
-                name for name in targets if name not in self._stream_years
-            ]
+            first_time = [name for name in targets if name not in self._stream_years]
             rolling = [
                 name
                 for name in targets
-                if name in self._stream_years
-                and self._stream_years[name] != dt.year
+                if name in self._stream_years and self._stream_years[name] != dt.year
             ]
             if rolling:
                 # Rows of the old year go to its files before the new ones,

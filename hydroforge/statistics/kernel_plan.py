@@ -790,8 +790,13 @@ def _variable(
                 addressing.append(Let(source, Load(layout.gather, element, _INDEX)))
             else:
                 source = _view_source(
-                    element, output_shape, source_shape, layout.axes,
-                    names, prefix, addressing,
+                    element,
+                    output_shape,
+                    source_shape,
+                    layout.axes,
+                    names,
+                    prefix,
+                    addressing,
                 )
             source_plane = Const(max(1, prod(source_shape)), _INDEX)
 
@@ -917,7 +922,9 @@ def _group(
     for variable in variables:
         gather = context.layouts[variable.variable.name].gather
         if gather is not None:
-            buffers.setdefault(gather, Param(gather, context.buffer(gather).dtype, "read"))
+            buffers.setdefault(
+                gather, Param(gather, context.buffer(gather).dtype, "read")
+            )
         for item in context.layouts[variable.variable.name].axes or ():
             if item.table is not None:
                 buffers.setdefault(

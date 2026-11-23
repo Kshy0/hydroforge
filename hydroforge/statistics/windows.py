@@ -498,9 +498,7 @@ class WindowState:
         self.inner_samples = False
         if not self.dirty:
             return ()
-        inner_dirty = tuple(
-            name for name in self.inner_outputs if name in self.dirty
-        )
+        inner_dirty = tuple(name for name in self.inner_outputs if name in self.dirty)
         outer_dirty = (
             tuple(name for name in self.outer_outputs if name in self.dirty)
             if outer_closed
@@ -509,9 +507,7 @@ class WindowState:
         if inner_dirty and inner_label is None:
             raise RuntimeError("statistics window closed without a start time")
         if outer_dirty and outer_label is None:
-            raise RuntimeError(
-                "outer statistics window closed without a start time"
-            )
+            raise RuntimeError("outer statistics window closed without a start time")
         if inner_dirty and outer_dirty:
             if inner_label == outer_label:
                 return ((inner_label, (*inner_dirty, *outer_dirty)),)

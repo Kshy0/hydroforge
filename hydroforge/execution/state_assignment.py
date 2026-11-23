@@ -75,14 +75,18 @@ def state_field(
         raise ValueError(f"state key {key!r}: module {module_name!r} is not open")
     spec = type(module).spec().tensor_fields.get(name)
     if spec is None or spec.category not in categories:
-        raise ValueError(f"state key {key!r} is not a {' or '.join(sorted(categories))} tensor")
+        raise ValueError(
+            f"state key {key!r} is not a {' or '.join(sorted(categories))} tensor"
+        )
     tensor = getattr(module, name)
     if tensor is None:
         raise ValueError(f"state key {key!r} is not allocated in this model")
     return tensor, spec
 
 
-def state_keys(model: Any, categories: Iterable[str] = ("init_state",)) -> tuple[str, ...]:
+def state_keys(
+    model: Any, categories: Iterable[str] = ("init_state",)
+) -> tuple[str, ...]:
     """``module.field`` of every allocated state tensor of the given categories."""
 
     wanted = frozenset(categories)
@@ -108,7 +112,9 @@ def _require_readable(model: Any, what: str) -> Any:
     return runtime
 
 
-def capture_state(model: Any, keys: Iterable[str] | None = None) -> dict[str, torch.Tensor]:
+def capture_state(
+    model: Any, keys: Iterable[str] | None = None
+) -> dict[str, torch.Tensor]:
     """Detached copies of state tensors (default: every ``init_state`` field)."""
 
     if managed_step_active():
@@ -234,9 +240,16 @@ def assign_clock(model: Any, value: ModelClock) -> None:
             )
         if value.elapsed_microseconds > clock.frontier:
             raise ValueError("the clock cannot move beyond the furthest step reached")
-        if runtime.plan.parameters and value.elapsed_microseconds != clock.elapsed_microseconds:
-            raise ValueError("a model with scheduled parameter changes cannot move its clock")
-        signature = canonical((value.time, value.schedule_index, value.elapsed_microseconds))
+        if (
+            runtime.plan.parameters
+            and value.elapsed_microseconds != clock.elapsed_microseconds
+        ):
+            raise ValueError(
+                "a model with scheduled parameter changes cannot move its clock"
+            )
+        signature = canonical(
+            (value.time, value.schedule_index, value.elapsed_microseconds)
+        )
     except BaseException as caught:
         error = caught
     runtime.channel.preflight(

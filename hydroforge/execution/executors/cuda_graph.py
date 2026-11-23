@@ -524,7 +524,9 @@ class _Fixed:
         def body() -> None:
             for _ in range(repetitions):
                 if loop.clocked:
-                    fixed_clock(counter=loop.counter, count=loop.count, clock=loop.clock)
+                    fixed_clock(
+                        counter=loop.counter, count=loop.count, clock=loop.clock
+                    )
                 for program in programs:
                     program.launch()
                 if launch is not None:

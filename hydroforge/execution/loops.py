@@ -293,6 +293,7 @@ class PredicateLoop:
         self.body: Any = None
         self.runner: Any = None
         self.sync_channel: Any = None
+        self.ensemble_coupled = False
 
     @property
     def programs(self) -> tuple[Any, ...]:
@@ -309,14 +310,21 @@ class PredicateLoop:
             self.under_limit,
         )
 
-    def bind(self, body: Any) -> PredicateLoop:
-        """Attach the recorded loop body and build its backend runner."""
+    def bind(self, body: Any, *, ensemble_coupled: bool = False) -> PredicateLoop:
+        """Attach the recorded loop body and build its backend runner.
+
+        Each spatial group runs its own count, unless
+        ``ensemble_coupled``: the body reduces across ensemble ranks, so
+        the groups must reach one exit decision or every rank raises.
+        """
 
         self.body = body
+        self.ensemble_coupled = ensemble_coupled
         plan = getattr(self._runtime, "plan", None)
         self.sync_channel = (
             self._runtime.channel
-            if getattr(plan, "spatial_world_size", 1) > 1 and predicate_has_halo(body)
+            if (getattr(plan, "spatial_world_size", 1) > 1 and predicate_has_halo(body))
+            or (ensemble_coupled and getattr(plan, "world_size", 1) > 1)
             else None
         )
         self.runner = self.executor.predicate(self)

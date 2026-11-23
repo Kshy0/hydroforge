@@ -128,17 +128,20 @@ class OutputView(HydroForgeModel):
     point_dimension: Identifier = "point"
 
     def __init__(
-        self, axes: Mapping[str, Selector] | None = None, *,
-        points: Mapping[str, Any] | None = None, point_dimension: str = "point",
+        self,
+        axes: Mapping[str, Selector] | None = None,
+        *,
+        points: Mapping[str, Any] | None = None,
+        point_dimension: str = "point",
         **named: Any,
     ):
         if axes is not None and named:
             raise ValueError("pass axes as a mapping or as keywords, not both")
         super().__init__(
             axes=dict(axes if axes is not None else named),
-            points={} if points is None else {
-                axis: tuple(indices) for axis, indices in points.items()
-            },
+            points={}
+            if points is None
+            else {axis: tuple(indices) for axis, indices in points.items()},
             point_dimension=point_dimension,
         )
 
@@ -146,7 +149,9 @@ class OutputView(HydroForgeModel):
     def _validate_points(self) -> Self:
         if self.points:
             if self.axes:
-                raise ValueError("a view selects axis ranges or paired points, not both")
+                raise ValueError(
+                    "a view selects axis ranges or paired points, not both"
+                )
             sizes = {len(indices) for indices in self.points.values()}
             if len(sizes) != 1 or 0 in sizes:
                 raise ValueError("point axes must have equal nonzero lengths")

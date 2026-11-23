@@ -568,7 +568,9 @@ class _StatisticsBinder:
                         if owned is not None and i == slab_axis[0]
                         else np.arange(extents[i], dtype=np.int64)
                     )
-                grid = [item.reshape(-1) for item in np.meshgrid(*ranges, indexing="ij")]
+                grid = [
+                    item.reshape(-1) for item in np.meshgrid(*ranges, indexing="ij")
+                ]
                 cells = np.empty((grid[0].size, len(names)), dtype=np.int64)
                 for i, axis in enumerate(names):
                     cells[:, i] = (
@@ -661,7 +663,9 @@ class _StatisticsBinder:
         union = isinstance(view, OutputUnion)
         if view is not None and (union or view.points):
             if located_axis is not None:
-                raise ValueError("point views require grid axes, not located entity axes")
+                raise ValueError(
+                    "point views require grid axes, not located entity axes"
+                )
             points, numbers = (
                 self._union_cells(view, names, tuple(extents), slab_axis)
                 if union

@@ -16,6 +16,7 @@ from hydroforge.contracts.conditions import (
     never,
     opt,
 )
+from hydroforge.contracts.coupling import Port
 from hydroforge.contracts.fields import FieldDemandPlan
 from hydroforge.contracts.options import (
     ForcingOptionField,
@@ -26,7 +27,6 @@ from hydroforge.contracts.options import (
     option,
     validate_option_groups,
 )
-from hydroforge.contracts.coupling import Port
 from hydroforge.contracts.parameters import ParameterChange
 from hydroforge.contracts.runtime import (
     BackendRequirement,

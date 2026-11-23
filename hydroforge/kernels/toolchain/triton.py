@@ -183,9 +183,7 @@ def _compile_with_fallback(compile_fn):
         attempt = _policy_attempt.set(attempt_cell)
         try:
             try:
-                return compile_fn(
-                    src, target=target, options=options, _env_vars=env
-                )
+                return compile_fn(src, target=target, options=options, _env_vars=env)
             except Exception:
                 if not attempt_cell[0]:
                     raise

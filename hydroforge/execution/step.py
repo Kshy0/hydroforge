@@ -643,12 +643,16 @@ class _ManagedStepDescriptor:
         statistics_configured = plan.output.windows is not None
         reverse = self.reverse
         if reverse and plan.parameters:
-            raise ValueError("a model with scheduled parameter changes has no reverse step")
+            raise ValueError(
+                "a model with scheduled parameter changes has no reverse step"
+            )
         step = None
         if schedule is not None:
             if reverse:
                 if clock.schedule_index == 0:
-                    raise ValueError("no step to reverse: the clock is at the schedule start")
+                    raise ValueError(
+                        "no step to reverse: the clock is at the schedule start"
+                    )
                 step = schedule._step_at_trusted(clock.schedule_index - 1)
             else:
                 if clock.schedule_index >= len(schedule):

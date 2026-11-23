@@ -375,7 +375,9 @@ class StatisticsDeclarationCompiler:
         tokens: dict[str, str] = {}
         for declared in slabs.values():
             tokens.update(slab_tokens(declared, self.selection.spec.grid_axes))
-        interior = tuple(axis for declared in slabs.values() for axis in declared.interior)
+        interior = tuple(
+            axis for declared in slabs.values() for axis in declared.interior
+        )
         for view in expression.views:
             field = self.fields[view.field].tensor
             if field.category == "virtual" and field.expression:
@@ -611,9 +613,7 @@ class StatisticsDeclarationCompiler:
     ) -> None:
         self.compile_view(output, metadata)
         key = (output.name, output.operation)
-        operation = self.compile_operation(
-            output.name, output.operation, metadata
-        )
+        operation = self.compile_operation(output.name, output.operation, metadata)
         self.compiled_operations[key] = operation
         self.compiled_output_metadata[key] = metadata
         name = f"{output.name}_{output.operation}"

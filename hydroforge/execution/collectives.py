@@ -389,6 +389,8 @@ def _submit_collective(request: _CollectiveRequest) -> None:
         return
     device = _device_reduction(request)
     recorder = recording_sink()
+    if recorder is not None and request.scope == "ensemble":
+        recorder.ensemble_coupled = True
     if recorder is not None and device is not None:
         # A kernel per tensor: the recorded loop stays capturable.
         reducer, transport = device

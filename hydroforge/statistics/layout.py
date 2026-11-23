@@ -328,7 +328,7 @@ class _StatisticsLayoutCompiler:
         gather = self.fields[name].output_gather
         axes = None
         if gather is not None:
-            actual_shape = (*source.shape[:int(source.batched)], output_axes[0].extent)
+            actual_shape = (*source.shape[: int(source.batched)], output_axes[0].extent)
             if not output_axes[0].extent:
                 # No point on this rank: nothing is read, nothing addressed.
                 gather = None

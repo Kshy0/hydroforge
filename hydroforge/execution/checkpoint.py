@@ -36,9 +36,9 @@ from hydroforge.data.input import InputProxy
 from hydroforge.io.construction_input import (
     SLAB_COORDINATES,
     is_slab_coordinate,
-    slab_coordinate,
     located_coordinate,
     merge_construction_parts,
+    slab_coordinate,
     transient_coordinate,
     write_construction_input,
 )

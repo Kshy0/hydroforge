@@ -979,37 +979,64 @@ _CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16
 _CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH = 95
 
 
-def _cooperative_grid(kit: Any, function: ctypes.c_void_p, step: CudaLaunch, device: int):
+def _cooperative_grid(
+    kit: Any, function: ctypes.c_void_p, step: CudaLaunch, device: int
+):
     """The checked grid of a cooperative launch (resolving ``"resident"``)."""
 
     if kit.hip:
         raise NotImplementedError("cooperative launches are implemented for CUDA only")
     if not hasattr(kit, "LaunchCooperativeKernel"):
         p = ctypes.c_void_p
-        kit._bind_driver("LaunchCooperativeKernel", p, *(ctypes.c_uint,) * 6, ctypes.c_uint, p, p)
-        kit._bind_driver("OccupancyMaxActiveBlocksPerMultiprocessor",
-                         ctypes.POINTER(ctypes.c_int), p, ctypes.c_int, ctypes.c_size_t)
+        kit._bind_driver(
+            "LaunchCooperativeKernel", p, *(ctypes.c_uint,) * 6, ctypes.c_uint, p, p
+        )
+        kit._bind_driver(
+            "OccupancyMaxActiveBlocksPerMultiprocessor",
+            ctypes.POINTER(ctypes.c_int),
+            p,
+            ctypes.c_int,
+            ctypes.c_size_t,
+        )
         kit._bind_driver("DeviceGet", ctypes.POINTER(ctypes.c_int), ctypes.c_int)
-        kit._bind_driver("DeviceGetAttribute", ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int)
+        kit._bind_driver(
+            "DeviceGetAttribute",
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int,
+            ctypes.c_int,
+        )
     handle, value = ctypes.c_int(), ctypes.c_int()
     kit.check_driver(kit.DeviceGet(ctypes.byref(handle), device), "querying the device")
-    kit.check_driver(kit.DeviceGetAttribute(ctypes.byref(value), _CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, handle),
-                     "querying cooperative launch support")
+    kit.check_driver(
+        kit.DeviceGetAttribute(
+            ctypes.byref(value), _CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, handle
+        ),
+        "querying cooperative launch support",
+    )
     if not value.value:
-        raise RuntimeError(f"{step.kernel}: device {device} does not support cooperative launches")
-    kit.check_driver(kit.DeviceGetAttribute(ctypes.byref(value), _CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, handle),
-                     "querying the multiprocessor count")
+        raise RuntimeError(
+            f"{step.kernel}: device {device} does not support cooperative launches"
+        )
+    kit.check_driver(
+        kit.DeviceGetAttribute(
+            ctypes.byref(value), _CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, handle
+        ),
+        "querying the multiprocessor count",
+    )
     processors, per_processor = value.value, ctypes.c_int()
     threads = math.prod(step.block)
     kit.check_driver(
-        kit.OccupancyMaxActiveBlocksPerMultiprocessor(ctypes.byref(per_processor), function, threads,
-                                                      step.shared_memory),
+        kit.OccupancyMaxActiveBlocksPerMultiprocessor(
+            ctypes.byref(per_processor), function, threads, step.shared_memory
+        ),
         f"querying the occupancy of {step.kernel}",
     )
     resident = per_processor.value * processors
     if step.grid == "resident":
         if resident < 1:
-            raise ValueError(f"{step.kernel}: no block of {threads} threads fits on the device")
+            raise ValueError(
+                f"{step.kernel}: no block of {threads} threads fits on the device"
+            )
         return (resident, 1, 1)
     if math.prod(step.grid) > resident:
         raise ValueError(
@@ -1037,8 +1064,11 @@ def prepare(
             if isinstance(step, CudaConcurrent):
                 with torch.cuda.device(device):
                     streams = [torch.cuda.Stream(device=device) for _ in step.branches]
-                items.append(_PreparedConcurrent(
-                    [prepare_steps(branch) for branch in step.branches], streams))
+                items.append(
+                    _PreparedConcurrent(
+                        [prepare_steps(branch) for branch in step.branches], streams
+                    )
+                )
                 continue
             if not isinstance(step, CudaLaunch):
                 items.append(step)
@@ -1061,9 +1091,18 @@ def prepare(
                         f"reserving shared memory for {step.kernel}",
                     )
                     _shared_memory[function.value] = step.shared_memory
-        grid = _cooperative_grid(kit, function, step, device) if step.cooperative else step.grid
+        grid = (
+            _cooperative_grid(kit, function, step, device)
+            if step.cooperative
+            else step.grid
+        )
         return _PreparedLaunch(
-            function, grid, step.block, step.shared_memory, parameters, storage,
+            function,
+            grid,
+            step.block,
+            step.shared_memory,
+            parameters,
+            storage,
             step.cooperative,
         )
 

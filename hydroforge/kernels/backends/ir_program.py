@@ -184,7 +184,9 @@ def _compile_cuda_program(
     save_dir: Path | None,
 ) -> CompiledIrProgram:
     source = CUDA.program([kernel.function for kernel in kernels])
-    program = rtc.RtcProgram(source, rtc.program_options((), physics=physics), name_prefix)
+    program = rtc.RtcProgram(
+        source, rtc.program_options((), physics=physics), name_prefix
+    )
     request = rtc.RtcRequest(program, tuple(kernel.function.name for kernel in kernels))
     device_index = torch.device(device).index
     if device_index is None:
@@ -216,14 +218,18 @@ def _compile_cuda_program(
                 )
         steps = []
         for kernel in kernels:
-            count = 1 if kernel.extent is None else int(_eval_bound(kernel.extent, states))
+            count = (
+                1 if kernel.extent is None else int(_eval_bound(kernel.extent, states))
+            )
             if count == 0:
                 continue
             width = 1 if kernel.extent is None else block_size
             arguments = tuple(
                 rtc.pointer(states[param.name])
                 if param.access is not None
-                else rtc.scalar(_eval_bound(kernel.scalars[param.name], states), param.type)
+                else rtc.scalar(
+                    _eval_bound(kernel.scalars[param.name], states), param.type
+                )
                 for param in kernel.function.params
             )
             step = rtc.CudaLaunch(
@@ -542,7 +548,10 @@ def _torch_source(
             )
             for kernel in unique_kernels.values()
         ),
-        *("\n".join(_torch_entry_lines(name, group)) for name, group in entries.items()),
+        *(
+            "\n".join(_torch_entry_lines(name, group))
+            for name, group in entries.items()
+        ),
         *(
             "\n".join(_torch_entry_lines("update", entries["update"], phase))
             for phase in phases
@@ -810,16 +819,11 @@ def compile_ir_scalar_variants(
 
     buffer_params = [param for param in function.params if param.access is not None]
     scalar_params = [param for param in function.params if param.access is None]
-    states = dict(
-        zip((param.name for param in buffer_params), tensors, strict=True)
-    )
+    states = dict(zip((param.name for param in buffer_params), tensors, strict=True))
     if dialect == "torch":
         sizes = {name: tensor.numel() for name, tensor in states.items()}
         printer = TorchPrinter("device")
-        names = {
-            key: f"{function.name}_{index}"
-            for index, key in enumerate(variants)
-        }
+        names = {key: f"{function.name}_{index}" for index, key in enumerate(variants)}
         source = (
             "\n\n\n".join(
                 (

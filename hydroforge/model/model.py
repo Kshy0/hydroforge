@@ -264,7 +264,9 @@ class AbstractModel(ModelDeclaration, ABC):
 
         return ModelRuntime.of(self).update_structure()
 
-    def capture_state(self, keys: Iterable[str] | None = None) -> dict[str, torch.Tensor]:
+    def capture_state(
+        self, keys: Iterable[str] | None = None
+    ) -> dict[str, torch.Tensor]:
         """Copies of state tensors in device memory, keyed ``module.field``.
 
         Omitted ``keys`` selects every ``init_state`` field. Pair with

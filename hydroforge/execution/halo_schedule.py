@@ -49,7 +49,6 @@ from typing import Any
 
 import torch
 
-
 Storage = tuple[torch.device, int]
 
 

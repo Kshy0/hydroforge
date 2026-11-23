@@ -34,6 +34,7 @@ with the table; the host holds the table and builds the plan once.
 
 from __future__ import annotations
 
+import hashlib
 import pickle
 from dataclasses import dataclass, field
 from functools import cache
@@ -47,6 +48,8 @@ import hydroforge.parallel
 from hydroforge.compiler.partition import bare
 from hydroforge.contracts.slab import INTERIOR
 from hydroforge.core.errors import SubstepCompileError
+from hydroforge.core.identity import digest63
+from hydroforge.execution.channel import StepEvent
 from hydroforge.execution.context import managed_step_active
 from hydroforge.execution.session import ModelRuntime
 from hydroforge.kernels.calls import recording_sink
@@ -57,6 +60,19 @@ from hydroforge.parallel.halo import MAX_FIELDS, FieldLayout, occurrences
 
 _LAYOUT = FieldLayout("key", 0)
 _GATHER_BYTES = 1 << 21  # per rank and round of a plan's host-table gather
+# Every value of these converts to int64 exactly.
+_ID_DTYPES = frozenset(
+    (
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+        torch.uint16,
+        torch.uint32,
+    )
+)
+_REPLAY, _RECAPTURE, _REBUILD = 0, 1, 2
 
 
 @cache
@@ -86,7 +102,11 @@ def _csr_registry() -> BackendRegistry:
     )
     return BackendRegistry(
         spec,
-        {"cuda": CudaKernel(source, kernel="remap_csr_gather<{staging},{weights},{target}>")},
+        {
+            "cuda": CudaKernel(
+                source, kernel="remap_csr_gather<{staging},{weights},{target}>"
+            )
+        },
     )
 
 
@@ -185,13 +205,18 @@ def _side(runtime: Any, qualified: str, dims: tuple[str, ...] | None) -> _Side:
         rows = np.ravel_multi_index(np.meshgrid(*local, indexing="ij"), stored)
         ids = np.ravel_multi_index(np.meshgrid(*wide, indexing="ij"), extents)
         return _Side(
-            tensor, view, rows.reshape(-1).astype(np.int64),
-            ids.reshape(-1).astype(np.int64), carried,
+            tensor,
+            view,
+            rows.reshape(-1).astype(np.int64),
+            ids.reshape(-1).astype(np.int64),
+            carried,
         )
     if owner is not None:
         group = plan.fields.variable_groups.get(name)
         if group is None:
-            raise ValueError(f"exchange field {qualified!r} belongs to no spatial domain")
+            raise ValueError(
+                f"exchange field {qualified!r} belongs to no spatial domain"
+            )
         count = runtime.partition.rank_indices(group).size
         ids = getattr(runtime.modules[owner.module], coordinate)[:count]
         ids = ids.cpu().numpy().astype(np.int64)
@@ -276,13 +301,16 @@ class _Exchange:
     launch: Any = None
     # CUDA CSR fast path: one kernel launch regardless of target fan-in.
     csr_binder: Any = None
-    csr_pack: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    csr_pack: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = (
+        None
+    )
     csr_entries_host: np.ndarray | None = None
     csr_launch: Any = None
     # Host weights: device buffer(s) a captured graph reads.
     weighted: tuple[torch.Tensor, ...] | None = None
     graph: Any = None
     owner: Any = None  # the executor that holds ``graph``
+    table_digest: bytes = b""  # of the ID tables the plan was built from
     stats: dict[str, int] = field(default_factory=dict)
 
     def _bind_csr(self, weight_tensor: torch.Tensor, use_entries: int) -> Any:
@@ -311,11 +339,6 @@ class _Exchange:
     def reweigh(self, weights: torch.Tensor) -> None:
         """Take a new weight table of the same links (a local re-slice)."""
 
-        if weights.shape != self.target_ids.shape:
-            raise ValueError(
-                f"exchange weights of shape {tuple(weights.shape)} do not match "
-                f"the link table of shape {tuple(self.target_ids.shape)}"
-            )
         device, dtype = self.source.device, self.source.dtype
         if self.csr_binder is not None:
             if self.csr_pack is None:
@@ -361,6 +384,30 @@ class _Exchange:
                 buffer.copy_(values)
         self.weights = weights
 
+    def captures(self, executor: Any) -> bool:
+        return (
+            getattr(executor, "capture", None) is not None
+            and self.source.device.type == "cuda"
+            and (self.halo is None or self.halo.capturable)
+        )
+
+    def graph_stale(self, executor: Any, weights: torch.Tensor) -> bool:
+        """Whether this rank must capture (again) at this call."""
+
+        if not self.captures(executor):
+            return False
+        if (
+            self.graph is None
+            or self.owner is not executor
+            or not executor.owns(self.graph)
+        ):
+            return True
+        if self.csr_binder is not None and self.csr_pack is None:
+            return False  # no local links: the graph reads no weights
+        if weights.device == self.source.device:
+            return self.weighted is not None or weights is not self.weights
+        return self.weighted is None
+
     def drop_graph(self) -> None:
         """Release the captured graph, unless its executor already has."""
 
@@ -398,20 +445,15 @@ class _Exchange:
             view.index_add_(1, rows, values.view(outer, inner, -1).permute(0, 2, 1))
 
     def run(self, executor: Any) -> None:
-        capture = getattr(executor, "capture", None)
-        if (
-            capture is not None
-            and self.source.device.type == "cuda"
-            and (self.halo is None or self.halo.capturable)
-        ):
+        if self.captures(executor):
             if self.graph is not None and (
                 self.owner is not executor or not executor.owns(self.graph)
             ):
                 self.drop_graph()  # the executor invalidated its captures
             if self.graph is None:
-                # Every rank makes the same calls, so every rank captures
-                # (its warm-up exchanges included) at the same call.
-                self.graph = capture(
+                # exchange_ agreed this call across ranks, so every rank
+                # captures (its warm-up exchanges included) here.
+                self.graph = executor.capture(
                     self.body, mutated_state=(self.target, self.staging)
                 )
                 self.owner = executor
@@ -428,7 +470,38 @@ class _Exchange:
                 halo.close()
 
 
-def _build(
+def _check_ids(name: str, ids: torch.Tensor) -> None:
+    if ids.dtype not in _ID_DTYPES:
+        raise ValueError(
+            f"exchange {name} must be an integer tensor that converts to int64 "
+            f"exactly, not {ids.dtype}"
+        )
+
+
+def _host_ids(ids: torch.Tensor) -> np.ndarray:
+    return ids.detach().cpu().numpy().astype(np.int64)
+
+
+def _table_digest(to_ids: np.ndarray, from_ids: np.ndarray) -> bytes:
+    digest = hashlib.sha256()
+    for table in (to_ids, from_ids):
+        digest.update(np.int64(table.size).tobytes())
+        digest.update(table.tobytes())
+    return digest.digest()
+
+
+@dataclass(slots=True)
+class _Prepared:
+    """One rank's checked inputs of a rebuild; nothing shared has changed."""
+
+    source: _Side
+    target: _Side
+    to_ids: np.ndarray
+    from_ids: np.ndarray
+    digest: bytes
+
+
+def _prepare(
     runtime: Any,
     source_name: str,
     target_name: str,
@@ -436,10 +509,7 @@ def _build(
     target_ids: torch.Tensor,
     source_ids: torch.Tensor,
     weights: torch.Tensor,
-) -> _Exchange:
-    from hydroforge.kernels.halo import attach
-    from hydroforge.parallel.halo import HaloPlan, HaloRuntime, RowLayout
-
+) -> _Prepared:
     source = _side(runtime, source_name, dims[0])
     target = _side(runtime, target_name, dims[1])
     if source.carried != target.carried:
@@ -447,11 +517,30 @@ def _build(
             f"exchange {source_name!r} -> {target_name!r}: the source carries "
             f"axes of extents {source.carried}, the target {target.carried}"
         )
-    if not target_ids.shape == source_ids.shape == weights.shape or target_ids.ndim != 1:
-        raise ValueError("exchange link tables must be one-dimensional and equal in length")
+    if (
+        not target_ids.shape == source_ids.shape == weights.shape
+        or target_ids.ndim != 1
+    ):
+        raise ValueError(
+            "exchange link tables must be one-dimensional and equal in length"
+        )
+    to_ids, from_ids = _host_ids(target_ids), _host_ids(source_ids)
+    return _Prepared(source, target, to_ids, from_ids, _table_digest(to_ids, from_ids))
+
+
+def _build(
+    runtime: Any,
+    prepared: _Prepared,
+    target_ids: torch.Tensor,
+    source_ids: torch.Tensor,
+    weights: torch.Tensor,
+) -> _Exchange:
+    from hydroforge.kernels.halo import attach
+    from hydroforge.parallel.halo import HaloPlan, HaloRuntime, RowLayout
+
+    source, target = prepared.source, prepared.target
+    to_ids, from_ids = prepared.to_ids, prepared.from_ids
     device = source.tensor.device
-    to_ids = target_ids.detach().cpu().numpy().astype(np.int64)
-    from_ids = source_ids.detach().cpu().numpy().astype(np.int64)
     needed, slot = np.unique(from_ids, return_inverse=True)
     slot = slot.reshape(-1)
     linked_ids = np.unique(to_ids)
@@ -470,7 +559,11 @@ def _build(
     entries = np.flatnonzero(take)
     rows = target.rows[order][place[take]]
     ghosts = np.setdiff1d(np.unique(slot[entries]), owned_needed)
-    everyone = _gathered(runtime, (owned_needed, mine[mine >= 0], ghosts))
+    everyone = _gathered(
+        runtime, (owned_needed, mine[mine >= 0], ghosts, prepared.digest)
+    )
+    if len({item[3] for item in everyone}) != 1:
+        raise ValueError("exchange ID tables differ across ranks")
     _each_once(needed, [item[0] for item in everyone], "source")
     _each_once(linked_ids, [item[1] for item in everyone], "target")
     # Staging rows: owned needed points, then received ones.
@@ -478,7 +571,10 @@ def _build(
     staging_row = np.full(needed.size, -1, np.int64)
     staging_row[stored] = np.arange(stored.size, dtype=np.int64)
     slots = staging_row[slot[entries]]
-    as_device = lambda value: torch.as_tensor(value, dtype=torch.int64, device=device)
+
+    def as_device(value):
+        return torch.as_tensor(value, dtype=torch.int64, device=device)
+
     channels = int(np.prod(source.carried, dtype=np.int64))
     staging = torch.zeros(
         (channels, stored.size), dtype=source.tensor.dtype, device=device
@@ -543,7 +639,9 @@ def _build(
             )
         else:
             csr_entries_host = np.zeros(0, np.int64)
-        linked_d = csr_pack[0] if csr_pack is not None else as_device(np.zeros(0, np.int64))
+        linked_d = (
+            csr_pack[0] if csr_pack is not None else as_device(np.zeros(0, np.int64))
+        )
     else:
         turns = occurrences(rows) if rows.size else np.zeros(0, np.int64)
         if turns.size:
@@ -579,6 +677,7 @@ def _build(
         csr_binder=csr_binder,
         csr_pack=csr_pack,
         csr_entries_host=csr_entries_host,
+        table_digest=prepared.digest,
         stats=dict(
             links=int(entries.size),
             owned=int(owned_needed.size),
@@ -608,13 +707,17 @@ def exchange_(
     The exchange is not differentiable: it raises when the source, target
     or weights require gradients.
 
-    One plan is cached per port. A different ID table or field tensor
-    rebuilds it (collectively); a different weight tensor of the same links
-    only re-slices the weights. Weights on the model device are read at
-    every call, so they may change in place; ID tables are read when the
-    plan is built. Under a CUDA-graph executor the exchange is captured at
-    its first call and replayed after: a new host weight tensor is copied
-    into the captured buffers, while a new device tensor recaptures, so
+    IDs must be integer tensors. One plan is cached per port, and the ranks
+    of a spatial group agree at every call on whether to keep, recapture or
+    rebuild it. New ID values or a new field tensor on any rank rebuild it;
+    an ID tensor with the same values only replaces the cached reference
+    (and costs one host comparison), and ID tables that differ across ranks
+    raise on every rank. A different weight tensor of the same links only
+    re-slices the weights. Weights on the model device are read at every
+    call, so they may change in place; ID tables are read when the plan is
+    built. Under a CUDA-graph executor the exchange is captured at its first
+    call and replayed after: a new host weight tensor is copied into the
+    captured buffers, while a new device tensor recaptures every rank, so
     change device weights in place when they change often.
     """
 
@@ -637,17 +740,34 @@ def exchange_(
             f"exchange_ {port!r} is not differentiable; its source, target and "
             "weights must not require gradients"
         )
+    _check_ids("target_ids", target_ids)
+    _check_ids("source_ids", source_ids)
+    # Every input check precedes the agreement, where a failure reaches peers.
+    if weights.shape != target_ids.shape:
+        raise ValueError(
+            f"exchange weights of shape {tuple(weights.shape)} do not match "
+            f"the link table of shape {tuple(target_ids.shape)}"
+        )
+    executor = runtime.execution.executor
     exchange = runtime.remaps.get(port)
-    if (
-        exchange is None
-        or exchange.target_ids is not target_ids
-        or exchange.source_ids is not source_ids
-        or exchange.source is not source
-        or exchange.target is not target
-    ):
-        if exchange is not None:
-            runtime.remaps.pop(port).close()
-        exchange = _build(
+    level = _REBUILD
+    if exchange is not None and exchange.source is source and exchange.target is target:
+        if (
+            exchange.target_ids is target_ids and exchange.source_ids is source_ids
+        ) or exchange.table_digest == _table_digest(
+            _host_ids(target_ids), _host_ids(source_ids)
+        ):
+            exchange.target_ids, exchange.source_ids = target_ids, source_ids
+            level = _RECAPTURE if exchange.graph_stale(executor, weights) else _REPLAY
+    # Ranks act on one decision: a rank alone in a collective would hang.
+    tag = digest63(("exchange_", port))
+    if runtime.plan.spatial_world_size > 1:
+        agreed, highest = runtime.channel.exchange_sync(level, tag)
+    else:
+        agreed = highest = level
+    prepared = None
+    if agreed == _REBUILD:
+        prepared = _prepare(
             runtime,
             f"{provider}.{offered.field}",
             f"{module_name}.{declared.field}",
@@ -656,10 +776,21 @@ def exchange_(
             source_ids,
             weights,
         )
+    if highest == _REBUILD and runtime.plan.spatial_world_size > 1:
+        # A rank whose inputs failed above has published it by now: the old
+        # plans close only once every rank can build the new one.
+        runtime.channel.event(StepEvent.EXCHANGE_SYNC, (0, tag, 1))
+    if agreed == _REBUILD:
+        if exchange is not None:
+            runtime.remaps.pop(port).close()
+        exchange = _build(runtime, prepared, target_ids, source_ids, weights)
         runtime.remaps[port] = exchange
-    elif exchange.weights is not weights:
-        exchange.reweigh(weights)
-    exchange.run(runtime.execution.executor)
+    else:
+        if agreed == _RECAPTURE:
+            exchange.drop_graph()
+        if exchange.weights is not weights:
+            exchange.reweigh(weights)
+    exchange.run(executor)
 
 
 __all__ = ["exchange_"]

@@ -176,7 +176,9 @@ def _triton_helpers():
                 result = result + value
             elif op == 1:
                 if floating:
-                    result = tl.where((value != value) | (value > result), value, result)
+                    result = tl.where(
+                        (value != value) | (value > result), value, result
+                    )
                 else:
                     result = tl.where(value > result, value, result)
             elif floating:
