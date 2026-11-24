@@ -27,7 +27,6 @@ from pydantic import (
     model_validator,
     validate_call,
 )
-from scipy.sparse import csr_matrix
 
 from hydroforge.core.arrays import (
     UniqueIds,
@@ -39,6 +38,7 @@ from hydroforge.core.arrays import (
 )
 from hydroforge.core.validation import HydroForgeModel
 from hydroforge.io.files import atomic_output_path
+from hydroforge.mapping.csr import CSRMatrix, nearest_points
 from hydroforge.mapping.engine import _segment_sums
 from hydroforge.mapping.grid import (
     _axis_bounds,
@@ -131,71 +131,6 @@ def _validate_csr_components(
         raise ValueError("sparse_indices fall outside matrix_shape")
 
 
-class _ImmutableCSR(csr_matrix):
-    """CSR read view whose structural storage cannot be replaced in place."""
-
-    _IMMUTABLE_ATTRIBUTES = frozenset({"data", "indices", "indptr", "_shape"})
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        if getattr(self, "_hydroforge_sealed", False) and (
-            name in self._IMMUTABLE_ATTRIBUTES
-        ):
-            raise TypeError("frozen mapping CSR storage is immutable")
-        super().__setattr__(name, value)
-
-    def _reject_mutation(self, *args: Any, **kwargs: Any) -> None:
-        del args, kwargs
-        if getattr(self, "_hydroforge_sealed", False):
-            raise TypeError("frozen mapping CSR storage is immutable")
-
-    def __setitem__(self, key: Any, value: Any) -> None:
-        self._reject_mutation()
-        super().__setitem__(key, value)
-
-    def eliminate_zeros(self) -> None:
-        self._reject_mutation()
-        super().eliminate_zeros()
-
-    def prune(self) -> None:
-        self._reject_mutation()
-        super().prune()
-
-    def resize(self, *shape: Any) -> None:
-        self._reject_mutation()
-        super().resize(*shape)
-
-    def setdiag(self, values: Any, k: int = 0) -> None:
-        self._reject_mutation()
-        super().setdiag(values, k=k)
-
-    def sort_indices(self) -> None:
-        # SciPy reductions call these unconditionally; canonical storage
-        # needs no change, so only a real mutation is rejected.
-        if self.has_sorted_indices:
-            return
-        self._reject_mutation()
-        super().sort_indices()
-
-    def sum_duplicates(self) -> None:
-        if self.has_canonical_format:
-            return
-        self._reject_mutation()
-        super().sum_duplicates()
-
-
-def _freeze_csr_storage(matrix: csr_matrix) -> csr_matrix:
-    """Replace CSR component arrays with immutable-buffer-backed arrays."""
-
-    # The new CSR shell may share inputs until each component is replaced by
-    # immutable_array's independently owned byte storage below.
-    frozen = _ImmutableCSR(matrix, copy=False)
-    frozen.data = immutable_array(frozen.data, order="C")
-    frozen.indices = immutable_array(frozen.indices, order="C")
-    frozen.indptr = immutable_array(frozen.indptr, order="C")
-    frozen._hydroforge_sealed = True
-    return frozen
-
-
 def _canonical_metadata_value(value: Any, *, path: str) -> Any:
     """Canonicalize one strict JSON metadata value without coercion."""
 
@@ -230,10 +165,10 @@ class LocalMapping(HydroForgeModel):
 
     target_ids: np.ndarray
     source_indices: np.ndarray
-    source_to_target: csr_matrix
+    source_to_target: CSRMatrix
 
     # ``target x active_source`` CSR derived once for :meth:`to_torch`.
-    _target_rows: csr_matrix | None = PrivateAttr(default=None)
+    _target_rows: CSRMatrix | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _validate_local_mapping(self) -> Self:
@@ -283,7 +218,7 @@ class LocalMapping(HydroForgeModel):
         object.__setattr__(
             self,
             "source_to_target",
-            _freeze_csr_storage(matrix),
+            matrix.freeze(),
         )
         return self
 
@@ -293,7 +228,7 @@ class LocalMapping(HydroForgeModel):
         *,
         target_ids: np.ndarray,
         source_indices: np.ndarray,
-        source_to_target: csr_matrix,
+        source_to_target: CSRMatrix,
     ) -> LocalMapping:
         """Own a local projection derived solely from a validated mapping."""
 
@@ -308,7 +243,7 @@ class LocalMapping(HydroForgeModel):
                 dtype=np.int64,
                 order="C",
             ),
-            source_to_target=_freeze_csr_storage(matrix),
+            source_to_target=matrix.freeze(),
         )
 
     def to_torch(
@@ -377,7 +312,7 @@ class MappingTable(HydroForgeModel):
     """CSR mapping from flattened source grid cells to target supports."""
 
     target_ids: np.ndarray
-    matrix: csr_matrix
+    matrix: CSRMatrix
     source_x: np.ndarray
     source_y: np.ndarray
     coverage: np.ndarray
@@ -417,10 +352,7 @@ class MappingTable(HydroForgeModel):
         )
         if self.matrix.dtype != np.dtype(np.float32):
             raise ValueError("mapping matrix must use exact float32 dtype")
-        # A fresh shell recomputes the canonical-format flag without copying
-        # storage; freezing below takes the only owned copy.
-        matrix = csr_matrix(self.matrix, copy=False)
-        if not matrix.has_canonical_format:
+        if not self.matrix.has_canonical_format:
             raise ValueError("mapping matrix must use canonical CSR storage")
         if not np.isfinite(self.matrix.data).all():
             raise ValueError("mapping matrix values must be finite")
@@ -468,7 +400,7 @@ class MappingTable(HydroForgeModel):
         object.__setattr__(
             self,
             "matrix",
-            _freeze_csr_storage(matrix),
+            self.matrix.freeze(),
         )
         return self
 
@@ -477,7 +409,7 @@ class MappingTable(HydroForgeModel):
         cls,
         *,
         target_ids: np.ndarray,
-        matrix: csr_matrix,
+        matrix: CSRMatrix,
         source_x: np.ndarray,
         source_y: np.ndarray,
         coverage: np.ndarray,
@@ -503,7 +435,7 @@ class MappingTable(HydroForgeModel):
             )
         return cls.model_construct(
             target_ids=immutable_array(target_ids, dtype=np.int64, order="C"),
-            matrix=_freeze_csr_storage(owned_matrix),
+            matrix=owned_matrix.freeze(),
             source_x=immutable_array(source_x, dtype=np.float64, order="C"),
             source_y=immutable_array(source_y, dtype=np.float64, order="C"),
             coverage=immutable_array(coverage, dtype=np.float32, order="C"),
@@ -570,7 +502,7 @@ class MappingTable(HydroForgeModel):
         selected = selected.copy()
         selected.eliminate_zeros()
         active = np.unique(selected.indices).astype(np.int64)
-        compact = csr_matrix(
+        compact = CSRMatrix(
             (selected.data, np.searchsorted(active, selected.indices), selected.indptr),
             shape=(selected.shape[0], active.size),
         )
@@ -597,7 +529,6 @@ class MappingTable(HydroForgeModel):
         """
         if not np.any(valid_grid):
             return None
-        from scipy.spatial import cKDTree
 
         nx = valid_grid.shape[1]
 
@@ -611,8 +542,7 @@ class MappingTable(HydroForgeModel):
             )
 
         valid_y, valid_x = np.nonzero(valid_grid)
-        tree = cKDTree(points(valid_y, valid_x))
-        _distance, nearest = tree.query(points(start_y, start_x))
+        nearest = nearest_points(points(valid_y, valid_x), points(start_y, start_x))
         return valid_y[nearest].astype(np.int64) * nx + valid_x[nearest]
 
     def _source_periodic_x(self) -> bool:
@@ -658,7 +588,7 @@ class MappingTable(HydroForgeModel):
     @classmethod
     def _weighted_center_indices(
         cls,
-        matrix: csr_matrix,
+        matrix: CSRMatrix,
         rows: np.ndarray,
         nx: int,
         periodic_x: bool,
@@ -740,7 +670,7 @@ class MappingTable(HydroForgeModel):
 
         coo = original.tocoo()
         keep = valid[coo.col]
-        masked = csr_matrix(
+        masked = CSRMatrix(
             (coo.data[keep], (coo.row[keep], coo.col[keep])),
             shape=original.shape,
             dtype=np.float64,
@@ -793,7 +723,7 @@ class MappingTable(HydroForgeModel):
                     ).tolist()
 
             if repair_row:
-                repair = csr_matrix(
+                repair = CSRMatrix(
                     (
                         np.asarray(repair_val, dtype=np.float64),
                         (
@@ -891,7 +821,7 @@ class MappingTable(HydroForgeModel):
                 label="target_ids",
             )
 
-            matrix = csr_matrix(
+            matrix = CSRMatrix(
                 (sparse_data, indices, indptr),
                 shape=(n_rows, n_cols),
             )

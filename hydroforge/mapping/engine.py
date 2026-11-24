@@ -409,7 +409,7 @@ def _hires_coo(
     rows = catchment_idx[valid].astype(np.int64, copy=False)
     cols = source_idx[valid]
     # Keep source areas in float64 until duplicate COO entries have been
-    # coalesced by scipy.  Casting each pixel before that reduction loses
+    # coalesced into CSR.  Casting each pixel before that reduction loses
     # measurable area when hundreds of hires pixels map to one source cell.
     data = pixel_area[valid]
     return rows, cols, data

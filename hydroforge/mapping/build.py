@@ -14,10 +14,10 @@ from typing import Annotated, Any, Literal
 
 import numpy as np
 from pydantic import AfterValidator, InstanceOf, validate_call
-from scipy.sparse import csr_matrix
 
 from hydroforge.core.validation import HydroForgeModel
 from hydroforge.mapping.cama import _cama_cell_targets, _cama_hires_source_cells
+from hydroforge.mapping.csr import CSRMatrix
 from hydroforge.mapping.engine import (
     _cell_area,
     _hires_coo,
@@ -144,7 +144,7 @@ def build_regular_grid_mapping(
     )
     return MappingTable._assemble(
         target_ids=target.target_ids,
-        matrix=csr_matrix(
+        matrix=CSRMatrix(
             (values, cols, indptr),
             shape=(n_target, source._size),
             dtype=np.float64,
@@ -171,7 +171,7 @@ def _hires_mapping(
     grid, like the covered-area fraction of overlap mappings.
     """
 
-    matrix = csr_matrix(
+    matrix = CSRMatrix(
         (data, (rows, cols)),
         shape=(target_ids.size, source._size),
         dtype=np.float64,
@@ -247,7 +247,7 @@ def _cama_cell_mapping(
     values = overlap.values * np.repeat(areas / cell_area, lengths)
     return MappingTable._assemble(
         target_ids=target_ids,
-        matrix=csr_matrix(
+        matrix=CSRMatrix(
             (values, overlap.cols, overlap.indptr),
             shape=(target_ids.size, source._size),
             dtype=np.float64,

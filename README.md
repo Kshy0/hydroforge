@@ -3,7 +3,7 @@
 A framework for GPU-accelerated hydrological modelling with Torch, Triton,
 native CUDA, and Metal backends. Use it through a model package such as
 [CaMa-Flood-GPU](https://github.com/Kshy0/CaMa-Flood-GPU) or
-[WRF-GPU](https://github.com/Kshy0/WRF-GPU); that package supplies the physics,
+[HydroNet](https://github.com/Kshy0/HydroNet); that package supplies the physics,
 input preparation tools, forcing interfaces, and model options.
 
 ## Installation
@@ -59,57 +59,58 @@ Prepare inputs with the model package's tools. `InputProxy.from_nc` opens
 prepared NetCDF inputs; it does not convert arbitrary source data into a
 model's input format.
 
-This WRF example requires the WRF-GPU package, a CUDA device, and a prepared
-`parameters.nc` matching the options and start time below. Other models have
-their own step methods and forcing setters; use their examples for those
-parts.
+This example requires [CaMa-Flood-GPU](https://github.com/Kshy0/CaMa-Flood-GPU),
+a CUDA device, and a prepared `parameters.nc` from its parameter tools. Other
+models have their own step methods, options, and forcing setters; use their
+examples for those parts.
 
 ```python
 from contextlib import closing
 from datetime import datetime, timedelta
 
 import torch
+from cmfgpu.config import CaMaOptions
+from cmfgpu.models import CaMaFlood
 from hydroforge.contracts import SimulationSchedule
 from hydroforge.data import InputProxy
 from hydroforge.model import OutputConfig
-from wrfgpu.config import WRFOptions
-from wrfgpu.models import WRF
 
-options = WRFOptions(mp_physics=1, time_step=2.0)
 schedule = SimulationSchedule.regular(
-    start=datetime(2000, 6, 1),
-    end=datetime(2000, 6, 1, 0, 1),
-    step=timedelta(seconds=options.time_step),
+    start=datetime(2000, 1, 1),
+    end=datetime(2000, 1, 3),
+    step=timedelta(days=1),
 )
 
 with closing(InputProxy.from_nc("parameters.nc", lazy=True)) as inputs:
-    with WRF(
+    with CaMaFlood(
         input_proxy=inputs,
-        options=options,
+        options=CaMaOptions(),
+        opened_modules=("base", "adaptive_time"),
         device=torch.device("cuda"),
         precision="float32",
         simulation_schedule=schedule,
         output=OutputConfig(
             dir="out",
-            experiment="forecast",
-            variables={"last": ("u", "v", "moist")},
+            experiment="flood_run",
+            variables={"mean": ("total_outflow",), "last": ("river_depth",)},
         ),
     ) as model:
+        runoff = torch.zeros(model.base.num_catchments, device="cuda")
         for _ in schedule:
+            model.set_inputs(runoff=runoff)
             model.step_advance()
         model.export_html("model.html")
 ```
 
 Keep model calls inside `with model:` and close input proxies when finished.
-The schedule supplies step times and durations; WRF requires its step duration
-to equal `options.time_step`. Update time-varying forcing through the model's
-public setter before each step when the model requires it.
+The schedule supplies step times and durations. Update time-varying forcing
+through the model's public setter before each step when the model requires it.
 
 ## Outputs
 
 `OutputConfig` selects fields and reductions such as `mean`, `sum`, `min`,
 `max`, `first`, and `last`. With no `statistics_plan`, outputs are sampled
-every model step. The example writes NetCDF files beneath `out/forecast`.
+every model step. The example writes NetCDF files beneath `out/flood_run`.
 Use the model's documented field names and units.
 
 Floating-point output defaults to FP32. Set `save_precision="float64"` to
@@ -119,13 +120,13 @@ Integer and boolean outputs retain their types.
 To keep results in memory, replace the output configuration with:
 
 ```python
-OutputConfig(sink="memory", variables={"last": ("u", "v")})
+OutputConfig(sink="memory", variables={"last": ("river_depth", "total_outflow")})
 ```
 
 Read them before leaving the model context:
 
 ```python
-u = model.results.get("u", op="last")  # tensor stacked over output times
+depth = model.results.get("river_depth", op="last")  # tensor stacked over output times
 ```
 
 For a subset of a structured grid, select the model's named global axes:
@@ -135,8 +136,8 @@ from hydroforge.contracts import Out, OutputView, Range
 
 OutputConfig(
     dir="out",
-    views={"box": OutputView(bottom_top=Range(10), west_east=Range(100, 200))},
-    variables={"last": (Out("u", view="box"),)},
+    views={"box": OutputView(lat=Range(10, 50), lon=Range(100, 200))},
+    variables={"last": (Out("runoff", view="box"),)},
 )
 ```
 

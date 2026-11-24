@@ -18,7 +18,6 @@ dependencies = [
     "numba",
     "tqdm",
     "cftime",
-    "scipy",
     "ninja; sys_platform == 'darwin'",
 ]
 

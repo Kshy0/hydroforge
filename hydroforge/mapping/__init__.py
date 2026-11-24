@@ -20,11 +20,13 @@ from hydroforge.mapping.aggregation import (
     build_point_mapping,
 )
 from hydroforge.mapping.build import build_regular_grid_mapping
+from hydroforge.mapping.csr import CSRMatrix
 from hydroforge.mapping.grid import RegularGrid
 from hydroforge.mapping.table import MappingTable
 from hydroforge.mapping.target import TargetSupport
 
 __all__ = [
+    "CSRMatrix",
     "MappingTable",
     "RegularGrid",
     "TargetSupport",
