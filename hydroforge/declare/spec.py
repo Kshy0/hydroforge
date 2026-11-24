@@ -103,6 +103,8 @@ class ModuleSpec:
     references: Mapping[str, ModuleRefSpec]
     required_modules: tuple[str, ...]
     kernel_fields: tuple[str, ...]
+    computed_caches: tuple[str, ...] = ()
+    """Names of the module's ``computed_cache`` values."""
 
 
 @dataclass(frozen=True, slots=True)

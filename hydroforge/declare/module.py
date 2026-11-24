@@ -55,6 +55,7 @@ from hydroforge.core.errors import UnknownFieldError, error_message
 from hydroforge.core.events import ModelEvent
 from hydroforge.core.naming import Identifier
 from hydroforge.core.validation import HydroForgeModel, require_unique
+from hydroforge.declare.computed_cache import ComputedCache
 from hydroforge.declare.initial import AfterInitProperty
 from hydroforge.declare.kernel_field import _KernelField
 from hydroforge.declare.spec import (
@@ -824,6 +825,7 @@ def _module_spec(cls: type[AbstractModule]) -> ModuleSpec:
     reference_indices: dict[str, ReferenceIndexSpec] = {}
     references: dict[str, ModuleRefSpec] = {}
     kernel_fields: list[str] = []
+    computed_caches: list[str] = []
     for name, value in attributes.items():
         if isinstance(value, _ReferenceIndexDescriptor):
             source = tensor_fields.get(value.reference)
@@ -856,6 +858,8 @@ def _module_spec(cls: type[AbstractModule]) -> ModuleSpec:
             )
         elif isinstance(value, _KernelField):
             kernel_fields.append(name)
+        elif isinstance(value, ComputedCache):
+            computed_caches.append(name)
     return ModuleSpec(
         module_type=cls,
         name=module_name,
@@ -869,6 +873,7 @@ def _module_spec(cls: type[AbstractModule]) -> ModuleSpec:
             name for name, reference in references.items() if not reference.optional
         ),
         kernel_fields=tuple(kernel_fields),
+        computed_caches=tuple(computed_caches),
     )
 
 
@@ -894,6 +899,7 @@ class AbstractModule(HydroForgeModel, ABC):
             _ReferenceIndexDescriptor,
             ModuleReference,
             _KernelField,
+            ComputedCache,
         ),
     )
 

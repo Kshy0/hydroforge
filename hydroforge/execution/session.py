@@ -195,6 +195,8 @@ class ModelRuntime:
         self.topology = None
         self._halo_layouts: dict[int, tuple[Any, Any]] = {}
         self.fixed_parameters: Mapping[str, frozenset[str]] = MappingProxyType({})
+        # What each computed_cache feeds (execution.derivation), on demand.
+        self.derivations: Any = None
         self.missing_inputs: frozenset[str] = frozenset()
         self.progress = None
         self.model_state_entered = False
@@ -657,6 +659,7 @@ class ModelRuntime:
 
     def _build(self) -> None:
         # Declaration-only imports do not need partition compilation or Numba.
+        from hydroforge.execution.derivation import record_before_discard
         from hydroforge.execution.parameters import (
             LocalParameterCompiler,
             ParameterPlanRuntime,
@@ -766,6 +769,7 @@ class ModelRuntime:
         self._check_field_values()
         # What derived parameters read is recorded before inputs are discarded.
         self.fixed_parameters = fixed_derived_parameters(self)
+        record_before_discard(self)
         for name in plan.modules:
             self.modules[name]._tensors._apply_modes()
         self.model_state_entered = True

@@ -23,6 +23,7 @@ from hydroforge.core.arrays import find_indices_in_torch
 from hydroforge.declare.tensors import ModuleTensors, ghost_rows
 from hydroforge.execution.checkpoint import CheckpointRuntime
 from hydroforge.execution.context import managed_step_active, validate_callback
+from hydroforge.execution.derivation import restage
 
 if TYPE_CHECKING:
     from hydroforge.execution.session import ModelRuntime
@@ -654,6 +655,18 @@ def _stale_reference_indices(
     return tuple(stale)
 
 
+# A structural update not handed the re-derivation of an escalated content one.
+_UNSTAGED: Any = object()
+
+
+def _restage(runtime: ModelRuntime, pairs: Sequence[tuple[torch.Tensor, torch.Tensor]]):
+    """Re-derive the values staged ``pairs`` leave stale through a cache,
+    before anything mutates (see :mod:`hydroforge.execution.derivation`)."""
+
+    staged = {id(current): replacement for current, replacement in pairs}
+    return restage(runtime, pairs, _stale_reference_indices(runtime, staged))
+
+
 def commit_content_update(
     runtime: ModelRuntime,
     bindings: Iterable[tuple[torch.Tensor, torch.Tensor]],
@@ -682,6 +695,18 @@ def _commit_content_update(
     runtime: ModelRuntime, pairs: Sequence[tuple[torch.Tensor, torch.Tensor]]
 ) -> StructuralUpdateResult:
     _require_update_boundary(runtime, "content")
+    staged = pairs
+    restaging = _restage(runtime, pairs)
+    if restaging is not None:
+        if restaging.resizes or restaging.rebinds:
+            # Values read through a cache change shape or kernel bindings.
+            return _commit_structural_update(
+                runtime,
+                staged,
+                content_ids=frozenset(id(c) for c, _ in staged),
+                restaging=restaging,
+            )
+        pairs = (*pairs, *restaging.pairs)
     replacements = _validate_replacements(pairs, kind="content")
 
     fields = _replacement_fields(runtime, replacements)
@@ -707,9 +732,13 @@ def _commit_content_update(
         statistics is not None and statistics.content_requires_rebind(changed)
     ):
         # Address stability does not imply validity of derived CSR contents.
-        # Reuse the full transaction, retaining the caller's content-copy policy.
+        # Reuse the full transaction, retaining the caller's content-copy policy;
+        # the re-derived tensors keep their addresses too.
         return _commit_structural_update(
-            runtime, pairs, content_ids=frozenset(replacements)
+            runtime,
+            staged,
+            content_ids=frozenset(replacements),
+            restaging=restaging,
         )
 
     bindings = runtime.parameters.prepare_rebind(replacements)
@@ -724,6 +753,8 @@ def _commit_content_update(
         with torch.inference_mode():
             for current, replacement in (*pairs, *derived, *selections):
                 current.copy_(replacement)
+        if restaging is not None:
+            restaging.finish()
         runtime.parameters.install_rebind(bindings)
         return StructuralUpdateResult(
             revision=runtime.execution.structural_revision,
@@ -756,8 +787,16 @@ def _commit_structural_update(
     pairs: Sequence[tuple[torch.Tensor, torch.Tensor]],
     *,
     content_ids: frozenset[int] = frozenset(),
+    restaging: Any = _UNSTAGED,
 ) -> StructuralUpdateResult:
+    """``restaging`` is the re-derivation an escalated content update already
+    evaluated for ``pairs`` (``None``: nothing is stale)."""
+
     _require_update_boundary(runtime, "structural")
+    if restaging is _UNSTAGED:
+        restaging = _restage(runtime, pairs)
+    if restaging is not None:
+        pairs = (*pairs, *restaging.pairs)
     replacements = _validate_replacements(
         pairs, kind="structural", content_ids=content_ids
     )
@@ -829,6 +868,8 @@ def _commit_structural_update(
                     current.copy_(fresh)
                 else:
                     current.set_(fresh)
+        if restaging is not None:
+            restaging.finish()
         changes = _publish_dimensions(inferred, previous_dimensions)
         _verify_dimensions(inferred)
         _rebuild_computed(runtime, stale)

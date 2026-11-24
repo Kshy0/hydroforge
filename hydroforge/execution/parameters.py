@@ -28,8 +28,13 @@ from hydroforge.contracts.fields import concrete_tensor_dtype
 from hydroforge.contracts.parameters import ParameterValue, validate_parameter_scalar
 from hydroforge.core.devices import devices_match
 from hydroforge.core.errors import ResourceCleanupError
+from hydroforge.declare.computed_cache import (
+    ComputedCache,
+    transient_computed_caches,
+)
 from hydroforge.declare.module import AbstractModule
 from hydroforge.declare.tensors import ModulePayload, ModuleTensors
+from hydroforge.execution.derivation import _ABSENT, derivations, same_value
 from hydroforge.execution.partition import searchsorted_batch
 
 if TYPE_CHECKING:
@@ -40,6 +45,10 @@ if TYPE_CHECKING:
 
 _FRAMEWORK_ATTRIBUTES = frozenset(dir(AbstractModule))
 
+# One recording pass's ``computed_cache`` values and the fields each reads,
+# by ``(id(module), name)``.
+_RecordedCaches = dict[tuple[int, str], tuple[Any, frozenset[str]]]
+
 
 class _ReadRecorder:
     """Stand-in ``self`` that records the declared tensor reads of one formula.
@@ -47,21 +56,30 @@ class _ReadRecorder:
     Declared tensor and reference-index reads are recorded by qualified name.
     Sibling modules resolve to their own recorders, and methods or properties
     authored by the module class run against the recorder so that helper
-    reads are recorded as well. Scalars, framework methods and private state
-    are read from the module itself.
+    reads are recorded as well. A ``computed_cache`` runs against a recorder
+    once per recording pass; every formula reading it records all of its
+    reads. Scalars, framework methods and private state are read from the
+    module itself.
     """
 
-    __slots__ = ("_recorded_module", "_recorded_fields", "_recorded_reads")
+    __slots__ = (
+        "_recorded_module",
+        "_recorded_fields",
+        "_recorded_reads",
+        "_recorded_caches",
+    )
 
     def __init__(
         self,
         module: Any,
         fields: Mapping[int, Mapping[str, str]],
         reads: set[str],
+        caches: _RecordedCaches | None = None,
     ) -> None:
         self._recorded_module = module
         self._recorded_fields = fields
         self._recorded_reads = reads
+        self._recorded_caches = {} if caches is None else caches
 
     @property
     def __class__(self) -> type:
@@ -78,8 +96,26 @@ class _ReadRecorder:
             sibling = getattr(module, name)
             if sibling is None:
                 return None
-            return _ReadRecorder(sibling, self._recorded_fields, self._recorded_reads)
+            return _ReadRecorder(
+                sibling,
+                self._recorded_fields,
+                self._recorded_reads,
+                self._recorded_caches,
+            )
         attribute = inspect.getattr_static(type(module), name, None)
+        if isinstance(attribute, ComputedCache):
+            key = (id(module), name)
+            entry = self._recorded_caches.get(key)
+            if entry is None:
+                reads: set[str] = set()
+                value = attribute.func(
+                    _ReadRecorder(
+                        module, self._recorded_fields, reads, self._recorded_caches
+                    )
+                )
+                entry = self._recorded_caches[key] = (value, frozenset(reads))
+            self._recorded_reads.update(entry[1])
+            return entry[0]
         if (
             isinstance(attribute, (FunctionType, property))
             and name not in _FRAMEWORK_ATTRIBUTES
@@ -122,13 +158,17 @@ def _declared_fields(runtime: Any) -> tuple[dict, dict, dict]:
 
 
 def _formula_reads(
-    qualified: str, module: Any, descriptor: cached_property, fields: Mapping
+    qualified: str,
+    module: Any,
+    descriptor: cached_property,
+    fields: Mapping,
+    caches: _RecordedCaches | None = None,
 ) -> set[str]:
     reads: set[str] = set()
     try:
         # Invoke only the formula: reading the result buffer here would
         # falsely record a self-dependency.
-        descriptor.func(_ReadRecorder(module, fields, reads))
+        descriptor.func(_ReadRecorder(module, fields, reads, caches))
     except Exception as error:
         raise ValueError(
             f"cannot record parameter dependencies for {qualified}: {error}"
@@ -153,9 +193,10 @@ def fixed_derived_parameters(runtime: Any) -> Mapping[str, frozenset[str]]:
     }
     if not discarded:
         return MappingProxyType({})
+    caches: _RecordedCaches = {}
     with torch.inference_mode():
         reads = {
-            qualified: _formula_reads(qualified, module, descriptor, fields)
+            qualified: _formula_reads(qualified, module, descriptor, fields, caches)
             for qualified, (module, _name, descriptor) in candidates.items()
         }
     fixed: dict[str, set[str]] = {}
@@ -549,6 +590,14 @@ class _TensorSnapshot:
     index_axis: int
 
 
+@dataclass(frozen=True, slots=True)
+class _CachedValue:
+    """A ``computed_cache`` value a parameter change dropped; a rollback
+    restores it."""
+
+    value: Any
+
+
 def _tensor_byte_ranges(
     tensor: torch.Tensor, indices: torch.Tensor | None = None, axis: int = 0
 ) -> tuple[tuple[int, int], ...]:
@@ -819,9 +868,10 @@ class ParameterPlanRuntime:
         for name in fixed:
             candidates.pop(name, None)
         dependencies = {}
+        caches: _RecordedCaches = {}
         with torch.inference_mode():
             for qualified, (module, _name, descriptor) in candidates.items():
-                reads = _formula_reads(qualified, module, descriptor, fields)
+                reads = _formula_reads(qualified, module, descriptor, fields, caches)
                 for dependency in reads:
                     if dependency in fixed:
                         # A fixed derived parameter never changes.
@@ -876,10 +926,47 @@ class ParameterPlanRuntime:
         self.dependencies = MappingProxyType(dependencies)
         self._dependency_revision = revision
 
-    def _refresh_derived_parameters(self, changed: set[str]) -> None:
+    def _affected(self, changed: set[str]) -> set[str]:
+        """Add aliases to ``changed``; return it with the derived parameters
+        (and their aliases) a change of ``changed`` refreshes."""
+
         changed.update(
             alias for name in tuple(changed) for alias in self._aliases.get(name, ())
         )
+        affected = set(changed)
+        for qualified in self._derived:
+            if not affected.isdisjoint(self.dependencies[qualified]):
+                affected.update(self._aliases.get(qualified, (qualified,)))
+        return affected
+
+    def _cache_readers(self, changed: set[str]) -> dict[str, tuple[Any, Any]]:
+        """Before any value changes: the values besides derived parameters
+        reading a ``computed_cache`` a change of ``changed`` leaves stale,
+        with their current value, evaluated if not resident (a kernel field
+        an invalidation dropped). The refresh rejects the change if any of
+        them would change."""
+
+        graph = derivations(self.runtime)
+        if graph is None:
+            return {}
+        readers = {}
+        with torch.no_grad():
+            for qualified in sorted(graph.stale(self._affected(set(changed)))):
+                node = graph.nodes[qualified]
+                if node.kind == "cache" or qualified in self._derived:
+                    continue
+                value = node.module.__dict__.get(node.name, _ABSENT)
+                if value is _ABSENT:
+                    value = node.func(node.module)
+                readers[qualified] = (node, value)
+        return readers
+
+    def _refresh_derived_parameters(
+        self,
+        changed: set[str],
+        readers: Mapping[str, tuple[Any, Any]] = MappingProxyType({}),
+    ) -> None:
+        affected = self._affected(changed)
         problems = []
         for module_name in self.runtime.plan.modules:
             fields = {
@@ -905,7 +992,10 @@ class ParameterPlanRuntime:
                     f"{name} was derived from a discarded input and is fixed; "
                     f"changing {', '.join(stale)} would leave it stale"
                 )
-        with torch.inference_mode():
+        self._drop_stale_caches(affected)
+        # Consumers of a dropped cache share one evaluation per change; it is
+        # not kept, so no inference tensor outlives this refresh.
+        with torch.inference_mode(), transient_computed_caches():
             for qualified, (module, name, descriptor) in self._derived.items():
                 if changed.isdisjoint(self.dependencies[qualified]):
                     continue
@@ -920,8 +1010,35 @@ class ParameterPlanRuntime:
                 )
                 current.copy_(fresh)
                 changed.update(self._aliases.get(qualified, (qualified,)))
+            for node, before in readers.values():
+                if not same_value(before, node.func(node.module)):
+                    raise ValueError(
+                        f"changing {', '.join(sorted(affected))} changes "
+                        f"{node.qualified}, which reads a computed_cache; a "
+                        "parameter change re-evaluates only derived parameters"
+                    )
             for module_name in self.runtime.plan.modules:
                 self.runtime.modules[module_name].validate_parameters()
+
+    def _drop_stale_caches(self, affected: set[str]) -> None:
+        """Drop each resident ``computed_cache`` an affected field leaves
+        stale; the transaction restores it on rollback."""
+
+        graph = derivations(self.runtime)
+        if graph is None:
+            return
+        stale = graph.stale(affected)
+        if not stale:
+            return
+        graph.reject_fixed(stale, affected)
+        for qualified in sorted(stale):
+            node = graph.nodes[qualified]
+            if node.kind != "cache" or node.name not in node.module.__dict__:
+                continue
+            value = node.module.__dict__.pop(node.name)
+            self._step_transaction_snapshots.append(
+                (node.module, node.name, _CachedValue(value))
+            )
 
     @staticmethod
     def _apply_tensor_value(
@@ -994,8 +1111,11 @@ class ParameterPlanRuntime:
     def _restore_value(
         module: Any,
         attr: str,
-        snapshot: _TensorSnapshot,
+        snapshot: _TensorSnapshot | _CachedValue,
     ) -> None:
+        if isinstance(snapshot, _CachedValue):
+            module.__dict__[attr] = snapshot.value
+            return
         current = getattr(module, attr)
         if snapshot.indices is None:
             current.copy_(snapshot.values)
@@ -1081,6 +1201,13 @@ class ParameterPlanRuntime:
             grouped.setdefault(key, []).append(active)
 
         self._record_dependencies()
+        changed = {
+            f"{plans[0].item.module.module_name}.{attr}"
+            for (_, attr), plans in grouped.items()
+        }
+        # What reads each cache, and the values of those the change must
+        # keep, are taken before any value changes.
+        readers = self._cache_readers(changed)
 
         snapshots: list[tuple[Any, str, Any]] = []
         for (_, attr), plans in grouped.items():
@@ -1104,12 +1231,7 @@ class ParameterPlanRuntime:
                         self._apply_grouped_changes(
                             plans[0].item.module, attr, selected
                         )
-            self._refresh_derived_parameters(
-                {
-                    f"{plans[0].item.module.module_name}.{attr}"
-                    for (_, attr), plans in grouped.items()
-                }
-            )
+            self._refresh_derived_parameters(changed, readers)
         except BaseException as apply_error:
             rollback_errors = self._restore_snapshots(snapshots)
             if rollback_errors:

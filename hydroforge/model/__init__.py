@@ -7,6 +7,7 @@
 """Public declarative physical-model API."""
 
 from hydroforge.contracts.conditions import always, module, never, opt
+from hydroforge.declare.computed_cache import computed_cache
 from hydroforge.declare.kernel_field import kernel_field
 from hydroforge.declare.model import OutputConfig
 from hydroforge.declare.module import (
@@ -39,6 +40,7 @@ __all__ = [
     "SelectionField",
     "TensorField",
     "always",
+    "computed_cache",
     "computed_field",
     "computed_tensor_field",
     "copy_tensor_inputs",
