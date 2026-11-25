@@ -21,6 +21,9 @@ dependencies = [
     "ninja; sys_platform == 'darwin'",
 ]
 
+[project.scripts]
+hydroforge-audit = "hydroforge.audit:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["hydroforge*"]

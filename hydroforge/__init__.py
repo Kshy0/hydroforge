@@ -26,6 +26,7 @@ execution   Model runtime: input binding, materialization, step orchestration,
             structural updates, checkpoints, and backend capture.
 model       AbstractModel and the public declarative-model API.
 testing     Module construction helpers for tests (same layer as model).
+audit       Standalone extractor/validator for HF-UPSTREAM-FIX annotations.
 """
 
 __all__: list[str] = []
