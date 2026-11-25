@@ -242,7 +242,7 @@ def program_options(options: tuple[str, ...], *, physics: bool) -> tuple[str, ..
     if not physics:
         return ("--fmad=false", *options)
     if CUDA.math.physics_fast_math and "--use_fast_math" not in options:
-        return ("--use_fast_math", *options)
+        return ("--use_fast_math", "-DHYDROFORGE_FAST_MATH=1", *options)
     if "--use_fast_math" in options or any(o.startswith("--fmad=") for o in options):
         return options
     return ("--fmad=false", *options)

@@ -84,6 +84,7 @@ if INTERPRET:
             "cos": np.cos,
             "erf": np.vectorize(math.erf, otypes=[np.float64]),
             "exp": np.exp,
+            "fast_powf": np.power,
             "floor": np.floor,
             "fmod": np.fmod,
             "hypot": np.hypot,
@@ -215,8 +216,9 @@ def log(value):
 
 @triton.jit
 def pow(base, exponent):
-    """libdevice ``base ** exponent`` (``exp2(exponent * log2(base))`` under
-    fast math); mixed FP32/FP64 operands are promoted to FP64 like ``/``."""
+    """libdevice ``base ** exponent`` (``fast_powf`` on NVIDIA fp32 or
+    ``exp2(exponent * log2(base))`` under fast math); mixed FP32/FP64 operands
+    are promoted to FP64 like ``/``."""
     base = constant(base, exponent)
     exponent = constant(exponent, base)
     if base.dtype == tl.float64:
@@ -224,6 +226,8 @@ def pow(base, exponent):
     elif exponent.dtype == tl.float64:
         base = base.to(tl.float64)
     if FAST_MATH:
+        if not is_hip() and base.dtype == tl.float32:
+            return libdevice.fast_powf(base, exponent)
         return tl.exp2(exponent * tl.log2(base))
     else:
         return libdevice.pow(base, exponent)
@@ -248,9 +252,16 @@ def _ocml_cbrt(arg0, _semantic=None):
 def cbrt(value):
     """Cube root: libdevice on NVIDIA, OCML on AMD, as CUDA/HIP ``cbrt``.
 
-    ROCm Triton's libdevice has no ``cbrt``; ``pow(x, 1/3)`` would round
-    worse and return NaN for negative ``x``.
+    Under ``HYDROFORGE_FAST_MATH``, NVIDIA FP32 uses ``libdevice.fast_powf``
+    preserving zero and negative signs.
     """
+    if FAST_MATH:
+        if not is_hip():
+            if value.dtype == tl.float32:
+                mag = libdevice.fast_powf(
+                    tl.abs(value), tl.full((), 1.0 / 3.0, tl.float32)
+                )
+                return tl.where(value == 0.0, 0.0, tl.where(value < 0.0, -mag, mag))
     if is_hip():
         return _ocml_cbrt(value)
     else:

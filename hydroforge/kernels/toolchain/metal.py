@@ -97,9 +97,27 @@ MetalOrigin = Literal["physics", "aten", "framework"]
 # Safe math still contracts ``a * b + c`` within one statement; this pragma,
 # leading the source, turns contraction off for the whole library.
 _NO_CONTRACTION = "#pragma METAL fp contract(off)\n"
+# Physics sources see HYDROFORGE_FAST_MATH, as CUDA physics sources do, so
+# they can opt individual float operations into ``fast::`` variants.
+_FAST_MATH_DEFINE = "#define HYDROFORGE_FAST_MATH 1\n"
 
 _LIBRARIES: dict[tuple[str, bool, str], int] = {}
 _LIBRARY_LOCK = threading.Lock()
+
+
+def compile_fast_math(*, origin: MetalOrigin, encoding: str = "native") -> bool:
+    """Whether the compiler's fast math mode applies to this library.
+
+    Only native physics libraries under ``HYDROFORGE_FAST_MATH``.  float32x2
+    libraries always compile with safe math: fast math may reassociate the
+    error-free transforms of the pair arithmetic.  Their physics code still
+    sees ``HYDROFORGE_FAST_MATH`` and opts single float operations in.
+    """
+    return (
+        origin == "physics"
+        and encoding == "native"
+        and METAL.math.physics_fast_math
+    )
 
 
 def prepare_source(
@@ -108,8 +126,6 @@ def prepare_source(
     """The exact source saved, hashed, and submitted to the native compiler."""
     if encoding not in {"native", "float32x2"}:
         raise ValueError(f"unknown Metal encoding {encoding!r}")
-    if encoding == "float32x2" and METAL.math.physics_fast_math:
-        raise ValueError("Metal float32x2 requires HYDROFORGE_FAST_MATH=0")
     if encoding == "float32x2":
         # Comments are removed by preprocessing, including ones directly
         # adjacent to a pragma. Generated pair programs need no _Pragma;
@@ -125,6 +141,12 @@ def prepare_source(
             raise ValueError(
                 "Metal float32x2 source cannot re-enable unsafe math or contraction"
             )
+    if origin == "physics" and METAL.math.physics_fast_math:
+        # Idempotent: the source may already carry the pragma and the define.
+        pragma = _NO_CONTRACTION if source.startswith(_NO_CONTRACTION) else ""
+        body = source[len(pragma):]
+        if not body.startswith(_FAST_MATH_DEFINE):
+            source = pragma + _FAST_MATH_DEFINE + body
     if origin == "framework" or encoding == "float32x2":
         if not source.startswith(_NO_CONTRACTION):
             source = _NO_CONTRACTION + source
@@ -143,7 +165,7 @@ def library(source: str, *, origin: MetalOrigin, encoding: str = "native") -> in
     """
 
     source = prepare_source(source, origin=origin, encoding=encoding)
-    fast_math = origin == "physics" and METAL.math.physics_fast_math
+    fast_math = compile_fast_math(origin=origin, encoding=encoding)
     key = (hashlib.sha256(source.encode()).hexdigest(), fast_math, encoding)
     with _LIBRARY_LOCK:
         compiled = _LIBRARIES.get(key)

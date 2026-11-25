@@ -275,8 +275,8 @@ def select(spec: ModelSpec, declaration: ModelDeclaration) -> Selection:
             "float32x2" if backend.name == "metal" and precisions.mixed else "native"
         )
     if emulation != "native":
-        if backend.math.physics_fast_math:
-            raise ValueError("Metal emulation requires HYDROFORGE_FAST_MATH=0")
+        # HYDROFORGE_FAST_MATH keeps float32x2 libraries in safe math; their
+        # physics code opts single float operations into fast variants.
         if (
             backend.name != "metal"
             or precisions.compute != "float32"

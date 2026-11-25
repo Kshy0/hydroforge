@@ -95,10 +95,65 @@ void release_after_completion(std::shared_ptr<void> resource,
   }
 }
 
+struct GroupedResources {
+  std::vector<id<MTLResource>> read_only;
+  std::vector<id<MTLResource>> write_only;
+  std::vector<id<MTLResource>> read_write;
+
+  void build_from(const std::vector<std::pair<id<MTLBuffer>, MTLResourceUsage>>& list) {
+    read_only.clear();
+    write_only.clear();
+    read_write.clear();
+    std::unordered_map<void*, MTLResourceUsage> merged;
+    merged.reserve(list.size());
+    std::vector<id<MTLBuffer>> order;
+    order.reserve(list.size());
+    for (const auto& [buffer, usage] : list) {
+      void* key = (__bridge void*)buffer;
+      auto it = merged.find(key);
+      if (it == merged.end()) {
+        merged.emplace(key, usage);
+        order.push_back(buffer);
+      } else {
+        it->second = it->second | usage;
+      }
+    }
+    for (id<MTLBuffer> buffer : order) {
+      MTLResourceUsage usage = merged[(__bridge void*)buffer];
+      if (usage == MTLResourceUsageRead) {
+        read_only.push_back(buffer);
+      } else if (usage == MTLResourceUsageWrite) {
+        write_only.push_back(buffer);
+      } else {
+        read_write.push_back(buffer);
+      }
+    }
+  }
+
+  void bind(id<MTLComputeCommandEncoder> encoder) const {
+    if (!read_only.empty()) {
+      [encoder useResources:read_only.data()
+                      count:read_only.size()
+                      usage:MTLResourceUsageRead];
+    }
+    if (!write_only.empty()) {
+      [encoder useResources:write_only.data()
+                      count:write_only.size()
+                      usage:MTLResourceUsageWrite];
+    }
+    if (!read_write.empty()) {
+      [encoder useResources:read_write.data()
+                      count:read_write.size()
+                      usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    }
+  }
+};
+
 struct ArgumentBinding {
   int64_t pipeline_id;
   id<MTLBuffer> encoded = nil;
   std::vector<std::pair<id<MTLBuffer>, MTLResourceUsage>> resources;
+  GroupedResources grouped_resources;
   std::vector<id<MTLBuffer>> owned_scalar_buffers;
   std::vector<torch::Tensor> retained_tensors;
   EncodedOn encoded_on;
@@ -114,6 +169,7 @@ int64_t next_binding_id = 0;
 struct ICBGraph {
   id<MTLIndirectCommandBuffer> commands;
   std::vector<std::pair<id<MTLBuffer>, MTLResourceUsage>> resources;
+  GroupedResources grouped_resources;
   std::vector<std::shared_ptr<ArgumentBinding>> retained_bindings;
   NSUInteger command_count;
   EncodedOn encoded_on;
@@ -428,6 +484,7 @@ int64_t create_argument_binding(
       }
     }
   }
+  binding->grouped_resources.build_from(binding->resources);
   std::lock_guard<std::mutex> guard(binding_mutex);
   TORCH_CHECK(next_binding_id < std::numeric_limits<int64_t>::max(),
               "Metal argument binding IDs exhausted");
@@ -461,9 +518,7 @@ void dispatch(
     id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
     [encoder setComputePipelineState:pipeline->state];
     [encoder setBuffer:binding->encoded offset:0 atIndex:0];
-    for (const auto& [resource, usage] : binding->resources) {
-      [encoder useResource:resource usage:usage];
-    }
+    binding->grouped_resources.bind(encoder);
     NSUInteger width = validate_group_size(*pipeline, requested_group_size);
     [encoder dispatchThreads:MTLSizeMake(threads, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
@@ -502,9 +557,7 @@ void dispatch_sequence(
       auto binding = command_bindings[i];
       [encoder setComputePipelineState:pipeline->state];
       [encoder setBuffer:binding->encoded offset:0 atIndex:0];
-      for (const auto& [resource, usage] : binding->resources) {
-        [encoder useResource:resource usage:usage];
-      }
+      binding->grouped_resources.bind(encoder);
       NSUInteger width = validate_group_size(*pipeline, group_sizes[i]);
       [encoder dispatchThreads:MTLSizeMake(threads[i], 1, 1)
           threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
@@ -595,6 +648,7 @@ int64_t create_icb(
         (command_index + count - 1) % count;
     if (barriers[preceding_command_index]) [command setBarrier];
   }
+  graph->grouped_resources.build_from(graph->resources);
   std::lock_guard<std::mutex> guard(graph_mutex);
   TORCH_CHECK(next_graph_id < std::numeric_limits<int64_t>::max(),
               "Metal ICB graph IDs exhausted");
@@ -617,9 +671,7 @@ void replay_icb(int64_t graph_id, uint64_t replays) {
   graph->encoded_on.note(stream);
   at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
     id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
-    for (const auto& [resource, usage] : graph->resources) {
-      [encoder useResource:resource usage:usage];
-    }
+    graph->grouped_resources.bind(encoder);
     for (uint64_t replay = 0; replay < replays; ++replay) {
       [encoder executeCommandsInBuffer:graph->commands
                               withRange:NSMakeRange(0, graph->command_count)];

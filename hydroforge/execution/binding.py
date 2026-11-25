@@ -425,7 +425,14 @@ class KernelBinder:
                 f"workspace {declaration.key!r} exceeds int64 byte size"
             )
         if declaration.initialize == "zeros":
-            tensor = torch.zeros(shape, device=plan.device, dtype=dtype)
+            if dtype == torch.float64 and plan.metal_emulation == "float32x2":
+                from hydroforge.kernels.emulated import EmulatedTensor
+
+                tensor = EmulatedTensor(
+                    torch.zeros(shape, device=plan.device, dtype=torch.int64)
+                )
+            else:
+                tensor = torch.zeros(shape, device=plan.device, dtype=dtype)
         else:
             source = value(declaration.source)
             if (

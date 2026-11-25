@@ -36,6 +36,21 @@ inline bool operator<=(hf_hp a, hf_hp b) { return hf_float32x2::le(a.value, b.va
 inline bool operator>(hf_hp a, hf_hp b) { return b < a; }
 inline bool operator>=(hf_hp a, hf_hp b) { return b <= a; }
 inline bool operator!=(hf_hp a, hf_hp b) { return !(a == b); }
+// Exact float overloads avoid redundant low-limb arithmetic and frexp/ldexp.
+inline hf_hp operator+(hf_hp a, float b) { return hf_hp_from_value(hf_float32x2::add_float(a.value, b)); }
+inline hf_hp operator+(float a, hf_hp b) { return hf_hp_from_value(hf_float32x2::add_float(b.value, a)); }
+inline hf_hp operator-(hf_hp a, float b) { return hf_hp_from_value(hf_float32x2::sub_float(a.value, b)); }
+inline hf_hp operator-(float a, hf_hp b) { return hf_hp_from_value(hf_float32x2::add_float(hf_float32x2::neg(b.value), a)); }
+inline hf_hp operator*(hf_hp a, float b) { return hf_hp_from_value(hf_float32x2::mul_float(a.value, b)); }
+inline hf_hp operator*(float a, hf_hp b) { return hf_hp_from_value(hf_float32x2::mul_float(b.value, a)); }
+inline bool operator<(hf_hp a, float b) { return hf_float32x2::lt_float(a.value, b); }
+inline bool operator<(float a, hf_hp b) { return hf_float32x2::gt_float(b.value, a); }
+inline bool operator<=(hf_hp a, float b) { return hf_float32x2::le_float(a.value, b); }
+inline bool operator<=(float a, hf_hp b) { return hf_float32x2::ge_float(b.value, a); }
+inline bool operator>(hf_hp a, float b) { return hf_float32x2::gt_float(a.value, b); }
+inline bool operator>(float a, hf_hp b) { return hf_float32x2::lt_float(b.value, a); }
+inline bool operator>=(hf_hp a, float b) { return hf_float32x2::ge_float(a.value, b); }
+inline bool operator>=(float a, hf_hp b) { return hf_float32x2::le_float(b.value, a); }
 // Both operand orders retain integer precision within pair capacity and resolve overloads in
 // the presence of the legacy implicit float conversion.
 template<typename T> inline hf_hp operator+(hf_hp a, T b) { return a + hf_hp(b); }

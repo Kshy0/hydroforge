@@ -191,7 +191,9 @@ class MetalProgram:
         does not compile or execute the program, and changes no cache key.
         """
         path = Path(path)
-        fast_math = self.origin == "physics" and METAL.math.physics_fast_math
+        fast_math = toolchain.compile_fast_math(
+            origin=self.origin, encoding=self.encoding
+        )
         atomic_write_text(path, self.source)
         atomic_write_text(
             path.with_suffix(path.suffix + ".json"),
@@ -561,7 +563,10 @@ kernel void {spec.name}(
     constant {spec.name}_args& args [[buffer(0)]],
     uint i [[thread_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
-    uint tpg [[threads_per_threadgroup]]) {{
+    uint tpg [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_width [[threads_per_simdgroup]]) {{
 {body}
 }}
 """

@@ -25,6 +25,22 @@ inline bool lt(Value a, Value b) {
     return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo);
 }
 inline bool le(Value a, Value b) { return lt(a, b) || eq(a, b); }
+inline bool lt_float(Value a, float b) {
+    if (isnan(a) || metal::isnan(b)) return false;
+    return a.hi < b || (a.hi == b && a.lo < 0.0f);
+}
+inline bool le_float(Value a, float b) {
+    if (isnan(a) || metal::isnan(b)) return false;
+    return a.hi < b || (a.hi == b && a.lo <= 0.0f);
+}
+inline bool gt_float(Value a, float b) {
+    if (isnan(a) || metal::isnan(b)) return false;
+    return a.hi > b || (a.hi == b && a.lo > 0.0f);
+}
+inline bool ge_float(Value a, float b) {
+    if (isnan(a) || metal::isnan(b)) return false;
+    return a.hi > b || (a.hi == b && a.lo >= 0.0f);
+}
 inline Value two_sum(float a, float b) {
     float s = a + b;
     if (!metal::isfinite(s)) return {s, 0.0f};
@@ -39,23 +55,43 @@ inline Value scale(Value a, int e) {
     return two_sum(h, metal::ldexp(a.lo, e));
 }
 inline Value add(Value a, Value b) {
-    if (isnan(a) || isnan(b)) return nan();
-    if (zero(a) && zero(b)) return from_float(a.hi + b.hi);
-    if (!isfinite(a) || !isfinite(b)) return from_float(a.hi + b.hi);
-    Value s = two_sum(a.hi, b.hi);
-    // Avoid losing a finite result when only the leading-limb sum overflows.
-    if (!metal::isfinite(s.hi)) {
-        a = scale(a, -1); b = scale(b, -1);
-        s = two_sum(a.hi, b.hi);
+    if (isfinite(a) && isfinite(b)) {
+        if (zero(a)) return zero(b) ? from_float(a.hi + b.hi) : b;
+        if (zero(b)) return a;
+        Value s = two_sum(a.hi, b.hi);
+        // Avoid losing a finite result when only the leading-limb sum overflows.
+        if (!metal::isfinite(s.hi)) {
+            a = scale(a, -1); b = scale(b, -1);
+            s = two_sum(a.hi, b.hi);
+            Value t = two_sum(a.lo, b.lo);
+            Value u = two_sum(s.hi, s.lo + t.hi);
+            return scale(two_sum(u.hi, u.lo + t.lo), 1);
+        }
         Value t = two_sum(a.lo, b.lo);
         Value u = two_sum(s.hi, s.lo + t.hi);
-        return scale(two_sum(u.hi, u.lo + t.lo), 1);
+        return two_sum(u.hi, u.lo + t.lo);
     }
-    Value t = two_sum(a.lo, b.lo);
-    Value u = two_sum(s.hi, s.lo + t.hi);
-    return two_sum(u.hi, u.lo + t.lo);
+    if (isnan(a) || isnan(b)) return nan();
+    return from_float(a.hi + b.hi);
+}
+inline Value add_float(Value a, float b) {
+    if (isfinite(a) && metal::isfinite(b)) {
+        if (b == 0.0f) return zero(a) ? from_float(a.hi + b) : a;
+        if (zero(a)) return from_float(b);
+        Value s = two_sum(a.hi, b);
+        if (!metal::isfinite(s.hi)) {
+            a = scale(a, -1);
+            float bs = metal::ldexp(b, -1);
+            s = two_sum(a.hi, bs);
+            return scale(two_sum(s.hi, s.lo + a.lo), 1);
+        }
+        return two_sum(s.hi, s.lo + a.lo);
+    }
+    if (isnan(a) || metal::isnan(b)) return nan();
+    return from_float(a.hi + b);
 }
 inline Value sub(Value a, Value b) { return add(a, neg(b)); }
+inline Value sub_float(Value a, float b) { return add_float(a, -b); }
 // Inputs to this internal product have modest, normalized exponents.
 inline Value mul_normal(Value a, Value b) {
     float p = a.hi * b.hi;
@@ -66,12 +102,40 @@ inline Value mul_normal(Value a, Value b) {
     return two_sum(p, e);
 }
 inline Value mul(Value a, Value b) {
+    if (isfinite(a) && isfinite(b)) {
+        if (zero(a) || zero(b)) return from_float(a.hi * b.hi);
+        // Normal-exponent fast path: keeps a.lo * b.lo above subnormals and
+        // avoids frexp/ldexp scaling with bit-identical results.
+        float aa = metal::fabs(a.hi), bb = metal::fabs(b.hi);
+        if (aa >= 0x1p-36f && aa <= 0x1p50f && bb >= 0x1p-36f && bb <= 0x1p50f) {
+            return mul_normal(a, b);
+        }
+        int ea = 0, eb = 0;
+        metal::frexp(a.hi, ea); metal::frexp(b.hi, eb);
+        return scale(mul_normal(scale(a, -ea), scale(b, -eb)), ea + eb);
+    }
     if (isnan(a) || isnan(b)) return nan();
-    if (!isfinite(a) || !isfinite(b) || zero(a) || zero(b))
-        return from_float(a.hi * b.hi);
-    int ea = 0, eb = 0;
-    metal::frexp(a.hi, ea); metal::frexp(b.hi, eb);
-    return scale(mul_normal(scale(a, -ea), scale(b, -eb)), ea + eb);
+    return from_float(a.hi * b.hi);
+}
+inline Value mul_float(Value a, float b) {
+    if (isfinite(a) && metal::isfinite(b)) {
+        if (zero(a) || b == 0.0f) return from_float(a.hi * b);
+        float aa = metal::fabs(a.hi), bb = metal::fabs(b);
+        if (aa >= 0x1p-50f && aa <= 0x1p50f && bb >= 0x1p-50f && bb <= 0x1p50f) {
+            float p = a.hi * b;
+            float e = metal::fma(a.hi, b, -p) + a.lo * b;
+            return two_sum(p, e);
+        }
+        int ea = 0, eb = 0;
+        metal::frexp(a.hi, ea); metal::frexp(b, eb);
+        Value as = scale(a, -ea);
+        float bs = metal::ldexp(b, -eb);
+        float p = as.hi * bs;
+        float e = metal::fma(as.hi, bs, -p) + as.lo * bs;
+        return scale(two_sum(p, e), ea + eb);
+    }
+    if (isnan(a) || metal::isnan(b)) return nan();
+    return from_float(a.hi * b);
 }
 inline Value div(Value a, Value b) {
     if (isnan(a) || isnan(b)) return nan();
